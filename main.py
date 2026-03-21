@@ -32,6 +32,10 @@ from src.dashboard import start_dashboard
 from src.exchange_aggregator import ExchangeAggregator
 from src.options_flow import OptionsFlowScanner
 from src.options_dashboard import start_options_dashboard
+from src.regime_detector import RegimeDetector
+from src.decision_firewall import DecisionFirewall
+from src.agent_scoring import AgentScorer
+from src.features import FeatureEngine
 from src import telegram_bot as tg
 
 # ─── Logging Setup ─────────────────────────────────────────────
@@ -99,6 +103,10 @@ class HyperliquidResearchBot:
         self.copy_trader = CopyTrader()
         self.exchange_agg = ExchangeAggregator()
         self.options_scanner = OptionsFlowScanner()
+        self.regime_detector = RegimeDetector(exchange_agg=self.exchange_agg)
+        self.firewall = DecisionFirewall()
+        self.agent_scorer = AgentScorer()
+        self.feature_engine = FeatureEngine()
         self.reporter = Reporter()
 
         # Start the web dashboard
@@ -213,17 +221,47 @@ class HyperliquidResearchBot:
             except Exception as e:
                 self.logger.warning(f"  Options flow scan error: {e}")
 
-            # Phase 4: Paper trade top strategies (increased from 5 to 15)
-            self.logger.info("Phase 4: Paper Trading")
-            top_strategies = self.scorer.get_top_strategies(n=15)
+            # Phase 3d: Regime Detection
+            self.logger.info("Phase 3d: Market Regime Detection")
+            regime_data = {}
+            try:
+                regime_data = self.regime_detector.get_market_regime()
+                self.logger.info(f"  Regime: {regime_data.get('overall_regime', '?')} "
+                               f"(confidence={regime_data.get('overall_confidence', 0):.0%})")
+                guidance = regime_data.get("strategy_guidance", {})
+                self.logger.info(f"  Activate: {guidance.get('activate', [])}")
+                self.logger.info(f"  Pause: {guidance.get('pause', [])}")
+                self.logger.info(f"  Size modifier: {guidance.get('size_modifier', 1.0):.0%}")
+            except Exception as e:
+                self.logger.warning(f"  Regime detection error: {e}")
+
+            # Phase 4: Paper trade top strategies (regime-filtered)
+            self.logger.info("Phase 4: Paper Trading (regime-aware)")
+            top_strategies = self.scorer.get_top_strategies(n=20)
+
+            # Filter strategies by regime — pause those that don't fit
+            if regime_data:
+                top_strategies = self.regime_detector.filter_strategies_by_regime(
+                    top_strategies, regime_data
+                )
+                self.logger.info(f"  Post-regime filter: {len(top_strategies)} strategies active")
 
             # Check existing positions first
             closed = self.paper_trader.check_open_positions()
             if closed:
                 self.logger.info(f"  Closed {len(closed)} positions")
-                # Telegram: notify closed trades
-                if tg.is_configured():
-                    for c in closed:
+                for c in closed:
+                    # Record outcome for agent scoring
+                    try:
+                        source_key = f"strategy:{c.get('strategy_type', 'unknown')}"
+                        signal_id = c.get("signal_id", f"{source_key}:{c.get('id', 0)}")
+                        pnl = c.get("pnl", 0)
+                        self.agent_scorer.record_outcome(source_key, signal_id, pnl)
+                        self.firewall.record_trade_outcome(c.get("coin", ""), pnl)
+                    except Exception:
+                        pass
+                    # Telegram: notify closed trades
+                    if tg.is_configured():
                         tg.notify_trade_closed(c, c.get("exit_price", 0), c.get("pnl", 0), c.get("reason", ""))
 
             # Execute new signals from strategies (with volume + options flow confirmation)
