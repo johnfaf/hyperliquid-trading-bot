@@ -31,7 +31,6 @@ from src.reporter import Reporter
 from src.dashboard import start_dashboard
 from src.exchange_aggregator import ExchangeAggregator
 from src.options_flow import OptionsFlowScanner
-from src.options_dashboard import start_options_dashboard
 from src.regime_detector import RegimeDetector
 from src.decision_firewall import DecisionFirewall
 from src.agent_scoring import AgentScorer
@@ -99,29 +98,28 @@ class HyperliquidResearchBot:
         self.discovery = TraderDiscovery()
         self.identifier = StrategyIdentifier()
         self.scorer = StrategyScorer()
-        self.paper_trader = PaperTrader()
-        self.copy_trader = CopyTrader()
         self.exchange_agg = ExchangeAggregator()
         self.options_scanner = OptionsFlowScanner()
         self.regime_detector = RegimeDetector(exchange_agg=self.exchange_agg)
         self.firewall = DecisionFirewall()
         self.agent_scorer = AgentScorer()
         self.feature_engine = FeatureEngine()
+        self.copy_trader = CopyTrader()
         self.reporter = Reporter()
 
-        # Start the web dashboard
+        # Paper trader with V2 components wired in
+        self.paper_trader = PaperTrader(
+            firewall=self.firewall,
+            agent_scorer=self.agent_scorer,
+            feature_engine=self.feature_engine,
+        )
+
+        # Start the unified web dashboard (main + options on same port)
         try:
-            self.dashboard = start_dashboard()
-            self.logger.info("Web dashboard started.")
+            self.dashboard = start_dashboard(options_scanner=self.options_scanner)
+            self.logger.info("Unified dashboard started (main + options flow on same port).")
         except Exception as e:
             self.logger.warning(f"Dashboard failed to start: {e}")
-
-        # Start the options flow dashboard (separate port)
-        try:
-            self.options_dashboard = start_options_dashboard(self.options_scanner)
-            self.logger.info("Options Flow Dashboard started.")
-        except Exception as e:
-            self.logger.warning(f"Options dashboard failed to start: {e}")
 
         self.logger.info("Bot initialized successfully.")
 
@@ -246,29 +244,21 @@ class HyperliquidResearchBot:
                 )
                 self.logger.info(f"  Post-regime filter: {len(top_strategies)} strategies active")
 
-            # Check existing positions first
+            # Check existing positions first (V2: outcomes auto-feed to agent scorer + firewall)
             closed = self.paper_trader.check_open_positions()
             if closed:
                 self.logger.info(f"  Closed {len(closed)} positions")
                 for c in closed:
-                    # Record outcome for agent scoring
-                    try:
-                        source_key = f"strategy:{c.get('strategy_type', 'unknown')}"
-                        signal_id = c.get("signal_id", f"{source_key}:{c.get('id', 0)}")
-                        pnl = c.get("pnl", 0)
-                        self.agent_scorer.record_outcome(source_key, signal_id, pnl)
-                        self.firewall.record_trade_outcome(c.get("coin", ""), pnl)
-                    except Exception:
-                        pass
                     # Telegram: notify closed trades
                     if tg.is_configured():
                         tg.notify_trade_closed(c, c.get("exit_price", 0), c.get("pnl", 0), c.get("reason", ""))
 
-            # Execute new signals from strategies (with volume + options flow confirmation)
+            # Execute new signals from strategies (V2 pipeline: features → scoring → firewall)
             if top_strategies:
                 executed = self.paper_trader.execute_strategy_signals(
                     top_strategies, exchange_agg=self.exchange_agg,
                     options_scanner=self.options_scanner,
+                    regime_data=regime_data,
                 )
                 self.logger.info(f"  Executed {len(executed)} new paper trades")
                 # Telegram: notify new trades

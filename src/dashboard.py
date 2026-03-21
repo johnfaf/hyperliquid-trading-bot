@@ -1,7 +1,10 @@
 """
-Live Simulation Dashboard
-Serves a web dashboard showing real-time bot status, strategies, paper trades, and trader data.
-Runs as a lightweight HTTP server alongside the main bot loop.
+Live Simulation Dashboard (V2)
+Serves a unified web dashboard on port 8080 with:
+  - Main bot dashboard (strategies, paper trades, trader data)
+  - Options flow dashboard (convictions, heatmap, unusual prints)
+
+Both dashboards served from the same port for Railway compatibility.
 """
 import json
 import os
@@ -14,6 +17,9 @@ from urllib.parse import urlparse, parse_qs
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import config
+
+# Module-level options scanner reference (set by set_options_scanner)
+_options_scanner = None
 
 
 def _get_db():
@@ -153,8 +159,11 @@ canvas{width:100%!important;height:200px!important}
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
 </head>
 <body>
-<h1>HYPERLIQUID RESEARCH BOT</h1>
-<p class="subtitle">Live Simulation Dashboard &mdash; <span id="update-time">loading...</span></p>
+<div style="display:flex;justify-content:space-between;align-items:center">
+<div><h1>HYPERLIQUID RESEARCH BOT</h1>
+<p class="subtitle">Live Simulation Dashboard &mdash; <span id="update-time">loading...</span></p></div>
+<a href="/options" style="color:#00d4aa;text-decoration:none;border:1px solid #00d4aa;padding:8px 16px;border-radius:6px;font-size:0.85em;font-weight:600">OPTIONS FLOW &rarr;</a>
+</div>
 
 <div class="grid" id="stats-cards"></div>
 
@@ -358,7 +367,7 @@ setInterval(refresh, 30000);
 
 
 class DashboardHandler(BaseHTTPRequestHandler):
-    """HTTP handler for the dashboard."""
+    """HTTP handler for the unified dashboard (main + options flow)."""
 
     def log_message(self, format, *args):
         pass  # Suppress default logging
@@ -372,38 +381,104 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(DASHBOARD_HTML.encode())
 
+        elif parsed.path == "/options":
+            # Serve the options flow dashboard
+            self._serve_options_html()
+
         elif parsed.path == "/api/data":
             try:
                 data = get_dashboard_data()
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Access-Control-Allow-Origin", "*")
-                self.end_headers()
-                self.wfile.write(json.dumps(data, default=_safe_json).encode())
+                self._json_response(data)
             except Exception as e:
-                self.send_response(500)
-                self.send_header("Content-Type", "application/json")
-                self.end_headers()
-                self.wfile.write(json.dumps({"error": str(e)}).encode())
+                self._json_response({"error": str(e)}, code=500)
+
+        elif parsed.path == "/api/flow":
+            # Options flow data endpoint
+            self._serve_flow_data()
 
         elif parsed.path == "/api/health":
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(json.dumps({"status": "ok", "timestamp": datetime.utcnow().isoformat()}).encode())
+            self._json_response({"status": "ok", "timestamp": datetime.utcnow().isoformat()})
 
         else:
             self.send_response(404)
             self.end_headers()
 
+    def do_POST(self):
+        parsed = urlparse(self.path)
+        if parsed.path == "/api/order":
+            self._handle_order()
+        else:
+            self.send_response(404)
+            self.end_headers()
 
-def start_dashboard(port=None):
-    """Start the dashboard server in a background thread."""
+    def _json_response(self, data: dict, code: int = 200):
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(json.dumps(data, default=_safe_json).encode())
+
+    def _serve_options_html(self):
+        """Serve the options flow dashboard HTML."""
+        try:
+            from src.options_dashboard import _get_dashboard_html
+            html = _get_dashboard_html()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(html.encode())
+        except Exception as e:
+            self.send_response(500)
+            self.end_headers()
+            self.wfile.write(f"Options dashboard error: {e}".encode())
+
+    def _serve_flow_data(self):
+        """Serve options flow data from the scanner."""
+        global _options_scanner
+        if _options_scanner:
+            data = _options_scanner.get_dashboard_data()
+        else:
+            data = {"error": "Scanner not initialized", "convictions": [],
+                    "heatmap": [], "flow_bars": [], "unusual_prints": [],
+                    "spot_prices": {}, "summary": {"total_unusual": 0},
+                    "timestamp": ""}
+        self._json_response(data)
+
+    def _handle_order(self):
+        """Handle options order placement (needs Deribit API keys)."""
+        try:
+            content_len = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(content_len))
+            self._json_response({
+                "status": "Order queued (Deribit API keys required for live execution)",
+                "order": body,
+            })
+        except Exception as e:
+            self._json_response({"status": f"Error: {e}"}, code=400)
+
+
+def set_options_scanner(scanner):
+    """Set the options scanner reference for the /options and /api/flow routes."""
+    global _options_scanner
+    _options_scanner = scanner
+
+
+def start_dashboard(port=None, options_scanner=None):
+    """Start the unified dashboard server in a background thread.
+
+    Serves both the main bot dashboard (/) and options flow (/options)
+    on a single port for Railway compatibility.
+    """
+    if options_scanner:
+        set_options_scanner(options_scanner)
+
     port = port or int(os.environ.get("PORT", 8080))
     server = HTTPServer(("0.0.0.0", port), DashboardHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     print(f"Dashboard running at http://0.0.0.0:{port}")
+    print(f"  Main dashboard:    http://0.0.0.0:{port}/")
+    print(f"  Options flow:      http://0.0.0.0:{port}/options")
     return server
 
 

@@ -1,7 +1,14 @@
 """
-Paper Trading Simulator
+Paper Trading Simulator (V2)
+============================
 Simulates trades based on the top-scoring strategies without risking real funds.
 Tracks performance to validate strategies before any real deployment.
+
+V2 integration:
+  - Signals routed through DecisionFirewall before execution
+  - Feature engine enriches signals with market context
+  - Agent scoring weights signals by source reliability
+  - All signals go through TradeSignal schema validation
 """
 import logging
 from datetime import datetime
@@ -12,6 +19,10 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import config
 from src import database as db
 from src import hyperliquid_client as hl
+from src.signal_schema import TradeSignal, SignalSide, SignalSource, RiskParams, signal_from_strategy
+from src.decision_firewall import DecisionFirewall
+from src.agent_scoring import AgentScorer
+from src.features import FeatureEngine
 
 logger = logging.getLogger(__name__)
 
@@ -19,7 +30,12 @@ logger = logging.getLogger(__name__)
 class PaperTrader:
     """Simulates trading based on identified strategies."""
 
-    def __init__(self):
+    def __init__(self, firewall: Optional[DecisionFirewall] = None,
+                 agent_scorer: Optional[AgentScorer] = None,
+                 feature_engine: Optional[FeatureEngine] = None):
+        self.firewall = firewall
+        self.agent_scorer = agent_scorer
+        self.feature_engine = feature_engine
         self._ensure_account()
 
     def _ensure_account(self):
@@ -62,12 +78,20 @@ class PaperTrader:
         }
 
     def execute_strategy_signals(self, strategies: List[Dict], exchange_agg=None,
-                                  options_scanner=None) -> List[Dict]:
+                                  options_scanner=None,
+                                  regime_data: Optional[Dict] = None) -> List[Dict]:
         """
         Generate and execute paper trades based on top strategies.
-        Only trades strategies with score above threshold.
-        If exchange_agg is provided, checks multi-exchange volume confirmation.
-        If options_scanner is provided, boosts signals aligned with options flow.
+
+        V2 Pipeline:
+        1. Generate raw signal dict from strategy
+        2. Enrich with feature engine context
+        3. Apply multi-exchange volume confirmation
+        4. Apply options flow confirmation
+        5. Convert to TradeSignal schema
+        6. Apply agent scoring weights
+        7. Route through DecisionFirewall
+        8. Execute approved signals
         """
         account = db.get_paper_account()
         if not account:
@@ -79,6 +103,43 @@ class PaperTrader:
         # Get current prices
         mids = hl.get_all_mids() or {}
 
+        # Pre-compute features for relevant coins if feature engine available
+        coin_features = {}
+        if self.feature_engine:
+            try:
+                from src.regime_detector import RegimeDetector
+                for coin in set(["BTC", "ETH", "SOL"]):
+                    try:
+                        # Fetch candles for feature computation
+                        import requests
+                        payload = {
+                            "type": "candleSnapshot",
+                            "req": {
+                                "coin": coin,
+                                "interval": "1h",
+                                "startTime": int((datetime.utcnow().timestamp() - 100 * 3600) * 1000),
+                                "endTime": int(datetime.utcnow().timestamp() * 1000),
+                            }
+                        }
+                        resp = requests.post("https://api.hyperliquid.xyz/info",
+                                             json=payload, timeout=10)
+                        if resp.status_code == 200:
+                            raw = resp.json()
+                            if isinstance(raw, list) and len(raw) >= 20:
+                                candles = [{"open": float(c.get("o", 0)), "high": float(c.get("h", 0)),
+                                            "low": float(c.get("l", 0)), "close": float(c.get("c", 0)),
+                                            "volume": float(c.get("v", 0))} for c in raw]
+                                features = self.feature_engine.compute(coin, candles)
+                                coin_features[coin] = features
+                                logger.debug(f"Features {coin}: score={features.overall_score:+.2f}, "
+                                           f"rsi={features.rsi:.0f}, vol={features.volatility:.3f}")
+                    except Exception as e:
+                        logger.debug(f"Feature computation for {coin}: {e}")
+            except Exception as e:
+                logger.debug(f"Feature engine error: {e}")
+
+        # Build trade signals from strategies
+        raw_signals = []
         for strategy in strategies:
             try:
                 # Check if we already have a position from this strategy
@@ -91,7 +152,32 @@ class PaperTrader:
                 if not signal:
                     continue
 
-                # Multi-exchange volume confirmation (if available)
+                # Enrich with feature engine data
+                coin = signal["coin"]
+                if coin in coin_features:
+                    feat = coin_features[coin]
+                    # If features strongly oppose the signal direction, reduce confidence
+                    if signal["side"] == "long" and feat.overall_score < -0.3:
+                        signal["confidence"] *= 0.7
+                        logger.debug(f"Features bearish for long {coin} (score={feat.overall_score:+.2f})")
+                    elif signal["side"] == "short" and feat.overall_score > 0.3:
+                        signal["confidence"] *= 0.7
+                        logger.debug(f"Features bullish for short {coin} (score={feat.overall_score:+.2f})")
+                    elif (signal["side"] == "long" and feat.overall_score > 0.3) or \
+                         (signal["side"] == "short" and feat.overall_score < -0.3):
+                        signal["confidence"] = min(signal["confidence"] * 1.15, 1.0)
+                        logger.debug(f"Features confirm {signal['side']} {coin}")
+
+                    # Add feature context to signal
+                    signal["features"] = {
+                        "overall_score": feat.overall_score,
+                        "rsi": feat.rsi,
+                        "rsi_signal": feat.rsi_signal,
+                        "volume_trend": feat.volume_trend,
+                        "funding_signal": feat.funding_signal,
+                    }
+
+                # Multi-exchange volume confirmation
                 if exchange_agg:
                     try:
                         confirmed, vol_confidence = exchange_agg.get_volume_confirmation(
@@ -101,46 +187,113 @@ class PaperTrader:
                             logger.info(f"Volume rejects {signal['side']} {signal['coin']} "
                                        f"(confidence={vol_confidence:.2f})")
                             continue
-                        # Boost or reduce confidence based on volume
                         signal["confidence"] = signal.get("confidence", 0.5) * (0.5 + vol_confidence * 0.5)
+                        signal["volume_confirmed"] = True
                     except Exception:
-                        pass  # Don't block trades if aggregator fails
+                        pass
 
-                # Options flow confirmation (if available)
+                # Options flow confirmation
                 if options_scanner:
                     try:
                         flow_signal = options_scanner.get_flow_signal(signal["coin"])
                         if flow_signal:
                             if flow_signal["side"] == signal["side"]:
-                                # Options flow agrees — boost confidence
                                 boost = 1.0 + flow_signal["confidence"] * 0.3
                                 signal["confidence"] = min(signal.get("confidence", 0.5) * boost, 1.0)
-                                logger.info(f"Options flow confirms {signal['side']} {signal['coin']} "
-                                           f"(flow: {flow_signal['net_flow']:.0f}, boost: {boost:.2f})")
+                                signal["options_flow_aligned"] = True
+                                logger.info(f"Options flow confirms {signal['side']} {signal['coin']}")
                             else:
-                                # Options flow disagrees — reduce confidence
                                 signal["confidence"] = signal.get("confidence", 0.5) * 0.7
-                                logger.info(f"Options flow opposes {signal['side']} {signal['coin']} "
-                                           f"(flow: {flow_signal['side']}, reducing confidence)")
+                                signal["options_flow_aligned"] = False
                     except Exception:
-                        pass  # Don't block trades if scanner fails
+                        pass
 
-                # Risk management checks
-                if not self._check_risk_limits(account, signal, open_trades):
-                    logger.info(f"Risk limit hit, skipping signal for {signal['coin']}")
-                    continue
-
-                # Execute the paper trade
-                trade = self._execute_paper_trade(account, strategy, signal)
-                if trade:
-                    executed.append(trade)
-                    open_trades.append(trade)  # Update local list
+                # Attach strategy reference
+                signal["strategy"] = strategy
+                raw_signals.append(signal)
 
             except Exception as e:
-                logger.error(f"Error executing strategy {strategy.get('name', '?')}: {e}")
+                logger.error(f"Error generating signal for {strategy.get('name', '?')}: {e}")
+
+        # Convert to TradeSignal objects and apply agent scoring
+        trade_signals = []
+        for sig in raw_signals:
+            try:
+                trade_signal = TradeSignal(
+                    coin=sig["coin"],
+                    side=SignalSide(sig["side"]),
+                    confidence=sig.get("confidence", 0.5),
+                    source=SignalSource.STRATEGY,
+                    reason=f"Strategy: {sig['strategy'].get('name', '?')} ({sig.get('strategy_type', '')})",
+                    strategy_id=sig["strategy"].get("id"),
+                    strategy_type=sig.get("strategy_type", ""),
+                    entry_price=sig["price"],
+                    leverage=sig["leverage"],
+                    position_pct=sig["size"] * sig["price"] / (db.get_paper_account() or {}).get("balance", 10000),
+                    risk=RiskParams(
+                        stop_loss_pct=config.PAPER_TRADING_STOP_LOSS_PCT,
+                        take_profit_pct=config.PAPER_TRADING_TAKE_PROFIT_PCT,
+                        max_leverage=config.PAPER_TRADING_MAX_LEVERAGE,
+                    ),
+                    regime=regime_data.get("overall_regime", "") if regime_data else "",
+                    regime_size_modifier=sig["strategy"].get("regime_size_modifier", 1.0),
+                    options_flow_aligned=sig.get("options_flow_aligned"),
+                    volume_confirmed=sig.get("volume_confirmed"),
+                )
+                trade_signals.append((trade_signal, sig))
+            except Exception as e:
+                logger.debug(f"Error creating TradeSignal: {e}")
+
+        # Apply agent scoring weights (higher-performing sources get boosted)
+        if self.agent_scorer and trade_signals:
+            signals_only = [ts for ts, _ in trade_signals]
+            self.agent_scorer.apply_weights_to_signals(signals_only)
+            logger.info(f"Agent scoring applied to {len(signals_only)} signals")
+
+        # Route through Decision Firewall
+        for trade_signal, sig in trade_signals:
+            try:
+                # Use firewall if available, else fall back to legacy risk checks
+                if self.firewall:
+                    passed, reason = self.firewall.validate(
+                        trade_signal,
+                        regime_data=regime_data,
+                        open_positions=open_trades,
+                    )
+                    if not passed:
+                        logger.info(f"Firewall rejected {sig['side']} {sig['coin']}: {reason}")
+                        continue
+                    logger.info(f"Firewall approved {sig['side']} {sig['coin']} "
+                               f"(confidence={trade_signal.confidence:.0%})")
+                else:
+                    # Legacy fallback
+                    if not self._check_risk_limits(account, sig, open_trades):
+                        logger.info(f"Risk limit hit, skipping {sig['coin']}")
+                        continue
+
+                # Record signal with agent scorer
+                signal_id = ""
+                if self.agent_scorer:
+                    source_key = self.agent_scorer.get_source_key(trade_signal)
+                    signal_id = self.agent_scorer.record_signal(source_key, {
+                        "coin": sig["coin"],
+                        "side": sig["side"],
+                        "confidence": trade_signal.confidence,
+                    })
+
+                # Execute the paper trade
+                trade = self._execute_paper_trade(account, sig["strategy"], sig)
+                if trade:
+                    trade["signal_id"] = signal_id
+                    trade["strategy_type"] = sig.get("strategy_type", "")
+                    executed.append(trade)
+                    open_trades.append(trade)
+
+            except Exception as e:
+                logger.error(f"Error in V2 pipeline for {sig.get('coin', '?')}: {e}")
 
         if executed:
-            logger.info(f"Executed {len(executed)} paper trades")
+            logger.info(f"Executed {len(executed)} paper trades (V2 pipeline)")
 
         return executed
 
@@ -312,8 +465,12 @@ class PaperTrader:
                 stop_loss=signal["stop_loss"],
                 take_profit=signal["take_profit"],
                 metadata={
-                    "strategy_type": signal["strategy_type"],
-                    "confidence": signal["confidence"],
+                    "strategy_type": signal.get("strategy_type", ""),
+                    "confidence": signal.get("confidence", 0),
+                    "signal_id": signal.get("signal_id", ""),
+                    "features": signal.get("features", {}),
+                    "options_flow_aligned": signal.get("options_flow_aligned"),
+                    "volume_confirmed": signal.get("volume_confirmed"),
                 },
             )
 
@@ -439,12 +596,42 @@ class PaperTrader:
                     f"PnL=${pnl:,.2f}"
                 )
 
+                # Record outcome with V2 scoring systems
+                trade_meta = {}
+                try:
+                    import json
+                    trade_meta = json.loads(trade.get("metadata", "{}") or "{}")
+                except Exception:
+                    pass
+
+                strategy_type = trade_meta.get("strategy_type", "unknown")
+                signal_id = trade_meta.get("signal_id", "")
+
+                # Feed outcome to agent scorer
+                if self.agent_scorer:
+                    try:
+                        source_key = f"strategy:{strategy_type}"
+                        return_pct = pnl / (trade["entry_price"] * trade["size"] * trade["leverage"]) if trade["entry_price"] > 0 else 0
+                        self.agent_scorer.record_outcome(source_key, signal_id, pnl, return_pct)
+                    except Exception as e:
+                        logger.debug(f"Agent scorer outcome error: {e}")
+
+                # Feed outcome to decision firewall daily tracker
+                if self.firewall:
+                    try:
+                        self.firewall.record_trade_outcome(trade["coin"], pnl)
+                    except Exception:
+                        pass
+
                 closed.append({
                     "trade_id": trade["id"],
                     "coin": trade["coin"],
                     "side": trade["side"],
                     "pnl": pnl,
                     "reason": close_reason,
+                    "strategy_type": strategy_type,
+                    "signal_id": signal_id,
+                    "exit_price": current_price,
                 })
 
         return closed
