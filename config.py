@@ -19,7 +19,7 @@ DB_PATH = os.environ.get("HL_BOT_DB", _DEFAULT_DB)
 # Set low initially so seed addresses get picked up; raise once the bot is mature
 MIN_PNL_THRESHOLD = 0
 # Maximum number of top traders to track at any time
-MAX_TRACKED_TRADERS = 100
+MAX_TRACKED_TRADERS = 1000  # Scan top 1000 from leaderboard, keep only real traders
 # How often to refresh the leaderboard (seconds)
 LEADERBOARD_REFRESH_INTERVAL = 3600  # 1 hour
 

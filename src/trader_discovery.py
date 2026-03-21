@@ -451,6 +451,39 @@ class TraderDiscovery:
             "avg_roi": total_closed_pnl / (avg_size * total_trades) if avg_size * total_trades > 0 else 0,
         }
 
+    def _fast_prescreen(self, address: str) -> bool:
+        """
+        Fast pre-screen using only 1 API call (get_user_state).
+        Returns True if the trader passes and should go to deep analysis.
+        Returns False to skip (saves expensive fills API call).
+        """
+        try:
+            state = hl.get_user_state(address)
+            if not state:
+                return False
+
+            account_value = state.get("account_value", 0)
+            positions = state.get("positions", [])
+            active = [p for p in positions if p["size"] > 0]
+
+            # Reject: tiny accounts (< $100 value)
+            if account_value < 100:
+                return False
+
+            # Reject: too many simultaneous positions (likely portfolio bot)
+            if len(active) > 15:
+                return False
+
+            # Reject: no activity at all
+            if account_value < 500 and len(active) == 0:
+                return False
+
+            return True
+
+        except Exception as e:
+            logger.debug(f"Pre-screen error for {address[:10]}: {e}")
+            return False
+
     def _is_bot_account(self, fills: List[Dict], positions: List[Dict],
                          trade_analysis: Dict) -> bool:
         """
@@ -465,6 +498,7 @@ class TraderDiscovery:
         - Extremely tight bid-ask spread captures
         - All trades on same side pattern (delta-neutral bot)
         - High liquidation count (reckless bots)
+        - Spread bot: high trade count with near-zero median PnL
         """
         if not fills:
             return False
@@ -476,27 +510,29 @@ class TraderDiscovery:
         liquidations = trade_analysis.get("liquidations", 0)
         active_positions = [p for p in positions if p["size"] > 0]
 
+        bot_signals = 0  # Count signals; 2+ = bot
+
         # Signal 1: Extreme frequency — >200 trades in 7 days of data = scalp bot
         if total > 1400:  # 200/day * 7 days
-            logger.info(f"Bot detected: {total} trades in window (likely bot)")
-            return True
+            logger.info(f"Bot signal: {total} trades in window (likely bot)")
+            bot_signals += 2  # Strong signal, instant flag
 
         # Signal 2: Very small avg trade size with huge count = market maker
         if total > 100 and avg_size < 50:  # $50 avg with 100+ trades
-            logger.info(f"Bot detected: tiny trades ({avg_size:.0f} avg) with {total} count")
-            return True
+            logger.info(f"Bot signal: tiny trades ({avg_size:.0f} avg) with {total} count")
+            bot_signals += 2
 
         # Signal 3: Near-zero PnL per trade with high volume = arb bot
-        if total > 50 and abs(pnl) < total * 0.5:  # less than $0.50 per trade
+        if total > 50 and abs(pnl) < total * 0.5:
             pnl_per_trade = abs(pnl) / total if total else 0
             if pnl_per_trade < 0.5 and avg_size > 1000:
-                logger.info(f"Bot detected: arb pattern (${pnl_per_trade:.2f}/trade, ${avg_size:.0f} avg)")
-                return True
+                logger.info(f"Bot signal: arb pattern (${pnl_per_trade:.2f}/trade, ${avg_size:.0f} avg)")
+                bot_signals += 1
 
         # Signal 4: Too many simultaneous positions = portfolio bot
         if len(active_positions) > 15:
-            logger.info(f"Bot detected: {len(active_positions)} simultaneous positions")
-            return True
+            logger.info(f"Bot signal: {len(active_positions)} simultaneous positions")
+            bot_signals += 1
 
         # Signal 5: Uniform trade sizes (low variance = bot)
         if len(fills) > 20:
@@ -507,60 +543,129 @@ class TraderDiscovery:
                 std_size = np.std(sizes)
                 cv = std_size / mean_size if mean_size > 0 else 0
                 if cv < 0.05:  # coefficient of variation < 5% = robotic
-                    logger.info(f"Bot detected: uniform trade sizes (CV={cv:.3f})")
-                    return True
+                    logger.info(f"Bot signal: uniform trade sizes (CV={cv:.3f})")
+                    bot_signals += 1
 
         # Signal 6: High liquidation rate = reckless bot
         if total > 10 and liquidations / total > 0.15:
-            logger.info(f"Bot detected: high liquidation rate ({liquidations}/{total})")
-            return True
+            logger.info(f"Bot signal: high liquidation rate ({liquidations}/{total})")
+            bot_signals += 1
 
-        return False
+        # Signal 7: Spread bot — high trade count with near-zero median PnL
+        if total > 200:
+            closed_pnls = sorted([f["closed_pnl"] for f in fills if f["closed_pnl"] != 0])
+            if closed_pnls:
+                median_pnl = closed_pnls[len(closed_pnls) // 2]
+                if abs(median_pnl) < 1.0:  # Median PnL < $1 = spread bot
+                    logger.info(f"Bot signal: spread bot (median PnL=${median_pnl:.2f}, {total} trades)")
+                    bot_signals += 1
+
+        is_bot = bot_signals >= 2
+        if is_bot:
+            logger.info(f"Bot detected ({bot_signals} signals): {fills[0].get('user', 'unknown')[:10] if fills else 'unknown'}...")
+        return is_bot
 
     def run_discovery_cycle(self) -> Dict:
         """
-        Run a full discovery and analysis cycle.
-        Returns summary of what was found.
+        Run a full discovery and analysis cycle with TWO-PHASE screening.
+
+        Phase 1 (Fast): Pre-screen up to 1000 traders with 1 API call each.
+                         Reject tiny accounts, bots with 15+ positions, inactive wallets.
+        Phase 2 (Deep): Full analysis (fills + bot detection) only on candidates
+                         that pass pre-screen. Mark detected bots as inactive in DB.
         """
-        logger.info("Starting trader discovery cycle...")
+        logger.info("=" * 60)
+        logger.info("Starting TWO-PHASE trader discovery cycle...")
+        logger.info("=" * 60)
 
-        # Step 1: Discover traders
+        # Step 1: Discover candidate addresses (leaderboard + seeds + whales)
         discovered = self.discover_top_traders()
+        total_candidates = len(discovered)
+        logger.info(f"Total candidate addresses: {total_candidates}")
 
-        # Step 2: Analyze each trader
+        # ─── Phase 1: Fast Pre-Screen ────────────────────────────────
+        logger.info(f"PHASE 1: Fast pre-screening {total_candidates} traders (1 API call each)...")
+        passed_prescreen = []
+        skipped_prescreen = 0
+        already_known_active = 0
+
+        for i, trader in enumerate(discovered):
+            addr = trader["address"]
+
+            # Progress logging every 100 traders
+            if (i + 1) % 100 == 0:
+                logger.info(f"  Pre-screen progress: {i+1}/{total_candidates} "
+                           f"(passed: {len(passed_prescreen)}, skipped: {skipped_prescreen})")
+
+            # Skip traders already known and recently analyzed (within 6 hours)
+            existing = self.known_traders.get(addr)
+            if existing and existing.get("trade_count", 0) > 0:
+                # Already tracked and analyzed — include without re-screening
+                passed_prescreen.append(trader)
+                already_known_active += 1
+                continue
+
+            # Fast pre-screen: 1 API call
+            if self._fast_prescreen(addr):
+                passed_prescreen.append(trader)
+            else:
+                skipped_prescreen += 1
+
+            time.sleep(0.35)  # Rate limiting
+
+        logger.info(f"PHASE 1 complete: {len(passed_prescreen)} passed, "
+                    f"{skipped_prescreen} rejected, {already_known_active} already tracked")
+
+        # ─── Phase 2: Deep Analysis ──────────────────────────────────
+        logger.info(f"PHASE 2: Deep analyzing {len(passed_prescreen)} traders (fills + bot detection)...")
         profiles = []
-        for trader in discovered:
+        bots_detected = 0
+
+        for i, trader in enumerate(passed_prescreen):
+            addr = trader["address"]
+
+            # Progress logging every 50 traders
+            if (i + 1) % 50 == 0:
+                logger.info(f"  Deep analysis progress: {i+1}/{len(passed_prescreen)} "
+                           f"(valid: {len(profiles)}, bots: {bots_detected})")
+
             try:
-                profile = self.analyze_trader(trader["address"])
+                profile = self.analyze_trader(addr)
                 if profile:
                     profiles.append(profile)
-                    self.known_traders[trader["address"]] = trader
+                    self.known_traders[addr] = trader
+                else:
+                    # analyze_trader returns None if bot detected or no data
+                    bots_detected += 1
+                    # Mark bot as inactive so we don't re-scan next cycle
+                    db.upsert_trader(
+                        address=addr,
+                        total_pnl=0, roi_pct=0, account_value=0,
+                        win_rate=0, trade_count=0,
+                        metadata={"status": "bot_detected", "detected_at": datetime.utcnow().isoformat()},
+                        is_active=False,
+                    )
             except Exception as e:
-                logger.error(f"Error analyzing trader {trader['address'][:10]}: {e}")
-            time.sleep(1.0)  # Be gentle with the API to avoid 429s
+                logger.error(f"Error analyzing trader {addr[:10]}: {e}")
 
-        # Step 3: Also re-analyze existing tracked traders
-        for addr in list(self.known_traders.keys()):
-            if addr not in {t["address"] for t in discovered}:
-                try:
-                    profile = self.analyze_trader(addr)
-                    if profile:
-                        profiles.append(profile)
-                except Exception as e:
-                    logger.debug(f"Error re-analyzing {addr[:10]}: {e}")
-                time.sleep(0.5)
+            time.sleep(0.5)  # Slightly slower for deep analysis (2 API calls)
 
+        logger.info(f"PHASE 2 complete: {len(profiles)} real traders, {bots_detected} bots excluded")
+
+        # ─── Summary ─────────────────────────────────────────────────
         summary = {
-            "traders_discovered": len(discovered),
+            "traders_discovered": total_candidates,
+            "traders_prescreened": len(passed_prescreen),
             "traders_analyzed": len(profiles),
+            "bots_detected": bots_detected,
             "total_tracked": len(self.known_traders),
             "timestamp": datetime.utcnow().isoformat(),
         }
 
-        # Log the research cycle
         db.log_research_cycle(
             cycle_type="discovery",
-            summary=f"Discovered {len(discovered)} traders, analyzed {len(profiles)}",
+            summary=(f"Scanned {total_candidates} → pre-screened {len(passed_prescreen)} "
+                    f"→ {len(profiles)} real traders ({bots_detected} bots excluded)"),
             details=summary,
             traders_analyzed=len(profiles),
         )

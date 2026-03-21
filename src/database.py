@@ -149,14 +149,15 @@ def init_db():
 # ─── Trader CRUD ───────────────────────────────────────────────
 
 def upsert_trader(address, total_pnl=0, roi_pct=0, account_value=0,
-                  win_rate=0, trade_count=0, metadata=None):
+                  win_rate=0, trade_count=0, metadata=None, is_active=True):
     now = datetime.utcnow().isoformat()
     meta_json = json.dumps(metadata or {})
+    active_int = 1 if is_active else 0
     with get_connection() as conn:
         conn.execute("""
             INSERT INTO traders (address, first_seen, last_updated, total_pnl,
-                                 roi_pct, account_value, win_rate, trade_count, metadata)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                 roi_pct, account_value, win_rate, trade_count, metadata, active)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(address) DO UPDATE SET
                 last_updated = ?,
                 total_pnl = ?,
@@ -164,10 +165,18 @@ def upsert_trader(address, total_pnl=0, roi_pct=0, account_value=0,
                 account_value = ?,
                 win_rate = ?,
                 trade_count = ?,
-                metadata = ?
+                metadata = ?,
+                active = ?
         """, (address, now, now, total_pnl, roi_pct, account_value,
-              win_rate, trade_count, meta_json,
-              now, total_pnl, roi_pct, account_value, win_rate, trade_count, meta_json))
+              win_rate, trade_count, meta_json, active_int,
+              now, total_pnl, roi_pct, account_value, win_rate, trade_count, meta_json, active_int))
+
+
+def mark_trader_inactive(address):
+    """Mark a trader as inactive (e.g. detected as bot)."""
+    with get_connection() as conn:
+        conn.execute("UPDATE traders SET active = 0, last_updated = ? WHERE address = ?",
+                     (datetime.utcnow().isoformat(), address))
 
 
 def get_active_traders():
