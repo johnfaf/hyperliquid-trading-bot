@@ -197,7 +197,13 @@ class CopyTrader:
         leverage = signal.get("leverage", 2)
         side = signal["side"]
 
-        # Check basic risk: max 5 copy trades per coin
+        # CRITICAL: No conflicting sides on same asset
+        for t in open_trades:
+            if t.get("coin") == signal["coin"] and t.get("side") != side:
+                logger.debug(f"Copy skip: conflicting side for {signal['coin']}")
+                return None
+
+        # Check basic risk: max 5 copy trades per coin (same direction only)
         coin_copies = sum(1 for t in open_trades if t.get("coin") == signal["coin"])
         if coin_copies >= 5:
             return None

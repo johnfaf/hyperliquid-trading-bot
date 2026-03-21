@@ -61,10 +61,11 @@ class PaperTrader:
             "roi_pct": round(((total_equity / config.PAPER_TRADING_INITIAL_BALANCE) - 1) * 100, 2),
         }
 
-    def execute_strategy_signals(self, strategies: List[Dict]) -> List[Dict]:
+    def execute_strategy_signals(self, strategies: List[Dict], exchange_agg=None) -> List[Dict]:
         """
         Generate and execute paper trades based on top strategies.
         Only trades strategies with score above threshold.
+        If exchange_agg is provided, checks multi-exchange volume confirmation.
         """
         account = db.get_paper_account()
         if not account:
@@ -87,6 +88,21 @@ class PaperTrader:
                 signal = self._generate_signal(strategy, mids)
                 if not signal:
                     continue
+
+                # Multi-exchange volume confirmation (if available)
+                if exchange_agg:
+                    try:
+                        confirmed, vol_confidence = exchange_agg.get_volume_confirmation(
+                            signal["coin"], signal["side"]
+                        )
+                        if not confirmed:
+                            logger.info(f"Volume rejects {signal['side']} {signal['coin']} "
+                                       f"(confidence={vol_confidence:.2f})")
+                            continue
+                        # Boost or reduce confidence based on volume
+                        signal["confidence"] = signal.get("confidence", 0.5) * (0.5 + vol_confidence * 0.5)
+                    except Exception:
+                        pass  # Don't block trades if aggregator fails
 
                 # Risk management checks
                 if not self._check_risk_limits(account, signal, open_trades):
@@ -217,12 +233,19 @@ class PaperTrader:
 
     def _check_risk_limits(self, account: Dict, signal: Dict, open_trades: List) -> bool:
         """Check if a new trade passes risk management rules."""
+        # CRITICAL: No conflicting sides on same asset (no long+short on same coin)
+        for t in open_trades:
+            if t["coin"] == signal["coin"] and t.get("side") != signal["side"]:
+                logger.info(f"Risk: conflicting side for {signal['coin']} "
+                           f"(have {t.get('side')}, want {signal['side']})")
+                return False
+
         # Max position count — allow up to 20 simultaneous positions
         if len(open_trades) >= 20:
             logger.info(f"Risk: max positions ({len(open_trades)}/20)")
             return False
 
-        # Max positions per coin — allow up to 3 per coin (different strategies)
+        # Max positions per coin — allow up to 3 per coin (same direction only)
         coin_positions = sum(1 for t in open_trades if t["coin"] == signal["coin"])
         if coin_positions >= 3:
             logger.info(f"Risk: max positions for {signal['coin']} ({coin_positions}/3)")

@@ -291,6 +291,11 @@ class TraderDiscovery:
                     margin_used=pos["margin_used"],
                 )
 
+        # Filter out bot/market-maker accounts
+        if self._is_bot_account(fills, positions, trade_analysis):
+            logger.info(f"Skipping bot account: {address[:10]}...")
+            return None
+
         # Build trader profile
         profile = {
             "address": address,
@@ -445,6 +450,72 @@ class TraderDiscovery:
             "liquidations": liquidations,
             "avg_roi": total_closed_pnl / (avg_size * total_trades) if avg_size * total_trades > 0 else 0,
         }
+
+    def _is_bot_account(self, fills: List[Dict], positions: List[Dict],
+                         trade_analysis: Dict) -> bool:
+        """
+        Detect if an account is likely a bot / market-maker / automated system.
+        We want to focus on real human traders whose strategies are reproducible.
+
+        Bot signals:
+        - Extremely high trade frequency (>200 trades/day)
+        - Very small, uniform trade sizes (market making)
+        - Near-zero PnL per trade with huge volume (arb bots)
+        - Many simultaneous positions across many coins (>15 active)
+        - Extremely tight bid-ask spread captures
+        - All trades on same side pattern (delta-neutral bot)
+        - High liquidation count (reckless bots)
+        """
+        if not fills:
+            return False
+
+        freq = trade_analysis.get("trading_frequency", "")
+        total = trade_analysis.get("total_trades", 0)
+        avg_size = trade_analysis.get("avg_trade_size", 0)
+        pnl = trade_analysis.get("total_closed_pnl", 0)
+        liquidations = trade_analysis.get("liquidations", 0)
+        active_positions = [p for p in positions if p["size"] > 0]
+
+        # Signal 1: Extreme frequency — >200 trades in 7 days of data = scalp bot
+        if total > 1400:  # 200/day * 7 days
+            logger.info(f"Bot detected: {total} trades in window (likely bot)")
+            return True
+
+        # Signal 2: Very small avg trade size with huge count = market maker
+        if total > 100 and avg_size < 50:  # $50 avg with 100+ trades
+            logger.info(f"Bot detected: tiny trades ({avg_size:.0f} avg) with {total} count")
+            return True
+
+        # Signal 3: Near-zero PnL per trade with high volume = arb bot
+        if total > 50 and abs(pnl) < total * 0.5:  # less than $0.50 per trade
+            pnl_per_trade = abs(pnl) / total if total else 0
+            if pnl_per_trade < 0.5 and avg_size > 1000:
+                logger.info(f"Bot detected: arb pattern (${pnl_per_trade:.2f}/trade, ${avg_size:.0f} avg)")
+                return True
+
+        # Signal 4: Too many simultaneous positions = portfolio bot
+        if len(active_positions) > 15:
+            logger.info(f"Bot detected: {len(active_positions)} simultaneous positions")
+            return True
+
+        # Signal 5: Uniform trade sizes (low variance = bot)
+        if len(fills) > 20:
+            sizes = [f["size"] * f["price"] for f in fills[:50]]
+            if sizes:
+                import numpy as np
+                mean_size = np.mean(sizes)
+                std_size = np.std(sizes)
+                cv = std_size / mean_size if mean_size > 0 else 0
+                if cv < 0.05:  # coefficient of variation < 5% = robotic
+                    logger.info(f"Bot detected: uniform trade sizes (CV={cv:.3f})")
+                    return True
+
+        # Signal 6: High liquidation rate = reckless bot
+        if total > 10 and liquidations / total > 0.15:
+            logger.info(f"Bot detected: high liquidation rate ({liquidations}/{total})")
+            return True
+
+        return False
 
     def run_discovery_cycle(self) -> Dict:
         """

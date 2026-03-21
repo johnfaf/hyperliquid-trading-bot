@@ -29,6 +29,8 @@ from src.paper_trader import PaperTrader
 from src.copy_trader import CopyTrader
 from src.reporter import Reporter
 from src.dashboard import start_dashboard
+from src.exchange_aggregator import ExchangeAggregator
+from src import telegram_bot as tg
 
 # ─── Logging Setup ─────────────────────────────────────────────
 
@@ -93,6 +95,7 @@ class HyperliquidResearchBot:
         self.scorer = StrategyScorer()
         self.paper_trader = PaperTrader()
         self.copy_trader = CopyTrader()
+        self.exchange_agg = ExchangeAggregator()
         self.reporter = Reporter()
 
         # Start the web dashboard
@@ -103,6 +106,13 @@ class HyperliquidResearchBot:
             self.logger.warning(f"Dashboard failed to start: {e}")
 
         self.logger.info("Bot initialized successfully.")
+
+        # Send Telegram startup notification
+        if tg.is_configured():
+            tg.send_startup_message()
+            self.logger.info("Telegram notifications enabled.")
+        else:
+            self.logger.info("Telegram not configured — set TELEGRAM_BOT_TOKEN & TELEGRAM_CHAT_ID to enable.")
 
     def run_once(self):
         """Run a single complete research + trading cycle."""
@@ -155,6 +165,22 @@ class HyperliquidResearchBot:
             score_results = self.scorer.score_all_strategies()
             self.logger.info(f"  Scored {len(score_results)} strategies")
 
+            # Phase 3b: Multi-exchange market overview
+            self.logger.info("Phase 3b: Multi-Exchange Volume Analysis")
+            try:
+                market_overview = self.exchange_agg.get_market_overview()
+                self.logger.info(f"  Market bias: {market_overview.get('overall_bias', '?')} "
+                               f"(score: {market_overview.get('overall_bias_score', 0):+.4f})")
+                self.logger.info(f"  Bullish: {market_overview.get('bullish_coins', [])}")
+                self.logger.info(f"  Bearish: {market_overview.get('bearish_coins', [])}")
+
+                # Telegram: notify if strong market bias
+                if tg.is_configured():
+                    tg.notify_market_bias(market_overview)
+            except Exception as e:
+                self.logger.warning(f"  Exchange aggregator error: {e}")
+                market_overview = {}
+
             # Phase 4: Paper trade top strategies (increased from 5 to 15)
             self.logger.info("Phase 4: Paper Trading")
             top_strategies = self.scorer.get_top_strategies(n=15)
@@ -163,11 +189,21 @@ class HyperliquidResearchBot:
             closed = self.paper_trader.check_open_positions()
             if closed:
                 self.logger.info(f"  Closed {len(closed)} positions")
+                # Telegram: notify closed trades
+                if tg.is_configured():
+                    for c in closed:
+                        tg.notify_trade_closed(c, c.get("exit_price", 0), c.get("pnl", 0), c.get("reason", ""))
 
-            # Execute new signals from strategies
+            # Execute new signals from strategies (with volume confirmation)
             if top_strategies:
-                executed = self.paper_trader.execute_strategy_signals(top_strategies)
+                executed = self.paper_trader.execute_strategy_signals(
+                    top_strategies, exchange_agg=self.exchange_agg
+                )
                 self.logger.info(f"  Executed {len(executed)} new paper trades")
+                # Telegram: notify new trades
+                if tg.is_configured():
+                    for t in executed:
+                        tg.notify_trade_opened(t, source="strategy")
 
             # Phase 4b: Copy trading - mirror top trader positions
             self.logger.info("Phase 4b: Copy Trading")
@@ -175,11 +211,20 @@ class HyperliquidResearchBot:
             if copy_signals:
                 copy_executed = self.copy_trader.execute_copy_signals(copy_signals)
                 self.logger.info(f"  Executed {len(copy_executed)} copy trades")
+                if tg.is_configured():
+                    for t in copy_executed:
+                        tg.notify_trade_opened(t, source="copy")
 
             # Phase 5: Report
             self.logger.info("Phase 5: Status Update")
             status = self.reporter.print_live_status()
             print(status)
+
+            # Telegram: send cycle summary
+            if tg.is_configured():
+                summary = self.paper_trader.get_account_summary()
+                summary["market_bias"] = market_overview.get("overall_bias", "unknown")
+                tg.notify_cycle_summary(summary)
 
             # Generate improvement report
             improvement = self.scorer.generate_improvement_report()
