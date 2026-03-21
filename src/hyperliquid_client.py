@@ -13,13 +13,18 @@ import config
 
 logger = logging.getLogger(__name__)
 
-# Rate limiting
+# Rate limiting — adaptive to avoid 429s
 _last_request_time = 0
-_MIN_REQUEST_INTERVAL = 0.2  # 200ms between requests
+_MIN_REQUEST_INTERVAL = 0.35  # 350ms between requests (safe for HL rate limits)
+_backoff_until = 0  # timestamp until which we should back off
 
 
 def _rate_limit():
-    global _last_request_time
+    global _last_request_time, _backoff_until
+    now = time.time()
+    # If we're in a backoff period, wait it out
+    if now < _backoff_until:
+        time.sleep(_backoff_until - now)
     elapsed = time.time() - _last_request_time
     if elapsed < _MIN_REQUEST_INTERVAL:
         time.sleep(_MIN_REQUEST_INTERVAL - elapsed)
@@ -27,7 +32,8 @@ def _rate_limit():
 
 
 def _post(payload: dict, retries: int = 3) -> Optional[dict]:
-    """POST to the Hyperliquid info endpoint with retries."""
+    """POST to the Hyperliquid info endpoint with retries and 429 backoff."""
+    global _backoff_until
     _rate_limit()
     for attempt in range(retries):
         try:
@@ -37,6 +43,13 @@ def _post(payload: dict, retries: int = 3) -> Optional[dict]:
                 headers={"Content-Type": "application/json"},
                 timeout=30
             )
+            if resp.status_code == 429:
+                # Back off for longer on rate limit
+                wait = min(2 ** (attempt + 2), 30)
+                logger.warning(f"Rate limited (429), backing off {wait}s")
+                _backoff_until = time.time() + wait
+                time.sleep(wait)
+                continue
             resp.raise_for_status()
             return resp.json()
         except requests.exceptions.RequestException as e:

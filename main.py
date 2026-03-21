@@ -27,6 +27,7 @@ from src.strategy_identifier import StrategyIdentifier
 from src.strategy_scorer import StrategyScorer
 from src.paper_trader import PaperTrader
 from src.reporter import Reporter
+from src.dashboard import start_dashboard
 
 # ─── Logging Setup ─────────────────────────────────────────────
 
@@ -85,6 +86,14 @@ class HyperliquidResearchBot:
         self.scorer = StrategyScorer()
         self.paper_trader = PaperTrader()
         self.reporter = Reporter()
+
+        # Start the web dashboard
+        try:
+            self.dashboard = start_dashboard()
+            self.logger.info("Web dashboard started.")
+        except Exception as e:
+            self.logger.warning(f"Dashboard failed to start: {e}")
+
         self.logger.info("Bot initialized successfully.")
 
     def run_once(self):

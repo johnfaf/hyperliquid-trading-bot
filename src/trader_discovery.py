@@ -494,7 +494,7 @@ class TraderDiscovery:
                     self.known_traders[trader["address"]] = trader
             except Exception as e:
                 logger.error(f"Error analyzing trader {trader['address'][:10]}: {e}")
-            time.sleep(0.5)  # Be gentle with the API
+            time.sleep(1.0)  # Be gentle with the API to avoid 429s
 
         # Step 3: Also re-analyze existing tracked traders
         for addr in list(self.known_traders.keys()):
