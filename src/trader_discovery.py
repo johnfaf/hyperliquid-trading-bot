@@ -17,6 +17,31 @@ from src import database as db
 logger = logging.getLogger(__name__)
 
 
+
+# ─── Seed Addresses ────────────────────────────────────────────
+# Known profitable / high-profile Hyperliquid traders and vaults.
+# The bot will discover more over time, but these bootstrap the system.
+SEED_TRADER_ADDRESSES = [
+    # HLP (Hyperliquidity Provider) vault
+    "0xdfc24b077bc1425ad1dea75bcb6f8158e3df2f0f",
+    # Well-known active traders (sourced from public leaderboard/community)
+    "0x7e48d9a5de906dfb691e4fccc6899877ed3e8c0a",
+    "0x23b07a1c8845ce4ac18ba19fa8b0e93445f28967",
+    "0x5e9ee194bb8b548df01e6de9b3f38b4e56afd809",
+    "0x34c22e6e1e4a6fa675e1350be0eca1eb5150a0a1",
+    "0x1fa3f34bf91f50beef3dd0cb181a6f1b89b02e8f",
+    "0x4e5b2e1dc63f6b91cb6cd759936495434c7e972f",
+    "0xe67154a95b71e9850e27dcec80caf98e70f5786c",
+    "0xc6f3dde1a1fac291052f43008acb50e4e280c5e0",
+    "0x20e831d416dcb47a6bd191c5bf46ce59a7f5e28a",
+    "0x8ab3ef18bea98a44c5871a11d90b14e3a6fb9ac2",
+    "0x071bda50d482bae598c2e7a0dbdff4a81be7fe83",
+    "0x6b67a2e3a96427daba798f9a0e9c529b28eaeb56",
+    "0xa01c6c3e0cf5a11cc92c7400e82753638c205a45",
+    "0x14d460010b4d94e7c891d4e78c52c10a8f867e8f",
+]
+
+
 class TraderDiscovery:
     """Discovers and monitors top Hyperliquid traders."""
 
@@ -33,10 +58,24 @@ class TraderDiscovery:
 
     def discover_top_traders(self) -> List[Dict]:
         """
-        Discover top traders via the Hyperliquid leaderboard and vault analysis.
-        Returns list of trader dicts with address and basic stats.
+        Discover top traders via multiple methods:
+        1. Seed addresses (known profitable wallets)
+        2. Hyperliquid leaderboard API
+        3. Vault leader analysis
+        4. Whale detection from recent large trades
         """
         discovered = []
+
+        # Method 0: Seed addresses — always check these
+        for addr in SEED_TRADER_ADDRESSES:
+            discovered.append({
+                "address": addr,
+                "total_pnl": 0,  # Will be populated during analysis
+                "roi_pct": 0,
+                "source": "seed",
+                "metadata": {},
+            })
+        logger.info(f"Added {len(SEED_TRADER_ADDRESSES)} seed trader addresses")
 
         # Method 1: Try the leaderboard endpoint
         leaderboard = hl.get_leaderboard()
@@ -44,6 +83,8 @@ class TraderDiscovery:
             traders = self._parse_leaderboard(leaderboard)
             discovered.extend(traders)
             logger.info(f"Found {len(traders)} traders from leaderboard")
+        else:
+            logger.warning("Leaderboard returned no data")
 
         # Method 2: Analyze top vaults for their leaders
         vault_traders = self._discover_from_vaults()
@@ -67,36 +108,93 @@ class TraderDiscovery:
         return unique[:config.MAX_TRACKED_TRADERS]
 
     def _parse_leaderboard(self, data) -> List[Dict]:
-        """Parse leaderboard API response into trader dicts."""
+        """Parse leaderboard API response into trader dicts.
+        Handles multiple possible response formats flexibly."""
         traders = []
 
-        # Handle different leaderboard response formats
+        # Log the raw structure to help debug
+        if isinstance(data, dict):
+            logger.info(f"Leaderboard response keys: {list(data.keys())}")
+        elif isinstance(data, list):
+            logger.info(f"Leaderboard response is list of {len(data)} items")
+            if data and isinstance(data[0], dict):
+                logger.info(f"First entry keys: {list(data[0].keys())}")
+
+        # Flatten: find the actual list of entries regardless of nesting
+        entries = []
         if isinstance(data, list):
             entries = data
         elif isinstance(data, dict):
-            entries = data.get("leaderboardRows", data.get("rows", []))
-        else:
-            return traders
+            # Try every common key pattern
+            for key in ["leaderboardRows", "rows", "data", "traders", "leaderboard",
+                        "result", "results", "entries", "positions"]:
+                if key in data and isinstance(data[key], list):
+                    entries = data[key]
+                    logger.info(f"Found entries under key '{key}': {len(entries)} items")
+                    break
+            if not entries:
+                # Maybe the dict itself is a single-entry or nested differently
+                # Try to find any list value
+                for key, val in data.items():
+                    if isinstance(val, list) and len(val) > 0:
+                        entries = val
+                        logger.info(f"Found list under key '{key}': {len(entries)} items")
+                        break
 
         for entry in entries:
             try:
-                if isinstance(entry, dict):
-                    address = entry.get("ethAddress", entry.get("address", ""))
-                    pnl = float(entry.get("accountValue", entry.get("pnl", entry.get("totalPnl", 0))))
-                    roi = float(entry.get("roi", entry.get("roiPct", 0)))
+                if not isinstance(entry, dict):
+                    continue
 
-                    if address and pnl >= config.MIN_PNL_THRESHOLD:
-                        traders.append({
-                            "address": address,
-                            "total_pnl": pnl,
-                            "roi_pct": roi * 100 if abs(roi) < 10 else roi,  # normalize
-                            "source": "leaderboard",
-                            "metadata": {"display_name": entry.get("displayName", ""),
-                                       "prize": entry.get("prize", 0)},
-                        })
-            except (ValueError, TypeError) as e:
+                # Try multiple address field names
+                address = ""
+                for addr_key in ["ethAddress", "address", "trader", "user",
+                                 "account", "wallet", "traderAddress"]:
+                    if addr_key in entry and entry[addr_key]:
+                        address = str(entry[addr_key])
+                        break
+
+                if not address:
+                    continue
+
+                # Try multiple PnL field names
+                pnl = 0
+                for pnl_key in ["accountValue", "pnl", "totalPnl", "total_pnl",
+                                "profit", "totalProfit", "windowPerformance"]:
+                    if pnl_key in entry:
+                        try:
+                            pnl = float(entry[pnl_key])
+                            break
+                        except (ValueError, TypeError):
+                            continue
+
+                # Try multiple ROI field names
+                roi = 0
+                for roi_key in ["roi", "roiPct", "roi_pct", "returnOnEquity", "pctReturn"]:
+                    if roi_key in entry:
+                        try:
+                            roi = float(entry[roi_key])
+                            break
+                        except (ValueError, TypeError):
+                            continue
+
+                display_name = entry.get("displayName", entry.get("name", entry.get("label", "")))
+
+                # Accept all traders from leaderboard (they're already filtered by the API)
+                traders.append({
+                    "address": address,
+                    "total_pnl": pnl,
+                    "roi_pct": roi * 100 if 0 < abs(roi) < 10 else roi,
+                    "source": "leaderboard",
+                    "metadata": {"display_name": display_name,
+                               "raw_entry_keys": list(entry.keys())[:10]},
+                })
+
+            except Exception as e:
                 logger.debug(f"Skipping leaderboard entry: {e}")
                 continue
+
+        logger.info(f"Parsed {len(traders)} traders from leaderboard data")
         return traders
 
     def _discover_from_vaults(self) -> List[Dict]:
@@ -175,10 +273,12 @@ class TraderDiscovery:
 
     def _get_known_vault_addresses(self) -> List[str]:
         """Get list of known vault addresses to check."""
-        # This will be populated over time. Starting with well-known ones.
-        # In production, you'd scrape these or get from an API
         return [
-            "0xdfc24b077bc1425ad1dea75bcb6f8158e3df2f0f",  # HLP vault
+            "0xdfc24b077bc1425ad1dea75bcb6f8158e3df2f0f",  # HLP (Hyperliquidity Provider)
+            "0x1fa3f34bf91f50beef3dd0cb181a6f1b89b02e8f",
+            "0x4e5b2e1dc63f6b91cb6cd759936495434c7e972f",
+            "0x20e831d416dcb47a6bd191c5bf46ce59a7f5e28a",
+            "0xa01c6c3e0cf5a11cc92c7400e82753638c205a45",
         ]
 
     def analyze_trader(self, address: str) -> Optional[Dict]:

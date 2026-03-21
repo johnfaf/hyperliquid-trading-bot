@@ -16,7 +16,8 @@ DB_PATH = os.environ.get("HL_BOT_DB", _DEFAULT_DB)
 
 # ─── Trader Discovery ─────────────────────────────────────────
 # Minimum PnL (USD) to consider a trader "top"
-MIN_PNL_THRESHOLD = 10_000
+# Set low initially so seed addresses get picked up; raise once the bot is mature
+MIN_PNL_THRESHOLD = 0
 # Maximum number of top traders to track at any time
 MAX_TRACKED_TRADERS = 50
 # How often to refresh the leaderboard (seconds)

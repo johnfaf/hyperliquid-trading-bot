@@ -169,34 +169,39 @@ def get_user_non_funding_ledger(address: str, start_time: Optional[int] = None):
 
 def get_leaderboard():
     """
-    Fetch the Hyperliquid leaderboard.
-    Returns list of top trader entries with PnL and performance data.
-    Note: This uses the undocumented leaderboard endpoint that the web UI uses.
+    Fetch the Hyperliquid leaderboard from multiple sources.
+    Returns raw data from whichever source responds.
     """
-    # The leaderboard is served from a separate endpoint
+    # Method 1: Official info endpoint with "leaderboard" type
+    try:
+        data = _post({"type": "leaderboard"})
+        if data:
+            logger.info(f"Leaderboard from info endpoint: type={type(data).__name__}, "
+                       f"keys={list(data.keys()) if isinstance(data, dict) else f'list[{len(data)}]'}")
+            return data
+    except Exception as e:
+        logger.warning(f"Info leaderboard failed: {e}")
+
+    # Method 2: Stats data endpoint (used by the frontend)
     try:
         _rate_limit()
-        # Hyperliquid's leaderboard API (used by the frontend)
-        resp = requests.post(
-            config.HYPERLIQUID_INFO_URL,
-            json={"type": "leaderboard"},
-            headers={"Content-Type": "application/json"},
+        resp = requests.get(
+            "https://stats-data.hyperliquid.xyz/Mainnet/leaderboard",
             timeout=30
         )
         if resp.status_code == 200:
-            return resp.json()
-    except Exception as e:
-        logger.warning(f"Leaderboard endpoint failed: {e}")
-
-    # Fallback: try the clearinghouseLeaderboard type
-    try:
-        data = _post({"type": "clearinghouseLeaderboard"})
-        if data:
+            data = resp.json()
+            logger.info(f"Leaderboard from stats endpoint: type={type(data).__name__}")
             return data
     except Exception as e:
-        logger.warning(f"Clearinghouse leaderboard failed: {e}")
+        logger.warning(f"Stats leaderboard failed: {e}")
 
     return None
+
+
+def get_user_portfolio(address: str):
+    """Get historical portfolio/PnL data for a user."""
+    return _post({"type": "portfolio", "user": address})
 
 
 def get_vault_details(vault_address: str):
