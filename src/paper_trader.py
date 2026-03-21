@@ -202,31 +202,40 @@ class PaperTrader:
 
     def _check_risk_limits(self, account: Dict, signal: Dict, open_trades: List) -> bool:
         """Check if a new trade passes risk management rules."""
-        # Max position count
-        if len(open_trades) >= 10:
+        # Max position count — allow up to 20 simultaneous positions
+        if len(open_trades) >= 20:
+            logger.debug(f"Risk: max positions ({len(open_trades)}/20)")
             return False
 
-        # Max exposure per coin
+        # Max positions per coin — allow up to 3 per coin (different strategies)
+        coin_positions = sum(1 for t in open_trades if t["coin"] == signal["coin"])
+        if coin_positions >= 3:
+            logger.debug(f"Risk: max positions for {signal['coin']} ({coin_positions}/3)")
+            return False
+
+        # Max exposure per coin — 50% of balance
         coin_exposure = sum(
             t["size"] * t["entry_price"] * t["leverage"]
             for t in open_trades if t["coin"] == signal["coin"]
         )
-        max_coin_exposure = account["balance"] * 0.3  # 30% max per coin
+        max_coin_exposure = account["balance"] * 0.50
         new_exposure = signal["size"] * signal["price"] * signal["leverage"]
         if coin_exposure + new_exposure > max_coin_exposure:
+            logger.debug(f"Risk: coin exposure for {signal['coin']} ${coin_exposure+new_exposure:,.0f} > ${max_coin_exposure:,.0f}")
             return False
 
-        # Max total exposure
+        # Max total exposure — 500% of balance (leveraged)
         total_exposure = sum(
             t["size"] * t["entry_price"] * t["leverage"]
             for t in open_trades
         )
-        max_total_exposure = account["balance"] * 2.0  # 200% max total
+        max_total_exposure = account["balance"] * 5.0
         if total_exposure + new_exposure > max_total_exposure:
+            logger.debug(f"Risk: total exposure ${total_exposure+new_exposure:,.0f} > ${max_total_exposure:,.0f}")
             return False
 
         # Minimum balance remaining
-        if account["balance"] < config.PAPER_TRADING_INITIAL_BALANCE * 0.1:
+        if account["balance"] < config.PAPER_TRADING_INITIAL_BALANCE * 0.05:
             return False
 
         return True
