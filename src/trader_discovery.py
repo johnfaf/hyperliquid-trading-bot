@@ -291,12 +291,10 @@ class TraderDiscovery:
                     margin_used=pos["margin_used"],
                 )
 
-        # Filter out bot/market-maker accounts
-        if self._is_bot_account(fills, positions, trade_analysis):
-            logger.info(f"Skipping bot account: {address[:10]}...")
-            return None
+        # Compute bot score (0 = definitely human, higher = more bot-like)
+        bot_score = self._get_bot_score(fills, positions, trade_analysis)
 
-        # Build trader profile
+        # Build trader profile (always, even for suspected bots — let caller decide)
         profile = {
             "address": address,
             "account_value": state["account_value"],
@@ -306,6 +304,7 @@ class TraderDiscovery:
             "total_margin_used": state["total_margin_used"],
             "num_open_positions": len([p for p in positions if p["size"] > 0]),
             "analyzed_at": datetime.utcnow().isoformat(),
+            "bot_score": bot_score,
         }
 
         # Update trader in database
@@ -484,46 +483,70 @@ class TraderDiscovery:
             logger.debug(f"Pre-screen error for {address[:10]}: {e}")
             return False
 
-    def _is_bot_account(self, fills: List[Dict], positions: List[Dict],
-                         trade_analysis: Dict) -> bool:
+    def _compute_trades_per_day(self, fills: List[Dict]) -> float:
+        """
+        Compute actual trades-per-day from fill timestamps.
+        The Hyperliquid API caps at 2000 fills, so we can't use len(fills)
+        as the real trade count — we must look at the TIME SPAN instead.
+        """
+        if len(fills) < 2:
+            return 0.0
+        times = sorted([f["time"] for f in fills if f.get("time")])
+        if len(times) < 2:
+            return 0.0
+        span_ms = times[-1] - times[0]
+        span_days = max(span_ms / (1000 * 86400), 0.01)  # avoid div by zero
+        return len(fills) / span_days
+
+    def _get_bot_score(self, fills: List[Dict], positions: List[Dict],
+                       trade_analysis: Dict) -> int:
         """
         Detect if an account is likely a bot / market-maker / automated system.
         We want to focus on real human traders whose strategies are reproducible.
 
-        Bot signals:
-        - Extremely high trade frequency (>200 trades/day)
+        IMPORTANT: The Hyperliquid fills API caps at 2000 results, so raw
+        fill count is NOT reliable. We use trades_per_day (time-based) instead.
+
+        Returns an integer bot_score (0 = human, higher = more bot-like).
+        Score of 3+ is considered a bot, but caller can use the score
+        for ranking/fallback when too many get flagged.
+
+        Signals (each adds 1-2 points):
+        - Extremely high trade frequency (>300 trades/day by time span)
         - Very small, uniform trade sizes (market making)
         - Near-zero PnL per trade with huge volume (arb bots)
         - Many simultaneous positions across many coins (>15 active)
-        - Extremely tight bid-ask spread captures
-        - All trades on same side pattern (delta-neutral bot)
-        - High liquidation count (reckless bots)
-        - Spread bot: high trade count with near-zero median PnL
+        - Uniform trade sizes (low coefficient of variation)
+        - High liquidation rate
+        - Spread bot: high frequency + near-zero median PnL per trade
         """
         if not fills:
-            return False
+            return 0  # No data = can't determine, assume human
 
-        freq = trade_analysis.get("trading_frequency", "")
-        total = trade_analysis.get("total_trades", 0)
+        total = len(fills)
         avg_size = trade_analysis.get("avg_trade_size", 0)
         pnl = trade_analysis.get("total_closed_pnl", 0)
         liquidations = trade_analysis.get("liquidations", 0)
         active_positions = [p for p in positions if p["size"] > 0]
 
-        bot_signals = 0  # Count signals; 2+ = bot
+        # Compute REAL frequency from timestamps (not raw count)
+        trades_per_day = self._compute_trades_per_day(fills)
 
-        # Signal 1: Extreme frequency — >200 trades in 7 days of data = scalp bot
-        if total > 1400:  # 200/day * 7 days
-            logger.info(f"Bot signal: {total} trades in window (likely bot)")
-            bot_signals += 2  # Strong signal, instant flag
+        bot_signals = 0  # Count signals; 3+ = bot
 
-        # Signal 2: Very small avg trade size with huge count = market maker
-        if total > 100 and avg_size < 50:  # $50 avg with 100+ trades
-            logger.info(f"Bot signal: tiny trades ({avg_size:.0f} avg) with {total} count")
+        # Signal 1: Extreme frequency by TIME — >300 trades/day is almost certainly a bot
+        # (A very active human day-trader might do 50-100, but 300+ is automation)
+        if trades_per_day > 300:
+            logger.info(f"Bot signal: {trades_per_day:.0f} trades/day (high frequency)")
+            bot_signals += 2  # Strong signal
+
+        # Signal 2: Very small avg trade size with high frequency = market maker
+        if trades_per_day > 50 and avg_size < 50:
+            logger.info(f"Bot signal: tiny trades (${avg_size:.0f} avg) at {trades_per_day:.0f}/day")
             bot_signals += 2
 
         # Signal 3: Near-zero PnL per trade with high volume = arb bot
-        if total > 50 and abs(pnl) < total * 0.5:
+        if total > 50:
             pnl_per_trade = abs(pnl) / total if total else 0
             if pnl_per_trade < 0.5 and avg_size > 1000:
                 logger.info(f"Bot signal: arb pattern (${pnl_per_trade:.2f}/trade, ${avg_size:.0f} avg)")
@@ -546,24 +569,27 @@ class TraderDiscovery:
                     logger.info(f"Bot signal: uniform trade sizes (CV={cv:.3f})")
                     bot_signals += 1
 
-        # Signal 6: High liquidation rate = reckless bot
+        # Signal 6: High liquidation rate
         if total > 10 and liquidations / total > 0.15:
             logger.info(f"Bot signal: high liquidation rate ({liquidations}/{total})")
             bot_signals += 1
 
-        # Signal 7: Spread bot — high trade count with near-zero median PnL
-        if total > 200:
+        # Signal 7: Spread bot — high frequency + near-zero median PnL
+        # Only trigger if frequency is actually high (not just API-capped count)
+        if trades_per_day > 100:
             closed_pnls = sorted([f["closed_pnl"] for f in fills if f["closed_pnl"] != 0])
             if closed_pnls:
                 median_pnl = closed_pnls[len(closed_pnls) // 2]
-                if abs(median_pnl) < 1.0:  # Median PnL < $1 = spread bot
-                    logger.info(f"Bot signal: spread bot (median PnL=${median_pnl:.2f}, {total} trades)")
+                if abs(median_pnl) < 1.0:
+                    logger.info(f"Bot signal: spread bot (median PnL=${median_pnl:.2f}, {trades_per_day:.0f} trades/day)")
                     bot_signals += 1
 
-        is_bot = bot_signals >= 2
-        if is_bot:
-            logger.info(f"Bot detected ({bot_signals} signals): {fills[0].get('user', 'unknown')[:10] if fills else 'unknown'}...")
-        return is_bot
+        if bot_signals >= 3:
+            logger.info(f"Bot LIKELY ({bot_signals} signals, {trades_per_day:.0f} trades/day): "
+                       f"{fills[0].get('user', 'unknown')[:10] if fills else 'unknown'}...")
+        else:
+            logger.info(f"Human-like ({bot_signals} signals, {trades_per_day:.0f} trades/day)")
+        return bot_signals
 
     def run_discovery_cycle(self) -> Dict:
         """
@@ -618,46 +644,75 @@ class TraderDiscovery:
 
         # ─── Phase 2: Deep Analysis ──────────────────────────────────
         logger.info(f"PHASE 2: Deep analyzing {len(passed_prescreen)} traders (fills + bot detection)...")
-        profiles = []
-        bots_detected = 0
+        all_profiles = []  # ALL profiles with bot_score
 
         for i, trader in enumerate(passed_prescreen):
             addr = trader["address"]
 
             # Progress logging every 50 traders
             if (i + 1) % 50 == 0:
+                human_count = len([p for p in all_profiles if p.get("bot_score", 0) < 3])
                 logger.info(f"  Deep analysis progress: {i+1}/{len(passed_prescreen)} "
-                           f"(valid: {len(profiles)}, bots: {bots_detected})")
+                           f"(human-like: {human_count}, total: {len(all_profiles)})")
 
             try:
                 profile = self.analyze_trader(addr)
                 if profile:
-                    profiles.append(profile)
+                    all_profiles.append(profile)
                     self.known_traders[addr] = trader
-                else:
-                    # analyze_trader returns None if bot detected or no data
-                    bots_detected += 1
-                    # Mark bot as inactive so we don't re-scan next cycle
-                    db.upsert_trader(
-                        address=addr,
-                        total_pnl=0, roi_pct=0, account_value=0,
-                        win_rate=0, trade_count=0,
-                        metadata={"status": "bot_detected", "detected_at": datetime.utcnow().isoformat()},
-                        is_active=False,
-                    )
             except Exception as e:
                 logger.error(f"Error analyzing trader {addr[:10]}: {e}")
 
             time.sleep(0.5)  # Slightly slower for deep analysis (2 API calls)
 
-        logger.info(f"PHASE 2 complete: {len(profiles)} real traders, {bots_detected} bots excluded")
+        # ─── Separate humans from bots, with guaranteed minimum ─────
+        BOT_THRESHOLD = 3
+        MIN_TRADERS = 20  # ALWAYS keep at least this many, even if bot-like
+
+        humans = [p for p in all_profiles if p.get("bot_score", 0) < BOT_THRESHOLD]
+        bots = [p for p in all_profiles if p.get("bot_score", 0) >= BOT_THRESHOLD]
+
+        # If we don't have enough human traders, promote the least-bot-like bots
+        profiles = humans
+        promoted_bots = 0
+        if len(profiles) < MIN_TRADERS and bots:
+            bots_sorted = sorted(bots, key=lambda p: p.get("bot_score", 99))
+            needed = MIN_TRADERS - len(profiles)
+            promoted = bots_sorted[:needed]
+            profiles.extend(promoted)
+            promoted_bots = len(promoted)
+            logger.info(f"Only {len(humans)} human traders found — promoted {promoted_bots} "
+                       f"least-bot-like accounts (scores: {[p.get('bot_score',0) for p in promoted]})")
+
+        # Mark high-confidence bots as inactive (score 4+, and not promoted)
+        promoted_addrs = {p["address"] for p in profiles}
+        bots_marked = 0
+        for p in bots:
+            if p["address"] not in promoted_addrs and p.get("bot_score", 0) >= 4:
+                db.upsert_trader(
+                    address=p["address"],
+                    total_pnl=0, roi_pct=0, account_value=0,
+                    win_rate=0, trade_count=0,
+                    metadata={"status": "bot_detected", "bot_score": p.get("bot_score", 0),
+                              "detected_at": datetime.utcnow().isoformat()},
+                    is_active=False,
+                )
+                bots_marked += 1
+
+        logger.info(f"PHASE 2 complete: {len(humans)} human, {len(bots)} bot-like, "
+                    f"{promoted_bots} promoted, {bots_marked} marked inactive")
+        logger.info(f"Final trader pool: {len(profiles)} traders for strategy analysis")
 
         # ─── Summary ─────────────────────────────────────────────────
         summary = {
             "traders_discovered": total_candidates,
             "traders_prescreened": len(passed_prescreen),
-            "traders_analyzed": len(profiles),
-            "bots_detected": bots_detected,
+            "traders_analyzed": len(all_profiles),
+            "human_traders": len(humans),
+            "bot_like_traders": len(bots),
+            "promoted_bots": promoted_bots,
+            "bots_marked_inactive": bots_marked,
+            "final_pool": len(profiles),
             "total_tracked": len(self.known_traders),
             "timestamp": datetime.utcnow().isoformat(),
         }
@@ -665,7 +720,8 @@ class TraderDiscovery:
         db.log_research_cycle(
             cycle_type="discovery",
             summary=(f"Scanned {total_candidates} → pre-screened {len(passed_prescreen)} "
-                    f"→ {len(profiles)} real traders ({bots_detected} bots excluded)"),
+                    f"→ analyzed {len(all_profiles)} → {len(profiles)} final pool "
+                    f"({len(humans)} human + {promoted_bots} promoted)"),
             details=summary,
             traders_analyzed=len(profiles),
         )
