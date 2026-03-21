@@ -198,36 +198,8 @@ class TraderDiscovery:
         return traders
 
     def _discover_from_vaults(self) -> List[Dict]:
-        """Discover profitable traders who run vaults."""
-        traders = []
-        # Known popular vault addresses (these are discovered over time)
-        # The bot will build this list as it runs
-        known_vault_addresses = self._get_known_vault_addresses()
-
-        for vault_addr in known_vault_addresses[:10]:  # limit API calls
-            try:
-                details = hl.get_vault_details(vault_addr)
-                if details:
-                    leader = details.get("leader", "")
-                    if leader:
-                        # Check leader's performance
-                        pnl_history = details.get("portfolio", {}).get("pnlHistory", [])
-                        total_pnl = sum(float(p[1]) for p in pnl_history) if pnl_history else 0
-
-                        if total_pnl >= config.MIN_PNL_THRESHOLD:
-                            traders.append({
-                                "address": leader,
-                                "total_pnl": total_pnl,
-                                "roi_pct": 0,
-                                "source": "vault",
-                                "metadata": {"vault_address": vault_addr,
-                                           "vault_name": details.get("name", "")},
-                            })
-            except Exception as e:
-                logger.debug(f"Error fetching vault {vault_addr}: {e}")
-                continue
-            time.sleep(0.3)
-        return traders
+        """Vault details API returns 422 — skip to avoid wasting 30s per cycle."""
+        return []
 
     def _discover_whales(self) -> List[Dict]:
         """

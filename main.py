@@ -21,11 +21,12 @@ from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(__file__))
 import config
-from src.database import init_db
+from src.database import init_db, restore_from_json, backup_to_json
 from src.trader_discovery import TraderDiscovery
 from src.strategy_identifier import StrategyIdentifier
 from src.strategy_scorer import StrategyScorer
 from src.paper_trader import PaperTrader
+from src.copy_trader import CopyTrader
 from src.reporter import Reporter
 from src.dashboard import start_dashboard
 
@@ -67,7 +68,8 @@ class HyperliquidResearchBot:
     2. Strategy identification (classify what they're doing)
     3. Strategy scoring (rank strategies, decay bad ones)
     4. Paper trading (simulate trades from top strategies)
-    5. Reporting (generate insights)
+    5. Copy trading (mirror top traders' live position changes)
+    6. Reporting (generate insights)
     """
 
     def __init__(self):
@@ -77,14 +79,20 @@ class HyperliquidResearchBot:
         self._last_scoring = 0
         self._last_report = 0
         self._cycle_count = 0
+        self._fast_cycle_count = 0
 
         # Initialize components
         self.logger.info("Initializing bot components...")
         init_db()
+
+        # Restore from backup if DB is empty (e.g. after Railway redeploy)
+        if restore_from_json():
+            self.logger.info("Restored DB from backup (post-deploy recovery)")
         self.discovery = TraderDiscovery()
         self.identifier = StrategyIdentifier()
         self.scorer = StrategyScorer()
         self.paper_trader = PaperTrader()
+        self.copy_trader = CopyTrader()
         self.reporter = Reporter()
 
         # Start the web dashboard
@@ -147,19 +155,26 @@ class HyperliquidResearchBot:
             score_results = self.scorer.score_all_strategies()
             self.logger.info(f"  Scored {len(score_results)} strategies")
 
-            # Phase 4: Paper trade top strategies
+            # Phase 4: Paper trade top strategies (increased from 5 to 15)
             self.logger.info("Phase 4: Paper Trading")
-            top_strategies = self.scorer.get_top_strategies(n=5)
+            top_strategies = self.scorer.get_top_strategies(n=15)
 
             # Check existing positions first
             closed = self.paper_trader.check_open_positions()
             if closed:
                 self.logger.info(f"  Closed {len(closed)} positions")
 
-            # Execute new signals
+            # Execute new signals from strategies
             if top_strategies:
                 executed = self.paper_trader.execute_strategy_signals(top_strategies)
                 self.logger.info(f"  Executed {len(executed)} new paper trades")
+
+            # Phase 4b: Copy trading - mirror top trader positions
+            self.logger.info("Phase 4b: Copy Trading")
+            copy_signals = self.copy_trader.scan_top_traders(top_n=10)
+            if copy_signals:
+                copy_executed = self.copy_trader.execute_copy_signals(copy_signals)
+                self.logger.info(f"  Executed {len(copy_executed)} copy trades")
 
             # Phase 5: Report
             self.logger.info("Phase 5: Status Update")
@@ -173,10 +188,35 @@ class HyperliquidResearchBot:
             self.logger.info(f"  Improving strategies: {improvement.get('improving', 0)}")
             self.logger.info(f"  Declining strategies: {improvement.get('declining', 0)}")
 
+            # Backup DB state (survives Railway redeploys)
+            backup_to_json()
+
             self.logger.info(f"Cycle #{self._cycle_count} complete.")
 
         except Exception as e:
             self.logger.error(f"Error in cycle #{self._cycle_count}: {e}", exc_info=True)
+
+    def _fast_cycle(self):
+        """
+        Fast cycle: check positions + copy-trade scan.
+        Runs every 60s between full research cycles.
+        """
+        self._fast_cycle_count += 1
+        try:
+            # Check SL/TP on open positions
+            closed = self.paper_trader.check_open_positions()
+            if closed:
+                self.logger.info(f"[fast] Closed {len(closed)} positions (SL/TP)")
+
+            # Scan top traders for position changes
+            copy_signals = self.copy_trader.scan_top_traders(top_n=10)
+            if copy_signals:
+                copy_executed = self.copy_trader.execute_copy_signals(copy_signals)
+                if copy_executed:
+                    self.logger.info(f"[fast] Copy-traded {len(copy_executed)} positions")
+
+        except Exception as e:
+            self.logger.error(f"Error in fast cycle: {e}")
 
     def run_loop(self):
         """Run the bot in a continuous loop."""
@@ -190,31 +230,20 @@ class HyperliquidResearchBot:
         signal.signal(signal.SIGTERM, signal_handler)
 
         self.logger.info("Bot starting continuous operation...")
-        self.logger.info(f"  Main loop interval: {config.MAIN_LOOP_INTERVAL}s")
-        self.logger.info(f"  Research interval: {config.RESEARCH_CYCLE_INTERVAL}s")
-        self.logger.info(f"  Scoring interval: {config.SCORING_INTERVAL}s")
+        self.logger.info(f"  Fast cycle interval: 60s (position checks + copy trading)")
+        self.logger.info(f"  Full research interval: {config.RESEARCH_CYCLE_INTERVAL}s")
 
         while self.running:
             now = time.time()
 
             try:
-                # Always check paper positions
-                closed = self.paper_trader.check_open_positions()
-                if closed:
-                    self.logger.info(f"Closed {len(closed)} paper positions")
-
-                # Run full research cycle periodically
+                # Run full research cycle periodically (every hour)
                 if now - self._last_research >= config.RESEARCH_CYCLE_INTERVAL:
                     self.run_once()
                     self._last_research = now
-
-                # Run scoring more frequently than full research
-                elif now - self._last_scoring >= config.SCORING_INTERVAL:
-                    self.logger.info("Running scoring cycle...")
-                    self.scorer.score_all_strategies()
-                    top = self.scorer.get_top_strategies(n=5)
-                    self.paper_trader.execute_strategy_signals(top)
-                    self._last_scoring = now
+                else:
+                    # Fast cycle: check positions + copy trades (every 60s)
+                    self._fast_cycle()
 
                 # Generate daily report
                 if now - self._last_report >= 86400:
@@ -225,13 +254,13 @@ class HyperliquidResearchBot:
             except Exception as e:
                 self.logger.error(f"Error in main loop: {e}", exc_info=True)
 
-            # Status heartbeat
-            if self._cycle_count % 12 == 0:
+            # Status heartbeat every 10 fast cycles
+            if self._fast_cycle_count % 10 == 0 and self._fast_cycle_count > 0:
                 print(self.reporter.print_live_status())
 
-            # Sleep until next check
+            # Sleep 60s between fast cycles
             if self.running:
-                time.sleep(config.MAIN_LOOP_INTERVAL)
+                time.sleep(60)
 
         self.logger.info("Bot stopped.")
         # Final report

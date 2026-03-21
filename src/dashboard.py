@@ -61,6 +61,11 @@ def get_dashboard_data():
             "SELECT * FROM paper_trades WHERE status = 'closed' ORDER BY closed_at DESC LIMIT 50"
         ).fetchall()]
 
+        # Copy trades (from metadata)
+        copy_trades = [dict(r) for r in conn.execute(
+            "SELECT * FROM paper_trades WHERE metadata LIKE '%copy_trade%' ORDER BY opened_at DESC LIMIT 30"
+        ).fetchall()]
+
         # Strategy type distribution
         type_dist = [dict(r) for r in conn.execute(
             "SELECT strategy_type, COUNT(*) as count, AVG(current_score) as avg_score, "
@@ -102,6 +107,7 @@ def get_dashboard_data():
             "strategies": strategies,
             "open_trades": open_trades,
             "closed_trades": closed_trades,
+            "copy_trades": copy_trades,
             "type_distribution": type_dist,
             "research_logs": logs,
             "score_history": score_history,
@@ -162,6 +168,14 @@ canvas{width:100%!important;height:200px!important}
 
 <div class="flex-row">
 <div class="section">
+<h2>Copy Trades (Mirroring Top Traders)</h2>
+<table><thead><tr><th>Coin</th><th>Side</th><th>Entry</th><th>Size</th><th>Source</th><th>Status</th><th>PnL</th></tr></thead>
+<tbody id="copy-trades"></tbody></table>
+</div>
+</div>
+
+<div class="flex-row">
+<div class="section">
 <h2>Strategy Rankings</h2>
 <table><thead><tr><th>#</th><th>Strategy</th><th>Type</th><th>Score</th><th>PnL</th><th>Win Rate</th><th>Trades</th></tr></thead>
 <tbody id="strategies-table"></tbody></table>
@@ -169,6 +183,10 @@ canvas{width:100%!important;height:200px!important}
 <div class="section">
 <h2>Strategy Type Distribution</h2>
 <canvas id="type-chart"></canvas>
+</div>
+<div class="section">
+<h2>Equity Curve</h2>
+<canvas id="equity-chart"></canvas>
 </div>
 </div>
 
@@ -275,6 +293,44 @@ function renderLogs(logs){
     <td>${l.summary}</td><td>${l.traders_analyzed||0}</td><td>${l.strategies_found||0}</td></tr>`).join('');
 }
 
+function renderCopyTrades(trades){
+  document.getElementById('copy-trades').innerHTML = trades.length ? trades.slice(0,15).map(t=>{
+    let meta = {};
+    try { meta = JSON.parse(t.metadata || '{}'); } catch(e) {}
+    return `<tr><td>${t.coin}</td>
+    <td><span class="badge badge-${t.side}">${t.side.toUpperCase()}</span></td>
+    <td>${fmtUsd(t.entry_price)}</td><td>${fmt(t.size,4)}</td>
+    <td><code>${meta.source_trader||'—'}</code></td>
+    <td><span class="badge badge-type">${t.status}</span></td>
+    <td class="${pnlClass(t.pnl)}">${t.pnl?fmtUsd(t.pnl):'—'}</td></tr>`;
+  }).join('') : '<tr><td colspan="7" style="color:#555">No copy trades yet — warming up position cache...</td></tr>';
+}
+
+let equityChart = null;
+function renderEquityChart(closed){
+  const ctx = document.getElementById('equity-chart').getContext('2d');
+  if(!closed || closed.length === 0) return;
+  // Build cumulative PnL from closed trades (oldest first)
+  const sorted = [...closed].reverse();
+  let cumPnl = 0;
+  const labels = [];
+  const data = [];
+  sorted.forEach((t,i)=>{
+    cumPnl += (t.pnl || 0);
+    labels.push(t.closed_at ? t.closed_at.slice(5,16) : `#${i+1}`);
+    data.push(cumPnl);
+  });
+  if(equityChart) equityChart.destroy();
+  equityChart = new Chart(ctx, {
+    type:'line',
+    data:{labels, datasets:[{label:'Cumulative PnL ($)',data,
+      borderColor:'#00d4aa',backgroundColor:'rgba(0,212,170,0.1)',fill:true,tension:0.3,pointRadius:2}]},
+    options:{responsive:true,maintainAspectRatio:false,
+      scales:{x:{ticks:{color:'#555',maxTicksLimit:10}},y:{ticks:{color:'#7b8ab8'}}},
+      plugins:{legend:{labels:{color:'#7b8ab8'}}}}
+  });
+}
+
 async function refresh(){
   try {
     const resp = await fetch('/api/data');
@@ -285,6 +341,8 @@ async function refresh(){
     renderStrategies(d.strategies);
     renderTraders(d.traders);
     renderClosedTrades(d.closed_trades);
+    renderCopyTrades(d.copy_trades || []);
+    renderEquityChart(d.closed_trades);
     renderTypeChart(d.type_distribution);
     renderLogs(d.research_logs);
   } catch(e) {

@@ -354,6 +354,85 @@ def log_research_cycle(cycle_type, summary, details=None,
               traders_analyzed, strategies_found, strategies_updated))
 
 
+# ─── Backup & Restore (for Railway persistence) ─────────────
+
+def backup_to_json(filepath: str = None):
+    """Backup critical DB state to a JSON file for Railway persistence."""
+    if filepath is None:
+        filepath = os.environ.get("HL_BOT_BACKUP", "/tmp/bot_backup.json")
+    try:
+        data = {
+            "timestamp": datetime.utcnow().isoformat(),
+            "paper_account": get_paper_account(),
+            "traders": get_active_traders()[:100],
+            "strategies": get_active_strategies()[:200],
+            "open_trades": get_open_paper_trades(),
+            "closed_trades": get_paper_trade_history(limit=200),
+        }
+        with open(filepath, "w") as f:
+            json.dump(data, f)
+    except Exception as e:
+        print(f"Backup failed: {e}")
+
+
+def restore_from_json(filepath: str = None):
+    """Restore DB state from a backup JSON file if DB is empty."""
+    if filepath is None:
+        filepath = os.environ.get("HL_BOT_BACKUP", "/tmp/bot_backup.json")
+    if not os.path.exists(filepath):
+        return False
+
+    # Only restore if DB is empty (fresh deploy)
+    account = get_paper_account()
+    if account:
+        return False  # DB already has data
+
+    try:
+        with open(filepath, "r") as f:
+            data = json.load(f)
+
+        # Restore paper account
+        if data.get("paper_account"):
+            acc = data["paper_account"]
+            init_paper_account(acc.get("balance", 10000))
+            update_paper_account(
+                acc.get("balance", 10000),
+                acc.get("total_pnl", 0),
+                acc.get("total_trades", 0),
+                acc.get("winning_trades", 0),
+            )
+
+        # Restore traders
+        for t in data.get("traders", []):
+            upsert_trader(
+                t["address"],
+                total_pnl=t.get("total_pnl", 0),
+                roi_pct=t.get("roi_pct", 0),
+                account_value=t.get("account_value", 0),
+                win_rate=t.get("win_rate", 0),
+                trade_count=t.get("trade_count", 0),
+            )
+
+        # Restore strategies
+        for s in data.get("strategies", []):
+            save_strategy(
+                s.get("name", "restored"),
+                s.get("description", ""),
+                s.get("strategy_type", "unknown"),
+                parameters=json.loads(s["parameters"]) if isinstance(s.get("parameters"), str) else s.get("parameters"),
+                total_pnl=s.get("total_pnl", 0),
+                trade_count=s.get("trade_count", 0),
+                win_rate=s.get("win_rate", 0),
+                sharpe_ratio=s.get("sharpe_ratio", 0),
+            )
+
+        print(f"Restored DB from backup: {len(data.get('traders', []))} traders, {len(data.get('strategies', []))} strategies")
+        return True
+    except Exception as e:
+        print(f"Restore failed: {e}")
+        return False
+
+
 if __name__ == "__main__":
     init_db()
     print(f"Database initialized at {get_db_path()}")

@@ -296,7 +296,9 @@ class PaperTrader:
     def check_open_positions(self) -> List[Dict]:
         """
         Check all open paper positions against current prices.
-        Close any that hit stop-loss or take-profit.
+        Close any that hit stop-loss, take-profit, or trailing stop.
+        Also implements trailing stop: if price moves 3%+ in our favor,
+        ratchet the stop-loss to lock in at least breakeven.
         """
         open_trades = db.get_open_paper_trades()
         if not open_trades:
@@ -313,14 +315,47 @@ class PaperTrader:
             should_close = False
             close_reason = ""
 
-            # Check stop loss
-            if trade["stop_loss"]:
-                if trade["side"] == "long" and current_price <= trade["stop_loss"]:
+            # --- Trailing stop logic ---
+            # If price has moved 3%+ in our favor, tighten the stop to lock in profits
+            entry = trade["entry_price"]
+            leverage = trade.get("leverage", 1)
+            sl = trade["stop_loss"]
+
+            if trade["side"] == "long":
+                move_pct = (current_price - entry) / entry
+                if move_pct >= 0.03 and sl and sl < entry:
+                    # Move SL to breakeven + 0.5%
+                    new_sl = entry * 1.005
+                    if new_sl > sl:
+                        self._update_stop_loss(trade["id"], new_sl)
+                        sl = new_sl
+                elif move_pct >= 0.06 and sl:
+                    # Trail SL at 2.5% below current price
+                    trail_sl = current_price * (1 - 0.025 / max(leverage, 1))
+                    if trail_sl > sl:
+                        self._update_stop_loss(trade["id"], trail_sl)
+                        sl = trail_sl
+            else:
+                move_pct = (entry - current_price) / entry
+                if move_pct >= 0.03 and sl and sl > entry:
+                    new_sl = entry * 0.995
+                    if new_sl < sl:
+                        self._update_stop_loss(trade["id"], new_sl)
+                        sl = new_sl
+                elif move_pct >= 0.06 and sl:
+                    trail_sl = current_price * (1 + 0.025 / max(leverage, 1))
+                    if trail_sl < sl:
+                        self._update_stop_loss(trade["id"], trail_sl)
+                        sl = trail_sl
+
+            # Check stop loss (using potentially updated SL)
+            if sl:
+                if trade["side"] == "long" and current_price <= sl:
                     should_close = True
-                    close_reason = "stop_loss"
-                elif trade["side"] == "short" and current_price >= trade["stop_loss"]:
+                    close_reason = "trailing_stop" if sl > trade["stop_loss"] else "stop_loss"
+                elif trade["side"] == "short" and current_price >= sl:
                     should_close = True
-                    close_reason = "stop_loss"
+                    close_reason = "trailing_stop" if sl < trade["stop_loss"] else "stop_loss"
 
             # Check take profit
             if trade["take_profit"] and not should_close:
@@ -330,6 +365,17 @@ class PaperTrader:
                 elif trade["side"] == "short" and current_price <= trade["take_profit"]:
                     should_close = True
                     close_reason = "take_profit"
+
+            # Time-based exit: close positions older than 24 hours
+            if not should_close and trade.get("opened_at"):
+                try:
+                    opened = datetime.fromisoformat(trade["opened_at"])
+                    age_hours = (datetime.utcnow() - opened).total_seconds() / 3600
+                    if age_hours > 24:
+                        should_close = True
+                        close_reason = "time_exit_24h"
+                except (ValueError, TypeError):
+                    pass
 
             if should_close:
                 pnl = self._calculate_pnl(trade, current_price)
@@ -358,6 +404,18 @@ class PaperTrader:
                 })
 
         return closed
+
+    def _update_stop_loss(self, trade_id: int, new_sl: float):
+        """Update stop loss for a trade (trailing stop)."""
+        try:
+            with db.get_connection() as conn:
+                conn.execute(
+                    "UPDATE paper_trades SET stop_loss = ? WHERE id = ? AND status = 'open'",
+                    (round(new_sl, 2), trade_id)
+                )
+            logger.info(f"Trailing stop updated for trade {trade_id}: new SL=${new_sl:,.2f}")
+        except Exception as e:
+            logger.error(f"Error updating trailing stop: {e}")
 
     def _calculate_pnl(self, trade: Dict, exit_price: float) -> float:
         """Calculate PnL for a trade."""
