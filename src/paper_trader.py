@@ -61,11 +61,13 @@ class PaperTrader:
             "roi_pct": round(((total_equity / config.PAPER_TRADING_INITIAL_BALANCE) - 1) * 100, 2),
         }
 
-    def execute_strategy_signals(self, strategies: List[Dict], exchange_agg=None) -> List[Dict]:
+    def execute_strategy_signals(self, strategies: List[Dict], exchange_agg=None,
+                                  options_scanner=None) -> List[Dict]:
         """
         Generate and execute paper trades based on top strategies.
         Only trades strategies with score above threshold.
         If exchange_agg is provided, checks multi-exchange volume confirmation.
+        If options_scanner is provided, boosts signals aligned with options flow.
         """
         account = db.get_paper_account()
         if not account:
@@ -103,6 +105,25 @@ class PaperTrader:
                         signal["confidence"] = signal.get("confidence", 0.5) * (0.5 + vol_confidence * 0.5)
                     except Exception:
                         pass  # Don't block trades if aggregator fails
+
+                # Options flow confirmation (if available)
+                if options_scanner:
+                    try:
+                        flow_signal = options_scanner.get_flow_signal(signal["coin"])
+                        if flow_signal:
+                            if flow_signal["side"] == signal["side"]:
+                                # Options flow agrees — boost confidence
+                                boost = 1.0 + flow_signal["confidence"] * 0.3
+                                signal["confidence"] = min(signal.get("confidence", 0.5) * boost, 1.0)
+                                logger.info(f"Options flow confirms {signal['side']} {signal['coin']} "
+                                           f"(flow: {flow_signal['net_flow']:.0f}, boost: {boost:.2f})")
+                            else:
+                                # Options flow disagrees — reduce confidence
+                                signal["confidence"] = signal.get("confidence", 0.5) * 0.7
+                                logger.info(f"Options flow opposes {signal['side']} {signal['coin']} "
+                                           f"(flow: {flow_signal['side']}, reducing confidence)")
+                    except Exception:
+                        pass  # Don't block trades if scanner fails
 
                 # Risk management checks
                 if not self._check_risk_limits(account, signal, open_trades):

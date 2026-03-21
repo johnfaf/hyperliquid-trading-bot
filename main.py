@@ -30,6 +30,8 @@ from src.copy_trader import CopyTrader
 from src.reporter import Reporter
 from src.dashboard import start_dashboard
 from src.exchange_aggregator import ExchangeAggregator
+from src.options_flow import OptionsFlowScanner
+from src.options_dashboard import start_options_dashboard
 from src import telegram_bot as tg
 
 # ─── Logging Setup ─────────────────────────────────────────────
@@ -96,6 +98,7 @@ class HyperliquidResearchBot:
         self.paper_trader = PaperTrader()
         self.copy_trader = CopyTrader()
         self.exchange_agg = ExchangeAggregator()
+        self.options_scanner = OptionsFlowScanner()
         self.reporter = Reporter()
 
         # Start the web dashboard
@@ -104,6 +107,13 @@ class HyperliquidResearchBot:
             self.logger.info("Web dashboard started.")
         except Exception as e:
             self.logger.warning(f"Dashboard failed to start: {e}")
+
+        # Start the options flow dashboard (separate port)
+        try:
+            self.options_dashboard = start_options_dashboard(self.options_scanner)
+            self.logger.info("Options Flow Dashboard started.")
+        except Exception as e:
+            self.logger.warning(f"Options dashboard failed to start: {e}")
 
         self.logger.info("Bot initialized successfully.")
 
@@ -181,6 +191,28 @@ class HyperliquidResearchBot:
                 self.logger.warning(f"  Exchange aggregator error: {e}")
                 market_overview = {}
 
+            # Phase 3c: Options Flow Scan (Deribit)
+            self.logger.info("Phase 3c: Options Flow Scan")
+            try:
+                flow_result = self.options_scanner.scan_flow()
+                self.logger.info(f"  Unusual prints: {flow_result.get('unusual_prints', 0)}")
+                self.logger.info(f"  Top convictions: {flow_result.get('top_convictions', 0)}")
+
+                # Telegram: notify strong flow signals
+                if tg.is_configured() and self.options_scanner.top_convictions:
+                    for conv in self.options_scanner.top_convictions[:3]:
+                        if conv.get("conviction_pct", 0) > 60:
+                            tg.notify_strong_signal({
+                                "source": "options_flow",
+                                "ticker": conv["ticker"],
+                                "direction": conv["direction"],
+                                "net_flow": conv["net_flow"],
+                                "prints": conv["total_prints"],
+                                "conviction": conv["conviction_pct"],
+                            })
+            except Exception as e:
+                self.logger.warning(f"  Options flow scan error: {e}")
+
             # Phase 4: Paper trade top strategies (increased from 5 to 15)
             self.logger.info("Phase 4: Paper Trading")
             top_strategies = self.scorer.get_top_strategies(n=15)
@@ -194,10 +226,11 @@ class HyperliquidResearchBot:
                     for c in closed:
                         tg.notify_trade_closed(c, c.get("exit_price", 0), c.get("pnl", 0), c.get("reason", ""))
 
-            # Execute new signals from strategies (with volume confirmation)
+            # Execute new signals from strategies (with volume + options flow confirmation)
             if top_strategies:
                 executed = self.paper_trader.execute_strategy_signals(
-                    top_strategies, exchange_agg=self.exchange_agg
+                    top_strategies, exchange_agg=self.exchange_agg,
+                    options_scanner=self.options_scanner,
                 )
                 self.logger.info(f"  Executed {len(executed)} new paper trades")
                 # Telegram: notify new trades
