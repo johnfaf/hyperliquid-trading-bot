@@ -49,7 +49,7 @@ SCORING_WEIGHTS = {
 
 # ─── Paper Trading ─────────────────────────────────────────────
 PAPER_TRADING_INITIAL_BALANCE = 10_000  # USD
-PAPER_TRADING_MAX_POSITION_PCT = 0.20   # 20% of balance per trade
+PAPER_TRADING_MAX_POSITION_PCT = 0.08   # 8% of balance per trade (smaller = more concurrent trades)
 PAPER_TRADING_MAX_LEVERAGE = 5
 PAPER_TRADING_STOP_LOSS_PCT = 0.05      # 5%
 PAPER_TRADING_TAKE_PROFIT_PCT = 0.10    # 10%

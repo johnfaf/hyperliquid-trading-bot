@@ -130,9 +130,24 @@ class PaperTrader:
         # Get target coins from strategy parameters
         coins = params.get("coins", [])
         if not coins:
-            coins = params.get("coins_traded", ["BTC", "ETH"])
+            coins = params.get("coins_traded", [])
         if isinstance(coins, str):
             coins = [coins]
+
+        # If strategy has no specific coins, pick from top liquid coins
+        # to diversify across many assets instead of all piling into BTC
+        if not coins:
+            import random
+            TOP_COINS = ["BTC", "ETH", "SOL", "DOGE", "AVAX", "LINK", "ARB",
+                         "OP", "SUI", "APT", "INJ", "SEI", "TIA", "JUP",
+                         "WIF", "PEPE", "ONDO", "RENDER", "FET", "NEAR"]
+            available = [c for c in TOP_COINS if c in mids]
+            if available:
+                # Use strategy ID as seed for deterministic but diverse selection
+                strat_id = hash(str(strategy.get("id", random.random())))
+                coins = [available[strat_id % len(available)]]
+            else:
+                coins = ["BTC", "ETH"]
 
         # Pick the first available coin with a price
         target_coin = None
@@ -204,13 +219,13 @@ class PaperTrader:
         """Check if a new trade passes risk management rules."""
         # Max position count — allow up to 20 simultaneous positions
         if len(open_trades) >= 20:
-            logger.debug(f"Risk: max positions ({len(open_trades)}/20)")
+            logger.info(f"Risk: max positions ({len(open_trades)}/20)")
             return False
 
         # Max positions per coin — allow up to 3 per coin (different strategies)
         coin_positions = sum(1 for t in open_trades if t["coin"] == signal["coin"])
         if coin_positions >= 3:
-            logger.debug(f"Risk: max positions for {signal['coin']} ({coin_positions}/3)")
+            logger.info(f"Risk: max positions for {signal['coin']} ({coin_positions}/3)")
             return False
 
         # Max exposure per coin — 50% of balance
@@ -221,7 +236,7 @@ class PaperTrader:
         max_coin_exposure = account["balance"] * 0.50
         new_exposure = signal["size"] * signal["price"] * signal["leverage"]
         if coin_exposure + new_exposure > max_coin_exposure:
-            logger.debug(f"Risk: coin exposure for {signal['coin']} ${coin_exposure+new_exposure:,.0f} > ${max_coin_exposure:,.0f}")
+            logger.info(f"Risk: coin exposure for {signal['coin']} ${coin_exposure+new_exposure:,.0f} > ${max_coin_exposure:,.0f}")
             return False
 
         # Max total exposure — 500% of balance (leveraged)
@@ -231,7 +246,7 @@ class PaperTrader:
         )
         max_total_exposure = account["balance"] * 5.0
         if total_exposure + new_exposure > max_total_exposure:
-            logger.debug(f"Risk: total exposure ${total_exposure+new_exposure:,.0f} > ${max_total_exposure:,.0f}")
+            logger.info(f"Risk: total exposure ${total_exposure+new_exposure:,.0f} > ${max_total_exposure:,.0f}")
             return False
 
         # Minimum balance remaining
