@@ -188,9 +188,9 @@ class StrategyScorer:
                     "strategy_id": strategy["id"],
                     "name": strategy["name"],
                     "type": strategy["strategy_type"],
-                    "score": composite,
-                    "breakdown": score_breakdown,
-                    "active": composite >= config.MIN_STRATEGY_SCORE,
+                    "score": float(composite),
+                    "breakdown": {k: float(v) for k, v in score_breakdown.items()},
+                    "active": bool(composite >= config.MIN_STRATEGY_SCORE),
                 })
 
             except Exception as e:

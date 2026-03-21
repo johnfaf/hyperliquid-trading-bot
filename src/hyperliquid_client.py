@@ -68,13 +68,19 @@ def get_asset_contexts():
         for i, ctx in enumerate(contexts):
             if i < len(universe):
                 coin = universe[i]["name"]
+                def _safe_float(val, default=0):
+                    try:
+                        return float(val) if val is not None else default
+                    except (ValueError, TypeError):
+                        return default
+
                 result[coin] = {
-                    "funding": float(ctx.get("funding", 0)),
-                    "open_interest": float(ctx.get("openInterest", 0)),
-                    "day_volume": float(ctx.get("dayNtlVlm", 0)),
-                    "mark_price": float(ctx.get("markPx", 0)),
-                    "oracle_price": float(ctx.get("oraclePx", 0)),
-                    "premium": float(ctx.get("premium", 0)),
+                    "funding": _safe_float(ctx.get("funding")),
+                    "open_interest": _safe_float(ctx.get("openInterest")),
+                    "day_volume": _safe_float(ctx.get("dayNtlVlm")),
+                    "mark_price": _safe_float(ctx.get("markPx")),
+                    "oracle_price": _safe_float(ctx.get("oraclePx")),
+                    "premium": _safe_float(ctx.get("premium")),
                 }
                 result[coin].update(ctx)
         return result
