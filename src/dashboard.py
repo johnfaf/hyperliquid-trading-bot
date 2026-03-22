@@ -156,13 +156,15 @@ def _get_v2_metrics(conn) -> Dict:
 # Module-level references for V2 components (set by set_v2_components)
 _firewall = None
 _regime_detector = None
+_arena = None
 
 
-def set_v2_components(firewall=None, regime_detector=None):
+def set_v2_components(firewall=None, regime_detector=None, arena=None):
     """Set V2 component references for dashboard metrics."""
-    global _firewall, _regime_detector
+    global _firewall, _regime_detector, _arena
     _firewall = firewall
     _regime_detector = regime_detector
+    _arena = arena
 
 
 DASHBOARD_HTML = """<!DOCTYPE html>
@@ -282,6 +284,18 @@ canvas{width:100%!important;height:200px!important}
 
 <h2>Per-Coin Regime</h2>
 <div id="regime-grid" class="grid"></div>
+</div>
+
+<div class="section" style="border-top:2px solid #ff6b35;padding-top:16px;margin-top:24px">
+<h2 style="color:#ff6b35">Alpha Arena</h2>
+<div class="grid" id="arena-cards"></div>
+
+<h2>Arena Leaderboard</h2>
+<table><thead><tr><th>#</th><th>Agent</th><th>Strategy</th><th>Status</th><th>ELO</th><th>Fitness</th><th>Capital</th><th>PnL</th><th>Trades</th><th>Win%</th><th>Sharpe</th><th>Gen</th></tr></thead>
+<tbody id="arena-leaderboard"></tbody></table>
+
+<h2>Recent Consensus Votes</h2>
+<div id="consensus-log" style="font-size:0.85em;color:#7b8ab8"></div>
 </div>
 
 <script>
@@ -418,6 +432,7 @@ async function refresh(){
     renderTypeChart(d.type_distribution);
     renderLogs(d.research_logs);
     if(d.v2) renderV2(d.v2);
+    if(d.v2 && d.v2.arena) renderArena(d.v2.arena);
   } catch(e) {
     console.error('Refresh error:', e);
   }
@@ -476,6 +491,53 @@ function renderV2(v2) {
   }).join('') : '<div style="color:#555;grid-column:1/-1">Regime data available after first full cycle</div>';
 }
 
+function renderArena(arena) {
+  const s = arena.stats || {};
+  const cards = [
+    {label:'Arena Agents', value: s.active_agents||0, cls:'blue', sub:`${s.champions||0} champions`},
+    {label:'Incubating', value: s.incubating||0, cls:'yellow'},
+    {label:'Eliminated', value: s.eliminated||0, cls:'red'},
+    {label:'Arena PnL', value: fmtUsd(s.total_arena_pnl||0), cls:pnlClass(s.total_arena_pnl)},
+    {label:'Max ELO', value: Math.round(s.max_elo||0), cls:'green'},
+    {label:'Rounds Played', value: s.total_rounds||0, cls:'blue'},
+  ];
+  document.getElementById('arena-cards').innerHTML = cards.map(c=>`
+    <div class="card"><div class="label">${c.label}</div>
+    <div class="value ${c.cls||''}">${c.value}</div>
+    ${c.sub?`<div class="sub">${c.sub}</div>`:''}</div>`).join('');
+
+  // Leaderboard
+  const lb = arena.leaderboard || [];
+  document.getElementById('arena-leaderboard').innerHTML = lb.length ? lb.map(a=>{
+    const statusCls = a.status==='champion'?'green':a.status==='active'?'blue':a.status==='probation'?'yellow':'red';
+    return `<tr>
+      <td>${a.rank}</td>
+      <td><code>${a.name}</code></td>
+      <td><span class="badge badge-type">${a.strategy}</span></td>
+      <td><span class="${statusCls}">${a.status.toUpperCase()}</span></td>
+      <td>${a.elo}</td>
+      <td>${a.fitness.toFixed(3)}</td>
+      <td>${fmtUsd(a.capital)}</td>
+      <td class="${pnlClass(a.pnl)}">${fmtUsd(a.pnl)}</td>
+      <td>${a.trades}</td>
+      <td>${a.win_rate}%</td>
+      <td>${a.sharpe}</td>
+      <td>${a.generation > 0 ? 'Gen '+a.generation : 'Seed'}</td>
+    </tr>`;
+  }).join('') : '<tr><td colspan="12" style="color:#555">Arena populating — agents compete after first full cycle</td></tr>';
+
+  // Consensus votes
+  const votes = (s.recent_votes || []).reverse();
+  document.getElementById('consensus-log').innerHTML = votes.length ? votes.map(v=>{
+    const cls = v.approved ? 'green' : 'red';
+    return `<div style="margin-bottom:6px;padding:6px;background:#141b2d;border-radius:4px">
+      <span class="${cls}" style="font-weight:bold">${v.approved?'APPROVED':'REJECTED'}</span>
+      <span>${v.side.toUpperCase()} ${v.coin}</span> —
+      <span style="color:#888">${v.votes_for} for / ${v.votes_against} against (${(v.approval_ratio*100).toFixed(0)}%)</span>
+    </div>`;
+  }).join('') : '<div style="color:#555">No consensus votes yet</div>';
+}
+
 refresh();
 setInterval(refresh, 30000);
 </script>
@@ -512,6 +574,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     data["v2"]["regime"] = {
                         coin: state.to_dict()
                         for coin, state in _regime_detector._cache.items()
+                    }
+                if _arena:
+                    data["v2"]["arena"] = {
+                        "stats": _arena.get_stats(),
+                        "leaderboard": _arena.get_leaderboard(top_n=15),
                     }
                 self._json_response(data)
             except Exception as e:

@@ -79,7 +79,8 @@ class PaperTrader:
 
     def execute_strategy_signals(self, strategies: List[Dict], exchange_agg=None,
                                   options_scanner=None,
-                                  regime_data: Optional[Dict] = None) -> List[Dict]:
+                                  regime_data: Optional[Dict] = None,
+                                  arena=None) -> List[Dict]:
         """
         Generate and execute paper trades based on top strategies.
 
@@ -270,6 +271,21 @@ class PaperTrader:
                     if not self._check_risk_limits(account, sig, open_trades):
                         logger.info(f"Risk limit hit, skipping {sig['coin']}")
                         continue
+
+                # Arena consensus vote (multi-agent debate)
+                if arena:
+                    try:
+                        feature_ctx = sig.get("features", {})
+                        approved, consensus_conf = arena.get_consensus_on_signal(
+                            trade_signal, features=feature_ctx
+                        )
+                        if not approved:
+                            logger.info(f"Arena consensus REJECTED {sig['side']} {sig['coin']}")
+                            continue
+                        # Use consensus-adjusted confidence
+                        trade_signal.confidence = consensus_conf
+                    except Exception as e:
+                        logger.debug(f"Arena consensus error: {e}")
 
                 # Record signal with agent scorer
                 signal_id = ""
@@ -622,6 +638,10 @@ class PaperTrader:
                         self.firewall.record_trade_outcome(trade["coin"], pnl)
                     except Exception:
                         pass
+
+                # Feed outcome to Alpha Arena (all agents of matching strategy type learn)
+                # The arena reference is passed at execution time, not stored
+                # We store strategy_type in metadata for this purpose
 
                 closed.append({
                     "trade_id": trade["id"],

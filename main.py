@@ -36,6 +36,7 @@ from src.regime_detector import RegimeDetector
 from src.decision_firewall import DecisionFirewall
 from src.agent_scoring import AgentScorer
 from src.features import FeatureEngine
+from src.alpha_arena import AlphaArena
 from src import telegram_bot as tg
 
 # ─── Logging Setup ─────────────────────────────────────────────
@@ -110,6 +111,7 @@ class HyperliquidResearchBot:
             agent_scorer=self.agent_scorer,
         )
         self.reporter = Reporter()
+        self.arena = AlphaArena()
 
         # Paper trader with V2 components wired in
         self.paper_trader = PaperTrader(
@@ -120,7 +122,7 @@ class HyperliquidResearchBot:
 
         # Start the unified web dashboard (main + options on same port)
         try:
-            set_v2_components(firewall=self.firewall, regime_detector=self.regime_detector)
+            set_v2_components(firewall=self.firewall, regime_detector=self.regime_detector, arena=self.arena)
             self.dashboard = start_dashboard(options_scanner=self.options_scanner)
             self.logger.info("Unified dashboard started (main + options flow on same port).")
         except Exception as e:
@@ -258,12 +260,13 @@ class HyperliquidResearchBot:
                     if tg.is_configured():
                         tg.notify_trade_closed(c, c.get("exit_price", 0), c.get("pnl", 0), c.get("reason", ""))
 
-            # Execute new signals from strategies (V2 pipeline: features → scoring → firewall)
+            # Execute new signals from strategies (V2 pipeline: features → scoring → firewall → consensus)
             if top_strategies:
                 executed = self.paper_trader.execute_strategy_signals(
                     top_strategies, exchange_agg=self.exchange_agg,
                     options_scanner=self.options_scanner,
                     regime_data=regime_data,
+                    arena=self.arena,
                 )
                 self.logger.info(f"  Executed {len(executed)} new paper trades")
                 # Telegram: notify new trades
@@ -370,8 +373,59 @@ class HyperliquidResearchBot:
                     for t in copy_executed:
                         tg.notify_trade_opened(t, source="copy")
 
-            # Phase 5: Report
-            self.logger.info("Phase 5: Status Update")
+            # Phase 4c: Feed closed trade outcomes to Alpha Arena
+            if closed:
+                for c in closed:
+                    try:
+                        stype = c.get("strategy_type", "unknown")
+                        pnl = c.get("pnl", 0)
+                        entry = c.get("entry_price", 1)
+                        size = 1
+                        return_pct = pnl / max(entry * size, 1)
+                        self.arena.record_trade_for_strategy(stype, pnl, return_pct)
+                    except Exception:
+                        pass
+
+            # Phase 5: Alpha Arena Cycle
+            self.logger.info("Phase 5: Alpha Arena")
+            try:
+                # Fetch historical candles for backtesting new agents
+                arena_candles = None
+                try:
+                    import requests
+                    payload = {
+                        "type": "candleSnapshot",
+                        "req": {
+                            "coin": "BTC",
+                            "interval": "1h",
+                            "startTime": int((datetime.utcnow().timestamp() - 720 * 3600) * 1000),
+                            "endTime": int(datetime.utcnow().timestamp() * 1000),
+                        }
+                    }
+                    resp = requests.post("https://api.hyperliquid.xyz/info",
+                                         json=payload, timeout=15)
+                    if resp.status_code == 200:
+                        raw = resp.json()
+                        if isinstance(raw, list) and len(raw) >= 50:
+                            arena_candles = [
+                                {"open": float(c.get("o", 0)), "high": float(c.get("h", 0)),
+                                 "low": float(c.get("l", 0)), "close": float(c.get("c", 0)),
+                                 "volume": float(c.get("v", 0))}
+                                for c in raw
+                            ]
+                except Exception:
+                    pass
+
+                self.arena.run_cycle(historical_candles=arena_candles)
+                stats = self.arena.get_stats()
+                self.logger.info(f"  Arena: {stats['active_agents']} active, "
+                               f"{stats['champions']} champions, "
+                               f"PnL=${stats['total_arena_pnl']:.2f}")
+            except Exception as e:
+                self.logger.warning(f"  Arena error: {e}")
+
+            # Phase 6: Report
+            self.logger.info("Phase 6: Status Update")
             status = self.reporter.print_live_status()
             print(status)
 
