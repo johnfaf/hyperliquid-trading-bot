@@ -42,6 +42,7 @@ from src.kelly_sizing import KellySizer
 from src.trade_memory import TradeMemory
 from src.calibration import CalibrationTracker
 from src.llm_filter import LLMFilter
+from src.signal_processor import SignalProcessor, ArenaIncubator
 from src import telegram_bot as tg
 
 # ─── Logging Setup ─────────────────────────────────────────────
@@ -118,6 +119,8 @@ class HyperliquidResearchBot:
         self.trade_memory = TradeMemory()
         self.calibration = CalibrationTracker()
         self.llm_filter = LLMFilter()
+        self.signal_processor = SignalProcessor()
+        self.arena_incubator = ArenaIncubator()
 
         # Bootstrap Kelly from existing agent scorer history
         self.kelly_sizer.load_from_agent_scorer(self.agent_scorer)
@@ -154,6 +157,8 @@ class HyperliquidResearchBot:
                 calibration=self.calibration,
                 llm_filter=self.llm_filter,
                 liquidation_strategy=self.liquidation_strategy,
+                signal_processor=self.signal_processor,
+                arena_incubator=self.arena_incubator,
             )
             self.dashboard = start_dashboard(options_scanner=self.options_scanner)
             self.logger.info("Unified dashboard started (main + options flow on same port).")
@@ -360,7 +365,7 @@ class HyperliquidResearchBot:
 
             # Phase 4: Paper trade top strategies (regime-filtered)
             self.logger.info("Phase 4: Paper Trading (regime-aware)")
-            top_strategies = self.scorer.get_top_strategies(n=20)
+            top_strategies = self.scorer.get_top_strategies(n=50)
 
             # Filter strategies by regime — pause those that don't fit
             if regime_data:
@@ -368,6 +373,13 @@ class HyperliquidResearchBot:
                     top_strategies, regime_data
                 )
                 self.logger.info(f"  Post-regime filter: {len(top_strategies)} strategies active")
+
+            # V3: Signal Processing — dedup, conflict resolution, compression
+            self.logger.info("Phase 4 pre-process: Signal Processor")
+            top_strategies = self.signal_processor.process(
+                top_strategies, regime_data=regime_data
+            )
+            self.logger.info(f"  Post-signal-processor: {len(top_strategies)} strategies")
 
             # Check existing positions first (V2: outcomes auto-feed to agent scorer + firewall)
             closed = self.paper_trader.check_open_positions()
@@ -680,6 +692,21 @@ class HyperliquidResearchBot:
                 llm_stats = self.llm_filter.get_stats()
                 self.logger.info(f"  LLM Filter: {llm_stats['total_filtered']} filtered, "
                                f"pass rate={llm_stats['pass_rate']:.0%}")
+            except Exception:
+                pass
+            try:
+                sp_stats = self.signal_processor.get_stats()
+                self.logger.info(f"  SignalProcessor: {sp_stats['total_in']} in → {sp_stats['total_out']} out "
+                               f"(reduction={sp_stats['reduction_rate']:.0%}, "
+                               f"culled={sp_stats['culled']}, deduped={sp_stats['deduped']}, "
+                               f"conflicts={sp_stats['conflicts_resolved']})")
+            except Exception:
+                pass
+            try:
+                inc_stats = self.arena_incubator.get_stats()
+                self.logger.info(f"  Incubator: {inc_stats['currently_incubating']} incubating, "
+                               f"{inc_stats['total_promoted']} promoted, "
+                               f"{inc_stats['total_rejected']} rejected")
             except Exception:
                 pass
 

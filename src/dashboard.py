@@ -153,18 +153,27 @@ def _get_v2_metrics(conn) -> Dict:
     return v2
 
 
-# Module-level references for V2 components (set by set_v2_components)
+# Module-level references for V2 + V2.5 + V3 components (set by set_v2_components)
 _firewall = None
 _regime_detector = None
 _arena = None
+_kelly_sizer = None
+_trade_memory = None
+_calibration = None
+_llm_filter = None
+_liquidation_strategy = None
+_signal_processor = None
+_arena_incubator = None
 
 
 def set_v2_components(firewall=None, regime_detector=None, arena=None,
                        kelly_sizer=None, trade_memory=None, calibration=None,
-                       llm_filter=None, liquidation_strategy=None):
-    """Set V2 + V2.5 component references for dashboard metrics."""
-    global _firewall, _regime_detector, _arena
-    global _kelly_sizer, _trade_memory, _calibration, _llm_filter, _liquidation_strategy
+                       llm_filter=None, liquidation_strategy=None,
+                       signal_processor=None, arena_incubator=None):
+    """Set V2 + V2.5 + V3 component references for dashboard metrics."""
+    global _firewall, _regime_detector, _arena  # noqa: PLW0603
+    global _kelly_sizer, _trade_memory, _calibration, _llm_filter, _liquidation_strategy  # noqa
+    global _signal_processor, _arena_incubator  # noqa
     _firewall = firewall
     _regime_detector = regime_detector
     _arena = arena
@@ -173,6 +182,8 @@ def set_v2_components(firewall=None, regime_detector=None, arena=None,
     _calibration = calibration
     _llm_filter = llm_filter
     _liquidation_strategy = liquidation_strategy
+    _signal_processor = signal_processor
+    _arena_incubator = arena_incubator
 
 
 DASHBOARD_HTML = """<!DOCTYPE html>
@@ -619,6 +630,16 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 try:
                     if _liquidation_strategy:
                         v25["lcrs"] = _liquidation_strategy.get_stats()
+                except Exception:
+                    pass
+                try:
+                    if _signal_processor:
+                        v25["signal_processor"] = _signal_processor.get_stats()
+                except Exception:
+                    pass
+                try:
+                    if _arena_incubator:
+                        v25["incubator"] = _arena_incubator.get_stats()
                 except Exception:
                     pass
                 if v25:
