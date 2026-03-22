@@ -21,6 +21,7 @@ from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(__file__))
 import config
+from src import database as db
 from src.database import init_db, restore_from_json, backup_to_json
 from src.trader_discovery import TraderDiscovery
 from src.strategy_identifier import StrategyIdentifier
@@ -28,7 +29,7 @@ from src.strategy_scorer import StrategyScorer
 from src.paper_trader import PaperTrader
 from src.copy_trader import CopyTrader
 from src.reporter import Reporter
-from src.dashboard import start_dashboard
+from src.dashboard import start_dashboard, set_v2_components
 from src.exchange_aggregator import ExchangeAggregator
 from src.options_flow import OptionsFlowScanner
 from src.regime_detector import RegimeDetector
@@ -104,7 +105,10 @@ class HyperliquidResearchBot:
         self.firewall = DecisionFirewall()
         self.agent_scorer = AgentScorer()
         self.feature_engine = FeatureEngine()
-        self.copy_trader = CopyTrader()
+        self.copy_trader = CopyTrader(
+            firewall=self.firewall,
+            agent_scorer=self.agent_scorer,
+        )
         self.reporter = Reporter()
 
         # Paper trader with V2 components wired in
@@ -116,6 +120,7 @@ class HyperliquidResearchBot:
 
         # Start the unified web dashboard (main + options on same port)
         try:
+            set_v2_components(firewall=self.firewall, regime_detector=self.regime_detector)
             self.dashboard = start_dashboard(options_scanner=self.options_scanner)
             self.logger.info("Unified dashboard started (main + options flow on same port).")
         except Exception as e:
@@ -266,11 +271,100 @@ class HyperliquidResearchBot:
                     for t in executed:
                         tg.notify_trade_opened(t, source="strategy")
 
-            # Phase 4b: Copy trading - mirror top trader positions
-            self.logger.info("Phase 4b: Copy Trading")
+            # Phase 4a2: Options flow standalone trades (high conviction → direct trade)
+            self.logger.info("Phase 4a2: Options Flow Trades")
+            try:
+                from src.signal_schema import signal_from_options_flow
+                options_executed = []
+                for conv in (getattr(self.options_scanner, 'top_convictions', None) or []):
+                    if conv.get("conviction_pct", 0) >= 70:  # Only very high conviction
+                        flow_signal = signal_from_options_flow(
+                            ticker=conv["ticker"],
+                            direction=conv["direction"],
+                            net_flow=conv["net_flow"],
+                            prints=conv["total_prints"],
+                            conviction_pct=conv["conviction_pct"],
+                        )
+                        # Set reasonable sizing
+                        flow_signal.position_pct = 0.04  # 4% per options flow trade (conservative)
+                        flow_signal.leverage = 2.0
+
+                        # Get entry price
+                        price = float(mids.get(conv["ticker"], 0))
+                        if price <= 0:
+                            continue
+                        flow_signal.entry_price = price
+
+                        # Route through firewall
+                        passed, reason = self.firewall.validate(
+                            flow_signal, regime_data=regime_data,
+                            open_positions=db.get_open_paper_trades(),
+                        )
+                        if not passed:
+                            self.logger.info(f"  Firewall rejected options flow {conv['ticker']}: {reason}")
+                            continue
+
+                        # Record with agent scorer
+                        source_key = "options_flow"
+                        signal_id = self.agent_scorer.record_signal(source_key, {
+                            "coin": conv["ticker"],
+                            "side": flow_signal.side.value,
+                            "confidence": flow_signal.confidence,
+                        })
+
+                        # Execute as paper trade
+                        account = db.get_paper_account()
+                        if account:
+                            size_usd = account["balance"] * flow_signal.effective_size
+                            size = size_usd / price
+                            side = flow_signal.side.value
+
+                            if side == "long":
+                                sl = price * (1 - 0.05)
+                                tp = price * (1 + 0.10)
+                            else:
+                                sl = price * (1 + 0.05)
+                                tp = price * (1 - 0.10)
+
+                            trade_id = db.open_paper_trade(
+                                strategy_id=None,
+                                coin=conv["ticker"],
+                                side=side,
+                                entry_price=price,
+                                size=size,
+                                leverage=2,
+                                stop_loss=round(sl, 2),
+                                take_profit=round(tp, 2),
+                                metadata={
+                                    "source": "options_flow",
+                                    "conviction": conv["conviction_pct"],
+                                    "net_flow": conv["net_flow"],
+                                    "prints": conv["total_prints"],
+                                    "signal_id": signal_id,
+                                },
+                            )
+                            self.logger.info(f"  Options flow trade: {side.upper()} {conv['ticker']} "
+                                           f"@ ${price:,.2f} (conviction: {conv['conviction_pct']}%)")
+                            options_executed.append({"id": trade_id, "coin": conv["ticker"], "side": side})
+
+                            if tg.is_configured():
+                                tg.notify_trade_opened(
+                                    {"coin": conv["ticker"], "side": side, "entry_price": price},
+                                    source="options_flow"
+                                )
+
+                if options_executed:
+                    self.logger.info(f"  Executed {len(options_executed)} options flow trades")
+            except Exception as e:
+                self.logger.warning(f"  Options flow trading error: {e}")
+
+            # Phase 4b: Copy trading - mirror top trader positions (V2: firewall gated)
+            self.logger.info("Phase 4b: Copy Trading (V2)")
             copy_signals = self.copy_trader.scan_top_traders(top_n=10)
             if copy_signals:
-                copy_executed = self.copy_trader.execute_copy_signals(copy_signals)
+                copy_executed = self.copy_trader.execute_copy_signals(
+                    copy_signals, regime_data=regime_data
+                )
                 self.logger.info(f"  Executed {len(copy_executed)} copy trades")
                 if tg.is_configured():
                     for t in copy_executed:

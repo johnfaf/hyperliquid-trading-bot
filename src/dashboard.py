@@ -13,6 +13,7 @@ import sqlite3
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime
+from typing import Dict
 from urllib.parse import urlparse, parse_qs
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -117,9 +118,51 @@ def get_dashboard_data():
             "type_distribution": type_dist,
             "research_logs": logs,
             "score_history": score_history,
+            "v2": _get_v2_metrics(conn),
         }
     finally:
         conn.close()
+
+
+def _get_v2_metrics(conn) -> Dict:
+    """Collect V2 pipeline metrics (firewall, agent scores, regime)."""
+    v2 = {
+        "firewall": {},
+        "agent_scores": [],
+        "regime": {},
+    }
+
+    try:
+        # Firewall stats — pulled from the global firewall instance if available
+        from src.decision_firewall import DecisionFirewall
+        # We'll populate this from the /api/data handler if firewall is set
+    except Exception:
+        pass
+
+    try:
+        # Agent scores from DB
+        rows = conn.execute(
+            "SELECT source_key, total_signals, correct_signals, total_pnl, "
+            "accuracy, sharpe, dynamic_weight, last_updated "
+            "FROM agent_scores ORDER BY dynamic_weight DESC LIMIT 20"
+        ).fetchall()
+        v2["agent_scores"] = [dict(r) for r in rows]
+    except Exception:
+        pass  # Table may not exist yet
+
+    return v2
+
+
+# Module-level references for V2 components (set by set_v2_components)
+_firewall = None
+_regime_detector = None
+
+
+def set_v2_components(firewall=None, regime_detector=None):
+    """Set V2 component references for dashboard metrics."""
+    global _firewall, _regime_detector
+    _firewall = firewall
+    _regime_detector = regime_detector
 
 
 DASHBOARD_HTML = """<!DOCTYPE html>
@@ -219,6 +262,26 @@ canvas{width:100%!important;height:200px!important}
 <h2>Research Activity Log</h2>
 <table><thead><tr><th>Time</th><th>Type</th><th>Summary</th><th>Traders</th><th>Strategies</th></tr></thead>
 <tbody id="logs-table"></tbody></table>
+</div>
+
+<div class="section" style="border-top:2px solid #00d4aa;padding-top:16px;margin-top:24px">
+<h2 style="color:#00d4aa">V2 Pipeline Metrics</h2>
+<div class="grid" id="v2-cards"></div>
+
+<div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
+<div>
+<h2>Decision Firewall</h2>
+<div id="firewall-stats" style="font-size:0.85em;color:#7b8ab8">Loading...</div>
+</div>
+<div>
+<h2>Agent Scores (Signal Sources)</h2>
+<table><thead><tr><th>Source</th><th>Signals</th><th>Accuracy</th><th>Sharpe</th><th>Weight</th><th>PnL</th></tr></thead>
+<tbody id="agent-scores"></tbody></table>
+</div>
+</div>
+
+<h2>Per-Coin Regime</h2>
+<div id="regime-grid" class="grid"></div>
 </div>
 
 <script>
@@ -354,9 +417,63 @@ async function refresh(){
     renderEquityChart(d.closed_trades);
     renderTypeChart(d.type_distribution);
     renderLogs(d.research_logs);
+    if(d.v2) renderV2(d.v2);
   } catch(e) {
     console.error('Refresh error:', e);
   }
+}
+
+function renderV2(v2) {
+  // V2 summary cards
+  const fw = v2.firewall || {};
+  const passRate = fw.total_signals > 0 ? (fw.passed / fw.total_signals * 100).toFixed(1) : '—';
+  const regimeCoins = Object.keys(v2.regime || {});
+  const mainRegime = regimeCoins.length > 0 ? (v2.regime[regimeCoins[0]] || {}).regime || '?' : 'unknown';
+
+  const cards = [
+    {label:'Firewall Pass Rate', value: passRate + '%', cls: Number(passRate) >= 50 ? 'green' : 'yellow', sub: `${fw.passed||0}/${fw.total_signals||0} signals`},
+    {label:'Signals Rejected', value: (fw.total_signals||0) - (fw.passed||0), cls:'red'},
+    {label:'Agent Sources', value: (v2.agent_scores||[]).length, cls:'blue'},
+    {label:'Market Regime', value: mainRegime.replace('_',' ').toUpperCase(), cls: mainRegime.includes('up') ? 'green' : mainRegime.includes('down') ? 'red' : 'yellow'},
+  ];
+  document.getElementById('v2-cards').innerHTML = cards.map(c=>`
+    <div class="card"><div class="label">${c.label}</div>
+    <div class="value ${c.cls||''}">${c.value}</div>
+    ${c.sub?`<div class="sub">${c.sub}</div>`:''}</div>`).join('');
+
+  // Firewall breakdown
+  if(fw.total_signals > 0) {
+    const reasons = ['confidence','risk','regime','conflict','cooldown','accuracy','drawdown','schema']
+      .filter(r => fw['rejected_'+r] > 0)
+      .map(r => `<span style="margin-right:12px"><span class="badge" style="background:#ff475733;color:#ff4757">${r}</span> ${fw['rejected_'+r]}</span>`);
+    document.getElementById('firewall-stats').innerHTML =
+      `<div style="margin-bottom:8px">Total: ${fw.total_signals} | Passed: <span class="green">${fw.passed}</span> | Rejected: <span class="red">${fw.total_signals - fw.passed}</span></div>` +
+      (reasons.length ? `<div>Rejection reasons: ${reasons.join('')}</div>` : '<div class="green">No rejections</div>');
+  }
+
+  // Agent scores table
+  const scores = v2.agent_scores || [];
+  document.getElementById('agent-scores').innerHTML = scores.length ? scores.map(s=>{
+    const accCls = s.accuracy >= 0.5 ? 'green' : s.accuracy >= 0.3 ? 'yellow' : 'red';
+    const wCls = s.dynamic_weight >= 0.6 ? 'green' : s.dynamic_weight >= 0.3 ? 'yellow' : 'red';
+    return `<tr><td><code>${s.source_key}</code></td><td>${s.total_signals}</td>
+      <td class="${accCls}">${(s.accuracy*100).toFixed(1)}%</td>
+      <td>${s.sharpe ? s.sharpe.toFixed(2) : '—'}</td>
+      <td class="${wCls}">${(s.dynamic_weight*100).toFixed(0)}%</td>
+      <td class="${pnlClass(s.total_pnl)}">${fmtUsd(s.total_pnl)}</td></tr>`;
+  }).join('') : '<tr><td colspan="6" style="color:#555">No agent data yet — scores build as trades complete</td></tr>';
+
+  // Regime per coin
+  const regime = v2.regime || {};
+  const coins = Object.entries(regime);
+  document.getElementById('regime-grid').innerHTML = coins.length ? coins.map(([coin, r])=>{
+    const cls = r.regime.includes('up') ? 'green' : r.regime.includes('down') ? 'red' : r.regime === 'volatile' ? 'yellow' : 'blue';
+    return `<div class="card" style="text-align:center">
+      <div class="label">${coin}</div>
+      <div class="value ${cls}" style="font-size:1em">${r.regime.replace('_',' ').toUpperCase()}</div>
+      <div class="sub">ADX: ${r.adx} | ATR: ${(r.atr_pct*100).toFixed(1)}% | Conf: ${(r.confidence*100).toFixed(0)}%</div>
+    </div>`;
+  }).join('') : '<div style="color:#555;grid-column:1/-1">Regime data available after first full cycle</div>';
 }
 
 refresh();
@@ -388,6 +505,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
         elif parsed.path == "/api/data":
             try:
                 data = get_dashboard_data()
+                # Inject live V2 metrics
+                if _firewall:
+                    data["v2"]["firewall"] = _firewall.get_stats()
+                if _regime_detector and _regime_detector._cache:
+                    data["v2"]["regime"] = {
+                        coin: state.to_dict()
+                        for coin, state in _regime_detector._cache.items()
+                    }
                 self._json_response(data)
             except Exception as e:
                 self._json_response({"error": str(e)}, code=500)

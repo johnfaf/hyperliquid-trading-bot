@@ -1,7 +1,10 @@
 """
-Copy Trading Engine
+Copy Trading Engine (V2)
+========================
 Monitors top traders' live positions on Hyperliquid and mirrors their new trades
 as paper trades. Detects when top traders open/close positions and generates signals.
+
+V2: Signals routed through DecisionFirewall and tracked by AgentScorer.
 """
 import logging
 import json
@@ -13,6 +16,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import config
 from src import database as db
 from src import hyperliquid_client as hl
+from src.signal_schema import TradeSignal, SignalSide, SignalSource, RiskParams, signal_from_copy_trade
+from src.decision_firewall import DecisionFirewall
+from src.agent_scoring import AgentScorer
 
 logger = logging.getLogger(__name__)
 
@@ -20,10 +26,13 @@ logger = logging.getLogger(__name__)
 class CopyTrader:
     """Monitors top traders and mirrors their position changes."""
 
-    def __init__(self):
+    def __init__(self, firewall: Optional[DecisionFirewall] = None,
+                 agent_scorer: Optional[AgentScorer] = None):
         # Cache of last-known positions per trader: {address: {coin: position_dict}}
         self._position_cache: Dict[str, Dict[str, Dict]] = {}
         self._copy_count = 0
+        self.firewall = firewall
+        self.agent_scorer = agent_scorer
 
     def scan_top_traders(self, top_n: int = 10) -> List[Dict]:
         """
@@ -146,9 +155,11 @@ class CopyTrader:
 
         return signals
 
-    def execute_copy_signals(self, signals: List[Dict]) -> List[Dict]:
+    def execute_copy_signals(self, signals: List[Dict],
+                              regime_data: Optional[Dict] = None) -> List[Dict]:
         """
         Execute copy-trade signals as paper trades.
+        V2: Routes open signals through DecisionFirewall before execution.
         Returns list of executed trades.
         """
         if not signals:
@@ -165,12 +176,45 @@ class CopyTrader:
         for signal in signals:
             try:
                 if signal["type"] == "copy_close":
-                    # Close any matching open trades for this coin
                     closed = self._close_copy_trades(signal, open_trades, mids)
                     executed.extend(closed)
                     continue
 
                 if signal["type"] in ("copy_open", "copy_scale_in", "copy_flip"):
+                    # V2: Convert to TradeSignal and validate through firewall
+                    if self.firewall and signal.get("price", 0) > 0:
+                        trade_signal = signal_from_copy_trade(
+                            trader_address=signal.get("source_trader", ""),
+                            coin=signal["coin"],
+                            side=signal["side"],
+                            entry_price=signal["price"],
+                            confidence=signal.get("confidence", 0.5),
+                        )
+                        trade_signal.leverage = signal.get("leverage", 2)
+
+                        # Apply agent scoring weight
+                        if self.agent_scorer:
+                            source_key = f"copy_trade:{signal.get('source_trader', 'unknown')}"
+                            weight = self.agent_scorer.get_weight(source_key)
+                            trade_signal.confidence = trade_signal.confidence * 0.6 + weight * 0.4
+
+                        passed, reason = self.firewall.validate(
+                            trade_signal, regime_data=regime_data, open_positions=open_trades
+                        )
+                        if not passed:
+                            logger.info(f"Firewall rejected copy {signal['side']} {signal['coin']}: {reason}")
+                            continue
+
+                        # Record signal with agent scorer
+                        if self.agent_scorer:
+                            source_key = f"copy_trade:{signal.get('source_trader', 'unknown')}"
+                            signal_id = self.agent_scorer.record_signal(source_key, {
+                                "coin": signal["coin"], "side": signal["side"],
+                                "confidence": trade_signal.confidence,
+                            })
+                            signal["_signal_id"] = signal_id
+                            signal["_source_key"] = source_key
+
                     trade = self._open_copy_trade(account, signal, open_trades)
                     if trade:
                         executed.append(trade)
@@ -181,7 +225,7 @@ class CopyTrader:
 
         if executed:
             self._copy_count += len(executed)
-            logger.info(f"Copy-trader executed {len(executed)} trades (total: {self._copy_count})")
+            logger.info(f"Copy-trader executed {len(executed)} trades via V2 (total: {self._copy_count})")
 
         return executed
 
@@ -289,6 +333,21 @@ class CopyTrader:
                     f"Copy trade closed (source exited): {trade['coin']} "
                     f"PnL=${pnl:,.2f}"
                 )
+
+                # V2: Feed outcome to agent scorer and firewall
+                if self.agent_scorer and meta.get("source_trader"):
+                    try:
+                        source_key = f"copy_trade:{meta['source_trader']}"
+                        return_pct = pnl / (trade["entry_price"] * trade["size"] * trade["leverage"]) if trade["entry_price"] > 0 else 0
+                        self.agent_scorer.record_outcome(source_key, meta.get("signal_id", ""), pnl, return_pct)
+                    except Exception:
+                        pass
+                if self.firewall:
+                    try:
+                        self.firewall.record_trade_outcome(trade["coin"], pnl)
+                    except Exception:
+                        pass
+
                 closed.append({"trade_id": trade["id"], "coin": trade["coin"], "pnl": pnl})
 
         return closed
