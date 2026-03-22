@@ -19,6 +19,9 @@ from src import hyperliquid_client as hl
 from src.signal_schema import TradeSignal, SignalSide, SignalSource, RiskParams, signal_from_copy_trade
 from src.decision_firewall import DecisionFirewall
 from src.agent_scoring import AgentScorer
+from src.kelly_sizing import KellySizer
+from src.trade_memory import TradeMemory
+from src.calibration import CalibrationTracker
 
 logger = logging.getLogger(__name__)
 
@@ -27,12 +30,18 @@ class CopyTrader:
     """Monitors top traders and mirrors their position changes."""
 
     def __init__(self, firewall: Optional[DecisionFirewall] = None,
-                 agent_scorer: Optional[AgentScorer] = None):
+                 agent_scorer: Optional[AgentScorer] = None,
+                 kelly_sizer: Optional[KellySizer] = None,
+                 trade_memory: Optional[TradeMemory] = None,
+                 calibration: Optional[CalibrationTracker] = None):
         # Cache of last-known positions per trader: {address: {coin: position_dict}}
         self._position_cache: Dict[str, Dict[str, Dict]] = {}
         self._copy_count = 0
         self.firewall = firewall
         self.agent_scorer = agent_scorer
+        self.kelly_sizer = kelly_sizer
+        self.trade_memory = trade_memory
+        self.calibration = calibration
 
     def scan_top_traders(self, top_n: int = 10) -> List[Dict]:
         """
@@ -231,8 +240,20 @@ class CopyTrader:
 
     def _open_copy_trade(self, account: Dict, signal: Dict, open_trades: List) -> Optional[Dict]:
         """Open a paper trade based on a copy signal."""
-        # Position sizing: smaller for copy trades (5% of balance)
-        size_usd = account["balance"] * 0.05 * signal.get("confidence", 0.5)
+        # Kelly-based position sizing if available, else default 5%
+        if self.kelly_sizer:
+            try:
+                source_key = f"copy_trade:{signal.get('source_trader', 'unknown')}"
+                sizing = self.kelly_sizer.get_sizing(
+                    strategy_key=source_key,
+                    account_balance=account["balance"],
+                    signal_confidence=signal.get("confidence", 0.5),
+                )
+                size_usd = sizing.position_usd
+            except Exception:
+                size_usd = account["balance"] * 0.05 * signal.get("confidence", 0.5)
+        else:
+            size_usd = account["balance"] * 0.05 * signal.get("confidence", 0.5)
         price = signal["price"]
         if price <= 0:
             return None
@@ -335,16 +356,64 @@ class CopyTrader:
                 )
 
                 # V2: Feed outcome to agent scorer and firewall
+                return_pct = pnl / (trade["entry_price"] * trade["size"] * trade["leverage"]) if trade["entry_price"] > 0 else 0
+                source_key = f"copy_trade:{meta.get('source_trader', 'unknown')}"
+
                 if self.agent_scorer and meta.get("source_trader"):
                     try:
-                        source_key = f"copy_trade:{meta['source_trader']}"
-                        return_pct = pnl / (trade["entry_price"] * trade["size"] * trade["leverage"]) if trade["entry_price"] > 0 else 0
                         self.agent_scorer.record_outcome(source_key, meta.get("signal_id", ""), pnl, return_pct)
                     except Exception:
                         pass
                 if self.firewall:
                     try:
                         self.firewall.record_trade_outcome(trade["coin"], pnl)
+                    except Exception:
+                        pass
+
+                # Feed to Kelly sizer
+                if self.kelly_sizer:
+                    try:
+                        self.kelly_sizer.record_outcome(
+                            strategy_key=source_key,
+                            pnl=pnl,
+                            entry_price=trade["entry_price"],
+                            size=trade["size"],
+                            leverage=trade.get("leverage", 1),
+                        )
+                    except Exception:
+                        pass
+
+                # Feed to calibration tracker
+                if self.calibration:
+                    try:
+                        self.calibration.record(
+                            source_key=source_key,
+                            predicted_confidence=meta.get("confidence", 0.5),
+                            actual_win=pnl > 0,
+                            pnl=pnl,
+                            coin=trade["coin"],
+                            side=trade.get("side", ""),
+                        )
+                    except Exception:
+                        pass
+
+                # Feed to trade memory
+                if self.trade_memory:
+                    try:
+                        self.trade_memory.record_trade(
+                            trade_id=str(trade["id"]),
+                            coin=trade["coin"],
+                            side=trade.get("side", ""),
+                            strategy_type="copy_trade",
+                            entry_price=trade["entry_price"],
+                            exit_price=current_price,
+                            pnl=pnl,
+                            return_pct=return_pct,
+                            opened_at=trade.get("opened_at", ""),
+                            closed_at="",
+                            confidence=meta.get("confidence", 0),
+                            source="copy_trade",
+                        )
                     except Exception:
                         pass
 

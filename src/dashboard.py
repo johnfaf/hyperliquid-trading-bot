@@ -159,12 +159,20 @@ _regime_detector = None
 _arena = None
 
 
-def set_v2_components(firewall=None, regime_detector=None, arena=None):
-    """Set V2 component references for dashboard metrics."""
+def set_v2_components(firewall=None, regime_detector=None, arena=None,
+                       kelly_sizer=None, trade_memory=None, calibration=None,
+                       llm_filter=None, liquidation_strategy=None):
+    """Set V2 + V2.5 component references for dashboard metrics."""
     global _firewall, _regime_detector, _arena
+    global _kelly_sizer, _trade_memory, _calibration, _llm_filter, _liquidation_strategy
     _firewall = firewall
     _regime_detector = regime_detector
     _arena = arena
+    _kelly_sizer = kelly_sizer
+    _trade_memory = trade_memory
+    _calibration = calibration
+    _llm_filter = llm_filter
+    _liquidation_strategy = liquidation_strategy
 
 
 DASHBOARD_HTML = """<!DOCTYPE html>
@@ -580,6 +588,42 @@ class DashboardHandler(BaseHTTPRequestHandler):
                         "stats": _arena.get_stats(),
                         "leaderboard": _arena.get_leaderboard(top_n=15),
                     }
+
+                # V2.5 metrics
+                v25 = {}
+                try:
+                    if _kelly_sizer:
+                        v25["kelly"] = _kelly_sizer.get_all_sizing_stats()
+                except Exception:
+                    pass
+                try:
+                    if _trade_memory:
+                        v25["memory"] = _trade_memory.get_stats()
+                except Exception:
+                    pass
+                try:
+                    if _calibration:
+                        v25["calibration"] = {
+                            "global_ece": _calibration.get_ece("global"),
+                            "quality": _calibration._quality_label(_calibration.get_ece("global")),
+                            "curve": _calibration.get_calibration_curve("global"),
+                            "sources": _calibration.get_all_stats(),
+                        }
+                except Exception:
+                    pass
+                try:
+                    if _llm_filter:
+                        v25["llm_filter"] = _llm_filter.get_stats()
+                except Exception:
+                    pass
+                try:
+                    if _liquidation_strategy:
+                        v25["lcrs"] = _liquidation_strategy.get_stats()
+                except Exception:
+                    pass
+                if v25:
+                    data["v25"] = v25
+
                 self._json_response(data)
             except Exception as e:
                 self._json_response({"error": str(e)}, code=500)

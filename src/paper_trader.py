@@ -23,6 +23,10 @@ from src.signal_schema import TradeSignal, SignalSide, SignalSource, RiskParams,
 from src.decision_firewall import DecisionFirewall
 from src.agent_scoring import AgentScorer
 from src.features import FeatureEngine
+from src.kelly_sizing import KellySizer
+from src.trade_memory import TradeMemory
+from src.calibration import CalibrationTracker
+from src.llm_filter import LLMFilter
 
 logger = logging.getLogger(__name__)
 
@@ -32,10 +36,18 @@ class PaperTrader:
 
     def __init__(self, firewall: Optional[DecisionFirewall] = None,
                  agent_scorer: Optional[AgentScorer] = None,
-                 feature_engine: Optional[FeatureEngine] = None):
+                 feature_engine: Optional[FeatureEngine] = None,
+                 kelly_sizer: Optional[KellySizer] = None,
+                 trade_memory: Optional[TradeMemory] = None,
+                 calibration: Optional[CalibrationTracker] = None,
+                 llm_filter: Optional[LLMFilter] = None):
         self.firewall = firewall
         self.agent_scorer = agent_scorer
         self.feature_engine = feature_engine
+        self.kelly_sizer = kelly_sizer
+        self.trade_memory = trade_memory
+        self.calibration = calibration
+        self.llm_filter = llm_filter
         self._ensure_account()
 
     def _ensure_account(self):
@@ -286,6 +298,71 @@ class PaperTrader:
                         trade_signal.confidence = consensus_conf
                     except Exception as e:
                         logger.debug(f"Arena consensus error: {e}")
+
+                # Calibration adjustment — correct miscalibrated confidence
+                if self.calibration:
+                    try:
+                        source_key = f"strategy:{sig.get('strategy_type', 'unknown')}"
+                        adjusted = self.calibration.get_adjustment_factor(
+                            source_key, trade_signal.confidence
+                        )
+                        if abs(adjusted - trade_signal.confidence) > 0.05:
+                            logger.debug(f"Calibration adjust {sig['coin']}: "
+                                       f"{trade_signal.confidence:.2f} → {adjusted:.2f}")
+                        trade_signal.confidence = adjusted
+                    except Exception as e:
+                        logger.debug(f"Calibration error: {e}")
+
+                # Trade memory lookup — check similar past trades
+                if self.trade_memory:
+                    try:
+                        memory_result = self.trade_memory.find_similar(
+                            features=sig.get("features", {}),
+                            coin=sig["coin"],
+                            side=sig["side"],
+                            top_k=8,
+                        )
+                        if memory_result.recommendation == "avoid":
+                            logger.info(f"Memory BLOCKED {sig['side']} {sig['coin']}: {memory_result.reason}")
+                            continue
+                        elif memory_result.recommendation == "caution":
+                            trade_signal.confidence *= 0.8
+                            logger.debug(f"Memory caution for {sig['coin']}: {memory_result.reason}")
+                    except Exception as e:
+                        logger.debug(f"Trade memory error: {e}")
+                        memory_result = None
+
+                # LLM Filter — final contextual check
+                if self.llm_filter:
+                    try:
+                        llm_context = {
+                            "regime_data": regime_data,
+                            "memory_result": memory_result.to_dict() if hasattr(memory_result, 'to_dict') and memory_result else None,
+                            "open_positions": open_trades,
+                            "all_signals": raw_signals,
+                        }
+                        llm_approved, llm_conf, llm_reason = self.llm_filter.filter(sig, llm_context)
+                        if not llm_approved:
+                            logger.info(f"LLM filter BLOCKED {sig['side']} {sig['coin']}: {llm_reason}")
+                            continue
+                        trade_signal.confidence = llm_conf
+                    except Exception as e:
+                        logger.debug(f"LLM filter error: {e}")
+
+                # Kelly sizing — mathematically optimal position size
+                if self.kelly_sizer:
+                    try:
+                        sizing = self.kelly_sizer.get_sizing(
+                            strategy_key=sig.get("strategy_type", "unknown"),
+                            account_balance=account["balance"],
+                            signal_confidence=trade_signal.confidence,
+                        )
+                        trade_signal.position_pct = sizing.position_pct
+                        if sizing.has_edge:
+                            logger.debug(f"Kelly [{sig.get('strategy_type')}]: {sizing.position_pct:.1%} "
+                                       f"(WR={sizing.win_rate:.0%}, R:R={sizing.reward_risk_ratio:.2f})")
+                    except Exception as e:
+                        logger.debug(f"Kelly sizing error: {e}")
 
                 # Record signal with agent scorer
                 signal_id = ""
@@ -639,9 +716,58 @@ class PaperTrader:
                     except Exception:
                         pass
 
-                # Feed outcome to Alpha Arena (all agents of matching strategy type learn)
-                # The arena reference is passed at execution time, not stored
-                # We store strategy_type in metadata for this purpose
+                # Feed outcome to Kelly sizer
+                if self.kelly_sizer:
+                    try:
+                        self.kelly_sizer.record_outcome(
+                            strategy_key=strategy_type,
+                            pnl=pnl,
+                            entry_price=trade["entry_price"],
+                            size=trade["size"],
+                            leverage=trade.get("leverage", 1),
+                        )
+                    except Exception:
+                        pass
+
+                # Feed outcome to calibration tracker
+                if self.calibration:
+                    try:
+                        source_key = f"strategy:{strategy_type}"
+                        predicted_conf = trade_meta.get("confidence", 0.5)
+                        self.calibration.record(
+                            source_key=source_key,
+                            predicted_confidence=predicted_conf,
+                            actual_win=pnl > 0,
+                            pnl=pnl,
+                            coin=trade["coin"],
+                            side=trade["side"],
+                        )
+                    except Exception:
+                        pass
+
+                # Feed outcome to trade memory
+                if self.trade_memory:
+                    try:
+                        return_pct = pnl / (trade["entry_price"] * trade["size"] * trade.get("leverage", 1)) if trade["entry_price"] > 0 else 0
+                        self.trade_memory.record_trade(
+                            trade_id=str(trade["id"]),
+                            coin=trade["coin"],
+                            side=trade["side"],
+                            strategy_type=strategy_type,
+                            entry_price=trade["entry_price"],
+                            exit_price=current_price,
+                            pnl=pnl,
+                            return_pct=return_pct,
+                            opened_at=trade.get("opened_at", ""),
+                            closed_at=datetime.utcnow().isoformat(),
+                            confidence=trade_meta.get("confidence", 0),
+                            source="strategy",
+                            regime=trade_meta.get("regime", ""),
+                            setup_type=trade_meta.get("setup_type", strategy_type),
+                            features=trade_meta.get("features", {}),
+                        )
+                    except Exception:
+                        pass
 
                 closed.append({
                     "trade_id": trade["id"],

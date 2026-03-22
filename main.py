@@ -37,6 +37,11 @@ from src.decision_firewall import DecisionFirewall
 from src.agent_scoring import AgentScorer
 from src.features import FeatureEngine
 from src.alpha_arena import AlphaArena
+from src.liquidation_strategy import LiquidationStrategy
+from src.kelly_sizing import KellySizer
+from src.trade_memory import TradeMemory
+from src.calibration import CalibrationTracker
+from src.llm_filter import LLMFilter
 from src import telegram_bot as tg
 
 # ─── Logging Setup ─────────────────────────────────────────────
@@ -106,23 +111,50 @@ class HyperliquidResearchBot:
         self.firewall = DecisionFirewall()
         self.agent_scorer = AgentScorer()
         self.feature_engine = FeatureEngine()
+
+        # V2.5: New modules — liquidation strategy, Kelly sizing, trade memory, calibration, LLM filter
+        self.liquidation_strategy = LiquidationStrategy()
+        self.kelly_sizer = KellySizer()
+        self.trade_memory = TradeMemory()
+        self.calibration = CalibrationTracker()
+        self.llm_filter = LLMFilter()
+
+        # Bootstrap Kelly from existing agent scorer history
+        self.kelly_sizer.load_from_agent_scorer(self.agent_scorer)
+
         self.copy_trader = CopyTrader(
             firewall=self.firewall,
             agent_scorer=self.agent_scorer,
+            kelly_sizer=self.kelly_sizer,
+            trade_memory=self.trade_memory,
+            calibration=self.calibration,
         )
         self.reporter = Reporter()
         self.arena = AlphaArena()
 
-        # Paper trader with V2 components wired in
+        # Paper trader with ALL V2 + V2.5 components wired in
         self.paper_trader = PaperTrader(
             firewall=self.firewall,
             agent_scorer=self.agent_scorer,
             feature_engine=self.feature_engine,
+            kelly_sizer=self.kelly_sizer,
+            trade_memory=self.trade_memory,
+            calibration=self.calibration,
+            llm_filter=self.llm_filter,
         )
 
         # Start the unified web dashboard (main + options on same port)
         try:
-            set_v2_components(firewall=self.firewall, regime_detector=self.regime_detector, arena=self.arena)
+            set_v2_components(
+                firewall=self.firewall,
+                regime_detector=self.regime_detector,
+                arena=self.arena,
+                kelly_sizer=self.kelly_sizer,
+                trade_memory=self.trade_memory,
+                calibration=self.calibration,
+                llm_filter=self.llm_filter,
+                liquidation_strategy=self.liquidation_strategy,
+            )
             self.dashboard = start_dashboard(options_scanner=self.options_scanner)
             self.logger.info("Unified dashboard started (main + options flow on same port).")
         except Exception as e:
@@ -240,6 +272,92 @@ class HyperliquidResearchBot:
             except Exception as e:
                 self.logger.warning(f"  Regime detection error: {e}")
 
+            # Phase 3e: Liquidation Cascade Reversal Strategy
+            self.logger.info("Phase 3e: Liquidation Strategy Scan")
+            lcrs_signals = []
+            try:
+                from src import hyperliquid_client as hl_client
+                mids = hl_client.get_all_mids() or {}
+                lcrs_coins = ["BTC", "ETH", "SOL", "DOGE", "AVAX", "LINK", "ARB",
+                              "OP", "SUI", "APT", "INJ", "SEI"]
+
+                for coin in lcrs_coins:
+                    price = float(mids.get(coin, 0))
+                    if price <= 0:
+                        continue
+                    try:
+                        # Build features for LCRS from regime data + feature engine
+                        lcrs_features = {}
+                        if regime_data and "per_coin" in regime_data:
+                            coin_regime = regime_data["per_coin"].get(coin, {})
+                            lcrs_features["trend_strength"] = coin_regime.get("trend_strength", 0.5)
+                            lcrs_features["volatility"] = coin_regime.get("atr_pct", 0.02)
+                            lcrs_features["volume_ratio"] = coin_regime.get("volume_ratio", 1.0)
+
+                        # Get funding rate from Hyperliquid
+                        try:
+                            import requests
+                            meta_resp = requests.post("https://api.hyperliquid.xyz/info",
+                                json={"type": "metaAndAssetCtxs"}, timeout=10)
+                            if meta_resp.status_code == 200:
+                                meta_data = meta_resp.json()
+                                if isinstance(meta_data, list) and len(meta_data) > 1:
+                                    for asset_ctx in meta_data[1]:
+                                        if isinstance(asset_ctx, dict) and asset_ctx.get("coin") == coin:
+                                            lcrs_features["funding_rate"] = float(asset_ctx.get("funding", 0))
+                                            lcrs_features["oi_change"] = float(asset_ctx.get("openInterest", 0)) * 0.01
+                                            break
+                        except Exception:
+                            pass
+
+                        # Enrich with feature engine data
+                        try:
+                            payload = {
+                                "type": "candleSnapshot",
+                                "req": {
+                                    "coin": coin,
+                                    "interval": "1h",
+                                    "startTime": int((datetime.utcnow().timestamp() - 100 * 3600) * 1000),
+                                    "endTime": int(datetime.utcnow().timestamp() * 1000),
+                                }
+                            }
+                            resp = requests.post("https://api.hyperliquid.xyz/info",
+                                                 json=payload, timeout=10)
+                            if resp.status_code == 200:
+                                raw = resp.json()
+                                if isinstance(raw, list) and len(raw) >= 20:
+                                    candles = [{"open": float(c.get("o", 0)), "high": float(c.get("h", 0)),
+                                                "low": float(c.get("l", 0)), "close": float(c.get("c", 0)),
+                                                "volume": float(c.get("v", 0))} for c in raw]
+                                    feat = self.feature_engine.compute(coin, candles)
+                                    lcrs_features.setdefault("rsi", feat.rsi)
+                                    lcrs_features.setdefault("momentum_score", feat.momentum_score)
+                                    lcrs_features.setdefault("trend_strength", feat.trend_strength)
+                                    lcrs_features.setdefault("volatility", feat.volatility)
+                                    lcrs_features.setdefault("volume_ratio", feat.volume_ratio)
+                                    lcrs_features.setdefault("overall_score", feat.overall_score)
+                                    lcrs_features.setdefault("bollinger_position", feat.bollinger_position)
+                                    # Price change from last 8 candles
+                                    if len(candles) >= 8:
+                                        lcrs_features["price_change"] = (candles[-1]["close"] - candles[-8]["close"]) / candles[-8]["close"]
+                        except Exception:
+                            pass
+
+                        sig = self.liquidation_strategy.generate_signal(coin, lcrs_features, price)
+                        if sig:
+                            lcrs_signals.append(sig)
+                            self.logger.info(f"  LCRS: {sig['side'].upper()} {coin} "
+                                           f"(conf={sig['confidence']:.0%}, type={sig['features'].get('setup_type', '')})")
+                    except Exception as e:
+                        self.logger.debug(f"  LCRS scan error {coin}: {e}")
+
+                if lcrs_signals:
+                    self.logger.info(f"  LCRS found {len(lcrs_signals)} setups")
+                else:
+                    self.logger.info("  LCRS: no setups detected")
+            except Exception as e:
+                self.logger.warning(f"  Liquidation strategy error: {e}")
+
             # Phase 4: Paper trade top strategies (regime-filtered)
             self.logger.info("Phase 4: Paper Trading (regime-aware)")
             top_strategies = self.scorer.get_top_strategies(n=20)
@@ -273,6 +391,101 @@ class HyperliquidResearchBot:
                 if tg.is_configured():
                     for t in executed:
                         tg.notify_trade_opened(t, source="strategy")
+
+            # Phase 4a: Execute LCRS signals through full V2 pipeline
+            if lcrs_signals:
+                self.logger.info("Phase 4a: Liquidation Strategy Execution")
+                try:
+                    # Package LCRS signals as strategies for the paper_trader pipeline
+                    lcrs_executed = []
+                    open_trades = db.get_open_paper_trades()
+                    account = db.get_paper_account()
+
+                    for sig in lcrs_signals:
+                        try:
+                            from src.signal_schema import TradeSignal, SignalSide, SignalSource, RiskParams
+                            trade_signal = TradeSignal(
+                                coin=sig["coin"],
+                                side=SignalSide(sig["side"]),
+                                confidence=sig["confidence"],
+                                source=SignalSource.STRATEGY,
+                                reason=f"LCRS: {sig['features'].get('setup_type', 'unknown')}",
+                                strategy_type="liquidation_reversal",
+                                entry_price=sig["price"],
+                                leverage=sig["leverage"],
+                                position_pct=sig.get("position_pct", 0.06),
+                                risk=RiskParams(
+                                    stop_loss_pct=0.025,
+                                    take_profit_pct=0.05,
+                                ),
+                                regime=regime_data.get("overall_regime", "") if regime_data else "",
+                            )
+
+                            # Full V2 pipeline: firewall → Kelly → memory → LLM filter
+                            if self.firewall:
+                                passed, reason = self.firewall.validate(
+                                    trade_signal, regime_data=regime_data, open_positions=open_trades)
+                                if not passed:
+                                    self.logger.info(f"  LCRS firewall rejected {sig['coin']}: {reason}")
+                                    continue
+
+                            # Kelly sizing
+                            if self.kelly_sizer and account:
+                                sizing = self.kelly_sizer.get_sizing(
+                                    "liquidation_reversal", account["balance"], trade_signal.confidence)
+                                trade_signal.position_pct = sizing.position_pct
+
+                            # Trade memory check
+                            if self.trade_memory:
+                                mem = self.trade_memory.find_similar(
+                                    sig.get("features", {}), coin=sig["coin"], side=sig["side"])
+                                if mem.recommendation == "avoid":
+                                    self.logger.info(f"  LCRS memory blocked {sig['coin']}: {mem.reason}")
+                                    continue
+
+                            # LLM filter
+                            if self.llm_filter:
+                                ctx = {"regime_data": regime_data, "open_positions": open_trades}
+                                approved, adj_conf, reason = self.llm_filter.filter(sig, ctx)
+                                if not approved:
+                                    self.logger.info(f"  LCRS LLM filter blocked {sig['coin']}: {reason}")
+                                    continue
+                                trade_signal.confidence = adj_conf
+
+                            # Execute
+                            if account:
+                                size_usd = account["balance"] * trade_signal.effective_size
+                                size = size_usd / sig["price"]
+
+                                trade_id = db.open_paper_trade(
+                                    strategy_id=None, coin=sig["coin"], side=sig["side"],
+                                    entry_price=sig["price"], size=size, leverage=sig["leverage"],
+                                    stop_loss=sig["stop_loss"], take_profit=sig["take_profit"],
+                                    metadata={
+                                        "source": "liquidation_strategy",
+                                        "strategy_type": "liquidation_reversal",
+                                        "confidence": trade_signal.confidence,
+                                        "setup_type": sig["features"].get("setup_type", ""),
+                                        "features": sig["features"],
+                                    },
+                                )
+                                lcrs_executed.append({"id": trade_id, "coin": sig["coin"], "side": sig["side"]})
+                                self.logger.info(f"  LCRS executed: {sig['side'].upper()} {sig['coin']} "
+                                               f"@ ${sig['price']:,.2f} (conf={trade_signal.confidence:.0%})")
+
+                                if tg.is_configured():
+                                    tg.notify_trade_opened(
+                                        {"coin": sig["coin"], "side": sig["side"], "entry_price": sig["price"]},
+                                        source="liquidation_strategy"
+                                    )
+
+                        except Exception as e:
+                            self.logger.debug(f"  LCRS execution error {sig.get('coin')}: {e}")
+
+                    if lcrs_executed:
+                        self.logger.info(f"  Executed {len(lcrs_executed)} LCRS trades")
+                except Exception as e:
+                    self.logger.warning(f"  LCRS execution phase error: {e}")
 
             # Phase 4a2: Options flow standalone trades (high conviction → direct trade)
             self.logger.info("Phase 4a2: Options Flow Trades")
@@ -434,6 +647,41 @@ class HyperliquidResearchBot:
                 summary = self.paper_trader.get_account_summary()
                 summary["market_bias"] = market_overview.get("overall_bias", "unknown")
                 tg.notify_cycle_summary(summary)
+
+            # V2.5 status: Kelly, Memory, Calibration, LLM Filter, LCRS
+            self.logger.info("V2.5 Module Status:")
+            try:
+                lcrs_stats = self.liquidation_strategy.get_stats()
+                self.logger.info(f"  LCRS: {lcrs_stats['setups_detected']} setups, "
+                               f"{lcrs_stats['signals_generated']} signals")
+            except Exception:
+                pass
+            try:
+                kelly_stats = self.kelly_sizer.get_all_sizing_stats()
+                edge_count = sum(1 for v in kelly_stats.values() if v.get("has_edge"))
+                self.logger.info(f"  Kelly: {len(kelly_stats)} strategies tracked, "
+                               f"{edge_count} with proven edge")
+            except Exception:
+                pass
+            try:
+                mem_stats = self.trade_memory.get_stats()
+                self.logger.info(f"  Memory: {mem_stats['total_trades']} trades stored, "
+                               f"{mem_stats['unique_coins']} coins")
+            except Exception:
+                pass
+            try:
+                cal_stats = self.calibration.get_all_stats()
+                global_ece = self.calibration.get_ece("global")
+                self.logger.info(f"  Calibration: ECE={global_ece:.3f} ({self.calibration._quality_label(global_ece)}), "
+                               f"{len(cal_stats)} sources tracked")
+            except Exception:
+                pass
+            try:
+                llm_stats = self.llm_filter.get_stats()
+                self.logger.info(f"  LLM Filter: {llm_stats['total_filtered']} filtered, "
+                               f"pass rate={llm_stats['pass_rate']:.0%}")
+            except Exception:
+                pass
 
             # Generate improvement report
             improvement = self.scorer.generate_improvement_report()
