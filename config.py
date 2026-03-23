@@ -62,6 +62,10 @@ RESEARCH_CYCLE_INTERVAL = 3600  # 1 hour
 # Strategy re-scoring interval (seconds)
 SCORING_INTERVAL = 86400  # daily
 
+# ─── Multi-Exchange Scanner ────────────────────────────────────
+# Enable/disable secondary venues (Hyperliquid is always primary)
+LIGHTER_ENABLED = os.environ.get("LIGHTER_ENABLED", "true").lower() in ("true", "1", "yes")
+
 # ─── Logging ───────────────────────────────────────────────────
 LOG_DIR = os.path.join(os.path.dirname(__file__), "logs")
 LOG_LEVEL = "INFO"

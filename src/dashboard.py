@@ -165,17 +165,19 @@ _liquidation_strategy = None
 _signal_processor = None
 _arena_incubator = None
 _decision_engine = None
+_multi_scanner = None
 
 
 def set_v2_components(firewall=None, regime_detector=None, arena=None,
                        kelly_sizer=None, trade_memory=None, calibration=None,
                        llm_filter=None, liquidation_strategy=None,
                        signal_processor=None, arena_incubator=None,
-                       decision_engine=None):
-    """Set V2 + V2.5 + V3 component references for dashboard metrics."""
+                       decision_engine=None, multi_scanner=None):
+    """Set V2 + V2.5 + V3 + V4 component references for dashboard metrics."""
     global _firewall, _regime_detector, _arena  # noqa: PLW0603
     global _kelly_sizer, _trade_memory, _calibration, _llm_filter, _liquidation_strategy  # noqa
     global _signal_processor, _arena_incubator, _decision_engine  # noqa
+    global _multi_scanner  # noqa
     _firewall = firewall
     _regime_detector = regime_detector
     _arena = arena
@@ -187,6 +189,7 @@ def set_v2_components(firewall=None, regime_detector=None, arena=None,
     _signal_processor = signal_processor
     _arena_incubator = arena_incubator
     _decision_engine = decision_engine
+    _multi_scanner = multi_scanner
 
 
 DASHBOARD_HTML = """<!DOCTYPE html>
@@ -648,6 +651,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 try:
                     if _decision_engine:
                         v25["decision_engine"] = _decision_engine.get_stats()
+                except Exception:
+                    pass
+                try:
+                    if _multi_scanner:
+                        v25["multi_scanner"] = _multi_scanner.get_stats()
                 except Exception:
                     pass
                 if v25:

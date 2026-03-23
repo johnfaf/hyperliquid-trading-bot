@@ -44,6 +44,7 @@ from src.calibration import CalibrationTracker
 from src.llm_filter import LLMFilter
 from src.signal_processor import SignalProcessor, ArenaIncubator
 from src.decision_engine import DecisionEngine
+from src.exchanges.scanner import MultiExchangeScanner
 from src import telegram_bot as tg
 
 # ─── Logging Setup ─────────────────────────────────────────────
@@ -124,6 +125,16 @@ class HyperliquidResearchBot:
         self.arena_incubator = ArenaIncubator()
         self.decision_engine = DecisionEngine()
 
+        # V4: Multi-exchange scanner (Hyperliquid + Lighter cross-venue confirmation)
+        try:
+            self.multi_scanner = MultiExchangeScanner(config={
+                "lighter_enabled": config.LIGHTER_ENABLED,
+            })
+            self.logger.info(f"Multi-exchange scanner initialized: {list(self.multi_scanner.adapters.keys())}")
+        except Exception as e:
+            self.logger.warning(f"Multi-exchange scanner init failed (continuing single-venue): {e}")
+            self.multi_scanner = None
+
         # Bootstrap Kelly from existing agent scorer history
         self.kelly_sizer.load_from_agent_scorer(self.agent_scorer)
 
@@ -162,6 +173,7 @@ class HyperliquidResearchBot:
                 signal_processor=self.signal_processor,
                 arena_incubator=self.arena_incubator,
                 decision_engine=self.decision_engine,
+                multi_scanner=self.multi_scanner,
             )
             self.dashboard = start_dashboard(options_scanner=self.options_scanner)
             self.logger.info("Unified dashboard started (main + options flow on same port).")
@@ -280,7 +292,46 @@ class HyperliquidResearchBot:
             except Exception as e:
                 self.logger.warning(f"  Regime detection error: {e}")
 
-            # Phase 3e: Liquidation Cascade Reversal Strategy
+            # Phase 3e: Multi-Exchange Scan + Cross-Venue Confirmation
+            self.logger.info("Phase 3e: Multi-Exchange Scanner")
+            cross_venue_data = {}
+            funding_arbs = []
+            try:
+                if self.multi_scanner:
+                    # Health check all venues
+                    venue_health = self.multi_scanner.check_health()
+                    self.logger.info(f"  Venue health: {venue_health}")
+
+                    # Get aggregated market data for cross-venue comparison
+                    common_markets = self.multi_scanner.get_common_markets()
+                    if common_markets:
+                        self.logger.info(f"  Common markets across venues: {common_markets[:15]}...")
+
+                    # Scan for funding rate arbitrage opportunities
+                    funding_arbs = self.multi_scanner.scan_funding_arb()
+                    if funding_arbs:
+                        for arb in funding_arbs[:3]:
+                            self.logger.info(
+                                f"  Funding arb: {arb.coin} "
+                                f"long@{arb.long_venue}({arb.long_funding_rate:+.4%}) / "
+                                f"short@{arb.short_venue}({arb.short_funding_rate:+.4%}) "
+                                f"= {arb.funding_spread_annualized:.1f}% ann."
+                            )
+                    else:
+                        self.logger.info("  No funding arb opportunities found")
+
+                    # Store cross-venue data for signal enrichment later
+                    cross_venue_data = {
+                        "health": venue_health,
+                        "common_markets": common_markets,
+                        "funding_arbs": funding_arbs,
+                    }
+                else:
+                    self.logger.info("  Multi-exchange scanner not available (single venue mode)")
+            except Exception as e:
+                self.logger.warning(f"  Multi-exchange scanner error: {e}")
+
+            # Phase 3f: Liquidation Cascade Reversal Strategy
             self.logger.info("Phase 3e: Liquidation Strategy Scan")
             lcrs_signals = []
             try:
@@ -392,6 +443,76 @@ class HyperliquidResearchBot:
                     # Telegram: notify closed trades
                     if tg.is_configured():
                         tg.notify_trade_closed(c, c.get("exit_price", 0), c.get("pnl", 0), c.get("reason", ""))
+
+            # V4: Cross-venue signal confirmation (enriches strategies before decision engine)
+            if self.multi_scanner and self.multi_scanner.cross_venue and top_strategies:
+                self.logger.info("Phase 4 cross-venue: Signal Confirmation")
+                try:
+                    # Extract coin + direction from each strategy for cross-venue check
+                    signals_to_confirm = []
+                    for s in top_strategies:
+                        params = s.get("parameters", {})
+                        if isinstance(params, str):
+                            import json
+                            try:
+                                params = json.loads(params)
+                            except (json.JSONDecodeError, TypeError):
+                                params = {}
+                        coins = params.get("coins", params.get("coins_traded", []))
+                        if isinstance(coins, str):
+                            coins = [coins]
+                        coin = coins[0] if coins else ""
+                        direction = s.get("direction", "long")
+                        score = s.get("score", 0.5)
+
+                        if coin and coin != "unknown":
+                            signals_to_confirm.append({
+                                "coin": coin,
+                                "direction": direction,
+                                "score": score,
+                            })
+
+                    if signals_to_confirm:
+                        confirmed = self.multi_scanner.confirm_signals(signals_to_confirm)
+
+                        # Inject confirmation scores back into strategies
+                        confirm_map = {
+                            f"{c.coin}:{c.direction}": c.confirmation_score
+                            for c in confirmed
+                        }
+                        for s in top_strategies:
+                            params = s.get("parameters", {})
+                            if isinstance(params, str):
+                                import json
+                                try:
+                                    params = json.loads(params)
+                                except (json.JSONDecodeError, TypeError):
+                                    params = {}
+                            coins = params.get("coins", params.get("coins_traded", []))
+                            if isinstance(coins, str):
+                                coins = [coins]
+                            coin = coins[0] if coins else ""
+                            direction = s.get("direction", "long")
+                            key = f"{coin}:{direction}"
+
+                            cv_score = confirm_map.get(key, 0.0)
+                            # Store cross-venue data in metadata for decision engine
+                            if "metadata" not in s:
+                                s["metadata"] = {}
+                            s["metadata"]["cross_venue_score"] = cv_score
+
+                            # Boost score by up to 15% based on cross-venue confirmation
+                            if cv_score > 0.15:
+                                original = s.get("score", 0.5)
+                                boost = cv_score * 0.15  # Max 15% boost
+                                s["score"] = min(1.0, original + boost)
+
+                        boosted = sum(1 for s in top_strategies if s.get("metadata", {}).get("cross_venue_score", 0) > 0.15)
+                        self.logger.info(f"  Cross-venue: confirmed {len(signals_to_confirm)} signals, "
+                                        f"{boosted} boosted")
+
+                except Exception as e:
+                    self.logger.warning(f"  Cross-venue confirmation error: {e}")
 
             # V3: Final Decision Engine — rank, score, and log decisions
             open_trades = db.get_open_paper_trades()
@@ -731,6 +852,22 @@ class HyperliquidResearchBot:
                 self.logger.info(f"  DecisionEngine: {de_stats['total_decisions']} decisions, "
                                f"{de_stats['total_executions']} executions, "
                                f"no-trade rate={de_stats['no_trade_rate']:.0%}")
+            except Exception:
+                pass
+            try:
+                if self.multi_scanner:
+                    ms_stats = self.multi_scanner.get_stats()
+                    cv_stats = ms_stats.get("cross_venue", {})
+                    last = ms_stats.get("last_scan", {})
+                    self.logger.info(f"  MultiExchange: {ms_stats['venue_count']} venues "
+                                   f"({', '.join(ms_stats['venues'])}), "
+                                   f"{ms_stats['scan_count']} scans, "
+                                   f"{ms_stats['cached_traders']} cached traders")
+                    if cv_stats:
+                        self.logger.info(f"  CrossVenue: {cv_stats.get('confirmations_checked', 0)} checked, "
+                                       f"{cv_stats.get('confirmations_found', 0)} confirmed, "
+                                       f"avg score={cv_stats.get('avg_confirmation_score', 0):.3f}, "
+                                       f"arbs={cv_stats.get('funding_arbs_found', 0)}")
             except Exception:
                 pass
 
