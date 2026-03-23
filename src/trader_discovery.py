@@ -615,7 +615,7 @@ class TraderDiscovery:
         """
         Run a full discovery and analysis cycle with TWO-PHASE screening.
 
-        Phase 1 (Fast): Pre-screen up to 1000 traders with 1 API call each.
+        Phase 1 (Fast): Pre-screen up to 500 traders with 1 API call each.
                          Reject tiny accounts, bots with 15+ positions, inactive wallets.
         Phase 2 (Deep): Full analysis (fills + bot detection) only on candidates
                          that pass pre-screen. Mark detected bots as inactive in DB.
@@ -657,7 +657,7 @@ class TraderDiscovery:
             else:
                 skipped_prescreen += 1
 
-            time.sleep(0.35)  # Rate limiting
+            time.sleep(0.8)  # Rate limiting — 800ms to stay well under HL limits
 
         logger.info(f"PHASE 1 complete: {len(passed_prescreen)} passed, "
                     f"{skipped_prescreen} rejected, {already_known_active} already tracked")
@@ -683,7 +683,7 @@ class TraderDiscovery:
             except Exception as e:
                 logger.error(f"Error analyzing trader {addr[:10]}: {e}")
 
-            time.sleep(0.5)  # Slightly slower for deep analysis (2 API calls)
+            time.sleep(1.0)  # Deep analysis makes 2+ API calls — need wider spacing
 
         # ─── Separate humans from bots, with guaranteed minimum ─────
         BOT_THRESHOLD = 3

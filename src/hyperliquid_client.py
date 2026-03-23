@@ -15,8 +15,10 @@ logger = logging.getLogger(__name__)
 
 # Rate limiting — adaptive to avoid 429s
 _last_request_time = 0
-_MIN_REQUEST_INTERVAL = 0.35  # 350ms between requests (safe for HL rate limits)
-_backoff_until = 0  # timestamp until which we should back off
+_MIN_REQUEST_INTERVAL = 0.6   # 600ms between requests (safe baseline for HL)
+_backoff_until = 0            # timestamp until which we should back off
+_consecutive_429s = 0         # Track consecutive rate limits to escalate backoff
+_BACKOFF_COOLDOWN = 60        # After a 429 storm, stay slow for 60s
 
 
 def _rate_limit():
@@ -25,15 +27,19 @@ def _rate_limit():
     # If we're in a backoff period, wait it out
     if now < _backoff_until:
         time.sleep(_backoff_until - now)
+    # After recent 429s, use a longer interval to avoid re-triggering
+    interval = _MIN_REQUEST_INTERVAL
+    if _consecutive_429s > 0:
+        interval = min(_MIN_REQUEST_INTERVAL * (1 + _consecutive_429s * 0.5), 5.0)
     elapsed = time.time() - _last_request_time
-    if elapsed < _MIN_REQUEST_INTERVAL:
-        time.sleep(_MIN_REQUEST_INTERVAL - elapsed)
+    if elapsed < interval:
+        time.sleep(interval - elapsed)
     _last_request_time = time.time()
 
 
 def _post(payload: dict, retries: int = 3) -> Optional[dict]:
     """POST to the Hyperliquid info endpoint with retries and 429 backoff."""
-    global _backoff_until
+    global _backoff_until, _consecutive_429s
     _rate_limit()
     for attempt in range(retries):
         try:
@@ -44,13 +50,21 @@ def _post(payload: dict, retries: int = 3) -> Optional[dict]:
                 timeout=30
             )
             if resp.status_code == 429:
-                # Back off for longer on rate limit
-                wait = min(2 ** (attempt + 2), 30)
-                logger.warning(f"Rate limited (429), backing off {wait}s")
+                _consecutive_429s += 1
+                # Escalating backoff: 5s → 15s → 30s → 60s based on how many 429s we've hit
+                base_wait = min(5 * (2 ** min(attempt, 3)), 60)
+                # Add extra penalty for consecutive 429 storms
+                storm_penalty = min(_consecutive_429s * 3, 30)
+                wait = base_wait + storm_penalty
+                logger.warning(f"Rate limited (429), backing off {wait}s "
+                             f"(consecutive={_consecutive_429s}, attempt={attempt+1})")
                 _backoff_until = time.time() + wait
                 time.sleep(wait)
                 continue
             resp.raise_for_status()
+            # Successful request — decay the consecutive counter
+            if _consecutive_429s > 0:
+                _consecutive_429s = max(0, _consecutive_429s - 1)
             return resp.json()
         except requests.exceptions.RequestException as e:
             logger.warning(f"API request failed (attempt {attempt+1}/{retries}): {e}")
