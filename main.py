@@ -43,6 +43,7 @@ from src.trade_memory import TradeMemory
 from src.calibration import CalibrationTracker
 from src.llm_filter import LLMFilter
 from src.signal_processor import SignalProcessor, ArenaIncubator
+from src.decision_engine import DecisionEngine
 from src import telegram_bot as tg
 
 # ─── Logging Setup ─────────────────────────────────────────────
@@ -121,6 +122,7 @@ class HyperliquidResearchBot:
         self.llm_filter = LLMFilter()
         self.signal_processor = SignalProcessor()
         self.arena_incubator = ArenaIncubator()
+        self.decision_engine = DecisionEngine()
 
         # Bootstrap Kelly from existing agent scorer history
         self.kelly_sizer.load_from_agent_scorer(self.agent_scorer)
@@ -159,6 +161,7 @@ class HyperliquidResearchBot:
                 liquidation_strategy=self.liquidation_strategy,
                 signal_processor=self.signal_processor,
                 arena_incubator=self.arena_incubator,
+                decision_engine=self.decision_engine,
             )
             self.dashboard = start_dashboard(options_scanner=self.options_scanner)
             self.logger.info("Unified dashboard started (main + options flow on same port).")
@@ -389,6 +392,20 @@ class HyperliquidResearchBot:
                     # Telegram: notify closed trades
                     if tg.is_configured():
                         tg.notify_trade_closed(c, c.get("exit_price", 0), c.get("pnl", 0), c.get("reason", ""))
+
+            # V3: Final Decision Engine — rank, score, and log decisions
+            open_trades = db.get_open_paper_trades()
+            kelly_stats = None
+            try:
+                kelly_stats = self.kelly_sizer.get_all_sizing_stats()
+            except Exception:
+                pass
+            top_strategies = self.decision_engine.decide(
+                top_strategies,
+                regime_data=regime_data,
+                open_positions=open_trades,
+                kelly_stats=kelly_stats,
+            )
 
             # Execute new signals from strategies (V2 pipeline: features → scoring → firewall → consensus)
             if top_strategies:
@@ -707,6 +724,13 @@ class HyperliquidResearchBot:
                 self.logger.info(f"  Incubator: {inc_stats['currently_incubating']} incubating, "
                                f"{inc_stats['total_promoted']} promoted, "
                                f"{inc_stats['total_rejected']} rejected")
+            except Exception:
+                pass
+            try:
+                de_stats = self.decision_engine.get_stats()
+                self.logger.info(f"  DecisionEngine: {de_stats['total_decisions']} decisions, "
+                               f"{de_stats['total_executions']} executions, "
+                               f"no-trade rate={de_stats['no_trade_rate']:.0%}")
             except Exception:
                 pass
 

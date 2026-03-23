@@ -234,6 +234,25 @@ def save_strategy(name, description, strategy_type, parameters=None,
         return cursor.lastrowid
 
 
+def save_strategies_batch(strategies_data):
+    """Batch insert multiple strategies in a single transaction."""
+    now = datetime.utcnow().isoformat()
+    saved_ids = []
+    with get_connection() as conn:
+        for s in strategies_data:
+            cursor = conn.execute("""
+                INSERT INTO strategies
+                (name, description, strategy_type, parameters, discovered_at,
+                 total_pnl, trade_count, win_rate, sharpe_ratio)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (s["name"], s["description"], s["strategy_type"],
+                  json.dumps(s.get("parameters") or {}),
+                  now, s.get("total_pnl", 0), s.get("trade_count", 0),
+                  s.get("win_rate", 0), s.get("sharpe_ratio", 0)))
+            saved_ids.append(cursor.lastrowid)
+    return saved_ids
+
+
 def update_strategy_score(strategy_id, score):
     now = datetime.utcnow().isoformat()
     with get_connection() as conn:

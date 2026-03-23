@@ -389,27 +389,93 @@ class StrategyIdentifier:
             }
         return None
 
+    # Minimum confidence to save a strategy to DB (prevents strategy bloat)
+    MIN_SAVE_CONFIDENCE = 0.60
+
     def save_identified_strategies(self, strategies: List[Dict]) -> List[int]:
-        """Save identified strategies to the database. Returns list of strategy IDs."""
-        saved_ids = []
+        """
+        Save identified strategies to the database with pre-save filtering
+        and batch inserts for performance.
+
+        Fixes applied:
+        - Pre-save confidence filter: discard strategies below MIN_SAVE_CONFIDENCE
+        - Trader address in logs: trace every strategy to its source wallet
+        - Batch DB insert: single transaction instead of one-by-one
+        """
+        # Step 1: Pre-save filter — reject low-confidence garbage before DB
+        qualified = []
+        discarded = 0
         for strat in strategies:
-            try:
-                metrics = strat.get("metrics", {})
-                strategy_id = db.save_strategy(
-                    name=f"{strat['type']}_{strat['trader_address'][:8]}",
-                    description=strat.get("description", ""),
-                    strategy_type=strat["type"],
-                    parameters=strat.get("parameters", {}),
-                    total_pnl=metrics.get("pnl", 0),
-                    trade_count=metrics.get("trade_count", 0),
-                    win_rate=metrics.get("win_rate", 0),
-                    sharpe_ratio=0,
-                )
-                saved_ids.append(strategy_id)
-                logger.info(f"Saved strategy: {strat['type']} (confidence: {strat['confidence']:.2f})")
-            except Exception as e:
-                logger.error(f"Error saving strategy {strat['type']}: {e}")
-        return saved_ids
+            conf = strat.get("confidence", 0)
+            addr = strat.get("trader_address", "unknown")[:10]
+            stype = strat.get("type", "unknown")
+
+            if conf < self.MIN_SAVE_CONFIDENCE:
+                logger.debug(f"Discarded {stype} from {addr}... — "
+                           f"confidence too low ({conf:.2f} < {self.MIN_SAVE_CONFIDENCE})")
+                discarded += 1
+                continue
+            qualified.append(strat)
+
+        if discarded > 0:
+            logger.info(f"Pre-save filter: discarded {discarded}/{len(strategies)} "
+                       f"low-confidence strategies (< {self.MIN_SAVE_CONFIDENCE})")
+
+        if not qualified:
+            return []
+
+        # Step 2: Prepare batch data
+        batch_data = []
+        for strat in qualified:
+            metrics = strat.get("metrics", {})
+            addr = strat.get("trader_address", "unknown")[:8]
+            batch_data.append({
+                "name": f"{strat['type']}_{addr}",
+                "description": strat.get("description", ""),
+                "strategy_type": strat["type"],
+                "parameters": strat.get("parameters", {}),
+                "total_pnl": metrics.get("pnl", 0),
+                "trade_count": metrics.get("trade_count", 0),
+                "win_rate": metrics.get("win_rate", 0),
+                "sharpe_ratio": 0,
+            })
+
+        # Step 3: Batch insert (single transaction)
+        try:
+            saved_ids = db.save_strategies_batch(batch_data)
+
+            # Log with trader address for traceability
+            for strat, sid in zip(qualified, saved_ids):
+                addr = strat.get("trader_address", "unknown")[:10]
+                logger.info(f"Saved strategy for {addr}...: {strat['type']} "
+                           f"(confidence: {strat['confidence']:.2f})")
+
+            logger.info(f"Batch saved {len(saved_ids)} strategies "
+                       f"({discarded} discarded, {len(strategies)} total input)")
+            return saved_ids
+
+        except Exception as e:
+            logger.error(f"Batch save error: {e} — falling back to individual inserts")
+            # Fallback to one-by-one if batch fails
+            saved_ids = []
+            for strat in qualified:
+                try:
+                    metrics = strat.get("metrics", {})
+                    addr = strat.get("trader_address", "unknown")[:8]
+                    strategy_id = db.save_strategy(
+                        name=f"{strat['type']}_{addr}",
+                        description=strat.get("description", ""),
+                        strategy_type=strat["type"],
+                        parameters=strat.get("parameters", {}),
+                        total_pnl=metrics.get("pnl", 0),
+                        trade_count=metrics.get("trade_count", 0),
+                        win_rate=metrics.get("win_rate", 0),
+                        sharpe_ratio=0,
+                    )
+                    saved_ids.append(strategy_id)
+                except Exception as inner_e:
+                    logger.error(f"Error saving strategy {strat.get('type')}: {inner_e}")
+            return saved_ids
 
 
 if __name__ == "__main__":
