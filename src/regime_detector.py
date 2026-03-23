@@ -64,9 +64,10 @@ REGIME_STRATEGY_MAP = {
         "size_modifier": 0.4,  # Heavily reduced
     },
     Regime.LOW_LIQUIDITY: {
-        "activate": [],  # Don't trade
-        "pause": ["all"],
-        "size_modifier": 0.0,
+        "activate": ["mean_reversion", "funding_arb"],  # Only low-risk strategies
+        "pause": ["momentum_long", "momentum_short", "breakout", "scalping",
+                   "swing_trading", "concentrated_bet"],
+        "size_modifier": 0.3,  # Heavily reduced but NOT zero
     },
     Regime.UNKNOWN: {
         "activate": ["mean_reversion", "funding_arb"],  # Conservative defaults
@@ -206,9 +207,10 @@ class RegimeDetector:
         """
         confidence = 0.5  # Base confidence
 
-        # 1. Low liquidity check
-        if volume_ratio < 0.3:
-            confidence = 0.7 + (0.3 - volume_ratio) * 0.5
+        # 1. Low liquidity check — only trigger on genuinely thin volume
+        # (threshold lowered from 0.3 → 0.15 since partial-candle bug is fixed)
+        if volume_ratio < 0.15:
+            confidence = 0.7 + (0.15 - volume_ratio) * 1.0
             return Regime.LOW_LIQUIDITY, min(confidence, 0.95)
 
         # 2. High volatility without trend = chaos
@@ -318,12 +320,24 @@ class RegimeDetector:
         return atr / current_price if current_price > 0 else 0.0
 
     def _calculate_volume_ratio(self, volumes: np.ndarray, period: int = 20) -> float:
-        """Current volume vs average of last N periods."""
-        if len(volumes) < period + 1:
+        """
+        Recent volume vs longer-term average volume.
+
+        IMPORTANT: The last candle in the array is often a PARTIAL (incomplete)
+        hourly candle. If the bot runs 10 minutes into the hour, that candle
+        has ~17% of the volume of a completed candle, making vol_ratio = 0.0x
+        and falsely triggering LOW_LIQUIDITY regime.
+
+        Fix: Use the average of the last 3 COMPLETED candles (excluding the
+        most recent/partial one) vs the 20-period average before them.
+        """
+        if len(volumes) < period + 4:
             return 1.0
-        avg_vol = np.mean(volumes[-period - 1:-1])  # Exclude current
-        current_vol = volumes[-1]
-        return current_vol / avg_vol if avg_vol > 0 else 1.0
+        # Exclude the last candle (likely partial/incomplete hour)
+        # Compare recent 3 completed candles vs 20-period average before them
+        recent_avg = np.mean(volumes[-4:-1])  # Last 3 completed candles
+        historical_avg = np.mean(volumes[-period - 4:-4])  # 20 periods before that
+        return recent_avg / historical_avg if historical_avg > 0 else 1.0
 
     def _calculate_trend_direction(self, closes: np.ndarray, period: int = 20) -> float:
         """
