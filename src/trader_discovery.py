@@ -532,16 +532,37 @@ class TraderDiscovery:
         # Compute REAL frequency from timestamps (not raw count)
         trades_per_day = self._compute_trades_per_day(fills)
 
+        # ─── HARD CUTOFFS (instant bot, no signal counting needed) ────
+        # These override the signal-based scoring entirely.
+        # Evidence from logs: 115,043 trades/day classified "Human-like" is unacceptable.
+
+        # Hard cutoff 1: >100 trades/day = bot, period
+        # A very active human scalper might do 30-80, but >100 is automation
+        if trades_per_day > 100:
+            logger.info(f"Bot INSTANT: {trades_per_day:.0f} trades/day (hard cutoff >100)")
+            return 10  # Guaranteed bot score
+
+        # Hard cutoff 2: Spread bot — high frequency + micro PnL per trade
+        # Median PnL < $0.50 with >50 trades/day = market maker / funding farmer
+        if trades_per_day > 50:
+            closed_pnls = sorted([f["closed_pnl"] for f in fills if f["closed_pnl"] != 0])
+            if closed_pnls:
+                median_pnl = closed_pnls[len(closed_pnls) // 2]
+                if abs(median_pnl) < 0.50:
+                    logger.info(f"Bot INSTANT: spread/MM bot (median PnL=${median_pnl:.2f}, "
+                               f"{trades_per_day:.0f} trades/day)")
+                    return 10  # Guaranteed bot score
+
+        # ─── SIGNAL-BASED SCORING (for borderline cases) ─────────────
         bot_signals = 0  # Count signals; 3+ = bot
 
-        # Signal 1: Extreme frequency by TIME — >300 trades/day is almost certainly a bot
-        # (A very active human day-trader might do 50-100, but 300+ is automation)
-        if trades_per_day > 300:
-            logger.info(f"Bot signal: {trades_per_day:.0f} trades/day (high frequency)")
+        # Signal 1: Elevated frequency — 50-100 trades/day is suspicious
+        if trades_per_day > 50:
+            logger.info(f"Bot signal: {trades_per_day:.0f} trades/day (elevated frequency)")
             bot_signals += 2  # Strong signal
 
-        # Signal 2: Very small avg trade size with high frequency = market maker
-        if trades_per_day > 50 and avg_size < 50:
+        # Signal 2: Very small avg trade size with moderate frequency = market maker
+        if trades_per_day > 30 and avg_size < 50:
             logger.info(f"Bot signal: tiny trades (${avg_size:.0f} avg) at {trades_per_day:.0f}/day")
             bot_signals += 2
 
@@ -574,14 +595,13 @@ class TraderDiscovery:
             logger.info(f"Bot signal: high liquidation rate ({liquidations}/{total})")
             bot_signals += 1
 
-        # Signal 7: Spread bot — high frequency + near-zero median PnL
-        # Only trigger if frequency is actually high (not just API-capped count)
-        if trades_per_day > 100:
+        # Signal 7: Near-zero median PnL (even at moderate frequency)
+        if trades_per_day > 20:
             closed_pnls = sorted([f["closed_pnl"] for f in fills if f["closed_pnl"] != 0])
             if closed_pnls:
                 median_pnl = closed_pnls[len(closed_pnls) // 2]
                 if abs(median_pnl) < 1.0:
-                    logger.info(f"Bot signal: spread bot (median PnL=${median_pnl:.2f}, {trades_per_day:.0f} trades/day)")
+                    logger.info(f"Bot signal: micro PnL (median=${median_pnl:.2f}, {trades_per_day:.0f} trades/day)")
                     bot_signals += 1
 
         if bot_signals >= 3:

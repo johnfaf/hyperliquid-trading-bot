@@ -62,8 +62,8 @@ def setup_logging():
     fh.setLevel(logging.DEBUG)
     fh.setFormatter(formatter)
 
-    # Console handler
-    ch = logging.StreamHandler()
+    # Console handler — use stdout (not stderr) so Railway doesn't tag INFO as "error"
+    ch = logging.StreamHandler(sys.stdout)
     ch.setLevel(getattr(logging, config.LOG_LEVEL))
     ch.setFormatter(formatter)
 
