@@ -93,6 +93,33 @@ class DecisionEngine:
             self.stats["total_no_trade"] += 1
             return []
 
+        # CRITICAL FIX #1: Block any strategy with missing asset symbol
+        # These cannot be reliably ranked or attributed
+        valid_strategies = []
+        for s in strategies:
+            params = s.get("parameters", {})
+            if isinstance(params, str):
+                import json
+                try:
+                    params = json.loads(params)
+                except (json.JSONDecodeError, TypeError):
+                    params = {}
+            coins = params.get("coins", params.get("coins_traded", []))
+            if isinstance(coins, str):
+                coins = [coins]
+
+            if not coins or coins[0] == "unknown":
+                logger.warning(f"Blocking strategy {s.get('strategy_type', '?')} "
+                             f"— missing asset symbol, cannot rank")
+                continue
+            valid_strategies.append(s)
+
+        strategies = valid_strategies
+        if not strategies:
+            self._log_decision([], regime_data, available_slots)
+            self.stats["total_no_trade"] += 1
+            return []
+
         # ─── Score each strategy ─────────────────────────
         scored = []
         for s in strategies:

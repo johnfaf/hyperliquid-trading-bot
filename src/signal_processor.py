@@ -98,11 +98,17 @@ class SignalProcessor:
         # Step 3: Resolve conflicts (opposing signals on same coin)
         before_conflict = len(survivors)
         survivors = self._resolve_conflicts(survivors, regime_data)
-        conflict_count = before_conflict - len(survivors)
+        # Conflict count should never be negative — it's the count of signals DROPPED
+        # due to conflicts. If the count is negative or zero, log separately.
+        conflict_count = max(0, before_conflict - len(survivors))
         self.stats["conflicts_resolved"] += conflict_count
         if conflict_count > 0:
             logger.info(f"SignalProcessor: resolved {conflict_count} conflicting signals "
                        f"({len(survivors)} remaining)")
+        elif len(survivors) > before_conflict:
+            # Safety check: if survivors increased, something went wrong
+            logger.warning(f"SignalProcessor: conflict resolution increased strategies "
+                          f"({before_conflict} → {len(survivors)}), possible dedup/copy issue")
 
         # Step 4: Compress — keep only top N
         before_compress = len(survivors)
@@ -162,11 +168,13 @@ class SignalProcessor:
     def _deduplicate(self, strategies: List[Dict]) -> List[Dict]:
         """
         Merge strategies that are functionally identical:
-          - Same strategy_type + same implied direction + same coin(s)
+          - Same coin + same implied direction = merge (regardless of strategy_type)
           - Keep the one with highest score, but boost confidence by
             number of agreeing sources (consensus signal)
 
-        Dedup key: (strategy_type, primary_coin_or_hash, implied_direction)
+        CRITICAL FIX: Use canonical key (coin, direction) not (type, direction, coin).
+        This ensures all longs on BTC merge into ONE signal, not 3 separate ones
+        from momentum_long, trend_following, and breakout all trying to trade BTC long.
         """
         import json
 
@@ -191,7 +199,9 @@ class SignalProcessor:
                 coins = [coins]
             coin_key = coins[0] if coins else "any"
 
-            key = f"{strategy_type}:{direction}:{coin_key}"
+            # CANONICAL KEY: (coin, direction) — ignore strategy_type
+            # This merges all longs on BTC into one, regardless of which strategy detected it
+            key = f"{coin_key}:{direction}"
             groups[key].append(s)
 
         # Merge each group
