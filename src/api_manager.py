@@ -347,10 +347,32 @@ class HyperliquidWebSocket:
                 time.sleep(wait)
 
     def _on_open(self, ws):
-        """Connected — subscribe to all channels."""
+        """
+        Connected — subscribe to all channels and reconcile state.
+
+        After a reconnect, local state (mids, books, trades) may be stale.
+        We clear local caches and re-subscribe so fresh data overwrites them.
+        If a reconciliation callback is registered, fire it so modules can
+        verify their positions match the exchange.
+        """
+        was_reconnect = self._connected is False and self._reconnect_count > 0
         self._connected = True
         self._reconnect_count = 0
-        logger.info("WebSocket connected")
+
+        if was_reconnect:
+            logger.info("WebSocket RECONNECTED — clearing stale local state")
+            # Invalidate stale data so modules don't act on old prices
+            self.mids.clear()
+            self.l2_books.clear()
+            self.recent_trades.clear()
+            # Fire reconciliation callbacks so modules can re-check positions
+            for cb in self._callbacks.get("_reconnect", []):
+                try:
+                    cb()
+                except Exception as e:
+                    logger.error(f"Reconciliation callback error: {e}")
+        else:
+            logger.info("WebSocket connected")
 
         # Subscribe to allMids (real-time prices for all assets)
         ws.send(json.dumps({
@@ -528,7 +550,17 @@ class APIManager:
         return result
 
     def _do_request(self, payload: dict, retries: int = 3) -> Optional[Any]:
-        """Execute the HTTP request with jittered backoff."""
+        """
+        Execute the HTTP request with classified error handling.
+
+        Error categories:
+        - 429 (rate limit): backoff hard, report to bucket, always retry
+        - 401/403 (auth): NEVER retry — credentials are wrong
+        - 422 (bad payload): NEVER retry — request is malformed
+        - 400 (other client): don't retry — request won't work
+        - 5xx (server): retry with backoff — transient
+        - Network errors: retry with backoff — transient
+        """
         req_type = payload.get("type", "unknown")
 
         for attempt in range(retries):
@@ -540,32 +572,75 @@ class APIManager:
                     timeout=30,
                 )
 
+                # ── 429: Rate limited — always retry with hard backoff ──
                 if resp.status_code == 429:
                     self.bucket.report_429()
                     wait = jittered_backoff(attempt, base=5.0, cap=60.0)
                     logger.warning(
-                        f"429 for type='{req_type}' — jittered wait {wait:.1f}s "
-                        f"(attempt {attempt+1}/{retries})"
+                        f"429 RATE_LIMITED type='{req_type}' — "
+                        f"wait {wait:.1f}s (attempt {attempt+1}/{retries})"
                     )
                     time.sleep(wait)
                     continue
 
-                # 4xx client errors — don't retry
+                # ── 401/403: Auth error — NEVER retry ──
+                if resp.status_code in (401, 403):
+                    logger.error(
+                        f"AUTH_ERROR {resp.status_code} type='{req_type}': "
+                        f"check API credentials (not retrying)"
+                    )
+                    return None
+
+                # ── 422: Bad payload — NEVER retry ──
+                if resp.status_code == 422:
+                    body_preview = resp.text[:200] if resp.text else "(empty)"
+                    logger.warning(
+                        f"BAD_PAYLOAD 422 type='{req_type}': {body_preview} (not retrying)"
+                    )
+                    return None
+
+                # ── Other 4xx: Client error — don't retry ──
                 if 400 <= resp.status_code < 500:
                     body_preview = resp.text[:200] if resp.text else "(empty)"
                     logger.warning(
-                        f"Client error {resp.status_code} for type='{req_type}': "
-                        f"{body_preview}"
+                        f"CLIENT_ERROR {resp.status_code} type='{req_type}': "
+                        f"{body_preview} (not retrying)"
                     )
                     return None
+
+                # ── 5xx: Server error — retry with backoff ──
+                if resp.status_code >= 500:
+                    wait = jittered_backoff(attempt, base=3.0, cap=30.0)
+                    logger.warning(
+                        f"SERVER_ERROR {resp.status_code} type='{req_type}' — "
+                        f"retry in {wait:.1f}s (attempt {attempt+1}/{retries})"
+                    )
+                    time.sleep(wait)
+                    continue
 
                 resp.raise_for_status()
                 self.bucket.report_success()
                 return resp.json()
 
+            except requests.exceptions.Timeout:
+                wait = jittered_backoff(attempt, base=2.0, cap=20.0)
+                logger.warning(
+                    f"TIMEOUT type='{req_type}' — retry in {wait:.1f}s "
+                    f"(attempt {attempt+1}/{retries})"
+                )
+                time.sleep(wait)
+
+            except requests.exceptions.ConnectionError:
+                wait = jittered_backoff(attempt, base=3.0, cap=30.0)
+                logger.warning(
+                    f"CONNECTION_ERROR type='{req_type}' — retry in {wait:.1f}s "
+                    f"(attempt {attempt+1}/{retries})"
+                )
+                time.sleep(wait)
+
             except requests.exceptions.RequestException as e:
                 logger.warning(
-                    f"Request failed for type='{req_type}' "
+                    f"REQUEST_ERROR type='{req_type}' "
                     f"(attempt {attempt+1}/{retries}): {e}"
                 )
                 if attempt < retries - 1:

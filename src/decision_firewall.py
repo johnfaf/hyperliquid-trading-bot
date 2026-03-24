@@ -45,6 +45,11 @@ class DecisionFirewall:
         self.min_source_accuracy = cfg.get("min_source_accuracy", 0.0)  # 0 = no filter
         self.cooldown_seconds = cfg.get("cooldown_seconds", 300)        # 5 min between trades same coin
 
+        # Portfolio-level aggregate exposure limit
+        # With 2000 traders scanned and golden wallets auto-connected,
+        # we need a hard cap on total notional exposure across ALL positions
+        self.max_aggregate_exposure_pct = cfg.get("max_aggregate_exposure", 0.30)  # 30% of balance
+
         # State tracking
         self._recent_trades: Dict[str, float] = {}  # coin → last trade timestamp
         self._daily_losses: float = 0.0
@@ -62,6 +67,7 @@ class DecisionFirewall:
             "rejected_cooldown": 0,
             "rejected_accuracy": 0,
             "rejected_drawdown": 0,
+            "rejected_exposure": 0,
         }
 
         logger.info(f"DecisionFirewall initialized: max_risk={self.max_risk_per_trade:.0%}/trade, "
@@ -104,6 +110,32 @@ class DecisionFirewall:
         if len(coin_positions) >= self.max_per_coin:
             self.stats["rejected_risk"] += 1
             return False, f"Max positions for {signal.coin} ({len(coin_positions)}/{self.max_per_coin})"
+
+        # 5b. Aggregate portfolio exposure — hard cap across ALL positions
+        # Sums the notional value (size × entry_price × leverage) of all open positions
+        # and rejects if adding this signal would exceed the limit
+        account = db.get_paper_account()
+        if account:
+            balance = account.get("balance", 10000)
+            total_exposure = 0.0
+            for pos in positions:
+                pos_size = pos.get("size", 0)
+                pos_price = pos.get("entry_price", 0)
+                pos_leverage = pos.get("leverage", 1)
+                total_exposure += abs(pos_size * pos_price * pos_leverage)
+
+            # Estimate new signal's notional (use signal size or default 8% allocation)
+            new_notional = signal.size * signal.leverage if signal.size else (
+                balance * 0.08 * signal.leverage
+            )
+            projected_exposure = total_exposure + new_notional
+            exposure_pct = projected_exposure / balance if balance > 0 else 1.0
+
+            if exposure_pct > self.max_aggregate_exposure_pct:
+                self.stats["rejected_exposure"] += 1
+                return False, (f"Aggregate exposure {exposure_pct:.0%} would exceed "
+                              f"{self.max_aggregate_exposure_pct:.0%} limit "
+                              f"(${projected_exposure:,.0f}/${balance:,.0f})")
 
         # 6. Conflict detection — no opposing positions on same coin
         for pos in coin_positions:

@@ -51,24 +51,53 @@ from src.hyperliquid_client import start_websocket, get_api_stats
 
 # ─── Logging Setup ─────────────────────────────────────────────
 
+class JSONFormatter(logging.Formatter):
+    """
+    Structured JSON log formatter for production.
+    Railway, Datadog, ELK, and most log aggregators parse JSON natively.
+    Each line is a self-contained JSON object — no multi-line parsing needed.
+    """
+    def format(self, record):
+        import json as _json
+        log_entry = {
+            "ts": self.formatTime(record, "%Y-%m-%dT%H:%M:%S"),
+            "level": record.levelname,
+            "logger": record.name,
+            "msg": record.getMessage(),
+        }
+        if record.exc_info and record.exc_info[0]:
+            log_entry["exception"] = self.formatException(record.exc_info)
+        # Add extra fields if present (e.g. logger.info("msg", extra={"wallet": "0x..."})
+        for key in ("wallet", "coin", "action", "latency_ms", "status_code"):
+            if hasattr(record, key):
+                log_entry[key] = getattr(record, key)
+        return _json.dumps(log_entry, default=str)
+
+
 def setup_logging():
     os.makedirs(config.LOG_DIR, exist_ok=True)
     log_file = os.path.join(config.LOG_DIR, f"bot_{datetime.utcnow().strftime('%Y%m%d')}.log")
 
-    formatter = logging.Formatter(
+    # Structured JSON for stdout (Railway / log aggregators)
+    json_formatter = JSONFormatter()
+
+    # Human-readable for local file debugging
+    text_formatter = logging.Formatter(
         "%(asctime)s [%(name)s] %(levelname)s: %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S"
     )
 
-    # File handler
+    # File handler — human-readable for local debugging
     fh = logging.FileHandler(log_file)
     fh.setLevel(logging.DEBUG)
-    fh.setFormatter(formatter)
+    fh.setFormatter(text_formatter)
 
-    # Console handler — use stdout (not stderr) so Railway doesn't tag INFO as "error"
+    # Console handler — structured JSON for Railway / production
+    # Falls back to text if LOG_FORMAT=text (for local dev)
     ch = logging.StreamHandler(sys.stdout)
     ch.setLevel(getattr(logging, config.LOG_LEVEL))
-    ch.setFormatter(formatter)
+    use_json = os.environ.get("LOG_FORMAT", "json").lower() != "text"
+    ch.setFormatter(json_formatter if use_json else text_formatter)
 
     root = logging.getLogger()
     root.setLevel(logging.DEBUG)
