@@ -573,29 +573,39 @@ class TraderDiscovery:
                     return 10  # Guaranteed bot score
 
         # ─── SIGNAL-BASED SCORING (for borderline cases) ─────────────
-        bot_signals = 0  # Count signals; 3+ = bot
+        #
+        # Previous bug: signals were weighted too lightly. A wallet with an
+        # arb pattern (1 signal) or high liquidation rate (1 signal) would
+        # score only 1-2, below BOT_THRESHOLD=3, and pass as "Human-like".
+        #
+        # Fix: ANY single clear bot signal now scores >= 3 (instant reject).
+        # Weaker signals still accumulate and 2+ weak signals = bot.
+        #
+        bot_signals = 0
 
         # Signal 1: Elevated frequency — 50-100 trades/day is suspicious
+        # This alone is strong evidence of automation
         if trades_per_day > 50:
             logger.info(f"Bot signal: {trades_per_day:.0f} trades/day (elevated frequency)")
-            bot_signals += 2  # Strong signal
+            bot_signals += 3  # Strong: 50+ trades/day alone = bot
 
         # Signal 2: Very small avg trade size with moderate frequency = market maker
         if trades_per_day > 30 and avg_size < 50:
             logger.info(f"Bot signal: tiny trades (${avg_size:.0f} avg) at {trades_per_day:.0f}/day")
-            bot_signals += 2
+            bot_signals += 3  # Strong: micro-size + frequency = MM bot
 
         # Signal 3: Near-zero PnL per trade with high volume = arb bot
+        # This is DEFINITIVE: no human trades 50+ times making <$0.50 per trade
         if total > 50:
             pnl_per_trade = abs(pnl) / total if total else 0
             if pnl_per_trade < 0.5 and avg_size > 1000:
                 logger.info(f"Bot signal: arb pattern (${pnl_per_trade:.2f}/trade, ${avg_size:.0f} avg)")
-                bot_signals += 1
+                bot_signals += 3  # Strong: arb pattern alone = bot
 
         # Signal 4: Too many simultaneous positions = portfolio bot
         if len(active_positions) > 15:
             logger.info(f"Bot signal: {len(active_positions)} simultaneous positions")
-            bot_signals += 1
+            bot_signals += 2  # Medium: could be an active human, but suspicious
 
         # Signal 5: Uniform trade sizes (low variance = bot)
         if len(fills) > 20:
@@ -607,27 +617,31 @@ class TraderDiscovery:
                 cv = std_size / mean_size if mean_size > 0 else 0
                 if cv < 0.05:  # coefficient of variation < 5% = robotic
                     logger.info(f"Bot signal: uniform trade sizes (CV={cv:.3f})")
-                    bot_signals += 1
+                    bot_signals += 2  # Medium: very uniform = likely automated
 
-        # Signal 6: High liquidation rate
+        # Signal 6: High liquidation rate = reckless bot or badly coded algo
         if total > 10 and liquidations / total > 0.15:
             logger.info(f"Bot signal: high liquidation rate ({liquidations}/{total})")
-            bot_signals += 1
+            bot_signals += 3  # Strong: >15% liquidation rate = not a strategy worth copying
 
-        # Signal 7: Near-zero median PnL (even at moderate frequency)
+        # Signal 7: Near-zero median PnL (even at moderate frequency) = spread/funding bot
         if trades_per_day > 20:
             closed_pnls = sorted([f["closed_pnl"] for f in fills if f["closed_pnl"] != 0])
             if closed_pnls:
                 median_pnl = closed_pnls[len(closed_pnls) // 2]
                 if abs(median_pnl) < 1.0:
                     logger.info(f"Bot signal: micro PnL (median=${median_pnl:.2f}, {trades_per_day:.0f} trades/day)")
-                    bot_signals += 1
+                    bot_signals += 3  # Strong: micro PnL + frequency = MM/funding bot
 
+        addr_short = fills[0].get('user', 'unknown')[:10] if fills else 'unknown'
         if bot_signals >= 3:
-            logger.info(f"Bot LIKELY ({bot_signals} signals, {trades_per_day:.0f} trades/day): "
-                       f"{fills[0].get('user', 'unknown')[:10] if fills else 'unknown'}...")
+            logger.info(f"Bot REJECTED ({bot_signals} signals, {trades_per_day:.0f} trades/day): "
+                       f"{addr_short}...")
+        elif bot_signals > 0:
+            logger.info(f"Borderline ({bot_signals} signals, {trades_per_day:.0f} trades/day): "
+                       f"{addr_short}... — passed but flagged")
         else:
-            logger.info(f"Human-like ({bot_signals} signals, {trades_per_day:.0f} trades/day)")
+            logger.info(f"Human-like (clean, {trades_per_day:.0f} trades/day)")
         return bot_signals
 
     def run_discovery_cycle(self) -> Dict:
