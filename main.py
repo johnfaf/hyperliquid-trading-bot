@@ -1058,6 +1058,48 @@ class HyperliquidResearchBot:
 
 # ─── CLI ───────────────────────────────────────────────────────
 
+def bootstrap_seed_data(logger, days: int = 14):
+    """
+    Cold-start bootstrap: pull recent fills from top traders to seed the DB
+    so Kelly/Scoring/Calibration have real data from day one.
+    """
+    from src.golden_wallet import init_golden_tables, evaluate_wallet, save_wallet_report, save_wallet_fills
+
+    logger.info(f"Bootstrap mode: seeding DB with last {days} days of top trader data...")
+    init_db()
+    init_golden_tables()
+
+    discovery = TraderDiscovery()
+
+    # Step 1: Discover traders (abbreviated scan)
+    logger.info("Step 1/3: Discovering top traders...")
+    discovery_result = discovery.run_discovery_cycle()
+    humans = discovery_result.get("human_like", 0)
+    logger.info(f"Discovery found {humans} human-like traders")
+
+    if humans == 0:
+        logger.warning("No human-like traders found. Try running again later.")
+        return
+
+    # Step 2: Evaluate top wallets (golden scan)
+    logger.info("Step 2/3: Running golden wallet evaluation...")
+    from src.golden_wallet import run_golden_scan
+    summary = run_golden_scan(max_wallets=30)
+    golden = summary.get("golden", 0)
+    logger.info(f"Golden scan: {golden} golden wallets found")
+
+    # Step 3: Initialize paper account if needed
+    logger.info("Step 3/3: Initializing paper trading account...")
+    account = db.get_paper_account()
+    if not account:
+        db.create_paper_account(config.PAPER_TRADING_INITIAL_BALANCE)
+        logger.info(f"Paper account created: ${config.PAPER_TRADING_INITIAL_BALANCE:,.0f}")
+
+    # Backup
+    backup_to_json()
+    logger.info(f"Bootstrap complete: {humans} traders, {golden} golden wallets, DB backed up")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Hyperliquid Auto-Research Trading Bot"
@@ -1068,9 +1110,18 @@ def main():
                         help="Generate a report and exit")
     parser.add_argument("--status", action="store_true",
                         help="Print current status and exit")
+    parser.add_argument("--bootstrap", action="store_true",
+                        help="Cold start: seed DB with top trader data (run once on first deploy)")
+    parser.add_argument("--bootstrap-days", type=int, default=14,
+                        help="Days of history to bootstrap (default: 14)")
     args = parser.parse_args()
 
     logger = setup_logging()
+
+    if args.bootstrap:
+        bootstrap_seed_data(logger, days=args.bootstrap_days)
+        return
+
     bot = HyperliquidResearchBot()
 
     if args.status:

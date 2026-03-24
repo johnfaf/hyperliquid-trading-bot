@@ -76,7 +76,9 @@ class StrategyScorer:
         pnl = strategy.get("total_pnl", 0)
         # Sigmoid normalization: maps any PnL to 0-1
         # $10k PnL -> ~0.73, $50k -> ~0.95, -$10k -> ~0.27
-        return 1 / (1 + np.exp(-pnl / 10000))
+        # Clamp exponent to avoid RuntimeWarning: overflow encountered in exp
+        x = np.clip(-pnl / 10000, -500, 500)
+        return float(1 / (1 + np.exp(x)))
 
     def _score_win_rate(self, strategy: Dict) -> float:
         """Score based on win rate. Minimum trades required for reliability."""
@@ -96,7 +98,7 @@ class StrategyScorer:
         # Normalize: Sharpe of 1 -> 0.5, Sharpe of 2 -> 0.73, Sharpe of 3 -> 0.88
         if sharpe <= 0:
             return max(0, 0.2 + sharpe * 0.1)  # Negative sharpe still gets some score
-        return 1 / (1 + np.exp(-sharpe + 1))
+        return float(1 / (1 + np.exp(np.clip(-sharpe + 1, -500, 500))))
 
     def _score_consistency(self, strategy: Dict) -> float:
         """
@@ -140,7 +142,7 @@ class StrategyScorer:
         if pnl > 0:
             risk_factor = max(0.1, loss_rate)
             risk_adj = (pnl / 10000) / risk_factor
-            return min(1.0, 1 / (1 + np.exp(-risk_adj + 1)))
+            return min(1.0, float(1 / (1 + np.exp(np.clip(-risk_adj + 1, -500, 500)))))
         else:
             return max(0, 0.3 * (1 - loss_rate))
 

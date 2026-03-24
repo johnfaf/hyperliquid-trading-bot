@@ -174,8 +174,30 @@ def get_leaderboard():
     """
     Fetch the Hyperliquid leaderboard from multiple sources.
     Returns raw data from whichever source responds.
+
+    Note: The info endpoint's {"type": "leaderboard"} returns 422 BAD_PAYLOAD
+    on newer API versions, so we try the stats endpoint first.
     """
-    # Method 1: Official info endpoint with "leaderboard" type
+    # Method 1: Stats data endpoint (used by the frontend — most reliable)
+    try:
+        mgr = get_manager()
+        if not mgr.bucket.acquire(priority=Priority.LOW, timeout=10):
+            logger.debug("Leaderboard: couldn't acquire token for stats endpoint")
+        else:
+            resp = requests.get(
+                "https://stats-data.hyperliquid.xyz/Mainnet/leaderboard",
+                timeout=30
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                logger.info(f"Leaderboard from stats endpoint: type={type(data).__name__}")
+                return data
+            else:
+                logger.debug(f"Stats leaderboard returned {resp.status_code}")
+    except Exception as e:
+        logger.warning(f"Stats leaderboard failed: {e}")
+
+    # Method 2: Fallback to info endpoint (may 422 on newer API versions)
     try:
         data = _post({"type": "leaderboard"}, priority=Priority.LOW)
         if data:
@@ -183,24 +205,7 @@ def get_leaderboard():
                        f"keys={list(data.keys()) if isinstance(data, dict) else f'list[{len(data)}]'}")
             return data
     except Exception as e:
-        logger.warning(f"Info leaderboard failed: {e}")
-
-    # Method 2: Stats data endpoint (used by the frontend)
-    # This goes through the token bucket but bypasses the info-endpoint cache
-    try:
-        mgr = get_manager()
-        if not mgr.bucket.acquire(priority=Priority.LOW, timeout=10):
-            return None
-        resp = requests.get(
-            "https://stats-data.hyperliquid.xyz/Mainnet/leaderboard",
-            timeout=30
-        )
-        if resp.status_code == 200:
-            data = resp.json()
-            logger.info(f"Leaderboard from stats endpoint: type={type(data).__name__}")
-            return data
-    except Exception as e:
-        logger.warning(f"Stats leaderboard failed: {e}")
+        logger.debug(f"Info leaderboard fallback failed: {e}")
 
     return None
 

@@ -66,6 +66,7 @@ class TradeSignal:
     # Sizing
     position_pct: float = 0.08        # % of portfolio (default 8%)
     leverage: float = 2.0             # Leverage to use
+    size: float = 0.0                 # Position size in asset units (0 = auto from position_pct)
 
     # Context
     entry_price: float = 0.0          # Expected entry price (0 = market)

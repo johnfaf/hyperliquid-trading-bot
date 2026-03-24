@@ -40,7 +40,7 @@ TRACKED_CURRENCIES = ["BTC", "ETH", "SOL"]
 # Cache TTLs
 INSTRUMENTS_CACHE_TTL = 300   # 5 min
 TRADES_CACHE_TTL = 30         # 30 sec
-OI_CACHE_TTL = 60             # 1 min
+OI_CACHE_TTL = 300            # 5 min (was 60s — caused 429 storms on get_order_book)
 
 
 class OptionsFlowScanner:
@@ -77,19 +77,31 @@ class OptionsFlowScanner:
     # ─── Deribit API Helpers ──────────────────────────────────
 
     def _deribit_get(self, method: str, params: dict = None) -> Optional[dict]:
-        """Call a Deribit public API method (JSON-RPC over HTTP GET)."""
-        try:
-            url = f"{DERIBIT_BASE}/{method}"
-            resp = self.session.get(url, params=params or {}, timeout=10)
-            if resp.status_code == 200:
-                data = resp.json()
-                return data.get("result", data)
-            else:
-                logger.warning(f"Deribit {method} returned {resp.status_code}")
+        """Call a Deribit public API method (JSON-RPC over HTTP GET).
+        Includes rate-limit handling: backs off on 429 with exponential delay.
+        """
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                url = f"{DERIBIT_BASE}/{method}"
+                resp = self.session.get(url, params=params or {}, timeout=10)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    return data.get("result", data)
+                elif resp.status_code == 429:
+                    backoff = min(30, 2 ** (attempt + 1))
+                    logger.warning(f"Deribit 429 on {method}, backing off {backoff}s "
+                                   f"(attempt {attempt+1}/{max_retries})")
+                    time.sleep(backoff)
+                    continue
+                else:
+                    logger.warning(f"Deribit {method} returned {resp.status_code}")
+                    return None
+            except Exception as e:
+                logger.debug(f"Deribit {method} error: {e}")
                 return None
-        except Exception as e:
-            logger.debug(f"Deribit {method} error: {e}")
-            return None
+        logger.warning(f"Deribit {method} failed after {max_retries} retries (429)")
+        return None
 
     def _binance_options_get(self, endpoint: str, params: dict = None) -> Optional[dict]:
         """Call Binance Options API."""
@@ -170,6 +182,7 @@ class OptionsFlowScanner:
             return cached["oi"]
 
         oi = 0.0
+        time.sleep(0.25)  # Throttle OI lookups — Deribit rate limit is ~5 req/s
         data = self._deribit_get("public/get_order_book", {
             "instrument_name": instrument_name, "depth": 1
         })

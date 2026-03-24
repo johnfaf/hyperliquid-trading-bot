@@ -136,8 +136,10 @@ class DecisionFirewall:
                 pos_leverage = pos.get("leverage", 1)
                 total_exposure += abs(pos_size * pos_price * pos_leverage)
 
-            new_notional = signal.size * signal.leverage if signal.size else (
-                balance * 0.08 * signal.leverage
+            new_notional = (
+                signal.size * signal.entry_price * signal.leverage
+                if signal.size and signal.entry_price
+                else balance * signal.position_pct * signal.leverage
             )
             projected_exposure = total_exposure + new_notional
             exposure_pct = projected_exposure / balance if balance > 0 else 1.0

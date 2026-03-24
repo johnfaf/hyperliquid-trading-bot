@@ -23,6 +23,12 @@ MAX_TRACKED_TRADERS = 2000  # Scan top 2000 — bots are skipped via DB, APIMana
 # How often to refresh the leaderboard (seconds)
 LEADERBOARD_REFRESH_INTERVAL = 3600  # 1 hour
 
+# ─── Bot Detection (tunable thresholds) ──────────────────────
+BOT_HARD_CUTOFF_TRADES = int(os.environ.get("BOT_HARD_CUTOFF_TRADES", 100))   # >N trades/day = instant bot
+BOT_THRESHOLD = int(os.environ.get("BOT_THRESHOLD", 3))                        # signal score >= N = bot
+BOT_MM_PNL_THRESHOLD = float(os.environ.get("BOT_MM_PNL_THRESHOLD", 0.0))     # median PnL < N = spread/MM
+BOT_ELEVATED_FREQ = int(os.environ.get("BOT_ELEVATED_FREQ", 50))              # trades/day for elevated freq signal
+
 # ─── Strategy Analysis ────────────────────────────────────────
 # Minimum number of trades to classify a strategy
 MIN_TRADES_FOR_STRATEGY = 5

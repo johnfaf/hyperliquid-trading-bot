@@ -557,8 +557,8 @@ class TraderDiscovery:
 
         # Hard cutoff 1: >100 trades/day = bot, period
         # A very active human scalper might do 30-80, but >100 is automation
-        if trades_per_day > 100:
-            logger.info(f"Bot INSTANT: {trades_per_day:.0f} trades/day (hard cutoff >100)")
+        if trades_per_day > config.BOT_HARD_CUTOFF_TRADES:
+            logger.info(f"Bot INSTANT: {trades_per_day:.0f} trades/day (hard cutoff >{config.BOT_HARD_CUTOFF_TRADES})")
             return 10  # Guaranteed bot score
 
         # Hard cutoff 2: Spread bot — high frequency + micro PnL per trade
@@ -585,8 +585,8 @@ class TraderDiscovery:
 
         # Signal 1: Elevated frequency — 50-100 trades/day is suspicious
         # This alone is strong evidence of automation
-        if trades_per_day > 50:
-            logger.info(f"Bot signal: {trades_per_day:.0f} trades/day (elevated frequency)")
+        if trades_per_day > config.BOT_ELEVATED_FREQ:
+            logger.info(f"Bot signal: {trades_per_day:.0f} trades/day (elevated frequency >{config.BOT_ELEVATED_FREQ})")
             bot_signals += 3  # Strong: 50+ trades/day alone = bot
 
         # Signal 2: Very small avg trade size with moderate frequency = market maker
@@ -786,7 +786,7 @@ class TraderDiscovery:
             time.sleep(DEEP_SLEEP)
 
         # ─── Separate humans from bots, with guaranteed minimum ─────
-        BOT_THRESHOLD = 3
+        BOT_THRESHOLD = config.BOT_THRESHOLD
         MIN_TRADERS = 20
 
         humans = [p for p in all_profiles if p.get("bot_score", 0) < BOT_THRESHOLD]
