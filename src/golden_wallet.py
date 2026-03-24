@@ -32,9 +32,15 @@ EXECUTION_DELAY_MS = 100        # +100 ms assumed latency
 FEE_SLIPPAGE_BPS = 4.5          # 0.045% total (taker fee + slippage)
 PENALTY_FACTOR = 1 - FEE_SLIPPAGE_BPS / 10_000  # ~0.99955
 MIN_FILLS_FOR_EVAL = 30         # need at least 30 round-trips
+MAX_FILLS_FOR_EVAL = 3000       # cap: anything above this is not human-like
 GOLDEN_THRESHOLD = 0.0          # penalised equity must be net-positive
 PAGE_SIZE = 2000                # HL max fills per request
 REQUEST_SLEEP = 0.8             # rate-limit padding
+
+# Superhuman detection: no real human trader sustains these numbers
+# over 90 days.  Wallets hitting these thresholds are bots/vaults/arb.
+MAX_HUMAN_WIN_RATE = 92.0       # >92% WR over 90d = not human
+MIN_HUMAN_DRAWDOWN = 0.5        # <0.5% max DD with big PnL = not human
 
 
 # ─── Data classes ────────────────────────────────────────────────
@@ -251,14 +257,24 @@ def compute_sharpe(pnl_series: List[float], periods_per_year: float = 365.0) -> 
     return round((mean / std) * (periods_per_year ** 0.5), 3)
 
 
-def evaluate_wallet(address: str, bot_score: int = 0) -> Optional[WalletReport]:
+def evaluate_wallet(address: str, bot_score: int = 0) -> Optional[Tuple[WalletReport, List[PenalisedFill]]]:
     """
     Full evaluation pipeline for one wallet:
     download → penalise → equity curve → score → tag golden/not
+
+    Returns (WalletReport, penalised_fills) tuple so the caller can
+    persist fills without re-downloading them (fixes double-download bug).
+    Returns None if wallet is skipped.
     """
     fills = download_fills_90d(address)
     if len(fills) < MIN_FILLS_FOR_EVAL:
         logger.info(f"Skipping {address[:10]}: only {len(fills)} fills (need {MIN_FILLS_FOR_EVAL})")
+        return None
+
+    # Hard cap: >3000 fills in 90 days = not a human trader
+    if len(fills) > MAX_FILLS_FOR_EVAL:
+        logger.info(f"Skipping {address[:10]}: {len(fills)} fills exceeds "
+                     f"{MAX_FILLS_FOR_EVAL} cap (not human-like)")
         return None
 
     penalised = apply_execution_penalties(fills)
@@ -301,10 +317,22 @@ def evaluate_wallet(address: str, bot_score: int = 0) -> Optional[WalletReport]:
     raw_total = sum(f.closed_pnl for f in penalised)
     pen_total = sum(f.penalised_pnl for f in penalised)
 
+    # Superhuman filter: these metrics indicate bots/vaults, not real traders.
+    # No human sustains 97%+ WR or 0% DD over 90 days with meaningful PnL.
+    superhuman = False
+    if win_rate > MAX_HUMAN_WIN_RATE and abs(pen_total) > 1000:
+        superhuman = True
+        logger.info(f"Superhuman filter: {address[:10]} WR={win_rate:.0f}% "
+                     f"(>{MAX_HUMAN_WIN_RATE}%) — likely bot/vault")
+    if compute_max_drawdown(pen_curve) < MIN_HUMAN_DRAWDOWN and pen_total > 5000:
+        superhuman = True
+        logger.info(f"Superhuman filter: {address[:10]} DD={compute_max_drawdown(pen_curve):.1f}% "
+                     f"(<{MIN_HUMAN_DRAWDOWN}%) with ${pen_total:+,.0f} — likely bot/vault")
+
     # Golden = penalised equity still positive AND curve trending up
-    # Check: final equity > initial AND last 30% of curve > first 30%
+    # AND passes the superhuman reality check
     is_golden = False
-    if pen_total > GOLDEN_THRESHOLD and len(pen_curve) > 10:
+    if not superhuman and pen_total > GOLDEN_THRESHOLD and len(pen_curve) > 10:
         split = len(pen_curve) // 3
         first_third_avg = sum(pen_curve[:split]) / split if split > 0 else 0
         last_third_avg = sum(pen_curve[-split:]) / split if split > 0 else 0
@@ -343,7 +371,7 @@ def evaluate_wallet(address: str, bot_score: int = 0) -> Optional[WalletReport]:
         f"| {tag}"
     )
 
-    return report
+    return report, penalised
 
 
 # ─── Database persistence ────────────────────────────────────────
@@ -544,13 +572,12 @@ def run_golden_scan(max_wallets: int = 50) -> Dict:
     for i, w in enumerate(wallets):
         logger.info(f"[{i+1}/{len(wallets)}] Evaluating {w['address'][:10]}...")
         try:
-            report = evaluate_wallet(w["address"], w.get("bot_score", 0))
-            if report:
+            result = evaluate_wallet(w["address"], w.get("bot_score", 0))
+            if result:
+                report, penalised_fills = result
                 save_wallet_report(report)
-                # Also save fills for backtest replay
-                fills = download_fills_90d(w["address"])  # re-download (or cache)
-                penalised = apply_execution_penalties(fills)
-                save_wallet_fills(w["address"], penalised)
+                # Reuse the fills from evaluate_wallet — no re-download!
+                save_wallet_fills(w["address"], penalised_fills)
                 results.append(report)
                 if report.is_golden:
                     golden_count += 1
