@@ -1,0 +1,583 @@
+"""
+Golden Wallet Pipeline
+======================
+1. Download 3 months of fills for every "human-like" wallet (bot_score < 3)
+2. Apply realistic execution penalties (+100ms delay, -0.045% slippage+fees)
+3. Build equity curves and tag wallets whose penalised curve is still rising
+4. Persist results so the backtest dashboard can read them
+
+Hyperliquid API returns max 2000 fills per call.  We page backwards with
+startTime to cover the full 90-day window.
+"""
+import logging
+import time
+import json
+import sqlite3
+import os
+import sys
+from datetime import datetime, timedelta, timezone
+from dataclasses import dataclass, field, asdict
+from typing import List, Dict, Optional, Tuple
+from enum import Enum
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+import config
+from src import hyperliquid_client as hl
+
+logger = logging.getLogger("golden_wallet")
+
+# ─── Constants ───────────────────────────────────────────────────
+LOOKBACK_DAYS = 90
+EXECUTION_DELAY_MS = 100        # +100 ms assumed latency
+FEE_SLIPPAGE_BPS = 4.5          # 0.045% total (taker fee + slippage)
+PENALTY_FACTOR = 1 - FEE_SLIPPAGE_BPS / 10_000  # ~0.99955
+MIN_FILLS_FOR_EVAL = 30         # need at least 30 round-trips
+GOLDEN_THRESHOLD = 0.0          # penalised equity must be net-positive
+PAGE_SIZE = 2000                # HL max fills per request
+REQUEST_SLEEP = 0.8             # rate-limit padding
+
+
+# ─── Data classes ────────────────────────────────────────────────
+@dataclass
+class PenalisedFill:
+    """A single fill with execution-reality adjustments applied."""
+    coin: str
+    side: str           # "buy" / "sell"
+    original_price: float
+    penalised_price: float
+    size: float
+    time_ms: int        # original timestamp
+    delayed_time_ms: int  # +100ms
+    closed_pnl: float   # raw from exchange
+    penalised_pnl: float # after slippage/fee deduction
+    fee: float
+    is_liquidation: bool
+    direction: str       # "Open Long", "Close Long", etc.
+
+
+@dataclass
+class WalletReport:
+    """Full backtest report for one wallet."""
+    address: str
+    bot_score: int
+    total_fills: int
+    fills_in_window: int
+    raw_pnl: float
+    penalised_pnl: float
+    raw_equity_curve: List[float] = field(default_factory=list)
+    penalised_equity_curve: List[float] = field(default_factory=list)
+    equity_timestamps: List[int] = field(default_factory=list)
+    max_drawdown_pct: float = 0.0
+    penalised_max_drawdown_pct: float = 0.0
+    sharpe_ratio: float = 0.0
+    win_rate: float = 0.0
+    trades_per_day: float = 0.0
+    is_golden: bool = False
+    coins_traded: List[str] = field(default_factory=list)
+    best_coin: str = ""
+    worst_coin: str = ""
+    avg_hold_time_hours: float = 0.0
+    evaluated_at: str = ""
+
+
+# ─── Core functions ──────────────────────────────────────────────
+
+def download_fills_90d(address: str) -> List[Dict]:
+    """
+    Download up to 90 days of fills for a single address.
+    Pages backwards using startTime to get past the 2000-fill cap.
+    """
+    cutoff_ms = int((datetime.now(timezone.utc) - timedelta(days=LOOKBACK_DAYS)).timestamp() * 1000)
+    all_fills = []
+    oldest_seen = None
+
+    for page in range(50):  # safety cap: 50 pages = 100k fills max
+        start_time = oldest_seen if oldest_seen else None
+        # For first page, don't pass startTime to get most recent
+        # For subsequent pages, use oldest seen to page backwards
+        if page == 0:
+            fills = hl.get_user_fills(address)
+        else:
+            fills = hl.get_user_fills(address, start_time=cutoff_ms)
+
+        if not fills:
+            break
+
+        # On page 0 we get newest fills; filter to window
+        new_fills = [f for f in fills if f["time"] >= cutoff_ms]
+        if not new_fills:
+            break
+
+        # Deduplicate by hash
+        seen_hashes = {f["hash"] for f in all_fills}
+        added = 0
+        for f in new_fills:
+            if f["hash"] not in seen_hashes:
+                all_fills.append(f)
+                seen_hashes.add(f["hash"])
+                added += 1
+
+        if added == 0:
+            break
+
+        # Find oldest fill time to use for next page
+        times = [f["time"] for f in new_fills]
+        min_time = min(times)
+        if oldest_seen is not None and min_time >= oldest_seen:
+            break  # No progress
+        oldest_seen = min_time
+
+        # If we got less than PAGE_SIZE, we've hit the bottom
+        if len(fills) < PAGE_SIZE:
+            break
+
+        logger.debug(f"  Page {page+1}: +{added} fills (total: {len(all_fills)}, oldest: {min_time})")
+        time.sleep(REQUEST_SLEEP)
+
+    all_fills.sort(key=lambda f: f["time"])
+    logger.info(f"Downloaded {len(all_fills)} fills for {address[:10]}... "
+                f"(span: {LOOKBACK_DAYS}d window)")
+    return all_fills
+
+
+def apply_execution_penalties(fills: List[Dict]) -> List[PenalisedFill]:
+    """
+    Apply realistic execution penalties to each fill:
+    - +100ms timestamp delay (you'd enter slightly later)
+    - -0.045% price penalty (taker fees + slippage)
+
+    For buys:  penalised_price = original * (1 + 0.00045)  — you pay more
+    For sells: penalised_price = original * (1 - 0.00045)  — you receive less
+    """
+    penalised = []
+
+    for f in fills:
+        side = f["side"]  # "buy" or "sell"
+        price = f["price"]
+        size = f["size"]
+        closed_pnl = f["closed_pnl"]
+
+        # Delay
+        delayed_time = f["time"] + EXECUTION_DELAY_MS
+
+        # Price penalty
+        if side == "buy":
+            pen_price = price * (1 + FEE_SLIPPAGE_BPS / 10_000)
+        else:
+            pen_price = price * (1 - FEE_SLIPPAGE_BPS / 10_000)
+
+        # Penalised PnL: if this fill closed a position, adjust the PnL
+        # The penalty applies to BOTH entry and exit, so double the single-leg fee
+        if closed_pnl != 0:
+            # PnL hit = notional * 2 * fee_rate (entry + exit penalty)
+            notional = price * size
+            pnl_penalty = notional * 2 * (FEE_SLIPPAGE_BPS / 10_000)
+            if closed_pnl > 0:
+                pen_pnl = max(0, closed_pnl - pnl_penalty)
+            else:
+                pen_pnl = closed_pnl - pnl_penalty  # loss gets worse
+        else:
+            pen_pnl = 0.0
+
+        penalised.append(PenalisedFill(
+            coin=f["coin"],
+            side=side,
+            original_price=price,
+            penalised_price=round(pen_price, 6),
+            size=size,
+            time_ms=f["time"],
+            delayed_time_ms=delayed_time,
+            closed_pnl=closed_pnl,
+            penalised_pnl=round(pen_pnl, 6),
+            fee=f.get("fee", 0),
+            is_liquidation=f.get("is_liquidation", False),
+            direction=f.get("direction", ""),
+        ))
+
+    return penalised
+
+
+def build_equity_curve(penalised_fills: List[PenalisedFill],
+                       initial_equity: float = 10_000.0
+                       ) -> Tuple[List[float], List[float], List[int]]:
+    """
+    Build two equity curves from penalised fills:
+    - raw_curve: using original closed_pnl
+    - penalised_curve: using penalised_pnl
+
+    Returns (raw_curve, penalised_curve, timestamps)
+    """
+    raw_eq = initial_equity
+    pen_eq = initial_equity
+    raw_curve = [raw_eq]
+    pen_curve = [pen_eq]
+    timestamps = [penalised_fills[0].time_ms if penalised_fills else 0]
+
+    for fill in penalised_fills:
+        if fill.closed_pnl != 0 or fill.penalised_pnl != 0:
+            raw_eq += fill.closed_pnl
+            pen_eq += fill.penalised_pnl
+            raw_curve.append(raw_eq)
+            pen_curve.append(pen_eq)
+            timestamps.append(fill.time_ms)
+
+    return raw_curve, pen_curve, timestamps
+
+
+def compute_max_drawdown(curve: List[float]) -> float:
+    """Compute maximum drawdown as a percentage."""
+    if not curve or len(curve) < 2:
+        return 0.0
+    peak = curve[0]
+    max_dd = 0.0
+    for val in curve:
+        if val > peak:
+            peak = val
+        dd = (peak - val) / peak if peak > 0 else 0
+        if dd > max_dd:
+            max_dd = dd
+    return round(max_dd * 100, 2)
+
+
+def compute_sharpe(pnl_series: List[float], periods_per_year: float = 365.0) -> float:
+    """Annualised Sharpe from a series of PnL values."""
+    if len(pnl_series) < 5:
+        return 0.0
+    import statistics
+    mean = statistics.mean(pnl_series)
+    std = statistics.stdev(pnl_series)
+    if std == 0:
+        return 0.0
+    return round((mean / std) * (periods_per_year ** 0.5), 3)
+
+
+def evaluate_wallet(address: str, bot_score: int = 0) -> Optional[WalletReport]:
+    """
+    Full evaluation pipeline for one wallet:
+    download → penalise → equity curve → score → tag golden/not
+    """
+    fills = download_fills_90d(address)
+    if len(fills) < MIN_FILLS_FOR_EVAL:
+        logger.info(f"Skipping {address[:10]}: only {len(fills)} fills (need {MIN_FILLS_FOR_EVAL})")
+        return None
+
+    penalised = apply_execution_penalties(fills)
+    raw_curve, pen_curve, timestamps = build_equity_curve(penalised)
+
+    # PnL series for Sharpe: daily aggregated
+    daily_pnl = {}
+    for f in penalised:
+        day = f.time_ms // (86400 * 1000)
+        daily_pnl.setdefault(day, {"raw": 0, "pen": 0})
+        daily_pnl[day]["raw"] += f.closed_pnl
+        daily_pnl[day]["pen"] += f.penalised_pnl
+
+    pen_daily = [v["pen"] for v in daily_pnl.values()]
+    raw_daily = [v["raw"] for v in daily_pnl.values()]
+
+    # Coin breakdown
+    coin_pnl = {}
+    for f in penalised:
+        coin_pnl.setdefault(f.coin, 0)
+        coin_pnl[f.coin] += f.penalised_pnl
+
+    coins_traded = list(coin_pnl.keys())
+    best_coin = max(coin_pnl, key=coin_pnl.get) if coin_pnl else ""
+    worst_coin = min(coin_pnl, key=coin_pnl.get) if coin_pnl else ""
+
+    # Win rate on closing fills
+    closing_fills = [f for f in penalised if f.penalised_pnl != 0]
+    wins = len([f for f in closing_fills if f.penalised_pnl > 0])
+    win_rate = (wins / len(closing_fills) * 100) if closing_fills else 0
+
+    # Trades per day
+    if len(fills) >= 2:
+        span_days = max((fills[-1]["time"] - fills[0]["time"]) / (86400 * 1000), 1)
+        tpd = len(fills) / span_days
+    else:
+        span_days = 1
+        tpd = 0
+
+    raw_total = sum(f.closed_pnl for f in penalised)
+    pen_total = sum(f.penalised_pnl for f in penalised)
+
+    # Golden = penalised equity still positive AND curve trending up
+    # Check: final equity > initial AND last 30% of curve > first 30%
+    is_golden = False
+    if pen_total > GOLDEN_THRESHOLD and len(pen_curve) > 10:
+        split = len(pen_curve) // 3
+        first_third_avg = sum(pen_curve[:split]) / split if split > 0 else 0
+        last_third_avg = sum(pen_curve[-split:]) / split if split > 0 else 0
+        is_golden = last_third_avg > first_third_avg and pen_curve[-1] > pen_curve[0]
+
+    report = WalletReport(
+        address=address,
+        bot_score=bot_score,
+        total_fills=len(fills),
+        fills_in_window=len(fills),
+        raw_pnl=round(raw_total, 2),
+        penalised_pnl=round(pen_total, 2),
+        raw_equity_curve=raw_curve,
+        penalised_equity_curve=pen_curve,
+        equity_timestamps=timestamps,
+        max_drawdown_pct=compute_max_drawdown(raw_curve),
+        penalised_max_drawdown_pct=compute_max_drawdown(pen_curve),
+        sharpe_ratio=compute_sharpe(pen_daily),
+        win_rate=round(win_rate, 1),
+        trades_per_day=round(tpd, 1),
+        is_golden=is_golden,
+        coins_traded=coins_traded,
+        best_coin=best_coin,
+        worst_coin=worst_coin,
+        avg_hold_time_hours=0,  # TODO: compute from open/close pairs
+        evaluated_at=datetime.utcnow().isoformat(),
+    )
+
+    tag = "GOLDEN" if is_golden else "not golden"
+    logger.info(
+        f"{'★' if is_golden else '·'} {address[:10]}: "
+        f"raw=${raw_total:+,.0f} → penalised=${pen_total:+,.0f} "
+        f"| DD={report.penalised_max_drawdown_pct:.1f}% "
+        f"| Sharpe={report.sharpe_ratio:.2f} "
+        f"| WR={report.win_rate:.0f}% "
+        f"| {tag}"
+    )
+
+    return report
+
+
+# ─── Database persistence ────────────────────────────────────────
+
+def _get_db():
+    conn = sqlite3.connect(config.DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_golden_tables():
+    """Create tables for golden wallet pipeline."""
+    conn = _get_db()
+    try:
+        conn.executescript("""
+        CREATE TABLE IF NOT EXISTS golden_wallets (
+            address TEXT PRIMARY KEY,
+            bot_score INTEGER DEFAULT 0,
+            total_fills INTEGER DEFAULT 0,
+            raw_pnl REAL DEFAULT 0,
+            penalised_pnl REAL DEFAULT 0,
+            max_drawdown_pct REAL DEFAULT 0,
+            penalised_max_drawdown_pct REAL DEFAULT 0,
+            sharpe_ratio REAL DEFAULT 0,
+            win_rate REAL DEFAULT 0,
+            trades_per_day REAL DEFAULT 0,
+            is_golden INTEGER DEFAULT 0,
+            coins_traded TEXT DEFAULT '[]',
+            best_coin TEXT DEFAULT '',
+            worst_coin TEXT DEFAULT '',
+            raw_equity_curve TEXT DEFAULT '[]',
+            penalised_equity_curve TEXT DEFAULT '[]',
+            equity_timestamps TEXT DEFAULT '[]',
+            evaluated_at TEXT NOT NULL,
+            connected_to_live INTEGER DEFAULT 0
+        );
+
+        CREATE TABLE IF NOT EXISTS wallet_fills (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            wallet_address TEXT NOT NULL,
+            coin TEXT NOT NULL,
+            side TEXT NOT NULL,
+            original_price REAL NOT NULL,
+            penalised_price REAL NOT NULL,
+            size REAL NOT NULL,
+            time_ms INTEGER NOT NULL,
+            delayed_time_ms INTEGER NOT NULL,
+            closed_pnl REAL DEFAULT 0,
+            penalised_pnl REAL DEFAULT 0,
+            fee REAL DEFAULT 0,
+            is_liquidation INTEGER DEFAULT 0,
+            direction TEXT DEFAULT '',
+            FOREIGN KEY (wallet_address) REFERENCES golden_wallets(address)
+        );
+        CREATE INDEX IF NOT EXISTS idx_wf_addr ON wallet_fills(wallet_address);
+        CREATE INDEX IF NOT EXISTS idx_wf_time ON wallet_fills(time_ms);
+        CREATE INDEX IF NOT EXISTS idx_wf_coin ON wallet_fills(coin);
+        """)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def save_wallet_report(report: WalletReport):
+    """Persist a wallet evaluation report + all its fills."""
+    conn = _get_db()
+    try:
+        conn.execute("""
+            INSERT OR REPLACE INTO golden_wallets
+            (address, bot_score, total_fills, raw_pnl, penalised_pnl,
+             max_drawdown_pct, penalised_max_drawdown_pct, sharpe_ratio,
+             win_rate, trades_per_day, is_golden, coins_traded, best_coin,
+             worst_coin, raw_equity_curve, penalised_equity_curve,
+             equity_timestamps, evaluated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            report.address, report.bot_score, report.total_fills,
+            report.raw_pnl, report.penalised_pnl,
+            report.max_drawdown_pct, report.penalised_max_drawdown_pct,
+            report.sharpe_ratio, report.win_rate, report.trades_per_day,
+            1 if report.is_golden else 0,
+            json.dumps(report.coins_traded), report.best_coin, report.worst_coin,
+            json.dumps(report.raw_equity_curve[-500:]),  # cap storage
+            json.dumps(report.penalised_equity_curve[-500:]),
+            json.dumps(report.equity_timestamps[-500:]),
+            report.evaluated_at,
+        ))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def save_wallet_fills(address: str, penalised_fills: List[PenalisedFill]):
+    """Persist penalised fills for backtest replay."""
+    conn = _get_db()
+    try:
+        # Clear old fills for this wallet
+        conn.execute("DELETE FROM wallet_fills WHERE wallet_address = ?", (address,))
+        for f in penalised_fills:
+            conn.execute("""
+                INSERT INTO wallet_fills
+                (wallet_address, coin, side, original_price, penalised_price,
+                 size, time_ms, delayed_time_ms, closed_pnl, penalised_pnl,
+                 fee, is_liquidation, direction)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                address, f.coin, f.side, f.original_price, f.penalised_price,
+                f.size, f.time_ms, f.delayed_time_ms, f.closed_pnl,
+                f.penalised_pnl, f.fee, 1 if f.is_liquidation else 0,
+                f.direction,
+            ))
+        conn.commit()
+        logger.info(f"Saved {len(penalised_fills)} fills for {address[:10]}")
+    finally:
+        conn.close()
+
+
+def get_golden_wallets() -> List[Dict]:
+    """Get all wallets flagged as golden."""
+    conn = _get_db()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM golden_wallets WHERE is_golden = 1 "
+            "ORDER BY penalised_pnl DESC"
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def get_all_wallet_reports() -> List[Dict]:
+    """Get all evaluated wallets (golden and non-golden)."""
+    conn = _get_db()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM golden_wallets ORDER BY penalised_pnl DESC"
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def get_wallet_fills(address: str) -> List[Dict]:
+    """Get all stored fills for a wallet."""
+    conn = _get_db()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM wallet_fills WHERE wallet_address = ? ORDER BY time_ms",
+            (address,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+# ─── Batch evaluation ────────────────────────────────────────────
+
+def get_human_wallets_from_db() -> List[Dict]:
+    """Get all active human-like traders from the bot's DB."""
+    conn = _get_db()
+    try:
+        rows = conn.execute(
+            "SELECT address, metadata FROM traders WHERE active = 1"
+        ).fetchall()
+        wallets = []
+        for r in rows:
+            meta = json.loads(r["metadata"]) if r["metadata"] else {}
+            bot_score = meta.get("bot_score", 0)
+            if bot_score < 3:  # Human-like threshold
+                wallets.append({
+                    "address": r["address"],
+                    "bot_score": bot_score,
+                })
+        return wallets
+    finally:
+        conn.close()
+
+
+def run_golden_scan(max_wallets: int = 50) -> Dict:
+    """
+    Main entry point: scan human-like wallets, evaluate, tag golden ones.
+    Returns summary stats.
+    """
+    init_golden_tables()
+
+    wallets = get_human_wallets_from_db()
+    if not wallets:
+        logger.warning("No human-like wallets found in DB. Run discovery first.")
+        return {"scanned": 0, "golden": 0, "error": "no wallets"}
+
+    logger.info(f"Starting golden wallet scan: {len(wallets)} human-like wallets "
+                f"(evaluating up to {max_wallets})")
+
+    wallets = wallets[:max_wallets]
+    results = []
+    golden_count = 0
+
+    for i, w in enumerate(wallets):
+        logger.info(f"[{i+1}/{len(wallets)}] Evaluating {w['address'][:10]}...")
+        try:
+            report = evaluate_wallet(w["address"], w.get("bot_score", 0))
+            if report:
+                save_wallet_report(report)
+                # Also save fills for backtest replay
+                fills = download_fills_90d(w["address"])  # re-download (or cache)
+                penalised = apply_execution_penalties(fills)
+                save_wallet_fills(w["address"], penalised)
+                results.append(report)
+                if report.is_golden:
+                    golden_count += 1
+        except Exception as e:
+            logger.error(f"Error evaluating {w['address'][:10]}: {e}")
+
+        # Rate limit between wallets
+        time.sleep(1.0)
+
+    summary = {
+        "scanned": len(results),
+        "golden": golden_count,
+        "total_human_wallets": len(wallets),
+        "golden_addresses": [r.address for r in results if r.is_golden],
+        "top_by_penalised_pnl": sorted(
+            [{"addr": r.address[:10], "pnl": r.penalised_pnl, "sharpe": r.sharpe_ratio,
+              "dd": r.penalised_max_drawdown_pct, "golden": r.is_golden}
+             for r in results],
+            key=lambda x: x["pnl"], reverse=True
+        )[:10],
+        "evaluated_at": datetime.utcnow().isoformat(),
+    }
+
+    logger.info(f"Golden scan complete: {golden_count}/{len(results)} wallets are golden")
+    for r in results:
+        if r.is_golden:
+            logger.info(f"  ★ {r.address[:10]}: penalised PnL=${r.penalised_pnl:+,.0f}, "
+                        f"Sharpe={r.sharpe_ratio:.2f}, DD={r.penalised_max_drawdown_pct:.1f}%")
+
+    return summary

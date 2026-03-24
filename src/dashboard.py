@@ -673,6 +673,20 @@ class DashboardHandler(BaseHTTPRequestHandler):
         elif parsed.path == "/api/health":
             self._json_response({"status": "ok", "timestamp": datetime.utcnow().isoformat()})
 
+        elif parsed.path == "/backtest":
+            self._serve_backtest_html()
+
+        elif parsed.path == "/api/backtest":
+            self._serve_backtest_data()
+
+        elif parsed.path == "/api/backtest/wallet":
+            params = parse_qs(parsed.query)
+            address = params.get("address", [None])[0]
+            if address:
+                self._serve_wallet_detail(address)
+            else:
+                self._json_response({"error": "address param required"}, code=400)
+
         else:
             self.send_response(404)
             self.end_headers()
@@ -681,6 +695,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         if parsed.path == "/api/order":
             self._handle_order()
+        elif parsed.path == "/api/backtest/run":
+            self._handle_backtest_run()
         else:
             self.send_response(404)
             self.end_headers()
@@ -730,6 +746,67 @@ class DashboardHandler(BaseHTTPRequestHandler):
         except Exception as e:
             self._json_response({"status": f"Error: {e}"}, code=400)
 
+    def _serve_backtest_html(self):
+        """Serve the backtest dashboard HTML."""
+        try:
+            from src.backtest_dashboard import BACKTEST_HTML
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(BACKTEST_HTML.encode())
+        except Exception as e:
+            self.send_response(500)
+            self.end_headers()
+            self.wfile.write(f"Backtest dashboard error: {e}".encode())
+
+    def _serve_backtest_data(self):
+        """Serve backtest overview data as JSON."""
+        try:
+            from src.backtest_dashboard import get_backtest_dashboard_data
+            data = get_backtest_dashboard_data()
+            self._json_response(data)
+        except Exception as e:
+            self._json_response({"error": str(e), "wallets": [],
+                                 "golden_count": 0, "total_evaluated": 0,
+                                 "timeframe_summaries": {}, "backtest_addresses": []})
+
+    def _serve_wallet_detail(self, address: str):
+        """Serve detailed backtest data for one wallet."""
+        try:
+            from src.backtest_dashboard import get_wallet_detail
+            data = get_wallet_detail(address)
+            if data:
+                self._json_response(data)
+            else:
+                self._json_response({"error": "Wallet not found"}, code=404)
+        except Exception as e:
+            self._json_response({"error": str(e)}, code=500)
+
+    def _handle_backtest_run(self):
+        """Trigger a golden wallet scan + backtest run."""
+        try:
+            import threading
+            from src.golden_wallet import run_golden_scan, init_golden_tables
+            from src.backtest_engine import run_all_backtests, save_backtest_result, init_backtest_tables
+
+            def _run():
+                try:
+                    init_golden_tables()
+                    init_backtest_tables()
+                    scan_result = run_golden_scan(max_wallets=30)
+                    results = run_all_backtests()
+                    for r in results:
+                        save_backtest_result(r)
+                except Exception as e:
+                    import logging
+                    logging.getLogger("backtest").error(f"Background scan error: {e}")
+
+            t = threading.Thread(target=_run, daemon=True)
+            t.start()
+            self._json_response({"status": "started", "message": "Golden scan + backtest running in background. Refresh in a few minutes."})
+        except Exception as e:
+            self._json_response({"error": str(e)}, code=500)
+
 
 def set_options_scanner(scanner):
     """Set the options scanner reference for the /options and /api/flow routes."""
@@ -753,6 +830,7 @@ def start_dashboard(port=None, options_scanner=None):
     print(f"Dashboard running at http://0.0.0.0:{port}")
     print(f"  Main dashboard:    http://0.0.0.0:{port}/")
     print(f"  Options flow:      http://0.0.0.0:{port}/options")
+    print(f"  Backtest:          http://0.0.0.0:{port}/backtest")
     return server
 
 

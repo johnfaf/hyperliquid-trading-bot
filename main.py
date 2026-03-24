@@ -46,6 +46,7 @@ from src.signal_processor import SignalProcessor, ArenaIncubator
 from src.decision_engine import DecisionEngine
 from src.exchanges.scanner import MultiExchangeScanner
 from src import telegram_bot as tg
+from src.golden_bridge import get_golden_copy_signals, auto_connect_golden_wallets, get_stats as golden_stats
 
 # ─── Logging Setup ─────────────────────────────────────────────
 
@@ -727,6 +728,17 @@ class HyperliquidResearchBot:
             # Phase 4b: Copy trading - mirror top trader positions (V2: firewall gated)
             self.logger.info("Phase 4b: Copy Trading (V2)")
             copy_signals = self.copy_trader.scan_top_traders(top_n=10)
+
+            # Inject golden wallet signals (higher confidence, proven profitable)
+            try:
+                auto_connect_golden_wallets()
+                golden_signals = get_golden_copy_signals()
+                if golden_signals:
+                    self.logger.info(f"  Golden bridge: {len(golden_signals)} signals from verified wallets")
+                    copy_signals = golden_signals + copy_signals  # golden first = higher priority
+            except Exception as e:
+                self.logger.debug(f"  Golden bridge skipped: {e}")
+
             if copy_signals:
                 copy_executed = self.copy_trader.execute_copy_signals(
                     copy_signals, regime_data=regime_data
@@ -869,6 +881,15 @@ class HyperliquidResearchBot:
                                        f"{cv_stats.get('confirmations_found', 0)} confirmed, "
                                        f"avg score={cv_stats.get('avg_confirmation_score', 0):.3f}, "
                                        f"arbs={cv_stats.get('funding_arbs_found', 0)}")
+            except Exception:
+                pass
+
+            try:
+                gs = golden_stats()
+                if gs["total_evaluated"] > 0:
+                    self.logger.info(f"  Golden Wallets: {gs['golden_wallets']} golden / "
+                                   f"{gs['total_evaluated']} evaluated, "
+                                   f"{gs['live_connected']} connected to live")
             except Exception:
                 pass
 
