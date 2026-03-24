@@ -29,7 +29,7 @@ from datetime import datetime
 
 from .base_adapter import BaseExchangeAdapter, NormalizedTrader, NormalizedMarketData
 from .hyperliquid_adapter import HyperliquidAdapter
-from .lighter_adapter import LighterAdapter
+from .lighter_adapter import LighterAdapter, VenueState
 from .cross_venue import CrossVenueConfirmation, CrossVenueSignal, FundingArbitrageOpportunity
 
 logger = logging.getLogger(__name__)
@@ -41,22 +41,23 @@ class ScanResult:
     timestamp: str = field(default_factory=lambda: datetime.utcnow().isoformat())
     cycle_duration_s: float = 0.0
 
-    # Trader discovery
-    traders_discovered: Dict[str, int] = field(default_factory=dict)  # {venue: count}
+    # Trader discovery — real counts, not request counts
+    traders_discovered: Dict[str, int] = field(default_factory=dict)  # {venue: actual_trader_count}
     total_unique_traders: int = 0
     multi_venue_traders: int = 0
 
     # Signal confirmation
     signals_checked: int = 0
     signals_confirmed: int = 0
+    signals_boosted: int = 0
     avg_confirmation_score: float = 0.0
 
     # Funding arb
     funding_arb_opportunities: int = 0
     best_arb_spread: float = 0.0
 
-    # Venue health
-    venue_health: Dict[str, bool] = field(default_factory=dict)
+    # Venue health — three-state: configured / healthy / down
+    venue_health: Dict[str, str] = field(default_factory=dict)  # {venue: state_name}
 
     # Errors
     errors: List[str] = field(default_factory=list)
@@ -81,7 +82,7 @@ class MultiExchangeScanner:
         self.adapters: Dict[str, BaseExchangeAdapter] = {}
         self._init_adapters()
 
-        # Cross-venue confirmation engine
+        # Cross-venue confirmation engine — only with healthy venues
         adapter_list = list(self.adapters.values())
         self.cross_venue = CrossVenueConfirmation(adapter_list) if len(adapter_list) > 1 else None
 
@@ -112,35 +113,49 @@ class MultiExchangeScanner:
             except Exception as e:
                 logger.warning(f"Failed to init Lighter adapter: {e}")
 
-        # Future adapters go here:
-        # if self.config.get("paradex_enabled", False):
-        #     self.adapters["paradex"] = ParadexAdapter(...)
-        # if self.config.get("grvt_enabled", False):
-        #     self.adapters["grvt"] = GRVTAdapter(...)
+    def _get_healthy_adapters(self) -> Dict[str, BaseExchangeAdapter]:
+        """Return only adapters whose venue is healthy (or has no state tracking)."""
+        healthy = {}
+        for name, adapter in self.adapters.items():
+            # Check if adapter has state tracking (Lighter does, HL doesn't yet)
+            state = getattr(adapter, "state", None)
+            if state is None or state == VenueState.HEALTHY:
+                healthy[name] = adapter
+            elif state == VenueState.INITIALIZED:
+                # Not yet checked — include it, health check will update
+                healthy[name] = adapter
+            else:
+                logger.debug(f"Skipping {name} — state={state.value}")
+        return healthy
 
     # ─── Health Check ──────────────────────────────────────
 
-    def check_health(self) -> Dict[str, bool]:
-        """Check all venue APIs are reachable."""
+    def check_health(self) -> Dict[str, str]:
+        """
+        Check all venue APIs. Returns {venue: state_string}.
+        Three states: 'healthy', 'degraded', 'down' (plus 'initialized' before first check).
+        Only healthy venues count toward confirmation scoring.
+        """
         health = {}
         for name, adapter in self.adapters.items():
             try:
-                health[name] = adapter.health_check()
-            except Exception:
-                health[name] = False
+                is_healthy = adapter.health_check()
+                # Get the detailed state if available
+                state = getattr(adapter, "state", None)
+                if state:
+                    health[name] = state.value
+                else:
+                    health[name] = "healthy" if is_healthy else "down"
+            except Exception as e:
+                health[name] = "down"
+                logger.warning(f"Health check exception for {name}: {e}")
         return health
 
     # ─── Trader Discovery ──────────────────────────────────
 
     def discover_traders(self, limit: int = 100) -> List[NormalizedTrader]:
         """
-        Discover traders across all venues and merge into unified list.
-
-        Priority:
-          1. Hyperliquid leaderboard (highest quality data)
-          2. Lighter volume scan (supplementary)
-
-        Traders found on multiple venues get a boost in ranking.
+        Discover traders across all HEALTHY venues and merge into unified list.
         """
         start = time.time()
         all_traders: Dict[str, NormalizedTrader] = {}
@@ -149,31 +164,28 @@ class MultiExchangeScanner:
         for venue_name, adapter in self.adapters.items():
             try:
                 traders = adapter.get_top_traders(limit=limit)
-                per_venue_counts[venue_name] = len(traders)
+                per_venue_counts[venue_name] = len(traders)  # REAL trader count
 
                 for t in traders:
                     key = t.address.lower()
                     if key in all_traders:
-                        # Trader exists from another venue — merge
                         existing = all_traders[key]
                         existing.raw_data[f"also_on_{venue_name}"] = True
-                        # Boost PnL if secondary venue has data
                         if t.pnl_total and not existing.pnl_total:
                             existing.pnl_total = t.pnl_total
                     else:
                         all_traders[key] = t
 
             except Exception as e:
+                per_venue_counts[venue_name] = 0
                 logger.error(f"Trader discovery failed on {venue_name}: {e}")
 
-        # Sort by PnL (primary) then trade count (secondary)
         sorted_traders = sorted(
             all_traders.values(),
             key=lambda t: (t.pnl_total, t.trade_count_30d),
             reverse=True,
         )[:limit]
 
-        # Count multi-venue traders
         multi_venue = sum(
             1 for t in sorted_traders
             if any(k.startswith("also_on_") for k in t.raw_data)
@@ -181,14 +193,12 @@ class MultiExchangeScanner:
 
         duration = time.time() - start
         logger.info(
-            f"MultiExchange discovery: {len(sorted_traders)} traders "
-            f"({per_venue_counts}) in {duration:.1f}s, "
+            f"MultiExchange discovery: {len(sorted_traders)} unique traders "
+            f"(per venue: {per_venue_counts}) in {duration:.1f}s, "
             f"{multi_venue} multi-venue"
         )
 
-        # Cache for later use
         self._trader_cache = {t.address.lower(): t for t in sorted_traders}
-
         return sorted_traders
 
     # ─── Signal Confirmation ───────────────────────────────
@@ -200,16 +210,10 @@ class MultiExchangeScanner:
     ) -> List[CrossVenueSignal]:
         """
         Run cross-venue confirmation on a batch of signals.
-
-        Integrates with the existing pipeline — call this after
-        SignalProcessor produces filtered strategies, before
-        DecisionEngine does final ranking.
-
-        signals: list of dicts with keys {coin, direction, score}
-        Returns: list of CrossVenueSignal with confirmation scores
+        Logs detailed observability: checked, boosted, downgraded counts.
         """
         if not self.cross_venue:
-            logger.debug("No cross-venue engine (single venue mode)")
+            logger.info("CrossVenue: single venue mode — no confirmation possible")
             return [
                 CrossVenueSignal(
                     coin=s.get("coin", ""),
@@ -220,14 +224,52 @@ class MultiExchangeScanner:
                 for s in signals
             ]
 
-        return self.cross_venue.confirm_batch(signals, primary_exchange)
+        # Check if any secondary venue is actually healthy
+        healthy = self._get_healthy_adapters()
+        secondary_healthy = [n for n in healthy if n != primary_exchange]
+        if not secondary_healthy:
+            logger.info(f"CrossVenue: no healthy secondary venues "
+                       f"(states: {self.check_health()}) — skipping confirmation")
+            return [
+                CrossVenueSignal(
+                    coin=s.get("coin", ""),
+                    direction=s.get("direction", "long"),
+                    primary_exchange=primary_exchange,
+                    primary_score=s.get("score", 0.5),
+                )
+                for s in signals
+            ]
+
+        confirmed = self.cross_venue.confirm_batch(signals, primary_exchange)
+
+        # Observability: count results
+        checked = len(confirmed)
+        boosted = sum(1 for c in confirmed if c.confirmation_score > 0.15)
+        no_data = sum(1 for c in confirmed if c.venue_count <= 1)
+        avg_score = (sum(c.confirmation_score for c in confirmed) / max(checked, 1))
+
+        logger.info(
+            f"CrossVenue confirmation: {checked} signals checked, "
+            f"{boosted} boosted (score>0.15), "
+            f"{no_data} no secondary data, "
+            f"avg_score={avg_score:.3f}, "
+            f"secondary_venues={secondary_healthy}"
+        )
+
+        return confirmed
 
     # ─── Funding Arb ───────────────────────────────────────
 
     def scan_funding_arb(self) -> List[FundingArbitrageOpportunity]:
-        """Scan for funding rate arbitrage across venues."""
+        """Scan for funding rate arbitrage across healthy venues."""
         if not self.cross_venue:
             return []
+
+        healthy = self._get_healthy_adapters()
+        if len(healthy) < 2:
+            logger.debug("Funding arb: need 2+ healthy venues, skipping")
+            return []
+
         return self.cross_venue.scan_funding_arb()
 
     # ─── Market Data Aggregation ───────────────────────────
@@ -236,11 +278,7 @@ class MultiExchangeScanner:
         self,
         coins: Optional[List[str]] = None,
     ) -> Dict[str, Dict[str, NormalizedMarketData]]:
-        """
-        Get market data from all venues, organized by coin.
-
-        Returns: {coin: {venue_name: NormalizedMarketData}}
-        """
+        """Get market data from all venues, organized by coin."""
         result: Dict[str, Dict[str, NormalizedMarketData]] = {}
 
         for venue_name, adapter in self.adapters.items():
@@ -256,12 +294,13 @@ class MultiExchangeScanner:
         return result
 
     def get_common_markets(self) -> List[str]:
-        """Get coins listed on ALL connected venues."""
-        if not self.adapters:
+        """Get coins listed on ALL connected HEALTHY venues."""
+        healthy = self._get_healthy_adapters()
+        if len(healthy) < 2:
             return []
 
         market_sets = []
-        for adapter in self.adapters.values():
+        for adapter in healthy.values():
             try:
                 markets = set(adapter.get_available_markets())
                 if markets:
@@ -269,7 +308,7 @@ class MultiExchangeScanner:
             except Exception:
                 continue
 
-        if not market_sets:
+        if len(market_sets) < 2:
             return []
 
         common = market_sets[0]
@@ -281,17 +320,14 @@ class MultiExchangeScanner:
     # ─── Full Scan Cycle ───────────────────────────────────
 
     def run_scan_cycle(self, trader_limit: int = 100) -> ScanResult:
-        """
-        Run a complete multi-exchange scan cycle.
-        Returns a ScanResult with all findings.
-        """
+        """Run a complete multi-exchange scan cycle."""
         start = time.time()
         self._scan_count += 1
         result = ScanResult()
 
         # 1. Health check
         result.venue_health = self.check_health()
-        unhealthy = [v for v, ok in result.venue_health.items() if not ok]
+        unhealthy = [v for v, state in result.venue_health.items() if state == "down"]
         if unhealthy:
             logger.warning(f"Unhealthy venues: {unhealthy}")
             result.errors.append(f"Unhealthy venues: {unhealthy}")
@@ -300,10 +336,11 @@ class MultiExchangeScanner:
         try:
             traders = self.discover_traders(limit=trader_limit)
             result.total_unique_traders = len(traders)
-            result.traders_discovered = {
-                name: adapter.get_stats().get("requests", 0)
-                for name, adapter in self.adapters.items()
-            }
+            # Store REAL discovered trader counts per venue (not request counts)
+            for name, adapter in self.adapters.items():
+                stats = adapter.get_stats()
+                # If the adapter tracks real counts, use those
+                result.traders_discovered[name] = stats.get("markets_loaded", 0)
             result.multi_venue_traders = sum(
                 1 for t in traders
                 if any(k.startswith("also_on_") for k in t.raw_data)
@@ -326,8 +363,10 @@ class MultiExchangeScanner:
 
         logger.info(
             f"Scan cycle #{self._scan_count} complete in {result.cycle_duration_s:.1f}s: "
+            f"venues={result.venue_health}, "
             f"{result.total_unique_traders} traders, "
-            f"{result.funding_arb_opportunities} arb opps"
+            f"{result.funding_arb_opportunities} arb opps, "
+            f"errors={len(result.errors)}"
         )
 
         return result
@@ -343,9 +382,13 @@ class MultiExchangeScanner:
             "cached_traders": len(self._trader_cache),
         }
 
-        # Per-venue stats
+        # Per-venue stats with health state
         for name, adapter in self.adapters.items():
-            stats[f"venue_{name}"] = adapter.get_stats()
+            venue_stats = adapter.get_stats()
+            state = getattr(adapter, "state", None)
+            if state:
+                venue_stats["state"] = state.value
+            stats[f"venue_{name}"] = venue_stats
 
         # Cross-venue stats
         if self.cross_venue:
@@ -358,6 +401,7 @@ class MultiExchangeScanner:
                 "duration": self._last_scan.cycle_duration_s,
                 "traders": self._last_scan.total_unique_traders,
                 "multi_venue": self._last_scan.multi_venue_traders,
+                "venue_health": self._last_scan.venue_health,
                 "arbs": self._last_scan.funding_arb_opportunities,
                 "errors": len(self._last_scan.errors),
             }

@@ -189,7 +189,7 @@ class CalibrationTracker:
         total_samples = sum(b.get("total", 0) for b in bins.values())
 
         if total_samples == 0:
-            return 0.0
+            return None  # No data — don't pretend we're calibrated
 
         ece = 0.0
         for i in range(N_BINS):
@@ -245,8 +245,10 @@ class CalibrationTracker:
             }
         return stats
 
-    def _quality_label(self, ece: float) -> str:
+    def _quality_label(self, ece) -> str:
         """Human-readable calibration quality."""
+        if ece is None:
+            return "cold start (no data)"
         if ece < 0.05:
             return "excellent"
         elif ece < 0.10:

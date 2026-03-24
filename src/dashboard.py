@@ -620,9 +620,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     pass
                 try:
                     if _calibration:
+                        _ece = _calibration.get_ece("global")
                         v25["calibration"] = {
-                            "global_ece": _calibration.get_ece("global"),
-                            "quality": _calibration._quality_label(_calibration.get_ece("global")),
+                            "global_ece": _ece if _ece is not None else "N/A",
+                            "quality": _calibration._quality_label(_ece),
                             "curve": _calibration.get_calibration_curve("global"),
                             "sources": _calibration.get_all_stats(),
                         }

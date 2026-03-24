@@ -822,7 +822,8 @@ class HyperliquidResearchBot:
             try:
                 cal_stats = self.calibration.get_all_stats()
                 global_ece = self.calibration.get_ece("global")
-                self.logger.info(f"  Calibration: ECE={global_ece:.3f} ({self.calibration._quality_label(global_ece)}), "
+                ece_str = f"{global_ece:.3f}" if global_ece is not None else "N/A"
+                self.logger.info(f"  Calibration: ECE={ece_str} ({self.calibration._quality_label(global_ece)}), "
                                f"{len(cal_stats)} sources tracked")
             except Exception:
                 pass

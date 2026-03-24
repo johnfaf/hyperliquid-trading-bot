@@ -41,6 +41,7 @@ def _post(payload: dict, retries: int = 3) -> Optional[dict]:
     """POST to the Hyperliquid info endpoint with retries and 429 backoff."""
     global _backoff_until, _consecutive_429s
     _rate_limit()
+    req_type = payload.get("type", "unknown")
     for attempt in range(retries):
         try:
             resp = requests.post(
@@ -51,9 +52,7 @@ def _post(payload: dict, retries: int = 3) -> Optional[dict]:
             )
             if resp.status_code == 429:
                 _consecutive_429s += 1
-                # Escalating backoff: 5s → 15s → 30s → 60s based on how many 429s we've hit
                 base_wait = min(5 * (2 ** min(attempt, 3)), 60)
-                # Add extra penalty for consecutive 429 storms
                 storm_penalty = min(_consecutive_429s * 3, 30)
                 wait = base_wait + storm_penalty
                 logger.warning(f"Rate limited (429), backing off {wait}s "
@@ -61,13 +60,22 @@ def _post(payload: dict, retries: int = 3) -> Optional[dict]:
                 _backoff_until = time.time() + wait
                 time.sleep(wait)
                 continue
+
+            # 4xx client errors (400, 404, 422) — don't retry, these are our fault
+            if 400 <= resp.status_code < 500 and resp.status_code != 429:
+                body_preview = resp.text[:200] if resp.text else "(empty)"
+                logger.warning(f"Client error {resp.status_code} for type='{req_type}': "
+                             f"{body_preview} (payload keys: {list(payload.keys())})")
+                return None
+
             resp.raise_for_status()
             # Successful request — decay the consecutive counter
             if _consecutive_429s > 0:
                 _consecutive_429s = max(0, _consecutive_429s - 1)
             return resp.json()
         except requests.exceptions.RequestException as e:
-            logger.warning(f"API request failed (attempt {attempt+1}/{retries}): {e}")
+            logger.warning(f"API request failed (attempt {attempt+1}/{retries}, "
+                         f"type='{req_type}'): {e}")
             if attempt < retries - 1:
                 time.sleep(2 ** attempt)
     return None
