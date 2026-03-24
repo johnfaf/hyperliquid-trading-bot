@@ -127,7 +127,8 @@ def get_user_fills(address: str, start_time: Optional[int] = None):
     payload = {"type": "userFills", "user": address}
     if start_time:
         payload["startTime"] = start_time
-    data = _post(payload, priority=Priority.NORMAL)
+    # LOW priority: historical fill downloads should yield to live trading/monitoring
+    data = _post(payload, priority=Priority.LOW)
     if not data:
         return []
 

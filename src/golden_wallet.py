@@ -35,7 +35,8 @@ MIN_FILLS_FOR_EVAL = 30         # need at least 30 round-trips
 MAX_FILLS_FOR_EVAL = 3000       # cap: anything above this is not human-like
 GOLDEN_THRESHOLD = 0.0          # penalised equity must be net-positive
 PAGE_SIZE = 2000                # HL max fills per request
-REQUEST_SLEEP = 0.8             # rate-limit padding
+REQUEST_SLEEP = 1.5             # rate-limit padding between pages (was 0.8 — caused 429s)
+BETWEEN_WALLET_SLEEP = 2.5      # pause between evaluating different wallets
 
 # Superhuman detection: no real human trader sustains these numbers
 # over 90 days.  Wallets hitting these thresholds are bots/vaults/arb.
@@ -92,19 +93,41 @@ def download_fills_90d(address: str) -> List[Dict]:
     """
     Download up to 90 days of fills for a single address.
     Pages backwards using startTime to get past the 2000-fill cap.
+
+    Uses LOW priority so live trading / position monitoring always
+    takes precedence over historical backfill.
     """
     cutoff_ms = int((datetime.now(timezone.utc) - timedelta(days=LOOKBACK_DAYS)).timestamp() * 1000)
     all_fills = []
     oldest_seen = None
+    consecutive_errors = 0
 
     for page in range(50):  # safety cap: 50 pages = 100k fills max
         start_time = oldest_seen if oldest_seen else None
         # For first page, don't pass startTime to get most recent
         # For subsequent pages, use oldest seen to page backwards
-        if page == 0:
-            fills = hl.get_user_fills(address)
-        else:
-            fills = hl.get_user_fills(address, start_time=cutoff_ms)
+        try:
+            if page == 0:
+                fills = hl.get_user_fills(address)
+            else:
+                fills = hl.get_user_fills(address, start_time=cutoff_ms)
+            consecutive_errors = 0
+        except Exception as e:
+            consecutive_errors += 1
+            err_str = str(e).lower()
+            if "429" in err_str or "rate" in err_str:
+                # Back off hard on rate limit during fill downloads
+                backoff = min(30, 5 * (2 ** consecutive_errors))
+                logger.warning(f"Rate limited downloading fills for {address[:10]} "
+                              f"(page {page}), backing off {backoff}s")
+                time.sleep(backoff)
+                if consecutive_errors >= 3:
+                    logger.warning(f"Giving up on {address[:10]} after {consecutive_errors} rate limits")
+                    break
+                continue
+            else:
+                logger.error(f"Error downloading fills for {address[:10]}: {e}")
+                break
 
         if not fills:
             break
@@ -245,16 +268,53 @@ def compute_max_drawdown(curve: List[float]) -> float:
     return round(max_dd * 100, 2)
 
 
-def compute_sharpe(pnl_series: List[float], periods_per_year: float = 365.0) -> float:
-    """Annualised Sharpe from a series of PnL values."""
-    if len(pnl_series) < 5:
+def compute_sharpe(daily_returns: List[float], periods_per_year: float = 365.0) -> float:
+    """
+    Annualised Sharpe ratio from a series of daily RETURNS (not raw PnL).
+
+    Previous bug: this function received raw PnL amounts, which meant days with
+    only opening fills contributed $0, diluting the mean to near-zero and making
+    Sharpe ≈ 0 for almost every wallet. Now we expect percentage returns computed
+    from the equity curve, which gives meaningful Sharpe values.
+    """
+    if len(daily_returns) < 5:
         return 0.0
     import statistics
-    mean = statistics.mean(pnl_series)
-    std = statistics.stdev(pnl_series)
-    if std == 0:
+    mean_r = statistics.mean(daily_returns)
+    std_r = statistics.stdev(daily_returns)
+    if std_r < 1e-10:  # avoid division by near-zero
         return 0.0
-    return round((mean / std) * (periods_per_year ** 0.5), 3)
+    return round((mean_r / std_r) * (periods_per_year ** 0.5), 3)
+
+
+def _equity_curve_to_daily_returns(equity_curve: List[float],
+                                     timestamps: List[int]) -> List[float]:
+    """
+    Resample an intra-day equity curve into daily returns.
+    Takes the last equity value for each calendar day and computes
+    day-over-day percentage returns.
+    """
+    if len(equity_curve) < 2 or len(timestamps) < 2:
+        return []
+
+    # Get end-of-day equity for each calendar day
+    daily_equity = {}
+    for eq, ts in zip(equity_curve, timestamps):
+        day = ts // (86400 * 1000)
+        daily_equity[day] = eq  # last value for each day wins
+
+    sorted_days = sorted(daily_equity.keys())
+    if len(sorted_days) < 2:
+        return []
+
+    daily_returns = []
+    for i in range(1, len(sorted_days)):
+        prev_eq = daily_equity[sorted_days[i - 1]]
+        curr_eq = daily_equity[sorted_days[i]]
+        if prev_eq > 0:
+            daily_returns.append((curr_eq - prev_eq) / prev_eq)
+
+    return daily_returns
 
 
 def evaluate_wallet(address: str, bot_score: int = 0) -> Optional[Tuple[WalletReport, List[PenalisedFill]]]:
@@ -280,16 +340,10 @@ def evaluate_wallet(address: str, bot_score: int = 0) -> Optional[Tuple[WalletRe
     penalised = apply_execution_penalties(fills)
     raw_curve, pen_curve, timestamps = build_equity_curve(penalised)
 
-    # PnL series for Sharpe: daily aggregated
-    daily_pnl = {}
-    for f in penalised:
-        day = f.time_ms // (86400 * 1000)
-        daily_pnl.setdefault(day, {"raw": 0, "pen": 0})
-        daily_pnl[day]["raw"] += f.closed_pnl
-        daily_pnl[day]["pen"] += f.penalised_pnl
-
-    pen_daily = [v["pen"] for v in daily_pnl.values()]
-    raw_daily = [v["raw"] for v in daily_pnl.values()]
+    # Daily returns for Sharpe: computed from the equity curve, not raw PnL.
+    # Raw PnL was buggy because days with only opening fills had $0 PnL,
+    # diluting the mean to ~0 and making Sharpe always round to 0.00.
+    pen_daily_returns = _equity_curve_to_daily_returns(pen_curve, timestamps)
 
     # Coin breakdown
     coin_pnl = {}
@@ -350,7 +404,7 @@ def evaluate_wallet(address: str, bot_score: int = 0) -> Optional[Tuple[WalletRe
         equity_timestamps=timestamps,
         max_drawdown_pct=compute_max_drawdown(raw_curve),
         penalised_max_drawdown_pct=compute_max_drawdown(pen_curve),
-        sharpe_ratio=compute_sharpe(pen_daily),
+        sharpe_ratio=compute_sharpe(pen_daily_returns),
         win_rate=round(win_rate, 1),
         trades_per_day=round(tpd, 1),
         is_golden=is_golden,
@@ -569,6 +623,7 @@ def run_golden_scan(max_wallets: int = 50) -> Dict:
     results = []
     golden_count = 0
 
+    rate_limit_hits = 0
     for i, w in enumerate(wallets):
         logger.info(f"[{i+1}/{len(wallets)}] Evaluating {w['address'][:10]}...")
         try:
@@ -582,10 +637,18 @@ def run_golden_scan(max_wallets: int = 50) -> Dict:
                 if report.is_golden:
                     golden_count += 1
         except Exception as e:
-            logger.error(f"Error evaluating {w['address'][:10]}: {e}")
+            err_str = str(e).lower()
+            if "429" in err_str or "rate" in err_str:
+                rate_limit_hits += 1
+                backoff = min(30, 5 * (2 ** rate_limit_hits))
+                logger.warning(f"Rate limited during golden scan ({rate_limit_hits}x), "
+                              f"backing off {backoff}s")
+                time.sleep(backoff)
+            else:
+                logger.error(f"Error evaluating {w['address'][:10]}: {e}")
 
-        # Rate limit between wallets
-        time.sleep(1.0)
+        # Generous pause between wallets — each wallet triggers multiple API calls
+        time.sleep(BETWEEN_WALLET_SLEEP)
 
     summary = {
         "scanned": len(results),
