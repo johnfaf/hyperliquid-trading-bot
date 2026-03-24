@@ -63,14 +63,22 @@ class TraderDiscovery:
         2. Hyperliquid leaderboard API
         3. Vault leader analysis
         4. Whale detection from recent large trades
+
+        Known bots (stored in DB from previous scans) are excluded upfront
+        so we don't waste API calls re-scanning them.
         """
+        # Load known bots from DB — these persist across redeploys
+        known_bots = db.get_known_bot_addresses()
+        if known_bots:
+            logger.info(f"Loaded {len(known_bots)} known bots from DB — will skip these")
+
         discovered = []
 
-        # Method 0: Seed addresses — always check these
+        # Method 0: Seed addresses — always check these (never skip seeds)
         for addr in SEED_TRADER_ADDRESSES:
             discovered.append({
                 "address": addr,
-                "total_pnl": 0,  # Will be populated during analysis
+                "total_pnl": 0,
                 "roi_pct": 0,
                 "source": "seed",
                 "metadata": {},
@@ -104,7 +112,18 @@ class TraderDiscovery:
                 seen.add(t["address"])
                 unique.append(t)
 
-        logger.info(f"Total unique traders discovered: {len(unique)}")
+        # Filter out known bots BEFORE returning candidates
+        # This is the key optimisation: we don't waste API calls on addresses
+        # already confirmed as bots in previous scans
+        before_filter = len(unique)
+        unique = [t for t in unique if t["address"] not in known_bots]
+        bots_skipped = before_filter - len(unique)
+        if bots_skipped:
+            logger.info(f"Skipped {bots_skipped} known bots from candidate list "
+                       f"({len(unique)} candidates remaining)")
+
+        logger.info(f"Total unique traders discovered: {len(unique)} "
+                   f"(after filtering {bots_skipped} known bots)")
         return unique[:config.MAX_TRACKED_TRADERS]
 
     def _parse_leaderboard(self, data) -> List[Dict]:
@@ -615,7 +634,11 @@ class TraderDiscovery:
         """
         Run a full discovery and analysis cycle with TWO-PHASE screening.
 
-        Phase 1 (Fast): Pre-screen up to 500 traders with 1 API call each.
+        Known bots (persisted in DB) are excluded before any API calls.
+        Scanning uses batched processing with adaptive sleep to avoid 429 storms
+        even with 2000 trader candidates.
+
+        Phase 1 (Fast): Pre-screen candidates with 1 API call each.
                          Reject tiny accounts, bots with 15+ positions, inactive wallets.
         Phase 2 (Deep): Full analysis (fills + bot detection) only on candidates
                          that pass pre-screen. Mark detected bots as inactive in DB.
@@ -625,15 +648,23 @@ class TraderDiscovery:
         logger.info("=" * 60)
 
         # Step 1: Discover candidate addresses (leaderboard + seeds + whales)
+        # discover_top_traders() already filters out known bots from DB
         discovered = self.discover_top_traders()
         total_candidates = len(discovered)
-        logger.info(f"Total candidate addresses: {total_candidates}")
+        logger.info(f"Total candidate addresses (bots pre-filtered): {total_candidates}")
 
         # ─── Phase 1: Fast Pre-Screen ────────────────────────────────
-        logger.info(f"PHASE 1: Fast pre-screening {total_candidates} traders (1 API call each)...")
+        # Batched: process in groups of 50, with a longer pause between batches
+        PRESCREEN_BATCH_SIZE = 50
+        PRESCREEN_SLEEP = 0.8        # 800ms between individual calls
+        PRESCREEN_BATCH_PAUSE = 5.0  # 5s pause between batches of 50
+
+        logger.info(f"PHASE 1: Fast pre-screening {total_candidates} traders "
+                   f"(batches of {PRESCREEN_BATCH_SIZE}, {PRESCREEN_SLEEP}s per call)...")
         passed_prescreen = []
         skipped_prescreen = 0
         already_known_active = 0
+        rate_limit_hits = 0
 
         for i, trader in enumerate(discovered):
             addr = trader["address"]
@@ -641,30 +672,63 @@ class TraderDiscovery:
             # Progress logging every 100 traders
             if (i + 1) % 100 == 0:
                 logger.info(f"  Pre-screen progress: {i+1}/{total_candidates} "
-                           f"(passed: {len(passed_prescreen)}, skipped: {skipped_prescreen})")
+                           f"(passed: {len(passed_prescreen)}, skipped: {skipped_prescreen}, "
+                           f"429s: {rate_limit_hits})")
+
+            # Batch pause every PRESCREEN_BATCH_SIZE calls
+            if i > 0 and i % PRESCREEN_BATCH_SIZE == 0:
+                logger.debug(f"  Batch pause ({PRESCREEN_BATCH_PAUSE}s) after {i} pre-screens")
+                time.sleep(PRESCREEN_BATCH_PAUSE)
 
             # Skip traders already known and recently analyzed (within 6 hours)
             existing = self.known_traders.get(addr)
             if existing and existing.get("trade_count", 0) > 0:
-                # Already tracked and analyzed — include without re-screening
                 passed_prescreen.append(trader)
                 already_known_active += 1
                 continue
 
             # Fast pre-screen: 1 API call
-            if self._fast_prescreen(addr):
-                passed_prescreen.append(trader)
-            else:
-                skipped_prescreen += 1
+            try:
+                if self._fast_prescreen(addr):
+                    passed_prescreen.append(trader)
+                else:
+                    skipped_prescreen += 1
+            except Exception as e:
+                err_str = str(e).lower()
+                if "429" in err_str or "rate" in err_str:
+                    rate_limit_hits += 1
+                    # Back off harder on rate limit
+                    backoff = min(30, 5 * (1 + rate_limit_hits))
+                    logger.warning(f"  Rate limited during pre-screen ({rate_limit_hits}x), "
+                                  f"backing off {backoff:.0f}s")
+                    time.sleep(backoff)
+                    # Retry once
+                    try:
+                        if self._fast_prescreen(addr):
+                            passed_prescreen.append(trader)
+                        else:
+                            skipped_prescreen += 1
+                    except:
+                        skipped_prescreen += 1
+                else:
+                    skipped_prescreen += 1
 
-            time.sleep(0.8)  # Rate limiting — 800ms to stay well under HL limits
+            time.sleep(PRESCREEN_SLEEP)
 
         logger.info(f"PHASE 1 complete: {len(passed_prescreen)} passed, "
-                    f"{skipped_prescreen} rejected, {already_known_active} already tracked")
+                    f"{skipped_prescreen} rejected, {already_known_active} already tracked, "
+                    f"{rate_limit_hits} rate-limit hits")
 
         # ─── Phase 2: Deep Analysis ──────────────────────────────────
-        logger.info(f"PHASE 2: Deep analyzing {len(passed_prescreen)} traders (fills + bot detection)...")
-        all_profiles = []  # ALL profiles with bot_score
+        # Wider spacing: deep analysis makes 2+ API calls per trader
+        DEEP_BATCH_SIZE = 30
+        DEEP_SLEEP = 1.2            # 1.2s between individual calls
+        DEEP_BATCH_PAUSE = 10.0     # 10s pause between batches of 30
+
+        logger.info(f"PHASE 2: Deep analyzing {len(passed_prescreen)} traders "
+                   f"(batches of {DEEP_BATCH_SIZE}, {DEEP_SLEEP}s per call)...")
+        all_profiles = []
+        rate_limit_hits_deep = 0
 
         for i, trader in enumerate(passed_prescreen):
             addr = trader["address"]
@@ -673,7 +737,13 @@ class TraderDiscovery:
             if (i + 1) % 50 == 0:
                 human_count = len([p for p in all_profiles if p.get("bot_score", 0) < 3])
                 logger.info(f"  Deep analysis progress: {i+1}/{len(passed_prescreen)} "
-                           f"(human-like: {human_count}, total: {len(all_profiles)})")
+                           f"(human-like: {human_count}, total: {len(all_profiles)}, "
+                           f"429s: {rate_limit_hits_deep})")
+
+            # Batch pause
+            if i > 0 and i % DEEP_BATCH_SIZE == 0:
+                logger.debug(f"  Batch pause ({DEEP_BATCH_PAUSE}s) after {i} deep analyses")
+                time.sleep(DEEP_BATCH_PAUSE)
 
             try:
                 profile = self.analyze_trader(addr)
@@ -681,13 +751,29 @@ class TraderDiscovery:
                     all_profiles.append(profile)
                     self.known_traders[addr] = trader
             except Exception as e:
-                logger.error(f"Error analyzing trader {addr[:10]}: {e}")
+                err_str = str(e).lower()
+                if "429" in err_str or "rate" in err_str:
+                    rate_limit_hits_deep += 1
+                    backoff = min(60, 10 * (1 + rate_limit_hits_deep))
+                    logger.warning(f"  Rate limited during deep analysis ({rate_limit_hits_deep}x), "
+                                  f"backing off {backoff:.0f}s")
+                    time.sleep(backoff)
+                    # Retry once
+                    try:
+                        profile = self.analyze_trader(addr)
+                        if profile:
+                            all_profiles.append(profile)
+                            self.known_traders[addr] = trader
+                    except:
+                        logger.error(f"Retry also failed for {addr[:10]}")
+                else:
+                    logger.error(f"Error analyzing trader {addr[:10]}: {e}")
 
-            time.sleep(1.0)  # Deep analysis makes 2+ API calls — need wider spacing
+            time.sleep(DEEP_SLEEP)
 
         # ─── Separate humans from bots, with guaranteed minimum ─────
         BOT_THRESHOLD = 3
-        MIN_TRADERS = 20  # ALWAYS keep at least this many, even if bot-like
+        MIN_TRADERS = 20
 
         humans = [p for p in all_profiles if p.get("bot_score", 0) < BOT_THRESHOLD]
         bots = [p for p in all_profiles if p.get("bot_score", 0) >= BOT_THRESHOLD]
@@ -704,26 +790,32 @@ class TraderDiscovery:
             logger.info(f"Only {len(humans)} human traders found — promoted {promoted_bots} "
                        f"least-bot-like accounts (scores: {[p.get('bot_score',0) for p in promoted]})")
 
-        # Mark high-confidence bots as inactive (score 4+, and not promoted)
+        # Mark high-confidence bots as inactive (score 3+, and not promoted)
+        # Lowered from 4 to 3 so ALL detected bots get persisted and skipped next cycle
         promoted_addrs = {p["address"] for p in profiles}
         bots_marked = 0
         for p in bots:
-            if p["address"] not in promoted_addrs and p.get("bot_score", 0) >= 4:
+            if p["address"] not in promoted_addrs and p.get("bot_score", 0) >= BOT_THRESHOLD:
                 db.upsert_trader(
                     address=p["address"],
-                    total_pnl=0, roi_pct=0, account_value=0,
+                    total_pnl=0, roi_pct=0,
+                    account_value=p.get("account_value", 0),
                     win_rate=0, trade_count=0,
-                    metadata={"status": "bot_detected", "bot_score": p.get("bot_score", 0),
+                    metadata={"status": "bot_detected",
+                              "bot_score": p.get("bot_score", 0),
                               "detected_at": datetime.utcnow().isoformat()},
                     is_active=False,
                 )
                 bots_marked += 1
 
         logger.info(f"PHASE 2 complete: {len(humans)} human, {len(bots)} bot-like, "
-                    f"{promoted_bots} promoted, {bots_marked} marked inactive")
+                    f"{promoted_bots} promoted, {bots_marked} marked inactive in DB")
         logger.info(f"Final trader pool: {len(profiles)} traders for strategy analysis")
+        logger.info(f"Rate limit hits: {rate_limit_hits} (pre-screen) + "
+                   f"{rate_limit_hits_deep} (deep)")
 
         # ─── Summary ─────────────────────────────────────────────────
+        known_bots_total = len(db.get_known_bot_addresses())
         summary = {
             "traders_discovered": total_candidates,
             "traders_prescreened": len(passed_prescreen),
@@ -732,8 +824,10 @@ class TraderDiscovery:
             "bot_like_traders": len(bots),
             "promoted_bots": promoted_bots,
             "bots_marked_inactive": bots_marked,
+            "bots_in_db_total": known_bots_total,
             "final_pool": len(profiles),
             "total_tracked": len(self.known_traders),
+            "rate_limit_hits": rate_limit_hits + rate_limit_hits_deep,
             "timestamp": datetime.utcnow().isoformat(),
         }
 
@@ -741,7 +835,8 @@ class TraderDiscovery:
             cycle_type="discovery",
             summary=(f"Scanned {total_candidates} → pre-screened {len(passed_prescreen)} "
                     f"→ analyzed {len(all_profiles)} → {len(profiles)} final pool "
-                    f"({len(humans)} human + {promoted_bots} promoted)"),
+                    f"({len(humans)} human + {promoted_bots} promoted) | "
+                    f"{known_bots_total} bots in DB, {rate_limit_hits + rate_limit_hits_deep} 429s"),
             details=summary,
             traders_analyzed=len(profiles),
         )

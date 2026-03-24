@@ -193,6 +193,28 @@ def get_trader(address):
     return dict(row) if row else None
 
 
+def get_known_bot_addresses() -> set:
+    """
+    Get all addresses previously detected as bots (active=0).
+    Used by trader_discovery to skip known bots entirely on subsequent scans,
+    persisting across redeploys since the data lives in SQLite.
+    """
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT address FROM traders WHERE active = 0"
+        ).fetchall()
+    return {r["address"] for r in rows}
+
+
+def get_all_traders_including_bots():
+    """Get ALL traders (active and inactive) for backup purposes."""
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT * FROM traders ORDER BY total_pnl DESC"
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
 # ─── Position Snapshots ───────────────────────────────────────
 
 def save_position_snapshot(trader_address, coin, side, size, entry_price,
@@ -393,6 +415,7 @@ def backup_to_json(filepath: str = None):
             "timestamp": datetime.utcnow().isoformat(),
             "paper_account": get_paper_account(),
             "traders": get_active_traders()[:100],
+            "bot_traders": [t for t in get_all_traders_including_bots() if not t.get("active", 1)],
             "strategies": get_active_strategies()[:200],
             "open_trades": get_open_paper_trades(),
             "closed_trades": get_paper_trade_history(limit=200),
@@ -430,7 +453,7 @@ def restore_from_json(filepath: str = None):
                 acc.get("winning_trades", 0),
             )
 
-        # Restore traders
+        # Restore active traders
         for t in data.get("traders", []):
             upsert_trader(
                 t["address"],
@@ -439,6 +462,25 @@ def restore_from_json(filepath: str = None):
                 account_value=t.get("account_value", 0),
                 win_rate=t.get("win_rate", 0),
                 trade_count=t.get("trade_count", 0),
+            )
+
+        # Restore bot traders (so they stay skipped across redeploys)
+        for t in data.get("bot_traders", []):
+            meta = t.get("metadata", "{}")
+            if isinstance(meta, str):
+                try:
+                    meta = json.loads(meta)
+                except:
+                    meta = {}
+            upsert_trader(
+                t["address"],
+                total_pnl=t.get("total_pnl", 0),
+                roi_pct=t.get("roi_pct", 0),
+                account_value=t.get("account_value", 0),
+                win_rate=t.get("win_rate", 0),
+                trade_count=t.get("trade_count", 0),
+                metadata=meta,
+                is_active=False,
             )
 
         # Restore strategies
