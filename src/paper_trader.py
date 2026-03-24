@@ -27,6 +27,7 @@ from src.kelly_sizing import KellySizer
 from src.trade_memory import TradeMemory
 from src.calibration import CalibrationTracker
 from src.llm_filter import LLMFilter
+import random
 
 logger = logging.getLogger(__name__)
 
@@ -545,14 +546,49 @@ class PaperTrader:
 
         return True
 
+    @staticmethod
+    def _apply_slippage(price: float, side: str, is_entry: bool = True) -> float:
+        """
+        Simulate realistic slippage for paper trading.
+
+        Real market orders experience slippage from:
+        - Spread crossing (taker fee already modeled elsewhere)
+        - Orderbook depth (larger orders move price more)
+        - Latency (price moves between signal and fill)
+
+        We apply 0.01% to 0.05% adverse slippage, randomized.
+        Entry longs get a higher price, entry shorts get a lower price.
+        Exit is the reverse.
+        """
+        slippage_bps = random.uniform(1, 5)  # 0.01% to 0.05%
+        slippage_pct = slippage_bps / 10_000
+
+        if is_entry:
+            # Entry: you pay more (long) or receive less (short)
+            if side == "long":
+                return price * (1 + slippage_pct)
+            else:
+                return price * (1 - slippage_pct)
+        else:
+            # Exit: you receive less (closing long) or pay more (closing short)
+            if side == "long":
+                return price * (1 - slippage_pct)
+            else:
+                return price * (1 + slippage_pct)
+
     def _execute_paper_trade(self, account: Dict, strategy: Dict, signal: Dict) -> Optional[Dict]:
-        """Execute a paper trade and record it."""
+        """Execute a paper trade and record it (with slippage simulation)."""
         try:
+            # Apply entry slippage — paper trades should reflect realistic fills
+            slipped_price = self._apply_slippage(signal["price"], signal["side"], is_entry=True)
+            logger.debug(f"Slippage: {signal['coin']} entry {signal['price']:.2f} → {slipped_price:.2f} "
+                        f"({signal['side']})")
+
             trade_id = db.open_paper_trade(
                 strategy_id=strategy.get("id"),
                 coin=signal["coin"],
                 side=signal["side"],
-                entry_price=signal["price"],
+                entry_price=slipped_price,
                 size=signal["size"],
                 leverage=signal["leverage"],
                 stop_loss=signal["stop_loss"],
@@ -672,8 +708,10 @@ class PaperTrader:
                     pass
 
             if should_close:
-                pnl = self._calculate_pnl(trade, current_price)
-                db.close_paper_trade(trade["id"], current_price, pnl)
+                # Apply exit slippage for realistic PnL calculation
+                slipped_exit = self._apply_slippage(current_price, trade["side"], is_entry=False)
+                pnl = self._calculate_pnl(trade, slipped_exit)
+                db.close_paper_trade(trade["id"], slipped_exit, pnl)
 
                 # Update account
                 account = db.get_paper_account()

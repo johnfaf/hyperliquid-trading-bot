@@ -84,15 +84,29 @@ class DecisionFirewall:
         """
         self.stats["total_signals"] += 1
 
+        def _reject(reason_key, reason_msg):
+            """Helper to reject + audit log in one step."""
+            self.stats[reason_key] += 1
+            try:
+                db.audit_log(
+                    action="signal_rejected",
+                    coin=signal.coin,
+                    side=signal.side.value if hasattr(signal.side, 'value') else str(signal.side),
+                    source=getattr(signal, "source", None) or "unknown",
+                    details={"reason": reason_msg, "confidence": getattr(signal, "confidence", 0)},
+                )
+            except Exception:
+                pass
+            return False, reason_msg
+
         # 1. Schema validation
         if not signal.validate():
-            self.stats["rejected_schema"] += 1
-            return False, f"Invalid signal schema: {signal.coin} {signal.side.value}"
+            return _reject("rejected_schema", f"Invalid signal schema: {signal.coin} {signal.side.value}")
 
         # 2. Minimum confidence
         if signal.confidence < self.min_confidence:
-            self.stats["rejected_confidence"] += 1
-            return False, f"Low confidence {signal.confidence:.0%} < {self.min_confidence:.0%}"
+            return _reject("rejected_confidence",
+                          f"Low confidence {signal.confidence:.0%} < {self.min_confidence:.0%}")
 
         # 3. Leverage check
         if signal.leverage > self.max_leverage:
@@ -102,18 +116,16 @@ class DecisionFirewall:
         # 4. Position limits
         positions = open_positions or db.get_open_paper_trades()
         if len(positions) >= self.max_positions:
-            self.stats["rejected_risk"] += 1
-            return False, f"Max positions reached ({len(positions)}/{self.max_positions})"
+            return _reject("rejected_risk",
+                          f"Max positions reached ({len(positions)}/{self.max_positions})")
 
         # 5. Per-coin limit
         coin_positions = [p for p in positions if p.get("coin") == signal.coin]
         if len(coin_positions) >= self.max_per_coin:
-            self.stats["rejected_risk"] += 1
-            return False, f"Max positions for {signal.coin} ({len(coin_positions)}/{self.max_per_coin})"
+            return _reject("rejected_risk",
+                          f"Max positions for {signal.coin} ({len(coin_positions)}/{self.max_per_coin})")
 
         # 5b. Aggregate portfolio exposure — hard cap across ALL positions
-        # Sums the notional value (size × entry_price × leverage) of all open positions
-        # and rejects if adding this signal would exceed the limit
         account = db.get_paper_account()
         if account:
             balance = account.get("balance", 10000)
@@ -124,7 +136,6 @@ class DecisionFirewall:
                 pos_leverage = pos.get("leverage", 1)
                 total_exposure += abs(pos_size * pos_price * pos_leverage)
 
-            # Estimate new signal's notional (use signal size or default 8% allocation)
             new_notional = signal.size * signal.leverage if signal.size else (
                 balance * 0.08 * signal.leverage
             )
@@ -132,16 +143,16 @@ class DecisionFirewall:
             exposure_pct = projected_exposure / balance if balance > 0 else 1.0
 
             if exposure_pct > self.max_aggregate_exposure_pct:
-                self.stats["rejected_exposure"] += 1
-                return False, (f"Aggregate exposure {exposure_pct:.0%} would exceed "
+                return _reject("rejected_exposure",
+                              f"Aggregate exposure {exposure_pct:.0%} would exceed "
                               f"{self.max_aggregate_exposure_pct:.0%} limit "
                               f"(${projected_exposure:,.0f}/${balance:,.0f})")
 
         # 6. Conflict detection — no opposing positions on same coin
         for pos in coin_positions:
             if pos.get("side") != signal.side.value:
-                self.stats["rejected_conflict"] += 1
-                return False, (f"Conflict: have {pos.get('side')} {signal.coin}, "
+                return _reject("rejected_conflict",
+                              f"Conflict: have {pos.get('side')} {signal.coin}, "
                               f"signal wants {signal.side.value}")
 
         # 7. Cooldown — prevent revenge trading
@@ -149,19 +160,19 @@ class DecisionFirewall:
         last_trade_ts = self._recent_trades.get(signal.coin, 0)
         if now - last_trade_ts < self.cooldown_seconds:
             remaining = int(self.cooldown_seconds - (now - last_trade_ts))
-            self.stats["rejected_cooldown"] += 1
-            return False, f"Cooldown: {signal.coin} traded {remaining}s ago"
+            return _reject("rejected_cooldown",
+                          f"Cooldown: {signal.coin} traded {remaining}s ago")
 
         # 8. Regime alignment check
         if regime_data:
             guidance = regime_data.get("strategy_guidance", {})
             paused = set(guidance.get("pause", []))
             if "all" in paused:
-                self.stats["rejected_regime"] += 1
-                return False, f"Regime {regime_data.get('overall_regime', '?')} pauses all trading"
+                return _reject("rejected_regime",
+                              f"Regime {regime_data.get('overall_regime', '?')} pauses all trading")
             if signal.strategy_type and signal.strategy_type.lower() in paused:
-                self.stats["rejected_regime"] += 1
-                return False, (f"Regime pauses {signal.strategy_type} "
+                return _reject("rejected_regime",
+                              f"Regime pauses {signal.strategy_type} "
                               f"(regime={regime_data.get('overall_regime', '?')})")
 
             # Apply size modifier from regime
@@ -171,8 +182,8 @@ class DecisionFirewall:
         # 9. Source accuracy check (if we have history)
         if self.min_source_accuracy > 0 and signal.source_accuracy > 0:
             if signal.source_accuracy < self.min_source_accuracy:
-                self.stats["rejected_accuracy"] += 1
-                return False, (f"Source accuracy {signal.source_accuracy:.0%} < "
+                return _reject("rejected_accuracy",
+                              f"Source accuracy {signal.source_accuracy:.0%} < "
                               f"{self.min_source_accuracy:.0%}")
 
         # 10. Daily drawdown circuit breaker
@@ -181,12 +192,26 @@ class DecisionFirewall:
         if account:
             balance = account.get("balance", 10000)
             if self._daily_losses / balance > 0.03:  # 3% daily loss limit
-                self.stats["rejected_drawdown"] += 1
-                return False, f"Daily loss limit hit ({self._daily_losses / balance:.1%} > 3%)"
+                return _reject("rejected_drawdown",
+                              f"Daily loss limit hit ({self._daily_losses / balance:.1%} > 3%)")
 
         # All checks passed
         self.stats["passed"] += 1
         self._recent_trades[signal.coin] = now
+
+        # Audit trail: record approval
+        try:
+            db.audit_log(
+                action="signal_approved",
+                coin=signal.coin,
+                side=signal.side.value,
+                source=getattr(signal, "source", None) or "unknown",
+                details={"confidence": signal.confidence, "leverage": signal.leverage,
+                         "strategy_type": signal.strategy_type},
+            )
+        except Exception:
+            pass  # audit logging must never break the trading path
+
         return True, "approved"
 
     def validate_batch(self, signals: List[TradeSignal],

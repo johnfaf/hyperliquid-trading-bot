@@ -143,6 +143,25 @@ def init_db():
             strategies_found INTEGER DEFAULT 0,
             strategies_updated INTEGER DEFAULT 0
         );
+
+        -- Immutable audit trail: every trading action is logged here.
+        -- INSERT-only table — rows are NEVER updated or deleted.
+        -- Used for forensic analysis, compliance, and debugging.
+        CREATE TABLE IF NOT EXISTS audit_trail (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            action TEXT NOT NULL,
+            coin TEXT,
+            side TEXT,
+            price REAL,
+            size REAL,
+            pnl REAL,
+            source TEXT,
+            details TEXT DEFAULT '{}'
+        );
+        CREATE INDEX IF NOT EXISTS idx_audit_timestamp ON audit_trail(timestamp);
+        CREATE INDEX IF NOT EXISTS idx_audit_action ON audit_trail(action);
+        CREATE INDEX IF NOT EXISTS idx_audit_coin ON audit_trail(coin);
         """)
 
 
@@ -402,6 +421,48 @@ def log_research_cycle(cycle_type, summary, details=None,
             VALUES (?, ?, ?, ?, ?, ?, ?)
         """, (now, cycle_type, summary, json.dumps(details or {}),
               traders_analyzed, strategies_found, strategies_updated))
+
+
+# ─── Audit Trail (immutable trade journal) ────────────────────
+
+def audit_log(action: str, coin: str = None, side: str = None,
+              price: float = None, size: float = None, pnl: float = None,
+              source: str = None, details: dict = None):
+    """
+    Append an immutable audit record. This table is INSERT-ONLY.
+    Every trade signal, execution, rejection, and error gets logged here
+    for forensic analysis and compliance.
+
+    Actions: signal_generated, signal_approved, signal_rejected,
+             trade_opened, trade_closed, stop_loss_hit, take_profit_hit,
+             circuit_breaker_triggered, rate_limit_hit, websocket_reconnect,
+             golden_wallet_connected, bot_detected, error
+    """
+    now = datetime.utcnow().isoformat()
+    with get_connection() as conn:
+        conn.execute("""
+            INSERT INTO audit_trail (timestamp, action, coin, side, price, size, pnl, source, details)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (now, action, coin, side, price, size, pnl, source,
+              json.dumps(details or {})))
+
+
+def get_audit_trail(limit: int = 200, action_filter: str = None,
+                    coin_filter: str = None) -> list:
+    """Query the audit trail with optional filters."""
+    with get_connection() as conn:
+        query = "SELECT * FROM audit_trail WHERE 1=1"
+        params = []
+        if action_filter:
+            query += " AND action = ?"
+            params.append(action_filter)
+        if coin_filter:
+            query += " AND coin = ?"
+            params.append(coin_filter)
+        query += " ORDER BY timestamp DESC LIMIT ?"
+        params.append(limit)
+        rows = conn.execute(query, params).fetchall()
+    return [dict(r) for r in rows]
 
 
 # ─── Backup & Restore (for Railway persistence) ─────────────

@@ -280,6 +280,13 @@ class HyperliquidWebSocket:
         self._reconnect_count = 0
         self._connected = False
 
+        # Sequence tracking for gap detection
+        # Hyperliquid doesn't use explicit sequence numbers, so we track
+        # timestamps to detect if we missed data during disconnects
+        self._last_msg_time: float = 0.0
+        self._gap_count: int = 0       # Number of detected gaps
+        self._max_gap_ms: float = 0.0  # Largest gap seen
+
     def start(self):
         """Start the WebSocket connection in a background thread."""
         if not HAS_WEBSOCKET:
@@ -403,7 +410,18 @@ class HyperliquidWebSocket:
     def _on_message(self, ws, message):
         """Handle incoming WebSocket messages."""
         self._messages_received += 1
-        self.last_update = time.time()
+        now = time.time()
+
+        # Gap detection: if time since last message > 5s, we likely missed data
+        if self._last_msg_time > 0:
+            gap_ms = (now - self._last_msg_time) * 1000
+            if gap_ms > 5000:  # 5 second gap = suspicious
+                self._gap_count += 1
+                self._max_gap_ms = max(self._max_gap_ms, gap_ms)
+                logger.warning(f"WebSocket gap detected: {gap_ms:.0f}ms since last message "
+                             f"(gap #{self._gap_count})")
+        self._last_msg_time = now
+        self.last_update = now
 
         try:
             data = json.loads(message)
@@ -468,6 +486,8 @@ class HyperliquidWebSocket:
             "mids_tracked": len(self.mids),
             "last_update": self.last_update,
             "age_seconds": round(time.time() - self.last_update, 1) if self.last_update else None,
+            "gaps_detected": self._gap_count,
+            "max_gap_ms": round(self._max_gap_ms, 0),
         }
 
 
@@ -489,6 +509,14 @@ class APIManager:
         self._ws_served = 0
         self._rest_requests = 0
         self._lock = threading.Lock()
+
+        # Failure circuit breaker: if we see too many errors in a window,
+        # pause non-critical requests to let the exchange recover.
+        # This prevents the bot from hammering a struggling API.
+        self._recent_failures = 0
+        self._circuit_open_until = 0.0
+        self._CIRCUIT_THRESHOLD = 10    # failures in window to trip
+        self._CIRCUIT_COOLDOWN = 60.0   # seconds to wait when tripped
 
     def start_websocket(self, coins: list = None):
         """Start the WebSocket feed for real-time data."""
@@ -530,6 +558,13 @@ class APIManager:
                     self._ws_served += 1
                 return mids
 
+        # Circuit breaker: if too many recent failures, block non-critical requests
+        now = time.monotonic()
+        if now < self._circuit_open_until and priority > Priority.HIGH:
+            remaining = round(self._circuit_open_until - now, 1)
+            logger.debug(f"Circuit breaker OPEN — skipping {req_type} ({remaining}s remaining)")
+            return None
+
         # Acquire token from bucket
         if not self.bucket.acquire(priority=priority, timeout=30):
             logger.warning(f"Rate limiter timeout for {req_type} (priority={priority.name})")
@@ -541,6 +576,21 @@ class APIManager:
             self._rest_requests += 1
 
         result = self._do_request(payload, retries=retries)
+
+        # Track failures for circuit breaker
+        with self._lock:
+            if result is None:
+                self._recent_failures += 1
+                if self._recent_failures >= self._CIRCUIT_THRESHOLD:
+                    self._circuit_open_until = time.monotonic() + self._CIRCUIT_COOLDOWN
+                    logger.warning(
+                        f"Circuit breaker TRIPPED after {self._recent_failures} failures — "
+                        f"pausing non-critical requests for {self._CIRCUIT_COOLDOWN}s"
+                    )
+                    self._recent_failures = 0  # Reset counter
+            else:
+                # Successful request: decay failure counter
+                self._recent_failures = max(0, self._recent_failures - 1)
 
         # Cache the result
         if result is not None:
@@ -658,6 +708,7 @@ class APIManager:
     def get_stats(self) -> Dict:
         with self._lock:
             total = self._total_requests or 1
+            now = time.monotonic()
             return {
                 "total_requests": self._total_requests,
                 "cache_served": self._cache_served,
@@ -665,6 +716,12 @@ class APIManager:
                 "rest_requests": self._rest_requests,
                 "cache_hit_pct": round(self._cache_served / total * 100, 1),
                 "ws_hit_pct": round(self._ws_served / total * 100, 1),
+                "circuit_breaker": {
+                    "open": now < self._circuit_open_until,
+                    "recent_failures": self._recent_failures,
+                    "threshold": self._CIRCUIT_THRESHOLD,
+                    "cooldown_remaining_s": max(0, round(self._circuit_open_until - now, 1)),
+                },
                 "bucket": self.bucket.get_stats(),
                 "cache": self.cache.get_stats(),
                 "websocket": self.ws.get_stats(),

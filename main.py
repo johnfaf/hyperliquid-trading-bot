@@ -51,22 +51,42 @@ from src.hyperliquid_client import start_websocket, get_api_stats
 
 # ─── Logging Setup ─────────────────────────────────────────────
 
+import re as _re
+
+# Patterns that should NEVER appear in logs — matches common secret formats
+_SECRET_PATTERNS = [
+    _re.compile(r'(api[_-]?key|api[_-]?secret|private[_-]?key|secret[_-]?key|password|token|authorization)\s*[=:]\s*\S+', _re.IGNORECASE),
+    _re.compile(r'0x[a-fA-F0-9]{64}'),  # Ethereum private keys (64 hex chars)
+    _re.compile(r'(Bearer|Basic)\s+[A-Za-z0-9+/=_-]{20,}', _re.IGNORECASE),  # Auth headers
+]
+
+def _scrub_secrets(text: str) -> str:
+    """Remove any secrets that might accidentally appear in log messages."""
+    for pattern in _SECRET_PATTERNS:
+        text = pattern.sub("[REDACTED]", text)
+    return text
+
+
 class JSONFormatter(logging.Formatter):
     """
     Structured JSON log formatter for production.
     Railway, Datadog, ELK, and most log aggregators parse JSON natively.
     Each line is a self-contained JSON object — no multi-line parsing needed.
+
+    Includes secret-scrubbing: API keys, private keys, and auth tokens
+    are redacted before they reach the log output.
     """
     def format(self, record):
         import json as _json
+        msg = _scrub_secrets(record.getMessage())
         log_entry = {
             "ts": self.formatTime(record, "%Y-%m-%dT%H:%M:%S"),
             "level": record.levelname,
             "logger": record.name,
-            "msg": record.getMessage(),
+            "msg": msg,
         }
         if record.exc_info and record.exc_info[0]:
-            log_entry["exception"] = self.formatException(record.exc_info)
+            log_entry["exception"] = _scrub_secrets(self.formatException(record.exc_info))
         # Add extra fields if present (e.g. logger.info("msg", extra={"wallet": "0x..."})
         for key in ("wallet", "coin", "action", "latency_ms", "status_code"):
             if hasattr(record, key):
