@@ -1,101 +1,61 @@
 """
 Hyperliquid API client for fetching leaderboard, trader positions, market data, and PnL.
 Uses only the public Info endpoint — no API key required for read-only operations.
+
+V3: All requests route through the centralized APIManager (token bucket +
+    TTL cache + WebSocket feed).  The public function signatures are unchanged
+    so every module that imports this file keeps working.
 """
 import requests
 import time
 import logging
+import random
 from typing import Optional
 
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import config
+from src.api_manager import get_manager, Priority
 
 logger = logging.getLogger(__name__)
 
-# Rate limiting — adaptive to avoid 429s
-_last_request_time = 0
-_MIN_REQUEST_INTERVAL = 0.6   # 600ms between requests (safe baseline for HL)
-_backoff_until = 0            # timestamp until which we should back off
-_consecutive_429s = 0         # Track consecutive rate limits to escalate backoff
-_BACKOFF_COOLDOWN = 60        # After a 429 storm, stay slow for 60s
+
+# ─── Internal post — now delegates to APIManager ─────────────────
+
+def _post(payload: dict, retries: int = 3,
+          priority: Priority = None) -> Optional[dict]:
+    """
+    POST to the Hyperliquid info endpoint.
+    Routes through the global APIManager for rate limiting + caching.
+    """
+    mgr = get_manager()
+    return mgr.post(payload, priority=priority, retries=retries)
 
 
+# Legacy compatibility: modules that imported _rate_limit directly
 def _rate_limit():
-    global _last_request_time, _backoff_until
-    now = time.time()
-    # If we're in a backoff period, wait it out
-    if now < _backoff_until:
-        time.sleep(_backoff_until - now)
-    # After recent 429s, use a longer interval to avoid re-triggering
-    interval = _MIN_REQUEST_INTERVAL
-    if _consecutive_429s > 0:
-        interval = min(_MIN_REQUEST_INTERVAL * (1 + _consecutive_429s * 0.5), 5.0)
-    elapsed = time.time() - _last_request_time
-    if elapsed < interval:
-        time.sleep(interval - elapsed)
-    _last_request_time = time.time()
-
-
-def _post(payload: dict, retries: int = 3) -> Optional[dict]:
-    """POST to the Hyperliquid info endpoint with retries and 429 backoff."""
-    global _backoff_until, _consecutive_429s
-    _rate_limit()
-    req_type = payload.get("type", "unknown")
-    for attempt in range(retries):
-        try:
-            resp = requests.post(
-                config.HYPERLIQUID_INFO_URL,
-                json=payload,
-                headers={"Content-Type": "application/json"},
-                timeout=30
-            )
-            if resp.status_code == 429:
-                _consecutive_429s += 1
-                base_wait = min(5 * (2 ** min(attempt, 3)), 60)
-                storm_penalty = min(_consecutive_429s * 3, 30)
-                wait = base_wait + storm_penalty
-                logger.warning(f"Rate limited (429), backing off {wait}s "
-                             f"(consecutive={_consecutive_429s}, attempt={attempt+1})")
-                _backoff_until = time.time() + wait
-                time.sleep(wait)
-                continue
-
-            # 4xx client errors (400, 404, 422) — don't retry, these are our fault
-            if 400 <= resp.status_code < 500 and resp.status_code != 429:
-                body_preview = resp.text[:200] if resp.text else "(empty)"
-                logger.warning(f"Client error {resp.status_code} for type='{req_type}': "
-                             f"{body_preview} (payload keys: {list(payload.keys())})")
-                return None
-
-            resp.raise_for_status()
-            # Successful request — decay the consecutive counter
-            if _consecutive_429s > 0:
-                _consecutive_429s = max(0, _consecutive_429s - 1)
-            return resp.json()
-        except requests.exceptions.RequestException as e:
-            logger.warning(f"API request failed (attempt {attempt+1}/{retries}, "
-                         f"type='{req_type}'): {e}")
-            if attempt < retries - 1:
-                time.sleep(2 ** attempt)
-    return None
+    """No-op — rate limiting now handled by APIManager's token bucket."""
+    pass
 
 
 # ─── Market Metadata ───────────────────────────────────────────
 
 def get_meta():
     """Get exchange metadata (list of all perpetual assets)."""
-    return _post({"type": "meta"})
+    return _post({"type": "meta"}, priority=Priority.LOW)
 
 
 def get_all_mids():
-    """Get mid-prices for all assets. Returns dict like {'BTC': '67432.5', ...}."""
-    return _post({"type": "allMids"})
+    """
+    Get mid-prices for all assets. Returns dict like {'BTC': '67432.5', ...}.
+    Served from WebSocket when available (zero REST cost).
+    """
+    return _post({"type": "allMids"}, priority=Priority.HIGH)
 
 
 def get_asset_contexts():
     """Get detailed context for all assets (funding, open interest, etc.)."""
-    data = _post({"type": "metaAndAssetCtxs"})
+    data = _post({"type": "metaAndAssetCtxs"}, priority=Priority.NORMAL)
     if data and len(data) == 2:
         meta, contexts = data
         universe = meta.get("universe", [])
@@ -129,7 +89,8 @@ def get_user_state(address: str):
     Get a trader's clearinghouse state: positions, margin, account value.
     This is the main endpoint for analyzing what a trader is doing.
     """
-    data = _post({"type": "clearinghouseState", "user": address})
+    data = _post({"type": "clearinghouseState", "user": address},
+                 priority=Priority.HIGH)
     if not data:
         return None
 
@@ -166,7 +127,7 @@ def get_user_fills(address: str, start_time: Optional[int] = None):
     payload = {"type": "userFills", "user": address}
     if start_time:
         payload["startTime"] = start_time
-    data = _post(payload)
+    data = _post(payload, priority=Priority.NORMAL)
     if not data:
         return []
 
@@ -215,7 +176,7 @@ def get_leaderboard():
     """
     # Method 1: Official info endpoint with "leaderboard" type
     try:
-        data = _post({"type": "leaderboard"})
+        data = _post({"type": "leaderboard"}, priority=Priority.LOW)
         if data:
             logger.info(f"Leaderboard from info endpoint: type={type(data).__name__}, "
                        f"keys={list(data.keys()) if isinstance(data, dict) else f'list[{len(data)}]'}")
@@ -224,8 +185,11 @@ def get_leaderboard():
         logger.warning(f"Info leaderboard failed: {e}")
 
     # Method 2: Stats data endpoint (used by the frontend)
+    # This goes through the token bucket but bypasses the info-endpoint cache
     try:
-        _rate_limit()
+        mgr = get_manager()
+        if not mgr.bucket.acquire(priority=Priority.LOW, timeout=10):
+            return None
         resp = requests.get(
             "https://stats-data.hyperliquid.xyz/Mainnet/leaderboard",
             timeout=30
@@ -242,19 +206,19 @@ def get_leaderboard():
 
 def get_user_portfolio(address: str):
     """Get historical portfolio/PnL data for a user."""
-    return _post({"type": "portfolio", "user": address})
+    return _post({"type": "portfolio", "user": address}, priority=Priority.LOW)
 
 
 def get_vault_details(vault_address: str):
     """Get details about a Hyperliquid vault (community-managed fund)."""
-    return _post({"type": "vaultDetails", "user": vault_address})
+    return _post({"type": "vaultDetails", "user": vault_address}, priority=Priority.LOW)
 
 
 # ─── Order Book & Market Data ─────────────────────────────────
 
 def get_l2_book(coin: str):
     """Get L2 order book for a coin."""
-    return _post({"type": "l2Book", "coin": coin})
+    return _post({"type": "l2Book", "coin": coin}, priority=Priority.NORMAL)
 
 
 def get_candles(coin: str, interval: str = "1h", start_time: Optional[int] = None,
@@ -268,12 +232,12 @@ def get_candles(coin: str, interval: str = "1h", start_time: Optional[int] = Non
         payload["req"]["startTime"] = start_time
     if end_time:
         payload["req"]["endTime"] = end_time
-    return _post(payload) or []
+    return _post(payload, priority=Priority.LOW) or []
 
 
 def get_recent_trades(coin: str):
     """Get recent trades for a coin."""
-    return _post({"type": "recentTrades", "coin": coin})
+    return _post({"type": "recentTrades", "coin": coin}, priority=Priority.NORMAL)
 
 
 # ─── Utility ───────────────────────────────────────────────────
@@ -291,13 +255,27 @@ def get_funding_history(coin: str, start_time: Optional[int] = None):
     payload = {"type": "fundingHistory", "coin": coin}
     if start_time:
         payload["req"] = {"coin": coin, "startTime": start_time}
-    return _post(payload) or []
+    return _post(payload, priority=Priority.LOW) or []
+
+
+# ─── Manager access for other modules ────────────────────────────
+
+def start_websocket(coins: list = None):
+    """Start the WebSocket feed. Call from main.py during init."""
+    mgr = get_manager()
+    mgr.start_websocket(coins=coins)
+
+
+def get_api_stats() -> dict:
+    """Get API manager stats for dashboard/logging."""
+    mgr = get_manager()
+    return mgr.get_stats()
 
 
 if __name__ == "__main__":
     # Quick test
     logging.basicConfig(level=logging.INFO)
-    print("Testing Hyperliquid API client...")
+    print("Testing Hyperliquid API client (V3 — via APIManager)...")
 
     coins = get_all_coins()
     print(f"Available coins ({len(coins)}): {coins[:10]}...")
@@ -313,4 +291,6 @@ if __name__ == "__main__":
         print(f"Test account value: ${state['account_value']:,.2f}")
         print(f"Open positions: {len(state['positions'])}")
 
+    stats = get_api_stats()
+    print(f"\nAPI Manager stats: {json.dumps(stats, indent=2)}")
     print("API client test complete.")

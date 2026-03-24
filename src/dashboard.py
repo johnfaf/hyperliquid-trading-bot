@@ -659,6 +659,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
                         v25["multi_scanner"] = _multi_scanner.get_stats()
                 except Exception:
                     pass
+                try:
+                    from src.hyperliquid_client import get_api_stats
+                    v25["api_manager"] = get_api_stats()
+                except Exception:
+                    pass
                 if v25:
                     data["v25"] = v25
 

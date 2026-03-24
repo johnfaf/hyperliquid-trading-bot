@@ -47,6 +47,7 @@ from src.decision_engine import DecisionEngine
 from src.exchanges.scanner import MultiExchangeScanner
 from src import telegram_bot as tg
 from src.golden_bridge import get_golden_copy_signals, auto_connect_golden_wallets, get_stats as golden_stats
+from src.hyperliquid_client import start_websocket, get_api_stats
 
 # ─── Logging Setup ─────────────────────────────────────────────
 
@@ -135,6 +136,13 @@ class HyperliquidResearchBot:
         except Exception as e:
             self.logger.warning(f"Multi-exchange scanner init failed (continuing single-venue): {e}")
             self.multi_scanner = None
+
+        # V5: Start WebSocket feed for real-time market data (reduces REST polling)
+        try:
+            start_websocket(coins=["BTC", "ETH", "SOL", "DOGE", "ARB", "OP"])
+            self.logger.info("WebSocket feed started for real-time price data")
+        except Exception as e:
+            self.logger.warning(f"WebSocket start failed (REST fallback active): {e}")
 
         # Bootstrap Kelly from existing agent scorer history
         self.kelly_sizer.load_from_agent_scorer(self.agent_scorer)
@@ -890,6 +898,17 @@ class HyperliquidResearchBot:
                     self.logger.info(f"  Golden Wallets: {gs['golden_wallets']} golden / "
                                    f"{gs['total_evaluated']} evaluated, "
                                    f"{gs['live_connected']} connected to live")
+            except Exception:
+                pass
+            try:
+                api_s = get_api_stats()
+                self.logger.info(
+                    f"  API Manager: {api_s['rest_requests']} REST, "
+                    f"{api_s['cache_served']} cached ({api_s['cache_hit_pct']}% hit), "
+                    f"{api_s['ws_served']} from WS | "
+                    f"bucket: {api_s['bucket']['tokens_available']:.0f} tokens, "
+                    f"429s={api_s['bucket']['consecutive_429s']}"
+                )
             except Exception:
                 pass
 
