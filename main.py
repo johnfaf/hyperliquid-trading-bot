@@ -1002,9 +1002,14 @@ class HyperliquidResearchBot:
         """Run the bot in a continuous loop."""
         self.running = True
 
-        # Handle graceful shutdown
+        # Handle graceful shutdown — backup DB before exit
         def signal_handler(sig, frame):
-            self.logger.info("Shutdown signal received. Stopping...")
+            self.logger.info("Shutdown signal received. Backing up DB before exit...")
+            try:
+                backup_to_json()
+                self.logger.info("DB backup complete.")
+            except Exception as e:
+                self.logger.error(f"DB backup failed on shutdown: {e}")
             self.running = False
         signal.signal(signal.SIGINT, signal_handler)
         signal.signal(signal.SIGTERM, signal_handler)

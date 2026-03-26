@@ -468,29 +468,94 @@ def get_audit_trail(limit: int = 200, action_filter: str = None,
 # ─── Backup & Restore (for Railway persistence) ─────────────
 
 def backup_to_json(filepath: str = None):
-    """Backup critical DB state to a JSON file for Railway persistence."""
+    """
+    Backup critical DB state to a JSON file for Railway persistence.
+
+    Includes golden wallets + wallet_fills so the expensive research
+    data survives Railway redeploys without re-scanning.
+
+    Set HL_BOT_BACKUP env var to a Railway volume path (e.g. /data/bot_backup.json)
+    so it persists across container restarts.
+    """
     if filepath is None:
-        filepath = os.environ.get("HL_BOT_BACKUP", "/tmp/bot_backup.json")
+        # Default: data/ dir in repo (survives if mounted as volume)
+        default_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                     "..", "data", "bot_backup.json")
+        filepath = os.environ.get("HL_BOT_BACKUP", default_path)
+
+    os.makedirs(os.path.dirname(os.path.abspath(filepath)), exist_ok=True)
+
     try:
         data = {
+            "version": 2,
             "timestamp": datetime.utcnow().isoformat(),
             "paper_account": get_paper_account(),
-            "traders": get_active_traders()[:100],
+            "traders": get_active_traders()[:200],
             "bot_traders": [t for t in get_all_traders_including_bots() if not t.get("active", 1)],
-            "strategies": get_active_strategies()[:200],
+            "strategies": get_active_strategies()[:500],
             "open_trades": get_open_paper_trades(),
-            "closed_trades": get_paper_trade_history(limit=200),
+            "closed_trades": get_paper_trade_history(limit=500),
         }
+
+        # Golden wallets + fills (the most expensive data to regenerate)
+        try:
+            with get_connection() as conn:
+                def _table_exists(name):
+                    return conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+                        (name,)
+                    ).fetchone() is not None
+
+                if _table_exists("golden_wallets"):
+                    rows = conn.execute(
+                        "SELECT * FROM golden_wallets ORDER BY penalised_pnl DESC"
+                    ).fetchall()
+                    data["golden_wallets"] = [dict(r) for r in rows]
+
+                if _table_exists("wallet_fills"):
+                    # Only backup fills from golden wallets (not all fills)
+                    rows = conn.execute("""
+                        SELECT wf.* FROM wallet_fills wf
+                        JOIN golden_wallets gw ON wf.wallet_address = gw.address
+                        WHERE gw.is_golden = 1
+                        ORDER BY wf.time_ms
+                    """).fetchall()
+                    data["wallet_fills"] = [dict(r) for r in rows]
+
+                if _table_exists("calibration_records"):
+                    rows = conn.execute(
+                        "SELECT * FROM calibration_records ORDER BY timestamp DESC LIMIT 100"
+                    ).fetchall()
+                    data["calibration_records"] = [dict(r) for r in rows]
+        except Exception as e:
+            print(f"Warning: could not backup golden/calibration data: {e}")
+
         with open(filepath, "w") as f:
             json.dump(data, f)
+
+        size_kb = os.path.getsize(filepath) / 1024
+        counts = (f"{len(data.get('traders', []))} traders, "
+                  f"{len(data.get('bot_traders', []))} bots, "
+                  f"{len(data.get('strategies', []))} strategies, "
+                  f"{len(data.get('golden_wallets', []))} golden wallets, "
+                  f"{len(data.get('wallet_fills', []))} fills")
+        print(f"DB backup ({size_kb:.0f} KB): {counts} → {filepath}")
     except Exception as e:
         print(f"Backup failed: {e}")
 
 
 def restore_from_json(filepath: str = None):
-    """Restore DB state from a backup JSON file if DB is empty."""
+    """
+    Restore DB state from a backup JSON file if DB is empty.
+
+    Includes golden wallets + wallet_fills so the expensive research
+    survives Railway redeploys without a full re-scan.
+    """
     if filepath is None:
-        filepath = os.environ.get("HL_BOT_BACKUP", "/tmp/bot_backup.json")
+        default_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                     "..", "data", "bot_backup.json")
+        filepath = os.environ.get("HL_BOT_BACKUP", default_path)
+
     if not os.path.exists(filepath):
         return False
 
@@ -502,6 +567,8 @@ def restore_from_json(filepath: str = None):
     try:
         with open(filepath, "r") as f:
             data = json.load(f)
+
+        print(f"Restoring from backup ({data.get('timestamp', '?')})...")
 
         # Restore paper account
         if data.get("paper_account"):
@@ -557,7 +624,82 @@ def restore_from_json(filepath: str = None):
                 sharpe_ratio=s.get("sharpe_ratio", 0),
             )
 
-        print(f"Restored DB from backup: {len(data.get('traders', []))} traders, {len(data.get('strategies', []))} strategies")
+        # Restore golden wallets (v2 backup)
+        golden_count = 0
+        fills_count = 0
+        if data.get("golden_wallets"):
+            try:
+                from src.golden_wallet import init_golden_tables
+                init_golden_tables()
+
+                with get_connection() as conn:
+                    for gw in data["golden_wallets"]:
+                        try:
+                            conn.execute("""
+                                INSERT OR IGNORE INTO golden_wallets
+                                (address, penalised_pnl, raw_pnl, sharpe_ratio,
+                                 max_drawdown_pct, penalised_max_drawdown_pct,
+                                 win_rate, trades_per_day, is_golden, coins_traded,
+                                 best_coin, evaluated_at, connected_to_live)
+                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """, (
+                                gw["address"],
+                                gw.get("penalised_pnl", 0),
+                                gw.get("raw_pnl", 0),
+                                gw.get("sharpe_ratio", 0),
+                                gw.get("max_drawdown_pct", 0),
+                                gw.get("penalised_max_drawdown_pct", 0),
+                                gw.get("win_rate", 0),
+                                gw.get("trades_per_day", 0),
+                                gw.get("is_golden", 0),
+                                gw.get("coins_traded", ""),
+                                gw.get("best_coin", ""),
+                                gw.get("evaluated_at", datetime.utcnow().isoformat()),
+                                gw.get("connected_to_live", 0),
+                            ))
+                            golden_count += 1
+                        except Exception:
+                            pass
+            except Exception as e:
+                print(f"Warning: could not restore golden wallets: {e}")
+
+        # Restore wallet fills (v2 backup)
+        if data.get("wallet_fills"):
+            try:
+                with get_connection() as conn:
+                    for fill in data["wallet_fills"]:
+                        try:
+                            conn.execute("""
+                                INSERT OR IGNORE INTO wallet_fills
+                                (wallet_address, coin, side, size, price,
+                                 time_ms, fee, closed_pnl, direction,
+                                 raw_pnl, penalised_pnl, slippage_cost, fee_cost)
+                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """, (
+                                fill["wallet_address"],
+                                fill.get("coin", ""),
+                                fill.get("side", ""),
+                                fill.get("size", 0),
+                                fill.get("price", 0),
+                                fill.get("time_ms", 0),
+                                fill.get("fee", 0),
+                                fill.get("closed_pnl", 0),
+                                fill.get("direction", ""),
+                                fill.get("raw_pnl", 0),
+                                fill.get("penalised_pnl", 0),
+                                fill.get("slippage_cost", 0),
+                                fill.get("fee_cost", 0),
+                            ))
+                            fills_count += 1
+                        except Exception:
+                            pass
+            except Exception as e:
+                print(f"Warning: could not restore wallet fills: {e}")
+
+        print(f"Restored DB from backup: {len(data.get('traders', []))} traders, "
+              f"{len(data.get('bot_traders', []))} bots, "
+              f"{len(data.get('strategies', []))} strategies, "
+              f"{golden_count} golden wallets, {fills_count} fills")
         return True
     except Exception as e:
         print(f"Restore failed: {e}")
