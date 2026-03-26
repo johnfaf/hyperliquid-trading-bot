@@ -4,6 +4,8 @@ SQLite database layer for persisting traders, strategies, scores, and paper trad
 import sqlite3
 import json
 import os
+import time
+import logging
 from datetime import datetime
 from contextlib import contextmanager
 
@@ -11,10 +13,48 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import config
 
+logger = logging.getLogger(__name__)
+
+
+def _wait_for_volume(path: str, timeout: int = 30) -> bool:
+    """Wait for a Railway persistent volume to become writable.
+
+    On Railway the /data mount point directory exists before the actual
+    volume is attached, so os.path.isdir('/data') returns True but writes
+    fail.  This helper retries until the volume is ready or timeout expires.
+    """
+    parent = os.path.dirname(path) or path
+    deadline = time.monotonic() + timeout
+    attempt = 0
+    while time.monotonic() < deadline:
+        try:
+            os.makedirs(parent, exist_ok=True)
+            # Try creating a temp file to prove it's writable
+            probe = os.path.join(parent, ".volume_probe")
+            with open(probe, "w") as f:
+                f.write("ok")
+            os.remove(probe)
+            if attempt > 0:
+                logger.info(f"[PERSISTENCE] Volume became writable after {attempt} retries")
+            return True
+        except OSError:
+            attempt += 1
+            time.sleep(1)
+    logger.error(f"[PERSISTENCE] Volume at {parent} not writable after {timeout}s — falling back to local")
+    return False
+
 
 def get_db_path():
-    os.makedirs(os.path.dirname(config.DB_PATH), exist_ok=True)
-    return config.DB_PATH
+    db_path = config.DB_PATH
+    # If using a persistent volume, wait for it to be mounted and writable
+    if db_path.startswith("/data"):
+        if not _wait_for_volume(db_path):
+            # Fallback to local ephemeral storage so the bot can at least run
+            db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                    "..", "data", "bot.db")
+            logger.warning(f"[PERSISTENCE] Falling back to ephemeral DB: {db_path}")
+    os.makedirs(os.path.dirname(os.path.abspath(db_path)), exist_ok=True)
+    return db_path
 
 
 @contextmanager
