@@ -9,9 +9,13 @@ HYPERLIQUID_INFO_URL = f"{HYPERLIQUID_API_URL}/info"
 
 # ─── Database ──────────────────────────────────────────────────
 # Use environment variable or default to local data/ directory
-# On some systems the mounted folder may have restricted permissions,
-# so you can override with: export HL_BOT_DB=/path/to/bot.db
-_DEFAULT_DB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "bot.db")
+# On Railway: uses /data/ (persistent volume) so DB survives redeploys
+# Override with: export HL_BOT_DB=/path/to/bot.db
+_IS_RAILWAY = bool(os.environ.get("RAILWAY_ENVIRONMENT") or os.environ.get("RAILWAY_SERVICE_ID"))
+if _IS_RAILWAY:
+    _DEFAULT_DB = "/data/bot.db"
+else:
+    _DEFAULT_DB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "bot.db")
 DB_PATH = os.environ.get("HL_BOT_DB", _DEFAULT_DB)
 
 # ─── Trader Discovery ─────────────────────────────────────────

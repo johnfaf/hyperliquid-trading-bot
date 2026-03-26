@@ -478,9 +478,13 @@ def backup_to_json(filepath: str = None):
     so it persists across container restarts.
     """
     if filepath is None:
-        # Default: data/ dir in repo (survives if mounted as volume)
-        default_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                     "..", "data", "bot_backup.json")
+        # On Railway: use /data/ persistent volume so backup survives redeploys
+        is_railway = bool(os.environ.get("RAILWAY_ENVIRONMENT") or os.environ.get("RAILWAY_SERVICE_ID"))
+        if is_railway:
+            default_path = "/data/bot_backup.json"
+        else:
+            default_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                         "..", "data", "bot_backup.json")
         filepath = os.environ.get("HL_BOT_BACKUP", default_path)
 
     os.makedirs(os.path.dirname(os.path.abspath(filepath)), exist_ok=True)
@@ -552,8 +556,12 @@ def restore_from_json(filepath: str = None):
     survives Railway redeploys without a full re-scan.
     """
     if filepath is None:
-        default_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                     "..", "data", "bot_backup.json")
+        is_railway = bool(os.environ.get("RAILWAY_ENVIRONMENT") or os.environ.get("RAILWAY_SERVICE_ID"))
+        if is_railway:
+            default_path = "/data/bot_backup.json"
+        else:
+            default_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                         "..", "data", "bot_backup.json")
         filepath = os.environ.get("HL_BOT_BACKUP", default_path)
 
     if not os.path.exists(filepath):
