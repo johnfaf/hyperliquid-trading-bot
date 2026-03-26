@@ -664,6 +664,9 @@ def restore_from_json(filepath: str = None):
                 print(f"Warning: could not restore golden wallets: {e}")
 
         # Restore wallet fills (v2 backup)
+        # Schema: wallet_address, coin, side, original_price, penalised_price,
+        #         size, time_ms, delayed_time_ms, closed_pnl, penalised_pnl,
+        #         fee, is_liquidation, direction
         if data.get("wallet_fills"):
             try:
                 with get_connection() as conn:
@@ -671,24 +674,25 @@ def restore_from_json(filepath: str = None):
                         try:
                             conn.execute("""
                                 INSERT OR IGNORE INTO wallet_fills
-                                (wallet_address, coin, side, size, price,
-                                 time_ms, fee, closed_pnl, direction,
-                                 raw_pnl, penalised_pnl, slippage_cost, fee_cost)
+                                (wallet_address, coin, side, original_price,
+                                 penalised_price, size, time_ms, delayed_time_ms,
+                                 closed_pnl, penalised_pnl, fee, is_liquidation,
+                                 direction)
                                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                             """, (
                                 fill["wallet_address"],
                                 fill.get("coin", ""),
                                 fill.get("side", ""),
+                                fill.get("original_price", 0),
+                                fill.get("penalised_price", 0),
                                 fill.get("size", 0),
-                                fill.get("price", 0),
                                 fill.get("time_ms", 0),
-                                fill.get("fee", 0),
+                                fill.get("delayed_time_ms", 0),
                                 fill.get("closed_pnl", 0),
-                                fill.get("direction", ""),
-                                fill.get("raw_pnl", 0),
                                 fill.get("penalised_pnl", 0),
-                                fill.get("slippage_cost", 0),
-                                fill.get("fee_cost", 0),
+                                fill.get("fee", 0),
+                                fill.get("is_liquidation", 0),
+                                fill.get("direction", ""),
                             ))
                             fills_count += 1
                         except Exception:

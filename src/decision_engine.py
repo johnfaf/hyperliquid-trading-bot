@@ -118,6 +118,7 @@ class DecisionEngine:
                 traded_coins = metrics.get("coins", metrics.get("coins_traded", []))
                 if traded_coins and isinstance(traded_coins, list):
                     coins = traded_coins
+                    params["coins"] = coins  # Persist so _compute_composite_score sees it
 
             # Fallback 2: infer from strategy type — use top liquid coins
             if not coins or (coins and coins[0] == "unknown"):
@@ -128,9 +129,12 @@ class DecisionEngine:
                     coins = [random.choice(TOP_COINS[:3])]  # BTC, ETH, SOL
                 else:
                     coins = [random.choice(TOP_COINS[:7])]  # Top 7 liquid
-                params["coins"] = coins
                 logger.info(f"Inferred coin {coins[0]} for strategy "
                            f"{strategy_type} (no asset in parameters)")
+
+            # Always persist resolved coins back into params
+            params["coins"] = coins
+            s["parameters"] = params
 
             valid_strategies.append(s)
 
