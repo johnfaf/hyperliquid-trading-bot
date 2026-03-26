@@ -8,16 +8,29 @@ HYPERLIQUID_API_URL = "https://api.hyperliquid.xyz"
 HYPERLIQUID_INFO_URL = f"{HYPERLIQUID_API_URL}/info"
 
 # ─── Database ──────────────────────────────────────────────────
-# Use environment variable or default to local data/ directory
-# On Railway: uses /data/ (persistent volume) so DB survives redeploys
-# Override with: export HL_BOT_DB=/path/to/bot.db
-# Detection: check if /data volume actually exists on disk (more reliable than env vars)
-_HAS_PERSISTENT_VOLUME = os.path.isdir("/data")
-if _HAS_PERSISTENT_VOLUME:
-    _DEFAULT_DB = "/data/bot.db"
-else:
-    _DEFAULT_DB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "bot.db")
-DB_PATH = os.environ.get("HL_BOT_DB", _DEFAULT_DB)
+# Priority: HL_BOT_DB env var > /data/ volume > local ./data/
+# On Railway: set HL_BOT_DB=/data/bot.db in Variables tab, or the code
+# auto-detects the /data volume if it exists and is writable.
+def _resolve_db_path() -> str:
+    # 1. Explicit env var always wins
+    env_db = os.environ.get("HL_BOT_DB")
+    if env_db:
+        return env_db
+    # 2. Check if /data exists AND is writable (Railway persistent volume)
+    try:
+        os.makedirs("/data", exist_ok=True)
+        probe = "/data/.write_test"
+        with open(probe, "w") as f:
+            f.write("ok")
+        os.remove(probe)
+        return "/data/bot.db"
+    except OSError:
+        pass
+    # 3. Fallback to local ./data/
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "bot.db")
+
+DB_PATH = _resolve_db_path()
+_HAS_PERSISTENT_VOLUME = DB_PATH.startswith("/data")
 
 # ─── Trader Discovery ─────────────────────────────────────────
 # Minimum PnL (USD) to consider a trader "top"

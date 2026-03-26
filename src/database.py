@@ -4,7 +4,6 @@ SQLite database layer for persisting traders, strategies, scores, and paper trad
 import sqlite3
 import json
 import os
-import time
 import logging
 from datetime import datetime
 from contextlib import contextmanager
@@ -15,46 +14,13 @@ import config
 
 logger = logging.getLogger(__name__)
 
-
-def _wait_for_volume(path: str, timeout: int = 30) -> bool:
-    """Wait for a Railway persistent volume to become writable.
-
-    On Railway the /data mount point directory exists before the actual
-    volume is attached, so os.path.isdir('/data') returns True but writes
-    fail.  This helper retries until the volume is ready or timeout expires.
-    """
-    parent = os.path.dirname(path) or path
-    deadline = time.monotonic() + timeout
-    attempt = 0
-    while time.monotonic() < deadline:
-        try:
-            os.makedirs(parent, exist_ok=True)
-            # Try creating a temp file to prove it's writable
-            probe = os.path.join(parent, ".volume_probe")
-            with open(probe, "w") as f:
-                f.write("ok")
-            os.remove(probe)
-            if attempt > 0:
-                logger.info(f"[PERSISTENCE] Volume became writable after {attempt} retries")
-            return True
-        except OSError:
-            attempt += 1
-            time.sleep(1)
-    logger.error(f"[PERSISTENCE] Volume at {parent} not writable after {timeout}s — falling back to local")
-    return False
+# Resolved once at import — config.py already tested writability
+_DB_PATH = config.DB_PATH
+os.makedirs(os.path.dirname(os.path.abspath(_DB_PATH)), exist_ok=True)
 
 
 def get_db_path():
-    db_path = config.DB_PATH
-    # If using a persistent volume, wait for it to be mounted and writable
-    if db_path.startswith("/data"):
-        if not _wait_for_volume(db_path):
-            # Fallback to local ephemeral storage so the bot can at least run
-            db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                    "..", "data", "bot.db")
-            logger.warning(f"[PERSISTENCE] Falling back to ephemeral DB: {db_path}")
-    os.makedirs(os.path.dirname(os.path.abspath(db_path)), exist_ok=True)
-    return db_path
+    return _DB_PATH
 
 
 @contextmanager
@@ -518,14 +484,10 @@ def backup_to_json(filepath: str = None):
     so it persists across container restarts.
     """
     if filepath is None:
-        # Check if /data volume exists on disk (Railway persistent volume)
-        has_volume = os.path.isdir("/data")
-        if has_volume:
-            default_path = "/data/bot_backup.json"
-        else:
-            default_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                         "..", "data", "bot_backup.json")
-        filepath = os.environ.get("HL_BOT_BACKUP", default_path)
+        # Put backup next to the DB file (same volume / same dir)
+        db_dir = os.path.dirname(os.path.abspath(_DB_PATH))
+        filepath = os.environ.get("HL_BOT_BACKUP",
+                                   os.path.join(db_dir, "bot_backup.json"))
 
     os.makedirs(os.path.dirname(os.path.abspath(filepath)), exist_ok=True)
 
@@ -596,14 +558,10 @@ def restore_from_json(filepath: str = None):
     survives Railway redeploys without a full re-scan.
     """
     if filepath is None:
-        # Check if /data volume exists on disk (Railway persistent volume)
-        has_volume = os.path.isdir("/data")
-        if has_volume:
-            default_path = "/data/bot_backup.json"
-        else:
-            default_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                         "..", "data", "bot_backup.json")
-        filepath = os.environ.get("HL_BOT_BACKUP", default_path)
+        # Put backup next to the DB file (same volume / same dir)
+        db_dir = os.path.dirname(os.path.abspath(_DB_PATH))
+        filepath = os.environ.get("HL_BOT_BACKUP",
+                                   os.path.join(db_dir, "bot_backup.json"))
 
     if not os.path.exists(filepath):
         return False
