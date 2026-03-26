@@ -206,17 +206,18 @@ class TTLCache:
 # ─── Cache TTLs by request type ─────────────────────────────────
 # How long each type of data stays fresh in cache (seconds)
 CACHE_TTLS = {
-    "allMids": 1.0,            # Prices: 1s (changes fast)
-    "metaAndAssetCtxs": 5.0,   # Funding/OI: 5s
-    "meta": 300.0,             # Exchange metadata: 5 min
-    "l2Book": 1.0,             # Order book: 1s
-    "recentTrades": 2.0,       # Recent trades: 2s
-    "clearinghouseState": 3.0, # Trader positions: 3s
-    "userFills": 10.0,         # Fill history: 10s (doesn't change often)
-    "userFunding": 30.0,       # Funding payments: 30s
-    "leaderboard": 60.0,       # Leaderboard: 1 min
-    "candleSnapshot": 15.0,    # Candles: 15s
-    "fundingHistory": 60.0,    # Funding history: 1 min
+    "allMids": 2.0,            # Prices: 2s (multiple modules read within same cycle tick)
+    "metaAndAssetCtxs": 30.0,  # Funding/OI: 30s (regime+options+features all need this)
+    "meta": 600.0,             # Exchange metadata: 10 min (almost never changes)
+    "l2Book": 2.0,             # Order book: 2s
+    "recentTrades": 5.0,       # Recent trades: 5s
+    "clearinghouseState": 10.0,# Trader positions: 10s (scanning 258 traders, same trader
+                                #   may be queried by discovery + copy trader within 10s)
+    "userFills": 30.0,         # Fill history: 30s (doesn't change between cycle phases)
+    "userFunding": 120.0,      # Funding payments: 2 min
+    "leaderboard": 300.0,      # Leaderboard: 5 min (only refreshed hourly anyway)
+    "candleSnapshot": 30.0,    # Candles: 30s (used by regime + features in same cycle)
+    "fundingHistory": 300.0,   # Funding history: 5 min
 }
 
 # Priority by request type

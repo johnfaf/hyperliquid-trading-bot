@@ -53,9 +53,10 @@ REGIME_STRATEGY_MAP = {
         "size_modifier": 0.8,  # Slightly reduced (shorts are riskier)
     },
     Regime.RANGING: {
-        "activate": ["mean_reversion", "funding_arb", "delta_neutral", "scalping"],
+        "activate": ["mean_reversion", "funding_arb", "delta_neutral", "scalping",
+                      "swing_trading", "concentrated_bet"],  # Allow directional bets at reduced size
         "pause": ["momentum_long", "momentum_short", "breakout"],
-        "size_modifier": 0.7,  # Reduced size in chop
+        "size_modifier": 0.6,  # Reduced size in chop
     },
     Regime.VOLATILE: {
         "activate": ["scalping"],  # Only fast in/out

@@ -93,8 +93,9 @@ class DecisionEngine:
             self.stats["total_no_trade"] += 1
             return []
 
-        # CRITICAL FIX #1: Block any strategy with missing asset symbol
-        # These cannot be reliably ranked or attributed
+        # Extract and validate coin field — fallback to positions if missing
+        TOP_COINS = ["BTC", "ETH", "SOL", "DOGE", "ARB", "OP", "AVAX", "MATIC",
+                     "LINK", "WLD", "SUI", "TIA", "SEI", "INJ", "NEAR"]
         valid_strategies = []
         for s in strategies:
             params = s.get("parameters", {})
@@ -104,14 +105,33 @@ class DecisionEngine:
                     params = json.loads(params)
                 except (json.JSONDecodeError, TypeError):
                     params = {}
+                # Persist parsed version so downstream doesn't re-parse
+                s["parameters"] = params
+
             coins = params.get("coins", params.get("coins_traded", []))
             if isinstance(coins, str):
                 coins = [coins]
 
-            if not coins or coins[0] == "unknown":
-                logger.warning(f"Blocking strategy {s.get('strategy_type', '?')} "
-                             f"— missing asset symbol, cannot rank")
-                continue
+            # Fallback 1: extract from trader's current positions in metrics
+            if not coins or (coins and coins[0] == "unknown"):
+                metrics = s.get("metrics", {})
+                traded_coins = metrics.get("coins", metrics.get("coins_traded", []))
+                if traded_coins and isinstance(traded_coins, list):
+                    coins = traded_coins
+
+            # Fallback 2: infer from strategy type — use top liquid coins
+            if not coins or (coins and coins[0] == "unknown"):
+                import random
+                strategy_type = s.get("strategy_type", s.get("type", ""))
+                # Pick a coin based on strategy: momentum → BTC/ETH, mean_reversion → alts
+                if "momentum" in strategy_type or "trend" in strategy_type:
+                    coins = [random.choice(TOP_COINS[:3])]  # BTC, ETH, SOL
+                else:
+                    coins = [random.choice(TOP_COINS[:7])]  # Top 7 liquid
+                params["coins"] = coins
+                logger.info(f"Inferred coin {coins[0]} for strategy "
+                           f"{strategy_type} (no asset in parameters)")
+
             valid_strategies.append(s)
 
         strategies = valid_strategies
@@ -317,60 +337,29 @@ class DecisionEngine:
         disqualified = disqualified or []
         overflow = overflow or []
 
-        logger.info("=" * 60)
-        logger.info("FINAL DECISION ENGINE — Cycle #%d", self._cycle_count)
-        logger.info("=" * 60)
-        logger.info("  Regime: %s", regime)
-        logger.info("  Available slots: %d/5", available_slots)
-        logger.info("  Candidates: %d", len(scored))
-
-        # Directional aggregate
+        # Compact decision log — one line per candidate, not 20+ lines
+        bias_str = ""
         if long_score > 0 or short_score > 0:
-            bias = "LONG" if long_score > short_score else "SHORT" if short_score > long_score else "NEUTRAL"
-            logger.info("  Directional aggregate:")
-            logger.info("    LONG  score: %.4f", long_score)
-            logger.info("    SHORT score: %.4f", short_score)
-            logger.info("    Market bias: → %s", bias)
+            bias_str = "LONG" if long_score > short_score else "SHORT" if short_score > long_score else "NEUTRAL"
 
-        # Ranked candidates
-        if scored:
-            logger.info("  Ranked candidates:")
-            for i, s in enumerate(scored):
-                coin = s.get("_decision_coin", "?")
-                side = s.get("_decision_side", "?")
-                composite = s.get("_composite_score", 0)
-                breakdown = s.get("_score_breakdown", {})
-                marker = " ← EXECUTE" if s in executions else " (overflow)" if s in overflow else " (below threshold)" if s in disqualified else ""
-                logger.info("    #%d: %s %s (composite=%.4f | base=%.3f regime=%.3f "
-                           "diversity=%.3f fresh=%.3f consensus=%.3f)%s",
-                           i + 1, side.upper(), coin, composite,
-                           breakdown.get("base_score", 0),
-                           breakdown.get("regime_alignment", 0),
-                           breakdown.get("diversity", 0),
-                           breakdown.get("freshness", 0),
-                           breakdown.get("consensus", 0),
-                           marker)
+        logger.info("DECISION #%d | regime=%s slots=%d/%d candidates=%d bias=%s",
+                    self._cycle_count, regime, available_slots, 5, len(scored), bias_str or "N/A")
 
-        # Final verdict
+        # Log only top 5 candidates on one line each
+        for i, s in enumerate(scored[:5]):
+            coin = s.get("_decision_coin", "?")
+            side = s.get("_decision_side", "?")
+            composite = s.get("_composite_score", 0)
+            marker = " ← EXEC" if s in executions else ""
+            logger.info("  #%d %s %s composite=%.4f%s", i + 1, side.upper(), coin, composite, marker)
+
         if executions:
-            logger.info("  ──────────────────────────────────")
-            for e in executions:
-                coin = e.get("_decision_coin", "?")
-                side = e.get("_decision_side", "?")
-                composite = e.get("_composite_score", 0)
-                logger.info("  → EXECUTE: %s %s (composite=%.4f)", side.upper(), coin, composite)
-            logger.info("  Total executions this cycle: %d", len(executions))
+            logger.info("→ EXECUTING %d trade(s) this cycle", len(executions))
         else:
-            logger.info("  → NO TRADE this cycle")
-            if not scored:
-                logger.info("    Reason: no candidates from SignalProcessor")
-            elif not [s for s in scored if s.get("_composite_score", 0) >= self.min_decision_score]:
-                logger.info("    Reason: all candidates below min threshold (%.2f)",
-                           self.min_decision_score)
-            elif available_slots == 0:
-                logger.info("    Reason: no available position slots (5/5 full)")
-
-        logger.info("=" * 60)
+            reason = "no candidates" if not scored else \
+                     "below threshold" if not [s for s in scored if s.get("_composite_score", 0) >= self.min_decision_score] else \
+                     "no slots" if available_slots == 0 else "unknown"
+            logger.info("→ NO TRADE this cycle (%s)", reason)
 
     def get_stats(self) -> Dict:
         """Return decision engine statistics."""

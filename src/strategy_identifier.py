@@ -93,7 +93,8 @@ class StrategyIdentifier:
         # Score and rank the identified strategies
         strategies.sort(key=lambda s: s.get("confidence", 0), reverse=True)
 
-        logger.info(f"Identified {len(strategies)} strategies for trader {address[:10]}")
+        if strategies:
+            logger.debug(f"Identified {len(strategies)} strategies for trader {address[:10]}")
         return strategies
 
     def _detect_momentum(self, positions, pos_analysis, trade_analysis, address) -> Optional[Dict]:

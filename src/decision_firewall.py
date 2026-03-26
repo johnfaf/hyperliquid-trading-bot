@@ -48,7 +48,9 @@ class DecisionFirewall:
         # Portfolio-level aggregate exposure limit
         # With 2000 traders scanned and golden wallets auto-connected,
         # we need a hard cap on total notional exposure across ALL positions
-        self.max_aggregate_exposure_pct = cfg.get("max_aggregate_exposure", 0.30)  # 30% of balance
+        # Exposure cap: 8% position × 5x leverage = 40% notional per trade.
+        # Two concurrent trades = 80%.  60% cap allows 1–2 leveraged positions.
+        self.max_aggregate_exposure_pct = cfg.get("max_aggregate_exposure", 0.60)  # 60% of balance
 
         # State tracking
         self._recent_trades: Dict[str, float] = {}  # coin → last trade timestamp
