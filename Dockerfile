@@ -9,11 +9,13 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application code
 COPY . .
 
-# Create data directory for SQLite
-RUN mkdir -p /app/data /app/logs /app/reports
+# Create data directories for SQLite
+# /data is the Railway persistent volume mount point — must exist and be
+# owned by botuser so the app can write to it once the volume is attached.
+RUN mkdir -p /app/data /app/logs /app/reports /data
 
 # Non-root user for security
-RUN useradd -m botuser && chown -R botuser:botuser /app
+RUN useradd -m botuser && chown -R botuser:botuser /app /data
 USER botuser
 
 # Health check — hits the /api/health endpoint
