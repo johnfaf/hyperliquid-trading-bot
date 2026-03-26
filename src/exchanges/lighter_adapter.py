@@ -222,13 +222,24 @@ class LighterAdapter(BaseExchangeAdapter):
         self._symbol_map = {}
         self._reverse_symbol_map = {}
 
+        # Debug: log sample market entry keys so we can adapt parsing
+        if markets and len(markets) > 0:
+            sample = markets[0]
+            logger.debug(f"Lighter: sample market entry keys={list(sample.keys()) if isinstance(sample, dict) else type(sample).__name__}")
+
         for m in markets:
-            # Lighter uses order_book_index as the market ID
+            if not isinstance(m, dict):
+                continue
+
+            # Lighter uses order_book_index as the market ID — try many field names
             market_id = str(
                 m.get("order_book_index",
                        m.get("orderBookIndex",
                               m.get("id",
-                                     m.get("order_book_id", ""))))
+                                     m.get("order_book_id",
+                                            m.get("orderBookId",
+                                                   m.get("market_id",
+                                                          m.get("marketId", "")))))))
             )
 
             # Symbol extraction — try various field names
@@ -236,12 +247,29 @@ class LighterAdapter(BaseExchangeAdapter):
                 m.get("symbol", "") or
                 m.get("base_token", "") or
                 m.get("baseToken", "") or
+                m.get("base_symbol", "") or
+                m.get("baseSymbol", "") or
+                m.get("base_currency", "") or
+                m.get("baseCurrency", "") or
                 m.get("name", "") or
-                m.get("ticker", "")
+                m.get("ticker", "") or
+                m.get("pair", "") or
+                m.get("market", "")
             )
+
+            # If symbol still empty, try to construct from quote/base fields
+            if not symbol:
+                base = m.get("base", m.get("baseAsset", ""))
+                quote = m.get("quote", m.get("quoteAsset", ""))
+                if base:
+                    symbol = base
 
             # Clean symbol to canonical form
             coin = self.normalize_coin_symbol(symbol)
+
+            # If market_id is empty, use index as fallback
+            if not market_id and coin:
+                market_id = str(markets.index(m))
 
             if market_id and coin and coin != "":
                 self._market_cache[market_id] = m
@@ -256,9 +284,14 @@ class LighterAdapter(BaseExchangeAdapter):
                        f"{list(self._symbol_map.values())[:10]}")
         else:
             self.state = VenueState.DEGRADED
-            logger.warning(f"Lighter: API responded but parsed 0 markets. "
+            # Enhanced debug: log first market entry to diagnose field name mismatch
+            sample_keys = []
+            if markets and len(markets) > 0 and isinstance(markets[0], dict):
+                sample_keys = list(markets[0].keys())
+            logger.warning(f"Lighter: API responded with {len(markets)} markets but parsed 0. "
                           f"Response type={type(data).__name__}, "
-                          f"keys={list(data.keys()) if isinstance(data, dict) else 'list'}")
+                          f"keys={list(data.keys()) if isinstance(data, dict) else 'list'}, "
+                          f"sample_market_keys={sample_keys}")
 
     def _resolve_account_index(self, address: str) -> Optional[int]:
         """

@@ -164,8 +164,8 @@ def download_fills_90d(address: str) -> List[Dict]:
         time.sleep(REQUEST_SLEEP)
 
     all_fills.sort(key=lambda f: f["time"])
-    logger.info(f"Downloaded {len(all_fills)} fills for {address[:10]}... "
-                f"(span: {LOOKBACK_DAYS}d window)")
+    logger.debug(f"Downloaded {len(all_fills)} fills for {address[:10]}... "
+                 f"(span: {LOOKBACK_DAYS}d window)")
     return all_fills
 
 
@@ -328,13 +328,13 @@ def evaluate_wallet(address: str, bot_score: int = 0) -> Optional[Tuple[WalletRe
     """
     fills = download_fills_90d(address)
     if len(fills) < MIN_FILLS_FOR_EVAL:
-        logger.info(f"Skipping {address[:10]}: only {len(fills)} fills (need {MIN_FILLS_FOR_EVAL})")
+        logger.debug(f"Skipping {address[:10]}: only {len(fills)} fills (need {MIN_FILLS_FOR_EVAL})")
         return None
 
     # Hard cap: >3000 fills in 90 days = not a human trader
     if len(fills) > MAX_FILLS_FOR_EVAL:
-        logger.info(f"Skipping {address[:10]}: {len(fills)} fills exceeds "
-                     f"{MAX_FILLS_FOR_EVAL} cap (not human-like)")
+        logger.debug(f"Skipping {address[:10]}: {len(fills)} fills exceeds "
+                      f"{MAX_FILLS_FOR_EVAL} cap (not human-like)")
         return None
 
     penalised = apply_execution_penalties(fills)
@@ -538,7 +538,7 @@ def save_wallet_fills(address: str, penalised_fills: List[PenalisedFill]):
                 f.direction,
             ))
         conn.commit()
-        logger.info(f"Saved {len(penalised_fills)} fills for {address[:10]}")
+        logger.debug(f"Saved {len(penalised_fills)} fills for {address[:10]}")
     finally:
         conn.close()
 
@@ -625,7 +625,7 @@ def run_golden_scan(max_wallets: int = 50) -> Dict:
 
     rate_limit_hits = 0
     for i, w in enumerate(wallets):
-        logger.info(f"[{i+1}/{len(wallets)}] Evaluating {w['address'][:10]}...")
+        logger.debug(f"[{i+1}/{len(wallets)}] Evaluating {w['address'][:10]}...")
         try:
             result = evaluate_wallet(w["address"], w.get("bot_score", 0))
             if result:
@@ -667,7 +667,7 @@ def run_golden_scan(max_wallets: int = 50) -> Dict:
     logger.info(f"Golden scan complete: {golden_count}/{len(results)} wallets are golden")
     for r in results:
         if r.is_golden:
-            logger.info(f"  ★ {r.address[:10]}: penalised PnL=${r.penalised_pnl:+,.0f}, "
-                        f"Sharpe={r.sharpe_ratio:.2f}, DD={r.penalised_max_drawdown_pct:.1f}%")
+            logger.debug(f"  ★ {r.address[:10]}: penalised PnL=${r.penalised_pnl:+,.0f}, "
+                         f"Sharpe={r.sharpe_ratio:.2f}, DD={r.penalised_max_drawdown_pct:.1f}%")
 
     return summary

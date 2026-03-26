@@ -211,7 +211,7 @@ class CopyTrader:
                             trade_signal, regime_data=regime_data, open_positions=open_trades
                         )
                         if not passed:
-                            logger.info(f"Firewall rejected copy {signal['side']} {signal['coin']}: {reason}")
+                            logger.debug(f"Firewall rejected copy {signal['side']} {signal['coin']}: {reason}")
                             continue
 
                         # Record signal with agent scorer

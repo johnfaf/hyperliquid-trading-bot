@@ -306,8 +306,8 @@ class SignalProcessor:
 
             # We have a conflict — resolve it
             if self.conflict_resolution == "block_both":
-                logger.info(f"Conflict: blocking ALL signals for {coin} "
-                           f"(long+short both present)")
+                logger.debug(f"Conflict: blocking ALL signals for {coin} "
+                            f"(long+short both present)")
                 continue
 
             elif self.conflict_resolution == "regime_aligned":
@@ -331,8 +331,8 @@ class SignalProcessor:
                         s.get("strategy_type", s.get("type", "")), s) == favored]
                     dropped = len(sigs) - len(kept)
                     if dropped > 0:
-                        logger.info(f"Conflict resolved for {coin}: keeping {favored} "
-                                   f"(regime={regime}), dropped {dropped} opposing signals")
+                        logger.debug(f"Conflict resolved for {coin}: keeping {favored} "
+                                    f"(regime={regime}), dropped {dropped} opposing signals")
                     resolved.extend(kept)
                 else:
                     # No clear regime — use higher confidence fallback
@@ -341,8 +341,8 @@ class SignalProcessor:
                         best.get("strategy_type", best.get("type", "")), best)
                     kept = [s for s in sigs if self._infer_direction(
                         s.get("strategy_type", s.get("type", "")), s) == best_dir]
-                    logger.info(f"Conflict resolved for {coin}: keeping {best_dir} "
-                               f"(highest confidence in ambiguous regime)")
+                    logger.debug(f"Conflict resolved for {coin}: keeping {best_dir} "
+                                f"(highest confidence in ambiguous regime)")
                     resolved.extend(kept)
 
             elif self.conflict_resolution == "higher_confidence":
@@ -351,8 +351,8 @@ class SignalProcessor:
                     best.get("strategy_type", best.get("type", "")), best)
                 kept = [s for s in sigs if self._infer_direction(
                     s.get("strategy_type", s.get("type", "")), s) == best_dir]
-                logger.info(f"Conflict resolved for {coin}: keeping {best_dir} "
-                           f"(higher confidence)")
+                logger.debug(f"Conflict resolved for {coin}: keeping {best_dir} "
+                            f"(higher confidence)")
                 resolved.extend(kept)
 
         # Add back strategies without specific coins

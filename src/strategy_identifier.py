@@ -448,8 +448,8 @@ class StrategyIdentifier:
             # Log with trader address for traceability
             for strat, sid in zip(qualified, saved_ids):
                 addr = strat.get("trader_address", "unknown")[:10]
-                logger.info(f"Saved strategy for {addr}...: {strat['type']} "
-                           f"(confidence: {strat['confidence']:.2f})")
+                logger.debug(f"Saved strategy for {addr}...: {strat['type']} "
+                            f"(confidence: {strat['confidence']:.2f})")
 
             logger.info(f"Batch saved {len(saved_ids)} strategies "
                        f"({discarded} discarded, {len(strategies)} total input)")

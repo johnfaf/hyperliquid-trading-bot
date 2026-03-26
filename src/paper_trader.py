@@ -198,8 +198,8 @@ class PaperTrader:
                             signal["coin"], signal["side"]
                         )
                         if not confirmed:
-                            logger.info(f"Volume rejects {signal['side']} {signal['coin']} "
-                                       f"(confidence={vol_confidence:.2f})")
+                            logger.debug(f"Volume rejects {signal['side']} {signal['coin']} "
+                                        f"(confidence={vol_confidence:.2f})")
                             continue
                         signal["confidence"] = signal.get("confidence", 0.5) * (0.5 + vol_confidence * 0.5)
                         signal["volume_confirmed"] = True
@@ -215,7 +215,7 @@ class PaperTrader:
                                 boost = 1.0 + flow_signal["confidence"] * 0.3
                                 signal["confidence"] = min(signal.get("confidence", 0.5) * boost, 1.0)
                                 signal["options_flow_aligned"] = True
-                                logger.info(f"Options flow confirms {signal['side']} {signal['coin']}")
+                                logger.debug(f"Options flow confirms {signal['side']} {signal['coin']}")
                             else:
                                 signal["confidence"] = signal.get("confidence", 0.5) * 0.7
                                 signal["options_flow_aligned"] = False
@@ -275,14 +275,14 @@ class PaperTrader:
                         open_positions=open_trades,
                     )
                     if not passed:
-                        logger.info(f"Firewall rejected {sig['side']} {sig['coin']}: {reason}")
+                        logger.debug(f"Firewall rejected {sig['side']} {sig['coin']}: {reason}")
                         continue
-                    logger.info(f"Firewall approved {sig['side']} {sig['coin']} "
-                               f"(confidence={trade_signal.confidence:.0%})")
+                    logger.debug(f"Firewall approved {sig['side']} {sig['coin']} "
+                                f"(confidence={trade_signal.confidence:.0%})")
                 else:
                     # Legacy fallback
                     if not self._check_risk_limits(account, sig, open_trades):
-                        logger.info(f"Risk limit hit, skipping {sig['coin']}")
+                        logger.debug(f"Risk limit hit, skipping {sig['coin']}")
                         continue
 
                 # Arena consensus vote (multi-agent debate)
@@ -293,7 +293,7 @@ class PaperTrader:
                             trade_signal, features=feature_ctx
                         )
                         if not approved:
-                            logger.info(f"Arena consensus REJECTED {sig['side']} {sig['coin']}")
+                            logger.debug(f"Arena consensus REJECTED {sig['side']} {sig['coin']}")
                             continue
                         # Use consensus-adjusted confidence
                         trade_signal.confidence = consensus_conf
@@ -324,7 +324,7 @@ class PaperTrader:
                             top_k=8,
                         )
                         if memory_result.recommendation == "avoid":
-                            logger.info(f"Memory BLOCKED {sig['side']} {sig['coin']}: {memory_result.reason}")
+                            logger.debug(f"Memory BLOCKED {sig['side']} {sig['coin']}: {memory_result.reason}")
                             continue
                         elif memory_result.recommendation == "caution":
                             trade_signal.confidence *= 0.8
@@ -344,7 +344,7 @@ class PaperTrader:
                         }
                         llm_approved, llm_conf, llm_reason = self.llm_filter.filter(sig, llm_context)
                         if not llm_approved:
-                            logger.info(f"LLM filter BLOCKED {sig['side']} {sig['coin']}: {llm_reason}")
+                            logger.debug(f"LLM filter BLOCKED {sig['side']} {sig['coin']}: {llm_reason}")
                             continue
                         trade_signal.confidence = llm_conf
                     except Exception as e:
@@ -504,19 +504,19 @@ class PaperTrader:
         # CRITICAL: No conflicting sides on same asset (no long+short on same coin)
         for t in open_trades:
             if t["coin"] == signal["coin"] and t.get("side") != signal["side"]:
-                logger.info(f"Risk: conflicting side for {signal['coin']} "
-                           f"(have {t.get('side')}, want {signal['side']})")
+                logger.debug(f"Risk: conflicting side for {signal['coin']} "
+                            f"(have {t.get('side')}, want {signal['side']})")
                 return False
 
         # Max position count — allow up to 20 simultaneous positions
         if len(open_trades) >= 20:
-            logger.info(f"Risk: max positions ({len(open_trades)}/20)")
+            logger.debug(f"Risk: max positions ({len(open_trades)}/20)")
             return False
 
         # Max positions per coin — allow up to 3 per coin (same direction only)
         coin_positions = sum(1 for t in open_trades if t["coin"] == signal["coin"])
         if coin_positions >= 3:
-            logger.info(f"Risk: max positions for {signal['coin']} ({coin_positions}/3)")
+            logger.debug(f"Risk: max positions for {signal['coin']} ({coin_positions}/3)")
             return False
 
         # Max exposure per coin — 50% of balance
@@ -527,7 +527,7 @@ class PaperTrader:
         max_coin_exposure = account["balance"] * 0.50
         new_exposure = signal["size"] * signal["price"] * signal["leverage"]
         if coin_exposure + new_exposure > max_coin_exposure:
-            logger.info(f"Risk: coin exposure for {signal['coin']} ${coin_exposure+new_exposure:,.0f} > ${max_coin_exposure:,.0f}")
+            logger.debug(f"Risk: coin exposure for {signal['coin']} ${coin_exposure+new_exposure:,.0f} > ${max_coin_exposure:,.0f}")
             return False
 
         # Max total exposure — 500% of balance (leveraged)
@@ -650,6 +650,9 @@ class PaperTrader:
             entry = trade["entry_price"]
             leverage = trade.get("leverage", 1)
             sl = trade["stop_loss"]
+
+            if not entry or entry <= 0:
+                continue
 
             if trade["side"] == "long":
                 move_pct = (current_price - entry) / entry

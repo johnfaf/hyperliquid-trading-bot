@@ -325,14 +325,16 @@ class HyperliquidResearchBot:
                 if tg.is_configured() and self.options_scanner.top_convictions:
                     for conv in self.options_scanner.top_convictions[:3]:
                         if conv.get("conviction_pct", 0) > 60:
-                            tg.notify_strong_signal({
-                                "source": "options_flow",
-                                "ticker": conv["ticker"],
-                                "direction": conv["direction"],
-                                "net_flow": conv["net_flow"],
-                                "prints": conv["total_prints"],
-                                "conviction": conv["conviction_pct"],
-                            })
+                            tg.notify_strong_signal(
+                                coin=conv["ticker"],
+                                side=conv["direction"],
+                                reasons=[
+                                    f"Options flow: {conv.get('total_prints', 0)} unusual prints",
+                                    f"Net flow: ${conv.get('net_flow', 0):,.0f}",
+                                    f"Conviction: {conv.get('conviction_pct', 0):.0f}%",
+                                ],
+                                confidence=conv.get("conviction_pct", 0) / 100.0,
+                            )
             except Exception as e:
                 self.logger.warning(f"  Options flow scan error: {e}")
 

@@ -114,7 +114,13 @@ class MultiExchangeScanner:
                 logger.warning(f"Failed to init Lighter adapter: {e}")
 
     def _get_healthy_adapters(self) -> Dict[str, BaseExchangeAdapter]:
-        """Return only adapters whose venue is healthy (or has no state tracking)."""
+        """Return adapters that are usable (healthy or degraded).
+
+        DEGRADED venues still have API connectivity — they may just have
+        incomplete market data. They can still provide useful cross-venue
+        signals (funding rates, volume, etc.) even with partial data.
+        Only DOWN venues are excluded entirely.
+        """
         healthy = {}
         for name, adapter in self.adapters.items():
             # Check if adapter has state tracking (Lighter does, HL doesn't yet)
@@ -124,6 +130,11 @@ class MultiExchangeScanner:
             elif state == VenueState.INITIALIZED:
                 # Not yet checked — include it, health check will update
                 healthy[name] = adapter
+            elif state == VenueState.DEGRADED:
+                # Degraded = API is reachable but incomplete data
+                # Still include for cross-venue confirmation (partial is better than none)
+                healthy[name] = adapter
+                logger.debug(f"Including {name} (degraded) for cross-venue — partial data available")
             else:
                 logger.debug(f"Skipping {name} — state={state.value}")
         return healthy

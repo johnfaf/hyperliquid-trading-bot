@@ -547,13 +547,17 @@ class OptionsFlowScanner:
         """
         with self._lock:
             for conv in self.top_convictions:
-                if conv["ticker"] == ticker and conv["conviction_pct"] > 60:
-                    return {
-                        "ticker": ticker,
-                        "side": "long" if conv["direction"] == "BULLISH" else "short",
-                        "confidence": conv["conviction_pct"] / 100,
-                        "net_flow": conv["net_flow"],
-                        "total_prints": conv["total_prints"],
-                        "source": "options_flow",
-                    }
+                try:
+                    if conv.get("ticker") == ticker and conv.get("conviction_pct", 0) > 60:
+                        return {
+                            "ticker": ticker,
+                            "side": "long" if conv.get("direction") == "BULLISH" else "short",
+                            "confidence": conv.get("conviction_pct", 0) / 100,
+                            "net_flow": conv.get("net_flow", 0),
+                            "total_prints": conv.get("total_prints", 0),
+                            "source": "options_flow",
+                        }
+                except (KeyError, TypeError) as e:
+                    logger.debug(f"Options flow signal parse error: {e}")
+                    continue
         return None

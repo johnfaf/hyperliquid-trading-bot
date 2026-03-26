@@ -182,9 +182,9 @@ class RegimeDetector:
         # Keep last 100 regime states per coin
         self._history[coin] = self._history[coin][-100:]
 
-        logger.info(f"Regime {coin}: {regime.value} (confidence={confidence:.0%}, "
-                    f"ADX={adx:.1f}, ATR%={atr_pct:.2%}, vol_ratio={volume_ratio:.1f}x, "
-                    f"trend={trend_dir:+.3f}, momentum={momentum:+.3f})")
+        logger.debug(f"Regime {coin}: {regime.value} (confidence={confidence:.0%}, "
+                     f"ADX={adx:.1f}, ATR%={atr_pct:.2%}, vol_ratio={volume_ratio:.1f}x, "
+                     f"trend={trend_dir:+.3f}, momentum={momentum:+.3f})")
 
         return state
 
