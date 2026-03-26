@@ -478,9 +478,9 @@ def backup_to_json(filepath: str = None):
     so it persists across container restarts.
     """
     if filepath is None:
-        # On Railway: use /data/ persistent volume so backup survives redeploys
-        is_railway = bool(os.environ.get("RAILWAY_ENVIRONMENT") or os.environ.get("RAILWAY_SERVICE_ID"))
-        if is_railway:
+        # Check if /data volume exists on disk (Railway persistent volume)
+        has_volume = os.path.isdir("/data")
+        if has_volume:
             default_path = "/data/bot_backup.json"
         else:
             default_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -556,8 +556,9 @@ def restore_from_json(filepath: str = None):
     survives Railway redeploys without a full re-scan.
     """
     if filepath is None:
-        is_railway = bool(os.environ.get("RAILWAY_ENVIRONMENT") or os.environ.get("RAILWAY_SERVICE_ID"))
-        if is_railway:
+        # Check if /data volume exists on disk (Railway persistent volume)
+        has_volume = os.path.isdir("/data")
+        if has_volume:
             default_path = "/data/bot_backup.json"
         else:
             default_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),

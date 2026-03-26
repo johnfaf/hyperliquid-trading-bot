@@ -11,8 +11,9 @@ HYPERLIQUID_INFO_URL = f"{HYPERLIQUID_API_URL}/info"
 # Use environment variable or default to local data/ directory
 # On Railway: uses /data/ (persistent volume) so DB survives redeploys
 # Override with: export HL_BOT_DB=/path/to/bot.db
-_IS_RAILWAY = bool(os.environ.get("RAILWAY_ENVIRONMENT") or os.environ.get("RAILWAY_SERVICE_ID"))
-if _IS_RAILWAY:
+# Detection: check if /data volume actually exists on disk (more reliable than env vars)
+_HAS_PERSISTENT_VOLUME = os.path.isdir("/data")
+if _HAS_PERSISTENT_VOLUME:
     _DEFAULT_DB = "/data/bot.db"
 else:
     _DEFAULT_DB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "bot.db")

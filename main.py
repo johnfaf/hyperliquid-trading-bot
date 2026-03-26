@@ -1125,6 +1125,10 @@ def main():
 
     logger = setup_logging()
 
+    # Log persistence paths so we can verify in Railway logs
+    import config as _cfg
+    logger.info(f"[PERSISTENCE] Volume detected: {_cfg._HAS_PERSISTENT_VOLUME}, DB_PATH: {_cfg.DB_PATH}")
+
     if args.bootstrap:
         bootstrap_seed_data(logger, days=args.bootstrap_days)
         return
