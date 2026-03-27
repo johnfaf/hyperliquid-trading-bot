@@ -466,15 +466,17 @@ class PaperTrader:
 
         if pre_decided in ("long", "short"):
             side = pre_decided
-        elif strategy_type in ("momentum_long", "trend_following", "breakout"):
+        elif strategy_type == "momentum_long":
             side = "long"
         elif strategy_type in ("momentum_short", "contrarian"):
             side = "short"
         elif strategy_type == "funding_arb":
             side = "short"  # Typically short to earn positive funding
         else:
-            # concentrated_bet, mean_reversion, scalping, swing_trading, delta_neutral, etc.
-            # — follow regime when confident, else use stored param
+            # breakout, trend_following, swing_trading, concentrated_bet,
+            # mean_reversion, scalping, delta_neutral, etc.
+            # — follow regime when confident (e.g. downside breakout = short in trending_down),
+            # else use stored param
             side = params.get("direction") or regime_default
 
         # Determine leverage (capped by config)

@@ -44,15 +44,15 @@ REGIME_COMPATIBILITY = {
     },
     "trending_down": {
         "momentum_short": 1.0,        # Perfect match
-        "trend_following": 0.9,       # Excellent
-        "breakout": 0.7,              # Good but less reliable than up
-        "swing_trading": 0.6,         # Decent
-        "concentrated_bet": 0.5,      # Moderate
-        "mean_reversion": 0.2,        # Counter-trend = risky
-        "momentum_long": 0.1,         # Wrong direction
-        "delta_neutral": 0.5,         # Neutral
-        "funding_arb": 0.6,           # Can work
-        "scalping": 0.5,              # Neutral
+        "trend_following": 0.9,       # Excellent (follow the downtrend = short)
+        "breakout": 0.7,              # Downside breakout = short
+        "scalping": 0.4,              # Neutral-ish
+        "mean_reversion": 0.2,        # Counter-trend = risky in strong downtrend
+        "momentum_long": 0.05,        # Wrong direction — pause
+        "swing_trading": 0.1,         # Pause — no clear long bias
+        "concentrated_bet": 0.1,      # Pause — no directional edge defined
+        "delta_neutral": 0.1,         # Pause — not useful in directional market
+        "funding_arb": 0.15,          # Pause — funding direction uncertain
     },
     "ranging": {
         "mean_reversion": 1.0,        # Perfect match
@@ -170,8 +170,9 @@ class RegimeStrategyFilter:
         # Re-score each strategy
         adjusted_strategies = []
         for strat in strategies:
-            strat_type = strat.get("type", "unknown")
-            base_score = strat.get("score", 0.5)
+            # Accept both "strategy_type" (DB field) and "type" (legacy field)
+            strat_type = (strat.get("strategy_type") or strat.get("type") or "unknown")
+            base_score = strat.get("current_score", strat.get("score", 0.5))
 
             # Get compatibility for this strategy in this regime
             compatibility = self._get_compatibility(strat_type, regime_name)
@@ -323,8 +324,8 @@ class RegimeStrategyFilter:
         lines.append(f"  Top Strategies ({len(filtered)} total):")
 
         for i, strat in enumerate(filtered[:3], 1):
-            stype = strat.get("type", "unknown")
-            base_score = strat.get("score", 0)
+            stype = strat.get("strategy_type") or strat.get("type") or "unknown"
+            base_score = strat.get("current_score", strat.get("score", 0))
             adj_score = strat.get("adjusted_score", 0)
             compat = strat.get("regime_compatibility", 0)
             lines.append(
@@ -337,7 +338,7 @@ class RegimeStrategyFilter:
         if worst:
             lines.append(f"  Low Compatibility (avoid):")
             for strat in worst[:3]:
-                stype = strat.get("type", "unknown")
+                stype = strat.get("strategy_type") or strat.get("type") or "unknown"
                 adj_score = strat.get("adjusted_score", 0)
                 compat = strat.get("regime_compatibility", 0)
                 lines.append(f"    - {stype}: {adj_score:.2f} (compatibility={compat:.2f})")

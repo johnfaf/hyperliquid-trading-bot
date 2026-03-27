@@ -254,11 +254,14 @@ class DecisionEngine:
         # Store for logging
         strategy["_decision_coin"] = target_coin
 
-        # Infer direction — regime-aware for ambiguous types
-        long_types  = {"momentum_long", "trend_following", "breakout", "swing_trading"}
+        # Infer direction — regime-aware for all non-explicitly-directional types
+        # Only momentum_long/short are unconditionally directional.
+        # breakout, trend_following, swing_trading follow the dominant trend direction
+        # (downside breakout = short in trending_down; upside breakout = long in trending_up).
+        long_types  = {"momentum_long"}
         short_types = {"momentum_short", "contrarian"}
 
-        # Derive regime direction bias (used as default for undirected strategies)
+        # Derive regime direction bias (default for all non-explicit strategies)
         overall_regime = (regime_data or {}).get("overall_regime", "unknown")
         regime_conf    = (regime_data or {}).get("overall_confidence", 0.0)
         if overall_regime == "trending_down" and regime_conf >= 0.6:
@@ -273,8 +276,9 @@ class DecisionEngine:
         elif strategy_type in short_types:
             direction = "short"
         else:
-            # concentrated_bet, mean_reversion, scalping, funding_arb, delta_neutral, etc.
-            # — follow the regime when it's confident, else use stored param
+            # breakout, trend_following, swing_trading, concentrated_bet,
+            # mean_reversion, scalping, funding_arb, delta_neutral, etc.
+            # — follow the regime when confident, else use stored param
             direction = params.get("direction") or regime_default
         strategy["_decision_side"] = direction
 
