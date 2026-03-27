@@ -150,8 +150,19 @@ class RegimeStrategyFilter:
         if not strategies or not regime:
             return strategies
 
-        regime_name = regime.get("regime", "unknown")
-        regime_confidence = regime.get("confidence", 0.5)
+        # Detector outputs "overall_regime" / "overall_confidence" at market level.
+        # Accept both key names so the filter works whether it receives a per-coin
+        # RegimeState dict OR the market-level summary dict from get_market_regime().
+        regime_name = (
+            regime.get("overall_regime")
+            or regime.get("regime")
+            or "unknown"
+        )
+        regime_confidence = (
+            regime.get("overall_confidence")
+            or regime.get("confidence")
+            or 0.5
+        )
 
         # Get regime strength (how strong is this regime signal?)
         regime_strength = self._get_regime_strength(regime)
@@ -227,11 +238,24 @@ class RegimeStrategyFilter:
         Returns:
             Strength 0-1 (0=very weak, 1=very strong)
         """
-        regime_name = regime.get("regime", "unknown")
-        reported_confidence = regime.get("confidence", 0.5)
+        # Accept both market-level and per-coin dicts
+        regime_name = (
+            regime.get("overall_regime")
+            or regime.get("regime")
+            or "unknown"
+        )
+        reported_confidence = (
+            regime.get("overall_confidence")
+            or regime.get("confidence")
+            or 0.5
+        )
 
-        # For trending regimes, ADX is the key signal
+        # ADX lives in per-coin dict; for market-level dict extract BTC's ADX
         adx = regime.get("adx", 0)
+        if adx == 0:
+            per_coin = regime.get("per_coin", {})
+            btc_state = per_coin.get("BTC", per_coin.get("ETH", {}))
+            adx = btc_state.get("adx", 0) if isinstance(btc_state, dict) else 0
         if regime_name in ("trending_up", "trending_down"):
             # ADX: 0-25 = no trend, 25-50 = strong trend, >50 = very strong
             if adx >= 50:
@@ -266,11 +290,28 @@ class RegimeStrategyFilter:
         if not strategies or not regime:
             return "No strategies or regime data to report"
 
-        regime_name = regime.get("regime", "unknown")
+        regime_name = (
+            regime.get("overall_regime")
+            or regime.get("regime")
+            or "unknown"
+        )
         regime_strength = self._get_regime_strength(regime)
+        # ADX — try per-coin BTC first for market-level dicts
         adx = regime.get("adx", 0)
+        if adx == 0:
+            per_coin = regime.get("per_coin", {})
+            btc_state = per_coin.get("BTC", per_coin.get("ETH", {}))
+            adx = btc_state.get("adx", 0) if isinstance(btc_state, dict) else 0
         atr_pct = regime.get("atr_pct", 0)
-        confidence = regime.get("confidence", 0)
+        if atr_pct == 0:
+            per_coin = regime.get("per_coin", {})
+            btc_state = per_coin.get("BTC", per_coin.get("ETH", {}))
+            atr_pct = btc_state.get("atr_pct", 0) if isinstance(btc_state, dict) else 0
+        confidence = (
+            regime.get("overall_confidence")
+            or regime.get("confidence")
+            or 0
+        )
 
         lines = [
             f"Regime Report: {regime_name}",
