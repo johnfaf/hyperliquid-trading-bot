@@ -453,7 +453,7 @@ class TraderDiscovery:
         # Profit factor
         gross_profit = sum(p for p in closed_pnls if p > 0)
         gross_loss = abs(sum(p for p in closed_pnls if p < 0))
-        profit_factor = gross_profit / gross_loss if gross_loss > 0 else float('inf')
+        profit_factor = min(gross_profit / gross_loss, 999.0) if gross_loss > 0 else 999.0
 
         # Coins traded
         coins = list(set(f["coin"] for f in fills))

@@ -84,6 +84,7 @@ class AgentScorer:
                     total_signals INTEGER DEFAULT 0,
                     correct_signals INTEGER DEFAULT 0,
                     total_pnl REAL DEFAULT 0,
+                    total_return REAL DEFAULT 0,
                     accuracy REAL DEFAULT 0,
                     sharpe REAL DEFAULT 0,
                     dynamic_weight REAL DEFAULT 0.5,
@@ -91,6 +92,11 @@ class AgentScorer:
                     last_updated TEXT
                 )
             """)
+            # Safe migration: add total_return column if missing
+            try:
+                conn.execute("ALTER TABLE agent_scores ADD COLUMN total_return REAL DEFAULT 0")
+            except Exception:
+                pass  # Column already exists
             conn.commit()
 
             rows = conn.execute("SELECT * FROM agent_scores").fetchall()
@@ -101,6 +107,7 @@ class AgentScorer:
                     total_signals=row["total_signals"],
                     correct_signals=row["correct_signals"],
                     total_pnl=row["total_pnl"],
+                    total_return=row.get("total_return", 0) or 0,
                     accuracy=row["accuracy"],
                     sharpe=row["sharpe"],
                     dynamic_weight=row["dynamic_weight"],
@@ -134,10 +141,10 @@ class AgentScorer:
             conn.execute("""
                 INSERT OR REPLACE INTO agent_scores
                 (source_key, total_signals, correct_signals, total_pnl,
-                 accuracy, sharpe, dynamic_weight, trade_history, last_updated)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 total_return, accuracy, sharpe, dynamic_weight, trade_history, last_updated)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (source_key, score.total_signals, score.correct_signals,
-                  score.total_pnl, score.accuracy, score.sharpe,
+                  score.total_pnl, score.total_return, score.accuracy, score.sharpe,
                   score.dynamic_weight, history_json,
                   datetime.utcnow().isoformat()))
             conn.commit()

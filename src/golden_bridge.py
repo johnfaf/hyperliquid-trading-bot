@@ -148,7 +148,7 @@ def get_golden_copy_signals(mids: Optional[Dict] = None) -> List[Dict]:
                     continue
 
                 # Base confidence from backtest win rate + golden boost
-                base_conf = min(0.9, 0.5 + wallet.get("win_rate", 50) / 100 * 0.4)
+                base_conf = min(0.9, 0.5 + float(wallet.get("win_rate", 50) or 50) / 100 * 0.4)
                 boosted_conf = min(0.95, base_conf + GOLDEN_CONFIDENCE_BOOST)
 
                 signals.append({

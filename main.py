@@ -461,11 +461,12 @@ class HyperliquidResearchBot:
                 self.logger.warning(f"  Multi-exchange scanner error: {e}")
 
             # Phase 3f: Liquidation Cascade Reversal Strategy
-            self.logger.info("Phase 3e: Liquidation Strategy Scan")
+            self.logger.info("Phase 3f: Liquidation Strategy Scan")
             lcrs_signals = []
+            # Fetch mids once at a scope visible to both LCRS and Options Flow phases
+            from src import hyperliquid_client as hl_client
+            mids = hl_client.get_all_mids() or {}
             try:
-                from src import hyperliquid_client as hl_client
-                mids = hl_client.get_all_mids() or {}
                 lcrs_coins = ["BTC", "ETH", "SOL", "DOGE", "AVAX", "LINK", "ARB",
                               "OP", "SUI", "APT", "INJ", "SEI"]
 

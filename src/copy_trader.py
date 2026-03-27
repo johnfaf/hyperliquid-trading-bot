@@ -356,7 +356,7 @@ class CopyTrader:
                 )
 
                 # V2: Feed outcome to agent scorer and firewall
-                return_pct = pnl / (trade["entry_price"] * trade["size"] * trade["leverage"]) if trade["entry_price"] > 0 else 0
+                return_pct = pnl / max(trade["entry_price"] * max(trade["size"], 1e-8) * max(trade.get("leverage", 1), 1), 1e-8)
                 source_key = f"copy_trade:{meta.get('source_trader', 'unknown')}"
 
                 if self.agent_scorer and meta.get("source_trader"):

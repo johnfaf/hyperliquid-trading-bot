@@ -162,7 +162,7 @@ class PaperTrader:
                     continue
 
                 # Generate signal from strategy
-                signal = self._generate_signal(strategy, mids)
+                signal = self._generate_signal(strategy, mids, regime_data=regime_data)
                 if not signal:
                     continue
 
@@ -391,7 +391,8 @@ class PaperTrader:
 
         return executed
 
-    def _generate_signal(self, strategy: Dict, mids: Dict) -> Optional[Dict]:
+    def _generate_signal(self, strategy: Dict, mids: Dict,
+                         regime_data: Optional[Dict] = None) -> Optional[Dict]:
         """
         Generate a trading signal from a strategy.
         Maps strategy types to concrete trade parameters.
@@ -451,7 +452,7 @@ class PaperTrader:
 
         # Determine direction — regime-aware for ambiguous types.
         # Use pre-computed side from decision engine when available.
-        pre_decided = signal.get("side", signal.get("_decision_side", ""))
+        pre_decided = strategy.get("side", strategy.get("_decision_side", ""))
 
         # Regime direction bias: when regime is confident use it as the default
         # for undirected strategies instead of blindly defaulting to "long".
@@ -758,7 +759,7 @@ class PaperTrader:
                 if self.agent_scorer:
                     try:
                         source_key = f"strategy:{strategy_type}"
-                        return_pct = pnl / (trade["entry_price"] * trade["size"] * trade["leverage"]) if trade["entry_price"] > 0 else 0
+                        return_pct = pnl / max(trade["entry_price"] * max(trade["size"], 1e-8) * max(trade.get("leverage", 1), 1), 1e-8)
                         self.agent_scorer.record_outcome(source_key, signal_id, pnl, return_pct)
                     except Exception as e:
                         logger.debug(f"Agent scorer outcome error: {e}")

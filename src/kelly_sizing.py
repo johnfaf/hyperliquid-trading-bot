@@ -239,7 +239,7 @@ class KellySizer:
                 "total_pnl": round(total_pnl, 2),
                 "has_edge": self.calculate_kelly(
                     wins / n,
-                    sum(abs(o["return_pct"]) for o in outcomes if o["win"]) / max(wins, 1) /
+                    (sum(abs(o["return_pct"]) for o in outcomes if o["win"]) / max(wins, 1)) /
                     max(sum(abs(o["return_pct"]) for o in outcomes if not o["win"]) / max(n - wins, 1), 0.001)
                 ) > 0 if n >= self.min_trades_for_kelly else False,
             }

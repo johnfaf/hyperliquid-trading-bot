@@ -114,7 +114,7 @@ class FeatureEngine:
         bb_upper, bb_mid, bb_lower = self._bollinger_bands(closes, period=20, std_dev=2)
         if bb_upper > bb_lower:
             features.bollinger_width = (bb_upper - bb_lower) / bb_mid if bb_mid > 0 else 0
-            features.bollinger_position = (closes[-1] - bb_mid) / (bb_upper - bb_mid) if bb_upper != bb_mid else 0
+            features.bollinger_position = (closes[-1] - bb_mid) / (bb_upper - bb_mid) if bb_upper != bb_mid else 0.5
 
         # ─── Momentum ────────────────────────────────────────
         features.rsi = self._rsi(closes, period=14)
