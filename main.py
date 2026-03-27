@@ -307,6 +307,16 @@ class HyperliquidResearchBot:
         self.logger.info(f"{'='*60}")
 
         try:
+            # Phase 0: Purge non-golden wallets from previous scans
+            # This frees up space before the new golden scan runs
+            try:
+                from src.golden_wallet import purge_non_golden_wallets
+                purged = purge_non_golden_wallets()
+                if purged:
+                    self.logger.info(f"Purged {purged} non-golden wallets before new scan")
+            except Exception as e:
+                self.logger.debug(f"Golden wallet purge skipped: {e}")
+
             # Phase 1: Discover and analyze traders
             self.logger.info("Phase 1: Trader Discovery")
             discovery_result = self.discovery.run_discovery_cycle()
@@ -343,6 +353,15 @@ class HyperliquidResearchBot:
             if all_strategies:
                 saved_ids = self.identifier.save_identified_strategies(all_strategies)
                 self.logger.info(f"  Identified and saved {len(saved_ids)} strategies")
+
+            # Phase 2b: Golden wallet scan (evaluate top wallets for copy-trading)
+            try:
+                from src.golden_wallet import run_golden_scan
+                golden_summary = run_golden_scan(max_wallets=200)
+                self.logger.info(f"  Golden scan: {golden_summary.get('golden_count', 0)} golden wallets "
+                               f"out of {golden_summary.get('total_evaluated', 0)} evaluated")
+            except Exception as e:
+                self.logger.warning(f"Golden wallet scan failed: {e}")
 
             self._last_discovery = time.time()
             self.logger.info("Discovery cycle complete.")

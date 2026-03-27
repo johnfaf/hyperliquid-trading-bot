@@ -104,6 +104,11 @@ class TraderDiscovery:
         discovered.extend(whale_traders)
         logger.info(f"Found {len(whale_traders)} whale traders")
 
+        # Method 4: Active traders on high-OI coins (volume-weighted)
+        oi_traders = self._discover_from_open_interest()
+        discovered.extend(oi_traders)
+        logger.info(f"Found {len(oi_traders)} traders from open-interest scan")
+
         # Deduplicate by address
         seen = set()
         unique = []
@@ -222,44 +227,134 @@ class TraderDiscovery:
 
     def _discover_whales(self) -> List[Dict]:
         """
-        Discover whale traders by checking recent large trades on popular coins.
-        This method finds traders not on the leaderboard but still very active.
+        Discover whale traders by checking recent large trades across many coins.
+        Finds traders not on the leaderboard but moving serious size.
         """
         traders = []
-        top_coins = ["BTC", "ETH", "SOL", "DOGE", "ARB"]
+        # Expanded to 25 coins for much wider coverage
+        whale_coins = [
+            "BTC", "ETH", "SOL", "DOGE", "ARB", "OP", "SUI", "APT",
+            "AVAX", "LINK", "INJ", "SEI", "TIA", "JUP", "WIF",
+            "PEPE", "ONDO", "RENDER", "FET", "NEAR", "AAVE",
+            "MKR", "PENDLE", "STX", "WLD",
+        ]
 
-        for coin in top_coins:
+        seen_addrs = set()
+        for coin in whale_coins:
             try:
                 recent = hl.get_recent_trades(coin)
                 if not recent:
                     continue
 
-                # Find addresses with large trades
+                # Find addresses with large trades ($25k+ to catch mid-size whales too)
                 large_trade_addresses = set()
                 for trade in (recent if isinstance(recent, list) else []):
                     size_usd = float(trade.get("px", 0)) * float(trade.get("sz", 0))
-                    if size_usd > 50_000:  # $50k+ trades
+                    if size_usd > 25_000:
                         for user_key in ["user", "users"]:
                             if user_key in trade:
                                 addrs = trade[user_key] if isinstance(trade[user_key], list) else [trade[user_key]]
                                 large_trade_addresses.update(addrs)
 
-                # Check these whale addresses
-                for addr in list(large_trade_addresses)[:5]:
-                    if addr not in self.known_traders:
+                # Check up to 10 whale addresses per coin (was 5)
+                for addr in list(large_trade_addresses)[:10]:
+                    if addr in seen_addrs or addr in self.known_traders:
+                        continue
+                    seen_addrs.add(addr)
+                    try:
                         state = hl.get_user_state(addr)
-                        if state and state["account_value"] > 100_000:
+                        if state and state["account_value"] > 50_000:  # Lower threshold: $50k (was $100k)
                             traders.append({
                                 "address": addr,
-                                "total_pnl": 0,  # Will be updated on analysis
+                                "total_pnl": 0,
                                 "roi_pct": 0,
                                 "account_value": state["account_value"],
                                 "source": "whale_detection",
                                 "metadata": {"detected_on": coin},
                             })
+                    except Exception:
+                        pass
             except Exception as e:
                 logger.debug(f"Error in whale detection for {coin}: {e}")
             time.sleep(0.3)
+
+        logger.info(f"Whale detection: found {len(traders)} whale traders across {len(whale_coins)} coins")
+        return traders
+
+    def _discover_from_open_interest(self) -> List[Dict]:
+        """
+        Discover active traders by scanning who holds the largest open positions.
+        Uses metaAndAssetCtxs to find high-OI coins, then gets recent fills
+        to identify who's trading them.
+        """
+        traders = []
+        seen_addrs = set()
+
+        try:
+            import requests
+            # Get coins with highest open interest
+            resp = requests.post("https://api.hyperliquid.xyz/info",
+                                 json={"type": "metaAndAssetCtxs"}, timeout=10)
+            if resp.status_code != 200:
+                return []
+
+            data = resp.json()
+            if not isinstance(data, list) or len(data) < 2:
+                return []
+
+            # data[0] = meta (asset names), data[1] = asset contexts (OI, funding, etc.)
+            meta = data[0].get("universe", []) if isinstance(data[0], dict) else []
+            ctxs = data[1] if isinstance(data[1], list) else []
+
+            # Build sorted list of coins by open interest
+            oi_ranked = []
+            for i, ctx in enumerate(ctxs):
+                if not isinstance(ctx, dict):
+                    continue
+                coin = meta[i]["name"] if i < len(meta) and isinstance(meta[i], dict) else f"UNKNOWN_{i}"
+                oi = float(ctx.get("openInterest", 0))
+                oi_ranked.append((coin, oi))
+
+            oi_ranked.sort(key=lambda x: x[1], reverse=True)
+
+            # Scan recent fills on top 15 OI coins for active traders
+            for coin, oi in oi_ranked[:15]:
+                try:
+                    recent = hl.get_recent_trades(coin)
+                    if not recent or not isinstance(recent, list):
+                        continue
+
+                    # Extract unique addresses from recent trades
+                    addrs_with_size = {}
+                    for trade in recent:
+                        size_usd = float(trade.get("px", 0)) * float(trade.get("sz", 0))
+                        for user_key in ["user", "users"]:
+                            if user_key in trade:
+                                raw = trade[user_key]
+                                addr_list = raw if isinstance(raw, list) else [raw]
+                                for addr in addr_list:
+                                    if addr and addr not in self.known_traders and addr not in seen_addrs:
+                                        addrs_with_size[addr] = addrs_with_size.get(addr, 0) + size_usd
+
+                    # Take the top 5 by volume for this coin
+                    top_addrs = sorted(addrs_with_size.items(), key=lambda x: x[1], reverse=True)[:5]
+                    for addr, vol in top_addrs:
+                        seen_addrs.add(addr)
+                        traders.append({
+                            "address": addr,
+                            "total_pnl": 0,
+                            "roi_pct": 0,
+                            "source": "open_interest",
+                            "metadata": {"detected_on": coin, "volume_usd": round(vol, 0)},
+                        })
+                except Exception:
+                    pass
+                time.sleep(0.3)
+
+        except Exception as e:
+            logger.debug(f"Error in OI discovery: {e}")
+
+        logger.info(f"OI discovery: found {len(traders)} traders from high-OI coins")
         return traders
 
     def _get_known_vault_addresses(self) -> List[str]:

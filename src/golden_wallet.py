@@ -556,6 +556,38 @@ def get_golden_wallets() -> List[Dict]:
         conn.close()
 
 
+def purge_non_golden_wallets() -> int:
+    """
+    Remove all non-golden wallets from the golden_wallets table + their fills.
+    Frees DB space and ensures only proven wallets remain.
+    Returns number of wallets purged.
+    """
+    conn = _get_db()
+    try:
+        # Get non-golden addresses first (for fill cleanup)
+        rows = conn.execute(
+            "SELECT address FROM golden_wallets WHERE is_golden = 0"
+        ).fetchall()
+        non_golden = [r["address"] for r in rows]
+
+        if not non_golden:
+            logger.info("No non-golden wallets to purge")
+            return 0
+
+        # Delete fills for non-golden wallets
+        for addr in non_golden:
+            conn.execute("DELETE FROM wallet_fills WHERE wallet_address = ?", (addr,))
+
+        # Delete non-golden wallet records
+        conn.execute("DELETE FROM golden_wallets WHERE is_golden = 0")
+        conn.commit()
+
+        logger.info(f"Purged {len(non_golden)} non-golden wallets and their fills")
+        return len(non_golden)
+    finally:
+        conn.close()
+
+
 def get_all_wallet_reports() -> List[Dict]:
     """Get all evaluated wallets (golden and non-golden)."""
     conn = _get_db()
@@ -604,7 +636,7 @@ def get_human_wallets_from_db() -> List[Dict]:
         conn.close()
 
 
-def run_golden_scan(max_wallets: int = 50) -> Dict:
+def run_golden_scan(max_wallets: int = 200) -> Dict:
     """
     Main entry point: scan human-like wallets, evaluate, tag golden ones.
     Returns summary stats.
