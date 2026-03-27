@@ -449,22 +449,33 @@ class PaperTrader:
             if target_price == 0:
                 return None
 
-        # Determine direction based on strategy type
-        if strategy_type in ("momentum_long", "trend_following", "breakout"):
+        # Determine direction — regime-aware for ambiguous types.
+        # Use pre-computed side from decision engine when available.
+        pre_decided = signal.get("side", signal.get("_decision_side", ""))
+
+        # Regime direction bias: when regime is confident use it as the default
+        # for undirected strategies instead of blindly defaulting to "long".
+        _regime_str  = (regime_data or {}).get("overall_regime", "unknown")
+        _regime_conf = (regime_data or {}).get("overall_confidence", 0.0)
+        if _regime_str == "trending_down" and _regime_conf >= 0.6:
+            regime_default = "short"
+        elif _regime_str == "trending_up" and _regime_conf >= 0.6:
+            regime_default = "long"
+        else:
+            regime_default = params.get("direction", params.get("bias", "long"))
+
+        if pre_decided in ("long", "short"):
+            side = pre_decided
+        elif strategy_type in ("momentum_long", "trend_following", "breakout"):
             side = "long"
         elif strategy_type in ("momentum_short", "contrarian"):
             side = "short"
-        elif strategy_type == "mean_reversion":
-            # Check if current price is above or below recent average
-            side = params.get("direction", "long")
-        elif strategy_type in ("scalping", "swing_trading"):
-            # Use the bias from parameters or default to long
-            direction = params.get("direction", params.get("bias", "long"))
-            side = "long" if "long" in str(direction) else "short"
         elif strategy_type == "funding_arb":
             side = "short"  # Typically short to earn positive funding
         else:
-            side = "long"  # Default
+            # concentrated_bet, mean_reversion, scalping, swing_trading, delta_neutral, etc.
+            # — follow regime when confident, else use stored param
+            side = params.get("direction") or regime_default
 
         # Determine leverage (capped by config)
         leverage = min(

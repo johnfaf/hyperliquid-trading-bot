@@ -49,7 +49,11 @@ REGIME_STRATEGY_MAP = {
     },
     Regime.TRENDING_DOWN: {
         "activate": ["momentum_short", "trend_following", "breakout"],
-        "pause": ["momentum_long", "funding_arb", "delta_neutral"],
+        # concentrated_bet has no fixed direction — pausing it forces regime_default
+        # (short) rather than the hard-coded "long" fallback.
+        # swing_trading longs get badly hurt in downtrends.
+        "pause": ["momentum_long", "funding_arb", "delta_neutral",
+                  "concentrated_bet", "swing_trading"],
         "size_modifier": 0.8,  # Slightly reduced (shorts are riskier)
     },
     Regime.RANGING: {
