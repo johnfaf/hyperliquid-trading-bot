@@ -53,7 +53,7 @@ from src.adaptive_bot_detector import AdaptiveBotDetector
 from src.sharpe_calculator import calculate_sharpe
 from src.regime_strategy_filter import RegimeStrategyFilter
 from src import telegram_alerts as tg_alerts
-from src.report_exporter import ReportExporter
+from src import report_exporter
 from src.polymarket_scanner import PolymarketScanner
 
 # ─── Logging Setup ─────────────────────────────────────────────
@@ -216,7 +216,7 @@ class HyperliquidResearchBot:
         # V6: Phase 1 signal quality upgrades
         self.adaptive_bot_detector = AdaptiveBotDetector()
         self.regime_strategy_filter = RegimeStrategyFilter()
-        self.report_exporter = ReportExporter()
+        # report_exporter is a module with functions, not a class
 
         # V6: Polymarket prediction market scanner
         try:
@@ -1055,7 +1055,7 @@ class HyperliquidResearchBot:
             # V6: Export HTML report every 24 cycles (~daily)
             try:
                 if self._cycle_count % 24 == 0:
-                    report_path = self.report_exporter.export_html_report()
+                    report_path = report_exporter.export_html_report()
                     self.logger.info(f"  HTML report exported: {report_path}")
             except Exception as e:
                 self.logger.debug(f"  Report export error: {e}")
