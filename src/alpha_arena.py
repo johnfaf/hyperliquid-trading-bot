@@ -1070,10 +1070,21 @@ class AlphaArena:
                     tournament_rank INTEGER DEFAULT 0,
                     backtest_sharpe REAL DEFAULT 0,
                     backtest_pnl REAL DEFAULT 0,
+                    backtest_trades INTEGER DEFAULT 0,
+                    backtest_win_rate REAL DEFAULT 0,
                     created_at TEXT,
                     last_updated TEXT
                 )
             """)
+            # Migrate existing tables that might be missing the new columns
+            for col, typedef in [
+                ("backtest_trades", "INTEGER DEFAULT 0"),
+                ("backtest_win_rate", "REAL DEFAULT 0"),
+            ]:
+                try:
+                    conn.execute(f"ALTER TABLE arena_agents ADD COLUMN {col} {typedef}")
+                except Exception:
+                    pass  # Column already exists
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS arena_rounds (
                     round_id INTEGER PRIMARY KEY,
@@ -1154,6 +1165,8 @@ class AlphaArena:
                     tournament_rank=row.get("tournament_rank", 0),
                     backtest_sharpe=row.get("backtest_sharpe", 0),
                     backtest_pnl=row.get("backtest_pnl", 0),
+                    backtest_trades=row.get("backtest_trades", 0),
+                    backtest_win_rate=row.get("backtest_win_rate", 0),
                     created_at=row.get("created_at", ""),
                 )
                 self.agents[row["agent_id"]] = agent
@@ -1175,8 +1188,9 @@ class AlphaArena:
                      capital_allocated, total_pnl, total_trades, winning_trades,
                      sharpe_ratio, max_drawdown, win_rate, generation, parent_id,
                      elo_rating, tournament_rank, backtest_sharpe, backtest_pnl,
+                     backtest_trades, backtest_win_rate,
                      created_at, last_updated)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """, (
                     agent.agent_id, agent.name, agent.strategy_type,
                     agent.status.value, json.dumps(agent.params),
@@ -1186,6 +1200,7 @@ class AlphaArena:
                     agent.generation, agent.parent_id,
                     agent.elo_rating, agent.tournament_rank,
                     agent.backtest_sharpe, agent.backtest_pnl,
+                    agent.backtest_trades, agent.backtest_win_rate,
                     agent.created_at, now,
                 ))
             conn.commit()
@@ -1230,11 +1245,12 @@ class AlphaArena:
                 np.mean(agent._returns) / (np.std(agent._returns) + 1e-8)
             )
 
-        # Update max drawdown
+        # Update max drawdown (fractional, consistent with fitness_score formula)
         cumulative = np.cumsum(agent._returns)
         if len(cumulative) > 0:
             peak = np.maximum.accumulate(cumulative)
-            drawdowns = (peak - cumulative)
+            # Fractional drawdown: how far below peak as a fraction of peak
+            drawdowns = np.where(peak != 0, (peak - cumulative) / (np.abs(peak) + 1e-8), 0)
             agent.max_drawdown = float(np.max(drawdowns)) if len(drawdowns) > 0 else 0
 
     def record_trade_for_strategy(self, strategy_type: str, pnl: float,
@@ -1361,3 +1377,93 @@ class AlphaArena:
             "consensus_history": len(self.consensus.vote_history),
             "recent_votes": self.consensus.vote_history[-5:],
         }
+
+    # ═══════════════════════════════════════════════════════════
+    #  V7: Champion Signal Generation (closes Arena → Live gap)
+    # ═══════════════════════════════════════════════════════════
+
+    def get_champion_signals(self, current_candles: Optional[List[Dict]] = None,
+                              min_fitness: float = 0.15,
+                              min_trades: int = 10) -> List[Dict]:
+        """
+        Generate live trading signals from champion/top-performing agents.
+
+        This closes the critical gap where Arena agents evolved and learned
+        but never contributed signals to the live trading pipeline.
+
+        Args:
+            current_candles: Recent candle data (at least 30 bars).
+                             If None, no signals generated.
+            min_fitness: Minimum fitness score to qualify (default 0.15)
+            min_trades: Minimum trade history to trust agent (default 10)
+
+        Returns:
+            List of signal dicts compatible with paper_trader pipeline:
+            [{"coin": "BTC", "side": "long", "confidence": 0.72,
+              "source": "arena_champion", "agent_id": "...", ...}]
+        """
+        if not current_candles or len(current_candles) < 30:
+            return []
+
+        # Get qualified agents: champions + high-performing active agents
+        qualified = [
+            a for a in self.agents.values()
+            if a.status in (AgentStatus.CHAMPION, AgentStatus.ACTIVE)
+            and a.fitness_score >= min_fitness
+            and a.total_trades >= min_trades
+        ]
+
+        if not qualified:
+            return []
+
+        # Sort by fitness — best agents first
+        qualified.sort(key=lambda a: a.fitness_score, reverse=True)
+
+        current_bar = current_candles[-1]
+        signals = []
+        seen_agent_sides = set()  # Avoid duplicate strategy_type+side signals
+
+        for agent in qualified[:10]:  # Top 10 qualified agents
+            try:
+                signal = self.backtester._agent_generate_signal(
+                    agent, current_candles, current_bar
+                )
+                if not signal:
+                    continue
+
+                # Dedup on strategy_type+side so different strategies can both go long/short
+                sig_key = f"{agent.strategy_type}:{signal['side']}"
+                if sig_key in seen_agent_sides:
+                    continue
+                seen_agent_sides.add(sig_key)
+
+                # Weight confidence by agent fitness and track record
+                base_conf = signal["confidence"]
+                fitness_mult = min(1.0 + agent.fitness_score, 1.3)
+                adjusted_conf = min(base_conf * fitness_mult, 0.95)
+
+                signals.append({
+                    "coin": "BTC",  # Arena currently runs on BTC candles
+                    "side": signal["side"],
+                    "confidence": round(adjusted_conf, 3),
+                    "source": "arena_champion",
+                    "strategy_type": agent.strategy_type,
+                    "agent_id": agent.agent_id,
+                    "agent_name": agent.name,
+                    "agent_fitness": round(agent.fitness_score, 4),
+                    "agent_elo": round(agent.elo_rating, 0),
+                    "agent_trades": agent.total_trades,
+                    "agent_win_rate": round(agent.win_rate, 3),
+                    "agent_sharpe": round(agent.sharpe_ratio, 3),
+                    "price": signal["price"],
+                    "atr_pct": signal.get("atr_pct", 0.02),
+                })
+
+            except Exception as e:
+                logger.debug(f"Champion signal error for {agent.name}: {e}")
+
+        if signals:
+            logger.info(f"Arena champions generated {len(signals)} live signals "
+                       f"from {len(qualified)} qualified agents")
+
+        return signals

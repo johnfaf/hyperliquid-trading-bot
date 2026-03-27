@@ -388,6 +388,24 @@ def open_paper_trade(strategy_id, coin, side, entry_price, size, leverage=1,
         return cursor.lastrowid
 
 
+def update_paper_trade_metadata(trade_id: int, extra: dict):
+    """Merge extra keys into a paper trade's metadata JSON blob."""
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT metadata FROM paper_trades WHERE id = ?", (trade_id,)
+        ).fetchone()
+        if row:
+            try:
+                existing = json.loads(row["metadata"] or "{}")
+            except Exception:
+                existing = {}
+            existing.update(extra)
+            conn.execute(
+                "UPDATE paper_trades SET metadata = ? WHERE id = ?",
+                (json.dumps(existing), trade_id)
+            )
+
+
 def close_paper_trade(trade_id, exit_price, pnl):
     now = datetime.utcnow().isoformat()
     with get_connection() as conn:

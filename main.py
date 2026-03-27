@@ -55,6 +55,7 @@ from src.regime_strategy_filter import RegimeStrategyFilter
 from src import telegram_alerts as tg_alerts
 from src import report_exporter
 from src.polymarket_scanner import PolymarketScanner
+from src.live_trader import LiveTrader
 
 # ─── Logging Setup ─────────────────────────────────────────────
 
@@ -251,6 +252,17 @@ class HyperliquidResearchBot:
             llm_filter=self.llm_filter,
         )
 
+        # V6: Live trader (dry_run=True unless HL_LIVE_TRADING=true)
+        try:
+            self.live_trader = LiveTrader(firewall=self.firewall)
+            mode = "DRY RUN" if self.live_trader.dry_run else "LIVE"
+            self.logger.info(f"Live trader initialized [{mode}]")
+            if not self.live_trader.dry_run:
+                self.logger.warning("⚠️  LIVE TRADING ENABLED — real orders will be placed!")
+        except Exception as e:
+            self.live_trader = None
+            self.logger.info(f"Live trader not available (paper-only mode): {e}")
+
         # Start the unified web dashboard (main + options on same port)
         try:
             set_v2_components(
@@ -283,6 +295,11 @@ class HyperliquidResearchBot:
 
     def run_once(self):
         """Run a single complete research + trading cycle."""
+        # V6: Check live trader kill switch before cycle
+        if self.live_trader and not self.live_trader.dry_run:
+            if self.live_trader.check_daily_loss():
+                self.logger.error("🛑 KILL SWITCH ACTIVE — daily loss limit hit, skipping live trades")
+
         self._cycle_count += 1
         self.logger.info(f"{'='*60}")
         self.logger.info(f"Starting cycle #{self._cycle_count}")
@@ -650,6 +667,21 @@ class HyperliquidResearchBot:
                 kelly_stats=kelly_stats,
             )
 
+            # V7: Apply AgentScorer dynamic weights to strategy confidences
+            # Sources with better track records get boosted, bad ones get reduced
+            try:
+                if top_strategies and hasattr(self.agent_scorer, 'apply_weights_to_signals'):
+                    for s in top_strategies:
+                        stype = s.get("strategy_type", "unknown")
+                        source_key = f"strategy:{stype}"
+                        weight = self.agent_scorer.get_weight(source_key)
+                        orig_conf = float(s.get("confidence", 0.5))
+                        # Blend: 60% original confidence, 40% agent scorer weight
+                        s["confidence"] = round(orig_conf * 0.6 + weight * 0.4, 3)
+                        s["agent_scorer_weight"] = round(weight, 3)
+            except Exception as e:
+                self.logger.debug(f"  AgentScorer weight apply error: {e}")
+
             # Execute new signals from strategies (V2 pipeline: features → scoring → firewall → consensus)
             if top_strategies:
                 executed = self.paper_trader.execute_strategy_signals(
@@ -659,10 +691,42 @@ class HyperliquidResearchBot:
                     arena=self.arena,
                 )
                 self.logger.info(f"  Executed {len(executed)} new paper trades")
+                # Record signal IDs for AgentScorer outcome tracking
+                try:
+                    for t in executed:
+                        stype = t.get("strategy_type", "unknown")
+                        source_key = f"strategy:{stype}"
+                        signal_id = self.agent_scorer.record_signal(source_key, {
+                            "coin": t.get("coin", ""),
+                            "side": t.get("side", ""),
+                            "confidence": t.get("confidence", 0),
+                        })
+                        # Store signal_id in trade metadata so outcome can be matched later
+                        if t.get("id"):
+                            try:
+                                from src import database as _db
+                                _db.update_paper_trade_metadata(
+                                    t["id"], {"signal_id": signal_id, "source_key": source_key}
+                                )
+                            except Exception:
+                                pass
+                except Exception as e:
+                    self.logger.debug(f"  AgentScorer signal record error: {e}")
                 # Telegram: notify new trades
                 if tg.is_configured():
                     for t in executed:
                         tg.notify_trade_opened(t, source="strategy")
+
+                # V6: Mirror paper trades to live exchange (if enabled)
+                if self.live_trader and executed:
+                    for t in executed:
+                        try:
+                            live_result = self.live_trader.execute_signal(t)
+                            if live_result:
+                                self.logger.info(f"  LIVE: {live_result.get('status', '?')} "
+                                               f"{t.get('coin', '?')} {t.get('side', '?')}")
+                        except Exception as e:
+                            self.logger.warning(f"  Live execution error: {e}")
 
             # Phase 4a: Execute LCRS signals through full V2 pipeline
             if lcrs_signals:
@@ -875,16 +939,41 @@ class HyperliquidResearchBot:
                     for t in copy_executed:
                         tg.notify_trade_opened(t, source="copy")
 
-            # Phase 4c: Feed closed trade outcomes to Alpha Arena
+                # V6: Mirror copy trades to live exchange
+                if self.live_trader and copy_executed:
+                    for t in copy_executed:
+                        try:
+                            live_result = self.live_trader.execute_signal(t)
+                            if live_result:
+                                self.logger.info(f"  LIVE COPY: {live_result.get('status', '?')} "
+                                               f"{t.get('coin', '?')} {t.get('side', '?')}")
+                        except Exception as e:
+                            self.logger.warning(f"  Live copy execution error: {e}")
+
+            # Phase 4c: Feed closed trade outcomes to Alpha Arena + AgentScorer
             if closed:
                 for c in closed:
                     try:
                         stype = c.get("strategy_type", "unknown")
                         pnl = c.get("pnl", 0)
                         entry = c.get("entry_price", 1)
-                        size = 1
-                        return_pct = pnl / max(entry * size, 1)
+                        size = c.get("size", 0)
+                        notional = entry * max(size, 1e-8)
+                        # True return_pct: pnl / notional invested
+                        return_pct = pnl / max(notional, 1)
                         self.arena.record_trade_for_strategy(stype, pnl, return_pct)
+
+                        # Feed outcome back to AgentScorer so weights update from real PnL
+                        try:
+                            meta = c.get("metadata") or {}
+                            signal_id = meta.get("signal_id", "")
+                            source_key = f"strategy:{stype}"
+                            if signal_id:
+                                self.agent_scorer.record_outcome(
+                                    source_key, signal_id, pnl, return_pct
+                                )
+                        except Exception:
+                            pass
                     except Exception:
                         pass
 
@@ -923,6 +1012,66 @@ class HyperliquidResearchBot:
                 self.logger.info(f"  Arena: {stats['active_agents']} active, "
                                f"{stats['champions']} champions, "
                                f"PnL=${stats['total_arena_pnl']:.2f}")
+
+                # V7: Champion signals → paper trading pipeline
+                # Use the last 100 candles (recent) so agents signal on current market
+                if arena_candles and len(arena_candles) >= 30:
+                    try:
+                        champion_signals = self.arena.get_champion_signals(
+                            current_candles=arena_candles[-100:],
+                            min_fitness=0.15,
+                            min_trades=10,
+                        )
+                        if champion_signals:
+                            self.logger.info(f"  Arena champions: {len(champion_signals)} signals")
+                            account = db.get_paper_account()
+                            open_trades = db.get_open_paper_trades()
+                            for sig in champion_signals:
+                                try:
+                                    price = sig.get("price", 0)
+                                    if price <= 0:
+                                        continue
+                                    side = sig["side"]
+                                    conf = sig["confidence"]
+                                    if side == "long":
+                                        sl = price * 0.95
+                                        tp = price * 1.10
+                                    else:
+                                        sl = price * 1.05
+                                        tp = price * 0.90
+                                    if account:
+                                        size_usd = account["balance"] * 0.05 * conf
+                                        size = size_usd / price
+                                        trade_id = db.open_paper_trade(
+                                            strategy_id=None,
+                                            coin=sig["coin"],
+                                            side=side,
+                                            entry_price=price,
+                                            size=size,
+                                            leverage=2,
+                                            stop_loss=round(sl, 2),
+                                            take_profit=round(tp, 2),
+                                            metadata={
+                                                "source": "arena_champion",
+                                                "agent_id": sig["agent_id"],
+                                                "agent_name": sig["agent_name"],
+                                                "strategy_type": sig["strategy_type"],
+                                                "agent_fitness": sig["agent_fitness"],
+                                                "agent_elo": sig["agent_elo"],
+                                                "confidence": conf,
+                                            },
+                                        )
+                                        self.logger.info(
+                                            f"  Champion trade: {side.upper()} {sig['coin']} "
+                                            f"@ ${price:,.2f} | agent={sig['agent_name']} "
+                                            f"(fitness={sig['agent_fitness']:.3f}, "
+                                            f"elo={sig['agent_elo']:.0f})"
+                                        )
+                                except Exception as ce:
+                                    self.logger.debug(f"  Champion trade exec error: {ce}")
+                    except Exception as e:
+                        self.logger.debug(f"  Champion signals error: {e}")
+
             except Exception as e:
                 self.logger.warning(f"  Arena error: {e}")
 
