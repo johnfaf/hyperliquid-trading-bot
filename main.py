@@ -52,6 +52,9 @@ from src.ws_position_monitor import PositionMonitor
 from src.adaptive_bot_detector import AdaptiveBotDetector
 from src.sharpe_calculator import calculate_sharpe
 from src.regime_strategy_filter import RegimeStrategyFilter
+from src import telegram_alerts as tg_alerts
+from src.report_exporter import ReportExporter
+from src.polymarket_scanner import PolymarketScanner
 
 # ─── Logging Setup ─────────────────────────────────────────────
 
@@ -213,6 +216,15 @@ class HyperliquidResearchBot:
         # V6: Phase 1 signal quality upgrades
         self.adaptive_bot_detector = AdaptiveBotDetector()
         self.regime_strategy_filter = RegimeStrategyFilter()
+        self.report_exporter = ReportExporter()
+
+        # V6: Polymarket prediction market scanner
+        try:
+            self.polymarket = PolymarketScanner()
+            self.logger.info("Polymarket scanner initialized")
+        except Exception as e:
+            self.polymarket = None
+            self.logger.warning(f"Polymarket scanner init failed (continuing without): {e}")
 
         # V6: Real-time WebSocket position monitor for copy trading
         try:
@@ -373,6 +385,24 @@ class HyperliquidResearchBot:
                 self.logger.info(f"  Size modifier: {guidance.get('size_modifier', 1.0):.0%}")
             except Exception as e:
                 self.logger.warning(f"  Regime detection error: {e}")
+
+            # Phase 3d2: Polymarket Prediction Market Scan
+            polymarket_signals = []
+            if self.polymarket:
+                self.logger.info("Phase 3d2: Polymarket Scan")
+                try:
+                    polymarket_signals = self.polymarket.generate_signals(hl_regime=regime_data)
+                    sentiment = self.polymarket.get_market_sentiment()
+                    self.logger.info(f"  Polymarket: {len(polymarket_signals)} signals, "
+                                   f"sentiment={sentiment.get('sentiment', '?')} "
+                                   f"(conf={sentiment.get('confidence', 0):.0%}, "
+                                   f"markets={sentiment.get('markets_analyzed', 0)})")
+                    if polymarket_signals:
+                        for sig in polymarket_signals[:3]:
+                            self.logger.info(f"  PM signal: {sig['side'].upper()} {sig['coin']} "
+                                           f"(conf={sig['confidence']:.0%}) — {sig.get('reason', '')[:60]}")
+                except Exception as e:
+                    self.logger.warning(f"  Polymarket scan error: {e}")
 
             # Phase 3e: Multi-Exchange Scan + Cross-Venue Confirmation
             self.logger.info("Phase 3e: Multi-Exchange Scanner")
@@ -1010,6 +1040,25 @@ class HyperliquidResearchBot:
 
             # Backup DB state (survives Railway redeploys)
             backup_to_json()
+
+            # V6: Enhanced Telegram alerts — daily P&L + top mover detection
+            try:
+                if tg.is_configured() and self._cycle_count % 24 == 0:  # ~daily with 1hr cycles
+                    tg_alerts.send_daily_pnl_summary()
+                    self.logger.info("  Sent daily P&L Telegram summary")
+                if tg.is_configured() and self._cycle_count % 168 == 0:  # ~weekly
+                    tg_alerts.send_weekly_digest()
+                    self.logger.info("  Sent weekly Telegram digest")
+            except Exception as e:
+                self.logger.debug(f"  Enhanced alerts error: {e}")
+
+            # V6: Export HTML report every 24 cycles (~daily)
+            try:
+                if self._cycle_count % 24 == 0:
+                    report_path = self.report_exporter.export_html_report()
+                    self.logger.info(f"  HTML report exported: {report_path}")
+            except Exception as e:
+                self.logger.debug(f"  Report export error: {e}")
 
             self.logger.info(f"Cycle #{self._cycle_count} complete.")
 

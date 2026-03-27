@@ -1,0 +1,733 @@
+"""
+Polymarket Scanner (V6)
+========================
+Scans Polymarket prediction markets for:
+1. High-volume markets with crypto relevance
+2. Sharp odds movements (smart money detection)
+3. Cross-correlation with Hyperliquid signals
+4. Event-driven trading opportunities
+
+Feeds signals into the existing strategy pipeline.
+
+Architecture:
+  Markets discovery → Odds movement detection → Hyperliquid correlation
+                    ↓
+              Signal generation (compatible with DecisionEngine)
+
+Polymarket API:
+  REST: https://clob.polymarket.com
+  - Markets: GET /markets (returns list of markets with tokens, outcomes, prices)
+  - Order book: GET /book?token_id={token_id}
+  - Trades: GET /trades?market={condition_id}
+  - Prices: GET /prices?token_ids={comma_separated_ids}
+  - Gamma API: https://gamma-api.polymarket.com (enriched data)
+"""
+
+import logging
+import time
+import requests
+from typing import Dict, List, Optional, Tuple
+from datetime import datetime, timedelta
+from dataclasses import dataclass, field
+from collections import defaultdict
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class PolymarketMarket:
+    """Normalized Polymarket market data."""
+    token_id: str
+    market_id: str  # condition_id
+    title: str
+    description: str
+    outcomes: List[str]
+    current_prices: List[float]  # Probabilities for each outcome
+    volume_24h: float
+    liquidity: float
+    last_traded: str  # ISO timestamp
+    category: str
+
+
+@dataclass
+class OddsMovement:
+    """Detected odds movement in a market."""
+    market_id: str
+    title: str
+    direction: str  # "up" or "down"
+    magnitude: float  # Percentage change
+    timeframe: str  # "1h" or "24h"
+    current_probability: float
+    volume_move: float  # Volume during the move
+    smart_money_score: float  # 0-1, higher = more likely smart money
+
+
+@dataclass
+class PolymarketSignal:
+    """Signal for the bot's decision engine."""
+    source: str = "polymarket"
+    coin: str = ""
+    side: str = ""  # "long" or "short"
+    confidence: float = 0.0
+    reason: str = ""
+    polymarket_market: str = ""
+    polymarket_probability: float = 0.0
+    polymarket_volume_24h: float = 0.0
+    correlation_with_hl: str = ""  # Description of correlation
+    timestamp: str = field(default_factory=lambda: datetime.utcnow().isoformat())
+
+    def to_dict(self) -> Dict:
+        """Convert to dict for pipeline compatibility."""
+        return {
+            "source": self.source,
+            "coin": self.coin,
+            "side": self.side,
+            "confidence": self.confidence,
+            "reason": self.reason,
+            "polymarket_market": self.polymarket_market,
+            "polymarket_probability": self.polymarket_probability,
+            "polymarket_volume_24h": self.polymarket_volume_24h,
+            "correlation_with_hl": self.correlation_with_hl,
+            "timestamp": self.timestamp,
+        }
+
+
+class PolymarketScanner:
+    """
+    Scans Polymarket for crypto-relevant prediction markets and generates
+    trading signals based on odds movements and cross-correlation with Hyperliquid data.
+
+    Usage:
+        scanner = PolymarketScanner()
+        signals = scanner.generate_signals()
+        sentiment = scanner.get_market_sentiment()
+        stats = scanner.get_stats()
+    """
+
+    # Crypto keyword mapping
+    CRYPTO_KEYWORDS = {
+        "btc": ["bitcoin", "btc"],
+        "eth": ["ethereum", "eth"],
+        "sol": ["solana", "sol"],
+        "doge": ["dogecoin", "doge"],
+        "xrp": ["ripple", "xrp"],
+        "arb": ["arbitrum", "arb"],
+        "op": ["optimism", "op"],
+        "avax": ["avalanche", "avax"],
+        "matic": ["polygon", "matic"],
+        "link": ["chainlink", "link"],
+        "sui": ["sui"],
+        "inj": ["injective", "inj"],
+        "near": ["near"],
+        "sei": ["sei"],
+        "tia": ["celestia", "tia"],
+    }
+
+    # Event-to-crypto sentiment mapping
+    EVENT_SENTIMENT_MAP = {
+        # Bullish events (risk-on)
+        "fed": ("risk_on", 0.3),
+        "rate cut": ("risk_on", 0.5),
+        "inflation down": ("risk_on", 0.4),
+        "stimulus": ("risk_on", 0.5),
+        "bitcoin etf": ("risk_on", 0.6),
+        "approval": ("risk_on", 0.4),
+        "breakout": ("risk_on", 0.3),
+        "bull": ("risk_on", 0.4),
+
+        # Bearish events (risk-off)
+        "rate hike": ("risk_off", 0.5),
+        "inflation": ("risk_off", 0.4),
+        "recession": ("risk_off", 0.6),
+        "crash": ("risk_off", 0.5),
+        "liquidation": ("risk_off", 0.4),
+        "regulation": ("risk_off", 0.3),
+        "ban": ("risk_off", 0.5),
+        "bear": ("risk_off", 0.4),
+
+        # Neutral/uncertain
+        "election": ("uncertain", 0.2),
+        "sec": ("uncertain", 0.2),
+    }
+
+    # API endpoints
+    CLOB_API = "https://clob.polymarket.com"
+    GAMMA_API = "https://gamma-api.polymarket.com"
+
+    def __init__(self, config: Optional[Dict] = None):
+        self.config = config or {}
+
+        # Cache configuration
+        self.cache_ttl_minutes = self.config.get("cache_ttl_minutes", 5)
+        self.min_volume_threshold = self.config.get("min_volume_threshold", 10000)  # $10k
+        self.min_liquidity_threshold = self.config.get("min_liquidity_threshold", 5000)  # $5k
+
+        # Detection thresholds
+        self.odds_movement_threshold_1h = self.config.get("odds_movement_1h", 0.05)  # 5%
+        self.odds_movement_threshold_24h = self.config.get("odds_movement_24h", 0.10)  # 10%
+        self.smart_money_volume_threshold = self.config.get("smart_money_volume_threshold", 50000)  # $50k
+
+        # Scan configuration
+        self.scan_interval_seconds = self.config.get("scan_interval_seconds", 60)
+        self.max_markets_per_scan = self.config.get("max_markets_per_scan", 100)
+
+        # Rate limiting: max 1 req/sec
+        self.rate_limit_delay = 1.0
+        self._last_request_time = 0.0
+
+        # Cache
+        self._market_cache: Dict[str, PolymarketMarket] = {}
+        self._price_cache: Dict[str, List[float]] = {}  # token_id -> prices
+        self._price_cache_time: Dict[str, float] = {}  # token_id -> timestamp
+        self._movement_cache: Dict[str, List[OddsMovement]] = {}  # market_id -> movements
+
+        # Statistics
+        self._scan_count = 0
+        self._last_scan_time: Optional[datetime] = None
+        self._signals_generated = 0
+        self._markets_tracked = 0
+        self._crypto_markets_found = 0
+        self._movements_detected = 0
+
+        logger.info(f"PolymarketScanner initialized with cache TTL={self.cache_ttl_minutes}min, "
+                   f"rate_limit={self.rate_limit_delay}s")
+
+    def _rate_limit(self):
+        """Enforce rate limiting (max 1 req/sec to Polymarket)."""
+        elapsed = time.time() - self._last_request_time
+        if elapsed < self.rate_limit_delay:
+            time.sleep(self.rate_limit_delay - elapsed)
+        self._last_request_time = time.time()
+
+    def _fetch_json(self, url: str, timeout: int = 10) -> Optional[Dict]:
+        """Fetch JSON from URL with rate limiting and error handling."""
+        self._rate_limit()
+        try:
+            response = requests.get(url, timeout=timeout)
+            response.raise_for_status()
+            return response.json()
+        except requests.exceptions.Timeout:
+            logger.warning(f"Timeout fetching {url}")
+            return None
+        except requests.exceptions.ConnectionError:
+            logger.warning(f"Connection error fetching {url}")
+            return None
+        except requests.exceptions.HTTPError as e:
+            logger.warning(f"HTTP error {e.response.status_code} fetching {url}")
+            return None
+        except Exception as e:
+            logger.error(f"Error fetching {url}: {e}")
+            return None
+
+    def scan_markets(self) -> List[PolymarketMarket]:
+        """
+        Fetch active markets from Polymarket.
+        Filter for crypto-related markets and major macro markets.
+
+        Returns:
+            List of enriched market data (title, volume, liquidity, current price, 24h change)
+        """
+        logger.debug("Scanning Polymarket markets...")
+
+        # Fetch all markets from CLOB API
+        markets_url = f"{self.CLOB_API}/markets"
+        raw_markets = self._fetch_json(markets_url)
+
+        if not raw_markets:
+            logger.warning("Failed to fetch markets from Polymarket")
+            return []
+
+        if not isinstance(raw_markets, list):
+            # Sometimes wrapped in a dict with "markets" key
+            raw_markets = raw_markets.get("markets", [])
+
+        enriched = []
+        crypto_count = 0
+
+        for market_data in raw_markets:
+            try:
+                # Parse market structure
+                market_id = market_data.get("condition_id") or market_data.get("id")
+                title = market_data.get("question", "")
+                description = market_data.get("description", "")
+
+                if not market_id or not title:
+                    continue
+
+                # Get outcomes and current prices
+                outcomes = market_data.get("outcomes", [])
+                tokens = market_data.get("tokens", [])
+
+                # Extract current prices from tokens
+                prices = []
+                token_ids = []
+                for token in tokens:
+                    token_ids.append(token.get("token_id", ""))
+                    # Try to get price from token, fallback to 0
+                    price = token.get("price")
+                    if price is not None:
+                        prices.append(float(price))
+                    else:
+                        prices.append(0.0)
+
+                # Get volume and liquidity (from tokens or market level)
+                volume_24h = market_data.get("volume_24h", market_data.get("volume", 0))
+                liquidity = market_data.get("liquidity", market_data.get("total_liquidity", 0))
+
+                try:
+                    volume_24h = float(volume_24h)
+                    liquidity = float(liquidity)
+                except (ValueError, TypeError):
+                    volume_24h = 0.0
+                    liquidity = 0.0
+
+                last_traded = market_data.get("last_traded", datetime.utcnow().isoformat())
+
+                # Determine category
+                category = market_data.get("category", "general")
+
+                # Check if crypto-related
+                is_crypto = self._is_crypto_market(title, description, category)
+
+                market = PolymarketMarket(
+                    token_id=token_ids[0] if token_ids else market_id,
+                    market_id=market_id,
+                    title=title,
+                    description=description,
+                    outcomes=outcomes,
+                    current_prices=prices,
+                    volume_24h=volume_24h,
+                    liquidity=liquidity,
+                    last_traded=last_traded,
+                    category=category,
+                )
+
+                enriched.append(market)
+                if is_crypto:
+                    crypto_count += 1
+
+            except Exception as e:
+                logger.debug(f"Error parsing market: {e}")
+                continue
+
+        self._markets_tracked = len(enriched)
+        self._crypto_markets_found = crypto_count
+
+        logger.info(f"Scanned {len(enriched)} total markets, "
+                   f"found {crypto_count} crypto-related markets")
+
+        # Cache markets
+        self._market_cache = {m.market_id: m for m in enriched}
+
+        return enriched
+
+    def _is_crypto_market(self, title: str, description: str, category: str) -> bool:
+        """Check if market is crypto-related."""
+        text = f"{title} {description} {category}".lower()
+
+        # Check for crypto keywords
+        for coin, keywords in self.CRYPTO_KEYWORDS.items():
+            for keyword in keywords:
+                if keyword in text:
+                    return True
+
+        # Check for major macro events that affect crypto
+        macro_keywords = ["fed", "rate", "inflation", "election", "stimulus",
+                         "recession", "gdp", "jobs"]
+        for keyword in macro_keywords:
+            if keyword in text:
+                return True
+
+        return False
+
+    def detect_odds_movements(self, markets: List[PolymarketMarket]) -> List[OddsMovement]:
+        """
+        Compare current prices to cached prices.
+        Detect sharp movements (>5% in 1h, >10% in 24h).
+        Flag "smart money" patterns: large volume + price movement.
+
+        Returns:
+            List of movements with direction and magnitude
+        """
+        movements = []
+
+        for market in markets:
+            try:
+                current_prices = market.current_prices
+                if not current_prices:
+                    continue
+
+                # Get cached prices if available
+                if market.token_id in self._price_cache:
+                    cache_age = time.time() - self._price_cache_time.get(market.token_id, 0)
+
+                    if cache_age < 60:  # 1 hour cache for 1h movement
+                        old_prices = self._price_cache[market.token_id]
+
+                        # Calculate changes for each outcome
+                        for outcome_idx, (old_price, new_price) in enumerate(zip(old_prices, current_prices)):
+                            if old_price == 0:
+                                continue
+
+                            change = (new_price - old_price) / old_price
+
+                            # Check 1h movement threshold
+                            if abs(change) > self.odds_movement_threshold_1h:
+                                direction = "up" if change > 0 else "down"
+
+                                # Calculate smart money score
+                                smart_money_score = self._calculate_smart_money_score(
+                                    market, change, outcome_idx
+                                )
+
+                                movement = OddsMovement(
+                                    market_id=market.market_id,
+                                    title=market.title,
+                                    direction=direction,
+                                    magnitude=abs(change),
+                                    timeframe="1h",
+                                    current_probability=new_price,
+                                    volume_move=market.volume_24h,
+                                    smart_money_score=smart_money_score,
+                                )
+                                movements.append(movement)
+
+                # Update cache
+                self._price_cache[market.token_id] = current_prices
+                self._price_cache_time[market.token_id] = time.time()
+
+            except Exception as e:
+                logger.debug(f"Error detecting movement in {market.title}: {e}")
+                continue
+
+        self._movements_detected = len(movements)
+        logger.info(f"Detected {len(movements)} odds movements")
+
+        return movements
+
+    def _calculate_smart_money_score(self, market: PolymarketMarket,
+                                     price_change: float, outcome_idx: int) -> float:
+        """
+        Calculate score for smart money pattern detection.
+        0-1, where 1 = high confidence smart money (large volume + movement).
+        """
+        # Base score from magnitude of move
+        magnitude_score = min(abs(price_change) / 0.20, 1.0)  # Normalize to 20% move
+
+        # Volume boost: more volume = more likely smart money
+        volume_score = min(market.volume_24h / self.smart_money_volume_threshold, 1.0)
+
+        # Liquidity check: need adequate liquidity for large moves
+        liquidity_score = min(market.liquidity / (self.smart_money_volume_threshold * 2), 1.0)
+
+        # Composite (weighted average)
+        composite = (
+            magnitude_score * 0.5 +
+            volume_score * 0.3 +
+            liquidity_score * 0.2
+        )
+
+        return round(composite, 3)
+
+    def correlate_with_hyperliquid(self, polymarket_signals: List[Dict],
+                                   hl_regime: Optional[Dict] = None) -> List[Dict]:
+        """
+        Cross-reference Polymarket signals with Hyperliquid data.
+
+        Examples:
+          - "BTC above $100k by March" market moving up → bullish BTC signal
+          - "Fed rate cut" market spiking → risk-on → bullish crypto
+
+        Returns:
+            Correlated signals with confidence boost
+        """
+        if hl_regime is None:
+            hl_regime = {}
+
+        enhanced = []
+
+        for signal in polymarket_signals:
+            # Map market sentiment to crypto asset
+            coin = self._map_market_to_coin(signal.get("polymarket_market", ""))
+
+            if not coin:
+                continue
+
+            # Check event-to-crypto mapping
+            sentiment_boost = self._get_event_sentiment_boost(
+                signal.get("polymarket_market", ""),
+                hl_regime.get("overall_regime", "neutral")
+            )
+
+            # Boost confidence if correlated with regime
+            confidence = signal.get("confidence", 0.5)
+            if sentiment_boost != 0:
+                confidence = min(confidence + 0.15, 1.0) if sentiment_boost > 0 else max(confidence - 0.1, 0.0)
+
+            # Enhance signal
+            enhanced_signal = {
+                **signal,
+                "coin": coin,
+                "confidence": confidence,
+                "correlation_with_hl": f"Regime: {hl_regime.get('overall_regime', 'neutral')}, "
+                                       f"Boost: {'+' if sentiment_boost > 0 else ''}{sentiment_boost:.2f}",
+            }
+
+            enhanced.append(enhanced_signal)
+
+        return enhanced
+
+    def _map_market_to_coin(self, market_title: str) -> str:
+        """Map Polymarket title to crypto coin symbol."""
+        text = market_title.lower()
+
+        for coin, keywords in self.CRYPTO_KEYWORDS.items():
+            for keyword in keywords:
+                if keyword in text:
+                    return coin.upper()
+
+        return ""
+
+    def _get_event_sentiment_boost(self, market_title: str, hl_regime: str) -> float:
+        """
+        Determine sentiment boost from event-to-crypto mapping.
+        Returns float: positive for bullish, negative for bearish.
+        """
+        text = market_title.lower()
+
+        for event, (sentiment, weight) in self.EVENT_SENTIMENT_MAP.items():
+            if event in text:
+                if sentiment == "risk_on":
+                    return weight  # Positive boost for risk-on
+                elif sentiment == "risk_off":
+                    return -weight  # Negative boost for risk-off
+                else:
+                    return 0.0  # Neutral
+
+        return 0.0
+
+    def generate_signals(self, hl_regime: Optional[Dict] = None) -> List[Dict]:
+        """
+        Main entry point called by the bot loop.
+        Calls scan_markets → detect_odds_movements → correlate_with_hyperliquid.
+
+        Returns:
+            Signals in format compatible with the bot's signal pipeline:
+            {
+                "source": "polymarket",
+                "coin": str,
+                "side": "long" | "short",
+                "confidence": float,
+                "reason": str,
+                "polymarket_market": str,
+                "polymarket_probability": float,
+                "polymarket_volume_24h": float,
+                "correlation_with_hl": str,
+            }
+        """
+        self._scan_count += 1
+        self._last_scan_time = datetime.utcnow()
+
+        logger.info(f"Generating Polymarket signals (scan #{self._scan_count})...")
+
+        # Step 1: Scan markets
+        markets = self.scan_markets()
+        if not markets:
+            logger.warning("No markets found in scan")
+            return []
+
+        # Step 2: Detect odds movements
+        movements = self.detect_odds_movements(markets)
+        if not movements:
+            logger.info("No significant odds movements detected")
+            return []
+
+        # Step 3: Generate signals from movements
+        raw_signals = []
+        for movement in movements:
+            # Find the market
+            market = self._market_cache.get(movement.market_id)
+            if not market:
+                continue
+
+            # Skip low confidence smart money signals
+            if movement.smart_money_score < 0.3:
+                continue
+
+            # Determine signal direction
+            signal_side = "long" if movement.direction == "up" else "short"
+
+            # Map to crypto coin
+            coin = self._map_market_to_coin(movement.title)
+            if not coin:
+                continue
+
+            # Create raw signal
+            reason = (f"Polymarket odds movement: {movement.title} "
+                     f"{movement.direction} {movement.magnitude*100:.1f}% ({movement.timeframe}), "
+                     f"smart money score: {movement.smart_money_score:.2f}")
+
+            signal = {
+                "source": "polymarket",
+                "coin": coin,
+                "side": signal_side,
+                "confidence": min(movement.smart_money_score + 0.2, 1.0),
+                "reason": reason,
+                "polymarket_market": movement.title,
+                "polymarket_probability": movement.current_probability,
+                "polymarket_volume_24h": movement.volume_move,
+                "timestamp": datetime.utcnow().isoformat(),
+            }
+            raw_signals.append(signal)
+
+        # Step 4: Correlate with Hyperliquid regime
+        final_signals = self.correlate_with_hyperliquid(raw_signals, hl_regime)
+
+        self._signals_generated = len(final_signals)
+        logger.info(f"Generated {len(final_signals)} Polymarket signals")
+
+        return final_signals
+
+    def get_market_sentiment(self) -> Dict:
+        """
+        Aggregate crypto-related market probabilities into overall sentiment.
+
+        Returns:
+            {
+                "sentiment": "bullish" | "bearish" | "neutral",
+                "confidence": float (0-1),
+                "markets_analyzed": int,
+                "bullish_probability": float,
+                "bearish_probability": float,
+            }
+        """
+        if not self._market_cache:
+            self.scan_markets()
+
+        # Find crypto-relevant markets with price data
+        crypto_markets = [m for m in self._market_cache.values()
+                         if self._is_crypto_market(m.title, m.description, m.category)]
+
+        if not crypto_markets:
+            return {
+                "sentiment": "neutral",
+                "confidence": 0.0,
+                "markets_analyzed": 0,
+                "bullish_probability": 0.5,
+                "bearish_probability": 0.5,
+            }
+
+        # Aggregate probabilities
+        # For BTC/ETH markets: higher price = bullish
+        bullish_probs = []
+        bearish_probs = []
+
+        for market in crypto_markets:
+            if not market.current_prices:
+                continue
+
+            # Heuristic: if most outcomes are bullish (e.g., "BTC above X"),
+            # the highest price outcome is bullish
+            title_lower = market.title.lower()
+            is_bullish_market = any(kw in title_lower for kw in
+                                   ["above", "bull", "rally", "surge", "pump"])
+            is_bearish_market = any(kw in title_lower for kw in
+                                   ["below", "bear", "crash", "down", "dump"])
+
+            # Take probability of highest-priced outcome
+            if market.current_prices:
+                max_idx = market.current_prices.index(max(market.current_prices))
+                prob = market.current_prices[max_idx]
+
+                if is_bullish_market:
+                    bullish_probs.append(prob)
+                elif is_bearish_market:
+                    bearish_probs.append(prob)
+                else:
+                    # Neutral market — use 50/50
+                    bullish_probs.append(0.5)
+                    bearish_probs.append(0.5)
+
+        # Aggregate
+        avg_bullish = sum(bullish_probs) / len(bullish_probs) if bullish_probs else 0.5
+        avg_bearish = sum(bearish_probs) / len(bearish_probs) if bearish_probs else 0.5
+
+        # Determine overall sentiment
+        if avg_bullish > avg_bearish + 0.1:
+            sentiment = "bullish"
+            confidence = avg_bullish - 0.5  # 0-0.5 range
+        elif avg_bearish > avg_bullish + 0.1:
+            sentiment = "bearish"
+            confidence = avg_bearish - 0.5  # 0-0.5 range
+        else:
+            sentiment = "neutral"
+            confidence = 0.0
+
+        return {
+            "sentiment": sentiment,
+            "confidence": round(min(confidence, 0.5), 3),
+            "markets_analyzed": len(crypto_markets),
+            "bullish_probability": round(avg_bullish, 3),
+            "bearish_probability": round(avg_bearish, 3),
+        }
+
+    def get_stats(self) -> Dict:
+        """Return statistics for dashboard and monitoring."""
+        return {
+            "scan_count": self._scan_count,
+            "last_scan_time": self._last_scan_time.isoformat() if self._last_scan_time else None,
+            "signals_generated": self._signals_generated,
+            "markets_tracked": self._markets_tracked,
+            "crypto_markets_found": self._crypto_markets_found,
+            "movements_detected": self._movements_detected,
+            "cache_size": len(self._market_cache),
+            "rate_limit": f"{self.rate_limit_delay}s",
+            "cache_ttl": f"{self.cache_ttl_minutes}min",
+        }
+
+
+# ─── Standalone CLI for testing ───────────────────────────────────────
+
+if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(name)s] %(levelname)s: %(message)s"
+    )
+
+    print("\n=== Polymarket Scanner Test ===\n")
+
+    scanner = PolymarketScanner()
+
+    # Test 1: Scan markets
+    print("1. Scanning markets...")
+    markets = scanner.scan_markets()
+    print(f"   Found {len(markets)} markets, {scanner._crypto_markets_found} crypto-related")
+
+    # Test 2: Detect movements
+    print("\n2. Detecting odds movements...")
+    movements = scanner.detect_odds_movements(markets)
+    print(f"   Detected {len(movements)} movements")
+    for m in movements[:3]:
+        print(f"   - {m.title}: {m.direction} {m.magnitude*100:.1f}% ({m.smart_money_score:.2f})")
+
+    # Test 3: Generate signals
+    print("\n3. Generating signals...")
+    signals = scanner.generate_signals()
+    print(f"   Generated {len(signals)} signals")
+    for s in signals[:3]:
+        print(f"   - {s['coin']}: {s['side']} (conf: {s['confidence']:.2f})")
+
+    # Test 4: Market sentiment
+    print("\n4. Computing market sentiment...")
+    sentiment = scanner.get_market_sentiment()
+    print(f"   Sentiment: {sentiment['sentiment']} "
+          f"(bullish: {sentiment['bullish_probability']:.2f}, "
+          f"bearish: {sentiment['bearish_probability']:.2f})")
+
+    # Test 5: Stats
+    print("\n5. Scanner stats:")
+    stats = scanner.get_stats()
+    for key, val in stats.items():
+        print(f"   {key}: {val}")
+
+    print("\n=== Test Complete ===\n")
