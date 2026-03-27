@@ -643,9 +643,9 @@ class HyperliquidResearchBot:
 
                             # Boost score by up to 15% based on cross-venue confirmation
                             if cv_score > 0.15:
-                                original = s.get("score", 0.5)
+                                original = s.get("current_score", s.get("score", 0.5))
                                 boost = cv_score * 0.15  # Max 15% boost
-                                s["score"] = min(1.0, original + boost)
+                                s["current_score"] = min(1.0, original + boost)
 
                         boosted = sum(1 for s in top_strategies if s.get("metadata", {}).get("cross_venue_score", 0) > 0.15)
                         self.logger.info(f"  Cross-venue: confirmed {len(signals_to_confirm)} signals, "
