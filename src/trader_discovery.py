@@ -310,8 +310,19 @@ class TraderDiscovery:
                     margin_used=pos["margin_used"],
                 )
 
-        # Compute bot score (0 = definitely human, higher = more bot-like)
-        bot_score = self._get_bot_score(fills, positions, trade_analysis)
+        # V6: Adaptive bot detection (continuous probability 0-1)
+        try:
+            from src.adaptive_bot_detector import AdaptiveBotDetector
+            _detector = AdaptiveBotDetector()
+            bot_result = _detector.detect(fills, positions, trade_analysis, address)
+            bot_score = config.BOT_THRESHOLD if bot_result.is_bot else 0
+            if bot_result.is_bot:
+                logger.info(f"Bot DETECTED (prob={bot_result.bot_probability:.0%}, "
+                           f"conf={bot_result.confidence:.0%}): {address[:10]}... "
+                           f"reason={bot_result.reason}")
+        except Exception:
+            # Fallback to legacy detection
+            bot_score = self._get_bot_score(fills, positions, trade_analysis)
 
         # Build trader profile (always, even for suspected bots — let caller decide)
         profile = {

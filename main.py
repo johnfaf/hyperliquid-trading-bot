@@ -48,6 +48,10 @@ from src.exchanges.scanner import MultiExchangeScanner
 from src import telegram_bot as tg
 from src.golden_bridge import get_golden_copy_signals, auto_connect_golden_wallets, get_stats as golden_stats
 from src.hyperliquid_client import start_websocket, get_api_stats
+from src.ws_position_monitor import PositionMonitor
+from src.adaptive_bot_detector import AdaptiveBotDetector
+from src.sharpe_calculator import calculate_sharpe
+from src.regime_strategy_filter import RegimeStrategyFilter
 
 # ─── Logging Setup ─────────────────────────────────────────────
 
@@ -205,6 +209,24 @@ class HyperliquidResearchBot:
         )
         self.reporter = Reporter()
         self.arena = AlphaArena()
+
+        # V6: Phase 1 signal quality upgrades
+        self.adaptive_bot_detector = AdaptiveBotDetector()
+        self.regime_strategy_filter = RegimeStrategyFilter()
+
+        # V6: Real-time WebSocket position monitor for copy trading
+        try:
+            top_traders = db.get_active_traders()[:20]
+            if top_traders:
+                self.position_monitor = PositionMonitor(max_signal_queue=500)
+                self.position_monitor.start([t["address"] for t in top_traders])
+                self.logger.info(f"WebSocket position monitor started for {len(top_traders)} traders")
+            else:
+                self.position_monitor = None
+                self.logger.info("No active traders yet — position monitor will start after first discovery")
+        except Exception as e:
+            self.position_monitor = None
+            self.logger.warning(f"Position monitor init failed (REST copy trading as fallback): {e}")
 
         # Paper trader with ALL V2 + V2.5 components wired in
         self.paper_trader = PaperTrader(
@@ -481,11 +503,21 @@ class HyperliquidResearchBot:
             self.logger.info("Phase 4: Paper Trading (regime-aware)")
             top_strategies = self.scorer.get_top_strategies(n=50)
 
-            # Filter strategies by regime — pause those that don't fit
+            # V6: Enhanced regime-aware strategy filtering (compatibility matrix)
             if regime_data:
-                top_strategies = self.regime_detector.filter_strategies_by_regime(
-                    top_strategies, regime_data
-                )
+                try:
+                    top_strategies = self.regime_strategy_filter.filter(
+                        top_strategies, regime_data
+                    )
+                    report = self.regime_strategy_filter.get_regime_report(
+                        top_strategies, regime_data
+                    )
+                    self.logger.info(f"  Regime filter (V6): {report}")
+                except Exception as e:
+                    self.logger.debug(f"  V6 regime filter error, using legacy: {e}")
+                    top_strategies = self.regime_detector.filter_strategies_by_regime(
+                        top_strategies, regime_data
+                    )
                 self.logger.info(f"  Post-regime filter: {len(top_strategies)} strategies active")
 
             # V3: Signal Processing — dedup, conflict resolution, compression
@@ -784,9 +816,15 @@ class HyperliquidResearchBot:
             except Exception as e:
                 self.logger.warning(f"  Options flow trading error: {e}")
 
-            # Phase 4b: Copy trading - mirror top trader positions (V2: firewall gated)
-            self.logger.info("Phase 4b: Copy Trading (V2)")
-            copy_signals = self.copy_trader.scan_top_traders(top_n=10)
+            # Phase 4b: Copy trading - mirror top trader positions
+            # V6: Drain real-time WebSocket signals first, fall back to REST polling
+            self.logger.info("Phase 4b: Copy Trading (V6 — WebSocket + REST)")
+            ws_signals = []
+            if self.position_monitor:
+                ws_signals = self.position_monitor.drain_signals()
+                if ws_signals:
+                    self.logger.info(f"  WebSocket position monitor: {len(ws_signals)} real-time signals")
+            copy_signals = ws_signals + self.copy_trader.scan_top_traders(top_n=10)
 
             # Inject golden wallet signals (higher confidence, proven profitable)
             try:
