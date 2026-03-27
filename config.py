@@ -79,12 +79,21 @@ PAPER_TRADING_STOP_LOSS_PCT = 0.05      # 5%
 PAPER_TRADING_TAKE_PROFIT_PCT = 0.10    # 10%
 
 # ─── Scheduling ────────────────────────────────────────────────
-# Main loop interval (seconds)
-MAIN_LOOP_INTERVAL = 300  # 5 minutes
-# Full research cycle interval (seconds)
-RESEARCH_CYCLE_INTERVAL = 3600  # 1 hour
-# Strategy re-scoring interval (seconds)
-SCORING_INTERVAL = 86400  # daily
+# 3-tier scheduling:
+#   Tier 1 — Fast cycle:   position checks, SL/TP, copy-trade scan
+#   Tier 2 — Trading cycle: regime detection, scoring, paper trading, arena
+#   Tier 3 — Discovery:     leaderboard scan, bot detection, strategy ID
+FAST_CYCLE_INTERVAL = 60           # 1 minute — position management
+TRADING_CYCLE_INTERVAL = int(os.environ.get("TRADING_CYCLE_INTERVAL", 300))   # 5 minutes — regime + trading
+DISCOVERY_CYCLE_INTERVAL = int(os.environ.get("DISCOVERY_CYCLE_INTERVAL", 86400))  # 24 hours — leaderboard scan
+# Env-overridable so you can change on Railway without redeploying code:
+#   TRADING_CYCLE_INTERVAL=180  → trade every 3 min (high vol)
+#   DISCOVERY_CYCLE_INTERVAL=43200  → discover every 12h
+
+# Legacy (kept for backward compat, not used by new scheduler)
+MAIN_LOOP_INTERVAL = 300
+RESEARCH_CYCLE_INTERVAL = TRADING_CYCLE_INTERVAL
+SCORING_INTERVAL = 86400
 
 # ─── Multi-Exchange Scanner ────────────────────────────────────
 # Enable/disable secondary venues (Hyperliquid is always primary)

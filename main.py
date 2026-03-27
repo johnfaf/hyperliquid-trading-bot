@@ -154,6 +154,7 @@ class HyperliquidResearchBot:
         self._last_research = 0
         self._last_scoring = 0
         self._last_report = 0
+        self._last_discovery = 0  # Track when we last ran full discovery
         self._cycle_count = 0
         self._fast_cycle_count = 0
 
@@ -293,16 +294,16 @@ class HyperliquidResearchBot:
         else:
             self.logger.info("Telegram not configured — set TELEGRAM_BOT_TOKEN & TELEGRAM_CHAT_ID to enable.")
 
-    def run_once(self):
-        """Run a single complete research + trading cycle."""
-        # V6: Check live trader kill switch before cycle
-        if self.live_trader and not self.live_trader.dry_run:
-            if self.live_trader.check_daily_loss():
-                self.logger.error("🛑 KILL SWITCH ACTIVE — daily loss limit hit, skipping live trades")
+    # ─── Tier 3: Discovery (runs once per day) ─────────────────────
 
-        self._cycle_count += 1
+    def _run_discovery(self):
+        """
+        Heavy discovery cycle: scan leaderboard, bot-detect, identify strategies.
+        Runs once per day to refresh the trader/strategy pool.
+        API-intensive (~3000+ calls) — not needed every trading cycle.
+        """
         self.logger.info(f"{'='*60}")
-        self.logger.info(f"Starting cycle #{self._cycle_count}")
+        self.logger.info("DISCOVERY CYCLE — refreshing trader pool")
         self.logger.info(f"{'='*60}")
 
         try:
@@ -319,7 +320,6 @@ class HyperliquidResearchBot:
             all_strategies = []
 
             for trader in traders:
-                # Build a minimal profile for strategy identification
                 from src import hyperliquid_client as hl
                 state = hl.get_user_state(trader["address"])
                 if state:
@@ -344,6 +344,30 @@ class HyperliquidResearchBot:
                 saved_ids = self.identifier.save_identified_strategies(all_strategies)
                 self.logger.info(f"  Identified and saved {len(saved_ids)} strategies")
 
+            self._last_discovery = time.time()
+            self.logger.info("Discovery cycle complete.")
+        except Exception as e:
+            self.logger.error(f"Discovery cycle error: {e}", exc_info=True)
+
+    # ─── Tier 2: Trading cycle (runs every 5 min) ────────────────
+
+    def _run_trading_cycle(self):
+        """
+        Lightweight trading cycle: score strategies, detect regime, trade.
+        Uses existing DB data from last discovery — no leaderboard scanning.
+        Runs every ~5 minutes to react to market changes quickly.
+        """
+        # V6: Check live trader kill switch before cycle
+        if self.live_trader and not self.live_trader.dry_run:
+            if self.live_trader.check_daily_loss():
+                self.logger.error("KILL SWITCH ACTIVE — daily loss limit hit, skipping live trades")
+
+        self._cycle_count += 1
+        self.logger.info(f"{'='*60}")
+        self.logger.info(f"Starting trading cycle #{self._cycle_count}")
+        self.logger.info(f"{'='*60}")
+
+        try:
             # Phase 3: Score all strategies
             self.logger.info("Phase 3: Strategy Scoring")
             score_results = self.scorer.score_all_strategies()
@@ -1192,33 +1216,40 @@ class HyperliquidResearchBot:
             backup_to_json()
 
             # V6: Enhanced Telegram alerts — daily P&L + top mover detection
+            # With 5-min trading cycles: 288 cycles/day, 2016 cycles/week
+            cycles_per_day = max(int(86400 / config.TRADING_CYCLE_INTERVAL), 1)
             try:
-                if tg.is_configured() and self._cycle_count % 24 == 0:  # ~daily with 1hr cycles
+                if tg.is_configured() and self._cycle_count % cycles_per_day == 0:
                     tg_alerts.send_daily_pnl_summary()
                     self.logger.info("  Sent daily P&L Telegram summary")
-                if tg.is_configured() and self._cycle_count % 168 == 0:  # ~weekly
+                if tg.is_configured() and self._cycle_count % (cycles_per_day * 7) == 0:
                     tg_alerts.send_weekly_digest()
                     self.logger.info("  Sent weekly Telegram digest")
             except Exception as e:
                 self.logger.debug(f"  Enhanced alerts error: {e}")
 
-            # V6: Export HTML report every 24 cycles (~daily)
+            # V6: Export HTML report once per day
             try:
-                if self._cycle_count % 24 == 0:
+                if self._cycle_count % cycles_per_day == 0:
                     report_path = report_exporter.export_html_report()
                     self.logger.info(f"  HTML report exported: {report_path}")
             except Exception as e:
                 self.logger.debug(f"  Report export error: {e}")
 
-            self.logger.info(f"Cycle #{self._cycle_count} complete.")
+            self.logger.info(f"Trading cycle #{self._cycle_count} complete.")
 
         except Exception as e:
             self.logger.error(f"Error in cycle #{self._cycle_count}: {e}", exc_info=True)
 
+    def run_once(self):
+        """Backward-compat: run discovery + trading cycle together (used by CLI --once)."""
+        self._run_discovery()
+        self._run_trading_cycle()
+
     def _fast_cycle(self):
         """
         Fast cycle: check positions + copy-trade scan.
-        Runs every 60s between full research cycles.
+        Runs every 60s between trading cycles.
         """
         self._fast_cycle_count += 1
         try:
@@ -1238,7 +1269,20 @@ class HyperliquidResearchBot:
             self.logger.error(f"Error in fast cycle: {e}")
 
     def run_loop(self):
-        """Run the bot in a continuous loop."""
+        """
+        Run the bot in a continuous loop with 3-tier scheduling:
+
+        Tier 1 — Fast cycle (every 60s):
+            Position SL/TP checks, copy-trade scanning
+
+        Tier 2 — Trading cycle (every 5 min, env-tunable):
+            Regime detection, strategy scoring, paper trading, arena
+            Uses cached DB data — no leaderboard scanning
+
+        Tier 3 — Discovery cycle (every 24h, env-tunable):
+            Full leaderboard scan, bot detection, strategy identification
+            Heavy API usage — only needs to run once per day
+        """
         self.running = True
 
         # Handle graceful shutdown — backup DB before exit
@@ -1254,19 +1298,37 @@ class HyperliquidResearchBot:
         signal.signal(signal.SIGTERM, signal_handler)
 
         self.logger.info("Bot starting continuous operation...")
-        self.logger.info(f"  Fast cycle interval: 60s (position checks + copy trading)")
-        self.logger.info(f"  Full research interval: {config.RESEARCH_CYCLE_INTERVAL}s")
+        self.logger.info(f"  Fast cycle:      every {config.FAST_CYCLE_INTERVAL}s (position checks + copy trading)")
+        self.logger.info(f"  Trading cycle:   every {config.TRADING_CYCLE_INTERVAL}s (regime + scoring + trading)")
+        self.logger.info(f"  Discovery cycle: every {config.DISCOVERY_CYCLE_INTERVAL}s (leaderboard scan)")
+
+        # Run discovery on first boot if we have no data yet
+        trader_count = 0
+        try:
+            trader_count = len(db.get_active_traders())
+        except Exception:
+            pass
+
+        if trader_count == 0:
+            self.logger.info("No traders in DB — running initial discovery...")
+            self._run_discovery()
+        else:
+            self.logger.info(f"DB has {trader_count} traders — skipping boot discovery, next at midnight UTC")
 
         while self.running:
             now = time.time()
 
             try:
-                # Run full research cycle periodically (every hour)
-                if now - self._last_research >= config.RESEARCH_CYCLE_INTERVAL:
-                    self.run_once()
+                # Tier 3: Discovery — once per day
+                if now - self._last_discovery >= config.DISCOVERY_CYCLE_INTERVAL:
+                    self._run_discovery()
+
+                # Tier 2: Trading — every 5 min (or env-configured)
+                if now - self._last_research >= config.TRADING_CYCLE_INTERVAL:
+                    self._run_trading_cycle()
                     self._last_research = now
                 else:
-                    # Fast cycle: check positions + copy trades (every 60s)
+                    # Tier 1: Fast — every 60s between trading cycles
                     self._fast_cycle()
 
                 # Generate daily report
@@ -1282,9 +1344,9 @@ class HyperliquidResearchBot:
             if self._fast_cycle_count % 10 == 0 and self._fast_cycle_count > 0:
                 print(self.reporter.print_live_status())
 
-            # Sleep 60s between fast cycles
+            # Sleep between fast cycles
             if self.running:
-                time.sleep(60)
+                time.sleep(config.FAST_CYCLE_INTERVAL)
 
         self.logger.info("Bot stopped.")
         # Final report
