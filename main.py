@@ -294,6 +294,39 @@ class HyperliquidResearchBot:
         else:
             self.logger.info("Telegram not configured — set TELEGRAM_BOT_TOKEN & TELEGRAM_CHAT_ID to enable.")
 
+    # ─── Discovery timer persistence ─────────────────────────────
+    def _save_last_discovery_time(self):
+        """Persist the last discovery timestamp to DB so it survives redeploys."""
+        try:
+            conn = db.get_connection()
+            conn.execute(
+                "INSERT OR REPLACE INTO bot_state (key, value) VALUES (?, ?)",
+                ("last_discovery_ts", str(self._last_discovery))
+            )
+            conn.commit()
+            conn.close()
+        except Exception:
+            pass  # Table might not exist yet — non-critical
+
+    def _restore_last_discovery_time(self) -> float:
+        """Restore last discovery timestamp from DB. Returns 0 if not found."""
+        try:
+            conn = db.get_connection()
+            # Ensure the table exists
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS bot_state "
+                "(key TEXT PRIMARY KEY, value TEXT)"
+            )
+            conn.commit()
+            row = conn.execute(
+                "SELECT value FROM bot_state WHERE key = ?",
+                ("last_discovery_ts",)
+            ).fetchone()
+            conn.close()
+            return float(row["value"]) if row else 0.0
+        except Exception:
+            return 0.0
+
     # ─── Tier 3: Discovery (runs once per day) ─────────────────────
 
     def _run_discovery(self):
@@ -364,6 +397,7 @@ class HyperliquidResearchBot:
                 self.logger.warning(f"Golden wallet scan failed: {e}")
 
             self._last_discovery = time.time()
+            self._save_last_discovery_time()
             self.logger.info("Discovery cycle complete.")
         except Exception as e:
             self.logger.error(f"Discovery cycle error: {e}", exc_info=True)
@@ -592,7 +626,7 @@ class HyperliquidResearchBot:
 
             # Phase 4: Paper trade top strategies (regime-filtered)
             self.logger.info("Phase 4: Paper Trading (regime-aware)")
-            top_strategies = self.scorer.get_top_strategies(n=50)
+            top_strategies = self.scorer.get_top_strategies()  # Uses config.MAX_STRATEGIES_PER_CYCLE (default 15)
 
             # V6: Enhanced regime-aware strategy filtering (compatibility matrix)
             if regime_data:
@@ -617,6 +651,34 @@ class HyperliquidResearchBot:
                 top_strategies, regime_data=regime_data
             )
             self.logger.info(f"  Post-signal-processor: {len(top_strategies)} strategies")
+
+            # Inject Polymarket signals as synthetic strategies so the decision
+            # engine can rank them alongside trader-derived strategies.
+            if polymarket_signals:
+                for pm in polymarket_signals:
+                    synthetic = {
+                        "id": None,
+                        "name": f"polymarket_{pm.get('coin', 'UNK')}_{pm.get('side', '?')}",
+                        "strategy_type": "event_driven",
+                        "trader_address": "polymarket",
+                        "current_score": pm.get("confidence", 0.5),
+                        "confidence": pm.get("confidence", 0.5),
+                        "direction": pm.get("side", "long"),
+                        "side": pm.get("side", "long"),
+                        "source": "polymarket",
+                        "parameters": {
+                            "coins": [pm.get("coin", "BTC")],
+                            "market": pm.get("polymarket_market", ""),
+                            "probability": pm.get("polymarket_probability", 0),
+                        },
+                        "metrics": {},
+                        "metadata": {
+                            "polymarket_volume_24h": pm.get("polymarket_volume_24h", 0),
+                            "reason": pm.get("reason", ""),
+                        },
+                    }
+                    top_strategies.append(synthetic)
+                self.logger.info(f"  Injected {len(polymarket_signals)} Polymarket signals into strategy pipeline")
 
             # Check existing positions first (V2: outcomes auto-feed to agent scorer + firewall)
             closed = self.paper_trader.check_open_positions()
@@ -1321,7 +1383,9 @@ class HyperliquidResearchBot:
         self.logger.info(f"  Trading cycle:   every {config.TRADING_CYCLE_INTERVAL}s (regime + scoring + trading)")
         self.logger.info(f"  Discovery cycle: every {config.DISCOVERY_CYCLE_INTERVAL}s (leaderboard scan)")
 
-        # Run discovery on first boot if we have no data yet
+        # Run discovery on first boot if we have no data yet.
+        # Also restore last discovery timestamp from DB so a redeploy
+        # mid-day doesn't re-trigger the expensive leaderboard scan.
         trader_count = 0
         try:
             trader_count = len(db.get_active_traders())
@@ -1332,7 +1396,19 @@ class HyperliquidResearchBot:
             self.logger.info("No traders in DB — running initial discovery...")
             self._run_discovery()
         else:
-            self.logger.info(f"DB has {trader_count} traders — skipping boot discovery, next at midnight UTC")
+            # Restore last discovery time from DB, or default to "now" so the
+            # 24h countdown starts from this boot (not from epoch 0).
+            restored_ts = self._restore_last_discovery_time()
+            if restored_ts and (time.time() - restored_ts) < config.DISCOVERY_CYCLE_INTERVAL:
+                self._last_discovery = restored_ts
+                remaining_h = (config.DISCOVERY_CYCLE_INTERVAL - (time.time() - restored_ts)) / 3600
+                self.logger.info(f"DB has {trader_count} traders — restored discovery timer, "
+                               f"next discovery in {remaining_h:.1f}h")
+            else:
+                # Either no saved timestamp or it's stale — set to now
+                self._last_discovery = time.time()
+                self.logger.info(f"DB has {trader_count} traders — skipping boot discovery, "
+                               f"next in {config.DISCOVERY_CYCLE_INTERVAL/3600:.0f}h")
 
         while self.running:
             now = time.time()

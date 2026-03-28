@@ -208,18 +208,41 @@ class StrategyScorer:
             active_count = sum(1 for r in results if r["active"])
             logger.info(f"Active strategies: {active_count}/{len(results)}")
 
+        # Prune: if active strategies exceed MAX_ACTIVE_STRATEGIES,
+        # deactivate the lowest-scoring ones to prevent unbounded growth
+        active_results = [r for r in results if r["active"]]
+        if len(active_results) > config.MAX_ACTIVE_STRATEGIES:
+            # Keep top MAX_ACTIVE_STRATEGIES, deactivate the rest
+            to_deactivate = active_results[config.MAX_ACTIVE_STRATEGIES:]
+            for r in to_deactivate:
+                try:
+                    with db.get_connection() as conn:
+                        conn.execute(
+                            "UPDATE strategies SET active = 0 WHERE id = ?",
+                            (r["strategy_id"],)
+                        )
+                    r["active"] = False
+                except Exception:
+                    pass
+            logger.info(f"Pruned {len(to_deactivate)} excess strategies "
+                       f"(keeping top {config.MAX_ACTIVE_STRATEGIES})")
+
         # Log the scoring cycle
+        active_count = sum(1 for r in results if r["active"])
         db.log_research_cycle(
             cycle_type="scoring",
-            summary=f"Scored {len(results)} strategies, {sum(1 for r in results if r['active'])} active",
+            summary=f"Scored {len(results)} strategies, {active_count} active",
             details={"top_strategies": results[:5]},
             strategies_updated=len(results),
         )
 
         return results
 
-    def get_top_strategies(self, n: int = 10) -> List[Dict]:
-        """Get the top N strategies by current score."""
+    def get_top_strategies(self, n: int = None) -> List[Dict]:
+        """Get the top N strategies by current score.
+        Defaults to config.MAX_STRATEGIES_PER_CYCLE."""
+        if n is None:
+            n = config.MAX_STRATEGIES_PER_CYCLE
         strategies = db.get_active_strategies()
         return strategies[:n]
 

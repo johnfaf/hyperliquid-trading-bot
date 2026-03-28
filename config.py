@@ -61,7 +61,11 @@ TIME_WINDOWS = {
 # Weight decay factor for older strategy scores (per day)
 SCORE_DECAY_RATE = 0.95
 # Minimum score to keep a strategy active
-MIN_STRATEGY_SCORE = 0.1
+MIN_STRATEGY_SCORE = 0.15
+# Max active strategies in DB — prune lowest-scoring beyond this
+MAX_ACTIVE_STRATEGIES = int(os.environ.get("MAX_ACTIVE_STRATEGIES", 200))
+# Max strategies per trading cycle fed to decision engine
+MAX_STRATEGIES_PER_CYCLE = int(os.environ.get("MAX_STRATEGIES_PER_CYCLE", 15))
 # Scoring weights
 SCORING_WEIGHTS = {
     "pnl": 0.30,
