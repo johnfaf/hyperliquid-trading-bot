@@ -1794,7 +1794,9 @@ def main():
     parser.add_argument("--cbt-end", type=str, default=None,
                         help="End date YYYY-MM-DD (default: now)")
     parser.add_argument("--cbt-strategy", type=str, default="momentum",
-                        help="Strategy: momentum, mean_reversion, breakout, rsi (default: momentum)")
+                        help="Strategy: momentum, mean_reversion, breakout, rsi, macd, macd_histogram, "
+                             "vwap_reversion, stochastic, adx_trend, supertrend, ema_rsi_combo, "
+                             "volume_breakout, ichimoku (default: momentum)")
     parser.add_argument("--cbt-import", type=str, default=None,
                         help="Import candles from CSV or JSON file instead of API")
     parser.add_argument("--cbt-sweep", type=str, default=None,

@@ -67,6 +67,40 @@ class CandleBacktestConfig:
     rsi_oversold: float = 30.0
     bb_period: int = 20
     bb_std: float = 2.0
+
+    # MACD params
+    macd_fast: int = 12
+    macd_slow: int = 26
+    macd_signal: int = 9
+
+    # VWAP params
+    vwap_std: float = 1.5               # Std devs for VWAP bands
+
+    # Ichimoku params
+    ichi_tenkan: int = 9
+    ichi_kijun: int = 26
+    ichi_senkou_b: int = 52
+
+    # Stochastic params
+    stoch_k: int = 14
+    stoch_d: int = 3
+    stoch_overbought: float = 80.0
+    stoch_oversold: float = 20.0
+
+    # ADX / Trend params
+    adx_period: int = 14
+    adx_threshold: float = 25.0         # Min ADX to confirm trend
+
+    # SuperTrend params
+    supertrend_period: int = 10
+    supertrend_mult: float = 3.0
+
+    # Volume params
+    vol_sma_period: int = 20
+    vol_spike_mult: float = 2.0         # Volume spike multiplier
+
+    # Multi-timeframe
+    ema_trend_period: int = 200          # Long EMA for trend filter
     atr_period: int = 14
 
     # Speed
@@ -226,12 +260,342 @@ def _signals_rsi(close: np.ndarray, cfg: CandleBacktestConfig) -> np.ndarray:
     return signals
 
 
+def _signals_macd(close: np.ndarray, cfg: CandleBacktestConfig) -> np.ndarray:
+    """MACD crossover: buy when MACD crosses above signal line."""
+    fast_ema = _ema(close, cfg.macd_fast)
+    slow_ema = _ema(close, cfg.macd_slow)
+    macd_line = fast_ema - slow_ema
+    signal_line = _ema(macd_line, cfg.macd_signal)
+    signals = np.zeros(len(close), dtype=np.int8)
+
+    for i in range(1, len(close)):
+        if np.isnan(macd_line[i]) or np.isnan(signal_line[i]):
+            continue
+        if np.isnan(macd_line[i - 1]) or np.isnan(signal_line[i - 1]):
+            continue
+        if macd_line[i] > signal_line[i] and macd_line[i - 1] <= signal_line[i - 1]:
+            signals[i] = 1   # MACD crossed above signal → long
+        elif macd_line[i] < signal_line[i] and macd_line[i - 1] >= signal_line[i - 1]:
+            signals[i] = -1  # MACD crossed below signal → short
+    return signals
+
+
+def _signals_macd_histogram(close: np.ndarray, cfg: CandleBacktestConfig) -> np.ndarray:
+    """MACD histogram reversal: trades when histogram changes direction."""
+    fast_ema = _ema(close, cfg.macd_fast)
+    slow_ema = _ema(close, cfg.macd_slow)
+    macd_line = fast_ema - slow_ema
+    signal_line = _ema(macd_line, cfg.macd_signal)
+    hist = macd_line - signal_line
+    signals = np.zeros(len(close), dtype=np.int8)
+
+    for i in range(2, len(close)):
+        if np.isnan(hist[i]) or np.isnan(hist[i - 1]) or np.isnan(hist[i - 2]):
+            continue
+        # Histogram turned positive after decreasing
+        if hist[i] > 0 and hist[i] > hist[i - 1] and hist[i - 1] <= hist[i - 2]:
+            signals[i] = 1
+        # Histogram turned negative after increasing
+        elif hist[i] < 0 and hist[i] < hist[i - 1] and hist[i - 1] >= hist[i - 2]:
+            signals[i] = -1
+    return signals
+
+
+def _signals_vwap(close: np.ndarray, high: np.ndarray, low: np.ndarray,
+                  volume: np.ndarray, cfg: CandleBacktestConfig) -> np.ndarray:
+    """VWAP mean reversion: buy below lower band, sell above upper band."""
+    typical = (high + low + close) / 3.0
+    cum_vol = np.cumsum(volume)
+    cum_tp_vol = np.cumsum(typical * volume)
+    signals = np.zeros(len(close), dtype=np.int8)
+
+    for i in range(20, len(close)):
+        if cum_vol[i] == 0:
+            continue
+        vwap = cum_tp_vol[i] / cum_vol[i]
+        # Rolling std of (close - vwap)
+        window = close[max(0, i - 50):i + 1]
+        vwap_window = cum_tp_vol[max(0, i - 50):i + 1] / np.maximum(cum_vol[max(0, i - 50):i + 1], 1e-10)
+        dev = np.std(window - vwap_window)
+        upper = vwap + cfg.vwap_std * dev
+        lower = vwap - cfg.vwap_std * dev
+
+        if close[i] <= lower and close[i - 1] > lower:
+            signals[i] = 1   # Below lower VWAP band → long
+        elif close[i] >= upper and close[i - 1] < upper:
+            signals[i] = -1  # Above upper VWAP band → short
+    return signals
+
+
+def _signals_stochastic(close: np.ndarray, high: np.ndarray,
+                        low: np.ndarray, cfg: CandleBacktestConfig) -> np.ndarray:
+    """Stochastic oscillator: buy on oversold %K/%D cross, sell on overbought."""
+    k_period = cfg.stoch_k
+    d_period = cfg.stoch_d
+    n = len(close)
+    stoch_k = np.full(n, np.nan)
+
+    for i in range(k_period - 1, n):
+        highest = np.max(high[i - k_period + 1:i + 1])
+        lowest = np.min(low[i - k_period + 1:i + 1])
+        if highest != lowest:
+            stoch_k[i] = 100 * (close[i] - lowest) / (highest - lowest)
+        else:
+            stoch_k[i] = 50.0
+
+    stoch_d = _sma(stoch_k, d_period)
+    signals = np.zeros(n, dtype=np.int8)
+
+    for i in range(1, n):
+        if np.isnan(stoch_k[i]) or np.isnan(stoch_d[i]):
+            continue
+        if np.isnan(stoch_k[i - 1]) or np.isnan(stoch_d[i - 1]):
+            continue
+        # %K crosses above %D in oversold zone
+        if (stoch_k[i] > stoch_d[i] and stoch_k[i - 1] <= stoch_d[i - 1]
+                and stoch_k[i] < cfg.stoch_oversold + 10):
+            signals[i] = 1
+        # %K crosses below %D in overbought zone
+        elif (stoch_k[i] < stoch_d[i] and stoch_k[i - 1] >= stoch_d[i - 1]
+              and stoch_k[i] > cfg.stoch_overbought - 10):
+            signals[i] = -1
+    return signals
+
+
+def _adx(high: np.ndarray, low: np.ndarray, close: np.ndarray,
+         period: int = 14) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Compute ADX, +DI, -DI."""
+    n = len(close)
+    adx_out = np.full(n, np.nan)
+    plus_di = np.full(n, np.nan)
+    minus_di = np.full(n, np.nan)
+
+    if n < period * 2:
+        return adx_out, plus_di, minus_di
+
+    # True range
+    tr = np.zeros(n)
+    plus_dm = np.zeros(n)
+    minus_dm = np.zeros(n)
+
+    for i in range(1, n):
+        tr[i] = max(high[i] - low[i],
+                     abs(high[i] - close[i - 1]),
+                     abs(low[i] - close[i - 1]))
+        up_move = high[i] - high[i - 1]
+        down_move = low[i - 1] - low[i]
+        plus_dm[i] = up_move if (up_move > down_move and up_move > 0) else 0.0
+        minus_dm[i] = down_move if (down_move > up_move and down_move > 0) else 0.0
+
+    # Wilder smoothing
+    atr_sm = np.mean(tr[1:period + 1])
+    pdm_sm = np.mean(plus_dm[1:period + 1])
+    mdm_sm = np.mean(minus_dm[1:period + 1])
+
+    for i in range(period, n):
+        if i > period:
+            atr_sm = (atr_sm * (period - 1) + tr[i]) / period
+            pdm_sm = (pdm_sm * (period - 1) + plus_dm[i]) / period
+            mdm_sm = (mdm_sm * (period - 1) + minus_dm[i]) / period
+
+        if atr_sm > 0:
+            plus_di[i] = 100 * pdm_sm / atr_sm
+            minus_di[i] = 100 * mdm_sm / atr_sm
+
+    # ADX from smoothed DX
+    dx = np.full(n, np.nan)
+    for i in range(period, n):
+        if not np.isnan(plus_di[i]) and not np.isnan(minus_di[i]):
+            s = plus_di[i] + minus_di[i]
+            dx[i] = 100 * abs(plus_di[i] - minus_di[i]) / s if s > 0 else 0
+
+    # Smooth DX into ADX
+    first_valid = [i for i in range(n) if not np.isnan(dx[i])]
+    if len(first_valid) >= period:
+        start = first_valid[0]
+        adx_out[start + period - 1] = np.nanmean(dx[start:start + period])
+        for i in range(start + period, n):
+            if not np.isnan(dx[i]):
+                adx_out[i] = (adx_out[i - 1] * (period - 1) + dx[i]) / period
+
+    return adx_out, plus_di, minus_di
+
+
+def _signals_adx_trend(close: np.ndarray, high: np.ndarray,
+                       low: np.ndarray, cfg: CandleBacktestConfig) -> np.ndarray:
+    """ADX trend following: trade only when trend is strong (ADX > threshold).
+    Uses +DI/-DI crossover for direction."""
+    adx_vals, plus_di, minus_di = _adx(high, low, close, cfg.adx_period)
+    signals = np.zeros(len(close), dtype=np.int8)
+
+    for i in range(1, len(close)):
+        if np.isnan(adx_vals[i]) or np.isnan(plus_di[i]) or np.isnan(minus_di[i]):
+            continue
+        if adx_vals[i] < cfg.adx_threshold:
+            continue  # No trade in weak trend
+
+        if (plus_di[i] > minus_di[i] and
+                (np.isnan(plus_di[i - 1]) or plus_di[i - 1] <= minus_di[i - 1])):
+            signals[i] = 1   # +DI crossed above -DI in strong trend → long
+        elif (minus_di[i] > plus_di[i] and
+              (np.isnan(minus_di[i - 1]) or minus_di[i - 1] <= plus_di[i - 1])):
+            signals[i] = -1  # -DI crossed above +DI in strong trend → short
+    return signals
+
+
+def _signals_supertrend(close: np.ndarray, high: np.ndarray,
+                        low: np.ndarray, cfg: CandleBacktestConfig) -> np.ndarray:
+    """SuperTrend indicator: trend-following overlay using ATR bands."""
+    period = cfg.supertrend_period
+    mult = cfg.supertrend_mult
+    atr = _atr(high, low, close, period)
+    n = len(close)
+    signals = np.zeros(n, dtype=np.int8)
+
+    upper_band = np.zeros(n)
+    lower_band = np.zeros(n)
+    supertrend = np.zeros(n)
+    direction = np.ones(n, dtype=np.int8)  # 1=up, -1=down
+
+    for i in range(period, n):
+        if np.isnan(atr[i]):
+            continue
+
+        hl2 = (high[i] + low[i]) / 2
+        basic_upper = hl2 + mult * atr[i]
+        basic_lower = hl2 - mult * atr[i]
+
+        # Adjust bands
+        upper_band[i] = min(basic_upper, upper_band[i - 1]) if close[i - 1] <= upper_band[i - 1] else basic_upper
+        lower_band[i] = max(basic_lower, lower_band[i - 1]) if close[i - 1] >= lower_band[i - 1] else basic_lower
+
+        # Direction
+        if direction[i - 1] == 1:
+            direction[i] = -1 if close[i] < lower_band[i] else 1
+        else:
+            direction[i] = 1 if close[i] > upper_band[i] else -1
+
+        supertrend[i] = lower_band[i] if direction[i] == 1 else upper_band[i]
+
+        # Signal on direction change
+        if i > period and direction[i] != direction[i - 1]:
+            signals[i] = 1 if direction[i] == 1 else -1
+
+    return signals
+
+
+def _signals_ema_rsi_combo(close: np.ndarray, cfg: CandleBacktestConfig) -> np.ndarray:
+    """EMA + RSI combo: EMA crossover confirmed by RSI not extreme.
+    Long only if RSI < 70, short only if RSI > 30."""
+    fast = _ema(close, cfg.fast_period)
+    slow = _ema(close, cfg.slow_period)
+    rsi = _rsi(close, cfg.rsi_period)
+    signals = np.zeros(len(close), dtype=np.int8)
+
+    for i in range(1, len(close)):
+        if np.isnan(fast[i]) or np.isnan(slow[i]) or np.isnan(rsi[i]):
+            continue
+        if fast[i] > slow[i] and fast[i - 1] <= slow[i - 1]:
+            if rsi[i] < cfg.rsi_overbought:  # Not overbought
+                signals[i] = 1
+        elif fast[i] < slow[i] and fast[i - 1] >= slow[i - 1]:
+            if rsi[i] > cfg.rsi_oversold:  # Not oversold
+                signals[i] = -1
+    return signals
+
+
+def _signals_volume_breakout(close: np.ndarray, high: np.ndarray,
+                             low: np.ndarray, volume: np.ndarray,
+                             cfg: CandleBacktestConfig) -> np.ndarray:
+    """Volume-confirmed breakout: breakout + volume spike = stronger signal."""
+    period = cfg.slow_period
+    vol_period = cfg.vol_sma_period
+    vol_sma = _sma(volume, vol_period)
+    signals = np.zeros(len(close), dtype=np.int8)
+
+    for i in range(max(period, vol_period), len(close)):
+        if np.isnan(vol_sma[i]) or vol_sma[i] == 0:
+            continue
+        vol_ratio = volume[i] / vol_sma[i]
+        if vol_ratio < cfg.vol_spike_mult:
+            continue  # Not enough volume to confirm
+
+        window_high = np.max(high[i - period:i])
+        window_low = np.min(low[i - period:i])
+
+        if close[i] > window_high:
+            signals[i] = 1   # Breakout up on volume → long
+        elif close[i] < window_low:
+            signals[i] = -1  # Breakout down on volume → short
+    return signals
+
+
+def _signals_ichimoku(close: np.ndarray, high: np.ndarray,
+                      low: np.ndarray, cfg: CandleBacktestConfig) -> np.ndarray:
+    """Ichimoku Cloud: TK cross above cloud = long, below = short."""
+    tenkan_p = cfg.ichi_tenkan
+    kijun_p = cfg.ichi_kijun
+    senkou_b_p = cfg.ichi_senkou_b
+    n = len(close)
+
+    tenkan = np.full(n, np.nan)
+    kijun = np.full(n, np.nan)
+    senkou_a = np.full(n, np.nan)
+    senkou_b = np.full(n, np.nan)
+
+    for i in range(senkou_b_p - 1, n):
+        if i >= tenkan_p - 1:
+            tenkan[i] = (np.max(high[i - tenkan_p + 1:i + 1]) +
+                         np.min(low[i - tenkan_p + 1:i + 1])) / 2
+        if i >= kijun_p - 1:
+            kijun[i] = (np.max(high[i - kijun_p + 1:i + 1]) +
+                        np.min(low[i - kijun_p + 1:i + 1])) / 2
+        senkou_b[i] = (np.max(high[i - senkou_b_p + 1:i + 1]) +
+                       np.min(low[i - senkou_b_p + 1:i + 1])) / 2
+
+    # Senkou A = (tenkan + kijun) / 2 displaced forward (we compare at current)
+    for i in range(n):
+        if not np.isnan(tenkan[i]) and not np.isnan(kijun[i]):
+            senkou_a[i] = (tenkan[i] + kijun[i]) / 2
+
+    signals = np.zeros(n, dtype=np.int8)
+    for i in range(1, n):
+        if (np.isnan(tenkan[i]) or np.isnan(kijun[i]) or
+                np.isnan(senkou_a[i]) or np.isnan(senkou_b[i])):
+            continue
+        cloud_top = max(senkou_a[i], senkou_b[i])
+        cloud_bot = min(senkou_a[i], senkou_b[i])
+
+        # TK cross above cloud
+        if (tenkan[i] > kijun[i] and
+                (np.isnan(tenkan[i - 1]) or tenkan[i - 1] <= kijun[i - 1]) and
+                close[i] > cloud_top):
+            signals[i] = 1
+
+        # TK cross below cloud
+        elif (tenkan[i] < kijun[i] and
+              (np.isnan(kijun[i - 1]) or tenkan[i - 1] >= kijun[i - 1]) and
+              close[i] < cloud_bot):
+            signals[i] = -1
+
+    return signals
+
+
 STRATEGY_MAP = {
     "momentum": _signals_momentum,
     "ma_crossover": _signals_momentum,
     "mean_reversion": _signals_mean_reversion,
     "breakout": _signals_breakout,
     "rsi": _signals_rsi,
+    "macd": _signals_macd,
+    "macd_histogram": _signals_macd_histogram,
+    "vwap_reversion": _signals_vwap,
+    "stochastic": _signals_stochastic,
+    "adx_trend": _signals_adx_trend,
+    "supertrend": _signals_supertrend,
+    "ema_rsi_combo": _signals_ema_rsi_combo,
+    "volume_breakout": _signals_volume_breakout,
+    "ichimoku": _signals_ichimoku,
 }
 
 
@@ -355,7 +719,13 @@ class CandleBacktester:
         if sig_fn is None:
             raise ValueError(f"Unknown strategy: {strat}. Available: {list(STRATEGY_MAP.keys())}")
 
-        if strat == "breakout":
+        # Strategies that need extra arrays (high, low, volume)
+        NEEDS_HLV = {"vwap_reversion", "volume_breakout"}
+        NEEDS_HL = {"breakout", "stochastic", "adx_trend", "supertrend", "ichimoku"}
+
+        if strat in NEEDS_HLV:
+            signals = sig_fn(c, h, l, v, self.cfg)
+        elif strat in NEEDS_HL:
             signals = sig_fn(c, h, l, self.cfg)
         else:
             signals = sig_fn(c, self.cfg)

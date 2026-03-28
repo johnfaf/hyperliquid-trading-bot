@@ -279,10 +279,25 @@ BACKTEST_HTML = """<!DOCTYPE html>
       <div>
         <label class="stat-label" style="display:block;margin-bottom:4px;">Strategy</label>
         <select id="cbt-strategy" style="width:100%;padding:7px 10px;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:6px;font-size:13px;">
-          <option value="momentum">Momentum (EMA Cross)</option>
-          <option value="mean_reversion">Mean Reversion (BB)</option>
-          <option value="breakout">Breakout (N-Period)</option>
-          <option value="rsi">RSI (Overbought/Oversold)</option>
+          <optgroup label="Trend Following">
+            <option value="momentum">Momentum (EMA Cross)</option>
+            <option value="supertrend">SuperTrend</option>
+            <option value="adx_trend">ADX Trend (+DI/-DI)</option>
+            <option value="ichimoku">Ichimoku Cloud</option>
+            <option value="breakout">Breakout (N-Period)</option>
+            <option value="volume_breakout">Volume Breakout</option>
+          </optgroup>
+          <optgroup label="Mean Reversion">
+            <option value="mean_reversion">Mean Reversion (BB)</option>
+            <option value="rsi">RSI (Overbought/Oversold)</option>
+            <option value="stochastic">Stochastic (%K/%D)</option>
+            <option value="vwap_reversion">VWAP Reversion</option>
+          </optgroup>
+          <optgroup label="Oscillator / Combo">
+            <option value="macd">MACD Crossover</option>
+            <option value="macd_histogram">MACD Histogram</option>
+            <option value="ema_rsi_combo">EMA + RSI Combo</option>
+          </optgroup>
         </select>
       </div>
       <div>
