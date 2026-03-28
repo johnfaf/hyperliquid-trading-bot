@@ -24,6 +24,7 @@ Instead: ranked execution with clear priority + decision logging.
 import logging
 from typing import Dict, List, Optional, Tuple
 from datetime import datetime
+from collections import deque
 
 logger = logging.getLogger(__name__)
 
@@ -51,7 +52,7 @@ class DecisionEngine:
         self.max_trades_per_cycle = cfg.get("max_trades_per_cycle", 3)
 
         # Track decisions for audit
-        self._decision_history: List[Dict] = []
+        self._decision_history: deque = deque(maxlen=100)
         self._cycle_count = 0
 
         # Stats
@@ -203,9 +204,7 @@ class DecisionEngine:
             ],
         })
 
-        # Keep only last 100 decisions
-        if len(self._decision_history) > 100:
-            self._decision_history = self._decision_history[-100:]
+        # deque(maxlen=100) auto-trims old entries
 
         return executions
 
@@ -391,9 +390,9 @@ class DecisionEngine:
                               max(self.stats["total_candidates"], 1)),
             "no_trade_rate": (self.stats["total_no_trade"] /
                              max(self.stats["total_decisions"], 1)),
-            "recent_decisions": self._decision_history[-10:],
+            "recent_decisions": list(self._decision_history)[-10:],
         }
 
     def get_decision_history(self, limit: int = 20) -> List[Dict]:
         """Return recent decision history for dashboard."""
-        return self._decision_history[-limit:]
+        return list(self._decision_history)[-limit:]

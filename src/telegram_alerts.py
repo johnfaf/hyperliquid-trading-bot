@@ -60,7 +60,8 @@ def send_daily_pnl_summary() -> bool:
 
         # Calculate win rate
         win_rate = (winning_trades / total_trades * 100) if total_trades > 0 else 0
-        total_roi = (total_pnl / (balance - total_pnl) * 100) if (balance - total_pnl) > 0 else 0
+        initial_balance = balance - total_pnl
+        total_roi = (total_pnl / initial_balance * 100) if initial_balance > 0 else 0
 
         # Get today's trades (compare to 24h ago)
         closed_trades = db.get_paper_trade_history(limit=500)

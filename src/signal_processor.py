@@ -86,6 +86,7 @@ class SignalProcessor:
                        f"({len(survivors)} remaining)")
 
         # Step 2: Deduplicate
+        dedup_count = 0
         if self.dedup_enabled:
             before_dedup = len(survivors)
             survivors = self._deduplicate(survivors)

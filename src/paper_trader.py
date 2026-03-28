@@ -61,6 +61,8 @@ class PaperTrader:
     def get_account_summary(self) -> Dict:
         """Get current paper trading account summary."""
         account = db.get_paper_account()
+        if not account:
+            return {"balance": 0, "total_pnl": 0, "total_trades": 0, "open_trades": 0}
         open_trades = db.get_open_paper_trades()
         closed_trades = db.get_paper_trade_history(limit=100)
 
@@ -489,6 +491,8 @@ class PaperTrader:
 
         # Calculate position size
         account = db.get_paper_account()
+        if not account or account.get("balance", 0) <= 0:
+            return None
         max_position = account["balance"] * config.PAPER_TRADING_MAX_POSITION_PCT
         size_usd = max_position * (score / 1.0)  # Scale by confidence
         size = size_usd / target_price

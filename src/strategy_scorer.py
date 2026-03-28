@@ -144,7 +144,7 @@ class StrategyScorer:
             risk_adj = (pnl / 10000) / risk_factor
             return min(1.0, float(1 / (1 + np.exp(np.clip(-risk_adj + 1, -500, 500)))))
         else:
-            return max(0, 0.3 * (1 - loss_rate))
+            return max(0, 0.3 * loss_rate)
 
     def score_all_strategies(self) -> List[Dict]:
         """

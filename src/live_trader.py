@@ -742,6 +742,10 @@ class LiveTrader:
             side = signal.side.value.lower()
             size = signal.size or (signal.position_pct * signal.effective_size)
 
+            if not size or size <= 0:
+                logger.warning(f"Calculated size is 0 or negative for {coin} — skipping")
+                return None
+
             logger.info(f"Executing signal: {coin} {side} {size:.4f} "
                        f"(confidence={signal.confidence:.0%}, "
                        f"leverage={signal.leverage}x)")

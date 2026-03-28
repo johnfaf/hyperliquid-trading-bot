@@ -139,7 +139,7 @@ def _bybit_ticker(symbol: str) -> Optional[Dict]:
 def _kraken_ticker(pair: str) -> Optional[Dict]:
     """Get ticker from Kraken."""
     data = _safe_get("https://api.kraken.com/0/public/Ticker", {"pair": pair})
-    if data and data.get("result"):
+    if data and data.get("result") and len(data["result"]) > 0:
         key = list(data["result"].keys())[0]
         t = data["result"][key]
         price = float(t["c"][0])
