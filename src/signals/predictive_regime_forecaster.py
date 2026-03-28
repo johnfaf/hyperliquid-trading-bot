@@ -1,18 +1,28 @@
 """
-Predictive Regime Forecaster
-=============================
-Forward-looking regime detection using a composite signal from:
+Predictive Regime Forecaster (V2)
+==================================
+Forward-looking regime detection using a 5-input composite signal:
   1. Hyperliquid funding rate slope (public API — no key needed)
   2. Orderbook imbalance (bid/ask depth ratio)
   3. Arkham Intelligence smart-money flow (optional, requires ARKHAM_API_KEY)
+  4. Polymarket prediction-market sentiment (event-driven forward signal)
+  5. Options flow conviction (Deribit unusual activity net direction)
 
 Produces a regime prediction: "crash", "bullish", or "neutral" with a
 confidence score. This prediction is consumed by the DecisionFirewall
 for dynamic de-risking — cutting position size and tightening exposure
 caps when a crash regime is detected with high confidence.
 
-Composite Signal Formula (calibrated weights):
-  signal = 0.4 * funding_slope + 0.35 * imbalance + 0.25 * arkham_signal
+V2 Composite Signal Formula (re-calibrated weights):
+  signal = 0.30 * funding_slope
+         + 0.25 * imbalance
+         + 0.10 * arkham_signal
+         + 0.20 * polymarket_sentiment
+         + 0.15 * options_flow_conviction
+
+When Polymarket / Options Flow are unavailable, their weight is
+redistributed proportionally to the remaining active inputs so
+the signal always sums to the correct scale.
 
 Regime Classification:
   signal < -0.15 → "crash"
@@ -31,10 +41,15 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-# Weights for composite signal
-W_FUNDING = 0.40
-W_IMBALANCE = 0.35
-W_ARKHAM = 0.25
+# ─── V2 Weights (5-input model) ─────────────────────────────
+# When all 5 sources are active these sum to 1.0.
+# When Polymarket or Options Flow are unavailable, their weight
+# is redistributed to the remaining active inputs.
+W_FUNDING = 0.30
+W_IMBALANCE = 0.25
+W_ARKHAM = 0.10
+W_POLYMARKET = 0.20
+W_OPTIONS_FLOW = 0.15
 
 # Regime thresholds
 CRASH_THRESHOLD = -0.15
@@ -91,10 +106,16 @@ class ArkhamClient:
 
 class PredictiveRegimeForecaster:
     """
-    Forward-looking regime forecaster using funding, orderbook, and on-chain data.
+    Forward-looking regime forecaster using funding, orderbook, on-chain,
+    prediction-market, and options flow data.
 
     Caches predictions per coin with a configurable TTL (default 60s).
     Thread-safe for use across trading cycles.
+
+    External data injection:
+        Call `update_polymarket_sentiment(sentiment_dict)` each cycle to feed
+        Polymarket data.  Call `update_options_flow(convictions_list)` to feed
+        Deribit/Binance options flow.  Both degrade gracefully when absent.
     """
 
     def __init__(self, config: Optional[Dict] = None):
@@ -110,11 +131,44 @@ class PredictiveRegimeForecaster:
         # Arkham client (optional)
         self.arkham = ArkhamClient()
 
-        logger.info("PredictiveRegimeForecaster initialized")
+        # ─── External data slots (set by main bot loop each cycle) ───
+        self._polymarket_sentiment: Optional[Dict] = None
+        self._polymarket_ts: float = 0.0
+        self._options_convictions: list = []
+        self._options_ts: float = 0.0
+        self._external_data_ttl = cfg.get("external_data_ttl", 600)  # 10 min staleness limit
+
+        logger.info("PredictiveRegimeForecaster V2 initialized (5-input model)")
+
+    # ─── External Data Injection ─────────────────────────────────
+
+    def update_polymarket_sentiment(self, sentiment: Dict) -> None:
+        """
+        Feed latest Polymarket sentiment into the forecaster.
+        Expected format (from PolymarketScanner.get_market_sentiment()):
+            {"sentiment": "bullish"|"bearish"|"neutral",
+             "confidence": float, "bullish_probability": float,
+             "bearish_probability": float, "markets_analyzed": int}
+        """
+        self._polymarket_sentiment = sentiment
+        self._polymarket_ts = time.time()
+        logger.debug(f"Polymarket sentiment updated: {sentiment.get('sentiment', '?')} "
+                     f"(conf={sentiment.get('confidence', 0):.2f})")
+
+    def update_options_flow(self, convictions: list) -> None:
+        """
+        Feed latest options flow top-conviction list into the forecaster.
+        Expected format (from OptionsFlowScanner.top_convictions):
+            [{"ticker": str, "direction": "BULLISH"|"BEARISH",
+              "net_flow": float, "conviction_pct": float, ...}, ...]
+        """
+        self._options_convictions = convictions or []
+        self._options_ts = time.time()
+        logger.debug(f"Options flow updated: {len(self._options_convictions)} convictions")
 
     def predict_regime(self, coin: str = "BTC") -> Dict:
         """
-        Predict the current market regime for a coin.
+        Predict the current market regime for a coin using the 5-input model.
 
         Returns:
             {
@@ -124,8 +178,11 @@ class PredictiveRegimeForecaster:
                 "components": {
                     "funding_slope": float,
                     "imbalance": float,
-                    "arkham_flow": float
-                }
+                    "arkham_flow": float,
+                    "polymarket": float,
+                    "options_flow": float,
+                },
+                "active_inputs": int,     # how many of 5 sources were active
             }
         """
         now = time.time()
@@ -136,19 +193,28 @@ class PredictiveRegimeForecaster:
             if now - cached.get("ts", 0) < self.cache_ttl:
                 return cached["data"]
 
-        # 1. Funding rate slope
+        # Collect (weight, value) pairs — inactive sources are excluded
+        # so their weight gets redistributed to active sources.
+        components = {}
+        active_weights = []
+
+        # 1. Funding rate slope (always available via public HL API)
         try:
             funding_slope = self._get_funding_slope(coin)
         except Exception:
             funding_slope = 0.0
+        components["funding_slope"] = funding_slope
+        active_weights.append((W_FUNDING, funding_slope))
 
-        # 2. Orderbook imbalance
+        # 2. Orderbook imbalance (always available via public HL API)
         try:
             imbalance = self._get_orderbook_imbalance(coin)
         except Exception:
             imbalance = 0.0
+        components["imbalance"] = imbalance
+        active_weights.append((W_IMBALANCE, imbalance))
 
-        # 3. Arkham on-chain flow
+        # 3. Arkham on-chain flow (optional — key-gated)
         arkham_signal = 0.0
         if self.arkham.api_key:
             try:
@@ -156,11 +222,28 @@ class PredictiveRegimeForecaster:
                 arkham_signal = flow.get("net_flow_score", 0.0)
             except Exception:
                 pass
+        components["arkham_flow"] = arkham_signal
+        if self.arkham.api_key:
+            active_weights.append((W_ARKHAM, arkham_signal))
 
-        # Composite signal (calibrated weights)
-        signal = (W_FUNDING * funding_slope +
-                  W_IMBALANCE * imbalance +
-                  W_ARKHAM * arkham_signal)
+        # 4. Polymarket prediction-market sentiment
+        pm_signal = self._get_polymarket_signal(now)
+        components["polymarket"] = pm_signal
+        if pm_signal != 0.0:
+            active_weights.append((W_POLYMARKET, pm_signal))
+
+        # 5. Options flow conviction (Deribit unusual activity)
+        of_signal = self._get_options_flow_signal(coin, now)
+        components["options_flow"] = of_signal
+        if of_signal != 0.0:
+            active_weights.append((W_OPTIONS_FLOW, of_signal))
+
+        # Compute composite with dynamic weight re-normalization
+        total_weight = sum(w for w, _ in active_weights)
+        if total_weight > 0:
+            signal = sum((w / total_weight) * v for w, v in active_weights)
+        else:
+            signal = 0.0
 
         # Regime classification
         if signal < CRASH_THRESHOLD:
@@ -176,16 +259,59 @@ class PredictiveRegimeForecaster:
             "signal": round(signal, 4),
             "regime": regime,
             "confidence": round(confidence, 4),
-            "components": {
-                "funding_slope": round(funding_slope, 4),
-                "imbalance": round(imbalance, 4),
-                "arkham_flow": round(arkham_signal, 4)
-            }
+            "components": {k: round(v, 4) for k, v in components.items()},
+            "active_inputs": len(active_weights),
         }
 
         self.cache[coin] = {"data": data, "ts": now}
-        logger.info(f"Forecaster {coin} → {regime} (signal={signal:.3f}, conf={confidence:.3f})")
+        inputs_str = "/".join(k for k in components if components[k] != 0.0) or "funding+book"
+        logger.info(f"Forecaster {coin} → {regime} (signal={signal:.3f}, "
+                    f"conf={confidence:.3f}, inputs={len(active_weights)}: {inputs_str})")
         return data
+
+    # ─── Internal: derive signals from external data ─────────────
+
+    def _get_polymarket_signal(self, now: float) -> float:
+        """
+        Convert Polymarket sentiment into a -1 to +1 signal.
+        Bullish sentiment → positive, bearish → negative.
+        Returns 0 if data is stale or unavailable.
+        """
+        if (self._polymarket_sentiment is None or
+                now - self._polymarket_ts > self._external_data_ttl):
+            return 0.0
+
+        sent = self._polymarket_sentiment
+        sentiment = sent.get("sentiment", "neutral")
+        conf = float(sent.get("confidence", 0))
+
+        if sentiment == "bullish":
+            return min(conf * 2.0, 1.0)   # scale confidence (0-0.5) → signal (0-1)
+        elif sentiment == "bearish":
+            return max(-conf * 2.0, -1.0)
+        return 0.0
+
+    def _get_options_flow_signal(self, coin: str, now: float) -> float:
+        """
+        Convert options flow conviction for a coin into a -1 to +1 signal.
+        Strong bullish net flow → positive, bearish → negative.
+        Returns 0 if data is stale, unavailable, or coin has no conviction entry.
+        """
+        if (not self._options_convictions or
+                now - self._options_ts > self._external_data_ttl):
+            return 0.0
+
+        for conv in self._options_convictions:
+            if conv.get("ticker", "").upper() == coin.upper():
+                pct = conv.get("conviction_pct", 0)
+                direction = conv.get("direction", "")
+                # conviction_pct is 0-100; normalize to 0-1 then sign
+                normalized = min(pct / 100.0, 1.0)
+                if direction == "BULLISH":
+                    return normalized
+                elif direction == "BEARISH":
+                    return -normalized
+        return 0.0
 
     def _get_funding_slope(self, coin: str) -> float:
         """

@@ -56,6 +56,7 @@ from src.notifications import telegram_alerts as tg_alerts
 from src.ui import report_exporter
 from src.data.polymarket_scanner import PolymarketScanner
 from src.trading.live_trader import LiveTrader
+from src.signals.predictive_regime_forecaster import PredictiveRegimeForecaster
 
 # ─── Logging Setup ─────────────────────────────────────────────
 
@@ -171,7 +172,17 @@ class HyperliquidResearchBot:
         self.exchange_agg = ExchangeAggregator()
         self.options_scanner = OptionsFlowScanner()
         self.regime_detector = RegimeDetector(exchange_agg=self.exchange_agg)
-        self.firewall = DecisionFirewall()
+
+        # V7: Shared Predictive Regime Forecaster (5-input model)
+        # Created here so main loop can inject Polymarket + options data each cycle.
+        try:
+            self.predictive_forecaster = PredictiveRegimeForecaster()
+            self.logger.info("Predictive Regime Forecaster V2 initialized (5-input model)")
+        except Exception as e:
+            self.predictive_forecaster = PredictiveRegimeForecaster()  # bare default
+            self.logger.warning(f"Forecaster init warning: {e}")
+
+        self.firewall = DecisionFirewall({"forecaster": self.predictive_forecaster})
         self.agent_scorer = AgentScorer()
         self.feature_engine = FeatureEngine()
 
@@ -285,6 +296,10 @@ class HyperliquidResearchBot:
         except Exception as e:
             self.logger.warning(f"Dashboard failed to start: {e}")
 
+        # V7: Start background scanner threads for Polymarket + Options Flow
+        # These run independently so the main loop doesn't block on Deribit/Polymarket latency.
+        self._start_background_scanners()
+
         self.logger.info("Bot initialized successfully.")
 
         # Send Telegram startup notification
@@ -293,6 +308,49 @@ class HyperliquidResearchBot:
             self.logger.info("Telegram notifications enabled.")
         else:
             self.logger.info("Telegram not configured — set TELEGRAM_BOT_TOKEN & TELEGRAM_CHAT_ID to enable.")
+
+    # ─── Background Scanner Threads ─────────────────────────────
+    def _start_background_scanners(self):
+        """
+        Launch daemon threads that periodically refresh Polymarket and Options Flow
+        data in the background. This keeps data warm so the main trading cycle
+        can read it instantly without blocking on external API latency.
+        """
+        import threading
+
+        def _polymarket_loop():
+            """Refresh Polymarket markets every 3 minutes."""
+            while self.running or True:  # also runs during init warmup
+                try:
+                    if self.polymarket:
+                        self.polymarket.scan_markets()
+                        self.polymarket.get_market_sentiment()
+                        self.logger.debug("Background: Polymarket scan complete")
+                except Exception as e:
+                    self.logger.debug(f"Background: Polymarket error: {e}")
+                time.sleep(180)  # 3 minutes
+
+        def _options_flow_loop():
+            """Refresh options flow data every 2 minutes."""
+            while self.running or True:
+                try:
+                    self.options_scanner.scan_flow()
+                    self.logger.debug("Background: Options flow scan complete")
+                except Exception as e:
+                    self.logger.debug(f"Background: Options flow error: {e}")
+                time.sleep(120)  # 2 minutes
+
+        # Start Polymarket background thread
+        if self.polymarket:
+            t = threading.Thread(target=_polymarket_loop, daemon=True, name="bg-polymarket")
+            t.start()
+            self.logger.info("Background Polymarket scanner thread started (interval=3min)")
+
+        # Start Options Flow background thread
+        if self.options_scanner:
+            t = threading.Thread(target=_options_flow_loop, daemon=True, name="bg-options-flow")
+            t.start()
+            self.logger.info("Background Options Flow scanner thread started (interval=2min)")
 
     # ─── Discovery timer persistence ─────────────────────────────
     def _save_last_discovery_time(self):
@@ -466,6 +524,14 @@ class HyperliquidResearchBot:
             except Exception as e:
                 self.logger.warning(f"  Options flow scan error: {e}")
 
+            # V7: Feed options flow convictions into the predictive forecaster
+            try:
+                if self.options_scanner.top_convictions and self.predictive_forecaster:
+                    self.predictive_forecaster.update_options_flow(self.options_scanner.top_convictions)
+                    self.logger.debug(f"  Forecaster ← {len(self.options_scanner.top_convictions)} options convictions")
+            except Exception as e:
+                self.logger.debug(f"  Forecaster options injection error: {e}")
+
             # Phase 3d: Regime Detection
             self.logger.info("Phase 3d: Market Regime Detection")
             regime_data = {}
@@ -497,6 +563,15 @@ class HyperliquidResearchBot:
                                            f"(conf={sig['confidence']:.0%}) — {sig.get('reason', '')[:60]}")
                 except Exception as e:
                     self.logger.warning(f"  Polymarket scan error: {e}")
+
+            # V7: Feed Polymarket sentiment into the predictive forecaster
+            try:
+                if self.polymarket and self.predictive_forecaster:
+                    pm_sentiment = self.polymarket.get_market_sentiment()
+                    self.predictive_forecaster.update_polymarket_sentiment(pm_sentiment)
+                    self.logger.debug(f"  Forecaster ← Polymarket sentiment: {pm_sentiment.get('sentiment', '?')}")
+            except Exception as e:
+                self.logger.debug(f"  Forecaster polymarket injection error: {e}")
 
             # Phase 3e: Multi-Exchange Scan + Cross-Venue Confirmation
             self.logger.info("Phase 3e: Multi-Exchange Scanner")

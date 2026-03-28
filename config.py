@@ -122,6 +122,19 @@ FUNDING_RISK_ENABLED = os.environ.get("FUNDING_RISK_ENABLED", "true").lower() in
 FUNDING_NEGATIVE_THRESHOLD = float(os.environ.get("FUNDING_NEGATIVE_THRESHOLD", -0.001))
 FUNDING_POSITIVE_THRESHOLD = float(os.environ.get("FUNDING_POSITIVE_THRESHOLD", 0.003))
 
+# ─── Polymarket Integration ──────────────────────────────────
+POLYMARKET_ENABLED = os.environ.get("POLYMARKET_ENABLED", "true").lower() in ("true", "1", "yes")
+POLYMARKET_SCAN_INTERVAL = int(os.environ.get("POLYMARKET_SCAN_INTERVAL", 180))  # 3 minutes
+POLYMARKET_MIN_VOLUME = float(os.environ.get("POLYMARKET_MIN_VOLUME", 10000))    # $10k min volume
+
+# ─── Options Flow Integration ───────────────────────────────
+OPTIONS_FLOW_ENABLED = os.environ.get("OPTIONS_FLOW_ENABLED", "true").lower() in ("true", "1", "yes")
+OPTIONS_FLOW_SCAN_INTERVAL = int(os.environ.get("OPTIONS_FLOW_SCAN_INTERVAL", 120))  # 2 minutes
+
+# ─── Forecaster External Data ───────────────────────────────
+# How long before external data (Polymarket, Options) is considered stale
+FORECASTER_EXTERNAL_DATA_TTL = int(os.environ.get("FORECASTER_EXTERNAL_DATA_TTL", 600))  # 10 min
+
 # ─── Monte-Carlo Stress Testing ──────────────────────────────
 MONTE_CARLO_PATHS = int(os.environ.get("MONTE_CARLO_PATHS", 5000))
 MONTE_CARLO_INCLUDE_CRASHES = True

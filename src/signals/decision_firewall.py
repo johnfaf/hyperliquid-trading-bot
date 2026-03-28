@@ -75,13 +75,15 @@ class DecisionFirewall:
         self._funding_cache_ts: float = 0.0
         self._funding_cache_ttl = 120  # 2 minutes
 
-        self._forecaster = None
-        if self.enable_predictive_derisk and HAS_FORECASTER:
+        self._forecaster = cfg.get("forecaster", None)
+        if self._forecaster is None and self.enable_predictive_derisk and HAS_FORECASTER:
             try:
                 self._forecaster = PredictiveRegimeForecaster()
                 logger.info("DecisionFirewall: predictive de-risking ENABLED")
             except Exception as e:
                 logger.debug(f"Could not init forecaster: {e}")
+        elif self._forecaster is not None:
+            logger.info("DecisionFirewall: using externally-provided forecaster")
 
         # State tracking
         self._recent_trades: Dict[str, float] = {}  # coin → last trade timestamp
