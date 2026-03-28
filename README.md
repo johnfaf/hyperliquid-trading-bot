@@ -176,6 +176,55 @@ docker run -p 8080:8080 hl-bot
 # Set env vars in Railway dashboard for any config overrides
 ```
 
+## Regime Forecaster V2 — Polymarket + Options Flow Integration
+
+The predictive regime forecaster uses a 5-input composite signal for forward-looking market regime detection:
+
+| Input | Weight | Source | Description |
+|-------|--------|--------|-------------|
+| Funding Rate Slope | 0.30 | Hyperliquid API | Slope of recent funding rates (bearish pressure detection) |
+| Orderbook Imbalance | 0.25 | Hyperliquid L2 | Bid/ask depth ratio from top 10 levels |
+| Polymarket Sentiment | 0.20 | Polymarket CLOB | Aggregated crypto prediction-market odds movements |
+| Options Flow Conviction | 0.15 | Deribit API | Net directional flow from unusual options prints |
+| Arkham Smart-Money Flow | 0.10 | Arkham API (optional) | On-chain whale/fund flow scoring |
+
+### How It Works
+
+1. **Background scanners** refresh Polymarket (every 3 min) and Deribit options flow (every 2 min) on daemon threads
+2. Each trading cycle, the main loop **injects** fresh sentiment + conviction data into the forecaster
+3. The forecaster computes a **composite signal** from all active inputs (weights auto-redistribute when sources are unavailable)
+4. Signal classification: `< -0.15` → crash, `> 0.15` → bullish, else neutral
+5. The **DecisionFirewall** uses the regime prediction for dynamic de-risking (80% size reduction + 25% exposure cap during crash regimes)
+
+### Example Regime Output
+
+```json
+{
+  "signal": -0.2341,
+  "regime": "crash",
+  "confidence": 0.4214,
+  "components": {
+    "funding_slope": -0.35,
+    "imbalance": -0.18,
+    "arkham_flow": 0.0,
+    "polymarket": -0.45,
+    "options_flow": -0.72
+  },
+  "active_inputs": 4
+}
+```
+
+### Configuration (Environment Variables)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `POLYMARKET_ENABLED` | `true` | Enable/disable Polymarket scanner |
+| `POLYMARKET_SCAN_INTERVAL` | `180` | Background scan interval (seconds) |
+| `OPTIONS_FLOW_ENABLED` | `true` | Enable/disable options flow scanner |
+| `OPTIONS_FLOW_SCAN_INTERVAL` | `120` | Background scan interval (seconds) |
+| `FORECASTER_EXTERNAL_DATA_TTL` | `600` | Max staleness for external data (seconds) |
+| `ENABLE_PREDICTIVE_FORECASTER` | `true` | Master switch for regime forecaster |
+
 ## Notes
 
 - No API key needed for the research/monitoring features (uses public info endpoint)

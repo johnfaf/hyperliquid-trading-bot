@@ -41,10 +41,11 @@ except ImportError:
 from src.signals.predictive_regime_forecaster import PredictiveRegimeForecaster
 
 
-# Feature order: [funding, funding_slope, imbalance, arkham_flow, volatility, volume_ratio]
+# Feature order: [funding, funding_slope, imbalance, arkham_flow, volatility, volume_ratio, polymarket, options_flow]
 FEATURE_NAMES = [
     "funding_rate", "funding_slope", "orderbook_imbalance",
-    "arkham_flow", "volatility_20", "volume_ratio"
+    "arkham_flow", "volatility_20", "volume_ratio",
+    "polymarket_sentiment", "options_flow_conviction"
 ]
 
 # Label encoding: crash=0, neutral=1, bullish=2
@@ -157,6 +158,8 @@ class XGBoostRegimeForecaster:
             "arkham_flow": components.get("arkham_flow", 0.0),
             "volatility_20": 0.0,  # Populated from candle data when available
             "volume_ratio": 0.0,   # Populated from candle data when available
+            "polymarket_sentiment": components.get("polymarket", 0.0),
+            "options_flow_conviction": components.get("options_flow", 0.0),
         }
 
     def _log_features(self, features: Dict, regime: str):
@@ -265,6 +268,24 @@ class XGBoostRegimeForecaster:
         except Exception as e:
             logger.debug(f"Could not load XGBoost model: {e}")
             self.model = None
+
+    def update_polymarket_sentiment(self, sentiment: Dict) -> None:
+        """
+        Pass through to fallback forecaster to update Polymarket sentiment.
+        Sentiment dict expected format:
+            {"sentiment": "bullish"|"bearish"|"neutral",
+             "confidence": float, "bullish_probability": float, ...}
+        """
+        self.fallback.update_polymarket_sentiment(sentiment)
+
+    def update_options_flow(self, convictions: list) -> None:
+        """
+        Pass through to fallback forecaster to update options flow convictions.
+        Convictions list expected format:
+            [{"ticker": str, "direction": "BULLISH"|"BEARISH",
+              "net_flow": float, "conviction_pct": float, ...}, ...]
+        """
+        self.fallback.update_options_flow(convictions)
 
     def get_stats(self) -> Dict:
         """Return forecaster statistics."""

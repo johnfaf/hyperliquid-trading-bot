@@ -57,6 +57,8 @@ from src.ui import report_exporter
 from src.data.polymarket_scanner import PolymarketScanner
 from src.trading.live_trader import LiveTrader
 from src.signals.predictive_regime_forecaster import PredictiveRegimeForecaster
+from src.trading.cross_venue_hedger import CrossVenueHedger
+from src.analysis.shadow_tracker import ShadowTracker
 
 # ─── Logging Setup ─────────────────────────────────────────────
 
@@ -222,6 +224,7 @@ class HyperliquidResearchBot:
             kelly_sizer=self.kelly_sizer,
             trade_memory=self.trade_memory,
             calibration=self.calibration,
+            regime_forecaster=self.predictive_forecaster,
         )
         self.reporter = Reporter()
         self.arena = AlphaArena()
@@ -264,9 +267,25 @@ class HyperliquidResearchBot:
             llm_filter=self.llm_filter,
         )
 
+        # V8: Cross-venue hedger (Binance/Bybit reduce-only on crash regime)
+        try:
+            self.cross_venue_hedger = CrossVenueHedger()
+            self.logger.info(f"CrossVenueHedger initialized (dry_run={self.cross_venue_hedger.dry_run})")
+        except Exception as e:
+            self.cross_venue_hedger = None
+            self.logger.warning(f"CrossVenueHedger init failed (continuing without): {e}")
+
+        # V8: Shadow mode PnL attribution tracker (30-day rolling per signal source)
+        try:
+            self.shadow_tracker = ShadowTracker()
+            self.logger.info("ShadowTracker initialized for PnL attribution")
+        except Exception as e:
+            self.shadow_tracker = None
+            self.logger.warning(f"ShadowTracker init failed (continuing without): {e}")
+
         # V6: Live trader (dry_run=True unless HL_LIVE_TRADING=true)
         try:
-            self.live_trader = LiveTrader(firewall=self.firewall)
+            self.live_trader = LiveTrader(firewall=self.firewall, regime_forecaster=self.predictive_forecaster)
             mode = "DRY RUN" if self.live_trader.dry_run else "LIVE"
             self.logger.info(f"Live trader initialized [{mode}]")
             if not self.live_trader.dry_run:
@@ -572,6 +591,28 @@ class HyperliquidResearchBot:
                     self.logger.debug(f"  Forecaster ← Polymarket sentiment: {pm_sentiment.get('sentiment', '?')}")
             except Exception as e:
                 self.logger.debug(f"  Forecaster polymarket injection error: {e}")
+
+            # V8: Cross-venue hedging — auto-hedge on crash regime
+            if self.cross_venue_hedger and regime_data:
+                try:
+                    # Build regime dict from predictive forecaster if available
+                    pred_regime = {}
+                    if self.predictive_forecaster:
+                        pred_regime = self.predictive_forecaster.predict_regime("BTC")
+                    else:
+                        pred_regime = {
+                            "regime": regime_data.get("overall_regime", "neutral"),
+                            "confidence": regime_data.get("overall_confidence", 0),
+                        }
+                    open_trades = db.get_open_paper_trades()
+                    hedge_result = self.cross_venue_hedger.check_and_hedge(pred_regime, open_trades)
+                    if hedge_result.get("action") != "idle":
+                        self.logger.info(f"  Hedger: {hedge_result['action']} | "
+                                       f"placed={hedge_result['hedges_placed']}, "
+                                       f"closed={hedge_result['hedges_closed']}, "
+                                       f"coins={hedge_result['coins_affected']}")
+                except Exception as e:
+                    self.logger.debug(f"  Cross-venue hedger error: {e}")
 
             # Phase 3e: Multi-Exchange Scan + Cross-Venue Confirmation
             self.logger.info("Phase 3e: Multi-Exchange Scanner")
@@ -1131,7 +1172,7 @@ class HyperliquidResearchBot:
                         except Exception as e:
                             self.logger.warning(f"  Live copy execution error: {e}")
 
-            # Phase 4c: Feed closed trade outcomes to Alpha Arena + AgentScorer
+            # Phase 4c: Feed closed trade outcomes to Alpha Arena + AgentScorer + ShadowTracker
             if closed:
                 for c in closed:
                     try:
@@ -1143,6 +1184,28 @@ class HyperliquidResearchBot:
                         # True return_pct: pnl / notional invested
                         return_pct = pnl / max(notional, 1)
                         self.arena.record_trade_for_strategy(stype, pnl, return_pct)
+
+                        # V8: Shadow tracker — record per-source PnL attribution
+                        if self.shadow_tracker:
+                            try:
+                                meta = c.get("metadata") or {}
+                                source = meta.get("source", f"strategy:{stype}")
+                                self.shadow_tracker.record_trade({
+                                    "signal_source": source,
+                                    "coin": c.get("coin", "UNK"),
+                                    "side": c.get("side", "long"),
+                                    "entry_price": entry,
+                                    "exit_price": c.get("exit_price", entry),
+                                    "size": size,
+                                    "pnl": pnl,
+                                    "pnl_pct": return_pct * 100,
+                                    "entry_ts": c.get("entry_ts", ""),
+                                    "exit_ts": c.get("exit_ts", ""),
+                                    "regime_at_entry": c.get("regime", ""),
+                                    "confidence": float(meta.get("confidence", 0.5)),
+                                })
+                            except Exception as st_e:
+                                self.logger.debug(f"  ShadowTracker record error: {st_e}")
 
                         # Feed outcome back to AgentScorer so weights update from real PnL
                         try:
@@ -1338,6 +1401,26 @@ class HyperliquidResearchBot:
                                        f"{cv_stats.get('confirmations_found', 0)} confirmed, "
                                        f"avg score={cv_stats.get('avg_confirmation_score', 0):.3f}, "
                                        f"arbs={cv_stats.get('funding_arbs_found', 0)}")
+            except Exception:
+                pass
+
+            # V8: Shadow tracker and hedger stats
+            try:
+                if self.shadow_tracker:
+                    shadow_summary = self.shadow_tracker.get_summary(days=30)
+                    self.logger.info(f"  ShadowTracker: {shadow_summary['total_trades']} trades, "
+                                   f"PnL=${shadow_summary['total_pnl']:.2f}, "
+                                   f"win_rate={shadow_summary['avg_win_rate']:.0%}, "
+                                   f"best_source={shadow_summary.get('best_source', 'N/A')}")
+            except Exception:
+                pass
+            try:
+                if self.cross_venue_hedger:
+                    hedge_stats = self.cross_venue_hedger.get_stats()
+                    self.logger.info(f"  Hedger: {hedge_stats['total_hedges_placed']} placed, "
+                                   f"{hedge_stats['total_hedges_closed']} closed, "
+                                   f"{hedge_stats['active_hedges_count']} active "
+                                   f"({'DRY' if hedge_stats['dry_run'] else 'LIVE'})")
             except Exception:
                 pass
 

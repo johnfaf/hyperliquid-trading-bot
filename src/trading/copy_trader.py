@@ -33,7 +33,8 @@ class CopyTrader:
                  agent_scorer: Optional[AgentScorer] = None,
                  kelly_sizer: Optional[KellySizer] = None,
                  trade_memory: Optional[TradeMemory] = None,
-                 calibration: Optional[CalibrationTracker] = None):
+                 calibration: Optional[CalibrationTracker] = None,
+                 regime_forecaster: Optional[object] = None):
         # Cache of last-known positions per trader: {address: {coin: position_dict}}
         self._position_cache: Dict[str, Dict[str, Dict]] = {}
         self._copy_count = 0
@@ -42,6 +43,7 @@ class CopyTrader:
         self.kelly_sizer = kelly_sizer
         self.trade_memory = trade_memory
         self.calibration = calibration
+        self.regime_forecaster = regime_forecaster
 
     def scan_top_traders(self, top_n: int = 10) -> List[Dict]:
         """
@@ -164,6 +166,61 @@ class CopyTrader:
 
         return signals
 
+    def _apply_regime_weight(self, signal: Dict, coin: str) -> Dict:
+        """
+        Apply regime-based weighting to copy signal confidence.
+
+        Reduces copy aggressiveness during crash regimes and increases during bullish regimes.
+        Gracefully degrades if regime_forecaster is unavailable.
+
+        Args:
+            signal: Copy signal dict
+            coin: Coin symbol
+
+        Returns:
+            Modified signal dict with adjusted confidence
+        """
+        if not self.regime_forecaster:
+            return signal
+
+        try:
+            regime_info = self.regime_forecaster.predict_regime(coin)
+        except Exception as e:
+            logger.debug(f"Failed to fetch regime data for {coin}: {e}")
+            return signal
+
+        regime = regime_info.get("regime", "neutral")
+        original_confidence = signal.get("confidence", 0.5)
+
+        # Apply regime multiplier to confidence
+        if regime == "crash":
+            # Copy much less aggressively during crashes (30% of normal confidence)
+            adjusted_confidence = original_confidence * 0.3
+            logger.info(
+                f"REGIME WEIGHT: crash detected for {coin}, "
+                f"reducing copy confidence {original_confidence:.2f} → {adjusted_confidence:.2f}"
+            )
+        elif regime == "neutral":
+            # Slightly reduce during neutral regimes (70% of normal confidence)
+            adjusted_confidence = original_confidence * 0.7
+            logger.debug(
+                f"REGIME WEIGHT: neutral regime for {coin}, "
+                f"reducing copy confidence {original_confidence:.2f} → {adjusted_confidence:.2f}"
+            )
+        elif regime == "bullish":
+            # Increase aggressiveness during bullish regimes (120% of normal, capped at 1.0)
+            adjusted_confidence = min(original_confidence * 1.2, 1.0)
+            if adjusted_confidence > original_confidence:
+                logger.info(
+                    f"REGIME WEIGHT: bullish detected for {coin}, "
+                    f"boosting copy confidence {original_confidence:.2f} → {adjusted_confidence:.2f}"
+                )
+        else:
+            adjusted_confidence = original_confidence
+
+        signal["confidence"] = adjusted_confidence
+        return signal
+
     def execute_copy_signals(self, signals: List[Dict],
                               regime_data: Optional[Dict] = None) -> List[Dict]:
         """
@@ -190,6 +247,9 @@ class CopyTrader:
                     continue
 
                 if signal["type"] in ("copy_open", "copy_scale_in", "copy_flip"):
+                    # Apply regime weighting to copy signal before further processing
+                    signal = self._apply_regime_weight(signal, signal["coin"])
+
                     # V2: Convert to TradeSignal and validate through firewall
                     if self.firewall and signal.get("price", 0) > 0:
                         trade_signal = signal_from_copy_trade(

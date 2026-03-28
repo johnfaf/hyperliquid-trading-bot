@@ -160,7 +160,8 @@ class LiveTrader:
     """
 
     def __init__(self, firewall: DecisionFirewall, dry_run: bool = True,
-                 max_daily_loss: float = 500, max_position_size: float = 1000):
+                 max_daily_loss: float = 500, max_position_size: float = 1000,
+                 regime_forecaster: Optional[object] = None):
         """
         Initialize live trader.
 
@@ -169,11 +170,13 @@ class LiveTrader:
             dry_run: If True, log what WOULD happen but don't execute (default True)
             max_daily_loss: Daily loss limit in USD (default $500)
             max_position_size: Max notional per position in USD (default $1000)
+            regime_forecaster: Optional PredictiveRegimeForecaster for regime-aware position sizing
         """
         self.firewall = firewall
         self.dry_run = dry_run
         self.max_daily_loss = float(os.environ.get("HL_MAX_DAILY_LOSS", max_daily_loss))
         self.max_position_size = float(os.environ.get("HL_MAX_POSITION_SIZE", max_position_size))
+        self.regime_forecaster = regime_forecaster
 
         # API endpoints (must come early since _load_* methods need these)
         self.exchange_url = "https://api.hyperliquid.xyz/exchange"
@@ -706,6 +709,68 @@ class LiveTrader:
             logger.error(f"Error getting open orders: {e}")
             return []
 
+    def apply_regime_overlay(self, signal: TradeSignal, regime_data: Optional[Dict] = None) -> TradeSignal:
+        """
+        Apply regime-based position sizing and risk adjustments to a signal.
+
+        Fetches regime prediction from self.regime_forecaster if available,
+        or uses provided regime_data. Applies dynamic sizing and stop loss adjustments.
+
+        Args:
+            signal: TradeSignal to modify
+            regime_data: Optional pre-computed regime data dict with 'regime' and 'confidence' keys
+
+        Returns:
+            Modified signal with adjusted size and risk parameters
+        """
+        regime_info = None
+
+        # Fetch regime data from forecaster if available
+        if self.regime_forecaster and not regime_data:
+            try:
+                regime_info = self.regime_forecaster.predict_regime(signal.coin)
+            except Exception as e:
+                logger.debug(f"Failed to fetch regime data for {signal.coin}: {e}")
+        elif regime_data:
+            regime_info = regime_data
+
+        if not regime_info:
+            return signal
+
+        regime = regime_info.get("regime", "neutral")
+        confidence = regime_info.get("confidence", 0.0)
+
+        # 1. CRASH regime: reduce size 60%, tighten stop loss to 3%
+        if regime == "crash" and confidence > 0.4:
+            original_size = signal.size or (signal.position_pct * signal.effective_size)
+            signal.size = original_size * 0.4  # 60% reduction = multiply by 0.4
+            signal.risk.stop_loss_pct = 0.03
+            logger.warning(
+                f"REGIME OVERLAY: crash detected (conf={confidence:.2f}), "
+                f"reducing size 60%, tightening SL to 3% for {signal.coin}"
+            )
+
+        # 2. VOLATILE regime: reduce size 30%, widen stop loss to 8%
+        elif regime == "volatile":
+            original_size = signal.size or (signal.position_pct * signal.effective_size)
+            signal.size = original_size * 0.7  # 30% reduction = multiply by 0.7
+            signal.risk.stop_loss_pct = 0.08
+            logger.info(
+                f"REGIME OVERLAY: volatile detected, "
+                f"reducing size 30%, widening SL to 8% for {signal.coin}"
+            )
+
+        # 3. BULLISH regime: allow full size, boost by 10%
+        elif regime == "bullish" and confidence > 0.6:
+            original_size = signal.size or (signal.position_pct * signal.effective_size)
+            signal.size = original_size * 1.1  # 10% boost
+            logger.info(
+                f"REGIME OVERLAY: bullish confirmed (conf={confidence:.2f}), "
+                f"boosting size 10% for {signal.coin}"
+            )
+
+        return signal
+
     def execute_signal(self, signal: TradeSignal) -> Optional[Dict]:
         """
         Main entry point: execute a trade signal through firewall.
@@ -739,6 +804,9 @@ class LiveTrader:
         if self.check_daily_loss():
             logger.warning("Daily loss limit exceeded - rejecting signal")
             return None
+
+        # Apply regime overlay for dynamic position sizing
+        signal = self.apply_regime_overlay(signal)
 
         try:
             coin = signal.coin
