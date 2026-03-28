@@ -1614,6 +1614,144 @@ def _run_cli_backtest(logger, args):
         print(f"Exported {len(result.trades)} trades to {args.bt_export}")
 
 
+def _run_candle_backtest(logger, args):
+    """Run candle-based backtest with data from Hyperliquid API or file import."""
+    from src.backtest.data_fetcher import DataFetcher
+    from src.backtest.candle_backtester import CandleBacktester, CandleBacktestConfig
+
+    fetcher = DataFetcher()
+    cfg = CandleBacktestConfig(strategy=args.cbt_strategy)
+    use_cache = not args.cbt_no_cache
+
+    # ─── Import from file ────────────────────────────────
+    if args.cbt_import:
+        filepath = args.cbt_import
+        if filepath.endswith(".json"):
+            candles = fetcher.import_json(filepath, coin=args.cbt_coin, timeframe=args.cbt_timeframe)
+        else:
+            candles = fetcher.import_csv(filepath, coin=args.cbt_coin, timeframe=args.cbt_timeframe)
+        if not candles:
+            logger.error(f"No candles imported from {filepath}")
+            return
+    # ─── Multi-coin mode ─────────────────────────────────
+    elif args.cbt_multi:
+        coins = [c.strip().upper() for c in args.cbt_multi.split(",")]
+        bt = CandleBacktester(cfg)
+        candle_sets = {}
+        for coin in coins:
+            logger.info(f"Fetching {coin}...")
+            data = fetcher.fetch_candles(
+                coin, args.cbt_timeframe,
+                start=args.cbt_start, end=args.cbt_end,
+                use_cache=use_cache
+            )
+            if data:
+                candle_sets[coin] = data
+
+        results = bt.run_multi_coin(candle_sets, strategy=args.cbt_strategy)
+
+        print(f"\n{'='*70}")
+        print(f"  Multi-Coin Backtest: {args.cbt_strategy} | {args.cbt_timeframe}")
+        print(f"{'='*70}")
+        print(f"{'Coin':<8} {'Trades':>7} {'Win%':>7} {'PnL':>12} {'MaxDD':>8} {'Sharpe':>8} {'PF':>8}")
+        print("-" * 70)
+        for coin, r in sorted(results.items(), key=lambda x: x[1].total_pnl, reverse=True):
+            print(f"{coin:<8} {r.total_trades:>7} {r.win_rate:>6.1f}% "
+                  f"${r.total_pnl:>+10,.2f} {r.max_drawdown_pct:>7.1f}% "
+                  f"{r.sharpe_ratio:>7.3f} {r.profit_factor:>7.2f}")
+        print("-" * 70)
+        total = sum(r.total_pnl for r in results.values())
+        print(f"{'TOTAL':<8} {'':>7} {'':>7} ${total:>+10,.2f}")
+        return
+
+    # ─── Single coin mode ────────────────────────────────
+    else:
+        candles = fetcher.fetch_candles(
+            args.cbt_coin, args.cbt_timeframe,
+            start=args.cbt_start, end=args.cbt_end,
+            use_cache=use_cache
+        )
+        if not candles:
+            logger.error(f"No candle data found for {args.cbt_coin}")
+            return
+
+    # ─── Parameter sweep ─────────────────────────────────
+    if args.cbt_sweep:
+        parts = args.cbt_sweep.split("=")
+        param_name = parts[0]
+        vals = parts[1].split(",")
+        if len(vals) == 3:
+            start_val, end_val, step_val = float(vals[0]), float(vals[1]), float(vals[2])
+            import numpy as _np
+            sweep_values = _np.arange(start_val, end_val + step_val, step_val).tolist()
+            # Convert to int if the param is naturally int
+            if param_name in ("fast_period", "slow_period", "rsi_period", "bb_period", "atr_period"):
+                sweep_values = [int(v) for v in sweep_values]
+        else:
+            sweep_values = [float(v) if "." in v else int(v) for v in vals]
+
+        bt = CandleBacktester(cfg)
+        results = bt.parameter_sweep(candles, param_name, sweep_values, strategy=args.cbt_strategy)
+
+        print(f"\n{'='*70}")
+        print(f"  Parameter Sweep: {param_name} | {args.cbt_strategy} | {args.cbt_coin} {args.cbt_timeframe}")
+        print(f"{'='*70}")
+        print(f"{'Value':>10} {'Trades':>7} {'Win%':>7} {'PnL':>12} {'MaxDD':>8} {'Sharpe':>8}")
+        print("-" * 70)
+        for r in results:
+            val = r.config.get(param_name, "?")
+            print(f"{val:>10} {r.total_trades:>7} {r.win_rate:>6.1f}% "
+                  f"${r.total_pnl:>+10,.2f} {r.max_drawdown_pct:>7.1f}% "
+                  f"{r.sharpe_ratio:>7.3f}")
+        return
+
+    # ─── Standard single run ─────────────────────────────
+    bt = CandleBacktester(cfg)
+    result = bt.run(candles, strategy=args.cbt_strategy)
+
+    print(f"\n{'='*60}")
+    print(f"  Candle Backtest: {result.coin} {result.timeframe} | {args.cbt_strategy}")
+    print(f"{'='*60}")
+    for k, v in result.summary().items():
+        print(f"  {k:<20} {v}")
+
+    if args.bt_export:
+        import csv as _csv
+        with open(args.bt_export, "w", newline="") as f:
+            writer = _csv.DictWriter(f, fieldnames=result.trades[0].keys() if result.trades else [])
+            writer.writeheader()
+            writer.writerows(result.trades)
+        print(f"\n  Exported {len(result.trades)} trades to {args.bt_export}")
+
+
+def _run_cache_list(logger):
+    """List all cached candle data."""
+    from src.backtest.data_fetcher import DataFetcher
+    fetcher = DataFetcher()
+    cached = fetcher.list_cached()
+    stats = fetcher.get_cache_stats()
+
+    if not cached:
+        print("No cached candle data. Run --candle-backtest to fetch some.")
+        return
+
+    print(f"\nCandle Cache ({stats['db_size_mb']:.1f} MB, {stats['total_candles']:,} candles)")
+    print(f"{'Coin':<8} {'TF':<6} {'Start':<12} {'End':<12} {'Candles':>10} {'Days':>8}")
+    print("-" * 60)
+    for c in cached:
+        print(f"{c['coin']:<8} {c['timeframe']:<6} {c['start']:<12} {c['end']:<12} "
+              f"{c['candles']:>10,} {c['days']:>7.0f}")
+
+
+def _run_cache_clear(logger):
+    """Clear candle cache."""
+    from src.backtest.data_fetcher import DataFetcher
+    fetcher = DataFetcher()
+    stats_before = fetcher.get_cache_stats()
+    fetcher.clear_cache()
+    print(f"Cleared {stats_before['total_candles']:,} candles ({stats_before['db_size_mb']:.1f} MB)")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Hyperliquid Auto-Research Trading Bot"
@@ -1644,6 +1782,31 @@ def main():
                         help="Filter backtest to specific strategy type")
     parser.add_argument("--bt-export", type=str, default=None,
                         help="Export backtest results to CSV file path")
+    # ─── Candle backtester args ───
+    parser.add_argument("--candle-backtest", action="store_true",
+                        help="Run candle-based backtest (fetch from HL API or import file)")
+    parser.add_argument("--cbt-coin", type=str, default="BTC",
+                        help="Coin for candle backtest (default: BTC)")
+    parser.add_argument("--cbt-timeframe", type=str, default="1h",
+                        help="Candle timeframe: 1m,5m,15m,1h,4h,1d (default: 1h)")
+    parser.add_argument("--cbt-start", type=str, default=None,
+                        help="Start date YYYY-MM-DD (default: 90 days ago)")
+    parser.add_argument("--cbt-end", type=str, default=None,
+                        help="End date YYYY-MM-DD (default: now)")
+    parser.add_argument("--cbt-strategy", type=str, default="momentum",
+                        help="Strategy: momentum, mean_reversion, breakout, rsi (default: momentum)")
+    parser.add_argument("--cbt-import", type=str, default=None,
+                        help="Import candles from CSV or JSON file instead of API")
+    parser.add_argument("--cbt-sweep", type=str, default=None,
+                        help="Parameter sweep: param=start,end,step (e.g. fast_period=5,50,5)")
+    parser.add_argument("--cbt-multi", type=str, default=None,
+                        help="Multi-coin backtest: comma-separated (e.g. BTC,ETH,SOL)")
+    parser.add_argument("--cbt-no-cache", action="store_true",
+                        help="Skip local cache, force re-download from API")
+    parser.add_argument("--cache-list", action="store_true",
+                        help="List all cached candle data and exit")
+    parser.add_argument("--cache-clear", action="store_true",
+                        help="Clear candle data cache and exit")
     args = parser.parse_args()
 
     logger = setup_logging()
@@ -1666,6 +1829,18 @@ def main():
                     f"balance = ${result['new_balance']:,.2f}")
         print(f"✓ Paper trades cleared ({result['open_deleted']} open + "
               f"{result['closed_deleted']} closed). Balance reset to ${balance:,.2f}")
+        return
+
+    if args.cache_list:
+        _run_cache_list(logger)
+        return
+
+    if args.cache_clear:
+        _run_cache_clear(logger)
+        return
+
+    if args.candle_backtest:
+        _run_candle_backtest(logger, args)
         return
 
     if args.backtest:
