@@ -1501,6 +1501,119 @@ def bootstrap_seed_data(logger, days: int = 14):
     logger.info(f"Bootstrap complete: {humans} traders, {golden} golden wallets, DB backed up")
 
 
+def _run_cli_backtest(logger, args):
+    """Run backtest from CLI with optional filters and export."""
+    from src.backtester import BacktestEngine, BacktestConfig
+    from src.golden_wallet import _get_db as gw_get_db
+    import csv as _csv
+
+    logger.info("Running CLI backtest...")
+
+    cfg = BacktestConfig()
+
+    # Load fills from golden wallets
+    conn = gw_get_db()
+    try:
+        query = "SELECT * FROM wallet_fills WHERE 1=1"
+        params = []
+
+        if args.bt_coins:
+            coins = [c.strip().upper() for c in args.bt_coins.split(",")]
+            placeholders = ",".join("?" * len(coins))
+            query += f" AND coin IN ({placeholders})"
+            params.extend(coins)
+
+        if args.bt_start:
+            # Convert date to epoch ms
+            from datetime import datetime as _dt
+            start_ms = int(_dt.strptime(args.bt_start, "%Y-%m-%d").timestamp() * 1000)
+            query += " AND time_ms >= ?"
+            params.append(start_ms)
+
+        if args.bt_end:
+            from datetime import datetime as _dt
+            end_ms = int(_dt.strptime(args.bt_end, "%Y-%m-%d").timestamp() * 1000)
+            query += " AND time_ms <= ?"
+            params.append(end_ms)
+
+        query += " ORDER BY time_ms ASC"
+        rows = conn.execute(query, params).fetchall()
+    finally:
+        conn.close()
+
+    if not rows:
+        logger.warning("No fills found matching filters")
+        print("No fills found. Run a golden wallet scan first.")
+        return
+
+    # Convert to BacktestFill objects
+    from src.backtester import BacktestFill
+    fills = []
+    for r in rows:
+        r = dict(r)
+        fills.append(BacktestFill(
+            wallet_address=r.get("wallet_address", ""),
+            coin=r.get("coin", ""),
+            side=r.get("side", ""),
+            price=float(r.get("price", 0)),
+            original_price=float(r.get("original_price", r.get("price", 0))),
+            size=float(r.get("size", 0)),
+            time_ms=int(r.get("time_ms", 0)),
+            closed_pnl=float(r.get("closed_pnl", 0)),
+            direction=r.get("direction", ""),
+            is_liquidation=bool(r.get("is_liquidation", False)),
+        ))
+
+    logger.info(f"Loaded {len(fills)} fills for backtest "
+               f"(coins={args.bt_coins or 'ALL'}, "
+               f"start={args.bt_start or 'earliest'}, end={args.bt_end or 'latest'})")
+
+    engine = BacktestEngine(cfg)
+    result = engine.run(fills)
+
+    # Print summary
+    print(f"\n{'='*60}")
+    print(f"  BACKTEST RESULTS")
+    print(f"{'='*60}")
+    print(f"  Trades:           {result.total_trades}")
+    print(f"  Win Rate:         {result.win_rate:.1f}%")
+    print(f"  Total PnL:        ${result.total_pnl:+,.2f}")
+    print(f"  Max Drawdown:     {result.max_drawdown_pct:.1f}%")
+    print(f"  Sharpe Ratio:     {result.sharpe_ratio:.3f}")
+    print(f"  Sortino Ratio:    {result.sortino_ratio:.3f}")
+    print(f"  Profit Factor:    {result.profit_factor:.2f}")
+    print(f"  Calmar Ratio:     {result.calmar_ratio:.3f}")
+    print(f"  Expectancy:       {result.expectancy:.4f}")
+    print(f"  Avg Hold (h):     {result.avg_hold_hours:.1f}")
+    print(f"  Max Consec Loss:  {result.max_consecutive_losses}")
+    print(f"  Duration:         {result.duration_seconds:.1f}s")
+    if result.coin_breakdown:
+        print(f"\n  Per-Coin Breakdown:")
+        for coin, data in sorted(result.coin_breakdown.items(), key=lambda x: x[1]["pnl"], reverse=True):
+            print(f"    {coin:>6}: {data['trades']:>3} trades, "
+                  f"PnL=${data['pnl']:+,.2f}, WR={data.get('win_rate', 0):.0f}%")
+    print(f"{'='*60}\n")
+
+    # Export to CSV
+    if args.bt_export and result.trades:
+        with open(args.bt_export, "w", newline="") as f:
+            writer = _csv.writer(f)
+            writer.writerow([
+                "coin", "side", "entry_price", "exit_price", "size", "leverage",
+                "entry_time", "exit_time", "pnl", "pnl_pct", "exit_reason",
+                "source_wallet", "hold_hours"
+            ])
+            for t in result.trades:
+                writer.writerow([
+                    t.coin, t.side, t.entry_price, t.exit_price, t.size, t.leverage,
+                    datetime.utcfromtimestamp(t.entry_time_ms / 1000).isoformat(),
+                    datetime.utcfromtimestamp(t.exit_time_ms / 1000).isoformat(),
+                    round(t.pnl, 2), round(t.pnl_pct, 6), t.exit_reason,
+                    t.source_wallet, round(t.hold_time_hours, 2),
+                ])
+        print(f"Exported {len(result.trades)} trades to {args.bt_export}")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Hyperliquid Auto-Research Trading Bot"
@@ -1515,6 +1628,22 @@ def main():
                         help="Cold start: seed DB with top trader data (run once on first deploy)")
     parser.add_argument("--bootstrap-days", type=int, default=14,
                         help="Days of history to bootstrap (default: 14)")
+    parser.add_argument("--reset-paper", action="store_true",
+                        help="Clear all paper trades and reset balance to $10k")
+    parser.add_argument("--reset-balance", type=float, default=None,
+                        help="Custom starting balance for --reset-paper (default: $10,000)")
+    parser.add_argument("--backtest", action="store_true",
+                        help="Run a backtest on golden wallet data and exit")
+    parser.add_argument("--bt-coins", type=str, default=None,
+                        help="Comma-separated coins to backtest (e.g. BTC,ETH,SOL)")
+    parser.add_argument("--bt-start", type=str, default=None,
+                        help="Backtest start date (YYYY-MM-DD)")
+    parser.add_argument("--bt-end", type=str, default=None,
+                        help="Backtest end date (YYYY-MM-DD)")
+    parser.add_argument("--bt-strategy", type=str, default=None,
+                        help="Filter backtest to specific strategy type")
+    parser.add_argument("--bt-export", type=str, default=None,
+                        help="Export backtest results to CSV file path")
     args = parser.parse_args()
 
     logger = setup_logging()
@@ -1527,6 +1656,20 @@ def main():
 
     if args.bootstrap:
         bootstrap_seed_data(logger, days=args.bootstrap_days)
+        return
+
+    if args.reset_paper:
+        balance = args.reset_balance or config.PAPER_TRADING_INITIAL_BALANCE
+        result = db.reset_paper_trades(balance)
+        logger.info(f"Paper trades reset: {result['open_deleted']} open + "
+                    f"{result['closed_deleted']} closed trades cleared, "
+                    f"balance = ${result['new_balance']:,.2f}")
+        print(f"✓ Paper trades cleared ({result['open_deleted']} open + "
+              f"{result['closed_deleted']} closed). Balance reset to ${balance:,.2f}")
+        return
+
+    if args.backtest:
+        _run_cli_backtest(logger, args)
         return
 
     bot = HyperliquidResearchBot()

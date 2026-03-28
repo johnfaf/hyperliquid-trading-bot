@@ -432,6 +432,37 @@ def get_paper_trade_history(limit=100):
     return [dict(r) for r in rows]
 
 
+def reset_paper_trades(initial_balance: float = None):
+    """
+    Wipe all paper trades and reset the paper account to fresh state.
+    Returns summary of what was deleted.
+    """
+    if initial_balance is None:
+        initial_balance = 10_000.0
+
+    with get_connection() as conn:
+        open_count = conn.execute(
+            "SELECT COUNT(*) as c FROM paper_trades WHERE status = 'open'"
+        ).fetchone()["c"]
+        closed_count = conn.execute(
+            "SELECT COUNT(*) as c FROM paper_trades WHERE status = 'closed'"
+        ).fetchone()["c"]
+
+        conn.execute("DELETE FROM paper_trades")
+        conn.execute("""
+            INSERT OR REPLACE INTO paper_account (id, balance, total_pnl, total_trades, winning_trades, last_updated)
+            VALUES (1, ?, 0, 0, 0, ?)
+        """, (initial_balance, datetime.utcnow().isoformat()))
+
+    logger.info(f"Paper trades reset: cleared {open_count} open + {closed_count} closed trades, "
+               f"balance reset to ${initial_balance:,.2f}")
+    return {
+        "open_deleted": open_count,
+        "closed_deleted": closed_count,
+        "new_balance": initial_balance,
+    }
+
+
 # ─── Research Logs ─────────────────────────────────────────────
 
 def log_research_cycle(cycle_type, summary, details=None,

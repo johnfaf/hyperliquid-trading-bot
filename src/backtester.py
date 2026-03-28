@@ -66,6 +66,18 @@ class BacktestConfig:
     min_confidence: float = 0.30         # firewall minimum
     cooldown_ms: int = 300_000           # 5 min cooldown per coin
 
+    # Funding rate simulation
+    funding_rate_8h: float = 0.0001      # 0.01% per 8h (HL average)
+    funding_enabled: bool = True         # charge funding on open positions
+
+    # Partial fill simulation
+    partial_fill_prob: float = 0.10      # 10% chance of partial fill
+    partial_fill_min_pct: float = 0.40   # minimum 40% of order filled
+
+    # Liquidation simulation
+    liquidation_enabled: bool = True
+    maintenance_margin_pct: float = 0.03 # 3% maintenance margin (HL standard)
+
     # Filters
     min_trade_size_usd: float = 100.0    # ignore dust
     max_hold_hours: float = 72.0         # force-close after 72h
@@ -131,7 +143,7 @@ class SimTrade:
     exit_time_ms: int
     pnl: float
     pnl_pct: float
-    exit_reason: str         # "signal", "stop_loss", "take_profit", "trailing_stop", "time_limit", "force_close"
+    exit_reason: str         # "signal", "stop_loss", "take_profit", "trailing_stop", "time_limit", "force_close", "liquidation"
     source_wallet: str
     hold_time_hours: float
 
@@ -359,6 +371,13 @@ class BacktestEngine:
         if size <= 0:
             return
 
+        # Partial fill simulation: randomly reduce fill size
+        import random as _rng
+        _rng.seed(self._rng_seed + self._total_signals)  # deterministic
+        if self.cfg.partial_fill_prob > 0 and _rng.random() < self.cfg.partial_fill_prob:
+            fill_pct = _rng.uniform(self.cfg.partial_fill_min_pct, 1.0)
+            size *= fill_pct
+
         # Calculate stop/take-profit levels
         if side == "long":
             stop_loss = entry_price * (1 - self.cfg.stop_loss_pct)
@@ -441,8 +460,57 @@ class BacktestEngine:
 
     # ─── Position Management ────────────────────────────────────
 
+    def _charge_funding(self, current_time_ms: int):
+        """Charge funding rate on all open positions (every 8h in simulation)."""
+        if not self.cfg.funding_enabled:
+            return
+        funding_interval_ms = 8 * 3600 * 1000  # 8 hours
+        for pos in self._positions:
+            elapsed = current_time_ms - pos.entry_time_ms
+            # Number of 8h periods since entry
+            periods = elapsed // funding_interval_ms
+            if periods < 1:
+                continue
+            # Charge once per snapshot — we approximate by checking if this is
+            # a funding boundary (within one fill of a period boundary)
+            if elapsed % funding_interval_ms < 60_000:  # within 1 minute of boundary
+                funding_cost = pos.notional * self.cfg.funding_rate_8h
+                # Longs pay funding when positive, shorts receive (simplified)
+                if pos.side == "long":
+                    self._balance -= funding_cost
+                else:
+                    self._balance += funding_cost
+
+    def _check_liquidations(self, current_time_ms: int):
+        """Check if any position has been liquidated (margin call)."""
+        if not self.cfg.liquidation_enabled:
+            return
+        to_liquidate = []
+        for pos in self._positions:
+            price = self._latest_prices.get(pos.coin)
+            if price is None:
+                continue
+            # Unrealized PnL
+            if pos.side == "long":
+                unrealized = (price - pos.entry_price) * pos.size * pos.leverage
+            else:
+                unrealized = (pos.entry_price - price) * pos.size * pos.leverage
+            # Margin = notional / leverage
+            margin = pos.notional / pos.leverage if pos.leverage > 0 else pos.notional
+            # Liquidated when unrealized loss exceeds (1 - maintenance_margin) * margin
+            if unrealized < -(margin * (1 - self.cfg.maintenance_margin_pct)):
+                to_liquidate.append((pos, price))
+
+        for pos, price in to_liquidate:
+            self._close_position(pos, price, current_time_ms, "liquidation")
+
     def _check_exits(self, current_time_ms: int):
         """Check all open positions against their stop/take-profit levels."""
+        # Charge funding before exit checks
+        self._charge_funding(current_time_ms)
+        # Check liquidations
+        self._check_liquidations(current_time_ms)
+
         to_close = []
 
         for pos in self._positions:

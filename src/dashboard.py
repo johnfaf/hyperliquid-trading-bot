@@ -702,9 +702,27 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._handle_order()
         elif parsed.path == "/api/backtest/run":
             self._handle_backtest_run()
+        elif parsed.path == "/api/paper/reset":
+            self._handle_paper_reset()
         else:
             self.send_response(404)
             self.end_headers()
+
+    def _handle_paper_reset(self):
+        """Reset all paper trades and balance."""
+        try:
+            from src.database import reset_paper_trades
+            import config as _cfg
+            # Read optional balance from request body
+            balance = _cfg.PAPER_TRADING_INITIAL_BALANCE
+            content_len = int(self.headers.get("Content-Length", 0))
+            if content_len > 0:
+                body = json.loads(self.rfile.read(content_len))
+                balance = float(body.get("balance", balance))
+            result = reset_paper_trades(balance)
+            self._json_response({"status": "ok", **result})
+        except Exception as e:
+            self._json_response({"error": str(e)}, code=500)
 
     def _json_response(self, data: dict, code: int = 200):
         self.send_response(code)

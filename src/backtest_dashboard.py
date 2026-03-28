@@ -155,57 +155,74 @@ BACKTEST_HTML = """<!DOCTYPE html>
 <title>Golden Wallet Backtest Dashboard</title>
 <style>
   :root {
-    --bg: #0d1117; --card: #161b22; --border: #30363d;
-    --text: #c9d1d9; --dim: #8b949e; --accent: #58a6ff;
-    --green: #3fb950; --red: #f85149; --gold: #d29922;
-    --purple: #bc8cff;
+    --bg: #0a0e14; --card: #12171e; --card-hover: #161d26; --border: #1e2a3a;
+    --text: #d0d7e0; --dim: #6b7a8d; --accent: #4da6ff; --accent-dim: rgba(77,166,255,.12);
+    --green: #00d68f; --green-dim: rgba(0,214,143,.12);
+    --red: #ff5c5c; --red-dim: rgba(255,92,92,.12);
+    --gold: #f0b429; --gold-dim: rgba(240,180,41,.12);
+    --purple: #a78bfa; --orange: #ff9f43;
   }
   * { box-sizing: border-box; margin: 0; padding: 0; }
-  body { background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 14px; }
-  .container { max-width: 1400px; margin: 0 auto; padding: 20px; }
-  h1 { font-size: 24px; margin-bottom: 8px; }
-  h2 { font-size: 18px; margin: 24px 0 12px; color: var(--accent); }
-  h3 { font-size: 15px; margin: 16px 0 8px; color: var(--dim); }
-  .subtitle { color: var(--dim); margin-bottom: 20px; }
-  .top-bar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }
-  .badge { display: inline-block; padding: 2px 10px; border-radius: 12px; font-size: 12px; font-weight: 600; }
-  .badge-gold { background: rgba(210,153,34,.15); color: var(--gold); }
-  .badge-green { background: rgba(63,185,80,.15); color: var(--green); }
-  .badge-red { background: rgba(248,81,73,.15); color: var(--red); }
-  .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin-bottom: 20px; }
-  .stat-card { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 16px; }
-  .stat-label { font-size: 11px; text-transform: uppercase; color: var(--dim); letter-spacing: .5px; }
-  .stat-value { font-size: 22px; font-weight: 700; margin-top: 4px; }
-  .stat-value.positive { color: var(--green); }
-  .stat-value.negative { color: var(--red); }
-  .stat-value.gold { color: var(--gold); }
-  table { width: 100%; border-collapse: collapse; background: var(--card); border-radius: 8px; overflow: hidden; }
-  th { background: #1c2128; padding: 10px 12px; text-align: left; font-size: 11px; text-transform: uppercase; color: var(--dim); letter-spacing: .5px; }
-  td { padding: 10px 12px; border-top: 1px solid var(--border); }
-  tr:hover td { background: rgba(88,166,255,.04); }
+  body { background: var(--bg); color: var(--text); font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 13px; line-height: 1.5; }
+  .container { max-width: 1440px; margin: 0 auto; padding: 24px; }
+  h1 { font-size: 22px; font-weight: 700; letter-spacing: -.3px; }
+  h2 { font-size: 16px; margin: 28px 0 14px; color: var(--accent); font-weight: 600; }
+  h3 { font-size: 14px; margin: 20px 0 10px; color: var(--dim); font-weight: 500; }
+  .subtitle { color: var(--dim); font-size: 12px; margin-top: 4px; }
+  .top-bar { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 24px; padding-bottom: 16px; border-bottom: 1px solid var(--border); }
+  .btn-group { display: flex; gap: 8px; align-items: center; }
+  .badge { display: inline-block; padding: 3px 10px; border-radius: 20px; font-size: 11px; font-weight: 600; }
+  .badge-gold { background: var(--gold-dim); color: var(--gold); }
+  .badge-green { background: var(--green-dim); color: var(--green); }
+  .badge-red { background: var(--red-dim); color: var(--red); }
+  .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 10px; margin-bottom: 20px; }
+  .stat-card { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; transition: background .15s; }
+  .stat-card:hover { background: var(--card-hover); }
+  .stat-label { font-size: 10px; text-transform: uppercase; color: var(--dim); letter-spacing: .8px; font-weight: 500; }
+  .stat-value { font-size: 20px; font-weight: 700; margin-top: 4px; font-variant-numeric: tabular-nums; }
+  .stat-sub { font-size: 11px; color: var(--dim); margin-top: 2px; }
+  .positive { color: var(--green); }
+  .negative { color: var(--red); }
+  .gold { color: var(--gold); }
+  table { width: 100%; border-collapse: collapse; background: var(--card); border-radius: 10px; overflow: hidden; font-size: 13px; }
+  th { background: #0e1319; padding: 10px 14px; text-align: left; font-size: 10px; text-transform: uppercase; color: var(--dim); letter-spacing: .8px; font-weight: 500; }
+  td { padding: 10px 14px; border-top: 1px solid var(--border); font-variant-numeric: tabular-nums; }
+  tr:hover td { background: rgba(77,166,255,.03); }
   .clickable { cursor: pointer; }
-  .clickable:hover td { background: rgba(88,166,255,.08); }
+  .clickable:hover td { background: rgba(77,166,255,.06); }
   .pnl-pos { color: var(--green); font-weight: 600; }
   .pnl-neg { color: var(--red); font-weight: 600; }
-  .chart-container { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 16px; margin: 12px 0; }
-  canvas { width: 100% !important; height: 300px !important; }
-  .heatmap { display: grid; gap: 2px; margin: 8px 0; }
-  .heatmap-cell { padding: 6px 4px; text-align: center; font-size: 11px; border-radius: 4px; min-width: 40px; }
+  .chart-container { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 16px; margin: 12px 0; }
+  canvas { width: 100% !important; height: 280px !important; }
+  .heatmap { display: grid; gap: 3px; margin: 8px 0; }
+  .heatmap-cell { padding: 6px 4px; text-align: center; font-size: 10px; border-radius: 4px; min-width: 40px; font-weight: 500; }
   .tabs { display: flex; gap: 4px; margin: 16px 0; }
-  .tab { padding: 8px 16px; border-radius: 6px; cursor: pointer; background: var(--card); border: 1px solid var(--border); color: var(--dim); font-size: 13px; }
+  .tab { padding: 7px 16px; border-radius: 8px; cursor: pointer; background: var(--card); border: 1px solid var(--border); color: var(--dim); font-size: 12px; font-weight: 500; transition: all .15s; }
+  .tab:hover { color: var(--text); border-color: var(--dim); }
   .tab.active { background: var(--accent); color: #fff; border-color: var(--accent); }
   .detail-panel { display: none; }
   .detail-panel.active { display: block; }
-  .back-btn { background: var(--card); border: 1px solid var(--border); color: var(--accent); padding: 6px 16px; border-radius: 6px; cursor: pointer; font-size: 13px; }
-  .back-btn:hover { background: var(--border); }
-  .run-btn { background: var(--green); color: #000; border: none; padding: 8px 20px; border-radius: 6px; cursor: pointer; font-weight: 600; font-size: 13px; }
-  .run-btn:hover { opacity: .85; }
-  .run-btn:disabled { opacity: .4; cursor: not-allowed; }
-  .spinner { display: inline-block; width: 14px; height: 14px; border: 2px solid #fff3; border-top-color: #fff; border-radius: 50%; animation: spin .8s linear infinite; margin-right: 6px; }
+  .back-btn { background: var(--card); border: 1px solid var(--border); color: var(--accent); padding: 7px 16px; border-radius: 8px; cursor: pointer; font-size: 12px; font-weight: 500; transition: all .15s; }
+  .back-btn:hover { background: var(--card-hover); }
+  .btn { border: none; padding: 8px 18px; border-radius: 8px; cursor: pointer; font-weight: 600; font-size: 12px; transition: all .15s; }
+  .btn:disabled { opacity: .4; cursor: not-allowed; }
+  .btn-green { background: var(--green); color: #000; }
+  .btn-green:hover:not(:disabled) { opacity: .85; }
+  .btn-red { background: var(--red-dim); color: var(--red); border: 1px solid rgba(255,92,92,.3); }
+  .btn-red:hover:not(:disabled) { background: rgba(255,92,92,.2); }
+  .btn-outline { background: transparent; color: var(--accent); border: 1px solid var(--border); }
+  .btn-outline:hover { border-color: var(--accent); background: var(--accent-dim); }
+  .spinner { display: inline-block; width: 12px; height: 12px; border: 2px solid #fff3; border-top-color: #fff; border-radius: 50%; animation: spin .8s linear infinite; margin-right: 6px; vertical-align: middle; }
   @keyframes spin { to { transform: rotate(360deg); } }
   .flex-row { display: flex; gap: 16px; flex-wrap: wrap; }
   .flex-row > * { flex: 1; min-width: 300px; }
-  #status-msg { color: var(--dim); font-style: italic; margin: 8px 0; }
+  #status-msg { color: var(--dim); font-size: 12px; font-style: italic; margin: 8px 0; min-height: 18px; }
+  .paper-section { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 20px; margin-bottom: 24px; }
+  .paper-section h2 { margin-top: 0; }
+  .section-row { display: flex; justify-content: space-between; align-items: center; }
+  code { font-family: 'JetBrains Mono', 'Fira Code', monospace; font-size: 12px; }
+  .tooltip { position: relative; }
+  .tooltip:hover::after { content: attr(data-tip); position: absolute; bottom: 100%; left: 50%; transform: translateX(-50%); background: #1a2332; color: var(--text); padding: 4px 8px; border-radius: 4px; font-size: 11px; white-space: nowrap; z-index: 10; }
 </style>
 </head>
 <body>
@@ -213,18 +230,30 @@ BACKTEST_HTML = """<!DOCTYPE html>
   <div class="top-bar">
     <div>
       <h1>Golden Wallet Backtest</h1>
-      <div class="subtitle">Multi-timeframe analysis with +100ms delay &amp; -0.045% fee penalty</div>
+      <div class="subtitle">Multi-timeframe analysis &middot; +100ms copy delay &middot; 4.5bps slippage &middot; funding rate sim</div>
     </div>
-    <div>
-      <button class="run-btn" id="runBtn" onclick="runScan()">Run Golden Scan</button>
-      <a href="/" style="margin-left:12px;color:var(--accent);text-decoration:none;">&larr; Main Dashboard</a>
+    <div class="btn-group">
+      <button class="btn btn-green" id="runBtn" onclick="runScan()">Run Golden Scan</button>
+      <button class="btn btn-red" id="resetBtn" onclick="resetPaper()">Reset Paper Trades</button>
+      <button class="btn btn-outline" onclick="exportCSV()">Export CSV</button>
+      <a href="/" style="margin-left:8px;color:var(--accent);text-decoration:none;font-size:12px;">&larr; Main</a>
     </div>
   </div>
   <div id="status-msg"></div>
 
+  <!-- Paper Trading Summary -->
+  <div class="paper-section" id="paper-section">
+    <div class="section-row">
+      <h2 style="margin:0">Paper Trading Account</h2>
+      <span id="paper-status" class="badge badge-green">Active</span>
+    </div>
+    <div class="stats-grid" id="paper-stats" style="margin-top:14px"></div>
+  </div>
+
   <!-- Overview page -->
   <div id="overview-page">
     <div class="stats-grid" id="summary-stats"></div>
+
     <h2>Evaluated Wallets</h2>
     <table id="wallets-table">
       <thead><tr>
@@ -257,6 +286,9 @@ BACKTEST_HTML = """<!DOCTYPE html>
 
     <h3>Equity Curve (Raw vs Penalised)</h3>
     <div class="chart-container"><canvas id="equityChart"></canvas></div>
+
+    <h3>Drawdown (%)</h3>
+    <div class="chart-container"><canvas id="drawdownChart"></canvas></div>
 
     <div class="flex-row">
       <div>
@@ -293,18 +325,85 @@ BACKTEST_HTML = """<!DOCTYPE html>
 <script>
 let DATA = null;
 let DETAIL = null;
+let PAPER = null;
 let selectedTf = '1d';
 let detailTf = '1d';
 let charts = {};
 
 async function load() {
   try {
-    const r = await fetch('/api/backtest');
-    DATA = await r.json();
+    const [btRes, paperRes] = await Promise.all([
+      fetch('/api/backtest'),
+      fetch('/api/status').catch(() => null),
+    ]);
+    DATA = await btRes.json();
+    if (paperRes && paperRes.ok) {
+      const status = await paperRes.json();
+      PAPER = status.paper_account;
+    }
     renderOverview();
+    renderPaperStats();
   } catch(e) {
     document.getElementById('status-msg').textContent = 'No backtest data yet. Click "Run Golden Scan" to start.';
   }
+}
+
+function renderPaperStats() {
+  const el = document.getElementById('paper-stats');
+  if (!PAPER) {
+    el.innerHTML = '<div class="stat-card"><div class="stat-label">Status</div><div class="stat-value" style="color:var(--dim)">No data</div></div>';
+    return;
+  }
+  const balance = PAPER.balance || 0;
+  const pnl = PAPER.total_pnl || 0;
+  const trades = PAPER.total_trades || 0;
+  const wins = PAPER.winning_trades || 0;
+  const wr = trades > 0 ? (wins/trades*100).toFixed(1) : '0';
+  const roi = balance > 0 ? ((pnl / 10000) * 100).toFixed(2) : '0';
+  el.innerHTML = `
+    <div class="stat-card"><div class="stat-label">Balance</div><div class="stat-value">$${balance.toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2})}</div></div>
+    <div class="stat-card"><div class="stat-label">Total PnL</div><div class="stat-value ${pnl>=0?'positive':'negative'}">${fmt(pnl,2)}</div></div>
+    <div class="stat-card"><div class="stat-label">ROI</div><div class="stat-value ${pnl>=0?'positive':'negative'}">${roi}%</div></div>
+    <div class="stat-card"><div class="stat-label">Trades</div><div class="stat-value">${trades}</div></div>
+    <div class="stat-card"><div class="stat-label">Win Rate</div><div class="stat-value">${wr}%</div></div>
+    <div class="stat-card"><div class="stat-label">Wins / Losses</div><div class="stat-value"><span class="positive">${wins}</span> / <span class="negative">${trades-wins}</span></div></div>
+  `;
+}
+
+async function resetPaper() {
+  if (!confirm('This will DELETE all paper trades and reset balance to $10,000. Continue?')) return;
+  const btn = document.getElementById('resetBtn');
+  btn.disabled = true;
+  btn.textContent = 'Resetting...';
+  try {
+    const r = await fetch('/api/paper/reset', {method:'POST'});
+    const res = await r.json();
+    document.getElementById('status-msg').textContent =
+      'Paper trades reset: ' + (res.open_deleted||0) + ' open + ' + (res.closed_deleted||0) + ' closed cleared.';
+    await load();
+  } catch(e) {
+    document.getElementById('status-msg').textContent = 'Reset failed: ' + e.message;
+  }
+  btn.disabled = false;
+  btn.textContent = 'Reset Paper Trades';
+}
+
+function exportCSV() {
+  if (!DATA || !DATA.wallets || !DATA.wallets.length) {
+    alert('No data to export');
+    return;
+  }
+  let csv = 'address,is_golden,raw_pnl,penalised_pnl,max_dd_pct,sharpe,win_rate,fills,trades_per_day\\n';
+  DATA.wallets.forEach(w => {
+    csv += [w.address,w.is_golden,w.raw_pnl.toFixed(2),w.penalised_pnl.toFixed(2),
+            w.penalised_max_drawdown_pct.toFixed(2),w.sharpe_ratio.toFixed(3),
+            w.win_rate.toFixed(1),w.total_fills,w.trades_per_day.toFixed(2)].join(',') + '\\n';
+  });
+  const blob = new Blob([csv], {type:'text/csv'});
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'backtest_wallets_' + new Date().toISOString().slice(0,10) + '.csv';
+  a.click();
 }
 
 function pnlClass(v) { return v >= 0 ? 'pnl-pos' : 'pnl-neg'; }
@@ -407,8 +506,9 @@ function renderDetail() {
     <div class="stat-card"><div class="stat-label">Fills (90d)</div><div class="stat-value">${w.total_fills}</div></div>
   `;
 
-  // Equity chart
+  // Equity chart + drawdown
   renderEquityChart(w);
+  renderDrawdownChart(w);
   // Hourly + weekday charts
   renderHourlyChart(DETAIL.hourly_pnl);
   renderWeekdayChart(DETAIL.weekday_pnl);
@@ -443,6 +543,46 @@ function renderEquityChart(w) {
       scales: {
         x: { ticks: { color: '#8b949e', maxTicksLimit: 12 }, grid: { color: '#21262d' } },
         y: { ticks: { color: '#8b949e', callback: v => '$'+v.toLocaleString() }, grid: { color: '#21262d' } },
+      }
+    }
+  });
+}
+
+function renderDrawdownChart(w) {
+  const ctx = document.getElementById('drawdownChart').getContext('2d');
+  if (charts.drawdown) charts.drawdown.destroy();
+
+  const pen = w.penalised_equity_curve || [];
+  const ts = w.equity_timestamps || [];
+  const labels = ts.map(t => new Date(t).toLocaleDateString());
+
+  // Compute drawdown series
+  let peak = pen[0] || 10000;
+  const dd = pen.map(v => {
+    if (v > peak) peak = v;
+    return peak > 0 ? ((v - peak) / peak * 100) : 0;
+  });
+
+  charts.drawdown = new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels: labels,
+      datasets: [{
+        label: 'Drawdown %',
+        data: dd,
+        borderColor: 'rgba(255,92,92,.8)',
+        backgroundColor: 'rgba(255,92,92,.08)',
+        borderWidth: 1.5,
+        pointRadius: 0,
+        fill: true,
+      }]
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      plugins: { legend: { labels: { color: '#6b7a8d' } } },
+      scales: {
+        x: { ticks: { color: '#6b7a8d', maxTicksLimit: 12 }, grid: { color: '#1e2a3a' } },
+        y: { ticks: { color: '#6b7a8d', callback: v => v.toFixed(1)+'%' }, grid: { color: '#1e2a3a' } },
       }
     }
   });
