@@ -21,7 +21,7 @@ from typing import List, Dict, Optional, Tuple
 from collections import defaultdict
 
 from src.signals.signal_schema import TradeSignal, SignalStrength
-from src import database as db
+from src.data import database as db
 
 logger = logging.getLogger(__name__)
 

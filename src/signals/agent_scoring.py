@@ -18,7 +18,7 @@ from typing import Dict, List, Optional, Tuple
 from collections import defaultdict
 from dataclasses import dataclass, asdict
 
-from src import database as db
+from src.data import database as db
 from src.signals.signal_schema import SignalSource
 
 logger = logging.getLogger(__name__)

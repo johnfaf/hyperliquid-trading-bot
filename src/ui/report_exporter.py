@@ -15,7 +15,7 @@ import json
 import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import config
-from src import database as db
+from src.data import database as db
 
 logger = logging.getLogger(__name__)
 

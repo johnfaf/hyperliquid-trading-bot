@@ -17,8 +17,8 @@ from typing import List, Dict, Optional
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import config
-from src import database as db
-from src import hyperliquid_client as hl
+from src.data import database as db
+from src.data import hyperliquid_client as hl
 from src.signals.signal_schema import TradeSignal, SignalSide, SignalSource, RiskParams, signal_from_strategy
 from src.signals.decision_firewall import DecisionFirewall
 from src.signals.agent_scoring import AgentScorer

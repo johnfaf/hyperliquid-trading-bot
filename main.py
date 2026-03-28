@@ -21,7 +21,7 @@ from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(__file__))
 import config
-from src import database as db
+from src.data import database as db
 from src.data.database import init_db, restore_from_json, backup_to_json
 from src.discovery.trader_discovery import TraderDiscovery
 from src.analysis.strategy_identifier import StrategyIdentifier
@@ -45,15 +45,15 @@ from src.signals.llm_filter import LLMFilter
 from src.signals.signal_processor import SignalProcessor, ArenaIncubator
 from src.signals.decision_engine import DecisionEngine
 from src.exchanges.scanner import MultiExchangeScanner
-from src import telegram_bot as tg
+from src.notifications import telegram_bot as tg
 from src.discovery.golden_bridge import get_golden_copy_signals, auto_connect_golden_wallets, get_stats as golden_stats
 from src.data.hyperliquid_client import start_websocket, get_api_stats
 from src.notifications.ws_position_monitor import PositionMonitor
 from src.discovery.adaptive_bot_detector import AdaptiveBotDetector
 from src.analysis.sharpe_calculator import calculate_sharpe
 from src.analysis.regime_strategy_filter import RegimeStrategyFilter
-from src import telegram_alerts as tg_alerts
-from src import report_exporter
+from src.notifications import telegram_alerts as tg_alerts
+from src.ui import report_exporter
 from src.data.polymarket_scanner import PolymarketScanner
 from src.trading.live_trader import LiveTrader
 
@@ -363,7 +363,7 @@ class HyperliquidResearchBot:
             all_strategies = []
 
             for trader in traders:
-                from src import hyperliquid_client as hl
+                from src.data import hyperliquid_client as hl
                 state = hl.get_user_state(trader["address"])
                 if state:
                     profile = {
@@ -541,7 +541,7 @@ class HyperliquidResearchBot:
             self.logger.info("Phase 3f: Liquidation Strategy Scan")
             lcrs_signals = []
             # Fetch mids once at a scope visible to both LCRS and Options Flow phases
-            from src import hyperliquid_client as hl_client
+            from src.data import hyperliquid_client as hl_client
             mids = hl_client.get_all_mids() or {}
             try:
                 lcrs_coins = ["BTC", "ETH", "SOL", "DOGE", "AVAX", "LINK", "ARB",
@@ -810,7 +810,7 @@ class HyperliquidResearchBot:
                         # Store signal_id in trade metadata so outcome can be matched later
                         if t.get("id"):
                             try:
-                                from src import database as _db
+                                from src.data import database as _db
                                 _db.update_paper_trade_metadata(
                                     t["id"], {"signal_id": signal_id, "source_key": source_key}
                                 )

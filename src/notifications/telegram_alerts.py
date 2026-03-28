@@ -23,7 +23,7 @@ from typing import Dict, List, Optional, Tuple
 from collections import defaultdict
 
 from src.notifications.telegram_bot import _send_message, is_configured
-from src import database as db
+from src.data import database as db
 
 logger = logging.getLogger(__name__)
 

@@ -32,7 +32,7 @@ import sys
 import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import config
-from src import hyperliquid_client as hl
+from src.data import hyperliquid_client as hl
 
 logger = logging.getLogger(__name__)
 
