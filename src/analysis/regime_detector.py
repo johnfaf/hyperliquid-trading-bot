@@ -26,7 +26,7 @@ import numpy as np
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from src import hyperliquid_client as hl
-from src.exchange_aggregator import ExchangeAggregator
+from src.data.exchange_aggregator import ExchangeAggregator
 
 logger = logging.getLogger(__name__)
 

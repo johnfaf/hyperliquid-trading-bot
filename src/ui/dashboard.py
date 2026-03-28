@@ -134,7 +134,7 @@ def _get_v2_metrics(conn) -> Dict:
 
     try:
         # Firewall stats — pulled from the global firewall instance if available
-        from src.decision_firewall import DecisionFirewall
+        from src.signals.decision_firewall import DecisionFirewall
         # We'll populate this from the /api/data handler if firewall is set
     except Exception:
         pass
@@ -660,7 +660,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 except Exception:
                     pass
                 try:
-                    from src.hyperliquid_client import get_api_stats
+                    from src.data.hyperliquid_client import get_api_stats
                     v25["api_manager"] = get_api_stats()
                 except Exception:
                     pass
@@ -711,7 +711,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def _handle_paper_reset(self):
         """Reset all paper trades and balance."""
         try:
-            from src.database import reset_paper_trades
+            from src.data.database import reset_paper_trades
             import config as _cfg
             # Read optional balance from request body
             balance = _cfg.PAPER_TRADING_INITIAL_BALANCE
@@ -734,7 +734,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def _serve_options_html(self):
         """Serve the options flow dashboard HTML."""
         try:
-            from src.options_dashboard import _get_dashboard_html
+            from src.ui.options_dashboard import _get_dashboard_html
             html = _get_dashboard_html()
             self.send_response(200)
             self.send_header("Content-Type", "text/html")
@@ -772,7 +772,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def _serve_backtest_html(self):
         """Serve the backtest dashboard HTML."""
         try:
-            from src.backtest_dashboard import BACKTEST_HTML
+            from src.ui.backtest_dashboard import BACKTEST_HTML
             self.send_response(200)
             self.send_header("Content-Type", "text/html")
             self.end_headers()
@@ -785,7 +785,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def _serve_backtest_data(self):
         """Serve backtest overview data as JSON."""
         try:
-            from src.backtest_dashboard import get_backtest_dashboard_data
+            from src.ui.backtest_dashboard import get_backtest_dashboard_data
             data = get_backtest_dashboard_data()
             self._json_response(data)
         except Exception as e:
@@ -796,7 +796,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def _serve_wallet_detail(self, address: str):
         """Serve detailed backtest data for one wallet."""
         try:
-            from src.backtest_dashboard import get_wallet_detail
+            from src.ui.backtest_dashboard import get_wallet_detail
             data = get_wallet_detail(address)
             if data:
                 self._json_response(data)
@@ -809,8 +809,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
         """Trigger a golden wallet scan + backtest run."""
         try:
             import threading
-            from src.golden_wallet import run_golden_scan, init_golden_tables
-            from src.backtest_engine import run_all_backtests, save_backtest_result, init_backtest_tables
+            from src.discovery.golden_wallet import run_golden_scan, init_golden_tables
+            from src.backtest.backtest_engine import run_all_backtests, save_backtest_result, init_backtest_tables
 
             def _run():
                 try:
@@ -861,7 +861,7 @@ if __name__ == "__main__":
     import logging
     logging.basicConfig(level=logging.INFO)
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-    from src.database import init_db
+    from src.data.database import init_db
     init_db()
     port = int(os.environ.get("PORT", 8080))
     print(f"Starting dashboard on port {port}...")

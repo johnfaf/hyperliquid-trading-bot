@@ -19,7 +19,7 @@ from collections import defaultdict
 from dataclasses import dataclass, asdict
 
 from src import database as db
-from src.signal_schema import SignalSource
+from src.signals.signal_schema import SignalSource
 
 logger = logging.getLogger(__name__)
 

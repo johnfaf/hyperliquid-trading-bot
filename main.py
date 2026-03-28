@@ -22,40 +22,40 @@ from datetime import datetime
 sys.path.insert(0, os.path.dirname(__file__))
 import config
 from src import database as db
-from src.database import init_db, restore_from_json, backup_to_json
-from src.trader_discovery import TraderDiscovery
-from src.strategy_identifier import StrategyIdentifier
-from src.strategy_scorer import StrategyScorer
-from src.paper_trader import PaperTrader
-from src.copy_trader import CopyTrader
-from src.reporter import Reporter
-from src.dashboard import start_dashboard, set_v2_components
-from src.exchange_aggregator import ExchangeAggregator
-from src.options_flow import OptionsFlowScanner
-from src.regime_detector import RegimeDetector
-from src.decision_firewall import DecisionFirewall
-from src.agent_scoring import AgentScorer
-from src.features import FeatureEngine
-from src.alpha_arena import AlphaArena
-from src.liquidation_strategy import LiquidationStrategy
-from src.kelly_sizing import KellySizer
-from src.trade_memory import TradeMemory
-from src.calibration import CalibrationTracker
-from src.llm_filter import LLMFilter
-from src.signal_processor import SignalProcessor, ArenaIncubator
-from src.decision_engine import DecisionEngine
+from src.data.database import init_db, restore_from_json, backup_to_json
+from src.discovery.trader_discovery import TraderDiscovery
+from src.analysis.strategy_identifier import StrategyIdentifier
+from src.analysis.strategy_scorer import StrategyScorer
+from src.trading.paper_trader import PaperTrader
+from src.trading.copy_trader import CopyTrader
+from src.ui.reporter import Reporter
+from src.ui.dashboard import start_dashboard, set_v2_components
+from src.data.exchange_aggregator import ExchangeAggregator
+from src.data.options_flow import OptionsFlowScanner
+from src.analysis.regime_detector import RegimeDetector
+from src.signals.decision_firewall import DecisionFirewall
+from src.signals.agent_scoring import AgentScorer
+from src.analysis.features import FeatureEngine
+from src.signals.alpha_arena import AlphaArena
+from src.analysis.liquidation_strategy import LiquidationStrategy
+from src.signals.kelly_sizing import KellySizer
+from src.trading.trade_memory import TradeMemory
+from src.signals.calibration import CalibrationTracker
+from src.signals.llm_filter import LLMFilter
+from src.signals.signal_processor import SignalProcessor, ArenaIncubator
+from src.signals.decision_engine import DecisionEngine
 from src.exchanges.scanner import MultiExchangeScanner
 from src import telegram_bot as tg
-from src.golden_bridge import get_golden_copy_signals, auto_connect_golden_wallets, get_stats as golden_stats
-from src.hyperliquid_client import start_websocket, get_api_stats
-from src.ws_position_monitor import PositionMonitor
-from src.adaptive_bot_detector import AdaptiveBotDetector
-from src.sharpe_calculator import calculate_sharpe
-from src.regime_strategy_filter import RegimeStrategyFilter
+from src.discovery.golden_bridge import get_golden_copy_signals, auto_connect_golden_wallets, get_stats as golden_stats
+from src.data.hyperliquid_client import start_websocket, get_api_stats
+from src.notifications.ws_position_monitor import PositionMonitor
+from src.discovery.adaptive_bot_detector import AdaptiveBotDetector
+from src.analysis.sharpe_calculator import calculate_sharpe
+from src.analysis.regime_strategy_filter import RegimeStrategyFilter
 from src import telegram_alerts as tg_alerts
 from src import report_exporter
-from src.polymarket_scanner import PolymarketScanner
-from src.live_trader import LiveTrader
+from src.data.polymarket_scanner import PolymarketScanner
+from src.trading.live_trader import LiveTrader
 
 # ─── Logging Setup ─────────────────────────────────────────────
 
@@ -343,7 +343,7 @@ class HyperliquidResearchBot:
             # Phase 0: Purge non-golden wallets from previous scans
             # This frees up space before the new golden scan runs
             try:
-                from src.golden_wallet import purge_non_golden_wallets
+                from src.discovery.golden_wallet import purge_non_golden_wallets
                 purged = purge_non_golden_wallets()
                 if purged:
                     self.logger.info(f"Purged {purged} non-golden wallets before new scan")
@@ -358,7 +358,7 @@ class HyperliquidResearchBot:
 
             # Phase 2: Identify strategies from analyzed traders
             self.logger.info("Phase 2: Strategy Identification")
-            from src.database import get_active_traders
+            from src.data.database import get_active_traders
             traders = get_active_traders()
             all_strategies = []
 
@@ -389,7 +389,7 @@ class HyperliquidResearchBot:
 
             # Phase 2b: Golden wallet scan (evaluate top wallets for copy-trading)
             try:
-                from src.golden_wallet import run_golden_scan
+                from src.discovery.golden_wallet import run_golden_scan
                 golden_summary = run_golden_scan(max_wallets=200)
                 self.logger.info(f"  Golden scan: {golden_summary.get('golden_count', 0)} golden wallets "
                                f"out of {golden_summary.get('total_evaluated', 0)} evaluated")
@@ -845,7 +845,7 @@ class HyperliquidResearchBot:
 
                     for sig in lcrs_signals:
                         try:
-                            from src.signal_schema import TradeSignal, SignalSide, SignalSource, RiskParams
+                            from src.signals.signal_schema import TradeSignal, SignalSide, SignalSource, RiskParams
                             trade_signal = TradeSignal(
                                 coin=sig["coin"],
                                 side=SignalSide(sig["side"]),
@@ -932,7 +932,7 @@ class HyperliquidResearchBot:
             # Phase 4a2: Options flow standalone trades (high conviction → direct trade)
             self.logger.info("Phase 4a2: Options Flow Trades")
             try:
-                from src.signal_schema import signal_from_options_flow
+                from src.signals.signal_schema import signal_from_options_flow
                 options_executed = []
                 for conv in (getattr(self.options_scanner, 'top_convictions', None) or []):
                     if conv.get("conviction_pct", 0) >= 70:  # Only very high conviction
@@ -1464,7 +1464,7 @@ def bootstrap_seed_data(logger, days: int = 14):
     Cold-start bootstrap: pull recent fills from top traders to seed the DB
     so Kelly/Scoring/Calibration have real data from day one.
     """
-    from src.golden_wallet import init_golden_tables, evaluate_wallet, save_wallet_report, save_wallet_fills
+    from src.discovery.golden_wallet import init_golden_tables, evaluate_wallet, save_wallet_report, save_wallet_fills
 
     logger.info(f"Bootstrap mode: seeding DB with last {days} days of top trader data...")
     init_db()
@@ -1484,7 +1484,7 @@ def bootstrap_seed_data(logger, days: int = 14):
 
     # Step 2: Evaluate top wallets (golden scan)
     logger.info("Step 2/3: Running golden wallet evaluation...")
-    from src.golden_wallet import run_golden_scan
+    from src.discovery.golden_wallet import run_golden_scan
     summary = run_golden_scan(max_wallets=30)
     golden = summary.get("golden", 0)
     logger.info(f"Golden scan: {golden} golden wallets found")
@@ -1503,8 +1503,8 @@ def bootstrap_seed_data(logger, days: int = 14):
 
 def _run_cli_backtest(logger, args):
     """Run backtest from CLI with optional filters and export."""
-    from src.backtester import BacktestEngine, BacktestConfig
-    from src.golden_wallet import _get_db as gw_get_db
+    from src.backtest.backtester import BacktestEngine, BacktestConfig
+    from src.discovery.golden_wallet import _get_db as gw_get_db
     import csv as _csv
 
     logger.info("Running CLI backtest...")
@@ -1547,7 +1547,7 @@ def _run_cli_backtest(logger, args):
         return
 
     # Convert to BacktestFill objects
-    from src.backtester import BacktestFill
+    from src.backtest.backtester import BacktestFill
     fills = []
     for r in rows:
         r = dict(r)

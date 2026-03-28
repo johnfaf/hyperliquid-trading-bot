@@ -20,7 +20,7 @@ from datetime import datetime, timedelta
 from typing import List, Dict, Optional, Tuple
 from collections import defaultdict
 
-from src.signal_schema import TradeSignal, SignalStrength
+from src.signals.signal_schema import TradeSignal, SignalStrength
 from src import database as db
 
 logger = logging.getLogger(__name__)

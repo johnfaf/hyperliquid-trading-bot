@@ -22,7 +22,7 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 from collections import defaultdict
 
-from src.telegram_bot import _send_message, is_configured
+from src.notifications.telegram_bot import _send_message, is_configured
 from src import database as db
 
 logger = logging.getLogger(__name__)

@@ -685,7 +685,7 @@ def restore_from_json(filepath: str = None):
         fills_count = 0
         if data.get("golden_wallets"):
             try:
-                from src.golden_wallet import init_golden_tables
+                from src.discovery.golden_wallet import init_golden_tables
                 init_golden_tables()
 
                 with get_connection() as conn:

@@ -15,7 +15,7 @@ from typing import Optional
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import config
-from src.api_manager import get_manager, Priority
+from src.core.api_manager import get_manager, Priority
 
 logger = logging.getLogger(__name__)
 

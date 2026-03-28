@@ -19,14 +19,14 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import config
 from src import database as db
 from src import hyperliquid_client as hl
-from src.signal_schema import TradeSignal, SignalSide, SignalSource, RiskParams, signal_from_strategy
-from src.decision_firewall import DecisionFirewall
-from src.agent_scoring import AgentScorer
-from src.features import FeatureEngine
-from src.kelly_sizing import KellySizer
-from src.trade_memory import TradeMemory
-from src.calibration import CalibrationTracker
-from src.llm_filter import LLMFilter
+from src.signals.signal_schema import TradeSignal, SignalSide, SignalSource, RiskParams, signal_from_strategy
+from src.signals.decision_firewall import DecisionFirewall
+from src.signals.agent_scoring import AgentScorer
+from src.analysis.features import FeatureEngine
+from src.signals.kelly_sizing import KellySizer
+from src.trading.trade_memory import TradeMemory
+from src.signals.calibration import CalibrationTracker
+from src.signals.llm_filter import LLMFilter
 import random
 
 logger = logging.getLogger(__name__)
@@ -123,7 +123,7 @@ class PaperTrader:
         coin_features = {}
         if self.feature_engine:
             try:
-                from src.regime_detector import RegimeDetector
+                from src.analysis.regime_detector import RegimeDetector
                 for coin in set(["BTC", "ETH", "SOL"]):
                     try:
                         # Fetch candles for feature computation

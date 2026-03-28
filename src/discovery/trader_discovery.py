@@ -407,7 +407,7 @@ class TraderDiscovery:
 
         # V6: Adaptive bot detection (continuous probability 0-1)
         try:
-            from src.adaptive_bot_detector import AdaptiveBotDetector
+            from src.discovery.adaptive_bot_detector import AdaptiveBotDetector
             _detector = AdaptiveBotDetector()
             bot_result = _detector.detect(fills, positions, trade_analysis, address)
             bot_score = config.BOT_THRESHOLD if bot_result.is_bot else 0

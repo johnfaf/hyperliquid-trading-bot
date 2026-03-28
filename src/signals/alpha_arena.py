@@ -36,7 +36,7 @@ import numpy as np
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import config
-from src.signal_schema import TradeSignal, SignalSide, SignalSource, SignalStrength
+from src.signals.signal_schema import TradeSignal, SignalSide, SignalSource, SignalStrength
 
 logger = logging.getLogger(__name__)
 
