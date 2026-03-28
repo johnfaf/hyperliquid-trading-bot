@@ -250,6 +250,118 @@ BACKTEST_HTML = """<!DOCTYPE html>
     <div class="stats-grid" id="paper-stats" style="margin-top:14px"></div>
   </div>
 
+  <!-- Candle Backtest Section -->
+  <div class="paper-section" id="candle-bt-section">
+    <div class="section-row">
+      <h2 style="margin:0">Candle Backtest</h2>
+      <span id="cbt-speed" class="badge badge-green" style="display:none"></span>
+    </div>
+    <div class="subtitle" style="margin-bottom:14px">Run strategies against historical OHLCV data from Hyperliquid</div>
+
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px;margin-bottom:14px;">
+      <div>
+        <label class="stat-label" style="display:block;margin-bottom:4px;">Coin</label>
+        <select id="cbt-coin" style="width:100%;padding:7px 10px;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:6px;font-size:13px;">
+          <option>BTC</option><option>ETH</option><option>SOL</option><option>DOGE</option>
+          <option>ARB</option><option>OP</option><option>AVAX</option><option>SUI</option>
+          <option>WIF</option><option>PEPE</option><option>ONDO</option><option>LINK</option>
+          <option>WLD</option><option>TIA</option><option>INJ</option><option>SEI</option>
+        </select>
+      </div>
+      <div>
+        <label class="stat-label" style="display:block;margin-bottom:4px;">Timeframe</label>
+        <select id="cbt-tf" style="width:100%;padding:7px 10px;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:6px;font-size:13px;">
+          <option value="1m">1 Min</option><option value="5m">5 Min</option>
+          <option value="15m">15 Min</option><option value="1h" selected>1 Hour</option>
+          <option value="4h">4 Hour</option><option value="1d">1 Day</option>
+        </select>
+      </div>
+      <div>
+        <label class="stat-label" style="display:block;margin-bottom:4px;">Strategy</label>
+        <select id="cbt-strategy" style="width:100%;padding:7px 10px;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:6px;font-size:13px;">
+          <option value="momentum">Momentum (EMA Cross)</option>
+          <option value="mean_reversion">Mean Reversion (BB)</option>
+          <option value="breakout">Breakout (N-Period)</option>
+          <option value="rsi">RSI (Overbought/Oversold)</option>
+        </select>
+      </div>
+      <div>
+        <label class="stat-label" style="display:block;margin-bottom:4px;">Start Date</label>
+        <input type="date" id="cbt-start" style="width:100%;padding:7px 10px;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:6px;font-size:13px;">
+      </div>
+      <div>
+        <label class="stat-label" style="display:block;margin-bottom:4px;">End Date</label>
+        <input type="date" id="cbt-end" style="width:100%;padding:7px 10px;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:6px;font-size:13px;">
+      </div>
+    </div>
+
+    <details style="margin-bottom:14px;">
+      <summary style="cursor:pointer;color:var(--accent);font-size:12px;font-weight:500;">Advanced Parameters</summary>
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px;margin-top:10px;">
+        <div>
+          <label class="stat-label" style="display:block;margin-bottom:4px;">Position Size %</label>
+          <input type="number" id="cbt-possize" value="5" min="1" max="50" step="1" style="width:100%;padding:7px 10px;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:6px;font-size:13px;">
+        </div>
+        <div>
+          <label class="stat-label" style="display:block;margin-bottom:4px;">Leverage</label>
+          <input type="number" id="cbt-leverage" value="3" min="1" max="20" step="0.5" style="width:100%;padding:7px 10px;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:6px;font-size:13px;">
+        </div>
+        <div>
+          <label class="stat-label" style="display:block;margin-bottom:4px;">Stop Loss %</label>
+          <input type="number" id="cbt-sl" value="2" min="0.5" max="20" step="0.5" style="width:100%;padding:7px 10px;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:6px;font-size:13px;">
+        </div>
+        <div>
+          <label class="stat-label" style="display:block;margin-bottom:4px;">Take Profit %</label>
+          <input type="number" id="cbt-tp" value="4" min="0.5" max="50" step="0.5" style="width:100%;padding:7px 10px;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:6px;font-size:13px;">
+        </div>
+        <div>
+          <label class="stat-label" style="display:block;margin-bottom:4px;">Fast MA Period</label>
+          <input type="number" id="cbt-fast" value="10" min="2" max="100" step="1" style="width:100%;padding:7px 10px;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:6px;font-size:13px;">
+        </div>
+        <div>
+          <label class="stat-label" style="display:block;margin-bottom:4px;">Slow MA Period</label>
+          <input type="number" id="cbt-slow" value="30" min="5" max="200" step="1" style="width:100%;padding:7px 10px;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:6px;font-size:13px;">
+        </div>
+        <div>
+          <label class="stat-label" style="display:block;margin-bottom:4px;">RSI Period</label>
+          <input type="number" id="cbt-rsi" value="14" min="2" max="50" step="1" style="width:100%;padding:7px 10px;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:6px;font-size:13px;">
+        </div>
+        <div>
+          <label class="stat-label" style="display:block;margin-bottom:4px;">Trailing Stop %</label>
+          <input type="number" id="cbt-trail" value="1.5" min="0" max="10" step="0.5" style="width:100%;padding:7px 10px;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:6px;font-size:13px;">
+        </div>
+      </div>
+    </details>
+
+    <div class="btn-group">
+      <button class="btn btn-green" id="cbtRunBtn" onclick="runCandleBacktest()">Run Backtest</button>
+      <button class="btn btn-outline" id="cbtFetchBtn" onclick="fetchCandleData()">Fetch Data Only</button>
+      <button class="btn btn-outline" id="cbtCacheBtn" onclick="showCacheInfo()">Cache Info</button>
+      <button class="btn btn-red" id="cbtClearBtn" onclick="clearCache()">Clear Cache</button>
+    </div>
+    <div id="cbt-status" style="color:var(--dim);font-size:12px;font-style:italic;margin-top:8px;min-height:18px;"></div>
+
+    <!-- Results -->
+    <div id="cbt-results" style="display:none;margin-top:20px;">
+      <h3>Results</h3>
+      <div class="stats-grid" id="cbt-stats"></div>
+
+      <h3>Equity Curve</h3>
+      <div class="chart-container"><canvas id="cbtEquityChart"></canvas></div>
+
+      <h3>Drawdown</h3>
+      <div class="chart-container"><canvas id="cbtDrawdownChart"></canvas></div>
+
+      <h3>Trade Log</h3>
+      <table id="cbt-trades-table">
+        <thead><tr>
+          <th>#</th><th>Side</th><th>Entry</th><th>Exit</th><th>PnL</th><th>PnL%</th><th>Exit Reason</th><th>Hold</th>
+        </tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </div>
+
   <!-- Overview page -->
   <div id="overview-page">
     <div class="stats-grid" id="summary-stats"></div>
@@ -707,6 +819,228 @@ async function runScan() {
   btn.disabled = false;
   btn.textContent = 'Run Golden Scan';
 }
+
+// ─── Candle Backtest Functions ─────────────────────────────
+
+let CBT_RESULT = null;
+
+function _getCbtParams() {
+  return {
+    coin: document.getElementById('cbt-coin').value,
+    timeframe: document.getElementById('cbt-tf').value,
+    strategy: document.getElementById('cbt-strategy').value,
+    start: document.getElementById('cbt-start').value || undefined,
+    end: document.getElementById('cbt-end').value || undefined,
+    position_size_pct: parseFloat(document.getElementById('cbt-possize').value) / 100,
+    max_leverage: parseFloat(document.getElementById('cbt-leverage').value),
+    stop_loss_pct: parseFloat(document.getElementById('cbt-sl').value) / 100,
+    take_profit_pct: parseFloat(document.getElementById('cbt-tp').value) / 100,
+    trailing_stop_pct: parseFloat(document.getElementById('cbt-trail').value) / 100,
+    fast_period: parseInt(document.getElementById('cbt-fast').value),
+    slow_period: parseInt(document.getElementById('cbt-slow').value),
+    rsi_period: parseInt(document.getElementById('cbt-rsi').value),
+  };
+}
+
+async function runCandleBacktest() {
+  const btn = document.getElementById('cbtRunBtn');
+  const status = document.getElementById('cbt-status');
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span>Running...';
+  status.textContent = 'Fetching data and running backtest...';
+
+  try {
+    const params = _getCbtParams();
+    const r = await fetch('/api/candle-backtest/run', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(params),
+    });
+    const data = await r.json();
+
+    if (data.error) {
+      status.textContent = 'Error: ' + data.error;
+      btn.disabled = false;
+      btn.textContent = 'Run Backtest';
+      return;
+    }
+
+    CBT_RESULT = data;
+    status.textContent = `Done in ${data.duration_seconds.toFixed(2)}s — ` +
+      `${(data.candles_per_second||0).toLocaleString()} candles/sec`;
+
+    const badge = document.getElementById('cbt-speed');
+    badge.style.display = 'inline-block';
+    badge.textContent = `${(data.candles_per_second||0).toLocaleString()} candles/s`;
+
+    renderCbtResults(data);
+  } catch(e) {
+    status.textContent = 'Error: ' + e.message;
+  }
+
+  btn.disabled = false;
+  btn.textContent = 'Run Backtest';
+}
+
+async function fetchCandleData() {
+  const btn = document.getElementById('cbtFetchBtn');
+  const status = document.getElementById('cbt-status');
+  btn.disabled = true;
+  btn.textContent = 'Fetching...';
+  status.textContent = 'Downloading candle data from Hyperliquid...';
+
+  try {
+    const params = _getCbtParams();
+    const r = await fetch('/api/candle-backtest/fetch', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(params),
+    });
+    const data = await r.json();
+    if (data.error) {
+      status.textContent = 'Error: ' + data.error;
+    } else {
+      status.textContent = `Fetched ${data.candles.toLocaleString()} ${data.coin} ${data.timeframe} candles (cached locally)`;
+    }
+  } catch(e) {
+    status.textContent = 'Error: ' + e.message;
+  }
+
+  btn.disabled = false;
+  btn.textContent = 'Fetch Data Only';
+}
+
+async function showCacheInfo() {
+  const status = document.getElementById('cbt-status');
+  try {
+    const r = await fetch('/api/candle-backtest/cache');
+    const data = await r.json();
+    if (!data.cached || !data.cached.length) {
+      status.textContent = 'Cache is empty. Fetch some data first.';
+      return;
+    }
+    const lines = data.cached.map(c =>
+      `${c.coin} ${c.timeframe}: ${c.candles.toLocaleString()} candles (${c.start} → ${c.end})`
+    );
+    status.innerHTML = `<strong>Cache</strong> (${data.stats.db_size_mb} MB): ` + lines.join(' | ');
+  } catch(e) {
+    status.textContent = 'Error: ' + e.message;
+  }
+}
+
+async function clearCache() {
+  if (!confirm('Clear all cached candle data?')) return;
+  const status = document.getElementById('cbt-status');
+  try {
+    await fetch('/api/candle-backtest/cache/clear', {method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'});
+    status.textContent = 'Cache cleared.';
+  } catch(e) {
+    status.textContent = 'Error: ' + e.message;
+  }
+}
+
+function renderCbtResults(data) {
+  document.getElementById('cbt-results').style.display = 'block';
+
+  const s = document.getElementById('cbt-stats');
+  const pnlCls = data.total_pnl >= 0 ? 'positive' : 'negative';
+  s.innerHTML = `
+    <div class="stat-card"><div class="stat-label">Total PnL</div><div class="stat-value ${pnlCls}">${fmt(data.total_pnl,2)}</div><div class="stat-sub">${data.total_pnl_pct >= 0 ? '+' : ''}${data.total_pnl_pct.toFixed(1)}%</div></div>
+    <div class="stat-card"><div class="stat-label">Trades</div><div class="stat-value">${data.total_trades}</div><div class="stat-sub"><span class="positive">${data.winning_trades}W</span> / <span class="negative">${data.losing_trades}L</span></div></div>
+    <div class="stat-card"><div class="stat-label">Win Rate</div><div class="stat-value">${data.win_rate.toFixed(1)}%</div></div>
+    <div class="stat-card"><div class="stat-label">Sharpe</div><div class="stat-value">${data.sharpe_ratio.toFixed(3)}</div></div>
+    <div class="stat-card"><div class="stat-label">Sortino</div><div class="stat-value">${data.sortino_ratio.toFixed(3)}</div></div>
+    <div class="stat-card"><div class="stat-label">Max Drawdown</div><div class="stat-value negative">${data.max_drawdown_pct.toFixed(1)}%</div></div>
+    <div class="stat-card"><div class="stat-label">Profit Factor</div><div class="stat-value">${data.profit_factor.toFixed(2)}</div></div>
+    <div class="stat-card"><div class="stat-label">Best Trade</div><div class="stat-value positive">${fmt(data.best_trade_pnl,2)}</div></div>
+    <div class="stat-card"><div class="stat-label">Worst Trade</div><div class="stat-value negative">${fmt(data.worst_trade_pnl,2)}</div></div>
+    <div class="stat-card"><div class="stat-label">Total Fees</div><div class="stat-value">${fmt(-data.total_fees,2)}</div></div>
+  `;
+
+  // Equity chart
+  renderCbtEquityChart(data.equity_curve);
+  renderCbtDrawdownChart(data.drawdown_curve);
+  renderCbtTradeTable(data.trades || []);
+}
+
+function renderCbtEquityChart(equity) {
+  const ctx = document.getElementById('cbtEquityChart').getContext('2d');
+  if (charts.cbtEquity) charts.cbtEquity.destroy();
+
+  const labels = equity.map((_, i) => i);
+  charts.cbtEquity = new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels,
+      datasets: [
+        { label: 'Equity', data: equity, borderColor: '#4da6ff', borderWidth: 1.5, pointRadius: 0, fill: false },
+        { label: 'Initial ($10k)', data: equity.map(() => 10000), borderColor: '#30363d', borderWidth: 1, borderDash: [4,4], pointRadius: 0, fill: false },
+      ]
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      plugins: { legend: { labels: { color: '#8b949e' } } },
+      scales: {
+        x: { display: false },
+        y: { ticks: { color: '#8b949e', callback: v => '$'+v.toLocaleString() }, grid: { color: '#21262d' } },
+      }
+    }
+  });
+}
+
+function renderCbtDrawdownChart(dd) {
+  const ctx = document.getElementById('cbtDrawdownChart').getContext('2d');
+  if (charts.cbtDrawdown) charts.cbtDrawdown.destroy();
+
+  charts.cbtDrawdown = new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels: dd.map((_, i) => i),
+      datasets: [{
+        label: 'Drawdown %',
+        data: dd.map(v => -v),
+        borderColor: 'rgba(255,92,92,.8)',
+        backgroundColor: 'rgba(255,92,92,.08)',
+        borderWidth: 1.5, pointRadius: 0, fill: true,
+      }]
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      plugins: { legend: { labels: { color: '#6b7a8d' } } },
+      scales: {
+        x: { display: false },
+        y: { ticks: { color: '#6b7a8d', callback: v => v.toFixed(1)+'%' }, grid: { color: '#1e2a3a' } },
+      }
+    }
+  });
+}
+
+function renderCbtTradeTable(trades) {
+  const tbody = document.querySelector('#cbt-trades-table tbody');
+  tbody.innerHTML = trades.slice(0, 100).map((t, i) => {
+    const sideClass = t.side === 'long' ? 'positive' : 'negative';
+    const pnlClass2 = t.pnl >= 0 ? 'pnl-pos' : 'pnl-neg';
+    return `<tr>
+      <td>${i+1}</td>
+      <td class="${sideClass}" style="font-weight:600;text-transform:uppercase;">${t.side}</td>
+      <td>$${t.entry_price.toFixed(2)}</td>
+      <td>$${t.exit_price.toFixed(2)}</td>
+      <td class="${pnlClass2}">${fmt(t.pnl,2)}</td>
+      <td class="${pnlClass2}">${t.pnl_pct >= 0 ? '+' : ''}${t.pnl_pct.toFixed(2)}%</td>
+      <td><span class="badge ${t.exit_reason === 'take_profit' ? 'badge-green' : t.exit_reason === 'stop_loss' ? 'badge-red' : 'badge-gold'}">${t.exit_reason}</span></td>
+      <td>${t.hold_candles} candles</td>
+    </tr>`;
+  }).join('');
+}
+
+// Set default dates (90 days ago → today)
+(function setDefaultDates() {
+  const end = new Date();
+  const start = new Date();
+  start.setDate(start.getDate() - 90);
+  document.getElementById('cbt-end').value = end.toISOString().slice(0, 10);
+  document.getElementById('cbt-start').value = start.toISOString().slice(0, 10);
+})();
 
 // Auto-refresh every 30s
 setInterval(load, 30000);

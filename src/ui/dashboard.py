@@ -684,6 +684,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
         elif parsed.path == "/api/backtest":
             self._serve_backtest_data()
 
+        elif parsed.path == "/api/candle-backtest/cache":
+            self._serve_cache_list()
+
         elif parsed.path == "/api/backtest/wallet":
             params = parse_qs(parsed.query)
             address = params.get("address", [None])[0]
@@ -704,6 +707,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._handle_backtest_run()
         elif parsed.path == "/api/paper/reset":
             self._handle_paper_reset()
+        elif parsed.path == "/api/candle-backtest/run":
+            self._handle_candle_backtest()
+        elif parsed.path == "/api/candle-backtest/fetch":
+            self._handle_candle_fetch()
+        elif parsed.path == "/api/candle-backtest/cache/clear":
+            self._handle_cache_clear()
         else:
             self.send_response(404)
             self.end_headers()
@@ -721,6 +730,125 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 balance = float(body.get("balance", balance))
             result = reset_paper_trades(balance)
             self._json_response({"status": "ok", **result})
+        except Exception as e:
+            self._json_response({"error": str(e)}, code=500)
+
+    def _serve_cache_list(self):
+        """Return cached candle data summary."""
+        try:
+            from src.backtest.data_fetcher import DataFetcher
+            fetcher = DataFetcher()
+            self._json_response({
+                "cached": fetcher.list_cached(),
+                "stats": fetcher.get_cache_stats(),
+            })
+        except Exception as e:
+            self._json_response({"error": str(e)}, code=500)
+
+    def _handle_candle_fetch(self):
+        """Fetch candle data from Hyperliquid API (and cache it)."""
+        try:
+            content_len = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(content_len)) if content_len > 0 else {}
+
+            from src.backtest.data_fetcher import DataFetcher
+            fetcher = DataFetcher()
+            coin = body.get("coin", "BTC").upper()
+            timeframe = body.get("timeframe", "1h")
+            start = body.get("start")
+            end = body.get("end")
+            no_cache = body.get("no_cache", False)
+
+            candles = fetcher.fetch_candles(coin, timeframe, start=start, end=end, use_cache=not no_cache)
+            self._json_response({
+                "status": "ok",
+                "coin": coin,
+                "timeframe": timeframe,
+                "candles": len(candles),
+                "start": candles[0].timestamp_ms if candles else None,
+                "end": candles[-1].timestamp_ms if candles else None,
+            })
+        except Exception as e:
+            self._json_response({"error": str(e)}, code=500)
+
+    def _handle_candle_backtest(self):
+        """Run a candle-based backtest and return results."""
+        try:
+            content_len = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(content_len)) if content_len > 0 else {}
+
+            from src.backtest.data_fetcher import DataFetcher
+            from src.backtest.candle_backtester import CandleBacktester, CandleBacktestConfig
+
+            fetcher = DataFetcher()
+            coin = body.get("coin", "BTC").upper()
+            timeframe = body.get("timeframe", "1h")
+            strategy = body.get("strategy", "momentum")
+            start = body.get("start")
+            end = body.get("end")
+
+            # Build config from body params
+            cfg_params = {}
+            for key in ("position_size_pct", "max_leverage", "stop_loss_pct",
+                         "take_profit_pct", "trailing_stop_pct", "fast_period",
+                         "slow_period", "rsi_period", "rsi_overbought", "rsi_oversold",
+                         "bb_period", "bb_std"):
+                if key in body:
+                    cfg_params[key] = float(body[key]) if "." in str(body[key]) else int(body[key])
+            cfg_params["strategy"] = strategy
+            cfg = CandleBacktestConfig(**cfg_params)
+
+            # Fetch data
+            candles = fetcher.fetch_candles(coin, timeframe, start=start, end=end)
+            if not candles:
+                self._json_response({"error": f"No candle data for {coin} {timeframe}"}, code=400)
+                return
+
+            # Run backtest
+            bt = CandleBacktester(cfg)
+            result = bt.run(candles, strategy=strategy, coin=coin)
+
+            # Return result (limit equity curve to 500 points for JSON size)
+            ec = result.equity_curve
+            dd = result.drawdown_curve
+            step = max(1, len(ec) // 500)
+            self._json_response({
+                "status": "ok",
+                "summary": result.summary(),
+                "total_trades": result.total_trades,
+                "winning_trades": result.winning_trades,
+                "losing_trades": result.losing_trades,
+                "win_rate": result.win_rate,
+                "total_pnl": result.total_pnl,
+                "total_pnl_pct": result.total_pnl_pct,
+                "max_drawdown_pct": result.max_drawdown_pct,
+                "sharpe_ratio": result.sharpe_ratio,
+                "sortino_ratio": result.sortino_ratio,
+                "profit_factor": result.profit_factor,
+                "avg_trade_pnl": result.avg_trade_pnl,
+                "best_trade_pnl": result.best_trade_pnl,
+                "worst_trade_pnl": result.worst_trade_pnl,
+                "total_fees": result.total_fees,
+                "duration_seconds": result.duration_seconds,
+                "candles_per_second": result.candles_per_second,
+                "equity_curve": ec[::step],
+                "drawdown_curve": dd[::step],
+                "trades": result.trades[:200],  # Limit for JSON size
+            })
+        except Exception as e:
+            self._json_response({"error": str(e)}, code=500)
+
+    def _handle_cache_clear(self):
+        """Clear the candle data cache."""
+        try:
+            content_len = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(content_len)) if content_len > 0 else {}
+            from src.backtest.data_fetcher import DataFetcher
+            fetcher = DataFetcher()
+            coin = body.get("coin")
+            timeframe = body.get("timeframe")
+            fetcher.clear_cache(coin=coin, timeframe=timeframe)
+            self._json_response({"status": "ok"})
         except Exception as e:
             self._json_response({"error": str(e)}, code=500)
 
