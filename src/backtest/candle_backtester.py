@@ -620,6 +620,7 @@ class CandleBacktestResult:
     max_drawdown_pct: float = 0.0
     sharpe_ratio: float = 0.0
     sortino_ratio: float = 0.0
+    calmar_ratio: float = 0.0
     profit_factor: float = 0.0
     avg_trade_pnl: float = 0.0
     best_trade_pnl: float = 0.0
@@ -650,6 +651,7 @@ class CandleBacktestResult:
             "pnl_pct": f"{self.total_pnl_pct:+.1f}%",
             "max_dd": f"{self.max_drawdown_pct:.1f}%",
             "sharpe": f"{self.sharpe_ratio:.3f}",
+            "calmar": f"{self.calmar_ratio:.3f}",
             "profit_factor": f"{self.profit_factor:.2f}",
             "speed": f"{self.candles_per_second:,.0f} candles/s",
         }
@@ -954,6 +956,9 @@ class CandleBacktester:
         else:
             sharpe = sortino = 0.0
 
+        # Calmar ratio: annualized return / max drawdown
+        calmar = total_pnl_pct / max_dd if max_dd > 0 else 0.0
+
         # Profit factor
         gross_profit = float(np.sum(pnls[pnls > 0])) if len(pnls) > 0 else 0
         gross_loss = float(np.abs(np.sum(pnls[pnls < 0]))) if len(pnls) > 0 else 0
@@ -987,6 +992,7 @@ class CandleBacktester:
             max_drawdown_pct=round(max_dd, 2),
             sharpe_ratio=round(sharpe, 4),
             sortino_ratio=round(sortino, 4),
+            calmar_ratio=round(calmar, 4),
             profit_factor=round(profit_factor, 4),
             avg_trade_pnl=round(avg_pnl, 2),
             best_trade_pnl=round(best_pnl, 2),

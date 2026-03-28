@@ -64,11 +64,14 @@ class HyperliquidSigner:
     Implements the domain and signing requirements for Hyperliquid orders.
     """
 
-    # EIP-712 domain for Hyperliquid (Arbitrum mainnet)
+    # EIP-712 domain for Hyperliquid L1 mainnet
+    # NOTE: Hyperliquid migrated from Arbitrum (42161) to its own L1.
+    # Mainnet uses chainId 1337; testnet uses 421614.
+    # Env override available for future chain changes.
     DOMAIN = {
         "name": "HyperliquidSignTransaction",
         "version": "1",
-        "chainId": 42161,  # Arbitrum mainnet
+        "chainId": int(os.environ.get("HL_CHAIN_ID", 1337)),
         "verifyingContract": "0x0000000000000000000000000000000000000000"
     }
 

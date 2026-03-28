@@ -103,6 +103,29 @@ SCORING_INTERVAL = 86400
 # Enable/disable secondary venues (Hyperliquid is always primary)
 LIGHTER_ENABLED = os.environ.get("LIGHTER_ENABLED", "true").lower() in ("true", "1", "yes")
 
+# ─── Predictive Regime Forecaster ──────────────────────────────
+ENABLE_PREDICTIVE_FORECASTER = os.environ.get("ENABLE_PREDICTIVE_FORECASTER", "true").lower() in ("true", "1", "yes")
+FORECASTER_CRASH_THRESHOLD = float(os.environ.get("FORECASTER_CRASH_THRESHOLD", -0.15))
+ARKHAM_API_KEY = os.environ.get("ARKHAM_API_KEY")  # Optional: platform.arkhamintelligence.com
+
+# ─── XGBoost Forecaster (optional ML upgrade) ─────────────────
+ENABLE_XGBOOST_FORECASTER = os.environ.get("ENABLE_XGBOOST_FORECASTER", "false").lower() in ("true", "1", "yes")
+XGBOOST_MODEL_PATH = "models/regime_xgboost.json"
+
+# ─── Kelly Sizing ─────────────────────────────────────────────
+# Multiplier: 1.0=full, 0.5=half, 0.25=quarter (recommended for crypto)
+KELLY_MULTIPLIER = float(os.environ.get("KELLY_MULTIPLIER", 0.25))
+KELLY_VOL_ADJUSTED = os.environ.get("KELLY_VOL_ADJUSTED", "true").lower() in ("true", "1", "yes")
+
+# ─── Funding Rate Risk ────────────────────────────────────────
+FUNDING_RISK_ENABLED = os.environ.get("FUNDING_RISK_ENABLED", "true").lower() in ("true", "1", "yes")
+FUNDING_NEGATIVE_THRESHOLD = float(os.environ.get("FUNDING_NEGATIVE_THRESHOLD", -0.001))
+FUNDING_POSITIVE_THRESHOLD = float(os.environ.get("FUNDING_POSITIVE_THRESHOLD", 0.003))
+
+# ─── Monte-Carlo Stress Testing ──────────────────────────────
+MONTE_CARLO_PATHS = int(os.environ.get("MONTE_CARLO_PATHS", 5000))
+MONTE_CARLO_INCLUDE_CRASHES = True
+
 # ─── Logging ───────────────────────────────────────────────────
 LOG_DIR = os.path.join(os.path.dirname(__file__), "logs")
 LOG_LEVEL = "INFO"

@@ -1,6 +1,15 @@
-# Pinned versions for reproducible builds (review recommendation)
+# Pinned versions for reproducible builds
 requests==2.31.0
 pandas==2.1.4
 numpy==1.26.4
 websocket-client==1.7.0
 eth_account==0.10.0
+
+# ─── Optional: ML regime forecasting ────────────────────────
+# Uncomment to enable XGBoost regime forecaster
+# xgboost>=2.0.0
+# scikit-learn>=1.3.0
+
+# ─── Dev / Testing ──────────────────────────────────────────
+# pip install -r requirements-dev.txt  (or just: pip install pytest)
+pytest>=7.4.0

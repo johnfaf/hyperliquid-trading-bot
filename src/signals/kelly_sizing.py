@@ -27,6 +27,8 @@ import math
 from typing import Dict, Optional, Tuple
 from dataclasses import dataclass, asdict
 
+import numpy as np
+
 logger = logging.getLogger(__name__)
 
 
@@ -59,13 +61,23 @@ class KellySizer:
     def __init__(self, config: Optional[Dict] = None):
         cfg = config or {}
 
-        # Kelly multiplier (0.5 = Half-Kelly, recommended)
-        self.kelly_multiplier = cfg.get("kelly_multiplier", 0.5)
+        # Kelly multiplier — controls aggressiveness of sizing:
+        #   1.0  = Full Kelly  (theoretical max growth, very volatile)
+        #   0.5  = Half-Kelly  (classic conservative choice)
+        #   0.25 = Quarter-Kelly (very conservative, recommended for crypto)
+        # Default: Quarter-Kelly for crypto perps (high-variance environment)
+        self.kelly_multiplier = cfg.get("kelly_multiplier", 0.25)
+
+        # Volatility-adjusted Kelly: dynamically reduce multiplier when
+        # recent returns have high variance (set False for fixed fraction)
+        self.vol_adjusted_kelly = cfg.get("vol_adjusted_kelly", True)
+        self.vol_lookback = cfg.get("vol_lookback", 30)  # trades for vol calc
+        self.vol_target = cfg.get("vol_target", 0.02)    # target per-trade vol
 
         # Position size caps
-        self.max_position_pct = cfg.get("max_position_pct", 0.10)    # 10% max per trade
+        self.max_position_pct = cfg.get("max_position_pct", 0.08)    # 8% max per trade (was 10%)
         self.min_position_pct = cfg.get("min_position_pct", 0.01)    # 1% min (if trading at all)
-        self.default_position_pct = cfg.get("default_position_pct", 0.04)  # 4% for unknown strategies
+        self.default_position_pct = cfg.get("default_position_pct", 0.03)  # 3% for unknown (was 4%)
 
         # Minimum trades needed for Kelly to be meaningful
         self.min_trades_for_kelly = cfg.get("min_trades_for_kelly", 15)
@@ -129,10 +141,30 @@ class KellySizer:
         if kelly <= 0:
             return 0.0  # No edge — don't bet
 
-        # Apply safety multiplier (Half-Kelly)
+        # Apply fractional Kelly multiplier
         safe_kelly = kelly * self.kelly_multiplier
 
         return safe_kelly
+
+    def _vol_adjusted_multiplier(self, strategy_key: str) -> float:
+        """
+        Dynamically adjust Kelly multiplier based on recent return volatility.
+        When volatility is high, reduce sizing; when low, allow more.
+        """
+        outcomes = self._strategy_outcomes.get(strategy_key, [])
+        recent = outcomes[-self.vol_lookback:] if len(outcomes) > self.vol_lookback else outcomes
+        if len(recent) < 5:
+            return self.kelly_multiplier
+
+        returns = [o["return_pct"] for o in recent]
+        vol = float(np.std(returns)) if len(returns) > 1 else 0.02
+        if vol <= 0:
+            return self.kelly_multiplier
+
+        # Scale: if actual vol > target, reduce multiplier proportionally
+        adjustment = min(self.vol_target / vol, 1.5)  # cap at 1.5x
+        adjusted = self.kelly_multiplier * adjustment
+        return max(0.05, min(adjusted, 0.75))  # bounds: 5% to 75% of full Kelly
 
     def get_sizing(self, strategy_key: str,
                     account_balance: float,
@@ -192,6 +224,13 @@ class KellySizer:
         else:
             confidence_level = "low"
             confidence_factor = 0.4
+
+        # Apply volatility-adjusted Kelly if enabled
+        if self.vol_adjusted_kelly and has_edge:
+            effective_multiplier = self._vol_adjusted_multiplier(strategy_key)
+            # Recompute kelly with adjusted multiplier
+            raw_kelly = win_rate - ((1.0 - win_rate) / reward_risk_ratio)
+            kelly_fraction = max(0, raw_kelly * effective_multiplier)
 
         # Calculate final position size
         if has_edge:

@@ -23,6 +23,13 @@ from collections import defaultdict
 from src.signals.signal_schema import TradeSignal, SignalStrength
 from src.data import database as db
 
+# Optional: predictive regime forecaster for dynamic de-risking
+try:
+    from src.signals.predictive_regime_forecaster import PredictiveRegimeForecaster
+    HAS_FORECASTER = True
+except ImportError:
+    HAS_FORECASTER = False
+
 logger = logging.getLogger(__name__)
 
 
@@ -52,6 +59,30 @@ class DecisionFirewall:
         # Two concurrent trades = 80%.  60% cap allows 1–2 leveraged positions.
         self.max_aggregate_exposure_pct = cfg.get("max_aggregate_exposure", 0.60)  # 60% of balance
 
+        # Predictive regime forecaster for dynamic de-risking
+        self.enable_predictive_derisk = cfg.get("enable_predictive_derisk", True)
+        self.crash_confidence_threshold = cfg.get("crash_confidence_threshold", 0.4)
+        self.crash_size_multiplier = cfg.get("crash_size_multiplier", 0.20)    # 80% reduction
+        self.crash_exposure_cap = cfg.get("crash_exposure_cap", 0.25)          # 25% vs normal 60%
+        self._normal_exposure_cap = self.max_aggregate_exposure_pct            # Save default for reset
+
+        # Funding rate risk: block new longs when funding is deeply negative
+        # (means longs pay shorts → holding longs is expensive)
+        self.funding_risk_enabled = cfg.get("funding_risk_enabled", True)
+        self.funding_negative_threshold = cfg.get("funding_negative_threshold", -0.001)  # -0.1%/8h
+        self.funding_positive_threshold = cfg.get("funding_positive_threshold", 0.003)   # +0.3%/8h
+        self._funding_cache: Dict[str, float] = {}
+        self._funding_cache_ts: float = 0.0
+        self._funding_cache_ttl = 120  # 2 minutes
+
+        self._forecaster = None
+        if self.enable_predictive_derisk and HAS_FORECASTER:
+            try:
+                self._forecaster = PredictiveRegimeForecaster()
+                logger.info("DecisionFirewall: predictive de-risking ENABLED")
+            except Exception as e:
+                logger.debug(f"Could not init forecaster: {e}")
+
         # State tracking
         self._recent_trades: Dict[str, float] = {}  # coin → last trade timestamp
         self._daily_losses: float = 0.0
@@ -70,6 +101,7 @@ class DecisionFirewall:
             "rejected_accuracy": 0,
             "rejected_drawdown": 0,
             "rejected_exposure": 0,
+            "rejected_funding": 0,
         }
 
         logger.info(f"DecisionFirewall initialized: max_risk={self.max_risk_per_trade:.0%}/trade, "
@@ -199,6 +231,48 @@ class DecisionFirewall:
                 return _reject("rejected_drawdown",
                               f"Daily loss limit hit ({self._daily_losses / balance:.1%} > 3%)")
 
+        # 11. Funding rate risk check
+        #     Block new longs when funding is deeply negative (longs pay shorts heavily)
+        #     Block new shorts when funding is extremely positive (shorts pay longs)
+        if self.funding_risk_enabled:
+            try:
+                funding = self._get_funding_rate(signal.coin)
+                side_val = signal.side.value if hasattr(signal.side, 'value') else str(signal.side)
+                if side_val == "long" and funding < self.funding_negative_threshold:
+                    return _reject("rejected_funding",
+                                  f"Funding deeply negative ({funding:.4%}/8h) — "
+                                  f"longs pay {abs(funding)*3*365:.0f}% annualized, blocking long")
+                elif side_val == "short" and funding > self.funding_positive_threshold:
+                    return _reject("rejected_funding",
+                                  f"Funding extremely positive ({funding:.4%}/8h) — "
+                                  f"shorts pay {funding*3*365:.0f}% annualized, blocking short")
+            except Exception as e:
+                logger.debug(f"Funding rate check failed: {e}")
+
+        # 12. Predictive regime de-risking
+        #     If forecaster detects crash with high confidence, dynamically reduce
+        #     position size and tighten exposure cap instead of outright blocking.
+        if self._forecaster and self.enable_predictive_derisk:
+            try:
+                pred = self._forecaster.predict_regime(signal.coin)
+                if (pred["regime"] == "crash" and
+                        pred["confidence"] > self.crash_confidence_threshold):
+                    # De-risk: cut position size dramatically
+                    signal.size *= self.crash_size_multiplier  # 80% reduction
+                    # Tighten aggregate exposure cap for this check
+                    self.max_aggregate_exposure_pct = self.crash_exposure_cap
+                    logger.warning(
+                        f"CRASH REGIME detected for {signal.coin} "
+                        f"(conf={pred['confidence']:.2f}) — "
+                        f"de-risking: size *= {self.crash_size_multiplier}, "
+                        f"exposure cap → {self.crash_exposure_cap:.0%}"
+                    )
+                else:
+                    # Reset to normal exposure cap
+                    self.max_aggregate_exposure_pct = self._normal_exposure_cap
+            except Exception as e:
+                logger.debug(f"Forecaster check failed: {e}")
+
         # All checks passed
         self.stats["passed"] += 1
         self._recent_trades[signal.coin] = now
@@ -252,6 +326,38 @@ class DecisionFirewall:
         """Record a trade outcome for daily drawdown tracking."""
         if pnl < 0:
             self._daily_losses += abs(pnl)
+
+    def _get_funding_rate(self, coin: str) -> float:
+        """
+        Fetch current funding rate from Hyperliquid (cached).
+        Returns annualized rate approximation.
+        """
+        now = time.time()
+        if now - self._funding_cache_ts < self._funding_cache_ttl and coin in self._funding_cache:
+            return self._funding_cache[coin]
+
+        try:
+            import requests
+            resp = requests.post(
+                "https://api.hyperliquid.xyz/info",
+                json={"type": "metaAndAssetCtxs"},
+                timeout=5
+            )
+            if resp.ok:
+                data = resp.json()
+                if len(data) >= 2:
+                    meta = data[0]
+                    asset_ctxs = data[1]
+                    for i, asset in enumerate(meta.get("universe", [])):
+                        if i < len(asset_ctxs):
+                            name = asset.get("name", "").upper()
+                            rate = float(asset_ctxs[i].get("funding", 0))
+                            self._funding_cache[name] = rate
+                    self._funding_cache_ts = now
+        except Exception as e:
+            logger.debug(f"Funding rate fetch failed: {e}")
+
+        return self._funding_cache.get(coin.upper(), 0.0)
 
     def _check_daily_reset(self):
         """Reset daily loss counter at midnight UTC."""
