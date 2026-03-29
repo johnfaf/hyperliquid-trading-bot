@@ -49,9 +49,8 @@ FEATURE_DEPENDENCIES: Dict[str, List[str]] = {
     "telegram": [
         "requests",
     ],
-    "dashboard": [
-        "flask",
-    ],
+    # dashboard uses stdlib http.server — no extra deps needed
+    "dashboard": [],
     "backtester": [
         "pandas",
         "numpy",

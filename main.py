@@ -89,7 +89,10 @@ class HyperliquidResearchBot:
         self._register_background_tasks()
 
         self.logger.info("Bot initialized.")
-        self.logger.info(health_registry.get_health_report())
+        try:
+            self.logger.info(health_registry.get_health_report())
+        except Exception as exc:
+            self.logger.warning("Health report failed: %s", exc)
 
     # ── Background tasks (replaces raw daemon threads) ────────
 
@@ -189,6 +192,7 @@ class HyperliquidResearchBot:
           Tier 3 — Discovery (24h): leaderboard scan, strategy ID
         """
         self.running = True
+        self.logger.info("Entering run_loop()…")
 
         # ── Graceful shutdown handler ──
         def signal_handler(sig, frame):
@@ -328,4 +332,9 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as exc:
+        import logging
+        logging.getLogger("boot").critical("FATAL: unhandled exception — %s", exc, exc_info=True)
+        sys.exit(1)

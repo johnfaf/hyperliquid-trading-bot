@@ -22,11 +22,26 @@ def run_reporting(container, cycle_count: int, health_registry=None) -> None:
     Phase 6+: status update, module stats, alerts, backup.
     Called at the end of every trading cycle.
     """
-    from src.notifications import telegram_bot as tg
-    from src.notifications import telegram_alerts as tg_alerts
-    from src.ui import report_exporter
-    from src.discovery.golden_bridge import get_stats as golden_stats
-    from src.data.hyperliquid_client import get_api_stats
+    try:
+        from src.notifications import telegram_bot as tg
+    except ImportError:
+        tg = None
+    try:
+        from src.notifications import telegram_alerts as tg_alerts
+    except ImportError:
+        tg_alerts = None
+    try:
+        from src.ui import report_exporter
+    except ImportError:
+        report_exporter = None
+    try:
+        from src.discovery.golden_bridge import get_stats as golden_stats
+    except ImportError:
+        golden_stats = None
+    try:
+        from src.data.hyperliquid_client import get_api_stats
+    except ImportError:
+        get_api_stats = None
 
     # ── Phase 6: Status ──
     logger.info("Phase 6: Status Update")
@@ -35,7 +50,7 @@ def run_reporting(container, cycle_count: int, health_registry=None) -> None:
         print(status)
 
     # Telegram cycle summary
-    if tg.is_configured() and container.paper_trader:
+    if tg and tg.is_configured() and container.paper_trader:
         try:
             summary = container.paper_trader.get_account_summary()
             tg.notify_cycle_summary(summary)
@@ -72,8 +87,8 @@ def run_reporting(container, cycle_count: int, health_registry=None) -> None:
 
     # ── Golden wallet stats ──
     try:
-        gs = golden_stats()
-        if gs["total_evaluated"] > 0:
+        gs = golden_stats() if golden_stats else None
+        if gs and gs["total_evaluated"] > 0:
             logger.info(
                 "  Golden Wallets: %d golden / %d evaluated, %d connected",
                 gs["golden_wallets"], gs["total_evaluated"], gs["live_connected"],
@@ -83,7 +98,9 @@ def run_reporting(container, cycle_count: int, health_registry=None) -> None:
 
     # ── API manager stats ──
     try:
-        api_s = get_api_stats()
+        api_s = get_api_stats() if get_api_stats else None
+        if not api_s:
+            raise ValueError("skip")
         logger.info(
             "  API Manager: %d REST, %d cached (%s%% hit), %d from WS | "
             "bucket: %.0f tokens, 429s=%d",
@@ -108,10 +125,10 @@ def run_reporting(container, cycle_count: int, health_registry=None) -> None:
     # ── Telegram daily/weekly alerts ──
     cycles_per_day = max(int(86400 / config.TRADING_CYCLE_INTERVAL), 1)
     try:
-        if tg.is_configured() and cycle_count % cycles_per_day == 0:
+        if tg and tg.is_configured() and tg_alerts and cycle_count % cycles_per_day == 0:
             tg_alerts.send_daily_pnl_summary()
             logger.info("  Sent daily P&L Telegram summary")
-        if tg.is_configured() and cycle_count % (cycles_per_day * 7) == 0:
+        if tg and tg.is_configured() and tg_alerts and cycle_count % (cycles_per_day * 7) == 0:
             tg_alerts.send_weekly_digest()
             logger.info("  Sent weekly Telegram digest")
     except Exception as exc:
@@ -119,7 +136,7 @@ def run_reporting(container, cycle_count: int, health_registry=None) -> None:
 
     # ── HTML report (daily) ──
     try:
-        if cycle_count % cycles_per_day == 0:
+        if report_exporter and cycle_count % cycles_per_day == 0:
             report_path = report_exporter.export_html_report()
             logger.info("  HTML report exported: %s", report_path)
     except Exception as exc:

@@ -23,5 +23,8 @@ EXPOSE 8080
 # Default to JSON logging in container
 ENV LOG_FORMAT=json
 ENV PORT=8080
+# CRITICAL: Disable Python stdout/stderr buffering so logs appear in real-time
+# Without this, Railway/Docker log collectors may miss log output entirely
+ENV PYTHONUNBUFFERED=1
 
-CMD ["python", "main.py"]
+CMD ["python", "-u", "main.py"]

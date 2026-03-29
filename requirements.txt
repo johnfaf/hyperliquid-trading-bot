@@ -7,8 +7,7 @@ numpy==1.26.4
 websocket-client==1.7.0
 eth_account==0.10.0
 
-# Flask for the unified web dashboard
-flask>=3.0.0
+# Dashboard uses stdlib http.server — no Flask needed
 
 # ─── Optional extras (see requirements-optional.txt) ──────────
 # Install separately:  pip install -r requirements-optional.txt
