@@ -2,394 +2,141 @@
 """
 Hyperliquid Auto-Research Trading Bot
 ======================================
-Main orchestrator that runs the continuous research, strategy identification,
-scoring, and paper trading loop.
+Slim orchestrator.  All heavy logic lives in domain modules:
+
+  src/core/boot.py               — logging, dependency validation, DB init
+  src/core/subsystem_registry.py — instantiate + wire subsystems
+  src/core/health_registry.py    — per-subsystem health states
+  src/core/task_runner.py        — supervised background threads
+  src/core/cycles/               — research, trading, fast, reporting cycles
+  cli.py                         — CLI entrypoints (backtest, bootstrap, etc.)
 
 Usage:
     python main.py              # Run the full bot loop
     python main.py --once       # Run a single cycle then exit
+    python main.py --core-only  # Run with fundable-core profile only
     python main.py --report     # Generate a report and exit
     python main.py --status     # Print current status and exit
+    python main.py --bootstrap  # Cold-start DB seeding
 """
-import sys
 import os
-import time
 import signal
-import logging
-import argparse
-from datetime import datetime
+import sys
+import time
 
 sys.path.insert(0, os.path.dirname(__file__))
 import config
+
+from src.core.boot import (
+    setup_logging,
+    validate_dependencies,
+    init_database,
+    log_persistence_info,
+)
+from src.core.health_registry import registry as health_registry, SubsystemState
+from src.core.task_runner import SupervisedTaskRunner
+from src.core.subsystem_registry import (
+    build_subsystems,
+    FUNDABLE_CORE,
+    FULL_PROFILE,
+    SubsystemContainer,
+)
+from src.core.cycles.research_cycle import run_discovery
+from src.core.cycles.trading_cycle import run_trading_cycle
+from src.core.cycles.fast_cycle import run_fast_cycle
+from src.core.cycles.reporting_cycle import run_reporting
 from src.data import database as db
-from src.data.database import init_db, restore_from_json, backup_to_json
-from src.discovery.trader_discovery import TraderDiscovery
-from src.analysis.strategy_identifier import StrategyIdentifier
-from src.analysis.strategy_scorer import StrategyScorer
-from src.trading.paper_trader import PaperTrader
-from src.trading.copy_trader import CopyTrader
-from src.ui.reporter import Reporter
-from src.ui.dashboard import start_dashboard, set_v2_components
-from src.data.exchange_aggregator import ExchangeAggregator
-from src.data.options_flow import OptionsFlowScanner
-from src.analysis.regime_detector import RegimeDetector
-from src.signals.decision_firewall import DecisionFirewall
-from src.signals.agent_scoring import AgentScorer
-from src.analysis.features import FeatureEngine
-from src.signals.alpha_arena import AlphaArena
-from src.analysis.liquidation_strategy import LiquidationStrategy
-from src.signals.kelly_sizing import KellySizer
-from src.trading.trade_memory import TradeMemory
-from src.signals.calibration import CalibrationTracker
-from src.signals.llm_filter import LLMFilter
-from src.signals.signal_processor import SignalProcessor, ArenaIncubator
-from src.signals.decision_engine import DecisionEngine
-from src.exchanges.scanner import MultiExchangeScanner
-from src.notifications import telegram_bot as tg
-from src.discovery.golden_bridge import get_golden_copy_signals, auto_connect_golden_wallets, get_stats as golden_stats
-from src.data.hyperliquid_client import start_websocket, get_api_stats
-from src.notifications.ws_position_monitor import PositionMonitor
-from src.discovery.adaptive_bot_detector import AdaptiveBotDetector
-from src.analysis.sharpe_calculator import calculate_sharpe
-from src.analysis.regime_strategy_filter import RegimeStrategyFilter
-from src.notifications import telegram_alerts as tg_alerts
-from src.ui import report_exporter
-from src.data.polymarket_scanner import PolymarketScanner
-from src.trading.live_trader import LiveTrader
-from src.signals.predictive_regime_forecaster import PredictiveRegimeForecaster
-from src.trading.cross_venue_hedger import CrossVenueHedger
-from src.analysis.shadow_tracker import ShadowTracker
+from src.data.database import backup_to_json
 
-# ─── Logging Setup ─────────────────────────────────────────────
-
-import re as _re
-
-# Patterns that should NEVER appear in logs — matches common secret formats
-_SECRET_PATTERNS = [
-    _re.compile(r'(api[_-]?key|api[_-]?secret|private[_-]?key|secret[_-]?key|password|token|authorization)\s*[=:]\s*\S+', _re.IGNORECASE),
-    _re.compile(r'0x[a-fA-F0-9]{64}'),  # Ethereum private keys (64 hex chars)
-    _re.compile(r'(Bearer|Basic)\s+[A-Za-z0-9+/=_-]{20,}', _re.IGNORECASE),  # Auth headers
-]
-
-def _scrub_secrets(text: str) -> str:
-    """Remove any secrets that might accidentally appear in log messages."""
-    for pattern in _SECRET_PATTERNS:
-        text = pattern.sub("[REDACTED]", text)
-    return text
-
-
-class JSONFormatter(logging.Formatter):
-    """
-    Structured JSON log formatter for production.
-    Railway, Datadog, ELK, and most log aggregators parse JSON natively.
-    Each line is a self-contained JSON object — no multi-line parsing needed.
-
-    Includes secret-scrubbing: API keys, private keys, and auth tokens
-    are redacted before they reach the log output.
-    """
-    def format(self, record):
-        import json as _json
-        msg = _scrub_secrets(record.getMessage())
-        log_entry = {
-            "ts": self.formatTime(record, "%Y-%m-%dT%H:%M:%S"),
-            "level": record.levelname,
-            "logger": record.name,
-            "msg": msg,
-        }
-        if record.exc_info and record.exc_info[0]:
-            log_entry["exception"] = _scrub_secrets(self.formatException(record.exc_info))
-        # Add extra fields if present (e.g. logger.info("msg", extra={"wallet": "0x..."})
-        for key in ("wallet", "coin", "action", "latency_ms", "status_code"):
-            if hasattr(record, key):
-                log_entry[key] = getattr(record, key)
-        return _json.dumps(log_entry, default=str)
-
-
-def setup_logging():
-    os.makedirs(config.LOG_DIR, exist_ok=True)
-    log_file = os.path.join(config.LOG_DIR, f"bot_{datetime.utcnow().strftime('%Y%m%d')}.log")
-
-    # Structured JSON for stdout (Railway / log aggregators)
-    json_formatter = JSONFormatter()
-
-    # Human-readable for local file debugging
-    text_formatter = logging.Formatter(
-        "%(asctime)s [%(name)s] %(levelname)s: %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S"
-    )
-
-    # File handler — human-readable for local debugging
-    fh = logging.FileHandler(log_file)
-    fh.setLevel(logging.DEBUG)
-    fh.setFormatter(text_formatter)
-
-    # Console handler — structured JSON for Railway / production
-    # Falls back to text if LOG_FORMAT=text (for local dev)
-    ch = logging.StreamHandler(sys.stdout)
-    ch.setLevel(getattr(logging, config.LOG_LEVEL))
-    use_json = os.environ.get("LOG_FORMAT", "json").lower() != "text"
-    ch.setFormatter(json_formatter if use_json else text_formatter)
-
-    root = logging.getLogger()
-    root.setLevel(logging.DEBUG)
-    root.addHandler(fh)
-    root.addHandler(ch)
-
-    return logging.getLogger(__name__)
+from cli import (
+    build_parser,
+    bootstrap_seed_data,
+    run_cli_backtest,
+    run_candle_backtest,
+    run_cache_list,
+    run_cache_clear,
+)
 
 
 # ─── Bot Engine ────────────────────────────────────────────────
 
 class HyperliquidResearchBot:
     """
-    Main bot that orchestrates:
-    1. Trader discovery (find top performers)
-    2. Strategy identification (classify what they're doing)
-    3. Strategy scoring (rank strategies, decay bad ones)
-    4. Paper trading (simulate trades from top strategies)
-    5. Copy trading (mirror top traders' live position changes)
-    6. Reporting (generate insights)
+    Orchestrates the 3-tier scheduling loop.  Delegates all work to cycle
+    modules and uses the health registry to track subsystem state.
     """
 
-    def __init__(self):
-        self.logger = logging.getLogger(self.__class__.__name__)
+    def __init__(self, profile=None):
+        self.logger = setup_logging()
         self.running = False
         self._last_research = 0
-        self._last_scoring = 0
+        self._last_discovery = 0
         self._last_report = 0
-        self._last_discovery = 0  # Track when we last ran full discovery
         self._cycle_count = 0
         self._fast_cycle_count = 0
 
-        # Initialize components
-        self.logger.info("Initializing bot components...")
-        init_db()
+        # ── Boot sequence ──
+        log_persistence_info(self.logger)
+        validate_dependencies(self.logger)
+        init_database(self.logger)
 
-        # Restore from backup if DB is empty (e.g. after Railway redeploy)
-        if restore_from_json():
-            self.logger.info("Restored DB from backup (post-deploy recovery)")
-        self.discovery = TraderDiscovery()
-        self.identifier = StrategyIdentifier()
-        self.scorer = StrategyScorer()
-        self.exchange_agg = ExchangeAggregator()
-        self.options_scanner = OptionsFlowScanner()
-        self.regime_detector = RegimeDetector(exchange_agg=self.exchange_agg)
+        # ── Build subsystems ──
+        effective_profile = profile or FULL_PROFILE
+        self.container = build_subsystems(health_registry, effective_profile)
 
-        # V7: Shared Predictive Regime Forecaster (5-input model)
-        # Created here so main loop can inject Polymarket + options data each cycle.
-        try:
-            self.predictive_forecaster = PredictiveRegimeForecaster()
-            self.logger.info("Predictive Regime Forecaster V2 initialized (5-input model)")
-        except Exception as e:
-            self.predictive_forecaster = PredictiveRegimeForecaster()  # bare default
-            self.logger.warning(f"Forecaster init warning: {e}")
+        # ── Supervised background tasks ──
+        self.task_runner = SupervisedTaskRunner(health_registry=health_registry)
+        self._register_background_tasks()
 
-        self.firewall = DecisionFirewall({"forecaster": self.predictive_forecaster})
-        self.agent_scorer = AgentScorer()
-        self.feature_engine = FeatureEngine()
+        self.logger.info("Bot initialized.")
+        self.logger.info(health_registry.get_health_report())
 
-        # V2.5: New modules — liquidation strategy, Kelly sizing, trade memory, calibration, LLM filter
-        self.liquidation_strategy = LiquidationStrategy()
-        self.kelly_sizer = KellySizer()
-        self.trade_memory = TradeMemory()
-        self.calibration = CalibrationTracker()
-        self.llm_filter = LLMFilter()
-        self.signal_processor = SignalProcessor()
-        self.arena_incubator = ArenaIncubator()
-        self.decision_engine = DecisionEngine()
+    # ── Background tasks (replaces raw daemon threads) ────────
 
-        # V4: Multi-exchange scanner (Hyperliquid + Lighter cross-venue confirmation)
-        try:
-            self.multi_scanner = MultiExchangeScanner(config={
-                "lighter_enabled": config.LIGHTER_ENABLED,
-            })
-            self.logger.info(f"Multi-exchange scanner initialized: {list(self.multi_scanner.adapters.keys())}")
-        except Exception as e:
-            self.logger.warning(f"Multi-exchange scanner init failed (continuing single-venue): {e}")
-            self.multi_scanner = None
-
-        # V5: Start WebSocket feed for real-time market data (reduces REST polling)
-        try:
-            start_websocket(coins=["BTC", "ETH", "SOL", "DOGE", "ARB", "OP"])
-            self.logger.info("WebSocket feed started for real-time price data")
-        except Exception as e:
-            self.logger.warning(f"WebSocket start failed (REST fallback active): {e}")
-
-        # Bootstrap Kelly from existing agent scorer history
-        self.kelly_sizer.load_from_agent_scorer(self.agent_scorer)
-
-        self.copy_trader = CopyTrader(
-            firewall=self.firewall,
-            agent_scorer=self.agent_scorer,
-            kelly_sizer=self.kelly_sizer,
-            trade_memory=self.trade_memory,
-            calibration=self.calibration,
-            regime_forecaster=self.predictive_forecaster,
-        )
-        self.reporter = Reporter()
-        self.arena = AlphaArena()
-
-        # V6: Phase 1 signal quality upgrades
-        self.adaptive_bot_detector = AdaptiveBotDetector()
-        self.regime_strategy_filter = RegimeStrategyFilter()
-        # report_exporter is a module with functions, not a class
-
-        # V6: Polymarket prediction market scanner
-        try:
-            self.polymarket = PolymarketScanner()
-            self.logger.info("Polymarket scanner initialized")
-        except Exception as e:
-            self.polymarket = None
-            self.logger.warning(f"Polymarket scanner init failed (continuing without): {e}")
-
-        # V6: Real-time WebSocket position monitor for copy trading
-        try:
-            top_traders = db.get_active_traders()[:20]
-            if top_traders:
-                self.position_monitor = PositionMonitor(max_signal_queue=500)
-                self.position_monitor.start([t["address"] for t in top_traders])
-                self.logger.info(f"WebSocket position monitor started for {len(top_traders)} traders")
-            else:
-                self.position_monitor = None
-                self.logger.info("No active traders yet — position monitor will start after first discovery")
-        except Exception as e:
-            self.position_monitor = None
-            self.logger.warning(f"Position monitor init failed (REST copy trading as fallback): {e}")
-
-        # Paper trader with ALL V2 + V2.5 components wired in
-        self.paper_trader = PaperTrader(
-            firewall=self.firewall,
-            agent_scorer=self.agent_scorer,
-            feature_engine=self.feature_engine,
-            kelly_sizer=self.kelly_sizer,
-            trade_memory=self.trade_memory,
-            calibration=self.calibration,
-            llm_filter=self.llm_filter,
-        )
-
-        # V8: Cross-venue hedger (Binance/Bybit reduce-only on crash regime)
-        try:
-            self.cross_venue_hedger = CrossVenueHedger()
-            self.logger.info(f"CrossVenueHedger initialized (dry_run={self.cross_venue_hedger.dry_run})")
-        except Exception as e:
-            self.cross_venue_hedger = None
-            self.logger.warning(f"CrossVenueHedger init failed (continuing without): {e}")
-
-        # V8: Shadow mode PnL attribution tracker (30-day rolling per signal source)
-        try:
-            self.shadow_tracker = ShadowTracker()
-            self.logger.info("ShadowTracker initialized for PnL attribution")
-        except Exception as e:
-            self.shadow_tracker = None
-            self.logger.warning(f"ShadowTracker init failed (continuing without): {e}")
-
-        # V6: Live trader (dry_run=True unless HL_LIVE_TRADING=true)
-        try:
-            self.live_trader = LiveTrader(firewall=self.firewall, regime_forecaster=self.predictive_forecaster)
-            mode = "DRY RUN" if self.live_trader.dry_run else "LIVE"
-            self.logger.info(f"Live trader initialized [{mode}]")
-            if not self.live_trader.dry_run:
-                self.logger.warning("⚠️  LIVE TRADING ENABLED — real orders will be placed!")
-        except Exception as e:
-            self.live_trader = None
-            self.logger.info(f"Live trader not available (paper-only mode): {e}")
-
-        # Start the unified web dashboard (main + options on same port)
-        try:
-            set_v2_components(
-                firewall=self.firewall,
-                regime_detector=self.regime_detector,
-                arena=self.arena,
-                kelly_sizer=self.kelly_sizer,
-                trade_memory=self.trade_memory,
-                calibration=self.calibration,
-                llm_filter=self.llm_filter,
-                liquidation_strategy=self.liquidation_strategy,
-                signal_processor=self.signal_processor,
-                arena_incubator=self.arena_incubator,
-                decision_engine=self.decision_engine,
-                multi_scanner=self.multi_scanner,
+    def _register_background_tasks(self):
+        """Register background scanner tasks with the supervised runner."""
+        if self.container.polymarket:
+            self.task_runner.register(
+                "bg-polymarket",
+                self._polymarket_scan,
+                interval_seconds=config.POLYMARKET_SCAN_INTERVAL,
+                max_retries=10,
             )
-            self.dashboard = start_dashboard(options_scanner=self.options_scanner)
-            self.logger.info("Unified dashboard started (main + options flow on same port).")
-        except Exception as e:
-            self.logger.warning(f"Dashboard failed to start: {e}")
+            health_registry.register("bg-polymarket", affects_trading=False)
 
-        # V7: Start background scanner threads for Polymarket + Options Flow
-        # These run independently so the main loop doesn't block on Deribit/Polymarket latency.
-        self._start_background_scanners()
+        if self.container.options_scanner:
+            self.task_runner.register(
+                "bg-options-flow",
+                self._options_scan,
+                interval_seconds=config.OPTIONS_FLOW_SCAN_INTERVAL,
+                max_retries=10,
+            )
+            health_registry.register("bg-options-flow", affects_trading=False)
 
-        self.logger.info("Bot initialized successfully.")
+    def _polymarket_scan(self):
+        self.container.polymarket.scan_markets()
+        self.container.polymarket.get_market_sentiment()
 
-        # Send Telegram startup notification
-        if tg.is_configured():
-            tg.send_startup_message()
-            self.logger.info("Telegram notifications enabled.")
-        else:
-            self.logger.info("Telegram not configured — set TELEGRAM_BOT_TOKEN & TELEGRAM_CHAT_ID to enable.")
+    def _options_scan(self):
+        self.container.options_scanner.scan_flow()
 
-    # ─── Background Scanner Threads ─────────────────────────────
-    def _start_background_scanners(self):
-        """
-        Launch daemon threads that periodically refresh Polymarket and Options Flow
-        data in the background. This keeps data warm so the main trading cycle
-        can read it instantly without blocking on external API latency.
-        """
-        import threading
+    # ── Discovery timer persistence ───────────────────────────
 
-        def _polymarket_loop():
-            """Refresh Polymarket markets every 3 minutes."""
-            while self.running or True:  # also runs during init warmup
-                try:
-                    if self.polymarket:
-                        self.polymarket.scan_markets()
-                        self.polymarket.get_market_sentiment()
-                        self.logger.debug("Background: Polymarket scan complete")
-                except Exception as e:
-                    self.logger.debug(f"Background: Polymarket error: {e}")
-                time.sleep(180)  # 3 minutes
-
-        def _options_flow_loop():
-            """Refresh options flow data every 2 minutes."""
-            while self.running or True:
-                try:
-                    self.options_scanner.scan_flow()
-                    self.logger.debug("Background: Options flow scan complete")
-                except Exception as e:
-                    self.logger.debug(f"Background: Options flow error: {e}")
-                time.sleep(120)  # 2 minutes
-
-        # Start Polymarket background thread
-        if self.polymarket:
-            t = threading.Thread(target=_polymarket_loop, daemon=True, name="bg-polymarket")
-            t.start()
-            self.logger.info("Background Polymarket scanner thread started (interval=3min)")
-
-        # Start Options Flow background thread
-        if self.options_scanner:
-            t = threading.Thread(target=_options_flow_loop, daemon=True, name="bg-options-flow")
-            t.start()
-            self.logger.info("Background Options Flow scanner thread started (interval=2min)")
-
-    # ─── Discovery timer persistence ─────────────────────────────
     def _save_last_discovery_time(self):
-        """Persist the last discovery timestamp to DB so it survives redeploys."""
         try:
             conn = db.get_connection()
             conn.execute(
                 "INSERT OR REPLACE INTO bot_state (key, value) VALUES (?, ?)",
-                ("last_discovery_ts", str(self._last_discovery))
+                ("last_discovery_ts", str(self._last_discovery)),
             )
             conn.commit()
             conn.close()
         except Exception:
-            pass  # Table might not exist yet — non-critical
+            pass
 
     def _restore_last_discovery_time(self) -> float:
-        """Restore last discovery timestamp from DB. Returns 0 if not found."""
         try:
             conn = db.get_connection()
-            # Ensure the table exists
             conn.execute(
                 "CREATE TABLE IF NOT EXISTS bot_state "
                 "(key TEXT PRIMARY KEY, value TEXT)"
@@ -397,1153 +144,75 @@ class HyperliquidResearchBot:
             conn.commit()
             row = conn.execute(
                 "SELECT value FROM bot_state WHERE key = ?",
-                ("last_discovery_ts",)
+                ("last_discovery_ts",),
             ).fetchone()
             conn.close()
             return float(row["value"]) if row else 0.0
         except Exception:
             return 0.0
 
-    # ─── Tier 3: Discovery (runs once per day) ─────────────────────
+    # ── Scheduling loops ──────────────────────────────────────
 
     def _run_discovery(self):
-        """
-        Heavy discovery cycle: scan leaderboard, bot-detect, identify strategies.
-        Runs once per day to refresh the trader/strategy pool.
-        API-intensive (~3000+ calls) — not needed every trading cycle.
-        """
-        self.logger.info(f"{'='*60}")
-        self.logger.info("DISCOVERY CYCLE — refreshing trader pool")
-        self.logger.info(f"{'='*60}")
-
-        try:
-            # Phase 0: Purge non-golden wallets from previous scans
-            # This frees up space before the new golden scan runs
-            try:
-                from src.discovery.golden_wallet import purge_non_golden_wallets
-                purged = purge_non_golden_wallets()
-                if purged:
-                    self.logger.info(f"Purged {purged} non-golden wallets before new scan")
-            except Exception as e:
-                self.logger.debug(f"Golden wallet purge skipped: {e}")
-
-            # Phase 1: Discover and analyze traders
-            self.logger.info("Phase 1: Trader Discovery")
-            discovery_result = self.discovery.run_discovery_cycle()
-            self.logger.info(f"  Discovered: {discovery_result.get('traders_discovered', 0)} traders")
-            self.logger.info(f"  Analyzed: {discovery_result.get('traders_analyzed', 0)} traders")
-
-            # Phase 2: Identify strategies from analyzed traders
-            self.logger.info("Phase 2: Strategy Identification")
-            from src.data.database import get_active_traders
-            traders = get_active_traders()
-            all_strategies = []
-
-            for trader in traders:
-                from src.data import hyperliquid_client as hl
-                state = hl.get_user_state(trader["address"])
-                if state:
-                    profile = {
-                        "address": trader["address"],
-                        "positions": state["positions"],
-                        "position_analysis": self.discovery._analyze_positions(state["positions"]),
-                        "trade_analysis": {
-                            "total_trades": trader["trade_count"],
-                            "win_rate": trader["win_rate"],
-                            "total_closed_pnl": trader["total_pnl"],
-                            "trading_frequency": "unknown",
-                            "profit_factor": 1.5,
-                            "coins_traded": [p["coin"] for p in state["positions"] if p["size"] > 0],
-                        },
-                    }
-                    strategies = self.identifier.identify_strategies(profile)
-                    all_strategies.extend(strategies)
-                time.sleep(0.3)
-
-            if all_strategies:
-                saved_ids = self.identifier.save_identified_strategies(all_strategies)
-                self.logger.info(f"  Identified and saved {len(saved_ids)} strategies")
-
-            # Phase 2b: Golden wallet scan (evaluate top wallets for copy-trading)
-            try:
-                from src.discovery.golden_wallet import run_golden_scan
-                golden_summary = run_golden_scan(max_wallets=200)
-                self.logger.info(f"  Golden scan: {golden_summary.get('golden_count', 0)} golden wallets "
-                               f"out of {golden_summary.get('total_evaluated', 0)} evaluated")
-            except Exception as e:
-                self.logger.warning(f"Golden wallet scan failed: {e}")
-
-            self._last_discovery = time.time()
-            self._save_last_discovery_time()
-            self.logger.info("Discovery cycle complete.")
-        except Exception as e:
-            self.logger.error(f"Discovery cycle error: {e}", exc_info=True)
-
-    # ─── Tier 2: Trading cycle (runs every 5 min) ────────────────
+        run_discovery(self.container)
+        self._last_discovery = time.time()
+        self._save_last_discovery_time()
 
     def _run_trading_cycle(self):
-        """
-        Lightweight trading cycle: score strategies, detect regime, trade.
-        Uses existing DB data from last discovery — no leaderboard scanning.
-        Runs every ~5 minutes to react to market changes quickly.
-        """
-        # V6: Check live trader kill switch before cycle
-        if self.live_trader and not self.live_trader.dry_run:
-            if self.live_trader.check_daily_loss():
-                self.logger.error("KILL SWITCH ACTIVE — daily loss limit hit, skipping live trades")
-
         self._cycle_count += 1
-        self.logger.info(f"{'='*60}")
-        self.logger.info(f"Starting trading cycle #{self._cycle_count}")
-        self.logger.info(f"{'='*60}")
-
-        try:
-            # Phase 3: Score all strategies
-            self.logger.info("Phase 3: Strategy Scoring")
-            score_results = self.scorer.score_all_strategies()
-            self.logger.info(f"  Scored {len(score_results)} strategies")
-
-            # Phase 3b: Multi-exchange market overview
-            self.logger.info("Phase 3b: Multi-Exchange Volume Analysis")
-            try:
-                market_overview = self.exchange_agg.get_market_overview()
-                self.logger.info(f"  Market bias: {market_overview.get('overall_bias', '?')} "
-                               f"(score: {market_overview.get('overall_bias_score', 0):+.4f})")
-                self.logger.info(f"  Bullish: {market_overview.get('bullish_coins', [])}")
-                self.logger.info(f"  Bearish: {market_overview.get('bearish_coins', [])}")
-
-                # Telegram: notify if strong market bias
-                if tg.is_configured():
-                    tg.notify_market_bias(market_overview)
-            except Exception as e:
-                self.logger.warning(f"  Exchange aggregator error: {e}")
-                market_overview = {}
-
-            # Phase 3c: Options Flow Scan (Deribit)
-            self.logger.info("Phase 3c: Options Flow Scan")
-            try:
-                flow_result = self.options_scanner.scan_flow()
-                self.logger.info(f"  Unusual prints: {flow_result.get('unusual_prints', 0)}")
-                self.logger.info(f"  Top convictions: {flow_result.get('top_convictions', 0)}")
-
-                # Telegram: notify strong flow signals
-                if tg.is_configured() and self.options_scanner.top_convictions:
-                    for conv in self.options_scanner.top_convictions[:3]:
-                        if conv.get("conviction_pct", 0) > 60:
-                            tg.notify_strong_signal(
-                                coin=conv["ticker"],
-                                side=conv["direction"],
-                                reasons=[
-                                    f"Options flow: {conv.get('total_prints', 0)} unusual prints",
-                                    f"Net flow: ${conv.get('net_flow', 0):,.0f}",
-                                    f"Conviction: {conv.get('conviction_pct', 0):.0f}%",
-                                ],
-                                confidence=conv.get("conviction_pct", 0) / 100.0,
-                            )
-            except Exception as e:
-                self.logger.warning(f"  Options flow scan error: {e}")
-
-            # V7: Feed options flow convictions into the predictive forecaster
-            try:
-                if self.options_scanner.top_convictions and self.predictive_forecaster:
-                    self.predictive_forecaster.update_options_flow(self.options_scanner.top_convictions)
-                    self.logger.debug(f"  Forecaster ← {len(self.options_scanner.top_convictions)} options convictions")
-            except Exception as e:
-                self.logger.debug(f"  Forecaster options injection error: {e}")
-
-            # Phase 3d: Regime Detection
-            self.logger.info("Phase 3d: Market Regime Detection")
-            regime_data = {}
-            try:
-                regime_data = self.regime_detector.get_market_regime()
-                self.logger.info(f"  Regime: {regime_data.get('overall_regime', '?')} "
-                               f"(confidence={regime_data.get('overall_confidence', 0):.0%})")
-                guidance = regime_data.get("strategy_guidance", {})
-                self.logger.info(f"  Activate: {guidance.get('activate', [])}")
-                self.logger.info(f"  Pause: {guidance.get('pause', [])}")
-                self.logger.info(f"  Size modifier: {guidance.get('size_modifier', 1.0):.0%}")
-            except Exception as e:
-                self.logger.warning(f"  Regime detection error: {e}")
-
-            # Phase 3d2: Polymarket Prediction Market Scan
-            polymarket_signals = []
-            if self.polymarket:
-                self.logger.info("Phase 3d2: Polymarket Scan")
-                try:
-                    polymarket_signals = self.polymarket.generate_signals(hl_regime=regime_data)
-                    sentiment = self.polymarket.get_market_sentiment()
-                    self.logger.info(f"  Polymarket: {len(polymarket_signals)} signals, "
-                                   f"sentiment={sentiment.get('sentiment', '?')} "
-                                   f"(conf={sentiment.get('confidence', 0):.0%}, "
-                                   f"markets={sentiment.get('markets_analyzed', 0)})")
-                    if polymarket_signals:
-                        for sig in polymarket_signals[:3]:
-                            self.logger.info(f"  PM signal: {sig['side'].upper()} {sig['coin']} "
-                                           f"(conf={sig['confidence']:.0%}) — {sig.get('reason', '')[:60]}")
-                except Exception as e:
-                    self.logger.warning(f"  Polymarket scan error: {e}")
-
-            # V7: Feed Polymarket sentiment into the predictive forecaster
-            try:
-                if self.polymarket and self.predictive_forecaster:
-                    pm_sentiment = self.polymarket.get_market_sentiment()
-                    self.predictive_forecaster.update_polymarket_sentiment(pm_sentiment)
-                    self.logger.debug(f"  Forecaster ← Polymarket sentiment: {pm_sentiment.get('sentiment', '?')}")
-            except Exception as e:
-                self.logger.debug(f"  Forecaster polymarket injection error: {e}")
-
-            # V8: Cross-venue hedging — auto-hedge on crash regime
-            if self.cross_venue_hedger and regime_data:
-                try:
-                    # Build regime dict from predictive forecaster if available
-                    pred_regime = {}
-                    if self.predictive_forecaster:
-                        pred_regime = self.predictive_forecaster.predict_regime("BTC")
-                    else:
-                        pred_regime = {
-                            "regime": regime_data.get("overall_regime", "neutral"),
-                            "confidence": regime_data.get("overall_confidence", 0),
-                        }
-                    open_trades = db.get_open_paper_trades()
-                    hedge_result = self.cross_venue_hedger.check_and_hedge(pred_regime, open_trades)
-                    if hedge_result.get("action") != "idle":
-                        self.logger.info(f"  Hedger: {hedge_result['action']} | "
-                                       f"placed={hedge_result['hedges_placed']}, "
-                                       f"closed={hedge_result['hedges_closed']}, "
-                                       f"coins={hedge_result['coins_affected']}")
-                except Exception as e:
-                    self.logger.debug(f"  Cross-venue hedger error: {e}")
-
-            # Phase 3e: Multi-Exchange Scan + Cross-Venue Confirmation
-            self.logger.info("Phase 3e: Multi-Exchange Scanner")
-            cross_venue_data = {}
-            funding_arbs = []
-            try:
-                if self.multi_scanner:
-                    # Health check all venues
-                    venue_health = self.multi_scanner.check_health()
-                    self.logger.info(f"  Venue health: {venue_health}")
-
-                    # Get aggregated market data for cross-venue comparison
-                    common_markets = self.multi_scanner.get_common_markets()
-                    if common_markets:
-                        self.logger.info(f"  Common markets across venues: {common_markets[:15]}...")
-
-                    # Scan for funding rate arbitrage opportunities
-                    funding_arbs = self.multi_scanner.scan_funding_arb()
-                    if funding_arbs:
-                        for arb in funding_arbs[:3]:
-                            self.logger.info(
-                                f"  Funding arb: {arb.coin} "
-                                f"long@{arb.long_venue}({arb.long_funding_rate:+.4%}) / "
-                                f"short@{arb.short_venue}({arb.short_funding_rate:+.4%}) "
-                                f"= {arb.funding_spread_annualized:.1f}% ann."
-                            )
-                    else:
-                        self.logger.info("  No funding arb opportunities found")
-
-                    # Store cross-venue data for signal enrichment later
-                    cross_venue_data = {
-                        "health": venue_health,
-                        "common_markets": common_markets,
-                        "funding_arbs": funding_arbs,
-                    }
-                else:
-                    self.logger.info("  Multi-exchange scanner not available (single venue mode)")
-            except Exception as e:
-                self.logger.warning(f"  Multi-exchange scanner error: {e}")
-
-            # Phase 3f: Liquidation Cascade Reversal Strategy
-            self.logger.info("Phase 3f: Liquidation Strategy Scan")
-            lcrs_signals = []
-            # Fetch mids once at a scope visible to both LCRS and Options Flow phases
-            from src.data import hyperliquid_client as hl_client
-            mids = hl_client.get_all_mids() or {}
-            try:
-                lcrs_coins = ["BTC", "ETH", "SOL", "DOGE", "AVAX", "LINK", "ARB",
-                              "OP", "SUI", "APT", "INJ", "SEI"]
-
-                for coin in lcrs_coins:
-                    price = float(mids.get(coin, 0))
-                    if price <= 0:
-                        continue
-                    try:
-                        # Build features for LCRS from regime data + feature engine
-                        lcrs_features = {}
-                        if regime_data and "per_coin" in regime_data:
-                            coin_regime = regime_data["per_coin"].get(coin, {})
-                            lcrs_features["trend_strength"] = coin_regime.get("trend_strength", 0.5)
-                            lcrs_features["volatility"] = coin_regime.get("atr_pct", 0.02)
-                            lcrs_features["volume_ratio"] = coin_regime.get("volume_ratio", 1.0)
-
-                        # Get funding rate from Hyperliquid
-                        try:
-                            import requests
-                            meta_resp = requests.post("https://api.hyperliquid.xyz/info",
-                                json={"type": "metaAndAssetCtxs"}, timeout=10)
-                            if meta_resp.status_code == 200:
-                                meta_data = meta_resp.json()
-                                if isinstance(meta_data, list) and len(meta_data) > 1:
-                                    for asset_ctx in meta_data[1]:
-                                        if isinstance(asset_ctx, dict) and asset_ctx.get("coin") == coin:
-                                            lcrs_features["funding_rate"] = float(asset_ctx.get("funding", 0))
-                                            lcrs_features["oi_change"] = float(asset_ctx.get("openInterest", 0)) * 0.01
-                                            break
-                        except Exception:
-                            pass
-
-                        # Enrich with feature engine data
-                        try:
-                            payload = {
-                                "type": "candleSnapshot",
-                                "req": {
-                                    "coin": coin,
-                                    "interval": "1h",
-                                    "startTime": int((datetime.utcnow().timestamp() - 100 * 3600) * 1000),
-                                    "endTime": int(datetime.utcnow().timestamp() * 1000),
-                                }
-                            }
-                            resp = requests.post("https://api.hyperliquid.xyz/info",
-                                                 json=payload, timeout=10)
-                            if resp.status_code == 200:
-                                raw = resp.json()
-                                if isinstance(raw, list) and len(raw) >= 20:
-                                    candles = [{"open": float(c.get("o", 0)), "high": float(c.get("h", 0)),
-                                                "low": float(c.get("l", 0)), "close": float(c.get("c", 0)),
-                                                "volume": float(c.get("v", 0))} for c in raw]
-                                    feat = self.feature_engine.compute(coin, candles)
-                                    lcrs_features.setdefault("rsi", feat.rsi)
-                                    lcrs_features.setdefault("momentum_score", feat.momentum_score)
-                                    lcrs_features.setdefault("trend_strength", feat.trend_strength)
-                                    lcrs_features.setdefault("volatility", feat.volatility)
-                                    lcrs_features.setdefault("volume_ratio", feat.volume_ratio)
-                                    lcrs_features.setdefault("overall_score", feat.overall_score)
-                                    lcrs_features.setdefault("bollinger_position", feat.bollinger_position)
-                                    # Price change from last 8 candles
-                                    if len(candles) >= 8:
-                                        lcrs_features["price_change"] = (candles[-1]["close"] - candles[-8]["close"]) / candles[-8]["close"]
-                        except Exception:
-                            pass
-
-                        sig = self.liquidation_strategy.generate_signal(coin, lcrs_features, price)
-                        if sig:
-                            lcrs_signals.append(sig)
-                            self.logger.info(f"  LCRS: {sig['side'].upper()} {coin} "
-                                           f"(conf={sig['confidence']:.0%}, type={sig['features'].get('setup_type', '')})")
-                    except Exception as e:
-                        self.logger.debug(f"  LCRS scan error {coin}: {e}")
-
-                if lcrs_signals:
-                    self.logger.info(f"  LCRS found {len(lcrs_signals)} setups")
-                else:
-                    self.logger.info("  LCRS: no setups detected")
-            except Exception as e:
-                self.logger.warning(f"  Liquidation strategy error: {e}")
-
-            # Phase 4: Paper trade top strategies (regime-filtered)
-            self.logger.info("Phase 4: Paper Trading (regime-aware)")
-            top_strategies = self.scorer.get_top_strategies()  # Uses config.MAX_STRATEGIES_PER_CYCLE (default 15)
-
-            # V6: Enhanced regime-aware strategy filtering (compatibility matrix)
-            if regime_data:
-                try:
-                    top_strategies = self.regime_strategy_filter.filter(
-                        top_strategies, regime_data
-                    )
-                    report = self.regime_strategy_filter.get_regime_report(
-                        top_strategies, regime_data
-                    )
-                    self.logger.info(f"  Regime filter (V6): {report}")
-                except Exception as e:
-                    self.logger.debug(f"  V6 regime filter error, using legacy: {e}")
-                    top_strategies = self.regime_detector.filter_strategies_by_regime(
-                        top_strategies, regime_data
-                    )
-                self.logger.info(f"  Post-regime filter: {len(top_strategies)} strategies active")
-
-            # V3: Signal Processing — dedup, conflict resolution, compression
-            self.logger.info("Phase 4 pre-process: Signal Processor")
-            top_strategies = self.signal_processor.process(
-                top_strategies, regime_data=regime_data
-            )
-            self.logger.info(f"  Post-signal-processor: {len(top_strategies)} strategies")
-
-            # Inject Polymarket signals as synthetic strategies so the decision
-            # engine can rank them alongside trader-derived strategies.
-            if polymarket_signals:
-                for pm in polymarket_signals:
-                    synthetic = {
-                        "id": None,
-                        "name": f"polymarket_{pm.get('coin', 'UNK')}_{pm.get('side', '?')}",
-                        "strategy_type": "event_driven",
-                        "trader_address": "polymarket",
-                        "current_score": pm.get("confidence", 0.5),
-                        "confidence": pm.get("confidence", 0.5),
-                        "direction": pm.get("side", "long"),
-                        "side": pm.get("side", "long"),
-                        "source": "polymarket",
-                        "parameters": {
-                            "coins": [pm.get("coin", "BTC")],
-                            "market": pm.get("polymarket_market", ""),
-                            "probability": pm.get("polymarket_probability", 0),
-                        },
-                        "metrics": {},
-                        "metadata": {
-                            "polymarket_volume_24h": pm.get("polymarket_volume_24h", 0),
-                            "reason": pm.get("reason", ""),
-                        },
-                    }
-                    top_strategies.append(synthetic)
-                self.logger.info(f"  Injected {len(polymarket_signals)} Polymarket signals into strategy pipeline")
-
-            # Check existing positions first (V2: outcomes auto-feed to agent scorer + firewall)
-            closed = self.paper_trader.check_open_positions()
-            if closed:
-                self.logger.info(f"  Closed {len(closed)} positions")
-                for c in closed:
-                    # Telegram: notify closed trades
-                    if tg.is_configured():
-                        tg.notify_trade_closed(c, c.get("exit_price", 0), c.get("pnl", 0), c.get("reason", ""))
-
-            # V4: Cross-venue signal confirmation (enriches strategies before decision engine)
-            if self.multi_scanner and self.multi_scanner.cross_venue and top_strategies:
-                self.logger.info("Phase 4 cross-venue: Signal Confirmation")
-                try:
-                    # Extract coin + direction from each strategy for cross-venue check
-                    signals_to_confirm = []
-                    for s in top_strategies:
-                        params = s.get("parameters", {})
-                        if isinstance(params, str):
-                            import json
-                            try:
-                                params = json.loads(params)
-                            except (json.JSONDecodeError, TypeError):
-                                params = {}
-                        coins = params.get("coins", params.get("coins_traded", []))
-                        if isinstance(coins, str):
-                            coins = [coins]
-                        coin = coins[0] if coins else ""
-                        direction = s.get("direction", "long")
-                        score = s.get("score", 0.5)
-
-                        if coin and coin != "unknown":
-                            signals_to_confirm.append({
-                                "coin": coin,
-                                "direction": direction,
-                                "score": score,
-                            })
-
-                    if signals_to_confirm:
-                        confirmed = self.multi_scanner.confirm_signals(signals_to_confirm)
-
-                        # Inject confirmation scores back into strategies
-                        confirm_map = {
-                            f"{c.coin}:{c.direction}": c.confirmation_score
-                            for c in confirmed
-                        }
-                        for s in top_strategies:
-                            params = s.get("parameters", {})
-                            if isinstance(params, str):
-                                import json
-                                try:
-                                    params = json.loads(params)
-                                except (json.JSONDecodeError, TypeError):
-                                    params = {}
-                            coins = params.get("coins", params.get("coins_traded", []))
-                            if isinstance(coins, str):
-                                coins = [coins]
-                            coin = coins[0] if coins else ""
-                            direction = s.get("direction", "long")
-                            key = f"{coin}:{direction}"
-
-                            cv_score = confirm_map.get(key, 0.0)
-                            # Store cross-venue data in metadata for decision engine
-                            if "metadata" not in s:
-                                s["metadata"] = {}
-                            s["metadata"]["cross_venue_score"] = cv_score
-
-                            # Boost score by up to 15% based on cross-venue confirmation
-                            if cv_score > 0.15:
-                                original = s.get("current_score", s.get("score", 0.5))
-                                boost = cv_score * 0.15  # Max 15% boost
-                                s["current_score"] = min(1.0, original + boost)
-
-                        boosted = sum(1 for s in top_strategies if s.get("metadata", {}).get("cross_venue_score", 0) > 0.15)
-                        self.logger.info(f"  Cross-venue: confirmed {len(signals_to_confirm)} signals, "
-                                        f"{boosted} boosted")
-
-                except Exception as e:
-                    self.logger.warning(f"  Cross-venue confirmation error: {e}")
-
-            # V3: Final Decision Engine — rank, score, and log decisions
-            open_trades = db.get_open_paper_trades()
-            kelly_stats = None
-            try:
-                kelly_stats = self.kelly_sizer.get_all_sizing_stats()
-            except Exception:
-                pass
-            top_strategies = self.decision_engine.decide(
-                top_strategies,
-                regime_data=regime_data,
-                open_positions=open_trades,
-                kelly_stats=kelly_stats,
-            )
-
-            # V7: Apply AgentScorer dynamic weights to strategy confidences
-            # Sources with better track records get boosted, bad ones get reduced
-            try:
-                if top_strategies and hasattr(self.agent_scorer, 'apply_weights_to_signals'):
-                    for s in top_strategies:
-                        stype = s.get("strategy_type", "unknown")
-                        source_key = f"strategy:{stype}"
-                        weight = self.agent_scorer.get_weight(source_key)
-                        orig_conf = float(s.get("confidence", 0.5))
-                        # Blend: 60% original confidence, 40% agent scorer weight
-                        s["confidence"] = round(orig_conf * 0.6 + weight * 0.4, 3)
-                        s["agent_scorer_weight"] = round(weight, 3)
-            except Exception as e:
-                self.logger.debug(f"  AgentScorer weight apply error: {e}")
-
-            # Execute new signals from strategies (V2 pipeline: features → scoring → firewall → consensus)
-            if top_strategies:
-                executed = self.paper_trader.execute_strategy_signals(
-                    top_strategies, exchange_agg=self.exchange_agg,
-                    options_scanner=self.options_scanner,
-                    regime_data=regime_data,
-                    arena=self.arena,
-                )
-                self.logger.info(f"  Executed {len(executed)} new paper trades")
-                # Record signal IDs for AgentScorer outcome tracking
-                try:
-                    for t in executed:
-                        stype = t.get("strategy_type", "unknown")
-                        source_key = f"strategy:{stype}"
-                        signal_id = self.agent_scorer.record_signal(source_key, {
-                            "coin": t.get("coin", ""),
-                            "side": t.get("side", ""),
-                            "confidence": t.get("confidence", 0),
-                        })
-                        # Store signal_id in trade metadata so outcome can be matched later
-                        if t.get("id"):
-                            try:
-                                from src.data import database as _db
-                                _db.update_paper_trade_metadata(
-                                    t["id"], {"signal_id": signal_id, "source_key": source_key}
-                                )
-                            except Exception:
-                                pass
-                except Exception as e:
-                    self.logger.debug(f"  AgentScorer signal record error: {e}")
-                # Telegram: notify new trades
-                if tg.is_configured():
-                    for t in executed:
-                        tg.notify_trade_opened(t, source="strategy")
-
-                # V6: Mirror paper trades to live exchange (if enabled)
-                if self.live_trader and executed:
-                    for t in executed:
-                        try:
-                            live_result = self.live_trader.execute_signal(t)
-                            if live_result:
-                                self.logger.info(f"  LIVE: {live_result.get('status', '?')} "
-                                               f"{t.get('coin', '?')} {t.get('side', '?')}")
-                        except Exception as e:
-                            self.logger.warning(f"  Live execution error: {e}")
-
-            # Phase 4a: Execute LCRS signals through full V2 pipeline
-            if lcrs_signals:
-                self.logger.info("Phase 4a: Liquidation Strategy Execution")
-                try:
-                    # Package LCRS signals as strategies for the paper_trader pipeline
-                    lcrs_executed = []
-                    open_trades = db.get_open_paper_trades()
-                    account = db.get_paper_account()
-
-                    for sig in lcrs_signals:
-                        try:
-                            from src.signals.signal_schema import TradeSignal, SignalSide, SignalSource, RiskParams
-                            trade_signal = TradeSignal(
-                                coin=sig["coin"],
-                                side=SignalSide(sig["side"]),
-                                confidence=sig["confidence"],
-                                source=SignalSource.STRATEGY,
-                                reason=f"LCRS: {sig['features'].get('setup_type', 'unknown')}",
-                                strategy_type="liquidation_reversal",
-                                entry_price=sig["price"],
-                                leverage=sig["leverage"],
-                                position_pct=sig.get("position_pct", 0.06),
-                                risk=RiskParams(
-                                    stop_loss_pct=0.025,
-                                    take_profit_pct=0.05,
-                                ),
-                                regime=regime_data.get("overall_regime", "") if regime_data else "",
-                            )
-
-                            # Full V2 pipeline: firewall → Kelly → memory → LLM filter
-                            if self.firewall:
-                                passed, reason = self.firewall.validate(
-                                    trade_signal, regime_data=regime_data, open_positions=open_trades)
-                                if not passed:
-                                    self.logger.info(f"  LCRS firewall rejected {sig['coin']}: {reason}")
-                                    continue
-
-                            # Kelly sizing
-                            if self.kelly_sizer and account:
-                                sizing = self.kelly_sizer.get_sizing(
-                                    "liquidation_reversal", account["balance"], trade_signal.confidence)
-                                trade_signal.position_pct = sizing.position_pct
-
-                            # Trade memory check
-                            if self.trade_memory:
-                                mem = self.trade_memory.find_similar(
-                                    sig.get("features", {}), coin=sig["coin"], side=sig["side"])
-                                if mem.recommendation == "avoid":
-                                    self.logger.info(f"  LCRS memory blocked {sig['coin']}: {mem.reason}")
-                                    continue
-
-                            # LLM filter
-                            if self.llm_filter:
-                                ctx = {"regime_data": regime_data, "open_positions": open_trades}
-                                approved, adj_conf, reason = self.llm_filter.filter(sig, ctx)
-                                if not approved:
-                                    self.logger.info(f"  LCRS LLM filter blocked {sig['coin']}: {reason}")
-                                    continue
-                                trade_signal.confidence = adj_conf
-
-                            # Execute
-                            if account:
-                                size_usd = account["balance"] * trade_signal.effective_size
-                                size = size_usd / sig["price"]
-
-                                trade_id = db.open_paper_trade(
-                                    strategy_id=None, coin=sig["coin"], side=sig["side"],
-                                    entry_price=sig["price"], size=size, leverage=sig["leverage"],
-                                    stop_loss=sig["stop_loss"], take_profit=sig["take_profit"],
-                                    metadata={
-                                        "source": "liquidation_strategy",
-                                        "strategy_type": "liquidation_reversal",
-                                        "confidence": trade_signal.confidence,
-                                        "setup_type": sig["features"].get("setup_type", ""),
-                                        "features": sig["features"],
-                                    },
-                                )
-                                lcrs_executed.append({"id": trade_id, "coin": sig["coin"], "side": sig["side"]})
-                                self.logger.info(f"  LCRS executed: {sig['side'].upper()} {sig['coin']} "
-                                               f"@ ${sig['price']:,.2f} (conf={trade_signal.confidence:.0%})")
-
-                                if tg.is_configured():
-                                    tg.notify_trade_opened(
-                                        {"coin": sig["coin"], "side": sig["side"], "entry_price": sig["price"]},
-                                        source="liquidation_strategy"
-                                    )
-
-                        except Exception as e:
-                            self.logger.debug(f"  LCRS execution error {sig.get('coin')}: {e}")
-
-                    if lcrs_executed:
-                        self.logger.info(f"  Executed {len(lcrs_executed)} LCRS trades")
-                except Exception as e:
-                    self.logger.warning(f"  LCRS execution phase error: {e}")
-
-            # Phase 4a2: Options flow standalone trades (high conviction → direct trade)
-            self.logger.info("Phase 4a2: Options Flow Trades")
-            try:
-                from src.signals.signal_schema import signal_from_options_flow
-                options_executed = []
-                for conv in (getattr(self.options_scanner, 'top_convictions', None) or []):
-                    if conv.get("conviction_pct", 0) >= 70:  # Only very high conviction
-                        flow_signal = signal_from_options_flow(
-                            ticker=conv["ticker"],
-                            direction=conv["direction"],
-                            net_flow=conv["net_flow"],
-                            prints=conv["total_prints"],
-                            conviction_pct=conv["conviction_pct"],
-                        )
-                        # Set reasonable sizing
-                        flow_signal.position_pct = 0.04  # 4% per options flow trade (conservative)
-                        flow_signal.leverage = 2.0
-
-                        # Get entry price
-                        price = float(mids.get(conv["ticker"], 0))
-                        if price <= 0:
-                            continue
-                        flow_signal.entry_price = price
-
-                        # Route through firewall
-                        passed, reason = self.firewall.validate(
-                            flow_signal, regime_data=regime_data,
-                            open_positions=db.get_open_paper_trades(),
-                        )
-                        if not passed:
-                            self.logger.info(f"  Firewall rejected options flow {conv['ticker']}: {reason}")
-                            continue
-
-                        # Record with agent scorer
-                        source_key = "options_flow"
-                        signal_id = self.agent_scorer.record_signal(source_key, {
-                            "coin": conv["ticker"],
-                            "side": flow_signal.side.value,
-                            "confidence": flow_signal.confidence,
-                        })
-
-                        # Execute as paper trade
-                        account = db.get_paper_account()
-                        if account:
-                            size_usd = account["balance"] * flow_signal.effective_size
-                            size = size_usd / price
-                            side = flow_signal.side.value
-
-                            if side == "long":
-                                sl = price * (1 - 0.05)
-                                tp = price * (1 + 0.10)
-                            else:
-                                sl = price * (1 + 0.05)
-                                tp = price * (1 - 0.10)
-
-                            trade_id = db.open_paper_trade(
-                                strategy_id=None,
-                                coin=conv["ticker"],
-                                side=side,
-                                entry_price=price,
-                                size=size,
-                                leverage=2,
-                                stop_loss=round(sl, 2),
-                                take_profit=round(tp, 2),
-                                metadata={
-                                    "source": "options_flow",
-                                    "conviction": conv["conviction_pct"],
-                                    "net_flow": conv["net_flow"],
-                                    "prints": conv["total_prints"],
-                                    "signal_id": signal_id,
-                                },
-                            )
-                            self.logger.info(f"  Options flow trade: {side.upper()} {conv['ticker']} "
-                                           f"@ ${price:,.2f} (conviction: {conv['conviction_pct']}%)")
-                            options_executed.append({"id": trade_id, "coin": conv["ticker"], "side": side})
-
-                            if tg.is_configured():
-                                tg.notify_trade_opened(
-                                    {"coin": conv["ticker"], "side": side, "entry_price": price},
-                                    source="options_flow"
-                                )
-
-                if options_executed:
-                    self.logger.info(f"  Executed {len(options_executed)} options flow trades")
-            except Exception as e:
-                self.logger.warning(f"  Options flow trading error: {e}")
-
-            # Phase 4b: Copy trading - mirror top trader positions
-            # V6: Drain real-time WebSocket signals first, fall back to REST polling
-            self.logger.info("Phase 4b: Copy Trading (V6 — WebSocket + REST)")
-            ws_signals = []
-            if self.position_monitor:
-                ws_signals = self.position_monitor.drain_signals()
-                if ws_signals:
-                    self.logger.info(f"  WebSocket position monitor: {len(ws_signals)} real-time signals")
-            copy_signals = ws_signals + self.copy_trader.scan_top_traders(top_n=10)
-
-            # Inject golden wallet signals (higher confidence, proven profitable)
-            try:
-                auto_connect_golden_wallets()
-                golden_signals = get_golden_copy_signals()
-                if golden_signals:
-                    self.logger.info(f"  Golden bridge: {len(golden_signals)} signals from verified wallets")
-                    copy_signals = golden_signals + copy_signals  # golden first = higher priority
-            except Exception as e:
-                self.logger.debug(f"  Golden bridge skipped: {e}")
-
-            if copy_signals:
-                copy_executed = self.copy_trader.execute_copy_signals(
-                    copy_signals, regime_data=regime_data
-                )
-                self.logger.info(f"  Executed {len(copy_executed)} copy trades")
-                if tg.is_configured():
-                    for t in copy_executed:
-                        tg.notify_trade_opened(t, source="copy")
-
-                # V6: Mirror copy trades to live exchange
-                if self.live_trader and copy_executed:
-                    for t in copy_executed:
-                        try:
-                            live_result = self.live_trader.execute_signal(t)
-                            if live_result:
-                                self.logger.info(f"  LIVE COPY: {live_result.get('status', '?')} "
-                                               f"{t.get('coin', '?')} {t.get('side', '?')}")
-                        except Exception as e:
-                            self.logger.warning(f"  Live copy execution error: {e}")
-
-            # Phase 4c: Feed closed trade outcomes to Alpha Arena + AgentScorer + ShadowTracker
-            if closed:
-                for c in closed:
-                    try:
-                        stype = c.get("strategy_type", "unknown")
-                        pnl = c.get("pnl", 0)
-                        entry = c.get("entry_price", 1)
-                        size = c.get("size", 0)
-                        notional = entry * max(size, 1e-8)
-                        # True return_pct: pnl / notional invested
-                        return_pct = pnl / max(notional, 1)
-                        self.arena.record_trade_for_strategy(stype, pnl, return_pct)
-
-                        # V8: Shadow tracker — record per-source PnL attribution
-                        if self.shadow_tracker:
-                            try:
-                                meta = c.get("metadata") or {}
-                                source = meta.get("source", f"strategy:{stype}")
-                                self.shadow_tracker.record_trade({
-                                    "signal_source": source,
-                                    "coin": c.get("coin", "UNK"),
-                                    "side": c.get("side", "long"),
-                                    "entry_price": entry,
-                                    "exit_price": c.get("exit_price", entry),
-                                    "size": size,
-                                    "pnl": pnl,
-                                    "pnl_pct": return_pct * 100,
-                                    "entry_ts": c.get("entry_ts", ""),
-                                    "exit_ts": c.get("exit_ts", ""),
-                                    "regime_at_entry": c.get("regime", ""),
-                                    "confidence": float(meta.get("confidence", 0.5)),
-                                })
-                            except Exception as st_e:
-                                self.logger.debug(f"  ShadowTracker record error: {st_e}")
-
-                        # Feed outcome back to AgentScorer so weights update from real PnL
-                        try:
-                            meta = c.get("metadata") or {}
-                            signal_id = meta.get("signal_id", "")
-                            source_key = f"strategy:{stype}"
-                            if signal_id:
-                                self.agent_scorer.record_outcome(
-                                    source_key, signal_id, pnl, return_pct
-                                )
-                        except Exception:
-                            pass
-                    except Exception:
-                        pass
-
-            # Phase 5: Alpha Arena Cycle
-            self.logger.info("Phase 5: Alpha Arena")
-            try:
-                # Fetch historical candles for backtesting new agents
-                arena_candles = None
-                try:
-                    import requests
-                    payload = {
-                        "type": "candleSnapshot",
-                        "req": {
-                            "coin": "BTC",
-                            "interval": "1h",
-                            "startTime": int((datetime.utcnow().timestamp() - 720 * 3600) * 1000),
-                            "endTime": int(datetime.utcnow().timestamp() * 1000),
-                        }
-                    }
-                    resp = requests.post("https://api.hyperliquid.xyz/info",
-                                         json=payload, timeout=15)
-                    if resp.status_code == 200:
-                        raw = resp.json()
-                        if isinstance(raw, list) and len(raw) >= 50:
-                            arena_candles = [
-                                {"open": float(c.get("o", 0)), "high": float(c.get("h", 0)),
-                                 "low": float(c.get("l", 0)), "close": float(c.get("c", 0)),
-                                 "volume": float(c.get("v", 0))}
-                                for c in raw
-                            ]
-                except Exception:
-                    pass
-
-                self.arena.run_cycle(historical_candles=arena_candles)
-                stats = self.arena.get_stats()
-                self.logger.info(f"  Arena: {stats['active_agents']} active, "
-                               f"{stats['champions']} champions, "
-                               f"PnL=${stats['total_arena_pnl']:.2f}")
-
-                # V7: Champion signals → paper trading pipeline
-                # Use the last 100 candles (recent) so agents signal on current market
-                if arena_candles and len(arena_candles) >= 30:
-                    try:
-                        champion_signals = self.arena.get_champion_signals(
-                            current_candles=arena_candles[-100:],
-                            min_fitness=0.15,
-                            min_trades=10,
-                        )
-                        if champion_signals:
-                            self.logger.info(f"  Arena champions: {len(champion_signals)} signals")
-                            account = db.get_paper_account()
-                            open_trades = db.get_open_paper_trades()
-                            for sig in champion_signals:
-                                try:
-                                    price = sig.get("price", 0)
-                                    if price <= 0:
-                                        continue
-                                    side = sig["side"]
-                                    conf = sig["confidence"]
-                                    if side == "long":
-                                        sl = price * 0.95
-                                        tp = price * 1.10
-                                    else:
-                                        sl = price * 1.05
-                                        tp = price * 0.90
-                                    if account:
-                                        size_usd = account["balance"] * 0.05 * conf
-                                        size = size_usd / price
-                                        trade_id = db.open_paper_trade(
-                                            strategy_id=None,
-                                            coin=sig["coin"],
-                                            side=side,
-                                            entry_price=price,
-                                            size=size,
-                                            leverage=2,
-                                            stop_loss=round(sl, 2),
-                                            take_profit=round(tp, 2),
-                                            metadata={
-                                                "source": "arena_champion",
-                                                "agent_id": sig["agent_id"],
-                                                "agent_name": sig["agent_name"],
-                                                "strategy_type": sig["strategy_type"],
-                                                "agent_fitness": sig["agent_fitness"],
-                                                "agent_elo": sig["agent_elo"],
-                                                "confidence": conf,
-                                            },
-                                        )
-                                        self.logger.info(
-                                            f"  Champion trade: {side.upper()} {sig['coin']} "
-                                            f"@ ${price:,.2f} | agent={sig['agent_name']} "
-                                            f"(fitness={sig['agent_fitness']:.3f}, "
-                                            f"elo={sig['agent_elo']:.0f})"
-                                        )
-                                except Exception as ce:
-                                    self.logger.debug(f"  Champion trade exec error: {ce}")
-                    except Exception as e:
-                        self.logger.debug(f"  Champion signals error: {e}")
-
-            except Exception as e:
-                self.logger.warning(f"  Arena error: {e}")
-
-            # Phase 6: Report
-            self.logger.info("Phase 6: Status Update")
-            status = self.reporter.print_live_status()
-            print(status)
-
-            # Telegram: send cycle summary
-            if tg.is_configured():
-                summary = self.paper_trader.get_account_summary()
-                summary["market_bias"] = market_overview.get("overall_bias", "unknown")
-                tg.notify_cycle_summary(summary)
-
-            # V2.5 status: Kelly, Memory, Calibration, LLM Filter, LCRS
-            self.logger.info("V2.5 Module Status:")
-            try:
-                lcrs_stats = self.liquidation_strategy.get_stats()
-                self.logger.info(f"  LCRS: {lcrs_stats['setups_detected']} setups, "
-                               f"{lcrs_stats['signals_generated']} signals")
-            except Exception:
-                pass
-            try:
-                kelly_stats = self.kelly_sizer.get_all_sizing_stats()
-                edge_count = sum(1 for v in kelly_stats.values() if v.get("has_edge"))
-                self.logger.info(f"  Kelly: {len(kelly_stats)} strategies tracked, "
-                               f"{edge_count} with proven edge")
-            except Exception:
-                pass
-            try:
-                mem_stats = self.trade_memory.get_stats()
-                self.logger.info(f"  Memory: {mem_stats['total_trades']} trades stored, "
-                               f"{mem_stats['unique_coins']} coins")
-            except Exception:
-                pass
-            try:
-                cal_stats = self.calibration.get_all_stats()
-                global_ece = self.calibration.get_ece("global")
-                ece_str = f"{global_ece:.3f}" if global_ece is not None else "N/A"
-                self.logger.info(f"  Calibration: ECE={ece_str} ({self.calibration._quality_label(global_ece)}), "
-                               f"{len(cal_stats)} sources tracked")
-            except Exception:
-                pass
-            try:
-                llm_stats = self.llm_filter.get_stats()
-                self.logger.info(f"  LLM Filter: {llm_stats['total_filtered']} filtered, "
-                               f"pass rate={llm_stats['pass_rate']:.0%}")
-            except Exception:
-                pass
-            try:
-                sp_stats = self.signal_processor.get_stats()
-                self.logger.info(f"  SignalProcessor: {sp_stats['total_in']} in → {sp_stats['total_out']} out "
-                               f"(reduction={sp_stats['reduction_rate']:.0%}, "
-                               f"culled={sp_stats['culled']}, deduped={sp_stats['deduped']}, "
-                               f"conflicts={sp_stats['conflicts_resolved']})")
-            except Exception:
-                pass
-            try:
-                inc_stats = self.arena_incubator.get_stats()
-                self.logger.info(f"  Incubator: {inc_stats['currently_incubating']} incubating, "
-                               f"{inc_stats['total_promoted']} promoted, "
-                               f"{inc_stats['total_rejected']} rejected")
-            except Exception:
-                pass
-            try:
-                de_stats = self.decision_engine.get_stats()
-                self.logger.info(f"  DecisionEngine: {de_stats['total_decisions']} decisions, "
-                               f"{de_stats['total_executions']} executions, "
-                               f"no-trade rate={de_stats['no_trade_rate']:.0%}")
-            except Exception:
-                pass
-            try:
-                if self.multi_scanner:
-                    ms_stats = self.multi_scanner.get_stats()
-                    cv_stats = ms_stats.get("cross_venue", {})
-                    last = ms_stats.get("last_scan", {})
-                    self.logger.info(f"  MultiExchange: {ms_stats['venue_count']} venues "
-                                   f"({', '.join(ms_stats['venues'])}), "
-                                   f"{ms_stats['scan_count']} scans, "
-                                   f"{ms_stats['cached_traders']} cached traders")
-                    if cv_stats:
-                        self.logger.info(f"  CrossVenue: {cv_stats.get('confirmations_checked', 0)} checked, "
-                                       f"{cv_stats.get('confirmations_found', 0)} confirmed, "
-                                       f"avg score={cv_stats.get('avg_confirmation_score', 0):.3f}, "
-                                       f"arbs={cv_stats.get('funding_arbs_found', 0)}")
-            except Exception:
-                pass
-
-            # V8: Shadow tracker and hedger stats
-            try:
-                if self.shadow_tracker:
-                    shadow_summary = self.shadow_tracker.get_summary(days=30)
-                    self.logger.info(f"  ShadowTracker: {shadow_summary['total_trades']} trades, "
-                                   f"PnL=${shadow_summary['total_pnl']:.2f}, "
-                                   f"win_rate={shadow_summary['avg_win_rate']:.0%}, "
-                                   f"best_source={shadow_summary.get('best_source', 'N/A')}")
-            except Exception:
-                pass
-            try:
-                if self.cross_venue_hedger:
-                    hedge_stats = self.cross_venue_hedger.get_stats()
-                    self.logger.info(f"  Hedger: {hedge_stats['total_hedges_placed']} placed, "
-                                   f"{hedge_stats['total_hedges_closed']} closed, "
-                                   f"{hedge_stats['active_hedges_count']} active "
-                                   f"({'DRY' if hedge_stats['dry_run'] else 'LIVE'})")
-            except Exception:
-                pass
-
-            try:
-                gs = golden_stats()
-                if gs["total_evaluated"] > 0:
-                    self.logger.info(f"  Golden Wallets: {gs['golden_wallets']} golden / "
-                                   f"{gs['total_evaluated']} evaluated, "
-                                   f"{gs['live_connected']} connected to live")
-            except Exception:
-                pass
-            try:
-                api_s = get_api_stats()
-                self.logger.info(
-                    f"  API Manager: {api_s['rest_requests']} REST, "
-                    f"{api_s['cache_served']} cached ({api_s['cache_hit_pct']}% hit), "
-                    f"{api_s['ws_served']} from WS | "
-                    f"bucket: {api_s['bucket']['tokens_available']:.0f} tokens, "
-                    f"429s={api_s['bucket']['consecutive_429s']}"
-                )
-            except Exception:
-                pass
-
-            # Generate improvement report
-            improvement = self.scorer.generate_improvement_report()
-            health = improvement.get("health", "unknown")
-            self.logger.info(f"  Bot health: {health}")
-            self.logger.info(f"  Improving strategies: {improvement.get('improving', 0)}")
-            self.logger.info(f"  Declining strategies: {improvement.get('declining', 0)}")
-
-            # Backup DB state (survives Railway redeploys)
-            backup_to_json()
-
-            # V6: Enhanced Telegram alerts — daily P&L + top mover detection
-            # With 5-min trading cycles: 288 cycles/day, 2016 cycles/week
-            cycles_per_day = max(int(86400 / config.TRADING_CYCLE_INTERVAL), 1)
-            try:
-                if tg.is_configured() and self._cycle_count % cycles_per_day == 0:
-                    tg_alerts.send_daily_pnl_summary()
-                    self.logger.info("  Sent daily P&L Telegram summary")
-                if tg.is_configured() and self._cycle_count % (cycles_per_day * 7) == 0:
-                    tg_alerts.send_weekly_digest()
-                    self.logger.info("  Sent weekly Telegram digest")
-            except Exception as e:
-                self.logger.debug(f"  Enhanced alerts error: {e}")
-
-            # V6: Export HTML report once per day
-            try:
-                if self._cycle_count % cycles_per_day == 0:
-                    report_path = report_exporter.export_html_report()
-                    self.logger.info(f"  HTML report exported: {report_path}")
-            except Exception as e:
-                self.logger.debug(f"  Report export error: {e}")
-
-            self.logger.info(f"Trading cycle #{self._cycle_count} complete.")
-
-        except Exception as e:
-            self.logger.error(f"Error in cycle #{self._cycle_count}: {e}", exc_info=True)
+        run_trading_cycle(self.container, self._cycle_count)
+        run_reporting(self.container, self._cycle_count, health_registry)
+
+    def _fast_cycle(self):
+        self._fast_cycle_count += 1
+        run_fast_cycle(self.container, self._fast_cycle_count)
 
     def run_once(self):
-        """Backward-compat: run discovery + trading cycle together (used by CLI --once)."""
+        """Run discovery + trading cycle (CLI --once)."""
         self._run_discovery()
         self._run_trading_cycle()
 
-    def _fast_cycle(self):
-        """
-        Fast cycle: check positions + copy-trade scan.
-        Runs every 60s between trading cycles.
-        """
-        self._fast_cycle_count += 1
-        try:
-            # Check SL/TP on open positions
-            closed = self.paper_trader.check_open_positions()
-            if closed:
-                self.logger.info(f"[fast] Closed {len(closed)} positions (SL/TP)")
+    def generate_report(self):
+        if self.container.reporter:
+            print(self.container.reporter.generate_daily_report())
 
-            # Scan top traders for position changes
-            copy_signals = self.copy_trader.scan_top_traders(top_n=10)
-            if copy_signals:
-                copy_executed = self.copy_trader.execute_copy_signals(copy_signals)
-                if copy_executed:
-                    self.logger.info(f"[fast] Copy-traded {len(copy_executed)} positions")
-
-        except Exception as e:
-            self.logger.error(f"Error in fast cycle: {e}")
+    def print_status(self):
+        if self.container.reporter:
+            print(self.container.reporter.print_live_status())
+        print(health_registry.get_health_report())
 
     def run_loop(self):
         """
-        Run the bot in a continuous loop with 3-tier scheduling:
-
-        Tier 1 — Fast cycle (every 60s):
-            Position SL/TP checks, copy-trade scanning
-
-        Tier 2 — Trading cycle (every 5 min, env-tunable):
-            Regime detection, strategy scoring, paper trading, arena
-            Uses cached DB data — no leaderboard scanning
-
-        Tier 3 — Discovery cycle (every 24h, env-tunable):
-            Full leaderboard scan, bot detection, strategy identification
-            Heavy API usage — only needs to run once per day
+        3-tier continuous loop:
+          Tier 1 — Fast (60s):     position SL/TP, copy-trade scan
+          Tier 2 — Trading (5m):   regime, scoring, paper+live trading
+          Tier 3 — Discovery (24h): leaderboard scan, strategy ID
         """
         self.running = True
 
-        # Handle graceful shutdown — backup DB before exit
+        # ── Graceful shutdown handler ──
         def signal_handler(sig, frame):
-            self.logger.info("Shutdown signal received. Backing up DB before exit...")
+            self.logger.info("Shutdown signal received. Stopping background tasks…")
+            self.task_runner.stop_all(timeout=10)
             try:
                 backup_to_json()
                 self.logger.info("DB backup complete.")
-            except Exception as e:
-                self.logger.error(f"DB backup failed on shutdown: {e}")
+            except Exception as exc:
+                self.logger.error("DB backup failed on shutdown: %s", exc)
             self.running = False
+
         signal.signal(signal.SIGINT, signal_handler)
         signal.signal(signal.SIGTERM, signal_handler)
 
-        self.logger.info("Bot starting continuous operation...")
-        self.logger.info(f"  Fast cycle:      every {config.FAST_CYCLE_INTERVAL}s (position checks + copy trading)")
-        self.logger.info(f"  Trading cycle:   every {config.TRADING_CYCLE_INTERVAL}s (regime + scoring + trading)")
-        self.logger.info(f"  Discovery cycle: every {config.DISCOVERY_CYCLE_INTERVAL}s (leaderboard scan)")
+        # ── Start supervised background tasks ──
+        self.task_runner.start_all()
 
-        # Run discovery on first boot if we have no data yet.
-        # Also restore last discovery timestamp from DB so a redeploy
-        # mid-day doesn't re-trigger the expensive leaderboard scan.
+        self.logger.info("Bot starting continuous operation…")
+        self.logger.info("  Fast cycle:      every %ds", config.FAST_CYCLE_INTERVAL)
+        self.logger.info("  Trading cycle:   every %ds", config.TRADING_CYCLE_INTERVAL)
+        self.logger.info("  Discovery cycle: every %ds", config.DISCOVERY_CYCLE_INTERVAL)
+
+        # Initial discovery if needed
         trader_count = 0
         try:
             trader_count = len(db.get_active_traders())
@@ -1551,463 +220,102 @@ class HyperliquidResearchBot:
             pass
 
         if trader_count == 0:
-            self.logger.info("No traders in DB — running initial discovery...")
+            self.logger.info("No traders in DB — running initial discovery…")
             self._run_discovery()
         else:
-            # Restore last discovery time from DB, or default to "now" so the
-            # 24h countdown starts from this boot (not from epoch 0).
             restored_ts = self._restore_last_discovery_time()
             if restored_ts and (time.time() - restored_ts) < config.DISCOVERY_CYCLE_INTERVAL:
                 self._last_discovery = restored_ts
                 remaining_h = (config.DISCOVERY_CYCLE_INTERVAL - (time.time() - restored_ts)) / 3600
-                self.logger.info(f"DB has {trader_count} traders — restored discovery timer, "
-                               f"next discovery in {remaining_h:.1f}h")
+                self.logger.info("Restored discovery timer, next in %.1fh", remaining_h)
             else:
-                # Either no saved timestamp or it's stale — set to now
                 self._last_discovery = time.time()
-                self.logger.info(f"DB has {trader_count} traders — skipping boot discovery, "
-                               f"next in {config.DISCOVERY_CYCLE_INTERVAL/3600:.0f}h")
+                self.logger.info(
+                    "DB has %d traders — next discovery in %.0fh",
+                    trader_count, config.DISCOVERY_CYCLE_INTERVAL / 3600,
+                )
 
+        # ── Main loop ──
         while self.running:
             now = time.time()
-
             try:
-                # Tier 3: Discovery — once per day
+                # Tier 3: Discovery (daily)
                 if now - self._last_discovery >= config.DISCOVERY_CYCLE_INTERVAL:
                     self._run_discovery()
 
-                # Tier 2: Trading — every 5 min (or env-configured)
+                # Tier 2: Trading (5 min)
                 if now - self._last_research >= config.TRADING_CYCLE_INTERVAL:
                     self._run_trading_cycle()
                     self._last_research = now
                 else:
-                    # Tier 1: Fast — every 60s between trading cycles
+                    # Tier 1: Fast (60s)
                     self._fast_cycle()
 
-                # Generate daily report
+                # Daily report
                 if now - self._last_report >= 86400:
-                    self.logger.info("Generating daily report...")
-                    self.reporter.generate_daily_report()
+                    self.logger.info("Generating daily report…")
+                    if self.container.reporter:
+                        self.container.reporter.generate_daily_report()
                     self._last_report = now
 
-            except Exception as e:
-                self.logger.error(f"Error in main loop: {e}", exc_info=True)
+            except Exception as exc:
+                self.logger.error("Error in main loop: %s", exc, exc_info=True)
 
             # Status heartbeat every 10 fast cycles
             if self._fast_cycle_count % 10 == 0 and self._fast_cycle_count > 0:
-                print(self.reporter.print_live_status())
+                if self.container.reporter:
+                    print(self.container.reporter.print_live_status())
 
-            # Sleep between fast cycles
             if self.running:
                 time.sleep(config.FAST_CYCLE_INTERVAL)
 
+        # ── Shutdown ──
+        self.task_runner.stop_all(timeout=10)
         self.logger.info("Bot stopped.")
-        # Final report
-        self.reporter.generate_daily_report()
-
-    def generate_report(self):
-        """Generate a one-off report."""
-        report = self.reporter.generate_daily_report()
-        print(report)
-
-    def print_status(self):
-        """Print current status."""
-        print(self.reporter.print_live_status())
+        if self.container.reporter:
+            self.container.reporter.generate_daily_report()
 
 
 # ─── CLI ───────────────────────────────────────────────────────
 
-def bootstrap_seed_data(logger, days: int = 14):
-    """
-    Cold-start bootstrap: pull recent fills from top traders to seed the DB
-    so Kelly/Scoring/Calibration have real data from day one.
-    """
-    from src.discovery.golden_wallet import init_golden_tables, evaluate_wallet, save_wallet_report, save_wallet_fills
-
-    logger.info(f"Bootstrap mode: seeding DB with last {days} days of top trader data...")
-    init_db()
-    init_golden_tables()
-
-    discovery = TraderDiscovery()
-
-    # Step 1: Discover traders (abbreviated scan)
-    logger.info("Step 1/3: Discovering top traders...")
-    discovery_result = discovery.run_discovery_cycle()
-    humans = discovery_result.get("human_like", 0)
-    logger.info(f"Discovery found {humans} human-like traders")
-
-    if humans == 0:
-        logger.warning("No human-like traders found. Try running again later.")
-        return
-
-    # Step 2: Evaluate top wallets (golden scan)
-    logger.info("Step 2/3: Running golden wallet evaluation...")
-    from src.discovery.golden_wallet import run_golden_scan
-    summary = run_golden_scan(max_wallets=30)
-    golden = summary.get("golden", 0)
-    logger.info(f"Golden scan: {golden} golden wallets found")
-
-    # Step 3: Initialize paper account if needed
-    logger.info("Step 3/3: Initializing paper trading account...")
-    account = db.get_paper_account()
-    if not account:
-        db.create_paper_account(config.PAPER_TRADING_INITIAL_BALANCE)
-        logger.info(f"Paper account created: ${config.PAPER_TRADING_INITIAL_BALANCE:,.0f}")
-
-    # Backup
-    backup_to_json()
-    logger.info(f"Bootstrap complete: {humans} traders, {golden} golden wallets, DB backed up")
-
-
-def _run_cli_backtest(logger, args):
-    """Run backtest from CLI with optional filters and export."""
-    from src.backtest.backtester import BacktestEngine, BacktestConfig
-    from src.discovery.golden_wallet import _get_db as gw_get_db
-    import csv as _csv
-
-    logger.info("Running CLI backtest...")
-
-    cfg = BacktestConfig()
-
-    # Load fills from golden wallets
-    conn = gw_get_db()
-    try:
-        query = "SELECT * FROM wallet_fills WHERE 1=1"
-        params = []
-
-        if args.bt_coins:
-            coins = [c.strip().upper() for c in args.bt_coins.split(",")]
-            placeholders = ",".join("?" * len(coins))
-            query += f" AND coin IN ({placeholders})"
-            params.extend(coins)
-
-        if args.bt_start:
-            # Convert date to epoch ms
-            from datetime import datetime as _dt
-            start_ms = int(_dt.strptime(args.bt_start, "%Y-%m-%d").timestamp() * 1000)
-            query += " AND time_ms >= ?"
-            params.append(start_ms)
-
-        if args.bt_end:
-            from datetime import datetime as _dt
-            end_ms = int(_dt.strptime(args.bt_end, "%Y-%m-%d").timestamp() * 1000)
-            query += " AND time_ms <= ?"
-            params.append(end_ms)
-
-        query += " ORDER BY time_ms ASC"
-        rows = conn.execute(query, params).fetchall()
-    finally:
-        conn.close()
-
-    if not rows:
-        logger.warning("No fills found matching filters")
-        print("No fills found. Run a golden wallet scan first.")
-        return
-
-    # Convert to BacktestFill objects
-    from src.backtest.backtester import BacktestFill
-    fills = []
-    for r in rows:
-        r = dict(r)
-        fills.append(BacktestFill(
-            wallet_address=r.get("wallet_address", ""),
-            coin=r.get("coin", ""),
-            side=r.get("side", ""),
-            price=float(r.get("price", 0)),
-            original_price=float(r.get("original_price", r.get("price", 0))),
-            size=float(r.get("size", 0)),
-            time_ms=int(r.get("time_ms", 0)),
-            closed_pnl=float(r.get("closed_pnl", 0)),
-            direction=r.get("direction", ""),
-            is_liquidation=bool(r.get("is_liquidation", False)),
-        ))
-
-    logger.info(f"Loaded {len(fills)} fills for backtest "
-               f"(coins={args.bt_coins or 'ALL'}, "
-               f"start={args.bt_start or 'earliest'}, end={args.bt_end or 'latest'})")
-
-    engine = BacktestEngine(cfg)
-    result = engine.run(fills)
-
-    # Print summary
-    print(f"\n{'='*60}")
-    print(f"  BACKTEST RESULTS")
-    print(f"{'='*60}")
-    print(f"  Trades:           {result.total_trades}")
-    print(f"  Win Rate:         {result.win_rate:.1f}%")
-    print(f"  Total PnL:        ${result.total_pnl:+,.2f}")
-    print(f"  Max Drawdown:     {result.max_drawdown_pct:.1f}%")
-    print(f"  Sharpe Ratio:     {result.sharpe_ratio:.3f}")
-    print(f"  Sortino Ratio:    {result.sortino_ratio:.3f}")
-    print(f"  Profit Factor:    {result.profit_factor:.2f}")
-    print(f"  Calmar Ratio:     {result.calmar_ratio:.3f}")
-    print(f"  Expectancy:       {result.expectancy:.4f}")
-    print(f"  Avg Hold (h):     {result.avg_hold_hours:.1f}")
-    print(f"  Max Consec Loss:  {result.max_consecutive_losses}")
-    print(f"  Duration:         {result.duration_seconds:.1f}s")
-    if result.coin_breakdown:
-        print(f"\n  Per-Coin Breakdown:")
-        for coin, data in sorted(result.coin_breakdown.items(), key=lambda x: x[1]["pnl"], reverse=True):
-            print(f"    {coin:>6}: {data['trades']:>3} trades, "
-                  f"PnL=${data['pnl']:+,.2f}, WR={data.get('win_rate', 0):.0f}%")
-    print(f"{'='*60}\n")
-
-    # Export to CSV
-    if args.bt_export and result.trades:
-        with open(args.bt_export, "w", newline="") as f:
-            writer = _csv.writer(f)
-            writer.writerow([
-                "coin", "side", "entry_price", "exit_price", "size", "leverage",
-                "entry_time", "exit_time", "pnl", "pnl_pct", "exit_reason",
-                "source_wallet", "hold_hours"
-            ])
-            for t in result.trades:
-                writer.writerow([
-                    t.coin, t.side, t.entry_price, t.exit_price, t.size, t.leverage,
-                    datetime.utcfromtimestamp(t.entry_time_ms / 1000).isoformat(),
-                    datetime.utcfromtimestamp(t.exit_time_ms / 1000).isoformat(),
-                    round(t.pnl, 2), round(t.pnl_pct, 6), t.exit_reason,
-                    t.source_wallet, round(t.hold_time_hours, 2),
-                ])
-        print(f"Exported {len(result.trades)} trades to {args.bt_export}")
-
-
-def _run_candle_backtest(logger, args):
-    """Run candle-based backtest with data from Hyperliquid API or file import."""
-    from src.backtest.data_fetcher import DataFetcher
-    from src.backtest.candle_backtester import CandleBacktester, CandleBacktestConfig
-
-    fetcher = DataFetcher()
-    cfg = CandleBacktestConfig(strategy=args.cbt_strategy)
-    use_cache = not args.cbt_no_cache
-
-    # ─── Import from file ────────────────────────────────
-    if args.cbt_import:
-        filepath = args.cbt_import
-        if filepath.endswith(".json"):
-            candles = fetcher.import_json(filepath, coin=args.cbt_coin, timeframe=args.cbt_timeframe)
-        else:
-            candles = fetcher.import_csv(filepath, coin=args.cbt_coin, timeframe=args.cbt_timeframe)
-        if not candles:
-            logger.error(f"No candles imported from {filepath}")
-            return
-    # ─── Multi-coin mode ─────────────────────────────────
-    elif args.cbt_multi:
-        coins = [c.strip().upper() for c in args.cbt_multi.split(",")]
-        bt = CandleBacktester(cfg)
-        candle_sets = {}
-        for coin in coins:
-            logger.info(f"Fetching {coin}...")
-            data = fetcher.fetch_candles(
-                coin, args.cbt_timeframe,
-                start=args.cbt_start, end=args.cbt_end,
-                use_cache=use_cache
-            )
-            if data:
-                candle_sets[coin] = data
-
-        results = bt.run_multi_coin(candle_sets, strategy=args.cbt_strategy)
-
-        print(f"\n{'='*70}")
-        print(f"  Multi-Coin Backtest: {args.cbt_strategy} | {args.cbt_timeframe}")
-        print(f"{'='*70}")
-        print(f"{'Coin':<8} {'Trades':>7} {'Win%':>7} {'PnL':>12} {'MaxDD':>8} {'Sharpe':>8} {'PF':>8}")
-        print("-" * 70)
-        for coin, r in sorted(results.items(), key=lambda x: x[1].total_pnl, reverse=True):
-            print(f"{coin:<8} {r.total_trades:>7} {r.win_rate:>6.1f}% "
-                  f"${r.total_pnl:>+10,.2f} {r.max_drawdown_pct:>7.1f}% "
-                  f"{r.sharpe_ratio:>7.3f} {r.profit_factor:>7.2f}")
-        print("-" * 70)
-        total = sum(r.total_pnl for r in results.values())
-        print(f"{'TOTAL':<8} {'':>7} {'':>7} ${total:>+10,.2f}")
-        return
-
-    # ─── Single coin mode ────────────────────────────────
-    else:
-        candles = fetcher.fetch_candles(
-            args.cbt_coin, args.cbt_timeframe,
-            start=args.cbt_start, end=args.cbt_end,
-            use_cache=use_cache
-        )
-        if not candles:
-            logger.error(f"No candle data found for {args.cbt_coin}")
-            return
-
-    # ─── Parameter sweep ─────────────────────────────────
-    if args.cbt_sweep:
-        parts = args.cbt_sweep.split("=")
-        param_name = parts[0]
-        vals = parts[1].split(",")
-        if len(vals) == 3:
-            start_val, end_val, step_val = float(vals[0]), float(vals[1]), float(vals[2])
-            import numpy as _np
-            sweep_values = _np.arange(start_val, end_val + step_val, step_val).tolist()
-            # Convert to int if the param is naturally int
-            if param_name in ("fast_period", "slow_period", "rsi_period", "bb_period", "atr_period"):
-                sweep_values = [int(v) for v in sweep_values]
-        else:
-            sweep_values = [float(v) if "." in v else int(v) for v in vals]
-
-        bt = CandleBacktester(cfg)
-        results = bt.parameter_sweep(candles, param_name, sweep_values, strategy=args.cbt_strategy)
-
-        print(f"\n{'='*70}")
-        print(f"  Parameter Sweep: {param_name} | {args.cbt_strategy} | {args.cbt_coin} {args.cbt_timeframe}")
-        print(f"{'='*70}")
-        print(f"{'Value':>10} {'Trades':>7} {'Win%':>7} {'PnL':>12} {'MaxDD':>8} {'Sharpe':>8}")
-        print("-" * 70)
-        for r in results:
-            val = r.config.get(param_name, "?")
-            print(f"{val:>10} {r.total_trades:>7} {r.win_rate:>6.1f}% "
-                  f"${r.total_pnl:>+10,.2f} {r.max_drawdown_pct:>7.1f}% "
-                  f"{r.sharpe_ratio:>7.3f}")
-        return
-
-    # ─── Standard single run ─────────────────────────────
-    bt = CandleBacktester(cfg)
-    result = bt.run(candles, strategy=args.cbt_strategy)
-
-    print(f"\n{'='*60}")
-    print(f"  Candle Backtest: {result.coin} {result.timeframe} | {args.cbt_strategy}")
-    print(f"{'='*60}")
-    for k, v in result.summary().items():
-        print(f"  {k:<20} {v}")
-
-    if args.bt_export:
-        import csv as _csv
-        with open(args.bt_export, "w", newline="") as f:
-            writer = _csv.DictWriter(f, fieldnames=result.trades[0].keys() if result.trades else [])
-            writer.writeheader()
-            writer.writerows(result.trades)
-        print(f"\n  Exported {len(result.trades)} trades to {args.bt_export}")
-
-
-def _run_cache_list(logger):
-    """List all cached candle data."""
-    from src.backtest.data_fetcher import DataFetcher
-    fetcher = DataFetcher()
-    cached = fetcher.list_cached()
-    stats = fetcher.get_cache_stats()
-
-    if not cached:
-        print("No cached candle data. Run --candle-backtest to fetch some.")
-        return
-
-    print(f"\nCandle Cache ({stats['db_size_mb']:.1f} MB, {stats['total_candles']:,} candles)")
-    print(f"{'Coin':<8} {'TF':<6} {'Start':<12} {'End':<12} {'Candles':>10} {'Days':>8}")
-    print("-" * 60)
-    for c in cached:
-        print(f"{c['coin']:<8} {c['timeframe']:<6} {c['start']:<12} {c['end']:<12} "
-              f"{c['candles']:>10,} {c['days']:>7.0f}")
-
-
-def _run_cache_clear(logger):
-    """Clear candle cache."""
-    from src.backtest.data_fetcher import DataFetcher
-    fetcher = DataFetcher()
-    stats_before = fetcher.get_cache_stats()
-    fetcher.clear_cache()
-    print(f"Cleared {stats_before['total_candles']:,} candles ({stats_before['db_size_mb']:.1f} MB)")
-
-
 def main():
-    parser = argparse.ArgumentParser(
-        description="Hyperliquid Auto-Research Trading Bot"
-    )
-    parser.add_argument("--once", action="store_true",
-                        help="Run a single research cycle then exit")
-    parser.add_argument("--report", action="store_true",
-                        help="Generate a report and exit")
-    parser.add_argument("--status", action="store_true",
-                        help="Print current status and exit")
-    parser.add_argument("--bootstrap", action="store_true",
-                        help="Cold start: seed DB with top trader data (run once on first deploy)")
-    parser.add_argument("--bootstrap-days", type=int, default=14,
-                        help="Days of history to bootstrap (default: 14)")
-    parser.add_argument("--reset-paper", action="store_true",
-                        help="Clear all paper trades and reset balance to $10k")
-    parser.add_argument("--reset-balance", type=float, default=None,
-                        help="Custom starting balance for --reset-paper (default: $10,000)")
-    parser.add_argument("--backtest", action="store_true",
-                        help="Run a backtest on golden wallet data and exit")
-    parser.add_argument("--bt-coins", type=str, default=None,
-                        help="Comma-separated coins to backtest (e.g. BTC,ETH,SOL)")
-    parser.add_argument("--bt-start", type=str, default=None,
-                        help="Backtest start date (YYYY-MM-DD)")
-    parser.add_argument("--bt-end", type=str, default=None,
-                        help="Backtest end date (YYYY-MM-DD)")
-    parser.add_argument("--bt-strategy", type=str, default=None,
-                        help="Filter backtest to specific strategy type")
-    parser.add_argument("--bt-export", type=str, default=None,
-                        help="Export backtest results to CSV file path")
-    # ─── Candle backtester args ───
-    parser.add_argument("--candle-backtest", action="store_true",
-                        help="Run candle-based backtest (fetch from HL API or import file)")
-    parser.add_argument("--cbt-coin", type=str, default="BTC",
-                        help="Coin for candle backtest (default: BTC)")
-    parser.add_argument("--cbt-timeframe", type=str, default="1h",
-                        help="Candle timeframe: 1m,5m,15m,1h,4h,1d (default: 1h)")
-    parser.add_argument("--cbt-start", type=str, default=None,
-                        help="Start date YYYY-MM-DD (default: 90 days ago)")
-    parser.add_argument("--cbt-end", type=str, default=None,
-                        help="End date YYYY-MM-DD (default: now)")
-    parser.add_argument("--cbt-strategy", type=str, default="momentum",
-                        help="Strategy: momentum, mean_reversion, breakout, rsi, macd, macd_histogram, "
-                             "vwap_reversion, stochastic, adx_trend, supertrend, ema_rsi_combo, "
-                             "volume_breakout, ichimoku (default: momentum)")
-    parser.add_argument("--cbt-import", type=str, default=None,
-                        help="Import candles from CSV or JSON file instead of API")
-    parser.add_argument("--cbt-sweep", type=str, default=None,
-                        help="Parameter sweep: param=start,end,step (e.g. fast_period=5,50,5)")
-    parser.add_argument("--cbt-multi", type=str, default=None,
-                        help="Multi-coin backtest: comma-separated (e.g. BTC,ETH,SOL)")
-    parser.add_argument("--cbt-no-cache", action="store_true",
-                        help="Skip local cache, force re-download from API")
-    parser.add_argument("--cache-list", action="store_true",
-                        help="List all cached candle data and exit")
-    parser.add_argument("--cache-clear", action="store_true",
-                        help="Clear candle data cache and exit")
+    parser = build_parser()
     args = parser.parse_args()
 
-    logger = setup_logging()
-
-    # Log persistence paths so we can verify in Railway logs
-    import config as _cfg
-    logger.info(f"[PERSISTENCE] persistent_volume={_cfg._HAS_PERSISTENT_VOLUME} DB_PATH={_cfg.DB_PATH} "
-                f"HL_BOT_DB_env={os.environ.get('HL_BOT_DB', 'NOT SET')} "
-                f"uid={os.getuid()} /data_exists={os.path.isdir('/data')}")
-
+    # Commands that don't need the full bot
     if args.bootstrap:
+        from src.core.boot import setup_logging
+        logger = setup_logging()
         bootstrap_seed_data(logger, days=args.bootstrap_days)
         return
 
     if args.reset_paper:
+        init_database(setup_logging())
         balance = args.reset_balance or config.PAPER_TRADING_INITIAL_BALANCE
         result = db.reset_paper_trades(balance)
-        logger.info(f"Paper trades reset: {result['open_deleted']} open + "
-                    f"{result['closed_deleted']} closed trades cleared, "
-                    f"balance = ${result['new_balance']:,.2f}")
-        print(f"✓ Paper trades cleared ({result['open_deleted']} open + "
+        print(f"Paper trades cleared ({result['open_deleted']} open + "
               f"{result['closed_deleted']} closed). Balance reset to ${balance:,.2f}")
         return
 
     if args.cache_list:
-        _run_cache_list(logger)
+        run_cache_list(setup_logging())
         return
 
     if args.cache_clear:
-        _run_cache_clear(logger)
+        run_cache_clear(setup_logging())
         return
 
     if args.candle_backtest:
-        _run_candle_backtest(logger, args)
+        run_candle_backtest(setup_logging(), args)
         return
 
     if args.backtest:
-        _run_cli_backtest(logger, args)
+        run_cli_backtest(setup_logging(), args)
         return
 
-    bot = HyperliquidResearchBot()
+    # Commands that need the bot
+    profile = FUNDABLE_CORE if args.core_only else None
+    bot = HyperliquidResearchBot(profile=profile)
 
     if args.status:
         bot.print_status()

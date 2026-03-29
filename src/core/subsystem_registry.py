@@ -1,0 +1,373 @@
+"""
+Subsystem Registry
+==================
+Instantiates every subsystem and wires them together.  Each subsystem is
+registered with the health registry on creation so the rest of the bot can
+query ``is_trading_safe("firewall")`` etc.
+
+Extracted from the ~300-line ``HyperliquidResearchBot.__init__`` so that:
+* Each subsystem's init is isolated and can fail independently
+* Health status is set atomically (HEALTHY / DEGRADED / FAILED)
+* The "fundable core" profile can skip optional subsystems entirely
+
+Usage::
+
+    from src.core.subsystem_registry import SubsystemContainer, build_subsystems
+    container = build_subsystems(health_registry, feature_profile)
+    # container.firewall, container.paper_trader, etc.
+"""
+import logging
+import time
+from dataclasses import dataclass, field
+from typing import Optional, Any
+
+from src.core.health_registry import SubsystemHealthRegistry, SubsystemState
+
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Feature profiles
+# ---------------------------------------------------------------------------
+FUNDABLE_CORE = {
+    "discovery", "strategy_identifier", "strategy_scorer", "decision_firewall",
+    "paper_trader", "golden_wallet", "backtester", "database", "reporter",
+    "regime_detector", "feature_engine", "agent_scorer",
+}
+
+FULL_PROFILE = FUNDABLE_CORE | {
+    "copy_trader", "live_trader", "options_flow", "polymarket",
+    "predictive_forecaster", "xgboost_forecaster", "multi_scanner",
+    "liquidation_strategy", "kelly_sizer", "trade_memory", "calibration",
+    "llm_filter", "signal_processor", "arena_incubator", "decision_engine",
+    "alpha_arena", "position_monitor", "dashboard", "telegram",
+    "cross_venue_hedger", "shadow_tracker", "adaptive_bot_detector",
+    "regime_strategy_filter", "exchange_aggregator",
+}
+
+
+# ---------------------------------------------------------------------------
+# Container
+# ---------------------------------------------------------------------------
+
+@dataclass
+class SubsystemContainer:
+    """Bag of all subsystem instances — replaces ``self.xxx`` on the old bot."""
+    # Core (always present)
+    discovery: Any = None
+    identifier: Any = None
+    scorer: Any = None
+    firewall: Any = None
+    paper_trader: Any = None
+    reporter: Any = None
+    regime_detector: Any = None
+    feature_engine: Any = None
+    agent_scorer: Any = None
+    exchange_agg: Any = None
+
+    # Trading
+    copy_trader: Any = None
+    live_trader: Any = None
+    position_monitor: Any = None
+
+    # Signals & analysis
+    options_scanner: Any = None
+    polymarket: Any = None
+    predictive_forecaster: Any = None
+    multi_scanner: Any = None
+    liquidation_strategy: Any = None
+    kelly_sizer: Any = None
+    trade_memory: Any = None
+    calibration: Any = None
+    llm_filter: Any = None
+    signal_processor: Any = None
+    arena_incubator: Any = None
+    decision_engine: Any = None
+    arena: Any = None
+    adaptive_bot_detector: Any = None
+    regime_strategy_filter: Any = None
+
+    # Infra
+    cross_venue_hedger: Any = None
+    shadow_tracker: Any = None
+    dashboard: Any = None
+
+
+# ---------------------------------------------------------------------------
+# Builder
+# ---------------------------------------------------------------------------
+
+def _safe_init(name: str, factory, health: SubsystemHealthRegistry,
+               affects_trading: bool = True):
+    """
+    Try to instantiate a subsystem; register it with the health registry.
+    Returns the instance or None on failure.
+    """
+    health.register(name, affects_trading=affects_trading)
+    try:
+        instance = factory()
+        health.set_status(name, SubsystemState.HEALTHY)
+        health.heartbeat(name)
+        logger.info("  ✓ %s", name)
+        return instance
+    except Exception as exc:
+        health.set_status(name, SubsystemState.FAILED, reason=str(exc)[:120])
+        logger.warning("  ✗ %s — %s", name, exc)
+        return None
+
+
+def build_subsystems(
+    health: SubsystemHealthRegistry,
+    profile: Optional[set] = None,
+) -> SubsystemContainer:
+    """
+    Build and return a SubsystemContainer based on the given feature *profile*.
+    Subsystems not in the profile are skipped (left as None).
+    """
+    import config
+    from src.data.database import init_db, get_active_traders
+
+    if profile is None:
+        profile = FULL_PROFILE
+
+    c = SubsystemContainer()
+    logger.info("Building subsystems (profile has %d features)…", len(profile))
+
+    # ─── Core ─────────────────────────────────────────────────
+
+    from src.discovery.trader_discovery import TraderDiscovery
+    from src.analysis.strategy_identifier import StrategyIdentifier
+    from src.analysis.strategy_scorer import StrategyScorer
+    from src.data.exchange_aggregator import ExchangeAggregator
+    from src.analysis.regime_detector import RegimeDetector
+    from src.signals.decision_firewall import DecisionFirewall
+    from src.signals.agent_scoring import AgentScorer
+    from src.analysis.features import FeatureEngine
+    from src.ui.reporter import Reporter
+
+    c.exchange_agg = _safe_init("exchange_aggregator", ExchangeAggregator, health, affects_trading=False)
+    c.discovery = _safe_init("discovery", TraderDiscovery, health, affects_trading=False)
+    c.identifier = _safe_init("strategy_identifier", StrategyIdentifier, health, affects_trading=False)
+    c.scorer = _safe_init("strategy_scorer", StrategyScorer, health)
+    c.regime_detector = _safe_init(
+        "regime_detector",
+        lambda: RegimeDetector(exchange_agg=c.exchange_agg),
+        health,
+    )
+    c.agent_scorer = _safe_init("agent_scorer", AgentScorer, health)
+    c.feature_engine = _safe_init("feature_engine", FeatureEngine, health, affects_trading=False)
+    c.reporter = _safe_init("reporter", Reporter, health, affects_trading=False)
+
+    # ─── Predictive Forecaster (5-input model) ────────────────
+    if "predictive_forecaster" in profile:
+        from src.signals.predictive_regime_forecaster import PredictiveRegimeForecaster
+        c.predictive_forecaster = _safe_init(
+            "predictive_forecaster", PredictiveRegimeForecaster, health,
+        )
+
+    # Firewall — needs forecaster injected
+    c.firewall = _safe_init(
+        "decision_firewall",
+        lambda: DecisionFirewall({"forecaster": c.predictive_forecaster}),
+        health,
+    )
+
+    # ─── V2.5 modules ────────────────────────────────────────
+    if "liquidation_strategy" in profile:
+        from src.analysis.liquidation_strategy import LiquidationStrategy
+        c.liquidation_strategy = _safe_init("liquidation_strategy", LiquidationStrategy, health)
+
+    if "kelly_sizer" in profile:
+        from src.signals.kelly_sizing import KellySizer
+        c.kelly_sizer = _safe_init("kelly_sizer", KellySizer, health)
+        if c.kelly_sizer and c.agent_scorer:
+            try:
+                c.kelly_sizer.load_from_agent_scorer(c.agent_scorer)
+            except Exception:
+                pass
+
+    if "trade_memory" in profile:
+        from src.trading.trade_memory import TradeMemory
+        c.trade_memory = _safe_init("trade_memory", TradeMemory, health, affects_trading=False)
+
+    if "calibration" in profile:
+        from src.signals.calibration import CalibrationTracker
+        c.calibration = _safe_init("calibration", CalibrationTracker, health, affects_trading=False)
+
+    if "llm_filter" in profile:
+        from src.signals.llm_filter import LLMFilter
+        c.llm_filter = _safe_init("llm_filter", LLMFilter, health)
+
+    if "signal_processor" in profile:
+        from src.signals.signal_processor import SignalProcessor, ArenaIncubator
+        c.signal_processor = _safe_init("signal_processor", SignalProcessor, health)
+        c.arena_incubator = _safe_init("arena_incubator", ArenaIncubator, health, affects_trading=False)
+
+    if "decision_engine" in profile:
+        from src.signals.decision_engine import DecisionEngine
+        c.decision_engine = _safe_init("decision_engine", DecisionEngine, health)
+
+    if "alpha_arena" in profile:
+        from src.signals.alpha_arena import AlphaArena
+        c.arena = _safe_init("alpha_arena", AlphaArena, health, affects_trading=False)
+
+    # ─── Options Flow ─────────────────────────────────────────
+    if "options_flow" in profile:
+        from src.data.options_flow import OptionsFlowScanner
+        c.options_scanner = _safe_init("options_flow", OptionsFlowScanner, health)
+
+    # ─── Polymarket ───────────────────────────────────────────
+    if "polymarket" in profile:
+        from src.data.polymarket_scanner import PolymarketScanner
+        c.polymarket = _safe_init("polymarket", PolymarketScanner, health)
+
+    # ─── Multi-exchange ───────────────────────────────────────
+    if "multi_scanner" in profile:
+        from src.exchanges.scanner import MultiExchangeScanner
+        c.multi_scanner = _safe_init(
+            "multi_scanner",
+            lambda: MultiExchangeScanner(config={"lighter_enabled": config.LIGHTER_ENABLED}),
+            health,
+        )
+
+    # ─── Copy trader ──────────────────────────────────────────
+    if "copy_trader" in profile:
+        from src.trading.copy_trader import CopyTrader
+        c.copy_trader = _safe_init(
+            "copy_trader",
+            lambda: CopyTrader(
+                firewall=c.firewall,
+                agent_scorer=c.agent_scorer,
+                kelly_sizer=c.kelly_sizer,
+                trade_memory=c.trade_memory,
+                calibration=c.calibration,
+                regime_forecaster=c.predictive_forecaster,
+            ),
+            health,
+        )
+
+    # ─── Paper trader ─────────────────────────────────────────
+    from src.trading.paper_trader import PaperTrader
+    c.paper_trader = _safe_init(
+        "paper_trader",
+        lambda: PaperTrader(
+            firewall=c.firewall,
+            agent_scorer=c.agent_scorer,
+            feature_engine=c.feature_engine,
+            kelly_sizer=c.kelly_sizer,
+            trade_memory=c.trade_memory,
+            calibration=c.calibration,
+            llm_filter=c.llm_filter,
+        ),
+        health,
+    )
+
+    # ─── Live trader ──────────────────────────────────────────
+    if "live_trader" in profile:
+        from src.trading.live_trader import LiveTrader
+        c.live_trader = _safe_init(
+            "live_trader",
+            lambda: LiveTrader(
+                firewall=c.firewall,
+                regime_forecaster=c.predictive_forecaster,
+            ),
+            health,
+        )
+
+    # ─── Cross-venue hedger ───────────────────────────────────
+    if "cross_venue_hedger" in profile:
+        from src.trading.cross_venue_hedger import CrossVenueHedger
+        c.cross_venue_hedger = _safe_init(
+            "cross_venue_hedger", CrossVenueHedger, health,
+        )
+
+    # ─── Shadow tracker ───────────────────────────────────────
+    if "shadow_tracker" in profile:
+        from src.analysis.shadow_tracker import ShadowTracker
+        c.shadow_tracker = _safe_init(
+            "shadow_tracker", ShadowTracker, health, affects_trading=False,
+        )
+
+    # ─── Bot detector + regime filter ─────────────────────────
+    if "adaptive_bot_detector" in profile:
+        from src.discovery.adaptive_bot_detector import AdaptiveBotDetector
+        c.adaptive_bot_detector = _safe_init(
+            "adaptive_bot_detector", AdaptiveBotDetector, health, affects_trading=False,
+        )
+
+    if "regime_strategy_filter" in profile:
+        from src.analysis.regime_strategy_filter import RegimeStrategyFilter
+        c.regime_strategy_filter = _safe_init(
+            "regime_strategy_filter", RegimeStrategyFilter, health,
+        )
+
+    # ─── Position monitor (WebSocket) ─────────────────────────
+    if "position_monitor" in profile:
+        from src.notifications.ws_position_monitor import PositionMonitor
+        try:
+            import src.data.database as db
+            top_traders = db.get_active_traders()[:20]
+            if top_traders:
+                c.position_monitor = _safe_init(
+                    "position_monitor",
+                    lambda: _start_position_monitor(top_traders),
+                    health,
+                )
+        except Exception as exc:
+            logger.warning("  ✗ position_monitor — %s", exc)
+
+    # ─── WebSocket feed ───────────────────────────────────────
+    try:
+        from src.data.hyperliquid_client import start_websocket
+        start_websocket(coins=["BTC", "ETH", "SOL", "DOGE", "ARB", "OP"])
+        logger.info("  ✓ websocket_feed")
+    except Exception as exc:
+        logger.warning("  ✗ websocket_feed — %s (REST fallback active)", exc)
+
+    # ─── Dashboard ────────────────────────────────────────────
+    if "dashboard" in profile:
+        try:
+            from src.ui.dashboard import start_dashboard, set_v2_components
+            set_v2_components(
+                firewall=c.firewall,
+                regime_detector=c.regime_detector,
+                arena=c.arena,
+                kelly_sizer=c.kelly_sizer,
+                trade_memory=c.trade_memory,
+                calibration=c.calibration,
+                llm_filter=c.llm_filter,
+                liquidation_strategy=c.liquidation_strategy,
+                signal_processor=c.signal_processor,
+                arena_incubator=c.arena_incubator,
+                decision_engine=c.decision_engine,
+                multi_scanner=c.multi_scanner,
+            )
+            c.dashboard = start_dashboard(options_scanner=c.options_scanner)
+            logger.info("  ✓ dashboard")
+        except Exception as exc:
+            logger.warning("  ✗ dashboard — %s", exc)
+
+    # ─── Telegram ─────────────────────────────────────────────
+    try:
+        from src.notifications import telegram_bot as tg
+        if tg.is_configured():
+            tg.send_startup_message()
+            logger.info("  ✓ telegram")
+        else:
+            logger.info("  — telegram (not configured)")
+    except Exception as exc:
+        logger.debug("  ✗ telegram — %s", exc)
+
+    logger.info("Subsystem build complete.")
+    return c
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _start_position_monitor(top_traders):
+    from src.notifications.ws_position_monitor import PositionMonitor
+    pm = PositionMonitor(max_signal_queue=500)
+    pm.start([t["address"] for t in top_traders])
+    return pm

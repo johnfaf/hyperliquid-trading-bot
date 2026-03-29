@@ -1,0 +1,354 @@
+"""
+Subsystem health registry for tracking and monitoring trading bot components.
+
+Provides centralized health monitoring with states (HEALTHY, DEGRADED, DISABLED, FAILED)
+and trading safety checks. Thread-safe with automatic stale heartbeat detection.
+"""
+
+import logging
+import threading
+from dataclasses import dataclass, field
+from datetime import datetime
+from enum import Enum
+from typing import Dict, Optional
+
+logger = logging.getLogger(__name__)
+
+
+class SubsystemState(Enum):
+    """Health states for registered subsystems."""
+    HEALTHY = "HEALTHY"
+    DEGRADED = "DEGRADED"
+    DISABLED = "DISABLED"
+    FAILED = "FAILED"
+
+
+@dataclass
+class SubsystemStatus:
+    """Status information for a registered subsystem."""
+    name: str
+    state: SubsystemState
+    reason: str = ""
+    last_heartbeat: Optional[datetime] = None
+    startup_status: str = "PENDING"
+    dependency_ready: bool = False
+    affects_trading: bool = True
+    registered_at: datetime = field(default_factory=datetime.utcnow)
+
+    def is_trading_safe(self) -> bool:
+        """Check if this subsystem is safe for trading operations."""
+        return self.state in (SubsystemState.HEALTHY, SubsystemState.DEGRADED) and self.affects_trading
+
+    def __str__(self) -> str:
+        """Human-readable status representation."""
+        status_str = f"{self.name}: {self.state.value}"
+        if self.reason:
+            status_str += f" ({self.reason})"
+        if self.last_heartbeat:
+            status_str += f" [last heartbeat: {self.last_heartbeat.isoformat()}]"
+        return status_str
+
+
+class SubsystemHealthRegistry:
+    """
+    Thread-safe registry for tracking health status of trading bot subsystems.
+
+    Manages registration, state tracking, heartbeat monitoring, and trading safety checks
+    for all system components. Supports automatic degradation of stale subsystems.
+    """
+
+    def __init__(self):
+        """Initialize the health registry with thread safety."""
+        self._subsystems: Dict[str, SubsystemStatus] = {}
+        self._lock = threading.Lock()
+        logger.info("SubsystemHealthRegistry initialized")
+
+    def register(self, name: str, affects_trading: bool = True) -> SubsystemStatus:
+        """
+        Register a new subsystem with the health registry.
+
+        Args:
+            name: Unique identifier for the subsystem
+            affects_trading: Whether this subsystem's outputs can affect trading decisions
+
+        Returns:
+            SubsystemStatus: The created status object
+
+        Raises:
+            ValueError: If subsystem with this name is already registered
+        """
+        with self._lock:
+            if name in self._subsystems:
+                raise ValueError(f"Subsystem '{name}' is already registered")
+
+            status = SubsystemStatus(
+                name=name,
+                state=SubsystemState.HEALTHY,
+                startup_status="PENDING",
+                dependency_ready=False,
+                affects_trading=affects_trading,
+                registered_at=datetime.utcnow()
+            )
+            self._subsystems[name] = status
+            logger.info(
+                f"Registered subsystem '{name}' (affects_trading={affects_trading})"
+            )
+            return status
+
+    def heartbeat(self, name: str) -> None:
+        """
+        Update the last heartbeat timestamp for a subsystem.
+
+        Args:
+            name: Subsystem identifier
+
+        Raises:
+            KeyError: If subsystem is not registered
+        """
+        with self._lock:
+            if name not in self._subsystems:
+                raise KeyError(f"Subsystem '{name}' is not registered")
+
+            self._subsystems[name].last_heartbeat = datetime.utcnow()
+            logger.debug(f"Heartbeat received from '{name}'")
+
+    def set_status(
+        self,
+        name: str,
+        state: SubsystemState,
+        reason: str = ""
+    ) -> None:
+        """
+        Update the state of a registered subsystem.
+
+        Args:
+            name: Subsystem identifier
+            state: New SubsystemState value
+            reason: Optional explanation for the state change
+
+        Raises:
+            KeyError: If subsystem is not registered
+            TypeError: If state is not a SubsystemState enum value
+        """
+        if not isinstance(state, SubsystemState):
+            raise TypeError(f"state must be SubsystemState, got {type(state)}")
+
+        with self._lock:
+            if name not in self._subsystems:
+                raise KeyError(f"Subsystem '{name}' is not registered")
+
+            old_state = self._subsystems[name].state
+            self._subsystems[name].state = state
+            self._subsystems[name].reason = reason
+
+            if old_state != state:
+                logger.warning(
+                    f"Subsystem '{name}' state changed: {old_state.value} -> {state.value}"
+                    f"{' (' + reason + ')' if reason else ''}"
+                )
+
+    def get_status(self, name: str) -> Optional[SubsystemStatus]:
+        """
+        Retrieve the current status of a subsystem.
+
+        Args:
+            name: Subsystem identifier
+
+        Returns:
+            SubsystemStatus object or None if not registered
+        """
+        with self._lock:
+            return self._subsystems.get(name)
+
+    def get_all(self) -> Dict[str, SubsystemStatus]:
+        """
+        Get a snapshot of all registered subsystem statuses.
+
+        Returns:
+            Dictionary mapping subsystem names to SubsystemStatus objects
+        """
+        with self._lock:
+            return dict(self._subsystems)
+
+    def is_trading_safe(self, name: str) -> bool:
+        """
+        Check if a specific subsystem is safe for trading operations.
+
+        A subsystem is trading-safe if:
+        - It is registered
+        - Its state is HEALTHY or DEGRADED
+        - affects_trading is True
+
+        Args:
+            name: Subsystem identifier
+
+        Returns:
+            True if safe for trading, False otherwise
+        """
+        with self._lock:
+            if name not in self._subsystems:
+                return False
+            return self._subsystems[name].is_trading_safe()
+
+    def is_all_trading_safe(self) -> bool:
+        """
+        Check if all trading-affecting subsystems are safe for trading.
+
+        Returns:
+            True if all trading-affecting subsystems are HEALTHY or DEGRADED, False otherwise
+        """
+        with self._lock:
+            trading_subsystems = [
+                s for s in self._subsystems.values()
+                if s.affects_trading
+            ]
+            if not trading_subsystems:
+                return True
+            return all(
+                s.state in (SubsystemState.HEALTHY, SubsystemState.DEGRADED)
+                for s in trading_subsystems
+            )
+
+    def check_stale(self, timeout_seconds: int = 300) -> Dict[str, bool]:
+        """
+        Check for stale heartbeats and auto-degrade subsystems that exceed timeout.
+
+        This method should be called periodically (e.g., every 60 seconds) to detect
+        subsystems that have stopped sending heartbeats.
+
+        Args:
+            timeout_seconds: Heartbeat timeout threshold (default 300 seconds)
+
+        Returns:
+            Dictionary mapping subsystem names to whether they were auto-degraded
+        """
+        now = datetime.utcnow()
+        degraded = {}
+
+        with self._lock:
+            for name, status in self._subsystems.items():
+                # Skip subsystems that are already in a terminal state
+                if status.state == SubsystemState.DISABLED:
+                    degraded[name] = False
+                    continue
+
+                # Check if heartbeat is missing or stale
+                if status.last_heartbeat is None:
+                    # Never received a heartbeat
+                    time_since_registration = (
+                        now - status.registered_at
+                    ).total_seconds()
+                    if time_since_registration > timeout_seconds:
+                        self._subsystems[name].state = SubsystemState.DEGRADED
+                        self._subsystems[name].reason = f"No heartbeat for {timeout_seconds}s"
+                        degraded[name] = True
+                        logger.warning(
+                            f"Auto-degraded '{name}': no heartbeat received since registration"
+                        )
+                    else:
+                        degraded[name] = False
+                else:
+                    # Check for stale heartbeat
+                    time_since_heartbeat = (
+                        now - status.last_heartbeat
+                    ).total_seconds()
+                    if time_since_heartbeat > timeout_seconds:
+                        self._subsystems[name].state = SubsystemState.DEGRADED
+                        self._subsystems[name].reason = f"Stale heartbeat ({time_since_heartbeat:.0f}s ago)"
+                        degraded[name] = True
+                        logger.warning(
+                            f"Auto-degraded '{name}': stale heartbeat ({time_since_heartbeat:.0f}s ago)"
+                        )
+                    else:
+                        degraded[name] = False
+
+        return degraded
+
+    def get_health_report(self) -> str:
+        """
+        Generate a formatted health report of all registered subsystems.
+
+        Returns:
+            Multi-line string summarizing the health status of all subsystems
+        """
+        with self._lock:
+            if not self._subsystems:
+                return "No subsystems registered"
+
+            lines = ["Health Report:"]
+            lines.append("-" * 80)
+
+            # Group by state for better readability
+            by_state = {}
+            for status in self._subsystems.values():
+                state = status.state.value
+                if state not in by_state:
+                    by_state[state] = []
+                by_state[state].append(status)
+
+            # Print in priority order
+            state_order = [
+                SubsystemState.FAILED,
+                SubsystemState.DISABLED,
+                SubsystemState.DEGRADED,
+                SubsystemState.HEALTHY
+            ]
+
+            for state in state_order:
+                state_val = state.value
+                if state_val in by_state:
+                    lines.append(f"\n{state_val}:")
+                    for status in by_state[state_val]:
+                        uptime = self._format_uptime(status.registered_at)
+                        lines.append(f"  - {status.name}")
+                        lines.append(f"      Registered: {status.registered_at.isoformat()} ({uptime})")
+                        lines.append(f"      Affects Trading: {status.affects_trading}")
+                        lines.append(f"      Dependencies Ready: {status.dependency_ready}")
+                        if status.reason:
+                            lines.append(f"      Reason: {status.reason}")
+                        if status.last_heartbeat:
+                            time_since = (
+                                datetime.utcnow() - status.last_heartbeat
+                            ).total_seconds()
+                            lines.append(f"      Last Heartbeat: {time_since:.1f}s ago")
+
+            lines.append("-" * 80)
+
+            # Summary line
+            all_safe = self.is_all_trading_safe()
+            trading_status = "SAFE" if all_safe else "AT RISK"
+            lines.append(f"Trading Status: {trading_status}")
+
+            return "\n".join(lines)
+
+    @staticmethod
+    def _format_uptime(registered_at: datetime) -> str:
+        """Format uptime duration as human-readable string."""
+        now = datetime.utcnow()
+        delta = now - registered_at
+        seconds = int(delta.total_seconds())
+
+        if seconds < 60:
+            return f"{seconds}s"
+        elif seconds < 3600:
+            minutes = seconds // 60
+            return f"{minutes}m"
+        else:
+            hours = seconds // 3600
+            minutes = (seconds % 3600) // 60
+            return f"{hours}h {minutes}m"
+
+    def reset(self) -> None:
+        """
+        Clear all registered subsystems.
+
+        WARNING: This is primarily for testing purposes. Use with caution in production.
+        """
+        with self._lock:
+            count = len(self._subsystems)
+            self._subsystems.clear()
+            logger.warning(f"Health registry reset: {count} subsystems cleared")
+
+
+# Module-level singleton for easy import
+registry = SubsystemHealthRegistry()

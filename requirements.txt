@@ -1,15 +1,14 @@
-# Pinned versions for reproducible builds
+# ─── Production Core ──────────────────────────────────────────
+# These are REQUIRED for the bot to start.  The boot-time dependency
+# validator will refuse to launch if any of these are missing.
 requests==2.31.0
 pandas==2.1.4
 numpy==1.26.4
 websocket-client==1.7.0
 eth_account==0.10.0
 
-# ─── Optional: ML regime forecasting ────────────────────────
-# Uncomment to enable XGBoost regime forecaster
-# xgboost>=2.0.0
-# scikit-learn>=1.3.0
+# Flask for the unified web dashboard
+flask>=3.0.0
 
-# ─── Dev / Testing ──────────────────────────────────────────
-# pip install -r requirements-dev.txt  (or just: pip install pytest)
-pytest>=7.4.0
+# ─── Optional extras (see requirements-optional.txt) ──────────
+# Install separately:  pip install -r requirements-optional.txt
