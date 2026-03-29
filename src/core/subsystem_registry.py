@@ -364,6 +364,65 @@ def build_subsystems(
 
 
 # ---------------------------------------------------------------------------
+# Heartbeat helper
+# ---------------------------------------------------------------------------
+
+# Maps container field names → health registry names.
+# Only fields whose registry name differs from the field name need entries;
+# fields that match (e.g. "discovery" → "discovery") are also listed for
+# completeness and to keep the mapping explicit.
+_FIELD_TO_HEALTH_NAME: dict = {
+    "exchange_agg":           "exchange_aggregator",
+    "discovery":              "discovery",
+    "identifier":             "strategy_identifier",
+    "scorer":                 "strategy_scorer",
+    "regime_detector":        "regime_detector",
+    "agent_scorer":           "agent_scorer",
+    "feature_engine":         "feature_engine",
+    "reporter":               "reporter",
+    "predictive_forecaster":  "predictive_forecaster",
+    "firewall":               "decision_firewall",
+    "liquidation_strategy":   "liquidation_strategy",
+    "kelly_sizer":            "kelly_sizer",
+    "trade_memory":           "trade_memory",
+    "calibration":            "calibration",
+    "llm_filter":             "llm_filter",
+    "signal_processor":       "signal_processor",
+    "arena_incubator":        "arena_incubator",
+    "decision_engine":        "decision_engine",
+    "arena":                  "alpha_arena",
+    "options_scanner":        "options_flow",
+    "polymarket":             "polymarket",
+    "multi_scanner":          "multi_scanner",
+    "copy_trader":            "copy_trader",
+    "paper_trader":           "paper_trader",
+    "live_trader":            "live_trader",
+    "cross_venue_hedger":     "cross_venue_hedger",
+    "shadow_tracker":         "shadow_tracker",
+    "adaptive_bot_detector":  "adaptive_bot_detector",
+    "regime_strategy_filter": "regime_strategy_filter",
+    "position_monitor":       "position_monitor",
+}
+
+
+def heartbeat_active(container: SubsystemContainer,
+                     health: SubsystemHealthRegistry) -> None:
+    """
+    Send a heartbeat for every non-None subsystem in *container*.
+
+    Call this after each cycle (fast / trading / discovery / reporting)
+    so the health registry knows subsystems are alive and doesn't
+    auto-degrade them for stale heartbeats.
+    """
+    for field, health_name in _FIELD_TO_HEALTH_NAME.items():
+        if getattr(container, field, None) is not None:
+            try:
+                health.heartbeat(health_name)
+            except Exception:
+                pass  # heartbeat is best-effort
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 

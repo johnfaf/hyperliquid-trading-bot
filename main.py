@@ -44,6 +44,7 @@ from src.core.health_registry import registry as health_registry, SubsystemState
 from src.core.task_runner import SupervisedTaskRunner
 from src.core.subsystem_registry import (
     build_subsystems,
+    heartbeat_active,
     FUNDABLE_CORE,
     FULL_PROFILE,
     SubsystemContainer,
@@ -167,6 +168,7 @@ class HyperliquidResearchBot:
 
     def _run_discovery(self):
         run_discovery(self.container)
+        heartbeat_active(self.container, health_registry)
         self._last_discovery = time.time()
         self._save_last_discovery_time()
 
@@ -174,10 +176,12 @@ class HyperliquidResearchBot:
         self._cycle_count += 1
         run_trading_cycle(self.container, self._cycle_count)
         run_reporting(self.container, self._cycle_count, health_registry)
+        heartbeat_active(self.container, health_registry)
 
     def _fast_cycle(self):
         self._fast_cycle_count += 1
         run_fast_cycle(self.container, self._fast_cycle_count)
+        heartbeat_active(self.container, health_registry)
 
     def run_once(self):
         """Run discovery + trading cycle (CLI --once)."""
