@@ -63,7 +63,7 @@ class SubsystemHealthRegistry:
     def __init__(self):
         """Initialize the health registry with thread safety."""
         self._subsystems: Dict[str, SubsystemStatus] = {}
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         logger.debug("SubsystemHealthRegistry initialized")
 
     def register(self, name: str, affects_trading: bool = True) -> SubsystemStatus:
