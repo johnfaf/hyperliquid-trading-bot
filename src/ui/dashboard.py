@@ -16,8 +16,13 @@ from datetime import datetime
 from typing import Dict
 from urllib.parse import urlparse, parse_qs
 
+import logging
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import config
+
+logger = logging.getLogger(__name__)
+logger.addHandler(logging.NullHandler())
 
 # Module-level options scanner reference (set by set_options_scanner)
 _options_scanner = None
@@ -978,10 +983,10 @@ def start_dashboard(port=None, options_scanner=None):
     server = HTTPServer(("0.0.0.0", port), DashboardHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
-    print(f"Dashboard running at http://0.0.0.0:{port}")
-    print(f"  Main dashboard:    http://0.0.0.0:{port}/")
-    print(f"  Options flow:      http://0.0.0.0:{port}/options")
-    print(f"  Backtest:          http://0.0.0.0:{port}/backtest")
+    logger.info("Dashboard running at http://0.0.0.0:%d", port)
+    logger.info("  Main dashboard:    http://0.0.0.0:%d/", port)
+    logger.info("  Options flow:      http://0.0.0.0:%d/options", port)
+    logger.info("  Backtest:          http://0.0.0.0:%d/backtest", port)
     return server
 
 

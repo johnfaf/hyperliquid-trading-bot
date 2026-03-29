@@ -24,6 +24,13 @@ import signal
 import sys
 import time
 
+# Force unbuffered stdout/stderr for Docker/Railway log visibility
+# Belt-and-suspenders: also set via PYTHONUNBUFFERED=1 in Dockerfile
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(line_buffering=True)
+if hasattr(sys.stderr, 'reconfigure'):
+    sys.stderr.reconfigure(line_buffering=True)
+
 sys.path.insert(0, os.path.dirname(__file__))
 import config
 
@@ -89,10 +96,12 @@ class HyperliquidResearchBot:
         self._register_background_tasks()
 
         self.logger.info("Bot initialized.")
+        sys.stdout.flush()
         try:
             self.logger.info(health_registry.get_health_report())
         except Exception as exc:
             self.logger.warning("Health report failed: %s", exc)
+        sys.stdout.flush()
 
     # ── Background tasks (replaces raw daemon threads) ────────
 
@@ -193,6 +202,7 @@ class HyperliquidResearchBot:
         """
         self.running = True
         self.logger.info("Entering run_loop()…")
+        sys.stdout.flush()
 
         # ── Graceful shutdown handler ──
         def signal_handler(sig, frame):
@@ -215,6 +225,7 @@ class HyperliquidResearchBot:
         self.logger.info("  Fast cycle:      every %ds", config.FAST_CYCLE_INTERVAL)
         self.logger.info("  Trading cycle:   every %ds", config.TRADING_CYCLE_INTERVAL)
         self.logger.info("  Discovery cycle: every %ds", config.DISCOVERY_CYCLE_INTERVAL)
+        sys.stdout.flush()
 
         # Initial discovery if needed
         trader_count = 0
@@ -268,8 +279,9 @@ class HyperliquidResearchBot:
             # Status heartbeat every 10 fast cycles
             if self._fast_cycle_count % 10 == 0 and self._fast_cycle_count > 0:
                 if self.container.reporter:
-                    print(self.container.reporter.print_live_status())
+                    self.logger.info(self.container.reporter.print_live_status())
 
+            sys.stdout.flush()
             if self.running:
                 time.sleep(config.FAST_CYCLE_INTERVAL)
 
