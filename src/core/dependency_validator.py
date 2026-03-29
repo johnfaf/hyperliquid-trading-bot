@@ -18,6 +18,7 @@ import logging
 from typing import Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
+logger.addHandler(logging.NullHandler())
 
 # ---------------------------------------------------------------------------
 # Feature → packages required for that feature to function

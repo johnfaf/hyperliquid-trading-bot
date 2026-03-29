@@ -28,6 +28,7 @@ from dataclasses import dataclass, field
 from typing import Callable, Dict, Optional
 
 logger = logging.getLogger(__name__)
+logger.addHandler(logging.NullHandler())
 
 
 # ---------------------------------------------------------------------------

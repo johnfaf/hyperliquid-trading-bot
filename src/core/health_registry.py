@@ -13,6 +13,9 @@ from enum import Enum
 from typing import Dict, Optional
 
 logger = logging.getLogger(__name__)
+# Prevent "No handler found" warnings and stderr lastResort output
+# when the library is used before the application configures logging.
+logger.addHandler(logging.NullHandler())
 
 
 class SubsystemState(Enum):
@@ -61,25 +64,26 @@ class SubsystemHealthRegistry:
         """Initialize the health registry with thread safety."""
         self._subsystems: Dict[str, SubsystemStatus] = {}
         self._lock = threading.Lock()
-        logger.info("SubsystemHealthRegistry initialized")
+        logger.debug("SubsystemHealthRegistry initialized")
 
     def register(self, name: str, affects_trading: bool = True) -> SubsystemStatus:
         """
-        Register a new subsystem with the health registry.
+        Register a subsystem.  Idempotent — re-registering the same name
+        updates ``affects_trading`` but does not raise.
 
         Args:
             name: Unique identifier for the subsystem
             affects_trading: Whether this subsystem's outputs can affect trading decisions
 
         Returns:
-            SubsystemStatus: The created status object
-
-        Raises:
-            ValueError: If subsystem with this name is already registered
+            SubsystemStatus: The created or updated status object
         """
         with self._lock:
             if name in self._subsystems:
-                raise ValueError(f"Subsystem '{name}' is already registered")
+                # Idempotent update — no error on re-registration
+                self._subsystems[name].affects_trading = affects_trading
+                logger.debug("Re-registered subsystem '%s' (affects_trading=%s)", name, affects_trading)
+                return self._subsystems[name]
 
             status = SubsystemStatus(
                 name=name,
@@ -90,27 +94,21 @@ class SubsystemHealthRegistry:
                 registered_at=datetime.utcnow()
             )
             self._subsystems[name] = status
-            logger.info(
-                f"Registered subsystem '{name}' (affects_trading={affects_trading})"
-            )
+            logger.debug("Registered subsystem '%s' (affects_trading=%s)", name, affects_trading)
             return status
 
     def heartbeat(self, name: str) -> None:
         """
         Update the last heartbeat timestamp for a subsystem.
-
-        Args:
-            name: Subsystem identifier
-
-        Raises:
-            KeyError: If subsystem is not registered
+        Silently ignores unknown names (non-throwing) so callers don't
+        need try/except around every heartbeat.
         """
         with self._lock:
-            if name not in self._subsystems:
-                raise KeyError(f"Subsystem '{name}' is not registered")
-
-            self._subsystems[name].last_heartbeat = datetime.utcnow()
-            logger.debug(f"Heartbeat received from '{name}'")
+            sub = self._subsystems.get(name)
+            if sub is None:
+                logger.debug("heartbeat() for unknown subsystem '%s' — ignored", name)
+                return
+            sub.last_heartbeat = datetime.utcnow()
 
     def set_status(
         self,
@@ -120,31 +118,33 @@ class SubsystemHealthRegistry:
     ) -> None:
         """
         Update the state of a registered subsystem.
+        Silently ignores unknown names (non-throwing).
 
-        Args:
-            name: Subsystem identifier
-            state: New SubsystemState value
-            reason: Optional explanation for the state change
-
-        Raises:
-            KeyError: If subsystem is not registered
-            TypeError: If state is not a SubsystemState enum value
+        Logs at WARNING only for transitions *into* FAILED.  All other
+        transitions are logged at INFO to avoid polluting production logs
+        with expected state changes.
         """
         if not isinstance(state, SubsystemState):
             raise TypeError(f"state must be SubsystemState, got {type(state)}")
 
         with self._lock:
-            if name not in self._subsystems:
-                raise KeyError(f"Subsystem '{name}' is not registered")
+            sub = self._subsystems.get(name)
+            if sub is None:
+                logger.debug("set_status() for unknown subsystem '%s' — ignored", name)
+                return
 
-            old_state = self._subsystems[name].state
-            self._subsystems[name].state = state
-            self._subsystems[name].reason = reason
+            old_state = sub.state
+            sub.state = state
+            sub.reason = reason
 
             if old_state != state:
-                logger.warning(
-                    f"Subsystem '{name}' state changed: {old_state.value} -> {state.value}"
-                    f"{' (' + reason + ')' if reason else ''}"
+                # Only WARN on transitions into FAILED — everything else is INFO
+                level = logging.WARNING if state == SubsystemState.FAILED else logging.INFO
+                logger.log(
+                    level,
+                    "Subsystem '%s' %s -> %s%s",
+                    name, old_state.value, state.value,
+                    f" ({reason})" if reason else "",
                 )
 
     def get_status(self, name: str) -> Optional[SubsystemStatus]:

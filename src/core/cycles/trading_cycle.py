@@ -15,6 +15,7 @@ import config
 from src.data import database as db
 
 logger = logging.getLogger(__name__)
+logger.addHandler(logging.NullHandler())
 
 
 # ---------------------------------------------------------------------------

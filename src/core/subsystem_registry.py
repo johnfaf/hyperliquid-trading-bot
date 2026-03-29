@@ -24,6 +24,7 @@ from typing import Optional, Any
 from src.core.health_registry import SubsystemHealthRegistry, SubsystemState
 
 logger = logging.getLogger(__name__)
+logger.addHandler(logging.NullHandler())
 
 
 # ---------------------------------------------------------------------------

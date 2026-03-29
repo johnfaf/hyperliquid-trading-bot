@@ -14,6 +14,7 @@ import config
 from src.data.database import backup_to_json
 
 logger = logging.getLogger(__name__)
+logger.addHandler(logging.NullHandler())
 
 
 def run_reporting(container, cycle_count: int, health_registry=None) -> None:
