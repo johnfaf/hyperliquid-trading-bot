@@ -109,8 +109,11 @@ FORECASTER_CRASH_THRESHOLD = float(os.environ.get("FORECASTER_CRASH_THRESHOLD", 
 ARKHAM_API_KEY = os.environ.get("ARKHAM_API_KEY")  # Optional: platform.arkhamintelligence.com
 
 # ─── XGBoost Forecaster (optional ML upgrade) ─────────────────
-ENABLE_XGBOOST_FORECASTER = os.environ.get("ENABLE_XGBOOST_FORECASTER", "false").lower() in ("true", "1", "yes")
+ENABLE_XGBOOST_FORECASTER = os.environ.get("ENABLE_XGBOOST_FORECASTER", "true").lower() in ("true", "1", "yes")
 XGBOOST_MODEL_PATH = "models/regime_xgboost.json"
+XGBOOST_CRASH_THRESHOLD = float(os.environ.get("XGBOOST_CRASH_THRESHOLD", -0.18))
+XGBOOST_MIN_CONFIDENCE = float(os.environ.get("XGBOOST_MIN_CONFIDENCE", 0.52))
+XGBOOST_RETRAIN_INTERVAL = int(os.environ.get("XGBOOST_RETRAIN_INTERVAL", 86400))  # 24h walk-forward
 
 # ─── Kelly Sizing ─────────────────────────────────────────────
 # Multiplier: 1.0=full, 0.5=half, 0.25=quarter (recommended for crypto)

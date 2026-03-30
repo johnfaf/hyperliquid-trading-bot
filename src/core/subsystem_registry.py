@@ -159,12 +159,26 @@ def build_subsystems(
     c.feature_engine = _safe_init("feature_engine", FeatureEngine, health, affects_trading=False)
     c.reporter = _safe_init("reporter", Reporter, health, affects_trading=False)
 
-    # ─── Predictive Forecaster (5-input model) ────────────────
+    # ─── Predictive Forecaster ─────────────────────────────────
+    # Use XGBoost-powered forecaster when enabled (wraps the base
+    # PredictiveRegimeForecaster internally as fallback).
     if "predictive_forecaster" in profile:
-        from src.signals.predictive_regime_forecaster import PredictiveRegimeForecaster
-        c.predictive_forecaster = _safe_init(
-            "predictive_forecaster", PredictiveRegimeForecaster, health,
-        )
+        import config as _cfg
+        if getattr(_cfg, "ENABLE_XGBOOST_FORECASTER", False) and "xgboost_forecaster" in profile:
+            from src.signals.xgboost_regime_forecaster import XGBoostRegimeForecaster
+            c.predictive_forecaster = _safe_init(
+                "predictive_forecaster",
+                lambda: XGBoostRegimeForecaster({
+                    "model_path": getattr(_cfg, "XGBOOST_MODEL_PATH", "models/regime_xgboost.json"),
+                    "retrain_interval": getattr(_cfg, "XGBOOST_RETRAIN_INTERVAL", 86400),
+                }),
+                health,
+            )
+        else:
+            from src.signals.predictive_regime_forecaster import PredictiveRegimeForecaster
+            c.predictive_forecaster = _safe_init(
+                "predictive_forecaster", PredictiveRegimeForecaster, health,
+            )
 
     # Firewall — needs forecaster injected
     c.firewall = _safe_init(

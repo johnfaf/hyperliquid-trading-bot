@@ -9,5 +9,10 @@ eth_account==0.10.0
 
 # Dashboard uses stdlib http.server — no Flask needed
 
+# ─── XGBoost Regime Forecaster ────────────────────────────────
+# ML-powered regime prediction (walk-forward trained on bot history)
+xgboost>=2.0.0
+scikit-learn>=1.3.0
+
 # ─── Optional extras (see requirements-optional.txt) ──────────
 # Install separately:  pip install -r requirements-optional.txt
