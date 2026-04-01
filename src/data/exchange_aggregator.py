@@ -178,25 +178,56 @@ def _coinbase_ticker(product_id: str) -> Optional[Dict]:
 
 def _cryptocom_ticker(instrument_name: str) -> Optional[Dict]:
     """Get 24h ticker from Crypto.com Exchange."""
-    data = _safe_get(
-        "https://api.crypto.com/exchange/v1/public/get-ticker",
+    raw = _safe_get(
+        "https://api.crypto.com/exchange/v1/public/get-tickers",
         {"instrument_name": instrument_name}
     )
-    if data and isinstance(data, dict):
-        price = float(data.get("last", 0))
-        volume = float(data.get("volume", 0))
-        volume_usd = float(data.get("volume_value", 0))
-        change_pct = float(data.get("change", 0)) * 100  # API returns decimal
+    if not raw:
+        return None
+
+    try:
+        # Unwrap JSON-RPC style response: {"result": {"data": [...]}}
+        if isinstance(raw, dict) and "result" in raw:
+            result = raw["result"]
+        else:
+            result = raw
+
+        # Extract ticker from array or direct object
+        if isinstance(result, dict) and "data" in result:
+            items = result["data"]
+            if isinstance(items, list) and len(items) > 0:
+                ticker = items[0]
+            else:
+                return None
+        elif isinstance(result, list) and len(result) > 0:
+            ticker = result[0]
+        else:
+            return None
+
+        # Handle both abbreviated (v1 API) and full field names
+        # Abbreviated: "a"=last, "h"=high, "l"=low, "v"=volume, "vv"=volume_value,
+        #             "c"=change, "oi"=open_interest
+        price = float(ticker.get("a") or ticker.get("last", 0))
+        volume = float(ticker.get("v") or ticker.get("volume", 0))
+        volume_usd = float(ticker.get("vv") or ticker.get("volume_value", 0))
+        change_pct = float(ticker.get("c") or ticker.get("change", 0))
+
+        # If change is in decimal form (0-1 range), multiply by 100
+        if -1 < change_pct < 1:
+            change_pct *= 100
+
         return {
             "exchange": "crypto.com",
             "price": price,
             "volume_24h_usd": volume_usd if volume_usd > 0 else volume * price,
             "price_change_pct": change_pct,
-            "high_24h": float(data.get("high", 0)),
-            "low_24h": float(data.get("low", 0)),
-            "open_interest": float(data.get("open_interest", 0)),
+            "high_24h": float(ticker.get("h") or ticker.get("high", 0)),
+            "low_24h": float(ticker.get("l") or ticker.get("low", 0)),
+            "open_interest": float(ticker.get("oi") or ticker.get("open_interest", 0)),
         }
-    return None
+    except (ValueError, TypeError, KeyError) as e:
+        logger.debug(f"Error parsing crypto.com ticker: {e}")
+        return None
 
 
 # ─── Aggregation ──────────────────────────────────────────────

@@ -31,8 +31,8 @@ TIER_SWEEP = 500_000
 TIER_LARGE = 100_000
 
 # Minimum filters
-MIN_VOL_OI_RATIO = 1.5
-MIN_NOTIONAL = 50_000
+MIN_VOL_OI_RATIO = 0.10  # 10% of OI is already noteworthy for options
+MIN_NOTIONAL = 25_000    # Lowered from 50K; options have smaller trade sizes
 
 # Supported underlyings
 TRACKED_CURRENCIES = ["BTC", "ETH", "SOL"]
@@ -390,15 +390,20 @@ class OptionsFlowScanner:
                 trades = self.get_recent_trades(currency, count=500)
                 logger.info(f"{currency}: fetched {len(trades)} recent options trades")
 
+                passed_notional = 0
                 for trade in trades:
                     # Quick pre-filter: skip trades below notional minimum
                     # This avoids expensive OI lookups for low-value trades
                     if trade.get("notional", 0) < MIN_NOTIONAL:
                         continue
 
+                    passed_notional += 1
                     classified = self.classify_print(trade)
                     if classified["is_unusual"]:
                         all_unusual.append(classified)
+
+                logger.info(f"{currency}: {passed_notional}/{len(trades)} trades passed notional filter ($>{MIN_NOTIONAL}), "
+                           f"found {sum(1 for t in all_unusual if t['underlying'] == currency)} unusual")
 
                 time.sleep(0.3)  # Rate limiting between currencies
 

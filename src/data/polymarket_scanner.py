@@ -163,7 +163,7 @@ class PolymarketScanner:
         self.min_liquidity_threshold = self.config.get("min_liquidity_threshold", 5000)  # $5k
 
         # Detection thresholds
-        self.odds_movement_threshold_1h = self.config.get("odds_movement_1h", 0.05)  # 5%
+        self.odds_movement_threshold_1h = self.config.get("odds_movement_1h", 0.02)  # 2% (for 3-min scans)
         self.odds_movement_threshold_24h = self.config.get("odds_movement_24h", 0.10)  # 10%
         self.smart_money_volume_threshold = self.config.get("smart_money_volume_threshold", 50000)  # $50k
 
@@ -432,7 +432,7 @@ class PolymarketScanner:
                 if market.token_id in self._price_cache:
                     cache_age = time.time() - self._price_cache_time.get(market.token_id, 0)
 
-                    if cache_age < 60:  # 1 hour cache for 1h movement
+                    if cache_age < 600:  # Compare against prices cached within last 10 minutes
                         old_prices = self._price_cache[market.token_id]
 
                         # Calculate changes for each outcome

@@ -131,7 +131,13 @@ class CryptoComClient:
             resp = self.session.get(url, params=params, timeout=10)
 
             if resp.status_code == 200:
-                data = resp.json()
+                raw = resp.json()
+                # Crypto.com v1 wraps responses in {"id": -1, "method": "...", "code": 0, "result": {...}}
+                # Unwrap the result if present
+                if isinstance(raw, dict) and "result" in raw:
+                    data = raw["result"]
+                else:
+                    data = raw
                 self._set_cache(cache_key, data)
                 return data
             else:
@@ -167,36 +173,51 @@ class CryptoComClient:
             logger.debug(f"No mapping for {coin} ({'perp' if is_perp else 'spot'})")
             return None
 
-        # Fetch ticker
-        data = self._get("get-ticker", params={"instrument_name": instrument_name})
+        # Fetch ticker (note: get-tickers is plural and returns array in "data")
+        data = self._get("get-tickers", params={"instrument_name": instrument_name})
         if not data:
             return None
 
         try:
-            ticker = data.get("data", data)
-            if not ticker:
+            # get-tickers returns {"data": [{...}]} or already unwrapped
+            if isinstance(data, dict) and "data" in data:
+                items = data["data"]
+                if isinstance(items, list) and len(items) > 0:
+                    ticker = items[0]
+                else:
+                    return None
+            elif isinstance(data, list) and len(data) > 0:
+                # Already an array
+                ticker = data[0]
+            else:
                 return None
 
-            # Parse fields
-            price = float(ticker.get("last", 0))
-            change_pct = float(ticker.get("change", 0))
+            # Parse fields. Handle both abbreviated (v1 API) and full field names
+            # Abbreviated: "a"=last, "h"=high, "l"=low, "v"=volume, "vv"=volume_value,
+            #             "c"=change, "b"=best_bid, "k"=best_ask, "oi"=open_interest
+            # Full names: "last", "high", "low", "volume", "volume_value", "change", etc.
+            price = float(ticker.get("a") or ticker.get("last", 0))
+            change_pct = float(ticker.get("c") or ticker.get("change", 0))
+            volume_usd = float(ticker.get("vv") or ticker.get("volume_value", 0))
+            volume = float(ticker.get("v") or ticker.get("volume", 0))
 
             result = {
                 "exchange": "crypto.com",
                 "coin": coin,
                 "instrument_name": instrument_name,
                 "price": price,
-                "volume_24h_usd": float(ticker.get("volume_value", 0)),
+                "volume_24h_usd": volume_usd if volume_usd > 0 else volume * price,
                 "price_change_pct": change_pct,
-                "high_24h": float(ticker.get("high", 0)),
-                "low_24h": float(ticker.get("low", 0)),
-                "open": float(ticker.get("open", 0)),
-                "timestamp": ticker.get("timestamp", 0),
+                "high_24h": float(ticker.get("h") or ticker.get("high", 0)),
+                "low_24h": float(ticker.get("l") or ticker.get("low", 0)),
+                "open": float(ticker.get("o") or ticker.get("open", 0)),
+                "timestamp": ticker.get("ut") or ticker.get("timestamp", 0),
             }
 
             # Add perp-specific fields
-            if is_perp and "open_interest" in ticker:
-                result["open_interest"] = float(ticker["open_interest"])
+            oi = float(ticker.get("oi") or ticker.get("open_interest", 0))
+            if is_perp and oi > 0:
+                result["open_interest"] = oi
 
             return result
 
@@ -233,8 +254,13 @@ class CryptoComClient:
             return None
 
         try:
-            bids = data.get("bids", [])
-            asks = data.get("asks", [])
+            # Handle both direct object and nested structure
+            book_data = data
+            if isinstance(data, dict) and "data" in data:
+                book_data = data["data"]
+
+            bids = book_data.get("bids", [])
+            asks = book_data.get("asks", [])
 
             if not bids or not asks:
                 return None
@@ -264,7 +290,7 @@ class CryptoComClient:
                 "imbalance": round(imbalance, 4),  # -1 (all asks) to +1 (all bids)
                 "bid_volume": round(bid_volume, 4),
                 "ask_volume": round(ask_volume, 4),
-                "timestamp": data.get("timestamp", 0),
+                "timestamp": book_data.get("timestamp", 0),
             }
 
         except (ValueError, TypeError) as e:
@@ -295,12 +321,17 @@ class CryptoComClient:
             "instrument_name": instrument_name,
             "count": min(count, 150)  # Max 150 from API
         })
-        if not data or "data" not in data:
+        if not data:
             return None
 
         try:
+            # Extract trades array (may be nested or direct)
+            trades_list = data.get("data", data) if isinstance(data, dict) else data
+            if not isinstance(trades_list, list):
+                return None
+
             trades = []
-            for trade in data["data"]:
+            for trade in trades_list:
                 price = float(trade.get("price", 0))
                 qty = float(trade.get("qty", 0))
                 notional = price * qty
@@ -347,24 +378,32 @@ class CryptoComClient:
             "instrument_name": instrument_name,
             "timeframe": timeframe
         })
-        if not data or "data" not in data:
+        if not data:
             return None
 
         try:
+            # Extract candles array (may be nested or direct)
+            candles_list = data.get("data", data) if isinstance(data, dict) else data
+            if not isinstance(candles_list, list):
+                return None
+
             candles = []
-            for candle in data.get("data", []):
+            for candle in candles_list:
+                # Handle both abbreviated field names (v1 API) and full names
+                # Abbreviated: "o"=open, "h"=high, "l"=low, "c"=close
+                #             "v"=volume, "vv"=volume_usd, "ut"=update_time/timestamp
                 candles.append({
                     "coin": coin,
                     "exchange": "crypto.com",
                     "instrument_name": instrument_name,
                     "timeframe": timeframe,
-                    "open": float(candle.get("open", 0)),
-                    "high": float(candle.get("high", 0)),
-                    "low": float(candle.get("low", 0)),
-                    "close": float(candle.get("close", 0)),
-                    "volume": float(candle.get("volume", 0)),
-                    "volume_usd": float(candle.get("volume_usd", 0)),
-                    "timestamp": candle.get("timestamp", 0),
+                    "open": float(candle.get("o") or candle.get("open", 0)),
+                    "high": float(candle.get("h") or candle.get("high", 0)),
+                    "low": float(candle.get("l") or candle.get("low", 0)),
+                    "close": float(candle.get("c") or candle.get("close", 0)),
+                    "volume": float(candle.get("v") or candle.get("volume", 0)),
+                    "volume_usd": float(candle.get("vv") or candle.get("volume_usd", 0)),
+                    "timestamp": candle.get("ut") or candle.get("timestamp", 0),
                 })
 
             return candles
@@ -484,8 +523,12 @@ class CryptoComClient:
             List of instrument names (e.g., ["BTC_USD", "ETH_USD", ...])
         """
         data = self._get("get-instruments")
-        if data and "data" in data:
-            return data["data"]
+        if not data:
+            return None
+        # Handle both nested and direct array formats
+        instruments = data.get("data", data) if isinstance(data, dict) else data
+        if isinstance(instruments, list):
+            return instruments
         return None
 
 
