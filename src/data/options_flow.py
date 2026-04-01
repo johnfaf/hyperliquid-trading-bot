@@ -40,7 +40,7 @@ TRACKED_CURRENCIES = ["BTC", "ETH", "SOL"]
 # Cache TTLs
 INSTRUMENTS_CACHE_TTL = 300   # 5 min
 TRADES_CACHE_TTL = 30         # 30 sec
-OI_CACHE_TTL = 300            # 5 min (was 60s — caused 429 storms on get_order_book)
+OI_CACHE_TTL = 600            # 10 min (was 5 min; OI doesn't change fast enough for frequent refreshes)
 
 
 class OptionsFlowScanner:
@@ -175,12 +175,13 @@ class OptionsFlowScanner:
     # ─── Open Interest ────────────────────────────────────────
 
     def get_open_interest(self, instrument_name: str) -> float:
-        """Get open interest for a specific instrument. Cached 1 min."""
+        """Get open interest for a specific instrument. Cached 10 min. Throttles API only on cache miss."""
         now = time.time()
         cached = self._oi_cache.get(instrument_name)
         if cached and (now - cached["ts"]) < OI_CACHE_TTL:
             return cached["oi"]
 
+        # Cache miss — throttle and fetch from API
         oi = 0.0
         time.sleep(0.25)  # Throttle OI lookups — Deribit rate limit is ~5 req/s
         data = self._deribit_get("public/get_order_book", {
@@ -256,6 +257,8 @@ class OptionsFlowScanner:
         - Assign size tier (MEGA/BLOCK/SWEEP/LARGE)
         - Determine flow direction (bullish/bearish)
         - Tag strike relative to spot (OTM/ATM/ITM)
+
+        OPTIMIZATION: Early return for sub-notional trades to avoid OI API calls.
         """
         instrument = trade["instrument"]
         notional = trade["notional"]
@@ -265,7 +268,22 @@ class OptionsFlowScanner:
         strike = trade["strike"]
         underlying = trade["underlying"]
 
-        # Get OI for this instrument
+        # Early exit for low-notional trades — skip expensive OI lookup
+        if notional < MIN_NOTIONAL:
+            return {
+                **trade,
+                "vol_oi_ratio": 0.0,
+                "open_interest": 0.0,
+                "tier": "NORMAL",
+                "direction": "neutral",
+                "moneyness": "unknown",
+                "pct_from_spot": 0,
+                "spot_price": 0.0,
+                "expiry_window": self._classify_expiry(trade.get("expiry", "")),
+                "is_unusual": False,
+            }
+
+        # Get OI for this instrument (only called for notional >= MIN_NOTIONAL)
         oi = self.get_open_interest(instrument)
         vol_oi_ratio = amount / oi if oi > 0 else 999.0
 
@@ -373,6 +391,11 @@ class OptionsFlowScanner:
                 logger.info(f"{currency}: fetched {len(trades)} recent options trades")
 
                 for trade in trades:
+                    # Quick pre-filter: skip trades below notional minimum
+                    # This avoids expensive OI lookups for low-value trades
+                    if trade.get("notional", 0) < MIN_NOTIONAL:
+                        continue
+
                     classified = self.classify_print(trade)
                     if classified["is_unusual"]:
                         all_unusual.append(classified)

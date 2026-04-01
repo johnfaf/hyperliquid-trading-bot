@@ -23,6 +23,7 @@ class SignalSource(str, Enum):
     COPY_TRADE = "copy_trade"
     OPTIONS_FLOW = "options_flow"
     MANUAL = "manual"
+    WHALE_TRADE = "whale_trade"
 
 
 class SignalStrength(str, Enum):
@@ -166,4 +167,32 @@ def signal_from_options_flow(ticker: str, direction: str,
         source=SignalSource.OPTIONS_FLOW,
         reason=f"Options flow: net ${net_flow:,.0f} {direction} across {prints} prints",
         options_flow_aligned=True,
+    )
+
+
+def signal_from_whale_trade(coin: str, whale_side: str, notional: float,
+                            exchange: str = "crypto.com",
+                            confidence: float = 0.55) -> TradeSignal:
+    """Helper: create a TradeSignal from whale trade detection.
+
+    Args:
+        coin: Coin symbol (e.g., "BTC", "ETH")
+        whale_side: "buy" or "sell" from whale trade
+        notional: Trade notional value in USD
+        exchange: Exchange name (default "crypto.com")
+        confidence: Signal confidence (default 0.55, can be adjusted for notional size)
+
+    Returns:
+        TradeSignal with whale trade direction inferred from side
+    """
+    # Infer signal direction: whale buying = long signal, whale selling = short signal
+    side = SignalSide.LONG if whale_side.lower() == "buy" else SignalSide.SHORT
+
+    return TradeSignal(
+        coin=coin,
+        side=side,
+        confidence=confidence,
+        source=SignalSource.WHALE_TRADE,
+        reason=f"Whale {whale_side.upper()} ${notional:,.0f} on {exchange}",
+        entry_price=0.0,  # No specific entry price for whale signals
     )

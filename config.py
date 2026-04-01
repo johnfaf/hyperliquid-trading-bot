@@ -49,7 +49,7 @@ BOT_ELEVATED_FREQ = int(os.environ.get("BOT_ELEVATED_FREQ", 50))              # 
 
 # ─── Strategy Analysis ────────────────────────────────────────
 # Minimum number of trades to classify a strategy
-MIN_TRADES_FOR_STRATEGY = 5
+MIN_TRADES_FOR_STRATEGY = 10
 # Time windows for analysis
 TIME_WINDOWS = {
     "short": 24,     # hours

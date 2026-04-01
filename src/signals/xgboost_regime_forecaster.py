@@ -46,6 +46,15 @@ except ImportError:
 
 from src.signals.predictive_regime_forecaster import PredictiveRegimeForecaster
 
+# Try importing crypto.com client for enhanced signals
+try:
+    from src.data.cryptocom_client import CryptoComClient
+    _cryptocom = CryptoComClient()
+    HAS_CRYPTOCOM = True
+except ImportError:
+    _cryptocom = None
+    HAS_CRYPTOCOM = False
+
 
 # Feature order must match training and prediction
 FEATURE_NAMES = [
@@ -221,6 +230,7 @@ class XGBoostRegimeForecaster:
         """
         Extract the full 8-feature vector from current market state.
         Reuses the base forecaster's components + adds volatility & basis.
+        Enhanced with cross-exchange validation from Crypto.com.
         """
         components = base_prediction.get("components", {})
 
@@ -241,6 +251,20 @@ class XGBoostRegimeForecaster:
 
         # CEX-DEX basis spread (HL vs Binance)
         features["basis_spread"] = self._get_basis_spread(coin)
+
+        # Cross-exchange volatility from Crypto.com (validation signal)
+        if HAS_CRYPTOCOM:
+            try:
+                cdc_vol = _cryptocom.get_5m_volatility(coin)
+                if cdc_vol > 0:
+                    # Blend with existing volatility: average of both sources
+                    existing_vol = features.get("volatility_5m", 0)
+                    if existing_vol > 0:
+                        features["volatility_5m"] = (existing_vol + cdc_vol) / 2
+                    else:
+                        features["volatility_5m"] = cdc_vol
+            except Exception:
+                pass
 
         return features
 
@@ -300,8 +324,9 @@ class XGBoostRegimeForecaster:
 
     def _get_basis_spread(self, coin: str) -> float:
         """
-        CEX-DEX basis: Hyperliquid funding minus Binance funding.
+        CEX-DEX basis: Hyperliquid funding minus Binance funding, enhanced with Crypto.com data.
         Positive = HL funding higher (shorts pay more on HL vs Binance).
+        Multi-exchange basis uses weighted average if crypto.com data is available.
         """
         try:
             import requests as req
@@ -322,6 +347,28 @@ class XGBoostRegimeForecaster:
             if resp.ok:
                 binance_funding = float(resp.json().get("lastFundingRate", 0))
                 basis = hl_funding - binance_funding
+
+                # Crypto.com price comparison (spot-perp basis proxy)
+                if HAS_CRYPTOCOM:
+                    try:
+                        ticker = _cryptocom.get_ticker(coin)
+                        if ticker:
+                            cdc_price = ticker.get("price", 0)
+                            if cdc_price > 0:
+                                # Try to get orderbook imbalance from Crypto.com as additional signal
+                                cdc_imbalance = 0.0
+                                try:
+                                    cdc_imbalance = _cryptocom.get_orderbook_imbalance(coin)
+                                except Exception:
+                                    pass
+
+                                # Multi-exchange basis: average HL-Binance funding spread with CDC orderbook imbalance
+                                # Blend: 70% funding basis + 30% orderbook imbalance signal
+                                if cdc_imbalance != 0:
+                                    basis = basis * 0.7 + cdc_imbalance * 0.0003 * 0.3
+                    except Exception:
+                        pass
+
                 return max(min(basis * 10_000, 1.0), -1.0)
         except Exception:
             pass

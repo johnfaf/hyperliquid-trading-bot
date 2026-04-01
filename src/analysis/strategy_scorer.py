@@ -49,13 +49,26 @@ class StrategyScorer:
             self.weights["risk_adjusted_return"] * risk_adj_score
         )
 
+        # Sample-size penalty: strategies with fewer than 10 trades get
+        # a multiplicative discount that prevents high scores from thin data.
+        trade_count = strategy.get("trade_count", 0)
+        if trade_count < 10:
+            sample_penalty = (trade_count / 10) ** 1.5  # 5 trades = 0.35x, 8 = 0.72x
+            composite *= sample_penalty
+            logger.debug(f"Sample-size penalty: {trade_count} trades → {sample_penalty:.2f}x")
+
         # Apply time decay based on when strategy was last scored
         last_scored = strategy.get("last_scored")
         if last_scored:
             try:
                 last_dt = datetime.fromisoformat(last_scored)
                 days_since = (datetime.utcnow() - last_dt).days
-                decay_factor = self.decay_rate ** days_since
+                # Accelerated decay: gentle for first 7 days, aggressive after
+                if days_since <= 7:
+                    decay_factor = self.decay_rate ** days_since
+                else:
+                    # After 7 days: base decay + accelerated component
+                    decay_factor = (self.decay_rate ** 7) * (0.85 ** (days_since - 7))
                 composite *= decay_factor
             except (ValueError, TypeError):
                 pass
@@ -86,8 +99,9 @@ class StrategyScorer:
         trade_count = strategy.get("trade_count", 0)
 
         if trade_count < config.MIN_TRADES_FOR_STRATEGY:
-            # Penalize strategies with too few trades (low confidence)
-            return win_rate * (trade_count / config.MIN_TRADES_FOR_STRATEGY)
+            # Geometric penalty: 5 trades = 0.25x, 3 trades = 0.09x, 1 trade = 0.01x
+            penalty = (trade_count / config.MIN_TRADES_FOR_STRATEGY) ** 2
+            return win_rate * penalty
 
         # Win rate above 50% is good, above 65% is great
         return min(1.0, win_rate * 1.3)
@@ -107,11 +121,11 @@ class StrategyScorer:
         """
         strategy_id = strategy.get("id")
         if not strategy_id:
-            return 0.5  # Default for new strategies
+            return 0.3  # Default for new strategies
 
         history = db.get_strategy_score_history(strategy_id, limit=30)
         if len(history) < 3:
-            return 0.5  # Not enough data
+            return 0.3  # Not enough data
 
         scores = [h["score"] for h in history]
         mean_score = np.mean(scores)

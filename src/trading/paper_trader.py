@@ -156,16 +156,23 @@ class PaperTrader:
 
         # Build trade signals from strategies
         raw_signals = []
+        _drop_counts = {"existing_position": 0, "no_signal": 0, "volume_reject": 0,
+                        "schema_error": 0, "firewall": 0, "arena": 0, "memory": 0,
+                        "llm_filter": 0, "other_error": 0}
         for strategy in strategies:
             try:
                 # Check if we already have a position from this strategy
                 existing = [t for t in open_trades if t["strategy_id"] == strategy.get("id")]
                 if existing:
+                    _drop_counts["existing_position"] += 1
+                    logger.info(f"Skipping {strategy.get('name', '?')} — already have open position")
                     continue
 
                 # Generate signal from strategy
                 signal = self._generate_signal(strategy, mids, regime_data=regime_data)
                 if not signal:
+                    _drop_counts["no_signal"] += 1
+                    logger.info(f"No signal generated for {strategy.get('name', '?')}")
                     continue
 
                 # Enrich with feature engine data
@@ -200,7 +207,8 @@ class PaperTrader:
                             signal["coin"], signal["side"]
                         )
                         if not confirmed:
-                            logger.debug(f"Volume rejects {signal['side']} {signal['coin']} "
+                            _drop_counts["volume_reject"] += 1
+                            logger.info(f"Volume rejects {signal['side']} {signal['coin']} "
                                         f"(confidence={vol_confidence:.2f})")
                             continue
                         signal["confidence"] = signal.get("confidence", 0.5) * (0.5 + vol_confidence * 0.5)
@@ -258,7 +266,8 @@ class PaperTrader:
                 )
                 trade_signals.append((trade_signal, sig))
             except Exception as e:
-                logger.debug(f"Error creating TradeSignal: {e}")
+                _drop_counts["schema_error"] += 1
+                logger.info(f"Error creating TradeSignal: {e}")
 
         # Apply agent scoring weights (higher-performing sources get boosted)
         if self.agent_scorer and trade_signals:
@@ -277,7 +286,8 @@ class PaperTrader:
                         open_positions=open_trades,
                     )
                     if not passed:
-                        logger.debug(f"Firewall rejected {sig['side']} {sig['coin']}: {reason}")
+                        _drop_counts["firewall"] += 1
+                        logger.info(f"Firewall rejected {sig['side']} {sig['coin']}: {reason}")
                         continue
                     logger.debug(f"Firewall approved {sig['side']} {sig['coin']} "
                                 f"(confidence={trade_signal.confidence:.0%})")
@@ -295,7 +305,8 @@ class PaperTrader:
                             trade_signal, features=feature_ctx
                         )
                         if not approved:
-                            logger.debug(f"Arena consensus REJECTED {sig['side']} {sig['coin']}")
+                            _drop_counts["arena"] += 1
+                            logger.info(f"Arena consensus REJECTED {sig['side']} {sig['coin']}")
                             continue
                         # Use consensus-adjusted confidence
                         trade_signal.confidence = consensus_conf
@@ -326,7 +337,8 @@ class PaperTrader:
                             top_k=8,
                         )
                         if memory_result.recommendation == "avoid":
-                            logger.debug(f"Memory BLOCKED {sig['side']} {sig['coin']}: {memory_result.reason}")
+                            _drop_counts["memory"] += 1
+                            logger.info(f"Memory BLOCKED {sig['side']} {sig['coin']}: {memory_result.reason}")
                             continue
                         elif memory_result.recommendation == "caution":
                             trade_signal.confidence *= 0.8
@@ -346,7 +358,8 @@ class PaperTrader:
                         }
                         llm_approved, llm_conf, llm_reason = self.llm_filter.filter(sig, llm_context)
                         if not llm_approved:
-                            logger.debug(f"LLM filter BLOCKED {sig['side']} {sig['coin']}: {llm_reason}")
+                            _drop_counts["llm_filter"] += 1
+                            logger.info(f"LLM filter BLOCKED {sig['side']} {sig['coin']}: {llm_reason}")
                             continue
                         trade_signal.confidence = llm_conf
                     except Exception as e:
@@ -391,6 +404,12 @@ class PaperTrader:
         if executed:
             logger.info(f"Executed {len(executed)} paper trades (V2 pipeline)")
 
+        # Summary of filtering pipeline
+        total_dropped = sum(_drop_counts.values())
+        if total_dropped > 0 or executed:
+            logger.info(f"Paper trade pipeline: {len(strategies)} strategies → {len(raw_signals)} signals → "
+                        f"{len(executed)} executed | Drops: {dict((k,v) for k,v in _drop_counts.items() if v > 0)}")
+
         return executed
 
     def _generate_signal(self, strategy: Dict, mids: Dict,
@@ -413,6 +432,9 @@ class PaperTrader:
         # Only trade strategies with decent scores
         if score < 0.3:
             return None
+
+        # Use pre-computed coin from decision engine when available
+        pre_decided_coin = strategy.get("_decision_coin", "")
 
         # Get target coins from strategy parameters
         coins = params.get("coins", [])
@@ -439,11 +461,18 @@ class PaperTrader:
         # Pick the first available coin with a price
         target_coin = None
         target_price = 0
-        for coin in coins:
-            if coin in mids:
-                target_coin = coin
-                target_price = float(mids[coin])
-                break
+
+        # If decision engine pre-selected a coin, use it
+        if pre_decided_coin and pre_decided_coin in mids:
+            target_coin = pre_decided_coin
+            target_price = float(mids[pre_decided_coin])
+        else:
+            # Fallback to strategy coins
+            for coin in coins:
+                if coin in mids:
+                    target_coin = coin
+                    target_price = float(mids[coin])
+                    break
 
         if not target_coin or target_price == 0:
             # Fallback to BTC

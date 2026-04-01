@@ -207,17 +207,17 @@ class TTLCache:
 # ─── Cache TTLs by request type ─────────────────────────────────
 # How long each type of data stays fresh in cache (seconds)
 CACHE_TTLS = {
-    "allMids": 2.0,            # Prices: 2s (multiple modules read within same cycle tick)
+    "allMids": 5.0,            # Prices: 5s (mid prices read by multiple modules in same cycle; 5s still fresh)
     "metaAndAssetCtxs": 30.0,  # Funding/OI: 30s (regime+options+features all need this)
     "meta": 600.0,             # Exchange metadata: 10 min (almost never changes)
-    "l2Book": 2.0,             # Order book: 2s
-    "recentTrades": 5.0,       # Recent trades: 5s
+    "l2Book": 10.0,            # Order book: 10s (doesn't need sub-second freshness for paper trading)
+    "recentTrades": 15.0,      # Recent trades: 15s (trades don't change that fast)
     "clearinghouseState": 10.0,# Trader positions: 10s (scanning 258 traders, same trader
                                 #   may be queried by discovery + copy trader within 10s)
     "userFills": 30.0,         # Fill history: 30s (doesn't change between cycle phases)
     "userFunding": 120.0,      # Funding payments: 2 min
     "leaderboard": 300.0,      # Leaderboard: 5 min (only refreshed hourly anyway)
-    "candleSnapshot": 30.0,    # Candles: 30s (used by regime + features in same cycle)
+    "candleSnapshot": 60.0,    # Candles: 60s (already minute-level data, 1m freshness is adequate)
     "fundingHistory": 300.0,   # Funding history: 5 min
 }
 

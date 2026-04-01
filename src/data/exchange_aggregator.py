@@ -1,6 +1,6 @@
 """
 Multi-Exchange Data Aggregator
-Pulls public market data from Binance, Bybit, Kraken, and Coinbase
+Pulls public market data from Binance, Bybit, Kraken, Coinbase, and Crypto.com
 to identify volume trends and directional bias across exchanges.
 No API keys required — uses only public endpoints.
 """
@@ -14,26 +14,26 @@ logger = logging.getLogger(__name__)
 
 # Coin symbol mappings per exchange
 SYMBOL_MAP = {
-    "BTC": {"binance": "BTCUSDT", "bybit": "BTCUSDT", "kraken": "XBTUSD", "coinbase": "BTC-USD"},
-    "ETH": {"binance": "ETHUSDT", "bybit": "ETHUSDT", "kraken": "ETHUSD", "coinbase": "ETH-USD"},
-    "SOL": {"binance": "SOLUSDT", "bybit": "SOLUSDT", "kraken": "SOLUSD", "coinbase": "SOL-USD"},
-    "DOGE": {"binance": "DOGEUSDT", "bybit": "DOGEUSDT", "kraken": "DOGEUSD", "coinbase": "DOGE-USD"},
-    "AVAX": {"binance": "AVAXUSDT", "bybit": "AVAXUSDT", "kraken": "AVAXUSD", "coinbase": "AVAX-USD"},
-    "LINK": {"binance": "LINKUSDT", "bybit": "LINKUSDT", "kraken": "LINKUSD", "coinbase": "LINK-USD"},
-    "ARB": {"binance": "ARBUSDT", "bybit": "ARBUSDT", "kraken": None, "coinbase": "ARB-USD"},
-    "OP": {"binance": "OPUSDT", "bybit": "OPUSDT", "kraken": None, "coinbase": "OP-USD"},
-    "SUI": {"binance": "SUIUSDT", "bybit": "SUIUSDT", "kraken": None, "coinbase": "SUI-USD"},
-    "APT": {"binance": "APTUSDT", "bybit": "APTUSDT", "kraken": None, "coinbase": "APT-USD"},
-    "INJ": {"binance": "INJUSDT", "bybit": "INJUSDT", "kraken": None, "coinbase": "INJ-USD"},
-    "NEAR": {"binance": "NEARUSDT", "bybit": "NEARUSDT", "kraken": None, "coinbase": "NEAR-USD"},
-    "XRP": {"binance": "XRPUSDT", "bybit": "XRPUSDT", "kraken": "XRPUSD", "coinbase": "XRP-USD"},
-    "HYPE": {"binance": None, "bybit": "HYPEUSDT", "kraken": None, "coinbase": None},
-    "SEI": {"binance": "SEIUSDT", "bybit": "SEIUSDT", "kraken": None, "coinbase": "SEI-USD"},
-    "PEPE": {"binance": "PEPEUSDT", "bybit": "PEPEUSDT", "kraken": None, "coinbase": "PEPE-USD"},
-    "WIF": {"binance": "WIFUSDT", "bybit": "WIFUSDT", "kraken": None, "coinbase": None},
-    "FET": {"binance": "FETUSDT", "bybit": "FETUSDT", "kraken": None, "coinbase": "FET-USD"},
-    "ONDO": {"binance": "ONDOUSDT", "bybit": "ONDOUSDT", "kraken": None, "coinbase": "ONDO-USD"},
-    "TIA": {"binance": "TIAUSDT", "bybit": "TIAUSDT", "kraken": None, "coinbase": "TIA-USD"},
+    "BTC": {"binance": "BTCUSDT", "bybit": "BTCUSDT", "kraken": "XBTUSD", "coinbase": "BTC-USD", "cryptocom": "BTC_USD"},
+    "ETH": {"binance": "ETHUSDT", "bybit": "ETHUSDT", "kraken": "ETHUSD", "coinbase": "ETH-USD", "cryptocom": "ETH_USD"},
+    "SOL": {"binance": "SOLUSDT", "bybit": "SOLUSDT", "kraken": "SOLUSD", "coinbase": "SOL-USD", "cryptocom": "SOL_USD"},
+    "DOGE": {"binance": "DOGEUSDT", "bybit": "DOGEUSDT", "kraken": "DOGEUSD", "coinbase": "DOGE-USD", "cryptocom": "DOGE_USD"},
+    "AVAX": {"binance": "AVAXUSDT", "bybit": "AVAXUSDT", "kraken": "AVAXUSD", "coinbase": "AVAX-USD", "cryptocom": "AVAX_USD"},
+    "LINK": {"binance": "LINKUSDT", "bybit": "LINKUSDT", "kraken": "LINKUSD", "coinbase": "LINK-USD", "cryptocom": "LINK_USD"},
+    "ARB": {"binance": "ARBUSDT", "bybit": "ARBUSDT", "kraken": None, "coinbase": "ARB-USD", "cryptocom": "ARB_USD"},
+    "OP": {"binance": "OPUSDT", "bybit": "OPUSDT", "kraken": None, "coinbase": "OP-USD", "cryptocom": "OP_USD"},
+    "SUI": {"binance": "SUIUSDT", "bybit": "SUIUSDT", "kraken": None, "coinbase": "SUI-USD", "cryptocom": "SUI_USD"},
+    "APT": {"binance": "APTUSDT", "bybit": "APTUSDT", "kraken": None, "coinbase": "APT-USD", "cryptocom": "APT_USD"},
+    "INJ": {"binance": "INJUSDT", "bybit": "INJUSDT", "kraken": None, "coinbase": "INJ-USD", "cryptocom": "INJ_USD"},
+    "NEAR": {"binance": "NEARUSDT", "bybit": "NEARUSDT", "kraken": None, "coinbase": "NEAR-USD", "cryptocom": "NEAR_USD"},
+    "XRP": {"binance": "XRPUSDT", "bybit": "XRPUSDT", "kraken": "XRPUSD", "coinbase": "XRP-USD", "cryptocom": "XRP_USD"},
+    "HYPE": {"binance": None, "bybit": "HYPEUSDT", "kraken": None, "coinbase": None, "cryptocom": None},
+    "SEI": {"binance": "SEIUSDT", "bybit": "SEIUSDT", "kraken": None, "coinbase": "SEI-USD", "cryptocom": "SEI_USD"},
+    "PEPE": {"binance": "PEPEUSDT", "bybit": "PEPEUSDT", "kraken": None, "coinbase": "PEPE-USD", "cryptocom": "PEPE_USD"},
+    "WIF": {"binance": "WIFUSDT", "bybit": "WIFUSDT", "kraken": None, "coinbase": None, "cryptocom": "WIF_USD"},
+    "FET": {"binance": "FETUSDT", "bybit": "FETUSDT", "kraken": None, "coinbase": "FET-USD", "cryptocom": "FET_USD"},
+    "ONDO": {"binance": "ONDOUSDT", "bybit": "ONDOUSDT", "kraken": None, "coinbase": "ONDO-USD", "cryptocom": "ONDO_USD"},
+    "TIA": {"binance": "TIAUSDT", "bybit": "TIAUSDT", "kraken": None, "coinbase": "TIA-USD", "cryptocom": "TIA_USD"},
 }
 
 # Rate limiting
@@ -174,6 +174,31 @@ def _coinbase_ticker(product_id: str) -> Optional[Dict]:
     return None
 
 
+# ─── Crypto.com ──────────────────────────────────────────────
+
+def _cryptocom_ticker(instrument_name: str) -> Optional[Dict]:
+    """Get 24h ticker from Crypto.com Exchange."""
+    data = _safe_get(
+        "https://api.crypto.com/exchange/v1/public/get-ticker",
+        {"instrument_name": instrument_name}
+    )
+    if data and isinstance(data, dict):
+        price = float(data.get("last", 0))
+        volume = float(data.get("volume", 0))
+        volume_usd = float(data.get("volume_value", 0))
+        change_pct = float(data.get("change", 0)) * 100  # API returns decimal
+        return {
+            "exchange": "crypto.com",
+            "price": price,
+            "volume_24h_usd": volume_usd if volume_usd > 0 else volume * price,
+            "price_change_pct": change_pct,
+            "high_24h": float(data.get("high", 0)),
+            "low_24h": float(data.get("low", 0)),
+            "open_interest": float(data.get("open_interest", 0)),
+        }
+    return None
+
+
 # ─── Aggregation ──────────────────────────────────────────────
 
 class ExchangeAggregator:
@@ -225,6 +250,12 @@ class ExchangeAggregator:
             ticker = _coinbase_ticker(symbols["coinbase"])
             if ticker:
                 results["coinbase"] = ticker
+
+        # Crypto.com
+        if symbols.get("cryptocom"):
+            ticker = _cryptocom_ticker(symbols["cryptocom"])
+            if ticker:
+                results["crypto.com"] = ticker
 
         if not results:
             return None
