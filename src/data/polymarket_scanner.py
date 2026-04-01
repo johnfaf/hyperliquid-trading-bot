@@ -163,7 +163,7 @@ class PolymarketScanner:
         self.min_liquidity_threshold = self.config.get("min_liquidity_threshold", 5000)  # $5k
 
         # Detection thresholds
-        self.odds_movement_threshold_1h = self.config.get("odds_movement_1h", 0.02)  # 2% (for 3-min scans)
+        self.odds_movement_threshold_1h = self.config.get("odds_movement_1h", 0.005)  # 0.5% (for 3-min scans)
         self.odds_movement_threshold_24h = self.config.get("odds_movement_24h", 0.10)  # 10%
         self.smart_money_volume_threshold = self.config.get("smart_money_volume_threshold", 50000)  # $50k
 
@@ -472,7 +472,13 @@ class PolymarketScanner:
                 continue
 
         self._movements_detected = len(movements)
-        logger.info(f"Detected {len(movements)} odds movements")
+        cached_count = len(self._price_cache)
+        compared_count = sum(1 for m in markets if m.token_id in self._price_cache)
+        logger.info(
+            f"Detected {len(movements)} odds movements "
+            f"(cached={cached_count}, compared={compared_count}/{len(markets)}, "
+            f"threshold={self.odds_movement_threshold_1h:.3f})"
+        )
 
         return movements
 
@@ -622,7 +628,7 @@ class PolymarketScanner:
                 continue
 
             # Skip low confidence smart money signals
-            if movement.smart_money_score < 0.3:
+            if movement.smart_money_score < 0.15:
                 continue
 
             # Determine signal direction

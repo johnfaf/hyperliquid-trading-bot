@@ -739,14 +739,32 @@ def _run_copy_trading(container, regime_data):
             for t in copy_executed:
                 tg.notify_trade_opened(t, source="copy")
         if container.live_trader and copy_executed:
+            from src.signals.signal_schema import TradeSignal, signal_from_copy_trade
             for t in copy_executed:
                 try:
-                    live_result = container.live_trader.execute_signal(t)
+                    # Convert dict → TradeSignal if needed (live_trader expects TradeSignal)
+                    if isinstance(t, dict):
+                        sig = signal_from_copy_trade(
+                            trader_address=t.get("trader_address", t.get("trader", "")),
+                            coin=t.get("coin", ""),
+                            side=t.get("side", "long"),
+                            entry_price=float(t.get("entry_price", 0)),
+                            confidence=float(t.get("confidence", 0.6)),
+                        )
+                        # Carry over any extra fields
+                        if t.get("leverage"):
+                            sig.leverage = float(t["leverage"])
+                        if t.get("position_pct"):
+                            sig.position_pct = float(t["position_pct"])
+                    else:
+                        sig = t
+                    live_result = container.live_trader.execute_signal(sig)
                     if live_result:
                         logger.info(
                             "  LIVE COPY: %s %s %s",
                             live_result.get("status", "?"),
-                            t.get("coin", "?"), t.get("side", "?"),
+                            sig.coin if hasattr(sig, "coin") else t.get("coin", "?"),
+                            sig.side.value if hasattr(sig, "side") else t.get("side", "?"),
                         )
                 except Exception as exc:
                     logger.warning("  Live copy execution error: %s", exc)
