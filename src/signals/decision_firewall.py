@@ -45,8 +45,8 @@ class DecisionFirewall:
         # Risk limits
         self.max_risk_per_trade = cfg.get("max_risk_per_trade", 0.01)   # 1% of portfolio
         self.max_total_risk = cfg.get("max_total_risk", 0.05)           # 5% total
-        self.max_positions = cfg.get("max_positions", 5)
-        self.max_per_coin = cfg.get("max_per_coin", 2)                  # Max 2 positions per coin
+        self.max_positions = cfg.get("max_positions", 8)
+        self.max_per_coin = cfg.get("max_per_coin", 3)                  # Max 3 positions per coin
         self.max_leverage = cfg.get("max_leverage", 5)
         self.min_confidence = cfg.get("min_confidence", 0.3)            # Reject below 30%
         self.min_source_accuracy = cfg.get("min_source_accuracy", 0.0)  # 0 = no filter
@@ -57,7 +57,7 @@ class DecisionFirewall:
         # we need a hard cap on total notional exposure across ALL positions
         # Exposure cap: 8% position × 5x leverage = 40% notional per trade.
         # Two concurrent trades = 80%.  60% cap allows 1–2 leveraged positions.
-        self.max_aggregate_exposure_pct = cfg.get("max_aggregate_exposure", 0.60)  # 60% of balance
+        self.max_aggregate_exposure_pct = cfg.get("max_aggregate_exposure", 0.80)  # 80% of balance
 
         # Predictive regime forecaster for dynamic de-risking
         self.enable_predictive_derisk = cfg.get("enable_predictive_derisk", True)

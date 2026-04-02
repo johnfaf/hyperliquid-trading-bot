@@ -257,6 +257,41 @@ def run_trading_cycle(container, cycle_count: int) -> None:
                 top_strategies.append(synthetic)
             logger.info("  Injected %d Polymarket signals", len(polymarket_signals))
 
+        # Inject high-conviction options flow as synthetic strategies
+        # (Phase 4a2 still handles direct trades; this feeds the decision engine too)
+        if container.options_scanner:
+            convictions = getattr(container.options_scanner, "top_convictions", None) or []
+            injected_options = 0
+            for conv in convictions:
+                if conv.get("conviction_pct", 0) < 70:
+                    continue
+                direction = conv.get("direction", "bullish")
+                side = "long" if direction == "bullish" else "short"
+                synthetic = {
+                    "id": None,
+                    "name": f"options_flow_{conv.get('ticker', 'UNK')}_{side}",
+                    "strategy_type": "options_momentum",
+                    "trader_address": "options_flow",
+                    "current_score": conv.get("conviction_pct", 70) / 100.0,
+                    "confidence": conv.get("conviction_pct", 70) / 100.0,
+                    "direction": side,
+                    "side": side,
+                    "source": "options_flow",
+                    "parameters": {
+                        "coins": [conv.get("ticker", "BTC")],
+                    },
+                    "metrics": {},
+                    "metadata": {
+                        "net_flow": conv.get("net_flow", 0),
+                        "total_prints": conv.get("total_prints", 0),
+                        "conviction_pct": conv.get("conviction_pct", 0),
+                    },
+                }
+                top_strategies.append(synthetic)
+                injected_options += 1
+            if injected_options:
+                logger.info("  Injected %d options flow signals into decision engine", injected_options)
+
         # Check existing positions
         closed = container.paper_trader.check_open_positions() if container.paper_trader else []
         if closed:
@@ -771,13 +806,14 @@ def _run_copy_trading(container, regime_data):
 
 
 def _process_closed_trades(container, closed):
-    """Phase 4c: feed outcomes to arena, agent scorer, shadow tracker."""
+    """Phase 4c: feed outcomes to arena, agent scorer, shadow tracker, AND Kelly sizer."""
     for c_trade in closed:
         try:
             stype = c_trade.get("strategy_type", "unknown")
             pnl = c_trade.get("pnl", 0)
             entry = c_trade.get("entry_price", 1)
             size = c_trade.get("size", 0)
+            leverage = c_trade.get("leverage", 1)
             notional = entry * max(size, 1e-8)
             return_pct = pnl / max(notional, 1)
 
@@ -785,6 +821,28 @@ def _process_closed_trades(container, closed):
                 container.arena.record_trade_for_strategy(stype, pnl, return_pct)
 
             _record_shadow_trade(container, c_trade, pnl, return_pct, entry)
+
+            # Kelly sizer: feed trade outcomes so it can compute win_rate + reward/risk
+            if container.kelly_sizer:
+                try:
+                    # Use strategy_type as key; copy trades get source-specific key
+                    meta = c_trade.get("metadata") or {}
+                    source = meta.get("source", "")
+                    if source == "copy_trade":
+                        kelly_key = f"copy_trade:{c_trade.get('trader_address', 'unknown')}"
+                    elif source == "options_flow":
+                        kelly_key = f"options_flow:{c_trade.get('coin', 'UNK')}"
+                    else:
+                        kelly_key = stype or "unknown"
+                    container.kelly_sizer.record_outcome(
+                        strategy_key=kelly_key,
+                        pnl=pnl,
+                        entry_price=entry,
+                        size=max(size, 1e-8),
+                        leverage=max(leverage, 1),
+                    )
+                except Exception:
+                    pass
 
             # AgentScorer outcome
             if container.agent_scorer:

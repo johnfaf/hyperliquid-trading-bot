@@ -47,7 +47,7 @@ class SignalProcessor:
         #          "block_both" (if opposing, skip the coin entirely)
 
         # ─── Compression ────────────────────────────────
-        self.max_signals_out = cfg.get("max_signals_out", 5)
+        self.max_signals_out = cfg.get("max_signals_out", 8)
 
         # Stats
         self.stats = {
@@ -77,8 +77,8 @@ class SignalProcessor:
         if not strategies:
             return []
 
-        # Step 1: Cull garbage
-        survivors = self._cull(strategies)
+        # Step 1: Cull garbage (regime-aware)
+        survivors = self._cull(strategies, regime_data=regime_data)
         culled_count = len(strategies) - len(survivors)
         self.stats["culled"] += culled_count
         if culled_count > 0:
@@ -130,24 +130,39 @@ class SignalProcessor:
 
     # ─── Step 1: Culling ────────────────────────────────────────
 
-    def _cull(self, strategies: List[Dict]) -> List[Dict]:
+    def _cull(self, strategies: List[Dict],
+              regime_data: Optional[Dict] = None) -> List[Dict]:
         """
         Remove strategies that shouldn't exist:
           - Score below threshold (after enough trades to judge)
           - concentrated_bet with sub-0.85 confidence
           - Unknown/empty strategy types
+
+        Regime-aware: in ranging markets, lower the cull bar for
+        mean_reversion and delta_neutral strategies (they thrive in chop).
         """
         survivors = []
+        regime = (regime_data or {}).get("overall_regime", "")
+        is_ranging = "rang" in regime.lower() if regime else False
+
+        # Ranging-friendly strategy types get a lower cull threshold
+        _RANGING_FAVORED = {"mean_reversion", "delta_neutral", "grid", "market_making",
+                            "mean_reversion_short", "mean_reversion_long"}
 
         for s in strategies:
             strategy_type = s.get("strategy_type", s.get("type", ""))
             score = s.get("current_score", 0)
             trade_count = s.get("trade_count", 0)
 
+            # Dynamic threshold: softer for ranging-favored strategies in ranging regime
+            threshold = self.min_score_threshold
+            if is_ranging and strategy_type in _RANGING_FAVORED:
+                threshold *= 0.6  # 0.50 → 0.30 effectively
+
             # Kill strategies with enough history but poor performance
-            if trade_count >= self.min_trades_for_cull and score < self.min_score_threshold:
+            if trade_count >= self.min_trades_for_cull and score < threshold:
                 logger.debug(f"Culled {strategy_type} (score={score:.2f}, "
-                           f"trades={trade_count}) — below threshold")
+                           f"trades={trade_count}) — below threshold {threshold:.2f}")
                 continue
 
             # concentrated_bet requires high conviction by definition
