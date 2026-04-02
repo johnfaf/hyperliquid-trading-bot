@@ -1,290 +1,173 @@
 # Railway Deployment Guide
 
-## Overview
+## Prerequisites
 
-Your bot is ready to deploy to Railway with all the fixes applied. This guide explains:
-1. How to push the code
-2. How to set up Railway for persistent data
-3. What happens on redeploy
+- A Railway account with a project created
+- Git repo pushed to GitHub (Railway auto-deploys from pushes)
+- The bot runs from the `Dockerfile` at the repo root
 
----
-
-## Step 1: Push Code to Railway
-
-From your local machine:
+## 1. Push Code
 
 ```bash
 cd "hyperliquid trading bot"
 git push origin main
 ```
 
-This pushes 3 commits:
-- `65ca309` - Fix coin persistence + wallet_fills schema
-- `bc8695f` - Persist golden wallets + fills across redeploys
-- `4d0b9e2` - Fix zero-trade bug (signal funnel, exposure cap, cache, logging)
+Railway auto-detects the Dockerfile and triggers a build.
 
-Railway will auto-detect the push and trigger a deploy (if auto-deploy is enabled).
+## 2. Add a Persistent Volume
 
----
+Without a volume, the SQLite database and all discovered trader/strategy data get wiped on every redeploy.
 
-## Step 2: Set Up Railway Volume for Persistent Data
+In the Railway dashboard:
 
-**Critical:** Without a volume, your accumulated trader/strategy data gets wiped on every redeploy.
-
-### In Railway Dashboard:
-
-1. Go to your service → **Settings** → **Volumes**
-2. Click **+ Add Volume**
-3. Create volume named `data` with mount path `/app/data`
+1. Go to your service, then Settings, then Volumes.
+2. Click Add Volume.
+3. Set the mount path to `/data`.
 
 ```
 Volume name: data
-Mount path: /app/data
+Mount path:  /data
 ```
 
-This ensures that `data/bot_backup.json` (your backup file) survives container restarts.
+The bot auto-detects `/data` at startup. When the volume is writable, `DB_PATH` resolves to `/data/bot.db` and backups go to `/data/bot_backup.json`.
 
-### How It Works:
+## 3. Set Environment Variables
 
-```
-Bot lifecycle on Railway:
-┌─────────────────────────────────────────────────────────────┐
-│ 1. Container starts                                         │
-│    ↓                                                         │
-│ 2. Bot loads → restore_from_json()                          │
-│    Checks for /app/data/bot_backup.json                     │
-│    If exists: restores all traders, golden wallets, fills   │
-│    If missing: starts fresh                                 │
-│    ↓                                                         │
-│ 3. Bot runs normally                                         │
-│    Every cycle: backup_to_json() saves state                │
-│    ↓                                                         │
-│ 4. Railway redeploy (push new code or restart)              │
-│    SIGTERM signal sent                                      │
-│    Signal handler: backup_to_json() runs before exit        │
-│    Container killed                                         │
-│    ↓                                                         │
-│ 5. New container starts                                     │
-│    Volume mounted at /app/data                              │
-│    backup file persists → RESTORE → data recovered          │
-│    ↓                                                         │
-│ 6. Bot resumes with all old data intact                     │
-└─────────────────────────────────────────────────────────────┘
-```
-
----
-
-## Step 3: Configure Environment Variables
-
-In Railway **Settings** → **Variables**, add:
+In Settings, then Variables:
 
 ```
-DB_BACKUP_DIR=/app/data
-HL_BOT_BACKUP=/app/data/bot_backup.json
+# Required for persistence (auto-detected if /data is writable, but explicit is safer)
+HL_BOT_DB=/data/bot.db
+
+# Optional overrides
+TRADING_CYCLE_INTERVAL=300         # 5 min (lower for more frequent trading)
+DISCOVERY_CYCLE_INTERVAL=86400     # 24h
+LOG_FORMAT=json                     # structured logs for Railway log viewer
 ```
 
-Optional (for Hyperliquid API):
-```
-HL_API_KEY=your_key_here
-HL_API_SECRET=your_secret_here
-PAPER_TRADING_INITIAL_BALANCE=10000
-```
+No API keys are required for the research/paper-trading features. Hyperliquid's public info endpoint is unauthenticated.
 
----
-
-## Step 4: Monitor Deployment
-
-### Check Logs:
+Optional keys for enhanced features:
 
 ```
-Railway Dashboard → Logs tab
+ARKHAM_API_KEY=...          # Arkham Intelligence smart-money flow
+TELEGRAM_BOT_TOKEN=...     # Telegram alerts
+TELEGRAM_CHAT_ID=...       # Telegram chat for notifications
 ```
 
-Look for:
+## 4. How Persistence Works
 
-**Good signs:**
 ```
-✓ DB restore complete: 150 traders, 25 golden wallets, 500+ fills restored
-✓ Restored DB from backup (post-deploy recovery)
-→ EXECUTING 2 trade(s) this cycle
+Container starts
+  │
+  ▼
+boot.py → init_db() → restore_from_json(/data/bot_backup.json)
+  │   If backup exists and DB is empty: restores traders, golden wallets,
+  │   fills, strategies, experiments.
+  │   If no backup: starts fresh.
+  │
+  ▼
+Bot runs normally
+  │   Every cycle: backup_to_json() saves state to /data/bot_backup.json
+  │
+  ▼
+Redeploy triggered (git push or manual restart)
+  │   SIGTERM → signal handler calls backup_to_json() before exit
+  │   Container killed
+  │
+  ▼
+New container starts
+  │   Volume still mounted at /data with bot_backup.json intact
+  │   restore_from_json() recovers all data
+  │
+  ▼
+Bot resumes with full history
 ```
 
-**Bad signs:**
-```
-✗ Restore failed: No backup found
-✗ No trade this cycle (missing asset symbol)
-```
+The backup includes: traders, golden wallets, wallet fills, strategies, strategy scores, experiments, and the paper account.
 
-### Health Check:
+## 5. Health Check
 
-Railway pings `/api/health` every 30 seconds. If it fails 3 times in a row, Railway marks the service unhealthy.
+The Dockerfile configures a health check that pings `http://localhost:8080/api/health` every 30 seconds. Railway marks the service unhealthy after 3 consecutive failures.
 
-Check in Logs:
+Check the Logs tab for:
+
 ```
 GET /api/health 200 OK
 ```
 
----
+## 6. Verifying a Deploy
 
-## What the Fixes Do
-
-### 1. **Zero-Trade Bug Fix** (commit `4d0b9e2`)
-
-**Problem:** Bot was executing 0 trades per cycle despite identifying 500+ strategies.
-
-**Root cause:** Decision engine blocked strategies with missing `coins` field, firewall rejected due to 30% exposure cap, API cache had 0% hit rate.
-
-**Fixes:**
-- Decision engine coin fallback: infers coins from metrics or strategy type
-- Exposure cap: 30% → 60% to allow 1-2 leveraged positions
-- Cache TTLs: increased 5-10x so strategies identified in one phase can be used by another
-- Regime detector: now also activates swing_trading + concentrated_bet in ranging markets
-
-**Result:** Bot should now execute 1-3 trades per cycle instead of 0.
-
-### 2. **Data Persistence** (commit `bc8695f`)
-
-**Problem:** SQLite DB lives on ephemeral filesystem. Every Railway redeploy wipes all discovered traders, golden wallets, strategy scores.
-
-**Solution:**
-- `backup_to_json()`: saves to `/app/data/bot_backup.json` (persistent volume)
-- `restore_from_json()`: on startup, restores all tables if empty
-- Signal handler: on SIGTERM (redeploy), backs up before exit
-- Includes golden wallets + wallet_fills (the most expensive data to regenerate)
-
-**Result:** Your research survives redeploys. You don't restart from scratch.
-
-### 3. **Schema Fix** (commit `65ca309`)
-
-**Problem:** Decision engine didn't persist coins → coin field was "unknown" downstream.
-
-**Solution:** Always persist resolved coins back into `parameters` dict.
-
-**Result:** Strategies with metrics fallback coin now work correctly.
-
----
-
-## Data Flow During Redeploy
+After pushing, watch the logs for these milestones:
 
 ```
-BEFORE REDEPLOY:
-  Bot running → every cycle: backup_to_json() writes to disk
-  150 traders, 25 golden wallets, 500 strategy scores, etc.
+[boot] Dependency Boot Report
+  ✓ core       READY
+  ✓ backtester READY
+  ...
 
-REDEPLOY TRIGGERED:
-  git push main → Railway detects → pulls new code → kills container
-  Signal handler catches SIGTERM → backup_to_json() (one final save)
-  Container exits
+[database] Restored DB from backup: N traders, M golden wallets, K fills
 
-NEW CONTAINER:
-  Bot starts → restore_from_json() reads /app/data/bot_backup.json
-  Restores ALL traders, bots, golden wallets, fills, etc.
-  DB is full again → ready to trade
-
-RESULT:
-  Zero lost data. Bot picks up where it left off.
+[trading_cycle] Phase 1: Regime Detection
+[trading_cycle] Phase 2: Strategy Scoring (N strategies)
+[trading_cycle] Phase 3: Signal Processing
+[trading_cycle] EXECUTING X trade(s) this cycle
 ```
 
----
+If you see `EXECUTING 0 trade(s)` on every cycle after the first few hours, run `python scripts/diagnose_rejections.py` locally to identify which firewall check is blocking signals.
 
-## Troubleshooting
+## 7. Monitoring
 
-### Bot starts but "NO TRADE" every cycle
+### Key Metrics to Watch
 
-**Check logs for:**
-```
-→ NO TRADE this cycle (no candidates)
-Signal funnel: 500 strategies → 0 candidates
-```
+- **Trades per cycle**: Should be 0-3. Sustained 0 after bootstrap means the pipeline is too restrictive.
+- **Firewall pass rate**: Visible in the dashboard at `/`. Healthy range: 5-20% of signals.
+- **Paper PnL**: Track via `python main.py --status` or the dashboard.
+- **Discovery cycle**: Should log new traders every 24h. If stuck at 0 traders, check API rate limits.
 
-This suggests:
-- All strategies were culled (score too low)
-- All strategies had missing coins (unlikely if you're up to date)
-- Regime is set to "pause all trading"
+### Log Queries (Railway Log Viewer)
 
-**Fix:** Check `regime_detector.py` — verify ranging/trending detection is working.
+Search for:
 
-### "Backup failed" in logs
+- `EXECUTING` — trades taken this cycle
+- `signal_rejected` — firewall rejections (audit trail)
+- `golden_wallet_connected` — new golden wallets found
+- `bot_detected` — traders flagged as bots
+- `CRASH REGIME` — predictive de-risking activated
 
-```
-Backup failed: [Errno 13] Permission denied: '/app/data/bot_backup.json'
-```
+## 8. Troubleshooting
 
-**Fix:** Volume not mounted. Go to Railway Settings → Volumes, ensure `data` volume exists at `/app/data`.
+### "Backup failed: Permission denied"
 
-### Restore says "DB already has data"
+Volume not mounted. Go to Settings, then Volumes, and verify `/data` exists.
 
-```
-No backup snapshot found, starting fresh
-```
+### "No backup snapshot found, starting fresh"
 
-This is normal on first deploy. Subsequent redeploys will restore.
+Normal on first deploy. Subsequent redeploys restore from the backup.
+
+### "MISSING websocket, eth_account"
+
+The Dockerfile installs from `requirements.txt` which includes these. If you see this locally, run `pip install -r requirements.txt`.
 
 ### Data lost after redeploy
 
-**Likely cause:** Volume not mounted. Check Railway Settings → Volumes.
+The volume wasn't mounted before the first cycle ran. Add the volume, then either:
 
-**Workaround:** Commit backup as seed file:
-```bash
-git add -f data/bot_backup.json
-git commit -m "Seed data for fresh deployments"
-git push origin main
-```
+- Wait for the next discovery cycle to rebuild, or
+- Seed with sample data: `python scripts/seed_and_replay.py --seed-only`
 
-Then the repo itself carries the seed data (though it gets large over time).
+### Bot stuck at "0 strategies"
 
----
+The discovery cycle runs every 24h by default. For faster bootstrap, set `DISCOVERY_CYCLE_INTERVAL=3600` (1h) temporarily, or run `python main.py --bootstrap` locally and push the seeded DB.
 
-## Monitoring Checklist
+## 9. File Paths on Railway
 
-After deploy, verify in logs:
-
-- [ ] `Restored DB from backup` (means restore ran)
-- [ ] `EXECUTING 1-3 trade(s)` (zero-trade bug fixed)
-- [ ] No `permission denied` errors (volume mounted)
-- [ ] Signal handler registered (ready for graceful shutdown)
-- [ ] Cache hit rate increasing (should go from 0% to 20-40%)
-
----
-
-## What's Running Now
-
-```
-main branch:
-  4d0b9e2 ← Signal funnel + exposure cap + cache fixes
-  bc8695f ← Data persistence (backup/restore)
-  65ca309 ← Coin persistence fix
-
-ready to push to Railway
-```
-
----
-
-## Next Steps
-
-1. **Push code:**
-   ```bash
-   git push origin main
-   ```
-
-2. **Add volume in Railway:**
-   - Settings → Volumes → Add `/app/data`
-
-3. **Wait for deploy:**
-   - Check Logs tab
-   - Verify "EXECUTING X trade(s)" in logs
-
-4. **Monitor for 1-2 cycles:**
-   - Ensure backup/restore working
-   - Check API cache hit rate improving
-   - Verify trades executing
-
----
-
-## Questions?
-
-All the backup/restore logic is in:
-- `src/database.py` → `backup_to_json()`, `restore_from_json()`
-- `main.py` → signal handler (search for `SIGTERM`)
-
-The bot will automatically save state every cycle, so your research data is always safe.
+| Path | Contents | Persistent? |
+|------|----------|-------------|
+| `/app/` | Application code (from Dockerfile COPY) | No (rebuilt each deploy) |
+| `/data/bot.db` | SQLite database | Yes (volume) |
+| `/data/bot_backup.json` | JSON backup for recovery | Yes (volume) |
+| `/app/logs/` | Log files | No (use Railway log viewer) |
+| `/app/reports/` | Generated reports | No (view via dashboard) |
+| `/app/models/` | ML models (XGBoost) | No (retrained from DB data) |

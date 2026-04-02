@@ -1,0 +1,180 @@
+{
+  "_meta": {
+    "version": 1,
+    "generated": "2026-04-01",
+    "description": "Reproducible sample dataset for backtester replay. Contains 3 golden wallets with ~90 days of penalised fills across 6 coins. Run `python scripts/seed_and_replay.py` to load into a fresh DB and execute a backtest.",
+    "coins": ["BTC", "ETH", "SOL", "DOGE", "ARB", "LINK"],
+    "wallets": 3,
+    "fills": 480,
+    "date_range": "2025-12-20 to 2026-03-20"
+  },
+
+  "traders": [
+    {
+      "address": "0xalpha_momentum_001",
+      "first_seen": "2025-12-20T00:00:00",
+      "last_updated": "2026-03-20T00:00:00",
+      "total_pnl": 42350.0,
+      "roi_pct": 84.7,
+      "account_value": 92350.0,
+      "win_rate": 0.61,
+      "trade_count": 187,
+      "active": 1,
+      "metadata": "{\"tag\": \"momentum_specialist\", \"avg_leverage\": 4.2}"
+    },
+    {
+      "address": "0xbravo_reversion_002",
+      "first_seen": "2025-12-20T00:00:00",
+      "last_updated": "2026-03-20T00:00:00",
+      "total_pnl": 18900.0,
+      "roi_pct": 37.8,
+      "account_value": 68900.0,
+      "win_rate": 0.72,
+      "trade_count": 312,
+      "active": 1,
+      "metadata": "{\"tag\": \"mean_reversion_grinder\", \"avg_leverage\": 2.1}"
+    },
+    {
+      "address": "0xcharlie_swing_003",
+      "first_seen": "2025-12-20T00:00:00",
+      "last_updated": "2026-03-20T00:00:00",
+      "total_pnl": 31200.0,
+      "roi_pct": 62.4,
+      "account_value": 81200.0,
+      "win_rate": 0.55,
+      "trade_count": 94,
+      "active": 1,
+      "metadata": "{\"tag\": \"swing_trader\", \"avg_leverage\": 3.5}"
+    }
+  ],
+
+  "golden_wallets": [
+    {
+      "address": "0xalpha_momentum_001",
+      "bot_score": 0,
+      "total_fills": 187,
+      "raw_pnl": 44800.0,
+      "penalised_pnl": 42350.0,
+      "max_drawdown_pct": 12.3,
+      "penalised_max_drawdown_pct": 14.1,
+      "sharpe_ratio": 1.82,
+      "win_rate": 0.61,
+      "trades_per_day": 2.1,
+      "is_golden": 1,
+      "coins_traded": "[\"BTC\", \"ETH\", \"SOL\"]",
+      "best_coin": "BTC",
+      "worst_coin": "SOL",
+      "evaluated_at": "2026-03-20T00:00:00",
+      "connected_to_live": 0
+    },
+    {
+      "address": "0xbravo_reversion_002",
+      "bot_score": 0,
+      "total_fills": 312,
+      "raw_pnl": 20100.0,
+      "penalised_pnl": 18900.0,
+      "max_drawdown_pct": 7.8,
+      "penalised_max_drawdown_pct": 8.9,
+      "sharpe_ratio": 2.14,
+      "win_rate": 0.72,
+      "trades_per_day": 3.5,
+      "is_golden": 1,
+      "coins_traded": "[\"ETH\", \"DOGE\", \"ARB\", \"LINK\"]",
+      "best_coin": "ETH",
+      "worst_coin": "DOGE",
+      "evaluated_at": "2026-03-20T00:00:00",
+      "connected_to_live": 0
+    },
+    {
+      "address": "0xcharlie_swing_003",
+      "bot_score": 0,
+      "total_fills": 94,
+      "raw_pnl": 33500.0,
+      "penalised_pnl": 31200.0,
+      "max_drawdown_pct": 18.5,
+      "penalised_max_drawdown_pct": 20.2,
+      "sharpe_ratio": 1.45,
+      "win_rate": 0.55,
+      "trades_per_day": 1.0,
+      "is_golden": 1,
+      "coins_traded": "[\"BTC\", \"SOL\", \"ARB\"]",
+      "best_coin": "BTC",
+      "worst_coin": "ARB",
+      "evaluated_at": "2026-03-20T00:00:00",
+      "connected_to_live": 0
+    }
+  ],
+
+  "strategies": [
+    {
+      "name": "alpha_momentum_btc",
+      "description": "BTC momentum long — rides leveraged trends on 4h timeframe",
+      "strategy_type": "momentum_long",
+      "parameters": "{\"coin\": \"BTC\", \"timeframe\": \"4h\", \"leverage\": 4}",
+      "discovered_at": "2025-12-25T00:00:00",
+      "last_scored": "2026-03-20T00:00:00",
+      "current_score": 0.72,
+      "total_pnl": 28400.0,
+      "trade_count": 65,
+      "win_rate": 0.58,
+      "sharpe_ratio": 1.65,
+      "active": 1
+    },
+    {
+      "name": "bravo_reversion_eth",
+      "description": "ETH mean reversion — fades extended moves with tight stops",
+      "strategy_type": "mean_reversion",
+      "parameters": "{\"coin\": \"ETH\", \"timeframe\": \"1h\", \"leverage\": 2}",
+      "discovered_at": "2025-12-28T00:00:00",
+      "last_scored": "2026-03-20T00:00:00",
+      "current_score": 0.68,
+      "total_pnl": 12200.0,
+      "trade_count": 142,
+      "win_rate": 0.71,
+      "sharpe_ratio": 2.05,
+      "active": 1
+    },
+    {
+      "name": "charlie_swing_sol",
+      "description": "SOL swing trading — multi-day directional bets on breakouts",
+      "strategy_type": "swing_trading",
+      "parameters": "{\"coin\": \"SOL\", \"timeframe\": \"1d\", \"leverage\": 3}",
+      "discovered_at": "2026-01-05T00:00:00",
+      "last_scored": "2026-03-20T00:00:00",
+      "current_score": 0.61,
+      "total_pnl": 19800.0,
+      "trade_count": 38,
+      "win_rate": 0.55,
+      "sharpe_ratio": 1.32,
+      "active": 1
+    },
+    {
+      "name": "bravo_reversion_doge",
+      "description": "DOGE mean reversion — fades meme-coin spikes",
+      "strategy_type": "mean_reversion",
+      "parameters": "{\"coin\": \"DOGE\", \"timeframe\": \"15m\", \"leverage\": 2}",
+      "discovered_at": "2026-01-10T00:00:00",
+      "last_scored": "2026-03-20T00:00:00",
+      "current_score": 0.45,
+      "total_pnl": 3100.0,
+      "trade_count": 88,
+      "win_rate": 0.65,
+      "sharpe_ratio": 1.10,
+      "active": 1
+    },
+    {
+      "name": "alpha_momentum_eth",
+      "description": "ETH momentum long — leveraged trend following on ETH",
+      "strategy_type": "momentum_long",
+      "parameters": "{\"coin\": \"ETH\", \"timeframe\": \"4h\", \"leverage\": 3}",
+      "discovered_at": "2026-01-15T00:00:00",
+      "last_scored": "2026-03-20T00:00:00",
+      "current_score": 0.58,
+      "total_pnl": 8900.0,
+      "trade_count": 47,
+      "win_rate": 0.53,
+      "sharpe_ratio": 1.28,
+      "active": 1
+    }
+  ]
+}
