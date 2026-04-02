@@ -236,7 +236,7 @@ canvas{width:100%!important;height:200px!important}
 <body>
 <div style="display:flex;justify-content:space-between;align-items:center">
 <div><h1>HYPERLIQUID RESEARCH BOT</h1>
-<p class="subtitle">Live Simulation Dashboard &mdash; <span id="update-time">loading...</span></p></div>
+<p class="subtitle">Live Simulation Dashboard &mdash; <span id="update-time">loading...</span> <span id="ws-status" style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#ff4757;margin-left:8px" title="WebSocket disconnected"></span></p></div>
 <a href="/options" style="color:#00d4aa;text-decoration:none;border:1px solid #00d4aa;padding:8px 16px;border-radius:6px;font-size:0.85em;font-weight:600">OPTIONS FLOW &rarr;</a>
 </div>
 
@@ -245,7 +245,7 @@ canvas{width:100%!important;height:200px!important}
 <div class="flex-row">
 <div class="section">
 <h2>Open Positions</h2>
-<table><thead><tr><th>Coin</th><th>Side</th><th>Entry</th><th>Size</th><th>Lev</th><th>SL</th><th>TP</th><th>Strategy</th></tr></thead>
+<table><thead><tr><th>Coin</th><th>Side</th><th>Entry</th><th>Current</th><th>Size</th><th>Lev</th><th>Unreal. PnL</th><th>SL</th><th>TP</th><th>Strategy</th></tr></thead>
 <tbody id="open-trades"></tbody></table>
 </div>
 </div>
@@ -329,7 +329,54 @@ canvas{width:100%!important;height:200px!important}
 </div>
 
 <script>
+// WebSocket live price feed
+let livePrices = {};
+let ws = null;
+let wsReconnectTimer = null;
+
+function connectWebSocket(){
+  try {
+    ws = new WebSocket('wss://api.hyperliquid.xyz/ws');
+    ws.onopen = () => {
+      console.log('WebSocket connected');
+      document.getElementById('ws-status').style.background = '#00d4aa';
+      document.getElementById('ws-status').title = 'WebSocket connected';
+      const msg = JSON.stringify({method: 'subscribe', subscription: {type: 'allMids'}});
+      ws.send(msg);
+    };
+    ws.onmessage = (event) => {
+      try {
+        const data = JSON.parse(event.data);
+        if(data.channel === 'allMids' && data.data && data.data.mids) {
+          livePrices = data.data.mids;
+          renderOpenTrades(window.currentOpenTrades || []);
+        }
+      } catch(e) {
+        console.error('WebSocket message error:', e);
+      }
+    };
+    ws.onerror = (err) => {
+      console.error('WebSocket error:', err);
+      document.getElementById('ws-status').style.background = '#ff4757';
+      document.getElementById('ws-status').title = 'WebSocket error';
+    };
+    ws.onclose = () => {
+      console.log('WebSocket disconnected');
+      document.getElementById('ws-status').style.background = '#ff4757';
+      document.getElementById('ws-status').title = 'WebSocket disconnected';
+      clearTimeout(wsReconnectTimer);
+      wsReconnectTimer = setTimeout(connectWebSocket, 5000);
+    };
+  } catch(e) {
+    console.error('WebSocket connection error:', e);
+    document.getElementById('ws-status').style.background = '#ff4757';
+    clearTimeout(wsReconnectTimer);
+    wsReconnectTimer = setTimeout(connectWebSocket, 5000);
+  }
+}
+
 let typeChart = null;
+let liveUpdateInterval = null;
 
 function fmt(n, d=2){ return n != null ? Number(n).toLocaleString(undefined,{minimumFractionDigits:d,maximumFractionDigits:d}) : '—' }
 function fmtUsd(n){ return n != null ? '$' + fmt(n) : '—' }
@@ -353,12 +400,23 @@ function renderCards(d){
 }
 
 function renderOpenTrades(trades){
-  document.getElementById('open-trades').innerHTML = trades.length ? trades.map(t=>`
-    <tr><td>${t.coin}</td>
+  document.getElementById('open-trades').innerHTML = trades.length ? trades.map(t=>{
+    const currentPrice = livePrices[t.coin] ? parseFloat(livePrices[t.coin]) : null;
+    let unrealPnL = '—';
+    let pnlCls = '';
+    if(currentPrice) {
+      const diff = t.side === 'long' ? (currentPrice - t.entry_price) : (t.entry_price - currentPrice);
+      unrealPnL = diff * t.size * t.leverage;
+      pnlCls = unrealPnL > 0 ? 'green' : unrealPnL < 0 ? 'red' : '';
+    }
+    return `<tr><td>${t.coin}</td>
     <td><span class="badge badge-${t.side}">${t.side.toUpperCase()}</span></td>
-    <td>${fmtUsd(t.entry_price)}</td><td>${fmt(t.size,4)}</td>
-    <td>${t.leverage}x</td><td>${fmtUsd(t.stop_loss)}</td><td>${fmtUsd(t.take_profit)}</td>
-    <td>${t.strategy_id||'—'}</td></tr>`).join('') : '<tr><td colspan="8" style="color:#555">No open positions</td></tr>';
+    <td>${fmtUsd(t.entry_price)}</td><td>${currentPrice ? fmtUsd(currentPrice) : '—'}</td>
+    <td>${fmt(t.size,4)}</td><td>${t.leverage}x</td>
+    <td class="${pnlCls}">${unrealPnL !== '—' ? fmtUsd(unrealPnL) : '—'}</td>
+    <td>${fmtUsd(t.stop_loss)}</td><td>${fmtUsd(t.take_profit)}</td>
+    <td>${t.strategy_id||'—'}</td></tr>`;
+  }).join('') : '<tr><td colspan="10" style="color:#555">No open positions</td></tr>';
 }
 
 function renderStrategies(strats){
@@ -451,7 +509,9 @@ async function refresh(){
   try {
     const resp = await fetch('/api/data');
     const d = await resp.json();
-    document.getElementById('update-time').textContent = new Date().toLocaleTimeString() + ' (auto-refreshes every 30s)';
+    window.currentOpenTrades = d.open_trades;
+    const wsStatus = ws && ws.readyState === WebSocket.OPEN ? '(live prices via WebSocket)' : '(WebSocket connecting...)';
+    document.getElementById('update-time').textContent = new Date().toLocaleTimeString() + ' ' + wsStatus;
     renderCards(d);
     renderOpenTrades(d.open_trades);
     renderStrategies(d.strategies);
@@ -568,6 +628,17 @@ function renderArena(arena) {
   }).join('') : '<div style="color:#555">No consensus votes yet</div>';
 }
 
+// Connect to WebSocket for live prices
+connectWebSocket();
+
+// Live update open trades from WebSocket prices (1-2 second interval)
+liveUpdateInterval = setInterval(() => {
+  if(window.currentOpenTrades && Object.keys(livePrices).length > 0) {
+    renderOpenTrades(window.currentOpenTrades);
+  }
+}, 1500);
+
+// Full data refresh every 30 seconds
 refresh();
 setInterval(refresh, 30000);
 </script>

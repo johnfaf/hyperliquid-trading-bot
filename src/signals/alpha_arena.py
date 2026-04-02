@@ -153,9 +153,9 @@ class TournamentEngine:
     """
 
     # What % of agents get eliminated each round
-    ELIMINATION_RATE = 0.15   # Bottom 15%
+    ELIMINATION_RATE = 0.0    # No elimination — all 9 agents always compete
     PROMOTION_RATE = 0.10     # Top 10% become champions
-    MIN_AGENTS = 5            # Never drop below this
+    MIN_AGENTS = 9            # All 9 seed agents always compete
 
     def __init__(self):
         self.round_count = 0
@@ -209,24 +209,8 @@ class TournamentEngine:
                 logger.info(f"Arena PROMOTE: {agent.name} → Champion "
                            f"(fitness={agent.fitness_score:.3f}, elo={agent.elo_rating:.0f})")
 
-        # Eliminate bottom performers (but keep minimum)
-        n_eliminate = max(0, int(len(ranked) * self.ELIMINATION_RATE))
-        remaining_active = len([a for a in scoreable if a.status != AgentStatus.ELIMINATED])
-
-        for agent in ranked[-n_eliminate:]:
-            if remaining_active > self.MIN_AGENTS and agent.fitness_score < 0:
-                agent.status = AgentStatus.ELIMINATED
-                rnd.agents_eliminated += 1
-                remaining_active -= 1
-                logger.info(f"Arena ELIMINATE: {agent.name} "
-                           f"(fitness={agent.fitness_score:.3f}, trades={agent.total_trades})")
-
-        # Put borderline agents on probation
-        n_probation = max(0, int(len(ranked) * 0.20))
-        for agent in ranked[-(n_probation + n_eliminate):-n_eliminate or len(ranked)]:
-            if agent.status == AgentStatus.ACTIVE:
-                agent.status = AgentStatus.PROBATION
-                logger.debug(f"Arena PROBATION: {agent.name}")
+        # No elimination — all 9 agents compete permanently
+        # (ELIMINATION_RATE = 0.0 means no agents are eliminated)
 
         # Graduate incubating agents with enough trades
         for agent in agents:
@@ -253,20 +237,15 @@ class TournamentEngine:
 
 class CapitalAllocator:
     """
-    Dynamically redistributes capital among agents based on performance.
-    Good agents get more capital, bad agents get starved.
-
-    Uses a modified Kelly Criterion approach:
-    - Each agent gets capital proportional to their edge
-    - Champions get up to 3x base allocation
-    - Probation agents get 0.25x
-    - Incubating agents get 0.5x (enough to test, not enough to hurt)
+    Equal capital allocation for the 9 fixed arena agents.
+    Each agent receives an equal share of the total pool ($10,000 each).
+    No fitness-based weighting — agents compete on pure performance.
     """
 
-    BASE_CAPITAL = 1000.0
-    TOTAL_POOL = 50_000.0     # Total virtual capital available
-    MAX_SINGLE_AGENT = 0.25   # No single agent gets more than 25% of pool
-    MIN_ALLOCATION = 100.0    # Minimum capital for any active agent
+    BASE_CAPITAL = 10_000.0   # Each of 9 agents gets equal share
+    TOTAL_POOL = 90_000.0     # Total virtual capital: 9 agents × $10,000 each
+    MAX_SINGLE_AGENT = 0.25   # No single agent gets more than 25% of pool (not used with equal allocation)
+    MIN_ALLOCATION = 10_000.0 # Minimum capital for any active agent (not used with equal allocation)
 
     def __init__(self, total_pool: float = None):
         if total_pool:
@@ -274,7 +253,8 @@ class CapitalAllocator:
 
     def reallocate(self, agents: List[ArenaAgent]) -> Dict[str, float]:
         """
-        Redistribute capital among active agents.
+        Allocate equal capital to all 9 agents.
+        No fitness-based weighting, no status multipliers — pure equality.
         Returns dict of agent_id → new_capital.
         """
         active = [a for a in agents if a.status not in (AgentStatus.ELIMINATED,)]
@@ -282,41 +262,16 @@ class CapitalAllocator:
         if not active:
             return {}
 
-        # Status multipliers
-        status_mult = {
-            AgentStatus.CHAMPION: 3.0,
-            AgentStatus.ACTIVE: 1.0,
-            AgentStatus.PROBATION: 0.25,
-            AgentStatus.INCUBATING: 0.5,
-        }
-
-        # Compute raw weights: fitness * status_multiplier
-        weights = {}
-        for agent in active:
-            fitness = max(agent.fitness_score, 0.01)  # Floor at 0.01
-            mult = status_mult.get(agent.status, 1.0)
-            weights[agent.agent_id] = fitness * mult
-
-        total_weight = sum(weights.values())
-        if total_weight <= 0:
-            # Equal allocation
-            per_agent = self.TOTAL_POOL / len(active)
-            for agent in active:
-                agent.capital_allocated = per_agent
-            return {a.agent_id: per_agent for a in active}
-
-        # Allocate proportionally
+        # Equal allocation: each of the 9 agents gets the same capital
+        per_agent = round(self.TOTAL_POOL / len(active), 2)
         allocations = {}
-        max_cap = self.TOTAL_POOL * self.MAX_SINGLE_AGENT
 
         for agent in active:
-            raw = (weights[agent.agent_id] / total_weight) * self.TOTAL_POOL
-            capped = max(self.MIN_ALLOCATION, min(raw, max_cap))
-            agent.capital_allocated = round(capped, 2)
-            allocations[agent.agent_id] = agent.capital_allocated
+            agent.capital_allocated = per_agent
+            allocations[agent.agent_id] = per_agent
 
-        logger.info(f"Capital reallocation: {len(allocations)} agents, "
-                   f"range ${min(allocations.values()):,.0f} - ${max(allocations.values()):,.0f}")
+        logger.info(f"Capital allocation (equal): {len(allocations)} agents, "
+                   f"${per_agent:,.2f} each (total ${self.TOTAL_POOL:,.0f})")
 
         return allocations
 
@@ -1023,10 +978,10 @@ class AlphaArena:
     4. On spawn: backtest new agents on historical data → only promote survivors
     """
 
-    MAX_AGENTS = 50              # Max agents in the arena at once
+    MAX_AGENTS = 9               # Fixed at exactly 9 agents
     TOURNAMENT_INTERVAL = 5      # Run tournament every N cycles
-    SPAWN_INTERVAL = 10          # Spawn new agents every N cycles
-    SPAWN_COUNT = 5              # How many to spawn each time
+    SPAWN_INTERVAL = 0           # Disabled — no new agents spawned
+    SPAWN_COUNT = 0              # Disabled — only 9 seed agents
 
     def __init__(self):
         self.agents: Dict[str, ArenaAgent] = {}
@@ -1139,11 +1094,13 @@ class AlphaArena:
                 )
 
     def _load_agents(self):
-        """Load agents from DB (overrides seeds if they exist)."""
+        """Load agents from DB, purge non-seed agents, refill with seeds if needed."""
         try:
             conn = sqlite3.connect(config.DB_PATH)
             conn.row_factory = sqlite3.Row
             rows = conn.execute("SELECT * FROM arena_agents").fetchall()
+
+            # Load all agents from DB first
             for row in rows:
                 row = dict(row)
                 agent = ArenaAgent(
@@ -1171,8 +1128,21 @@ class AlphaArena:
                 )
                 self.agents[row["agent_id"]] = agent
             conn.close()
+
+            # Purge non-seed agents (only keep agents with IDs starting with "seed_")
+            non_seed_ids = [aid for aid in self.agents.keys() if not aid.startswith("seed_")]
+            for aid in non_seed_ids:
+                del self.agents[aid]
+                logger.info(f"Arena purged non-seed agent: {aid}")
+
             if rows:
-                logger.info(f"Loaded {len(rows)} agents from DB")
+                logger.info(f"Loaded {len(rows)} agents from DB; kept {len(self.agents)} seed agents")
+
+            # Refill with seed agents if we have fewer than 9
+            if len(self.agents) < 9:
+                self._seed_agents()
+                logger.info(f"Arena refilled to {len(self.agents)} seed agents")
+
         except Exception as e:
             logger.debug(f"Arena load: {e}")
 
@@ -1265,11 +1235,13 @@ class AlphaArena:
 
     def run_cycle(self, historical_candles: Optional[List[Dict]] = None):
         """
-        Run one arena cycle:
+        Run one arena cycle with 9 fixed agents:
         1. If tournament interval: run tournament round
-        2. If spawn interval: spawn new agents + backtest them
-        3. Reallocate capital
-        4. Save state
+        2. Reallocate capital (equal allocation)
+        3. Save state
+
+        Spawning is disabled — only the 9 seed agents exist.
+        No elimination — all 9 agents always compete.
         """
         self.cycle_count += 1
 
@@ -1278,47 +1250,10 @@ class AlphaArena:
             agents_list = list(self.agents.values())
             rnd = self.tournament.run_round(agents_list)
 
-            # Clean up eliminated agents over MAX limit
-            active_count = sum(1 for a in self.agents.values()
-                             if a.status != AgentStatus.ELIMINATED)
-            if active_count > self.MAX_AGENTS:
-                # Remove worst eliminated agents
-                eliminated = [a for a in self.agents.values()
-                            if a.status == AgentStatus.ELIMINATED]
-                eliminated.sort(key=lambda a: a.fitness_score)
-                for agent in eliminated[:active_count - self.MAX_AGENTS]:
-                    del self.agents[agent.agent_id]
+        # Spawning disabled — all 9 seed agents remain fixed
+        # (SPAWN_INTERVAL = 0 prevents this block from ever executing)
 
-        # Spawn new agents
-        if self.cycle_count % self.SPAWN_INTERVAL == 0:
-            active = [a for a in self.agents.values()
-                     if a.status != AgentStatus.ELIMINATED]
-
-            if len(active) < self.MAX_AGENTS:
-                new_agents = self.spawner.spawn_generation(
-                    active, target_count=self.SPAWN_COUNT
-                )
-
-                # Backtest new agents before adding
-                if historical_candles and len(historical_candles) >= 50:
-                    for agent in new_agents:
-                        result = self.backtester.backtest_agent(
-                            agent, historical_candles
-                        )
-                        # Only add agents that didn't lose money in backtest
-                        if result.get("total_pnl", 0) >= 0:
-                            self.agents[agent.agent_id] = agent
-                            logger.info(f"Arena added {agent.name} "
-                                       f"(backtest PnL=${result['total_pnl']:.2f})")
-                        else:
-                            logger.info(f"Arena rejected {agent.name} "
-                                       f"(backtest PnL=${result['total_pnl']:.2f})")
-                else:
-                    # No candles — add all and test live
-                    for agent in new_agents:
-                        self.agents[agent.agent_id] = agent
-
-        # Reallocate capital
+        # Reallocate capital (equal allocation to all 9 agents)
         active = [a for a in self.agents.values()
                  if a.status != AgentStatus.ELIMINATED]
         self.allocator.reallocate(active)
@@ -1327,7 +1262,7 @@ class AlphaArena:
         self._save_agents()
 
         logger.info(f"Arena cycle #{self.cycle_count}: "
-                   f"{len(self.agents)} agents "
+                   f"{len(self.agents)} agents (fixed at 9) "
                    f"({sum(1 for a in self.agents.values() if a.status == AgentStatus.CHAMPION)} champions, "
                    f"{sum(1 for a in self.agents.values() if a.status == AgentStatus.ACTIVE)} active, "
                    f"{sum(1 for a in self.agents.values() if a.status == AgentStatus.INCUBATING)} incubating)")
