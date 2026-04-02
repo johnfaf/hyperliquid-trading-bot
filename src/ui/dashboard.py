@@ -237,7 +237,11 @@ canvas{width:100%!important;height:200px!important}
 <div style="display:flex;justify-content:space-between;align-items:center">
 <div><h1>HYPERLIQUID RESEARCH BOT</h1>
 <p class="subtitle">Live Simulation Dashboard &mdash; <span id="update-time">loading...</span> <span id="ws-status" style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#ff4757;margin-left:8px" title="WebSocket disconnected"></span></p></div>
-<a href="/options" style="color:#00d4aa;text-decoration:none;border:1px solid #00d4aa;padding:8px 16px;border-radius:6px;font-size:0.85em;font-weight:600">OPTIONS FLOW &rarr;</a>
+<div style="display:flex;gap:10px">
+<a href="/options" style="color:#00d4aa;text-decoration:none;border:1px solid #00d4aa;padding:8px 16px;border-radius:6px;font-size:0.85em;font-weight:600">OPTIONS FLOW</a>
+<a href="/backtest" style="color:#94a3b8;text-decoration:none;border:1px solid #334155;padding:8px 16px;border-radius:6px;font-size:0.85em;font-weight:600">BACKTEST</a>
+<a href="/stress" style="color:#eab308;text-decoration:none;border:1px solid #eab308;padding:8px 16px;border-radius:6px;font-size:0.85em;font-weight:600">STRESS TEST</a>
+</div>
 </div>
 
 <div class="grid" id="stats-cards"></div>
@@ -767,6 +771,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
             else:
                 self._json_response({"error": "no report yet"}, code=404)
 
+        elif parsed.path == "/stress":
+            self._serve_stress_html()
+
+        elif parsed.path == "/api/stress":
+            self._serve_stress_data()
+
         elif parsed.path == "/backtest":
             self._serve_backtest_html()
 
@@ -802,6 +812,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._handle_candle_fetch()
         elif parsed.path == "/api/candle-backtest/cache/clear":
             self._handle_cache_clear()
+        elif parsed.path == "/api/stress/run":
+            self._handle_stress_run()
         else:
             self.send_response(404)
             self.end_headers()
@@ -821,6 +833,42 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._json_response({"status": "ok", **result})
         except Exception as e:
             self._json_response({"error": str(e)}, code=500)
+
+    def _serve_stress_html(self):
+        """Serve the stress test dashboard HTML."""
+        try:
+            from src.ui.stress_dashboard import STRESS_HTML
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(STRESS_HTML.encode())
+        except Exception as e:
+            self.send_response(500)
+            self.end_headers()
+            self.wfile.write(f"Stress dashboard error: {e}".encode())
+
+    def _serve_stress_data(self):
+        """Serve stress test data as JSON."""
+        try:
+            from src.ui.stress_dashboard import get_stress_dashboard_data
+            data = get_stress_dashboard_data()
+            self._json_response(data)
+        except Exception as e:
+            self._json_response({"error": str(e), "has_data": False})
+
+    def _handle_stress_run(self):
+        """Run a stress test on demand."""
+        try:
+            content_len = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(content_len)) if content_len > 0 else {}
+            scenarios = body.get("scenarios", None)
+            use_seed = body.get("use_seed", False)
+
+            from src.ui.stress_dashboard import run_stress_test
+            result = run_stress_test(scenarios=scenarios, use_seed=use_seed)
+            self._json_response(result)
+        except Exception as e:
+            self._json_response({"error": str(e), "has_data": False}, code=500)
 
     def _serve_cache_list(self):
         """Return cached candle data summary."""
@@ -1071,6 +1119,7 @@ def start_dashboard(port=None, options_scanner=None):
     logger.info("  Main dashboard:    http://0.0.0.0:%d/", port)
     logger.info("  Options flow:      http://0.0.0.0:%d/options", port)
     logger.info("  Backtest:          http://0.0.0.0:%d/backtest", port)
+    logger.info("  Stress test:       http://0.0.0.0:%d/stress", port)
     return server
 
 

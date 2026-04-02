@@ -32,6 +32,7 @@ sys.path.insert(0, str(ROOT))
 
 import config
 from src.data import database as db
+from src.discovery.golden_wallet import init_golden_tables
 
 logging.basicConfig(
     level=logging.INFO,
@@ -232,8 +233,9 @@ def seed_database():
     logger.info("Dataset: %s wallets, %d target fills, %s",
                 meta["wallets"], meta["fills"], meta["date_range"])
 
-    # Init DB schema
+    # Init DB schema (both core tables and golden wallet tables)
     db.init_db()
+    init_golden_tables()
 
     with db.get_connection() as conn:
         cur = conn.cursor()
