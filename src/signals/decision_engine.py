@@ -46,7 +46,10 @@ class DecisionEngine:
         self.w_consensus = cfg.get("w_consensus", 0.10)   # Dedup consensus boost
 
         # Minimum composite score to even consider executing
-        self.min_decision_score = cfg.get("min_decision_score", 0.30)
+        # Lowered from 0.30 → 0.20: with thin trade history the composite
+        # scores are suppressed by sample-size penalties. 0.20 lets
+        # promising-but-young strategies through for paper validation.
+        self.min_decision_score = cfg.get("min_decision_score", 0.20)
 
         # Max trades to execute per cycle (independent of position slots)
         self.max_trades_per_cycle = cfg.get("max_trades_per_cycle", 3)

@@ -53,7 +53,10 @@ class StrategyScorer:
         # a multiplicative discount that prevents high scores from thin data.
         trade_count = strategy.get("trade_count", 0)
         if trade_count < 10:
-            sample_penalty = (trade_count / 10) ** 1.5  # 5 trades = 0.35x, 8 = 0.72x
+            # Softened from exponent 1.5 → 1.0: old penalty was too harsh
+            # during bootstrap (5 trades = 0.35x killed everything).
+            # New: 5 trades = 0.50x, 3 trades = 0.30x, 8 trades = 0.80x
+            sample_penalty = (trade_count / 10) ** 1.0
             composite *= sample_penalty
             logger.debug(f"Sample-size penalty: {trade_count} trades → {sample_penalty:.2f}x")
 

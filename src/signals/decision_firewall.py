@@ -48,16 +48,27 @@ class DecisionFirewall:
         self.max_positions = cfg.get("max_positions", 8)
         self.max_per_coin = cfg.get("max_per_coin", 3)                  # Max 3 positions per coin
         self.max_leverage = cfg.get("max_leverage", 5)
-        self.min_confidence = cfg.get("min_confidence", 0.3)            # Reject below 30%
+        # Lowered from 0.30 → 0.15: during paper-trading bootstrap, most
+        # strategies have thin history so confidence is dampened by sample-size
+        # penalties.  0.15 lets early signals through for validation while still
+        # blocking truly garbage signals.  Raise back to 0.25-0.30 once the
+        # strategy DB has 50+ scored strategies with >10 trades each.
+        self.min_confidence = cfg.get("min_confidence", 0.15)
         self.min_source_accuracy = cfg.get("min_source_accuracy", 0.0)  # 0 = no filter
-        self.cooldown_seconds = cfg.get("cooldown_seconds", 300)        # 5 min between trades same coin
+        # Lowered from 300 → 60: 5-minute cooldown was blocking re-entries
+        # during paper trading when signals fire frequently on the same coin.
+        self.cooldown_seconds = cfg.get("cooldown_seconds", 60)
 
         # Portfolio-level aggregate exposure limit
         # With 2000 traders scanned and golden wallets auto-connected,
         # we need a hard cap on total notional exposure across ALL positions
         # Exposure cap: 8% position × 5x leverage = 40% notional per trade.
         # Two concurrent trades = 80%.  60% cap allows 1–2 leveraged positions.
-        self.max_aggregate_exposure_pct = cfg.get("max_aggregate_exposure", 0.80)  # 80% of balance
+        # Raised from 0.80 → 1.50: for paper trading, the 80% cap combined
+        # with 5x leverage means only ~2 positions can co-exist. 1.50 allows
+        # up to ~4-5 concurrent leveraged paper positions for better strategy
+        # evaluation.  Reduce to 0.60-0.80 for live trading.
+        self.max_aggregate_exposure_pct = cfg.get("max_aggregate_exposure", 1.50)
 
         # Predictive regime forecaster for dynamic de-risking
         self.enable_predictive_derisk = cfg.get("enable_predictive_derisk", True)

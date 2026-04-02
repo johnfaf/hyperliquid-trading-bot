@@ -33,7 +33,10 @@ class SignalProcessor:
         cfg = config or {}
 
         # ─── Culling thresholds ─────────────────────────
-        self.min_score_threshold = cfg.get("min_score_threshold", 0.50)
+        # Lowered from 0.50 → 0.30: early-stage strategies with thin sample
+        # sizes get heavily penalized by the scorer (5 trades = 0.35x), so
+        # a 0.50 bar culls nearly everything before the firewall even sees it.
+        self.min_score_threshold = cfg.get("min_score_threshold", 0.30)
         self.min_trades_for_cull = cfg.get("min_trades_for_cull", 10)
         self.concentrated_bet_min_confidence = cfg.get("concentrated_bet_min_confidence", 0.85)
 
