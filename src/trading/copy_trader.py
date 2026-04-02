@@ -246,7 +246,7 @@ class CopyTrader:
                     executed.extend(closed)
                     continue
 
-                if signal["type"] in ("copy_open", "copy_scale_in", "copy_flip"):
+                if signal["type"] in ("copy_open", "copy_scale_in", "copy_flip", "golden_copy"):
                     # Apply regime weighting to copy signal before further processing
                     signal = self._apply_regime_weight(signal, signal["coin"])
 
@@ -356,6 +356,9 @@ class CopyTrader:
                     "source_trader": signal.get("source_trader", ""),
                     "confidence": signal.get("confidence", 0),
                     "is_copy_trade": True,
+                    "is_golden": signal.get("is_golden", False),
+                    "golden_wallet": signal.get("is_golden", False),
+                    "source": "copy_trade",
                 },
             )
             logger.info(

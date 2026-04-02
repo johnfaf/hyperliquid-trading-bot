@@ -75,7 +75,7 @@ def get_dashboard_data():
 
         # Copy trades (from metadata)
         copy_trades = [dict(r) for r in conn.execute(
-            "SELECT * FROM paper_trades WHERE metadata LIKE '%copy_trade%' ORDER BY opened_at DESC LIMIT 30"
+            "SELECT * FROM paper_trades WHERE metadata LIKE '%copy_trade%' OR metadata LIKE '%golden_wallet%' ORDER BY opened_at DESC LIMIT 30"
         ).fetchall()]
 
         # Strategy type distribution
@@ -471,11 +471,14 @@ function renderCopyTrades(trades){
   document.getElementById('copy-trades').innerHTML = trades.length ? trades.slice(0,15).map(t=>{
     let meta = {};
     try { meta = JSON.parse(t.metadata || '{}'); } catch(e) {}
+    const isGolden = meta.is_golden || meta.golden_wallet;
+    const traderLabel = meta.source_trader ? `<code>${meta.source_trader}</code>${isGolden ? ' <span style="color:#ffd700;font-size:0.8em" title="Golden Wallet">★</span>' : ''}` : '—';
+    const typeLabel = meta.type || 'copy_open';
     return `<tr><td>${t.coin}</td>
     <td><span class="badge badge-${t.side}">${t.side.toUpperCase()}</span></td>
     <td>${fmtUsd(t.entry_price)}</td><td>${fmt(t.size,4)}</td>
-    <td><code>${meta.source_trader||'—'}</code></td>
-    <td><span class="badge badge-type">${t.status}</span></td>
+    <td>${traderLabel}</td>
+    <td><span class="badge badge-type">${t.status}</span> <span style="color:#555;font-size:0.75em">${typeLabel}</span></td>
     <td class="${pnlClass(t.pnl)}">${t.pnl?fmtUsd(t.pnl):'—'}</td></tr>`;
   }).join('') : '<tr><td colspan="7" style="color:#555">No copy trades yet — warming up position cache...</td></tr>';
 }

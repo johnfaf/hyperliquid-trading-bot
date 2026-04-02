@@ -97,10 +97,13 @@ def get_user_state(address: str):
     positions = []
     for pos_data in data.get("assetPositions", []):
         pos = pos_data.get("position", pos_data)
+        szi = float(pos.get("szi", 0))
+        if szi == 0:
+            continue  # Skip flat/zero positions entirely — no side to assign
         positions.append({
             "coin": pos.get("coin", ""),
-            "side": "long" if float(pos.get("szi", 0)) > 0 else "short",
-            "size": abs(float(pos.get("szi", 0))),
+            "side": "long" if szi > 0 else "short",
+            "size": abs(szi),
             "entry_price": float(pos.get("entryPx", 0)),
             "leverage": float(pos.get("leverage", {}).get("value", 1)) if isinstance(pos.get("leverage"), dict) else float(pos.get("leverage", 1)),
             "unrealized_pnl": float(pos.get("unrealizedPnl", 0)),
