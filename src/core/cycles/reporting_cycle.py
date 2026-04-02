@@ -151,6 +151,19 @@ def run_reporting(container, cycle_count: int, health_registry=None) -> None:
         except Exception:
             pass
 
+    # ── Machine-readable health report for Claude monitoring ──
+    try:
+        from src.core.health_reporter import write_health_report
+        # Grab regime_data from container if available
+        regime_data = getattr(container, "_last_regime_data", None)
+        write_health_report(
+            container, cycle_count,
+            health_registry=health_registry,
+            regime_data=regime_data,
+        )
+    except Exception as exc:
+        logger.debug("  Health report error: %s", exc)
+
 
 def _log_module_stats(container):
     """Log V2.5+ module statistics."""

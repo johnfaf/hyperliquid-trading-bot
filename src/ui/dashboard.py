@@ -683,6 +683,16 @@ class DashboardHandler(BaseHTTPRequestHandler):
         elif parsed.path == "/api/health":
             self._json_response({"status": "ok", "timestamp": datetime.utcnow().isoformat()})
 
+        elif parsed.path == "/api/health_report":
+            # Full structured health report for Claude monitoring
+            import os, json as _json
+            report_path = "/data/health_report.json"
+            if os.path.exists(report_path):
+                with open(report_path) as f:
+                    self._json_response(_json.load(f))
+            else:
+                self._json_response({"error": "no report yet"}, code=404)
+
         elif parsed.path == "/backtest":
             self._serve_backtest_html()
 

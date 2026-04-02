@@ -173,6 +173,7 @@ def run_trading_cycle(container, cycle_count: int) -> None:
         try:
             if container.regime_detector:
                 regime_data = container.regime_detector.get_market_regime()
+                container._last_regime_data = regime_data  # Expose for health reporter
                 logger.info(
                     "  Regime: %s (confidence=%s)",
                     regime_data.get("overall_regime", "?"),
