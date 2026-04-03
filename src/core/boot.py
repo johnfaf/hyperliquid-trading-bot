@@ -129,14 +129,25 @@ def validate_operational_controls(logger: logging.Logger) -> None:
         "PORTFOLIO_CHURN_PENALTY",
         "PORTFOLIO_EXPECTED_SLIPPAGE_BPS",
     ]
-    missing = [env for env in required_envs if os.environ.get(env) is None]
+    missing = [env for env in required_envs if not str(os.environ.get(env, "")).strip()]
+    shadow_mode = bool(getattr(config, "ROTATION_DRY_RUN_TELEMETRY", True))
     if missing:
-        raise RuntimeError(
-            "Rotation engine is enabled but explicit threshold env vars are missing: "
-            + ", ".join(missing)
-        )
-    logger.info("Rotation operational controls validated (explicit thresholds present).")
-    if getattr(config, "ROTATION_DRY_RUN_TELEMETRY", True):
+        if shadow_mode:
+            logger.warning(
+                "Rotation shadow mode enabled with missing explicit threshold env vars: %s. "
+                "Using config defaults for shadow simulation; set these env vars before "
+                "live replacement mode.",
+                ", ".join(missing),
+            )
+        else:
+            raise RuntimeError(
+                "Rotation engine is enabled but explicit threshold env vars are missing: "
+                + ", ".join(missing)
+            )
+    else:
+        logger.info("Rotation operational controls validated (explicit thresholds present).")
+
+    if shadow_mode:
         shadow_days = max(int(getattr(config, "ROTATION_SHADOW_MODE_DAYS", 7)), 1)
         end_at = datetime.now(timezone.utc) + timedelta(days=shadow_days)
         logger.info(
