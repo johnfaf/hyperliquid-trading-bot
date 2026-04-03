@@ -46,6 +46,7 @@ class CopyTrader:
         self.calibration = calibration
         self.regime_forecaster = regime_forecaster
         self.rotation_manager = PortfolioRotationManager()
+        self._closed_events: List[Dict] = []
 
     def scan_top_traders(self, top_n: int = 10) -> List[Dict]:
         """
@@ -247,7 +248,6 @@ class CopyTrader:
             try:
                 if signal["type"] == "copy_close":
                     closed = self._close_copy_trades(signal, open_trades, mids)
-                    executed.extend(closed)
                     closed_ids = {trade["trade_id"] for trade in closed}
                     open_trades = [trade for trade in open_trades if trade.get("id") not in closed_ids]
                     continue
@@ -321,6 +321,8 @@ class CopyTrader:
                 regime_data=regime_data,
                 replacements_used=replacements_used,
             )
+            victim = None
+            candidate_open_positions = open_trades
 
             if decision.action == "reject":
                 logger.info(
@@ -340,31 +342,15 @@ class CopyTrader:
                     logger.info("  Rotation skipped copy %s: incumbent not found", signal["coin"])
                     continue
 
-                current_price = float(
-                    mids.get(victim["coin"], victim.get("entry_price", 0)) or victim.get("entry_price", 0)
-                )
-                closed_trade = self._close_trade(
-                    victim,
-                    exit_price=current_price,
-                    close_reason=f"rotation_out:{signal['coin']}",
-                )
-                if not closed_trade:
-                    continue
-
-                open_trades = [trade for trade in open_trades if trade.get("id") != victim.get("id")]
-                replacements_used += 1
-                logger.info(
-                    "  Rotation replaced %s with copy %s (%s)",
-                    victim.get("coin"),
-                    signal["coin"],
-                    decision.reason,
-                )
+                candidate_open_positions = [
+                    trade for trade in open_trades if trade.get("id") != victim.get("id")
+                ]
 
             if self.firewall:
                 passed, reason = self.firewall.validate(
                     trade_signal,
                     regime_data=regime_data,
-                    open_positions=open_trades,
+                    open_positions=candidate_open_positions,
                 )
                 if not passed:
                     logger.info(
@@ -386,11 +372,48 @@ class CopyTrader:
                 signal["_source_key"] = source_key
 
             account = db.get_paper_account() or account
-            trade = self._open_copy_trade(account, signal, open_trades)
+            trade = self._open_copy_trade(account, signal, candidate_open_positions)
             if trade:
                 executed.append(trade)
                 self._annotate_open_trades([trade], mids)
                 open_trades.append(trade)
+                if victim:
+                    current_price = float(
+                        mids.get(victim["coin"], victim.get("entry_price", 0)) or victim.get("entry_price", 0)
+                    )
+                    closed_trade = self._close_trade(
+                        victim,
+                        exit_price=current_price,
+                        close_reason=f"rotation_out:{signal['coin']}",
+                    )
+                    if not closed_trade:
+                        logger.warning(
+                            "  Rotation close failed after opening copy %s; rolling back trade %s",
+                            signal["coin"],
+                            trade.get("id"),
+                        )
+                        rollback = self._close_trade(
+                            trade,
+                            exit_price=float(
+                                signal.get("price", trade.get("entry_price", 0))
+                                or trade.get("entry_price", 0)
+                            ),
+                            close_reason=f"rotation_rollback:{victim.get('coin', 'unknown')}",
+                        )
+                        open_trades = [t for t in open_trades if t.get("id") != trade.get("id")]
+                        executed = [t for t in executed if t.get("id") != trade.get("id")]
+                        if not rollback:
+                            logger.error("  Rollback close also failed for copy trade %s", trade.get("id"))
+                        continue
+
+                    open_trades = [t for t in open_trades if t.get("id") != victim.get("id")]
+                    replacements_used += 1
+                    logger.info(
+                        "  Rotation replaced %s with copy %s (%s)",
+                        victim.get("coin"),
+                        signal["coin"],
+                        decision.reason,
+                    )
 
         if executed:
             self._copy_count += len(executed)
@@ -601,7 +624,24 @@ class CopyTrader:
             except Exception:
                 pass
 
-        return {"trade_id": trade["id"], "coin": trade["coin"], "pnl": pnl, "reason": close_reason}
+        closed_event = {
+            "trade_id": trade["id"],
+            "coin": trade["coin"],
+            "side": trade.get("side", ""),
+            "entry_price": trade.get("entry_price", 0),
+            "exit_price": exit_price,
+            "size": trade.get("size", 0),
+            "leverage": trade.get("leverage", 1),
+            "pnl": pnl,
+            "reason": close_reason,
+            "metadata": meta,
+            "strategy_type": "copy_trade",
+            "trader_address": meta.get("source_trader", ""),
+            "opened_at": trade.get("opened_at", ""),
+            "closed_at": datetime.utcnow().isoformat(),
+        }
+        self._closed_events.append(closed_event)
+        return closed_event
 
     def _close_copy_trades(self, signal: Dict, open_trades: List, mids: Dict) -> List[Dict]:
         """Close open copy trades for a coin when the source trader exits."""
@@ -630,6 +670,12 @@ class CopyTrader:
                     closed.append(closed_trade)
 
         return closed
+
+    def drain_closed_events(self) -> List[Dict]:
+        """Drain closed-trade events produced during this cycle."""
+        events = list(self._closed_events)
+        self._closed_events.clear()
+        return events
 
     @property
     def total_copy_trades(self) -> int:

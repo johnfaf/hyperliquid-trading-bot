@@ -52,6 +52,7 @@ class PaperTrader:
         self.calibration = calibration
         self.llm_filter = llm_filter
         self.rotation_manager = PortfolioRotationManager()
+        self._closed_events: List[Dict] = []
         self._ensure_account()
 
     def _ensure_account(self):
@@ -414,6 +415,8 @@ class PaperTrader:
                 regime_data=regime_data,
                 replacements_used=replacements_used,
             )
+            victim = None
+            candidate_open_positions = open_trades
 
             if decision.action == "reject":
                 logger.info(
@@ -433,31 +436,15 @@ class PaperTrader:
                     logger.info("Rotation skipped %s: incumbent not found", sig["coin"])
                     continue
 
-                current_price = float(
-                    mids.get(victim["coin"], victim.get("entry_price", 0)) or victim.get("entry_price", 0)
-                )
-                closed_trade = self._close_trade(
-                    victim,
-                    current_price=current_price,
-                    close_reason=f"rotation_out:{sig['coin']}",
-                )
-                if not closed_trade:
-                    continue
-
-                open_trades = [trade for trade in open_trades if trade.get("id") != victim.get("id")]
-                replacements_used += 1
-                logger.info(
-                    "Rotation replaced %s with %s (%s)",
-                    victim.get("coin"),
-                    sig["coin"],
-                    decision.reason,
-                )
+                candidate_open_positions = [
+                    trade for trade in open_trades if trade.get("id") != victim.get("id")
+                ]
 
             if self.firewall:
                 passed, reason = self.firewall.validate(
                     trade_signal,
                     regime_data=regime_data,
-                    open_positions=open_trades,
+                    open_positions=candidate_open_positions,
                 )
                 if not passed:
                     logger.info(
@@ -485,6 +472,44 @@ class PaperTrader:
                 executed.append(trade)
                 self._annotate_open_trades([trade], mids)
                 open_trades.append(trade)
+
+                if victim:
+                    current_price = float(
+                        mids.get(victim["coin"], victim.get("entry_price", 0)) or victim.get("entry_price", 0)
+                    )
+                    closed_trade = self._close_trade(
+                        victim,
+                        current_price=current_price,
+                        close_reason=f"rotation_out:{sig['coin']}",
+                    )
+                    if not closed_trade:
+                        logger.warning(
+                            "Rotation close failed after opening %s; rolling back new trade %s",
+                            sig["coin"],
+                            trade.get("id"),
+                        )
+                        rollback = self._close_trade(
+                            trade,
+                            current_price=float(
+                                sig.get("price", trade.get("entry_price", 0))
+                                or trade.get("entry_price", 0)
+                            ),
+                            close_reason=f"rotation_rollback:{victim.get('coin', 'unknown')}",
+                        )
+                        open_trades = [t for t in open_trades if t.get("id") != trade.get("id")]
+                        executed = [t for t in executed if t.get("id") != trade.get("id")]
+                        if not rollback:
+                            logger.error("Rollback close also failed for trade %s", trade.get("id"))
+                        continue
+
+                    open_trades = [t for t in open_trades if t.get("id") != victim.get("id")]
+                    replacements_used += 1
+                    logger.info(
+                        "Rotation replaced %s with %s (%s)",
+                        victim.get("coin"),
+                        sig["coin"],
+                        decision.reason,
+                    )
 
         if executed:
             logger.info(f"Executed {len(executed)} paper trades (V2 pipeline)")
@@ -875,8 +900,11 @@ class PaperTrader:
             except Exception:
                 pass
 
-        return {
+        closed_event = {
             "trade_id": trade["id"],
+            "entry_price": trade.get("entry_price", 0),
+            "size": trade.get("size", 0),
+            "leverage": trade.get("leverage", 1),
             "coin": trade["coin"],
             "side": trade["side"],
             "pnl": pnl,
@@ -884,7 +912,18 @@ class PaperTrader:
             "strategy_type": strategy_type,
             "signal_id": signal_id,
             "exit_price": slipped_exit,
+            "metadata": trade_meta,
+            "opened_at": trade.get("opened_at", ""),
+            "closed_at": datetime.utcnow().isoformat(),
         }
+        self._closed_events.append(closed_event)
+        return closed_event
+
+    def drain_closed_events(self) -> List[Dict]:
+        """Drain closed-trade events produced during this cycle."""
+        events = list(self._closed_events)
+        self._closed_events.clear()
+        return events
 
     def check_open_positions(self) -> List[Dict]:
         """

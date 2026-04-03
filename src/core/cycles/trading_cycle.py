@@ -297,12 +297,6 @@ def run_trading_cycle(container, cycle_count: int) -> None:
         closed = container.paper_trader.check_open_positions() if container.paper_trader else []
         if closed:
             logger.info("  Closed %d positions", len(closed))
-            if tg.is_configured():
-                for c_trade in closed:
-                    tg.notify_trade_closed(
-                        c_trade, c_trade.get("exit_price", 0),
-                        c_trade.get("pnl", 0), c_trade.get("reason", ""),
-                    )
 
         # Cross-venue signal confirmation
         _run_cross_venue_confirmation(container, top_strategies)
@@ -360,6 +354,14 @@ def run_trading_cycle(container, cycle_count: int) -> None:
 
         # Phase 4b: Copy trading
         _run_copy_trading(container, regime_data)
+
+        closed = _collect_closed_trade_events(container, closed)
+        if closed and tg.is_configured():
+            for c_trade in closed:
+                tg.notify_trade_closed(
+                    c_trade, c_trade.get("exit_price", 0),
+                    c_trade.get("pnl", 0), c_trade.get("reason", ""),
+                )
 
         # Phase 4c: Feed closed trade outcomes
         if closed:
@@ -804,6 +806,33 @@ def _run_copy_trading(container, regime_data):
                         )
                 except Exception as exc:
                     logger.warning("  Live copy execution error: %s", exc)
+
+
+def _collect_closed_trade_events(container, initial_closed):
+    """Merge in-memory close events from paper/copy traders, deduping by trade id."""
+    merged = list(initial_closed or [])
+    seen = set()
+    for trade in merged:
+        trade_id = trade.get("trade_id")
+        if trade_id is not None:
+            seen.add(trade_id)
+
+    for trader_name in ("paper_trader", "copy_trader"):
+        trader = getattr(container, trader_name, None)
+        if not trader or not hasattr(trader, "drain_closed_events"):
+            continue
+        try:
+            for event in trader.drain_closed_events() or []:
+                trade_id = event.get("trade_id")
+                if trade_id is not None and trade_id in seen:
+                    continue
+                merged.append(event)
+                if trade_id is not None:
+                    seen.add(trade_id)
+        except Exception as exc:
+            logger.debug("  Failed draining %s close events: %s", trader_name, exc)
+
+    return merged
 
 
 def _process_closed_trades(container, closed):

@@ -239,6 +239,18 @@ def seed_database():
 
     with db.get_connection() as conn:
         cur = conn.cursor()
+        logger.info("Resetting seeded tables for deterministic replay...")
+        cur.execute("DELETE FROM wallet_fills")
+        cur.execute("DELETE FROM golden_wallets")
+        cur.execute("DELETE FROM strategies")
+        cur.execute("DELETE FROM traders")
+        try:
+            cur.execute(
+                "DELETE FROM sqlite_sequence WHERE name IN ('wallet_fills', 'golden_wallets', 'strategies')"
+            )
+        except Exception:
+            # sqlite_sequence may not exist in all SQLite builds/schemas.
+            pass
 
         # ─── Traders ───────────────────────────────────────────
         for t in data["traders"]:
