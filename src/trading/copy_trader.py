@@ -465,6 +465,7 @@ class CopyTrader:
             take_profit = price * (1 - 0.08 / leverage)
 
         try:
+            execution_role = signal.get("execution_role", config.PAPER_TRADING_DEFAULT_EXECUTION_ROLE)
             trade_id = db.open_paper_trade(
                 strategy_id=None,
                 coin=signal["coin"],
@@ -485,6 +486,11 @@ class CopyTrader:
                     "is_golden": signal.get("is_golden", False),
                     "golden_wallet": signal.get("is_golden", False),
                     "source": "copy_trade",
+                    "execution_role": execution_role,
+                    "maker_fee_bps": config.PAPER_TRADING_MAKER_FEE_BPS,
+                    "taker_fee_bps": config.PAPER_TRADING_TAKER_FEE_BPS,
+                    "intended_entry_price": price,
+                    "entry_slipped_price": price,
                 },
             )
             logger.info(
@@ -513,6 +519,11 @@ class CopyTrader:
                     "is_golden": signal.get("is_golden", False),
                     "golden_wallet": signal.get("is_golden", False),
                     "source": "copy_trade",
+                    "execution_role": execution_role,
+                    "maker_fee_bps": config.PAPER_TRADING_MAKER_FEE_BPS,
+                    "taker_fee_bps": config.PAPER_TRADING_TAKER_FEE_BPS,
+                    "intended_entry_price": price,
+                    "entry_slipped_price": price,
                 },
             }
         except Exception as e:
@@ -527,11 +538,65 @@ class CopyTrader:
 
     def _close_trade(self, trade: Dict, exit_price: float, close_reason: str) -> Optional[Dict]:
         """Close a copy trade and feed the result into the paper-trading scorekeepers."""
-        if trade["side"] == "long":
-            pnl = (exit_price - trade["entry_price"]) * trade["size"] * trade["leverage"]
+        meta = trade.get("metadata", "{}")
+        if isinstance(meta, str):
+            try:
+                meta = json.loads(meta)
+            except (json.JSONDecodeError, TypeError):
+                meta = {}
         else:
-            pnl = (trade["entry_price"] - exit_price) * trade["size"] * trade["leverage"]
-        pnl = round(pnl, 2)
+            meta = dict(meta or {})
+
+        if trade["side"] == "long":
+            gross_pnl = (exit_price - trade["entry_price"]) * trade["size"] * trade["leverage"]
+        else:
+            gross_pnl = (trade["entry_price"] - exit_price) * trade["size"] * trade["leverage"]
+        gross_pnl = round(gross_pnl, 2)
+
+        execution_role = meta.get("execution_role", config.PAPER_TRADING_DEFAULT_EXECUTION_ROLE)
+        fee_rate = (config.PAPER_TRADING_MAKER_FEE_BPS if execution_role == "maker" else config.PAPER_TRADING_TAKER_FEE_BPS) / 10_000
+        entry_notional = max(float(trade.get("entry_price", 0)), 0.0) * max(float(trade.get("size", 0)), 0.0) * max(float(trade.get("leverage", 1)), 1.0)
+        exit_notional = max(float(exit_price), 0.0) * max(float(trade.get("size", 0)), 0.0) * max(float(trade.get("leverage", 1)), 1.0)
+        entry_fee = entry_notional * fee_rate
+        exit_fee = exit_notional * fee_rate
+        total_fees = round(entry_fee + exit_fee, 4)
+        pnl = round(gross_pnl - total_fees, 2)
+
+        db.update_paper_trade_metadata(
+            trade["id"],
+            {
+                "execution_role": execution_role,
+                "maker_fee_bps": config.PAPER_TRADING_MAKER_FEE_BPS,
+                "taker_fee_bps": config.PAPER_TRADING_TAKER_FEE_BPS,
+                "entry_fee_paid": round(entry_fee, 4),
+                "exit_fee_paid": round(exit_fee, 4),
+                "total_fees_paid": total_fees,
+                "entry_slippage_cost": 0.0,
+                "exit_slippage_cost": 0.0,
+                "total_slippage_cost": 0.0,
+                "gross_pnl_before_fees": round(gross_pnl, 4),
+                "net_pnl_after_fees": pnl,
+                "intended_exit_price": float(exit_price),
+                "exit_slipped_price": float(exit_price),
+            },
+        )
+        meta.update(
+            {
+                "execution_role": execution_role,
+                "maker_fee_bps": config.PAPER_TRADING_MAKER_FEE_BPS,
+                "taker_fee_bps": config.PAPER_TRADING_TAKER_FEE_BPS,
+                "entry_fee_paid": round(entry_fee, 4),
+                "exit_fee_paid": round(exit_fee, 4),
+                "total_fees_paid": total_fees,
+                "entry_slippage_cost": 0.0,
+                "exit_slippage_cost": 0.0,
+                "total_slippage_cost": 0.0,
+                "gross_pnl_before_fees": round(gross_pnl, 4),
+                "net_pnl_after_fees": pnl,
+                "intended_exit_price": float(exit_price),
+                "exit_slipped_price": float(exit_price),
+            }
+        )
 
         db.close_paper_trade(trade["id"], exit_price, pnl)
 
@@ -545,23 +610,16 @@ class CopyTrader:
             )
 
         logger.info(
-            "Copy trade closed (%s): %s %s entry=$%s exit=$%s PnL=$%s",
+            "Copy trade closed (%s): %s %s entry=$%s exit=$%s gross=$%s fees=$%s net=$%s",
             close_reason,
             trade["side"].upper(),
             trade["coin"],
             f"{trade['entry_price']:,.2f}",
             f"{exit_price:,.2f}",
+            f"{gross_pnl:,.2f}",
+            f"{total_fees:,.2f}",
             f"{pnl:,.2f}",
         )
-
-        meta = trade.get("metadata", "{}")
-        if isinstance(meta, str):
-            try:
-                meta = json.loads(meta)
-            except (json.JSONDecodeError, TypeError):
-                meta = {}
-        else:
-            meta = dict(meta or {})
 
         return_pct = pnl / max(
             trade["entry_price"] * max(trade["size"], 1e-8) * max(trade.get("leverage", 1), 1),
@@ -633,6 +691,9 @@ class CopyTrader:
             "size": trade.get("size", 0),
             "leverage": trade.get("leverage", 1),
             "pnl": pnl,
+            "gross_pnl": round(gross_pnl, 4),
+            "fees_paid": total_fees,
+            "slippage_cost": 0.0,
             "reason": close_reason,
             "metadata": meta,
             "strategy_type": "copy_trade",

@@ -724,14 +724,27 @@ class PaperTrader:
             # Entry: you pay more (long) or receive less (short)
             if side == "long":
                 return price * (1 + slippage_pct)
-            else:
-                return price * (1 - slippage_pct)
-        else:
-            # Exit: you receive less (closing long) or pay more (closing short)
-            if side == "long":
-                return price * (1 - slippage_pct)
-            else:
-                return price * (1 + slippage_pct)
+            return price * (1 - slippage_pct)
+
+        # Exit: you receive less (closing long) or pay more (closing short)
+        if side == "long":
+            return price * (1 - slippage_pct)
+        return price * (1 + slippage_pct)
+
+    @staticmethod
+    def _fee_rate_for_role(role: str) -> float:
+        role = str(role or "").lower()
+        if role == "maker":
+            return max(config.PAPER_TRADING_MAKER_FEE_BPS, 0.0) / 10_000
+        return max(config.PAPER_TRADING_TAKER_FEE_BPS, 0.0) / 10_000
+
+    @staticmethod
+    def _slippage_cost(side: str, intended_price: float, filled_price: float, size: float, leverage: float) -> float:
+        """Positive number = adverse slippage cost in USD notional PnL terms."""
+        if intended_price <= 0 or filled_price <= 0 or size <= 0 or leverage <= 0:
+            return 0.0
+        direction = 1.0 if side == "long" else -1.0
+        return max((filled_price - intended_price) * direction * size * leverage, 0.0)
 
     def _execute_paper_trade(self, account: Dict, strategy: Dict, signal: Dict) -> Optional[Dict]:
         """Execute a paper trade and record it (with slippage simulation)."""
@@ -754,6 +767,11 @@ class PaperTrader:
                     "strategy_type": signal.get("strategy_type", ""),
                     "confidence": signal.get("confidence", 0),
                     "signal_id": signal.get("signal_id", ""),
+                    "execution_role": signal.get("execution_role", config.PAPER_TRADING_DEFAULT_EXECUTION_ROLE),
+                    "maker_fee_bps": config.PAPER_TRADING_MAKER_FEE_BPS,
+                    "taker_fee_bps": config.PAPER_TRADING_TAKER_FEE_BPS,
+                    "intended_entry_price": signal["price"],
+                    "entry_slipped_price": slipped_price,
                     "features": signal.get("features", {}),
                     "source_accuracy": signal.get("source_accuracy", 0),
                     "regime": signal.get("regime", ""),
@@ -773,7 +791,7 @@ class PaperTrader:
                 "id": trade_id,
                 "coin": signal["coin"],
                 "side": signal["side"],
-                "entry_price": signal["price"],
+                "entry_price": slipped_price,
                 "size": signal["size"],
                 "leverage": signal["leverage"],
                 "strategy_id": strategy.get("id"),
@@ -783,6 +801,11 @@ class PaperTrader:
                     "strategy_type": signal.get("strategy_type", ""),
                     "confidence": signal.get("confidence", 0),
                     "signal_id": signal.get("signal_id", ""),
+                    "execution_role": signal.get("execution_role", config.PAPER_TRADING_DEFAULT_EXECUTION_ROLE),
+                    "maker_fee_bps": config.PAPER_TRADING_MAKER_FEE_BPS,
+                    "taker_fee_bps": config.PAPER_TRADING_TAKER_FEE_BPS,
+                    "intended_entry_price": signal["price"],
+                    "entry_slipped_price": slipped_price,
                     "features": signal.get("features", {}),
                     "source_accuracy": signal.get("source_accuracy", 0),
                     "regime": signal.get("regime", ""),
@@ -802,8 +825,76 @@ class PaperTrader:
 
     def _close_trade(self, trade: Dict, current_price: float, close_reason: str) -> Optional[Dict]:
         """Close an open paper trade and feed its outcome to the scoring subsystems."""
+        trade_meta = {}
+        try:
+            meta = trade.get("metadata", {})
+            trade_meta = json.loads(meta or "{}") if isinstance(meta, str) else dict(meta or {})
+        except Exception:
+            trade_meta = {}
+
         slipped_exit = self._apply_slippage(current_price, trade["side"], is_entry=False)
-        pnl = self._calculate_pnl(trade, slipped_exit)
+        gross_pnl = self._calculate_pnl(trade, slipped_exit)
+        execution_role = trade_meta.get("execution_role", config.PAPER_TRADING_DEFAULT_EXECUTION_ROLE)
+        fee_rate = self._fee_rate_for_role(execution_role)
+        entry_notional = max(float(trade.get("entry_price", 0)), 0.0) * max(float(trade.get("size", 0)), 0.0) * max(float(trade.get("leverage", 1)), 1.0)
+        exit_notional = max(float(slipped_exit), 0.0) * max(float(trade.get("size", 0)), 0.0) * max(float(trade.get("leverage", 1)), 1.0)
+        entry_fee = entry_notional * fee_rate
+        exit_fee = exit_notional * fee_rate
+        total_fees = entry_fee + exit_fee
+        pnl = round(gross_pnl - total_fees, 2)
+
+        intended_entry = float(trade_meta.get("intended_entry_price", trade.get("entry_price", 0)) or trade.get("entry_price", 0) or 0)
+        entry_slippage_cost = self._slippage_cost(
+            trade.get("side", ""),
+            intended_entry,
+            float(trade.get("entry_price", 0) or 0),
+            float(trade.get("size", 0) or 0),
+            float(trade.get("leverage", 1) or 1),
+        )
+        exit_slippage_cost = self._slippage_cost(
+            trade.get("side", ""),
+            float(current_price or 0),
+            slipped_exit,
+            float(trade.get("size", 0) or 0),
+            float(trade.get("leverage", 1) or 1),
+        )
+        total_slippage_cost = round(entry_slippage_cost + exit_slippage_cost, 4)
+
+        db.update_paper_trade_metadata(
+            trade["id"],
+            {
+                "execution_role": execution_role,
+                "maker_fee_bps": config.PAPER_TRADING_MAKER_FEE_BPS,
+                "taker_fee_bps": config.PAPER_TRADING_TAKER_FEE_BPS,
+                "entry_fee_paid": round(entry_fee, 4),
+                "exit_fee_paid": round(exit_fee, 4),
+                "total_fees_paid": round(total_fees, 4),
+                "entry_slippage_cost": round(entry_slippage_cost, 4),
+                "exit_slippage_cost": round(exit_slippage_cost, 4),
+                "total_slippage_cost": total_slippage_cost,
+                "gross_pnl_before_fees": round(gross_pnl, 4),
+                "net_pnl_after_fees": pnl,
+                "intended_exit_price": float(current_price or 0),
+                "exit_slipped_price": slipped_exit,
+            },
+        )
+        trade_meta.update(
+            {
+                "execution_role": execution_role,
+                "maker_fee_bps": config.PAPER_TRADING_MAKER_FEE_BPS,
+                "taker_fee_bps": config.PAPER_TRADING_TAKER_FEE_BPS,
+                "entry_fee_paid": round(entry_fee, 4),
+                "exit_fee_paid": round(exit_fee, 4),
+                "total_fees_paid": round(total_fees, 4),
+                "entry_slippage_cost": round(entry_slippage_cost, 4),
+                "exit_slippage_cost": round(exit_slippage_cost, 4),
+                "total_slippage_cost": total_slippage_cost,
+                "gross_pnl_before_fees": round(gross_pnl, 4),
+                "net_pnl_after_fees": pnl,
+                "intended_exit_price": float(current_price or 0),
+                "exit_slipped_price": slipped_exit,
+            }
+        )
         db.close_paper_trade(trade["id"], slipped_exit, pnl)
 
         account = db.get_paper_account()
@@ -815,21 +906,16 @@ class PaperTrader:
             db.update_paper_account(new_balance, new_total_pnl, new_total_trades, new_winning)
 
         logger.info(
-            "Paper trade closed (%s): %s %s entry=$%s exit=$%s PnL=$%s",
+            "Paper trade closed (%s): %s %s entry=$%s exit=$%s gross=$%s fees=$%s net=$%s",
             close_reason,
             trade["side"].upper(),
             trade["coin"],
             f"{trade['entry_price']:,.2f}",
             f"{slipped_exit:,.2f}",
+            f"{gross_pnl:,.2f}",
+            f"{total_fees:,.2f}",
             f"{pnl:,.2f}",
         )
-
-        trade_meta = {}
-        try:
-            meta = trade.get("metadata", {})
-            trade_meta = json.loads(meta or "{}") if isinstance(meta, str) else dict(meta or {})
-        except Exception:
-            trade_meta = {}
 
         strategy_type = trade_meta.get("strategy_type", "unknown")
         signal_id = trade_meta.get("signal_id", "")
@@ -908,6 +994,9 @@ class PaperTrader:
             "coin": trade["coin"],
             "side": trade["side"],
             "pnl": pnl,
+            "gross_pnl": round(gross_pnl, 4),
+            "fees_paid": round(total_fees, 4),
+            "slippage_cost": total_slippage_cost,
             "reason": close_reason,
             "strategy_type": strategy_type,
             "signal_id": signal_id,

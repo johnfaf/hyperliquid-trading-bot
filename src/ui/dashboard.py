@@ -43,6 +43,42 @@ def _safe_json(obj):
     return str(obj)
 
 
+def _parse_trade_costs(trade: Dict) -> Dict:
+    """Extract fee/slippage cost fields from trade metadata with sensible fallbacks."""
+    meta = trade.get("metadata", {})
+    if isinstance(meta, str):
+        try:
+            meta = json.loads(meta or "{}")
+        except Exception:
+            meta = {}
+    elif not isinstance(meta, dict):
+        meta = {}
+
+    fee_rate_bps = (
+        float(meta.get("maker_fee_bps", config.PAPER_TRADING_MAKER_FEE_BPS))
+        if str(meta.get("execution_role", config.PAPER_TRADING_DEFAULT_EXECUTION_ROLE)).lower() == "maker"
+        else float(meta.get("taker_fee_bps", config.PAPER_TRADING_TAKER_FEE_BPS))
+    )
+    fee_rate = max(fee_rate_bps, 0.0) / 10_000
+    size = float(trade.get("size", 0) or 0)
+    leverage = float(trade.get("leverage", 1) or 1)
+    entry_price = float(trade.get("entry_price", 0) or 0)
+    exit_price = float(trade.get("exit_price", 0) or 0)
+    entry_notional = entry_price * size * leverage
+    exit_notional = exit_price * size * leverage
+    fallback_fees = (entry_notional + exit_notional) * fee_rate
+
+    fees_paid = float(meta.get("total_fees_paid", fallback_fees) or 0.0)
+    slippage_cost = float(meta.get("total_slippage_cost", 0.0) or 0.0)
+    gross_pnl = float(meta.get("gross_pnl_before_fees", (trade.get("pnl", 0) or 0) + fees_paid) or 0.0)
+    return {
+        "fees_paid": round(fees_paid, 4),
+        "slippage_cost": round(slippage_cost, 4),
+        "gross_pnl": round(gross_pnl, 4),
+        "execution_role": str(meta.get("execution_role", config.PAPER_TRADING_DEFAULT_EXECUTION_ROLE)),
+    }
+
+
 def get_dashboard_data():
     """Collect all data needed for the dashboard."""
     conn = _get_db()
@@ -72,6 +108,21 @@ def get_dashboard_data():
         closed_trades = [dict(r) for r in conn.execute(
             "SELECT * FROM paper_trades WHERE status = 'closed' ORDER BY closed_at DESC LIMIT 50"
         ).fetchall()]
+        for trade in closed_trades:
+            trade.update(_parse_trade_costs(trade))
+
+        # Lifetime execution-cost rollup across all closed trades
+        all_closed = [dict(r) for r in conn.execute(
+            "SELECT id, pnl, entry_price, exit_price, size, leverage, metadata FROM paper_trades WHERE status = 'closed'"
+        ).fetchall()]
+        total_fees = 0.0
+        total_slippage = 0.0
+        for trade in all_closed:
+            costs = _parse_trade_costs(trade)
+            total_fees += costs["fees_paid"]
+            total_slippage += costs["slippage_cost"]
+        recent_fees = sum(float(t.get("fees_paid", 0) or 0) for t in closed_trades)
+        recent_slippage = sum(float(t.get("slippage_cost", 0) or 0) for t in closed_trades)
 
         # Copy trades (from metadata)
         copy_trades = [dict(r) for r in conn.execute(
@@ -109,6 +160,12 @@ def get_dashboard_data():
             "account": {
                 "balance": balance,
                 "total_pnl": account.get("total_pnl", 0),
+                "gross_pnl_estimate": account.get("total_pnl", 0) + total_fees,
+                "lifetime_fees": round(total_fees, 2),
+                "lifetime_slippage": round(total_slippage, 2),
+                "lifetime_execution_cost": round(total_fees + total_slippage, 2),
+                "recent_fees": round(recent_fees, 2),
+                "recent_slippage": round(recent_slippage, 2),
                 "roi_pct": round(roi, 2),
                 "total_trades": account.get("total_trades", 0),
                 "winning_trades": account.get("winning_trades", 0),
@@ -289,7 +346,7 @@ canvas{width:100%!important;height:200px!important}
 <div class="flex-row">
 <div class="section">
 <h2>Closed Trades History</h2>
-<table><thead><tr><th>Coin</th><th>Side</th><th>Entry</th><th>Exit</th><th>PnL</th><th>Lev</th><th>Closed</th></tr></thead>
+<table><thead><tr><th>Coin</th><th>Side</th><th>Entry</th><th>Exit</th><th>Gross PnL</th><th>Fees</th><th>Slippage</th><th>Net PnL</th><th>Lev</th><th>Closed</th></tr></thead>
 <tbody id="closed-trades"></tbody></table>
 </div>
 </div>
@@ -392,6 +449,8 @@ function renderCards(d){
   const cards = [
     {label:'Paper Balance', value:fmtUsd(a.balance), cls:pnlClass(a.total_pnl)},
     {label:'Total PnL', value:fmtUsd(a.total_pnl), cls:pnlClass(a.total_pnl), sub:`ROI: ${a.roi_pct>0?'+':''}${a.roi_pct}%`},
+    {label:'Gross PnL (Est.)', value:fmtUsd(a.gross_pnl_estimate), cls:pnlClass(a.gross_pnl_estimate)},
+    {label:'Execution Costs', value:fmtUsd(-(a.lifetime_execution_cost||0)), cls:'red', sub:`Fees ${fmtUsd(a.lifetime_fees||0)} + Slip ${fmtUsd(a.lifetime_slippage||0)}`},
     {label:'Win Rate', value:a.win_rate+'%', cls:a.win_rate>=50?'green':'yellow', sub:`${a.winning_trades}/${a.total_trades} trades`},
     {label:'Tracked Traders', value:d.traders.length, cls:'blue'},
     {label:'Active Strategies', value:d.strategies.length, cls:'green'},
@@ -445,9 +504,12 @@ function renderClosedTrades(trades){
     <tr><td>${t.coin}</td>
     <td><span class="badge badge-${t.side}">${t.side.toUpperCase()}</span></td>
     <td>${fmtUsd(t.entry_price)}</td><td>${fmtUsd(t.exit_price)}</td>
+    <td class="${pnlClass(t.gross_pnl)}">${fmtUsd(t.gross_pnl)}</td>
+    <td class="red">${fmtUsd(-(t.fees_paid||0))}</td>
+    <td class="red">${fmtUsd(-(t.slippage_cost||0))}</td>
     <td class="${pnlClass(t.pnl)}">${fmtUsd(t.pnl)}</td>
     <td>${t.leverage}x</td><td>${t.closed_at?t.closed_at.slice(0,16):''}</td></tr>`).join('')
-    : '<tr><td colspan="7" style="color:#555">No closed trades yet</td></tr>';
+    : '<tr><td colspan="10" style="color:#555">No closed trades yet</td></tr>';
 }
 
 function renderTypeChart(dist){

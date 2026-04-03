@@ -81,6 +81,11 @@ PAPER_TRADING_MAX_POSITION_PCT = 0.08   # 8% of balance per trade (smaller = mor
 PAPER_TRADING_MAX_LEVERAGE = 5
 PAPER_TRADING_STOP_LOSS_PCT = 0.05      # 5%
 PAPER_TRADING_TAKE_PROFIT_PCT = 0.10    # 10%
+PAPER_TRADING_MAKER_FEE_BPS = float(os.environ.get("PAPER_TRADING_MAKER_FEE_BPS", 1.5))
+PAPER_TRADING_TAKER_FEE_BPS = float(os.environ.get("PAPER_TRADING_TAKER_FEE_BPS", 4.5))
+PAPER_TRADING_DEFAULT_EXECUTION_ROLE = os.environ.get(
+    "PAPER_TRADING_DEFAULT_EXECUTION_ROLE", "taker"
+).lower()
 
 # Portfolio rotation for paper trading: keep the book flexible without
 # removing safety rails entirely.
