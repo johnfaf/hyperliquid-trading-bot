@@ -44,6 +44,26 @@ HL_BOT_DB=/data/bot.db
 TRADING_CYCLE_INTERVAL=300         # 5 min (lower for more frequent trading)
 DISCOVERY_CYCLE_INTERVAL=86400     # 24h
 LOG_FORMAT=json                     # structured logs for Railway log viewer
+
+# Rotation shadow mode (recommended before live replacement execution)
+ROTATION_ENGINE_ENABLED=true
+ROTATION_DRY_RUN_TELEMETRY=true
+ROTATION_SHADOW_MODE_DAYS=7
+ROTATION_REQUIRE_EXPLICIT_THRESHOLDS=true
+
+# Explicit rotation thresholds (required when rotation engine is enabled)
+PORTFOLIO_REPLACEMENT_THRESHOLD=0.15
+PORTFOLIO_MAX_REPLACEMENTS_PER_CYCLE=1
+PORTFOLIO_MAX_REPLACEMENTS_PER_HOUR=4
+PORTFOLIO_MAX_REPLACEMENTS_PER_DAY=12
+PORTFOLIO_FORCED_EXIT_COOLDOWN_MINUTES=45
+PORTFOLIO_ROUND_TRIP_BLOCK_MINUTES=20
+PORTFOLIO_MAX_COIN_EXPOSURE_PCT=0.45
+PORTFOLIO_MAX_SIDE_EXPOSURE_PCT=0.65
+PORTFOLIO_MAX_CLUSTER_EXPOSURE_PCT=0.55
+PORTFOLIO_TRANSACTION_COST_WEIGHT=8.0
+PORTFOLIO_CHURN_PENALTY=0.02
+PORTFOLIO_EXPECTED_SLIPPAGE_BPS=3.0
 ```
 
 No API keys are required for the research/paper-trading features. Hyperliquid's public info endpoint is unauthenticated.
@@ -54,6 +74,25 @@ Optional keys for enhanced features:
 ARKHAM_API_KEY=...          # Arkham Intelligence smart-money flow
 TELEGRAM_BOT_TOKEN=...     # Telegram alerts
 TELEGRAM_CHAT_ID=...       # Telegram chat for notifications
+
+# Agent-wallet-only live execution (legacy HL_PRIVATE_KEY is blocked)
+HL_WALLET_MODE=agent_only
+HL_PUBLIC_ADDRESS=0x...              # Trading account (master/vault)
+SECRET_MANAGER_PROVIDER=aws_kms      # or hashicorp or none
+
+# If provider=none:
+HL_AGENT_PRIVATE_KEY=0x...
+HL_AGENT_WALLET_ADDRESS=0x...
+
+# If provider=aws_kms:
+AWS_KMS_REGION=us-east-1
+AWS_KMS_CIPHERTEXT_B64=...
+
+# If provider=hashicorp:
+VAULT_ADDR=https://vault.example.com
+VAULT_TOKEN=...
+VAULT_SECRET_PATH=kv/data/hyperliquid/prod
+VAULT_SECRET_KEY=hl_agent_private_key
 ```
 
 ## 4. How Persistence Works

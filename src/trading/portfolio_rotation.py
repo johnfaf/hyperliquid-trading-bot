@@ -393,12 +393,16 @@ class PortfolioRotationManager:
         self._telemetry["estimated_churn_cost"] += float(max(churn_cost, 0.0))
         self._cleanup_guardrail_state(now)
 
-    def record_dry_run_replacement_skip(self, decision: RotationDecision) -> None:
+    def record_dry_run_replacement_skip(
+        self,
+        decision: RotationDecision,
+        reason_key: str = "dry_run_rotation_disabled",
+    ) -> None:
         """Telemetry hook when replacement was proposed but intentionally skipped."""
         if decision.action != "replace":
             return
         reasons = self._telemetry["rejection_reasons"]
-        key = "dry_run_rotation_disabled"
+        key = reason_key or "dry_run_rotation_disabled"
         reasons[key] = reasons.get(key, 0) + 1
 
     def get_stats(self) -> Dict:

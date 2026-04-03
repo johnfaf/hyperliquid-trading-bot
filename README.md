@@ -96,7 +96,7 @@ The signal pipeline is deliberately aggressive: of the ~900 strategies generated
 │   ├── trading/
 │   │   ├── paper_trader.py          # Paper trading (firewall + slippage)
 │   │   ├── copy_trader.py           # Copy trading engine
-│   │   ├── live_trader.py           # Live execution (private key signing)
+│   │   ├── live_trader.py           # Live execution (agent-wallet signing)
 │   │   ├── cross_venue_hedger.py    # Multi-exchange hedging
 │   │   └── trade_memory.py          # Trade outcome memory
 │   ├── exchanges/
@@ -154,6 +154,7 @@ python scripts/seed_and_replay.py --seed-only  # Just populate DB
 python scripts/seed_and_replay.py --sweep      # Seed + parameter sweep
 python scripts/diagnose_rejections.py          # Debug signal rejections
 python scripts/run_crash_monte_carlo.py        # Crash stress test
+python scripts/run_rotation_shadow_mode.py     # 7-day rotation shadow mode
 ```
 
 ## Signal Pipeline
@@ -239,6 +240,19 @@ DISCOVERY_CYCLE_INTERVAL = 86400     # 24h  (env: DISCOVERY_CYCLE_INTERVAL)
 | `LIGHTER_ENABLED` | `true` | Enable Lighter exchange adapter |
 | `ENABLE_PREDICTIVE_FORECASTER` | `true` | Enable regime forecaster |
 | `ENABLE_XGBOOST_FORECASTER` | `true` | Enable ML regime model |
+| `HL_WALLET_MODE` | `agent_only` | Wallet mode; only agent-wallet signing is permitted |
+| `HL_PUBLIC_ADDRESS` | _(none)_ | Trading account address (master/vault) |
+| `HL_AGENT_PRIVATE_KEY` | _(none)_ | Agent wallet private key (only for `SECRET_MANAGER_PROVIDER=none`) |
+| `HL_AGENT_WALLET_ADDRESS` | _(none)_ | Optional explicit agent wallet address (must match signer) |
+| `SECRET_MANAGER_PROVIDER` | `none` | `none`, `aws_kms`, or `hashicorp` |
+| `AWS_KMS_REGION` | _(none)_ | AWS region for KMS decrypt (when provider is `aws_kms`) |
+| `AWS_KMS_CIPHERTEXT_B64` | _(none)_ | Base64-encrypted private key payload for KMS decrypt |
+| `VAULT_ADDR` | _(none)_ | Vault address (when provider is `hashicorp`) |
+| `VAULT_TOKEN` | _(none)_ | Vault token (when provider is `hashicorp`) |
+| `VAULT_SECRET_PATH` | _(none)_ | Vault secret path (when provider is `hashicorp`) |
+| `ROTATION_ENGINE_ENABLED` | `true` | Enable rotation decision engine |
+| `ROTATION_DRY_RUN_TELEMETRY` | `true` | Shadow mode: simulate replacements and log telemetry only |
+| `ROTATION_SHADOW_MODE_DAYS` | `7` | Planned shadow window length for operations logging |
 | `ARKHAM_API_KEY` | _(none)_ | Optional: Arkham Intelligence API key |
 | `LOG_FORMAT` | `json` | Log format: `json` (production) or `text` (local) |
 

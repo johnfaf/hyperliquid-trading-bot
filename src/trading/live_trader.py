@@ -12,7 +12,9 @@ This module:
   - Dry-run mode by default (must explicitly enable)
 
 SECURITY NOTES:
-  - Private key loaded from HL_PRIVATE_KEY env var
+  - Agent private key loaded from HL_AGENT_PRIVATE_KEY or secret manager
+  - Trading account address loaded from HL_PUBLIC_ADDRESS
+  - Agent signer wallet must be distinct from trading account wallet
   - dry_run=True by default — nothing executes without explicit enablement
   - Daily loss limit triggers automatic kill switch
   - Max position size enforced per order
@@ -42,6 +44,7 @@ except ImportError:
 import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import config
+from src.core.secret_manager import SecretManagerError, load_agent_private_key
 from src.signals.decision_firewall import DecisionFirewall
 from src.signals.signal_schema import TradeSignal, SignalSide
 
@@ -184,6 +187,7 @@ class LiveTrader:
 
         # Signer (loaded from env)
         self.signer = None
+        self.agent_wallet_address = None
         self.public_address = None
         self._load_credentials()
 
@@ -216,7 +220,7 @@ class LiveTrader:
             logger.warning("DRY RUN MODE - No real trades will be executed")
 
         if not self.signer:
-            logger.warning("No private key configured - forcing dry_run mode")
+            logger.warning("No agent wallet signer configured - forcing dry_run mode")
             self.dry_run = True
 
         # Reconcile positions on startup
@@ -224,21 +228,58 @@ class LiveTrader:
             self.reconcile_positions()
 
     def _load_credentials(self):
-        """Load private key and public address from environment."""
-        private_key = os.environ.get("HL_PRIVATE_KEY")
-        public_address = os.environ.get("HL_PUBLIC_ADDRESS")
+        """
+        Load agent-wallet signer credentials and trading account address.
 
-        if not private_key or not public_address:
-            logger.warning("HL_PRIVATE_KEY or HL_PUBLIC_ADDRESS not set in environment")
+        Security model:
+        - Agent private key comes from secret manager or HL_AGENT_PRIVATE_KEY.
+        - HL_PUBLIC_ADDRESS is the trading account (master/vault) to manage.
+        - Agent signer address must differ from HL_PUBLIC_ADDRESS.
+        """
+        trading_address = os.environ.get("HL_PUBLIC_ADDRESS", "").strip()
+        configured_agent_address = os.environ.get("HL_AGENT_WALLET_ADDRESS", "").strip()
+        secret_provider = str(getattr(config, "SECRET_MANAGER_PROVIDER", "none")).lower().strip()
+
+        if not trading_address:
+            logger.warning("HL_PUBLIC_ADDRESS not set; live execution remains disabled")
+            return
+        if os.environ.get("HL_PRIVATE_KEY"):
+            logger.error("HL_PRIVATE_KEY is disallowed in agent-wallet-only mode")
             return
 
         try:
+            private_key = load_agent_private_key(secret_provider)
+            if not private_key:
+                logger.warning(
+                    "No agent private key loaded (provider=%s). "
+                    "Set HL_AGENT_PRIVATE_KEY or configure secret manager.",
+                    secret_provider,
+                )
+                return
+
             self.signer = HyperliquidSigner(private_key)
-            self.public_address = public_address
-            logger.info(f"Credentials loaded for address: {public_address}")
-        except Exception as e:
-            logger.error(f"Failed to load credentials: {e}")
+            derived_agent_address = self.signer.address
+            if configured_agent_address and configured_agent_address.lower() != derived_agent_address.lower():
+                raise RuntimeError(
+                    "HL_AGENT_WALLET_ADDRESS does not match signer address derived from secret"
+                )
+            if derived_agent_address.lower() == trading_address.lower():
+                raise RuntimeError(
+                    "Agent wallet must be different from HL_PUBLIC_ADDRESS trading wallet"
+                )
+
+            self.agent_wallet_address = configured_agent_address or derived_agent_address
+            self.public_address = trading_address
+            logger.info(
+                "Agent-wallet credentials loaded (provider=%s agent=%s trading=%s)",
+                secret_provider,
+                self.agent_wallet_address,
+                self.public_address,
+            )
+        except (SecretManagerError, Exception) as e:
+            logger.error(f"Failed to load agent-wallet credentials: {e}")
             self.signer = None
+            self.agent_wallet_address = None
             self.public_address = None
 
     def _load_asset_index_map(self):
@@ -544,6 +585,9 @@ class LiveTrader:
                 "nonce": nonce,
                 "signature": signature
             }
+            if self.public_address and self.signer:
+                if self.public_address.lower() != self.signer.address.lower():
+                    payload["vaultAddress"] = self.public_address
 
             logger.debug(f"Posting order to {self.exchange_url}: action_hash={action_hash}")
 
@@ -1155,6 +1199,7 @@ class LiveTrader:
         return {
             "dry_run": self.dry_run,
             "signer_available": self.signer is not None,
+            "agent_wallet_address": self.agent_wallet_address,
             "public_address": self.public_address,
             "kill_switch_active": self.kill_switch_active,
             "daily_pnl": round(self.daily_pnl, 2),

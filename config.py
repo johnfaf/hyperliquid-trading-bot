@@ -87,6 +87,22 @@ PAPER_TRADING_DEFAULT_EXECUTION_ROLE = os.environ.get(
     "PAPER_TRADING_DEFAULT_EXECUTION_ROLE", "taker"
 ).lower()
 
+# Live trading wallet / secret-management controls.
+# Agent-wallet-only mode: signer key must be for a delegated agent wallet, and
+# HL_PUBLIC_ADDRESS points to the trading account (master/vault) being managed.
+HL_WALLET_MODE = os.environ.get("HL_WALLET_MODE", "agent_only").strip().lower()
+SECRET_MANAGER_PROVIDER = os.environ.get(
+    "SECRET_MANAGER_PROVIDER", "none"
+).strip().lower()
+AWS_KMS_REGION = os.environ.get("AWS_KMS_REGION", "")
+AWS_KMS_KEY_ID = os.environ.get("AWS_KMS_KEY_ID", "")
+AWS_KMS_CIPHERTEXT_B64 = os.environ.get("AWS_KMS_CIPHERTEXT_B64", "")
+VAULT_ADDR = os.environ.get("VAULT_ADDR", "")
+VAULT_TOKEN = os.environ.get("VAULT_TOKEN", "")
+VAULT_SECRET_PATH = os.environ.get("VAULT_SECRET_PATH", "")
+VAULT_SECRET_KEY = os.environ.get("VAULT_SECRET_KEY", "hl_agent_private_key")
+VAULT_KV_VERSION = int(os.environ.get("VAULT_KV_VERSION", "2"))
+
 # Portfolio rotation for paper trading: keep the book flexible without
 # removing safety rails entirely.
 PORTFOLIO_TARGET_POSITIONS = int(os.environ.get("PORTFOLIO_TARGET_POSITIONS", 8))
@@ -133,11 +149,12 @@ PORTFOLIO_MAX_CLUSTER_EXPOSURE_PCT = float(
     os.environ.get("PORTFOLIO_MAX_CLUSTER_EXPOSURE_PCT", 0.55)
 )
 ROTATION_ENGINE_ENABLED = os.environ.get(
-    "ROTATION_ENGINE_ENABLED", "false"
+    "ROTATION_ENGINE_ENABLED", "true"
 ).lower() in ("true", "1", "yes")
 ROTATION_DRY_RUN_TELEMETRY = os.environ.get(
     "ROTATION_DRY_RUN_TELEMETRY", "true"
 ).lower() in ("true", "1", "yes")
+ROTATION_SHADOW_MODE_DAYS = int(os.environ.get("ROTATION_SHADOW_MODE_DAYS", "7"))
 ROTATION_REQUIRE_EXPLICIT_THRESHOLDS = os.environ.get(
     "ROTATION_REQUIRE_EXPLICIT_THRESHOLDS", "true"
 ).lower() in ("true", "1", "yes")

@@ -429,21 +429,35 @@ class PaperTrader:
                 )
                 continue
 
-            if decision.action == "replace" and not rotation_enabled:
-                if rotation_dry_run:
-                    self.rotation_manager.record_dry_run_replacement_skip(decision)
+            if decision.action == "replace":
+                if not rotation_enabled:
+                    if rotation_dry_run:
+                        self.rotation_manager.record_dry_run_replacement_skip(
+                            decision, reason_key="dry_run_rotation_disabled"
+                        )
+                        logger.info(
+                            "Rotation dry-run: would replace %s with %s (%s)",
+                            decision.replacement_trade_id,
+                            sig["coin"],
+                            decision.reason,
+                        )
                     logger.info(
-                        "Rotation dry-run: would replace %s with %s (%s)",
+                        "Rotation disabled by config; skipped replacement for %s %s",
+                        sig["side"].upper(),
+                        sig["coin"],
+                    )
+                    continue
+                if rotation_dry_run:
+                    self.rotation_manager.record_dry_run_replacement_skip(
+                        decision, reason_key="dry_run_shadow_mode"
+                    )
+                    logger.info(
+                        "Rotation shadow mode: simulated replacement of %s with %s (%s)",
                         decision.replacement_trade_id,
                         sig["coin"],
                         decision.reason,
                     )
-                logger.info(
-                    "Rotation disabled by config; skipped replacement for %s %s",
-                    sig["side"].upper(),
-                    sig["coin"],
-                )
-                continue
+                    continue
 
             if decision.action == "replace":
                 victim = next(

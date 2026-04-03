@@ -17,7 +17,7 @@ import logging
 import os
 import re
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 import config
 
@@ -101,6 +101,7 @@ def validate_dependencies(logger: logging.Logger) -> None:
     logger.info(get_boot_report(config))
     validate_or_fail(config_module=config)
     validate_operational_controls(logger)
+    validate_wallet_security_controls(logger)
 
 
 def validate_operational_controls(logger: logging.Logger) -> None:
@@ -135,6 +136,71 @@ def validate_operational_controls(logger: logging.Logger) -> None:
             + ", ".join(missing)
         )
     logger.info("Rotation operational controls validated (explicit thresholds present).")
+    if getattr(config, "ROTATION_DRY_RUN_TELEMETRY", True):
+        shadow_days = max(int(getattr(config, "ROTATION_SHADOW_MODE_DAYS", 7)), 1)
+        end_at = datetime.now(timezone.utc) + timedelta(days=shadow_days)
+        logger.info(
+            "Rotation shadow mode active: replacements will be simulated only for %sd "
+            "(window end target %s).",
+            shadow_days,
+            end_at.isoformat(),
+        )
+
+
+def validate_wallet_security_controls(logger: logging.Logger) -> None:
+    """Enforce wallet-mode and secret-manager safety constraints."""
+    wallet_mode = str(getattr(config, "HL_WALLET_MODE", "agent_only")).lower().strip()
+    provider = str(getattr(config, "SECRET_MANAGER_PROVIDER", "none")).lower().strip()
+    if wallet_mode not in {"agent_only"}:
+        raise RuntimeError(
+            f"Unsupported HL_WALLET_MODE '{wallet_mode}'. Only 'agent_only' is permitted."
+        )
+    if os.environ.get("HL_PRIVATE_KEY"):
+        raise RuntimeError(
+            "Legacy HL_PRIVATE_KEY is disallowed in agent-only mode. "
+            "Use HL_AGENT_PRIVATE_KEY or SECRET_MANAGER_PROVIDER."
+        )
+    if provider not in {"none", "aws_kms", "hashicorp", "hashicorp_vault", "vault"}:
+        raise RuntimeError(
+            f"Unsupported SECRET_MANAGER_PROVIDER '{provider}'. "
+            "Expected one of: none, aws_kms, hashicorp."
+        )
+
+    if provider == "aws_kms":
+        missing = []
+        if not os.environ.get("AWS_KMS_CIPHERTEXT_B64"):
+            missing.append("AWS_KMS_CIPHERTEXT_B64")
+        if not os.environ.get("AWS_KMS_REGION"):
+            missing.append("AWS_KMS_REGION")
+        if missing:
+            raise RuntimeError(
+                "SECRET_MANAGER_PROVIDER=aws_kms but required env vars are missing: "
+                + ", ".join(missing)
+            )
+        try:
+            import boto3  # noqa: F401
+        except ImportError as exc:
+            raise RuntimeError(
+                "SECRET_MANAGER_PROVIDER=aws_kms requires boto3. "
+                "Install it or switch provider."
+            ) from exc
+
+    if provider in {"hashicorp", "hashicorp_vault", "vault"}:
+        missing = []
+        for env_name in ("VAULT_ADDR", "VAULT_TOKEN", "VAULT_SECRET_PATH"):
+            if not os.environ.get(env_name):
+                missing.append(env_name)
+        if missing:
+            raise RuntimeError(
+                "SECRET_MANAGER_PROVIDER=hashicorp but required env vars are missing: "
+                + ", ".join(missing)
+            )
+
+    logger.info(
+        "Wallet security controls validated (mode=%s, secret_provider=%s).",
+        wallet_mode,
+        provider,
+    )
 
 
 def init_database(logger: logging.Logger) -> None:
