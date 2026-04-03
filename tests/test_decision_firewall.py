@@ -36,7 +36,7 @@ class MockSignal:
 def test_firewall_passes_valid_signal(mock_db):
     """Valid signal should pass all checks."""
     mock_db.get_open_paper_trades.return_value = []
-    mock_db.get_paper_account.return_value = {"balance": 10000}
+    mock_db.get_paper_account.return_value = {"balance": 1000000}
     mock_db.audit_log = MagicMock()
 
     from src.signals.decision_firewall import DecisionFirewall
@@ -51,7 +51,7 @@ def test_firewall_passes_valid_signal(mock_db):
 def test_firewall_rejects_low_confidence(mock_db):
     """Signals below min_confidence should be rejected."""
     mock_db.get_open_paper_trades.return_value = []
-    mock_db.get_paper_account.return_value = {"balance": 10000}
+    mock_db.get_paper_account.return_value = {"balance": 1000000}
     mock_db.audit_log = MagicMock()
 
     from src.signals.decision_firewall import DecisionFirewall
@@ -73,7 +73,7 @@ def test_firewall_rejects_max_positions(mock_db):
         {"coin": "DOGE", "side": "long", "size": 1, "entry_price": 0.1, "leverage": 1},
         {"coin": "AVAX", "side": "long", "size": 1, "entry_price": 30, "leverage": 1},
     ]
-    mock_db.get_paper_account.return_value = {"balance": 10000}
+    mock_db.get_paper_account.return_value = {"balance": 1000000}
     mock_db.audit_log = MagicMock()
 
     from src.signals.decision_firewall import DecisionFirewall
@@ -86,12 +86,36 @@ def test_firewall_rejects_max_positions(mock_db):
 
 
 @patch("src.signals.decision_firewall.db")
+def test_firewall_can_preview_past_position_cap(mock_db):
+    """Preview checks should ignore the hard cap without mutating stats or cooldowns."""
+    mock_db.get_open_paper_trades.return_value = [
+        {"coin": "ETH", "side": "long", "size": 1, "entry_price": 3000, "leverage": 1},
+        {"coin": "SOL", "side": "long", "size": 1, "entry_price": 100, "leverage": 1},
+        {"coin": "ARB", "side": "long", "size": 1, "entry_price": 1, "leverage": 1},
+        {"coin": "DOGE", "side": "long", "size": 1, "entry_price": 0.1, "leverage": 1},
+        {"coin": "AVAX", "side": "long", "size": 1, "entry_price": 30, "leverage": 1},
+    ]
+    mock_db.get_paper_account.return_value = {"balance": 1000000}
+    mock_db.audit_log = MagicMock()
+
+    from src.signals.decision_firewall import DecisionFirewall
+    fw = DecisionFirewall({"max_positions": 5, "enable_predictive_derisk": False,
+                           "funding_risk_enabled": False})
+    signal = MockSignal(coin="BTC")
+
+    passed, reason = fw.validate(signal, ignore_position_limit=True, dry_run=True)
+    assert passed is True
+    assert reason == "approved"
+    assert fw.get_stats()["total_signals"] == 0
+
+
+@patch("src.signals.decision_firewall.db")
 def test_firewall_rejects_conflict(mock_db):
     """Should reject opposing positions on same coin."""
     mock_db.get_open_paper_trades.return_value = [
         {"coin": "BTC", "side": "short", "size": 1, "entry_price": 50000, "leverage": 1},
     ]
-    mock_db.get_paper_account.return_value = {"balance": 10000}
+    mock_db.get_paper_account.return_value = {"balance": 1000000}
     mock_db.audit_log = MagicMock()
 
     from src.signals.decision_firewall import DecisionFirewall
@@ -106,7 +130,7 @@ def test_firewall_rejects_conflict(mock_db):
 def test_firewall_clamps_leverage(mock_db):
     """Leverage above max should be clamped, not rejected."""
     mock_db.get_open_paper_trades.return_value = []
-    mock_db.get_paper_account.return_value = {"balance": 10000}
+    mock_db.get_paper_account.return_value = {"balance": 1000000}
     mock_db.audit_log = MagicMock()
 
     from src.signals.decision_firewall import DecisionFirewall

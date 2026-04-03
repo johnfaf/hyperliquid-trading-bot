@@ -123,7 +123,9 @@ class DecisionFirewall:
                     f"max_positions={self.max_positions}, min_confidence={self.min_confidence:.0%}")
 
     def validate(self, signal: TradeSignal, regime_data: Optional[Dict] = None,
-                 open_positions: Optional[List[Dict]] = None) -> Tuple[bool, str]:
+                 open_positions: Optional[List[Dict]] = None,
+                 ignore_position_limit: bool = False,
+                 dry_run: bool = False) -> Tuple[bool, str]:
         """
         Validate a single trade signal through all checks.
         Thread-safe: acquires _lock to prevent concurrent state corruption.
@@ -133,26 +135,36 @@ class DecisionFirewall:
           - passed=False: signal is rejected with explanation
         """
         with self._lock:
-            return self._validate_locked(signal, regime_data, open_positions)
+            return self._validate_locked(
+                signal,
+                regime_data,
+                open_positions,
+                ignore_position_limit=ignore_position_limit,
+                dry_run=dry_run,
+            )
 
     def _validate_locked(self, signal: TradeSignal, regime_data: Optional[Dict] = None,
-                         open_positions: Optional[List[Dict]] = None) -> Tuple[bool, str]:
+                         open_positions: Optional[List[Dict]] = None,
+                         ignore_position_limit: bool = False,
+                         dry_run: bool = False) -> Tuple[bool, str]:
         """Inner validate — must be called with _lock held."""
-        self.stats["total_signals"] += 1
+        if not dry_run:
+            self.stats["total_signals"] += 1
 
         def _reject(reason_key, reason_msg):
             """Helper to reject + audit log in one step."""
-            self.stats[reason_key] += 1
-            try:
-                db.audit_log(
-                    action="signal_rejected",
-                    coin=signal.coin,
-                    side=signal.side.value if hasattr(signal.side, 'value') else str(signal.side),
-                    source=getattr(signal, "source", None) or "unknown",
-                    details={"reason": reason_msg, "confidence": getattr(signal, "confidence", 0)},
-                )
-            except Exception:
-                pass
+            if not dry_run:
+                self.stats[reason_key] += 1
+                try:
+                    db.audit_log(
+                        action="signal_rejected",
+                        coin=signal.coin,
+                        side=signal.side.value if hasattr(signal.side, 'value') else str(signal.side),
+                        source=getattr(signal, "source", None) or "unknown",
+                        details={"reason": reason_msg, "confidence": getattr(signal, "confidence", 0)},
+                    )
+                except Exception:
+                    pass
             return False, reason_msg
 
         # 1. Schema validation
@@ -171,7 +183,7 @@ class DecisionFirewall:
 
         # 4. Position limits
         positions = open_positions or db.get_open_paper_trades()
-        if len(positions) >= self.max_positions:
+        if not ignore_position_limit and len(positions) >= self.max_positions:
             return _reject("rejected_risk",
                           f"Max positions reached ({len(positions)}/{self.max_positions})")
 
@@ -293,21 +305,22 @@ class DecisionFirewall:
                 logger.debug(f"Forecaster check failed: {e}")
 
         # All checks passed
-        self.stats["passed"] += 1
-        self._recent_trades[signal.coin] = now
+        if not dry_run:
+            self.stats["passed"] += 1
+            self._recent_trades[signal.coin] = now
 
-        # Audit trail: record approval
-        try:
-            db.audit_log(
-                action="signal_approved",
-                coin=signal.coin,
-                side=signal.side.value,
-                source=getattr(signal, "source", None) or "unknown",
-                details={"confidence": signal.confidence, "leverage": signal.leverage,
-                         "strategy_type": signal.strategy_type},
-            )
-        except Exception:
-            pass  # audit logging must never break the trading path
+            # Audit trail: record approval
+            try:
+                db.audit_log(
+                    action="signal_approved",
+                    coin=signal.coin,
+                    side=signal.side.value,
+                    source=getattr(signal, "source", None) or "unknown",
+                    details={"confidence": signal.confidence, "leverage": signal.leverage,
+                             "strategy_type": signal.strategy_type},
+                )
+            except Exception:
+                pass  # audit logging must never break the trading path
 
         return True, "approved"
 

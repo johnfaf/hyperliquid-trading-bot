@@ -11,6 +11,7 @@ V2 integration:
   - All signals go through TradeSignal schema validation
 """
 import logging
+import json
 from datetime import datetime
 from typing import List, Dict, Optional
 
@@ -25,6 +26,7 @@ from src.signals.agent_scoring import AgentScorer
 from src.analysis.features import FeatureEngine
 from src.signals.kelly_sizing import KellySizer
 from src.trading.trade_memory import TradeMemory
+from src.trading.portfolio_rotation import PortfolioRotationManager
 from src.signals.calibration import CalibrationTracker
 from src.signals.llm_filter import LLMFilter
 import random
@@ -49,6 +51,7 @@ class PaperTrader:
         self.trade_memory = trade_memory
         self.calibration = calibration
         self.llm_filter = llm_filter
+        self.rotation_manager = PortfolioRotationManager()
         self._ensure_account()
 
     def _ensure_account(self):
@@ -115,9 +118,11 @@ class PaperTrader:
 
         open_trades = db.get_open_paper_trades()
         executed = []
+        rotation_candidates = []
 
         # Get current prices
         mids = hl.get_all_mids() or {}
+        self._annotate_open_trades(open_trades, mids)
 
         # Pre-compute features for relevant coins if feature engine available
         coin_features = {}
@@ -284,6 +289,8 @@ class PaperTrader:
                         trade_signal,
                         regime_data=regime_data,
                         open_positions=open_trades,
+                        ignore_position_limit=True,
+                        dry_run=True,
                     )
                     if not passed:
                         _drop_counts["firewall"] += 1
@@ -380,26 +387,104 @@ class PaperTrader:
                     except Exception as e:
                         logger.debug(f"Kelly sizing error: {e}")
 
-                # Record signal with agent scorer
-                signal_id = ""
-                if self.agent_scorer:
-                    source_key = self.agent_scorer.get_source_key(trade_signal)
-                    signal_id = self.agent_scorer.record_signal(source_key, {
-                        "coin": sig["coin"],
-                        "side": sig["side"],
-                        "confidence": trade_signal.confidence,
-                    })
-
-                # Execute the paper trade
-                trade = self._execute_paper_trade(account, sig["strategy"], sig)
-                if trade:
-                    trade["signal_id"] = signal_id
-                    trade["strategy_type"] = sig.get("strategy_type", "")
-                    executed.append(trade)
-                    open_trades.append(trade)
+                sig["confidence"] = trade_signal.confidence
+                sig["source_accuracy"] = trade_signal.source_accuracy
+                sig["regime"] = trade_signal.regime
+                rotation_candidates.append({
+                    "trade_signal": trade_signal,
+                    "signal": sig,
+                })
 
             except Exception as e:
                 logger.error(f"Error in V2 pipeline for {sig.get('coin', '?')}: {e}")
+
+        replacements_used = 0
+        for candidate in sorted(
+            rotation_candidates,
+            key=lambda item: self.rotation_manager.candidate_score(
+                item["trade_signal"], regime_data=regime_data
+            ),
+            reverse=True,
+        ):
+            trade_signal = candidate["trade_signal"]
+            sig = candidate["signal"]
+            decision = self.rotation_manager.decide(
+                trade_signal,
+                open_trades,
+                regime_data=regime_data,
+                replacements_used=replacements_used,
+            )
+
+            if decision.action == "reject":
+                logger.info(
+                    "Rotation skipped %s %s: %s",
+                    sig["side"].upper(),
+                    sig["coin"],
+                    decision.reason,
+                )
+                continue
+
+            if decision.action == "replace":
+                victim = next(
+                    (trade for trade in open_trades if trade.get("id") == decision.replacement_trade_id),
+                    None,
+                )
+                if not victim:
+                    logger.info("Rotation skipped %s: incumbent not found", sig["coin"])
+                    continue
+
+                current_price = float(
+                    mids.get(victim["coin"], victim.get("entry_price", 0)) or victim.get("entry_price", 0)
+                )
+                closed_trade = self._close_trade(
+                    victim,
+                    current_price=current_price,
+                    close_reason=f"rotation_out:{sig['coin']}",
+                )
+                if not closed_trade:
+                    continue
+
+                open_trades = [trade for trade in open_trades if trade.get("id") != victim.get("id")]
+                replacements_used += 1
+                logger.info(
+                    "Rotation replaced %s with %s (%s)",
+                    victim.get("coin"),
+                    sig["coin"],
+                    decision.reason,
+                )
+
+            if self.firewall:
+                passed, reason = self.firewall.validate(
+                    trade_signal,
+                    regime_data=regime_data,
+                    open_positions=open_trades,
+                )
+                if not passed:
+                    logger.info(
+                        "Firewall rejected %s %s at execution time: %s",
+                        sig["side"],
+                        sig["coin"],
+                        reason,
+                    )
+                    continue
+
+            signal_id = ""
+            if self.agent_scorer:
+                source_key = self.agent_scorer.get_source_key(trade_signal)
+                signal_id = self.agent_scorer.record_signal(source_key, {
+                    "coin": sig["coin"],
+                    "side": sig["side"],
+                    "confidence": trade_signal.confidence,
+                })
+            sig["signal_id"] = signal_id
+
+            trade = self._execute_paper_trade(account, sig["strategy"], sig)
+            if trade:
+                trade["signal_id"] = signal_id
+                trade["strategy_type"] = sig.get("strategy_type", "")
+                executed.append(trade)
+                self._annotate_open_trades([trade], mids)
+                open_trades.append(trade)
 
         if executed:
             logger.info(f"Executed {len(executed)} paper trades (V2 pipeline)")
@@ -645,6 +730,8 @@ class PaperTrader:
                     "confidence": signal.get("confidence", 0),
                     "signal_id": signal.get("signal_id", ""),
                     "features": signal.get("features", {}),
+                    "source_accuracy": signal.get("source_accuracy", 0),
+                    "regime": signal.get("regime", ""),
                     "options_flow_aligned": signal.get("options_flow_aligned"),
                     "volume_confirmed": signal.get("volume_confirmed"),
                 },
@@ -665,10 +752,139 @@ class PaperTrader:
                 "size": signal["size"],
                 "leverage": signal["leverage"],
                 "strategy_id": strategy.get("id"),
+                "confidence": signal.get("confidence", 0),
+                "opened_at": datetime.utcnow().isoformat(),
+                "metadata": {
+                    "strategy_type": signal.get("strategy_type", ""),
+                    "confidence": signal.get("confidence", 0),
+                    "signal_id": signal.get("signal_id", ""),
+                    "features": signal.get("features", {}),
+                    "source_accuracy": signal.get("source_accuracy", 0),
+                    "regime": signal.get("regime", ""),
+                    "options_flow_aligned": signal.get("options_flow_aligned"),
+                    "volume_confirmed": signal.get("volume_confirmed"),
+                },
             }
         except Exception as e:
             logger.error(f"Error opening paper trade: {e}")
             return None
+
+    @staticmethod
+    def _annotate_open_trades(open_trades: List[Dict], mids: Dict):
+        for trade in open_trades:
+            fallback_price = float(trade.get("entry_price", 0) or 0)
+            trade["current_price"] = float(mids.get(trade.get("coin", ""), fallback_price) or fallback_price)
+
+    def _close_trade(self, trade: Dict, current_price: float, close_reason: str) -> Optional[Dict]:
+        """Close an open paper trade and feed its outcome to the scoring subsystems."""
+        slipped_exit = self._apply_slippage(current_price, trade["side"], is_entry=False)
+        pnl = self._calculate_pnl(trade, slipped_exit)
+        db.close_paper_trade(trade["id"], slipped_exit, pnl)
+
+        account = db.get_paper_account()
+        if account:
+            new_balance = account["balance"] + pnl
+            new_total_pnl = account["total_pnl"] + pnl
+            new_total_trades = account["total_trades"] + 1
+            new_winning = account["winning_trades"] + (1 if pnl > 0 else 0)
+            db.update_paper_account(new_balance, new_total_pnl, new_total_trades, new_winning)
+
+        logger.info(
+            "Paper trade closed (%s): %s %s entry=$%s exit=$%s PnL=$%s",
+            close_reason,
+            trade["side"].upper(),
+            trade["coin"],
+            f"{trade['entry_price']:,.2f}",
+            f"{slipped_exit:,.2f}",
+            f"{pnl:,.2f}",
+        )
+
+        trade_meta = {}
+        try:
+            meta = trade.get("metadata", {})
+            trade_meta = json.loads(meta or "{}") if isinstance(meta, str) else dict(meta or {})
+        except Exception:
+            trade_meta = {}
+
+        strategy_type = trade_meta.get("strategy_type", "unknown")
+        signal_id = trade_meta.get("signal_id", "")
+        return_pct = pnl / max(
+            trade["entry_price"] * max(trade["size"], 1e-8) * max(trade.get("leverage", 1), 1),
+            1e-8,
+        )
+
+        if self.agent_scorer:
+            try:
+                source_key = f"strategy:{strategy_type}"
+                self.agent_scorer.record_outcome(source_key, signal_id, pnl, return_pct)
+            except Exception as e:
+                logger.debug(f"Agent scorer outcome error: {e}")
+
+        if self.firewall:
+            try:
+                self.firewall.record_trade_outcome(trade["coin"], pnl)
+            except Exception:
+                pass
+
+        if self.kelly_sizer:
+            try:
+                self.kelly_sizer.record_outcome(
+                    strategy_key=strategy_type,
+                    pnl=pnl,
+                    entry_price=trade["entry_price"],
+                    size=trade["size"],
+                    leverage=trade.get("leverage", 1),
+                )
+            except Exception:
+                pass
+
+        if self.calibration:
+            try:
+                source_key = f"strategy:{strategy_type}"
+                predicted_conf = trade_meta.get("confidence", 0.5)
+                self.calibration.record(
+                    source_key=source_key,
+                    predicted_confidence=predicted_conf,
+                    actual_win=pnl > 0,
+                    pnl=pnl,
+                    coin=trade["coin"],
+                    side=trade["side"],
+                )
+            except Exception:
+                pass
+
+        if self.trade_memory:
+            try:
+                self.trade_memory.record_trade(
+                    trade_id=str(trade["id"]),
+                    coin=trade["coin"],
+                    side=trade["side"],
+                    strategy_type=strategy_type,
+                    entry_price=trade["entry_price"],
+                    exit_price=slipped_exit,
+                    pnl=pnl,
+                    return_pct=return_pct,
+                    opened_at=trade.get("opened_at", ""),
+                    closed_at=datetime.utcnow().isoformat(),
+                    confidence=trade_meta.get("confidence", 0),
+                    source="strategy",
+                    regime=trade_meta.get("regime", ""),
+                    setup_type=trade_meta.get("setup_type", strategy_type),
+                    features=trade_meta.get("features", {}),
+                )
+            except Exception:
+                pass
+
+        return {
+            "trade_id": trade["id"],
+            "coin": trade["coin"],
+            "side": trade["side"],
+            "pnl": pnl,
+            "reason": close_reason,
+            "strategy_type": strategy_type,
+            "signal_id": signal_id,
+            "exit_price": slipped_exit,
+        }
 
     def check_open_positions(self) -> List[Dict]:
         """
@@ -758,115 +974,13 @@ class PaperTrader:
                     pass
 
             if should_close:
-                # Apply exit slippage for realistic PnL calculation
-                slipped_exit = self._apply_slippage(current_price, trade["side"], is_entry=False)
-                pnl = self._calculate_pnl(trade, slipped_exit)
-                db.close_paper_trade(trade["id"], slipped_exit, pnl)
-
-                # Update account
-                account = db.get_paper_account()
-                new_balance = account["balance"] + pnl
-                new_total_pnl = account["total_pnl"] + pnl
-                new_total_trades = account["total_trades"] + 1
-                new_winning = account["winning_trades"] + (1 if pnl > 0 else 0)
-                db.update_paper_account(new_balance, new_total_pnl, new_total_trades, new_winning)
-
-                logger.info(
-                    f"Paper trade closed ({close_reason}): {trade['side'].upper()} {trade['coin']} "
-                    f"entry=${trade['entry_price']:,.2f} exit=${current_price:,.2f} "
-                    f"PnL=${pnl:,.2f}"
+                closed_trade = self._close_trade(
+                    trade,
+                    current_price=current_price,
+                    close_reason=close_reason,
                 )
-
-                # Record outcome with V2 scoring systems
-                trade_meta = {}
-                try:
-                    import json
-                    trade_meta = json.loads(trade.get("metadata", "{}") or "{}")
-                except Exception:
-                    pass
-
-                strategy_type = trade_meta.get("strategy_type", "unknown")
-                signal_id = trade_meta.get("signal_id", "")
-
-                # Feed outcome to agent scorer
-                if self.agent_scorer:
-                    try:
-                        source_key = f"strategy:{strategy_type}"
-                        return_pct = pnl / max(trade["entry_price"] * max(trade["size"], 1e-8) * max(trade.get("leverage", 1), 1), 1e-8)
-                        self.agent_scorer.record_outcome(source_key, signal_id, pnl, return_pct)
-                    except Exception as e:
-                        logger.debug(f"Agent scorer outcome error: {e}")
-
-                # Feed outcome to decision firewall daily tracker
-                if self.firewall:
-                    try:
-                        self.firewall.record_trade_outcome(trade["coin"], pnl)
-                    except Exception:
-                        pass
-
-                # Feed outcome to Kelly sizer
-                if self.kelly_sizer:
-                    try:
-                        self.kelly_sizer.record_outcome(
-                            strategy_key=strategy_type,
-                            pnl=pnl,
-                            entry_price=trade["entry_price"],
-                            size=trade["size"],
-                            leverage=trade.get("leverage", 1),
-                        )
-                    except Exception:
-                        pass
-
-                # Feed outcome to calibration tracker
-                if self.calibration:
-                    try:
-                        source_key = f"strategy:{strategy_type}"
-                        predicted_conf = trade_meta.get("confidence", 0.5)
-                        self.calibration.record(
-                            source_key=source_key,
-                            predicted_confidence=predicted_conf,
-                            actual_win=pnl > 0,
-                            pnl=pnl,
-                            coin=trade["coin"],
-                            side=trade["side"],
-                        )
-                    except Exception:
-                        pass
-
-                # Feed outcome to trade memory
-                if self.trade_memory:
-                    try:
-                        return_pct = pnl / (trade["entry_price"] * trade["size"] * trade.get("leverage", 1)) if trade["entry_price"] > 0 else 0
-                        self.trade_memory.record_trade(
-                            trade_id=str(trade["id"]),
-                            coin=trade["coin"],
-                            side=trade["side"],
-                            strategy_type=strategy_type,
-                            entry_price=trade["entry_price"],
-                            exit_price=current_price,
-                            pnl=pnl,
-                            return_pct=return_pct,
-                            opened_at=trade.get("opened_at", ""),
-                            closed_at=datetime.utcnow().isoformat(),
-                            confidence=trade_meta.get("confidence", 0),
-                            source="strategy",
-                            regime=trade_meta.get("regime", ""),
-                            setup_type=trade_meta.get("setup_type", strategy_type),
-                            features=trade_meta.get("features", {}),
-                        )
-                    except Exception:
-                        pass
-
-                closed.append({
-                    "trade_id": trade["id"],
-                    "coin": trade["coin"],
-                    "side": trade["side"],
-                    "pnl": pnl,
-                    "reason": close_reason,
-                    "strategy_type": strategy_type,
-                    "signal_id": signal_id,
-                    "exit_price": current_price,
-                })
+                if closed_trade:
+                    closed.append(closed_trade)
 
         return closed
 

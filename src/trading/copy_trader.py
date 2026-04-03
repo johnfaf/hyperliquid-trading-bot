@@ -21,6 +21,7 @@ from src.signals.decision_firewall import DecisionFirewall
 from src.signals.agent_scoring import AgentScorer
 from src.signals.kelly_sizing import KellySizer
 from src.trading.trade_memory import TradeMemory
+from src.trading.portfolio_rotation import PortfolioRotationManager
 from src.signals.calibration import CalibrationTracker
 
 logger = logging.getLogger(__name__)
@@ -44,6 +45,7 @@ class CopyTrader:
         self.trade_memory = trade_memory
         self.calibration = calibration
         self.regime_forecaster = regime_forecaster
+        self.rotation_manager = PortfolioRotationManager()
 
     def scan_top_traders(self, top_n: int = 10) -> List[Dict]:
         """
@@ -238,19 +240,22 @@ class CopyTrader:
         open_trades = db.get_open_paper_trades()
         mids = hl.get_all_mids() or {}
         executed = []
+        pending_entries = []
+        self._annotate_open_trades(open_trades, mids)
 
         for signal in signals:
             try:
                 if signal["type"] == "copy_close":
                     closed = self._close_copy_trades(signal, open_trades, mids)
                     executed.extend(closed)
+                    closed_ids = {trade["trade_id"] for trade in closed}
+                    open_trades = [trade for trade in open_trades if trade.get("id") not in closed_ids]
                     continue
 
                 if signal["type"] in ("copy_open", "copy_scale_in", "copy_flip", "golden_copy"):
-                    # Apply regime weighting to copy signal before further processing
                     signal = self._apply_regime_weight(signal, signal["coin"])
+                    trade_signal = None
 
-                    # V2: Convert to TradeSignal and validate through firewall
                     if self.firewall and signal.get("price", 0) > 0:
                         trade_signal = signal_from_copy_trade(
                             trader_address=signal.get("source_trader", ""),
@@ -260,37 +265,132 @@ class CopyTrader:
                             confidence=signal.get("confidence", 0.5),
                         )
                         trade_signal.leverage = signal.get("leverage", 2)
+                        trade_signal.regime = regime_data.get("overall_regime", "") if regime_data else ""
 
-                        # Apply agent scoring weight
                         if self.agent_scorer:
                             source_key = f"copy_trade:{signal.get('source_trader', 'unknown')}"
                             weight = self.agent_scorer.get_weight(source_key)
                             trade_signal.confidence = trade_signal.confidence * 0.6 + weight * 0.4
 
                         passed, reason = self.firewall.validate(
-                            trade_signal, regime_data=regime_data, open_positions=open_trades
+                            trade_signal,
+                            regime_data=regime_data,
+                            open_positions=open_trades,
+                            ignore_position_limit=True,
+                            dry_run=True,
                         )
                         if not passed:
                             logger.info(f"  Firewall rejected copy {signal['side']} {signal['coin']}: {reason}")
                             continue
 
-                        # Record signal with agent scorer
-                        if self.agent_scorer:
-                            source_key = f"copy_trade:{signal.get('source_trader', 'unknown')}"
-                            signal_id = self.agent_scorer.record_signal(source_key, {
-                                "coin": signal["coin"], "side": signal["side"],
-                                "confidence": trade_signal.confidence,
-                            })
-                            signal["_signal_id"] = signal_id
-                            signal["_source_key"] = source_key
+                    if trade_signal is None:
+                        trade_signal = signal_from_copy_trade(
+                            trader_address=signal.get("source_trader", ""),
+                            coin=signal["coin"],
+                            side=signal["side"],
+                            entry_price=signal["price"],
+                            confidence=signal.get("confidence", 0.5),
+                        )
+                        trade_signal.leverage = signal.get("leverage", 2)
+                        trade_signal.regime = regime_data.get("overall_regime", "") if regime_data else ""
 
-                    trade = self._open_copy_trade(account, signal, open_trades)
-                    if trade:
-                        executed.append(trade)
-                        open_trades.append(trade)
+                    signal["confidence"] = trade_signal.confidence
+                    signal["source_accuracy"] = trade_signal.source_accuracy
+                    signal["regime"] = trade_signal.regime
+                    pending_entries.append({
+                        "signal": signal,
+                        "trade_signal": trade_signal,
+                    })
 
             except Exception as e:
                 logger.error(f"Error executing copy signal: {e}")
+
+        replacements_used = 0
+        for candidate in sorted(
+            pending_entries,
+            key=lambda item: self.rotation_manager.candidate_score(
+                item["trade_signal"], regime_data=regime_data
+            ),
+            reverse=True,
+        ):
+            signal = candidate["signal"]
+            trade_signal = candidate["trade_signal"]
+            decision = self.rotation_manager.decide(
+                trade_signal,
+                open_trades,
+                regime_data=regime_data,
+                replacements_used=replacements_used,
+            )
+
+            if decision.action == "reject":
+                logger.info(
+                    "  Rotation skipped copy %s %s: %s",
+                    signal["side"],
+                    signal["coin"],
+                    decision.reason,
+                )
+                continue
+
+            if decision.action == "replace":
+                victim = next(
+                    (trade for trade in open_trades if trade.get("id") == decision.replacement_trade_id),
+                    None,
+                )
+                if not victim:
+                    logger.info("  Rotation skipped copy %s: incumbent not found", signal["coin"])
+                    continue
+
+                current_price = float(
+                    mids.get(victim["coin"], victim.get("entry_price", 0)) or victim.get("entry_price", 0)
+                )
+                closed_trade = self._close_trade(
+                    victim,
+                    exit_price=current_price,
+                    close_reason=f"rotation_out:{signal['coin']}",
+                )
+                if not closed_trade:
+                    continue
+
+                open_trades = [trade for trade in open_trades if trade.get("id") != victim.get("id")]
+                replacements_used += 1
+                logger.info(
+                    "  Rotation replaced %s with copy %s (%s)",
+                    victim.get("coin"),
+                    signal["coin"],
+                    decision.reason,
+                )
+
+            if self.firewall:
+                passed, reason = self.firewall.validate(
+                    trade_signal,
+                    regime_data=regime_data,
+                    open_positions=open_trades,
+                )
+                if not passed:
+                    logger.info(
+                        "  Firewall rejected copy %s %s at execution time: %s",
+                        signal["side"],
+                        signal["coin"],
+                        reason,
+                    )
+                    continue
+
+            if self.agent_scorer:
+                source_key = f"copy_trade:{signal.get('source_trader', 'unknown')}"
+                signal_id = self.agent_scorer.record_signal(source_key, {
+                    "coin": signal["coin"],
+                    "side": signal["side"],
+                    "confidence": trade_signal.confidence,
+                })
+                signal["_signal_id"] = signal_id
+                signal["_source_key"] = source_key
+
+            account = db.get_paper_account() or account
+            trade = self._open_copy_trade(account, signal, open_trades)
+            if trade:
+                executed.append(trade)
+                self._annotate_open_trades([trade], mids)
+                open_trades.append(trade)
 
         if executed:
             self._copy_count += len(executed)
@@ -355,6 +455,9 @@ class CopyTrader:
                     "type": signal["type"],
                     "source_trader": signal.get("source_trader", ""),
                     "confidence": signal.get("confidence", 0),
+                    "signal_id": signal.get("_signal_id", ""),
+                    "source_accuracy": signal.get("source_accuracy", 0),
+                    "regime": signal.get("regime", ""),
                     "is_copy_trade": True,
                     "is_golden": signal.get("is_golden", False),
                     "golden_wallet": signal.get("is_golden", False),
@@ -373,10 +476,132 @@ class CopyTrader:
                 "size": size,
                 "leverage": leverage,
                 "strategy_id": None,
+                "confidence": signal.get("confidence", 0),
+                "trader_address": signal.get("source_trader", ""),
+                "opened_at": datetime.utcnow().isoformat(),
+                "metadata": {
+                    "type": signal["type"],
+                    "source_trader": signal.get("source_trader", ""),
+                    "confidence": signal.get("confidence", 0),
+                    "signal_id": signal.get("_signal_id", ""),
+                    "source_accuracy": signal.get("source_accuracy", 0),
+                    "regime": signal.get("regime", ""),
+                    "is_copy_trade": True,
+                    "is_golden": signal.get("is_golden", False),
+                    "golden_wallet": signal.get("is_golden", False),
+                    "source": "copy_trade",
+                },
             }
         except Exception as e:
             logger.error(f"Error opening copy trade: {e}")
             return None
+
+    @staticmethod
+    def _annotate_open_trades(open_trades: List[Dict], mids: Dict):
+        for trade in open_trades:
+            fallback_price = float(trade.get("entry_price", 0) or 0)
+            trade["current_price"] = float(mids.get(trade.get("coin", ""), fallback_price) or fallback_price)
+
+    def _close_trade(self, trade: Dict, exit_price: float, close_reason: str) -> Optional[Dict]:
+        """Close a copy trade and feed the result into the paper-trading scorekeepers."""
+        if trade["side"] == "long":
+            pnl = (exit_price - trade["entry_price"]) * trade["size"] * trade["leverage"]
+        else:
+            pnl = (trade["entry_price"] - exit_price) * trade["size"] * trade["leverage"]
+        pnl = round(pnl, 2)
+
+        db.close_paper_trade(trade["id"], exit_price, pnl)
+
+        account = db.get_paper_account()
+        if account:
+            db.update_paper_account(
+                account["balance"] + pnl,
+                account["total_pnl"] + pnl,
+                account["total_trades"] + 1,
+                account["winning_trades"] + (1 if pnl > 0 else 0),
+            )
+
+        logger.info(
+            "Copy trade closed (%s): %s %s entry=$%s exit=$%s PnL=$%s",
+            close_reason,
+            trade["side"].upper(),
+            trade["coin"],
+            f"{trade['entry_price']:,.2f}",
+            f"{exit_price:,.2f}",
+            f"{pnl:,.2f}",
+        )
+
+        meta = trade.get("metadata", "{}")
+        if isinstance(meta, str):
+            try:
+                meta = json.loads(meta)
+            except (json.JSONDecodeError, TypeError):
+                meta = {}
+        else:
+            meta = dict(meta or {})
+
+        return_pct = pnl / max(
+            trade["entry_price"] * max(trade["size"], 1e-8) * max(trade.get("leverage", 1), 1),
+            1e-8,
+        )
+        source_key = f"copy_trade:{meta.get('source_trader', 'unknown')}"
+
+        if self.agent_scorer and meta.get("source_trader"):
+            try:
+                self.agent_scorer.record_outcome(source_key, meta.get("signal_id", ""), pnl, return_pct)
+            except Exception:
+                pass
+        if self.firewall:
+            try:
+                self.firewall.record_trade_outcome(trade["coin"], pnl)
+            except Exception:
+                pass
+
+        if self.kelly_sizer:
+            try:
+                self.kelly_sizer.record_outcome(
+                    strategy_key=source_key,
+                    pnl=pnl,
+                    entry_price=trade["entry_price"],
+                    size=trade["size"],
+                    leverage=trade.get("leverage", 1),
+                )
+            except Exception:
+                pass
+
+        if self.calibration:
+            try:
+                self.calibration.record(
+                    source_key=source_key,
+                    predicted_confidence=meta.get("confidence", 0.5),
+                    actual_win=pnl > 0,
+                    pnl=pnl,
+                    coin=trade["coin"],
+                    side=trade.get("side", ""),
+                )
+            except Exception:
+                pass
+
+        if self.trade_memory:
+            try:
+                self.trade_memory.record_trade(
+                    trade_id=str(trade["id"]),
+                    coin=trade["coin"],
+                    side=trade.get("side", ""),
+                    strategy_type="copy_trade",
+                    entry_price=trade["entry_price"],
+                    exit_price=exit_price,
+                    pnl=pnl,
+                    return_pct=return_pct,
+                    opened_at=trade.get("opened_at", ""),
+                    closed_at=datetime.utcnow().isoformat(),
+                    confidence=meta.get("confidence", 0),
+                    source="copy_trade",
+                )
+            except Exception:
+                pass
+
+        return {"trade_id": trade["id"], "coin": trade["coin"], "pnl": pnl, "reason": close_reason}
 
     def _close_copy_trades(self, signal: Dict, open_trades: List, mids: Dict) -> List[Dict]:
         """Close open copy trades for a coin when the source trader exits."""
@@ -396,91 +621,13 @@ class CopyTrader:
                 current_price = float(mids.get(trade["coin"], 0))
                 if current_price <= 0:
                     continue
-
-                if trade["side"] == "long":
-                    pnl = (current_price - trade["entry_price"]) * trade["size"] * trade["leverage"]
-                else:
-                    pnl = (trade["entry_price"] - current_price) * trade["size"] * trade["leverage"]
-                pnl = round(pnl, 2)
-
-                db.close_paper_trade(trade["id"], current_price, pnl)
-
-                account = db.get_paper_account()
-                db.update_paper_account(
-                    account["balance"] + pnl,
-                    account["total_pnl"] + pnl,
-                    account["total_trades"] + 1,
-                    account["winning_trades"] + (1 if pnl > 0 else 0),
+                closed_trade = self._close_trade(
+                    trade,
+                    exit_price=current_price,
+                    close_reason="source_exit",
                 )
-
-                logger.info(
-                    f"Copy trade closed (source exited): {trade['coin']} "
-                    f"PnL=${pnl:,.2f}"
-                )
-
-                # V2: Feed outcome to agent scorer and firewall
-                return_pct = pnl / max(trade["entry_price"] * max(trade["size"], 1e-8) * max(trade.get("leverage", 1), 1), 1e-8)
-                source_key = f"copy_trade:{meta.get('source_trader', 'unknown')}"
-
-                if self.agent_scorer and meta.get("source_trader"):
-                    try:
-                        self.agent_scorer.record_outcome(source_key, meta.get("signal_id", ""), pnl, return_pct)
-                    except Exception:
-                        pass
-                if self.firewall:
-                    try:
-                        self.firewall.record_trade_outcome(trade["coin"], pnl)
-                    except Exception:
-                        pass
-
-                # Feed to Kelly sizer
-                if self.kelly_sizer:
-                    try:
-                        self.kelly_sizer.record_outcome(
-                            strategy_key=source_key,
-                            pnl=pnl,
-                            entry_price=trade["entry_price"],
-                            size=trade["size"],
-                            leverage=trade.get("leverage", 1),
-                        )
-                    except Exception:
-                        pass
-
-                # Feed to calibration tracker
-                if self.calibration:
-                    try:
-                        self.calibration.record(
-                            source_key=source_key,
-                            predicted_confidence=meta.get("confidence", 0.5),
-                            actual_win=pnl > 0,
-                            pnl=pnl,
-                            coin=trade["coin"],
-                            side=trade.get("side", ""),
-                        )
-                    except Exception:
-                        pass
-
-                # Feed to trade memory
-                if self.trade_memory:
-                    try:
-                        self.trade_memory.record_trade(
-                            trade_id=str(trade["id"]),
-                            coin=trade["coin"],
-                            side=trade.get("side", ""),
-                            strategy_type="copy_trade",
-                            entry_price=trade["entry_price"],
-                            exit_price=current_price,
-                            pnl=pnl,
-                            return_pct=return_pct,
-                            opened_at=trade.get("opened_at", ""),
-                            closed_at="",
-                            confidence=meta.get("confidence", 0),
-                            source="copy_trade",
-                        )
-                    except Exception:
-                        pass
-
-                closed.append({"trade_id": trade["id"], "coin": trade["coin"], "pnl": pnl})
+                if closed_trade:
+                    closed.append(closed_trade)
 
         return closed
 

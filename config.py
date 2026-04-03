@@ -82,6 +82,24 @@ PAPER_TRADING_MAX_LEVERAGE = 5
 PAPER_TRADING_STOP_LOSS_PCT = 0.05      # 5%
 PAPER_TRADING_TAKE_PROFIT_PCT = 0.10    # 10%
 
+# Portfolio rotation for paper trading: keep the book flexible without
+# removing safety rails entirely.
+PORTFOLIO_TARGET_POSITIONS = int(os.environ.get("PORTFOLIO_TARGET_POSITIONS", 8))
+PORTFOLIO_HARD_MAX_POSITIONS = int(os.environ.get("PORTFOLIO_HARD_MAX_POSITIONS", 10))
+PORTFOLIO_RESERVED_HIGH_CONVICTION_SLOTS = int(
+    os.environ.get("PORTFOLIO_RESERVED_HIGH_CONVICTION_SLOTS", 2)
+)
+PORTFOLIO_HIGH_CONVICTION_THRESHOLD = float(
+    os.environ.get("PORTFOLIO_HIGH_CONVICTION_THRESHOLD", 0.78)
+)
+PORTFOLIO_MIN_HOLD_MINUTES = int(os.environ.get("PORTFOLIO_MIN_HOLD_MINUTES", 60))
+PORTFOLIO_REPLACEMENT_THRESHOLD = float(
+    os.environ.get("PORTFOLIO_REPLACEMENT_THRESHOLD", 0.15)
+)
+PORTFOLIO_MAX_REPLACEMENTS_PER_CYCLE = int(
+    os.environ.get("PORTFOLIO_MAX_REPLACEMENTS_PER_CYCLE", 1)
+)
+
 # ─── Scheduling ────────────────────────────────────────────────
 # 3-tier scheduling:
 #   Tier 1 — Fast cycle:   position checks, SL/TP, copy-trade scan
