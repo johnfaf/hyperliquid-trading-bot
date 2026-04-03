@@ -408,6 +408,11 @@ class CopyTrader:
 
                     open_trades = [t for t in open_trades if t.get("id") != victim.get("id")]
                     replacements_used += 1
+                    self.rotation_manager.register_replacement(
+                        replaced_trade=victim,
+                        new_coin=signal.get("coin", ""),
+                        new_side=signal.get("side", ""),
+                    )
                     logger.info(
                         "  Rotation replaced %s with copy %s (%s)",
                         victim.get("coin"),

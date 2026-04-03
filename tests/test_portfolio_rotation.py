@@ -87,3 +87,36 @@ def test_rotation_respects_min_hold_window():
     decision = manager.decide(MockSignal(confidence=0.95), open_positions)
     assert decision.action == "reject"
     assert "hold window" in decision.reason
+
+
+def test_rotation_guardrail_blocks_immediate_round_trip_reentry():
+    manager = PortfolioRotationManager({
+        "target_positions": 2,
+        "reserved_high_conviction_slots": 0,
+        "replacement_threshold": 0.01,
+        "round_trip_block_minutes": 60,
+        "forced_exit_cooldown_minutes": 60,
+    })
+    victim = _open_trade(1, confidence=0.20, minutes_ago=180, coin="BTC", side="long")
+    incumbent = _open_trade(2, confidence=0.55, minutes_ago=180, coin="ETH", side="long")
+    manager.register_replacement(victim, new_coin="SOL", new_side="long")
+
+    decision = manager.decide(MockSignal(confidence=0.95, side="short"), [victim, incumbent])
+    assert decision.action == "reject"
+    assert "cooldown" in decision.reason or "round-trip" in decision.reason
+
+
+def test_rotation_guardrail_caps_replacements_per_hour():
+    manager = PortfolioRotationManager({
+        "target_positions": 2,
+        "reserved_high_conviction_slots": 0,
+        "replacement_threshold": 0.01,
+        "max_replacements_per_hour": 1,
+        "max_replacements_per_day": 10,
+    })
+    victim = _open_trade(1, confidence=0.10, minutes_ago=200, coin="ARB")
+    manager.register_replacement(victim, new_coin="ETH", new_side="long")
+
+    decision = manager.decide(MockSignal(confidence=0.95), [victim, _open_trade(2, confidence=0.5, minutes_ago=200)])
+    assert decision.action == "reject"
+    assert "cap hit" in decision.reason
