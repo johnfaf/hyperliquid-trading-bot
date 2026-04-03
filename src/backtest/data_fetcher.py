@@ -172,7 +172,7 @@ class DataFetcher:
 
         # Fetch from API in chunks
         logger.info(f"Fetching {coin} {timeframe} candles from Hyperliquid "
-                    f"({start or '90d ago'} → {end or 'now'})...")
+                    f"({start or '90d ago'} -> {end or 'now'})...")
 
         all_candles = []
         chunk_start = start_ms
