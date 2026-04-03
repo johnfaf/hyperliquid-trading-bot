@@ -132,6 +132,15 @@ PORTFOLIO_MAX_SIDE_EXPOSURE_PCT = float(
 PORTFOLIO_MAX_CLUSTER_EXPOSURE_PCT = float(
     os.environ.get("PORTFOLIO_MAX_CLUSTER_EXPOSURE_PCT", 0.55)
 )
+ROTATION_ENGINE_ENABLED = os.environ.get(
+    "ROTATION_ENGINE_ENABLED", "false"
+).lower() in ("true", "1", "yes")
+ROTATION_DRY_RUN_TELEMETRY = os.environ.get(
+    "ROTATION_DRY_RUN_TELEMETRY", "true"
+).lower() in ("true", "1", "yes")
+ROTATION_REQUIRE_EXPLICIT_THRESHOLDS = os.environ.get(
+    "ROTATION_REQUIRE_EXPLICIT_THRESHOLDS", "true"
+).lower() in ("true", "1", "yes")
 
 # ─── Scheduling ────────────────────────────────────────────────
 # 3-tier scheduling:

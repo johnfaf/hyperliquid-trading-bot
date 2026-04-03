@@ -147,6 +147,15 @@ class PortfolioRotationManager:
         self._replacement_timestamps: List[datetime] = []
         self._symbol_cooldown_until: Dict[str, datetime] = {}
         self._last_forced_exit: Dict[str, Dict[str, str]] = {}
+        self._telemetry = {
+            "decisions": 0,
+            "open": 0,
+            "reject": 0,
+            "replace": 0,
+            "replacement_count": 0,
+            "estimated_churn_cost": 0.0,
+            "rejection_reasons": {},
+        }
         self._cluster_map = {
             "majors": {"BTC", "ETH"},
             "l1": {"SOL", "AVAX", "APT", "SUI", "INJ", "SEI"},
@@ -231,22 +240,26 @@ class PortfolioRotationManager:
 
         blocked, block_reason = self._guardrail_block_reason(signal, now)
         if blocked:
-            return RotationDecision(
+            decision = RotationDecision(
                 action="reject",
                 reason=block_reason,
                 candidate_score=candidate_score,
             )
+            self._record_decision(decision)
+            return decision
 
         if open_count < normal_slot_limit:
-            return RotationDecision(
+            decision = RotationDecision(
                 action="open",
                 reason=f"normal capacity available ({open_count}/{normal_slot_limit})",
                 candidate_score=candidate_score,
             )
+            self._record_decision(decision)
+            return decision
 
         if open_count < self.target_positions:
             if self.is_high_conviction(candidate_score):
-                return RotationDecision(
+                decision = RotationDecision(
                     action="open",
                     reason=(
                         f"reserved high-conviction slot used "
@@ -254,7 +267,9 @@ class PortfolioRotationManager:
                     ),
                     candidate_score=candidate_score,
                 )
-            return RotationDecision(
+                self._record_decision(decision)
+                return decision
+            decision = RotationDecision(
                 action="reject",
                 reason=(
                     "reserved slots held for stronger arrivals "
@@ -262,9 +277,11 @@ class PortfolioRotationManager:
                 ),
                 candidate_score=candidate_score,
             )
+            self._record_decision(decision)
+            return decision
 
         if replacements_used >= self.max_replacements_per_cycle:
-            return RotationDecision(
+            decision = RotationDecision(
                 action="reject",
                 reason=(
                     f"replacement budget exhausted "
@@ -272,6 +289,8 @@ class PortfolioRotationManager:
                 ),
                 candidate_score=candidate_score,
             )
+            self._record_decision(decision)
+            return decision
 
         eligible = []
         for trade in open_positions:
@@ -282,11 +301,13 @@ class PortfolioRotationManager:
             eligible.append((score, trade))
 
         if not eligible:
-            return RotationDecision(
+            decision = RotationDecision(
                 action="reject",
                 reason=f"all incumbents are inside the {self.min_hold_minutes}m hold window",
                 candidate_score=candidate_score,
             )
+            self._record_decision(decision)
+            return decision
 
         for incumbent_score, incumbent_trade in sorted(eligible, key=lambda item: item[0]):
             exposure_blocked, exposure_reason = self._would_worsen_concentration(
@@ -303,7 +324,7 @@ class PortfolioRotationManager:
             if improvement <= required_improvement:
                 continue
 
-            return RotationDecision(
+            decision = RotationDecision(
                 action="replace",
                 reason=(
                     f"candidate {candidate_score:.2f} beats incumbent {incumbent_score:.2f} "
@@ -313,20 +334,24 @@ class PortfolioRotationManager:
                 incumbent_score=incumbent_score,
                 replacement_trade_id=incumbent_trade.get("id"),
             )
+            self._record_decision(decision)
+            return decision
 
         weakest_score, weakest_trade = min(eligible, key=lambda item: item[0])
         blocked_concentration, reason = self._would_worsen_concentration(signal, open_positions, weakest_trade)
         if blocked_concentration:
-            return RotationDecision(
+            decision = RotationDecision(
                 action="reject",
                 reason=reason,
                 candidate_score=candidate_score,
                 incumbent_score=weakest_score,
                 replacement_trade_id=weakest_trade.get("id"),
             )
+            self._record_decision(decision)
+            return decision
         required = self._replacement_threshold_with_costs(weakest_trade, signal)
         improvement = candidate_score - weakest_score
-        return RotationDecision(
+        decision = RotationDecision(
             action="reject",
             reason=(
                 f"improvement {improvement:.2f} <= required threshold {required:.2f} "
@@ -336,6 +361,8 @@ class PortfolioRotationManager:
             incumbent_score=weakest_score,
             replacement_trade_id=weakest_trade.get("id"),
         )
+        self._record_decision(decision)
+        return decision
 
     def register_replacement(
         self,
@@ -361,7 +388,32 @@ class PortfolioRotationManager:
                 "entered_coin": str(new_coin or "").upper(),
                 "entered_side": self._side_value(new_side),
             }
+        self._telemetry["replacement_count"] += 1
+        churn_cost = self._replacement_threshold_with_costs(replaced_trade, type("S", (), {"coin": new_coin, "side": new_side})())
+        self._telemetry["estimated_churn_cost"] += float(max(churn_cost, 0.0))
         self._cleanup_guardrail_state(now)
+
+    def record_dry_run_replacement_skip(self, decision: RotationDecision) -> None:
+        """Telemetry hook when replacement was proposed but intentionally skipped."""
+        if decision.action != "replace":
+            return
+        reasons = self._telemetry["rejection_reasons"]
+        key = "dry_run_rotation_disabled"
+        reasons[key] = reasons.get(key, 0) + 1
+
+    def get_stats(self) -> Dict:
+        """Expose rotation telemetry for dashboards and reports."""
+        return {
+            "decisions": int(self._telemetry["decisions"]),
+            "open": int(self._telemetry["open"]),
+            "reject": int(self._telemetry["reject"]),
+            "replace": int(self._telemetry["replace"]),
+            "replacement_count": int(self._telemetry["replacement_count"]),
+            "estimated_churn_cost": round(float(self._telemetry["estimated_churn_cost"]), 4),
+            "rejection_reasons": dict(self._telemetry["rejection_reasons"]),
+            "replacements_last_hour": self._count_recent_replacements(hours=1),
+            "replacements_last_day": self._count_recent_replacements(hours=24),
+        }
 
     def is_high_conviction(self, score: float) -> bool:
         return score >= self.high_conviction_threshold
@@ -600,3 +652,20 @@ class PortfolioRotationManager:
             except Exception:
                 pass
         return False, ""
+
+    def _record_decision(self, decision: RotationDecision) -> None:
+        self._telemetry["decisions"] += 1
+        action = decision.action if decision.action in ("open", "reject", "replace") else "reject"
+        self._telemetry[action] += 1
+        if action == "reject":
+            reasons = self._telemetry["rejection_reasons"]
+            key = str(decision.reason or "unknown_reject")
+            reasons[key] = reasons.get(key, 0) + 1
+
+    def _count_recent_replacements(self, hours: int) -> int:
+        if hours <= 0:
+            return 0
+        from datetime import timedelta
+        now = datetime.now(timezone.utc)
+        cutoff = now - timedelta(hours=hours)
+        return sum(1 for ts in self._replacement_timestamps if ts >= cutoff)

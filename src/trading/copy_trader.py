@@ -306,6 +306,8 @@ class CopyTrader:
                 logger.error(f"Error executing copy signal: {e}")
 
         replacements_used = 0
+        rotation_enabled = bool(config.ROTATION_ENGINE_ENABLED)
+        rotation_dry_run = bool(config.ROTATION_DRY_RUN_TELEMETRY)
         for candidate in sorted(
             pending_entries,
             key=lambda item: self.rotation_manager.candidate_score(
@@ -330,6 +332,22 @@ class CopyTrader:
                     signal["side"],
                     signal["coin"],
                     decision.reason,
+                )
+                continue
+
+            if decision.action == "replace" and not rotation_enabled:
+                if rotation_dry_run:
+                    self.rotation_manager.record_dry_run_replacement_skip(decision)
+                    logger.info(
+                        "  Rotation dry-run: would replace %s with copy %s (%s)",
+                        decision.replacement_trade_id,
+                        signal["coin"],
+                        decision.reason,
+                    )
+                logger.info(
+                    "  Rotation disabled by config; skipped replacement for copy %s %s",
+                    signal["side"],
+                    signal["coin"],
                 )
                 continue
 

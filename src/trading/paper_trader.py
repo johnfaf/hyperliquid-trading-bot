@@ -400,6 +400,8 @@ class PaperTrader:
                 logger.error(f"Error in V2 pipeline for {sig.get('coin', '?')}: {e}")
 
         replacements_used = 0
+        rotation_enabled = bool(config.ROTATION_ENGINE_ENABLED)
+        rotation_dry_run = bool(config.ROTATION_DRY_RUN_TELEMETRY)
         for candidate in sorted(
             rotation_candidates,
             key=lambda item: self.rotation_manager.candidate_score(
@@ -424,6 +426,22 @@ class PaperTrader:
                     sig["side"].upper(),
                     sig["coin"],
                     decision.reason,
+                )
+                continue
+
+            if decision.action == "replace" and not rotation_enabled:
+                if rotation_dry_run:
+                    self.rotation_manager.record_dry_run_replacement_skip(decision)
+                    logger.info(
+                        "Rotation dry-run: would replace %s with %s (%s)",
+                        decision.replacement_trade_id,
+                        sig["coin"],
+                        decision.reason,
+                    )
+                logger.info(
+                    "Rotation disabled by config; skipped replacement for %s %s",
+                    sig["side"].upper(),
+                    sig["coin"],
                 )
                 continue
 

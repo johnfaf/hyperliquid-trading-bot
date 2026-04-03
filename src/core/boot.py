@@ -100,6 +100,41 @@ def validate_dependencies(logger: logging.Logger) -> None:
     from src.core.dependency_validator import validate_or_fail, get_boot_report
     logger.info(get_boot_report(config))
     validate_or_fail(config_module=config)
+    validate_operational_controls(logger)
+
+
+def validate_operational_controls(logger: logging.Logger) -> None:
+    """
+    Enforce explicit rotation thresholds before enabling rotation engine.
+    This prevents accidental live-ish operation on hidden defaults.
+    """
+    if not getattr(config, "ROTATION_ENGINE_ENABLED", False):
+        return
+    if not getattr(config, "ROTATION_REQUIRE_EXPLICIT_THRESHOLDS", True):
+        logger.warning("Rotation engine enabled without explicit-threshold enforcement.")
+        return
+
+    required_envs = [
+        "PORTFOLIO_REPLACEMENT_THRESHOLD",
+        "PORTFOLIO_MAX_REPLACEMENTS_PER_CYCLE",
+        "PORTFOLIO_MAX_REPLACEMENTS_PER_HOUR",
+        "PORTFOLIO_MAX_REPLACEMENTS_PER_DAY",
+        "PORTFOLIO_FORCED_EXIT_COOLDOWN_MINUTES",
+        "PORTFOLIO_ROUND_TRIP_BLOCK_MINUTES",
+        "PORTFOLIO_MAX_COIN_EXPOSURE_PCT",
+        "PORTFOLIO_MAX_SIDE_EXPOSURE_PCT",
+        "PORTFOLIO_MAX_CLUSTER_EXPOSURE_PCT",
+        "PORTFOLIO_TRANSACTION_COST_WEIGHT",
+        "PORTFOLIO_CHURN_PENALTY",
+        "PORTFOLIO_EXPECTED_SLIPPAGE_BPS",
+    ]
+    missing = [env for env in required_envs if os.environ.get(env) is None]
+    if missing:
+        raise RuntimeError(
+            "Rotation engine is enabled but explicit threshold env vars are missing: "
+            + ", ".join(missing)
+        )
+    logger.info("Rotation operational controls validated (explicit thresholds present).")
 
 
 def init_database(logger: logging.Logger) -> None:
