@@ -15,8 +15,9 @@ It enforces:
 Flow: Signal Source → TradeSignal → DecisionFirewall → Execution
 """
 import logging
+import threading
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Optional, Tuple
 from collections import defaultdict
 
@@ -96,8 +97,9 @@ class DecisionFirewall:
         elif self._forecaster is not None:
             logger.info("DecisionFirewall: using externally-provided forecaster")
 
-        # State tracking
-        self._recent_trades: Dict[str, float] = {}  # coin → last trade timestamp
+        # State tracking (protected by _lock for thread safety)
+        self._lock = threading.RLock()
+        self._recent_trades: Dict[str, float] = {}  # coin -> last trade timestamp
         self._daily_losses: float = 0.0
         self._daily_reset_date: str = ""
 
@@ -124,11 +126,18 @@ class DecisionFirewall:
                  open_positions: Optional[List[Dict]] = None) -> Tuple[bool, str]:
         """
         Validate a single trade signal through all checks.
+        Thread-safe: acquires _lock to prevent concurrent state corruption.
 
         Returns: (passed: bool, reason: str)
           - passed=True: signal is approved for execution
           - passed=False: signal is rejected with explanation
         """
+        with self._lock:
+            return self._validate_locked(signal, regime_data, open_positions)
+
+    def _validate_locked(self, signal: TradeSignal, regime_data: Optional[Dict] = None,
+                         open_positions: Optional[List[Dict]] = None) -> Tuple[bool, str]:
+        """Inner validate — must be called with _lock held."""
         self.stats["total_signals"] += 1
 
         def _reject(reason_key, reason_msg):
@@ -265,6 +274,9 @@ class DecisionFirewall:
         # 12. Predictive regime de-risking
         #     If forecaster detects crash with high confidence, dynamically reduce
         #     position size and tighten exposure cap instead of outright blocking.
+        #     NOTE: We do NOT mutate self.max_aggregate_exposure_pct here —
+        #     that was a thread-safety bug (one thread's crash detection affected
+        #     all other threads). Instead, the size reduction is per-signal only.
         if self._forecaster and self.enable_predictive_derisk:
             try:
                 pred = self._forecaster.predict_regime(signal.coin)
@@ -272,17 +284,11 @@ class DecisionFirewall:
                         pred["confidence"] > self.crash_confidence_threshold):
                     # De-risk: cut position size dramatically
                     signal.size *= self.crash_size_multiplier  # 80% reduction
-                    # Tighten aggregate exposure cap for this check
-                    self.max_aggregate_exposure_pct = self.crash_exposure_cap
                     logger.warning(
                         f"CRASH REGIME detected for {signal.coin} "
                         f"(conf={pred['confidence']:.2f}) — "
-                        f"de-risking: size *= {self.crash_size_multiplier}, "
-                        f"exposure cap → {self.crash_exposure_cap:.0%}"
+                        f"de-risking: size *= {self.crash_size_multiplier}"
                     )
-                else:
-                    # Reset to normal exposure cap
-                    self.max_aggregate_exposure_pct = self._normal_exposure_cap
             except Exception as e:
                 logger.debug(f"Forecaster check failed: {e}")
 
@@ -310,35 +316,38 @@ class DecisionFirewall:
         """
         Validate a batch of signals. Returns list of (signal, passed, reason).
         Processes in order of confidence (highest first).
+        Thread-safe: holds _lock for the entire batch to prevent interleaving.
         """
-        positions = db.get_open_paper_trades()
+        with self._lock:
+            positions = db.get_open_paper_trades()
 
-        # Sort by confidence descending
-        sorted_signals = sorted(signals, key=lambda s: s.confidence, reverse=True)
+            # Sort by confidence descending
+            sorted_signals = sorted(signals, key=lambda s: s.confidence, reverse=True)
 
-        results = []
-        for signal in sorted_signals:
-            passed, reason = self.validate(signal, regime_data, positions)
-            results.append((signal, passed, reason))
+            results = []
+            for signal in sorted_signals:
+                passed, reason = self._validate_locked(signal, regime_data, positions)
+                results.append((signal, passed, reason))
 
-            # If signal passed, add to positions for subsequent checks
-            if passed:
-                positions.append({
-                    "coin": signal.coin,
-                    "side": signal.side.value,
-                    "status": "open",
-                })
+                # If signal passed, add to positions for subsequent checks
+                if passed:
+                    positions.append({
+                        "coin": signal.coin,
+                        "side": signal.side.value,
+                        "status": "open",
+                    })
 
-        approved = sum(1 for _, p, _ in results if p)
-        rejected = sum(1 for _, p, _ in results if not p)
-        logger.info(f"Firewall batch: {approved} approved, {rejected} rejected out of {len(signals)}")
+            approved = sum(1 for _, p, _ in results if p)
+            rejected = sum(1 for _, p, _ in results if not p)
+            logger.info(f"Firewall batch: {approved} approved, {rejected} rejected out of {len(signals)}")
 
-        return results
+            return results
 
     def record_trade_outcome(self, coin: str, pnl: float):
         """Record a trade outcome for daily drawdown tracking."""
-        if pnl < 0:
-            self._daily_losses += abs(pnl)
+        with self._lock:
+            if pnl < 0:
+                self._daily_losses += abs(pnl)
 
     def _get_funding_rate(self, coin: str) -> float:
         """
@@ -373,8 +382,8 @@ class DecisionFirewall:
         return self._funding_cache.get(coin.upper(), 0.0)
 
     def _check_daily_reset(self):
-        """Reset daily loss counter at midnight UTC."""
-        today = datetime.utcnow().strftime("%Y-%m-%d")
+        """Reset daily loss counter at midnight UTC. Must hold _lock."""
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         if today != self._daily_reset_date:
             self._daily_reset_date = today
             self._daily_losses = 0.0

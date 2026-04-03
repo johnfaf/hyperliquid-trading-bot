@@ -198,6 +198,14 @@ class LiveTrader:
         self.orders_today = 0
         self.fills_today = 0
 
+        # Track realized PnL from closed positions for daily loss enforcement
+        self._last_known_positions: Dict[str, Dict] = {}  # coin -> position snapshot
+
+        # Order idempotency: prevent duplicate orders from timeout/retry
+        # Maps action_hash -> (timestamp, result) for recent orders
+        self._recent_order_hashes: Dict[str, Tuple[float, Dict]] = {}
+        self._ORDER_DEDUP_WINDOW = 30  # seconds to remember recent orders
+
         logger.info(
             f"LiveTrader initialized: dry_run={dry_run}, "
             f"max_daily_loss=${self.max_daily_loss:.2f}, "
@@ -205,11 +213,15 @@ class LiveTrader:
         )
 
         if dry_run:
-            logger.warning("⚠️  DRY RUN MODE - No real trades will be executed")
+            logger.warning("DRY RUN MODE - No real trades will be executed")
 
         if not self.signer:
-            logger.warning("⚠️  No private key configured - forcing dry_run mode")
+            logger.warning("No private key configured - forcing dry_run mode")
             self.dry_run = True
+
+        # Reconcile positions on startup
+        if not self.dry_run and self.signer:
+            self.reconcile_positions()
 
     def _load_credentials(self):
         """Load private key and public address from environment."""
@@ -286,6 +298,117 @@ class LiveTrader:
 
         return False
 
+    def reconcile_positions(self):
+        """
+        Compare exchange positions vs local state on startup.
+
+        Logs discrepancies so the operator knows if the bot's view
+        of the world differs from reality. Triggers kill switch if
+        unexpected positions are found.
+        """
+        logger.info("Reconciling positions with exchange...")
+        try:
+            exchange_positions = self.get_positions()
+            active_coins = []
+
+            for pos in exchange_positions:
+                pos_info = pos.get("position", pos)
+                coin = pos_info.get("coin", "")
+                size = float(pos_info.get("szi", 0))
+                entry_px = float(pos_info.get("entryPx", 0))
+                unrealized_pnl = float(pos_info.get("unrealizedPnl", 0))
+
+                if abs(size) > 0:
+                    side = "long" if size > 0 else "short"
+                    active_coins.append(coin)
+                    self._last_known_positions[coin] = {
+                        "coin": coin,
+                        "side": side,
+                        "size": abs(size),
+                        "entry_price": entry_px,
+                        "unrealized_pnl": unrealized_pnl,
+                    }
+                    logger.warning(
+                        f"EXISTING POSITION found: {side.upper()} {coin} "
+                        f"size={abs(size)} entry=${entry_px:,.2f} "
+                        f"uPnL=${unrealized_pnl:+,.2f}"
+                    )
+
+            if active_coins:
+                logger.warning(
+                    f"Reconciliation: {len(active_coins)} open positions found on "
+                    f"exchange: {', '.join(active_coins)}. These will be tracked."
+                )
+            else:
+                logger.info("Reconciliation: no open positions on exchange (clean state)")
+
+        except Exception as e:
+            logger.error(f"Position reconciliation failed: {e}")
+            logger.warning(
+                "Could not verify exchange state on startup. "
+                "Proceeding with caution — monitor positions manually."
+            )
+
+    def update_daily_pnl_from_fills(self):
+        """
+        Fetch recent fills from the exchange and update daily_pnl.
+
+        This is the CRITICAL missing piece: without this, the daily loss
+        circuit breaker never fires. Call this after every trade and
+        periodically from the trading cycle.
+        """
+        self._check_daily_reset()
+
+        try:
+            if not self.public_address:
+                return
+
+            response = requests.post(
+                self.info_url,
+                json={"type": "userFills", "user": self.public_address},
+                timeout=10,
+            )
+            response.raise_for_status()
+            fills = response.json()
+
+            if not isinstance(fills, list):
+                return
+
+            # Sum closed PnL from today's fills
+            today = datetime.utcnow().strftime("%Y-%m-%d")
+            today_pnl = 0.0
+            for fill in fills:
+                fill_time = fill.get("time", "")
+                if isinstance(fill_time, (int, float)):
+                    from datetime import timezone
+                    fill_date = datetime.fromtimestamp(
+                        fill_time / 1000, tz=timezone.utc
+                    ).strftime("%Y-%m-%d")
+                elif isinstance(fill_time, str):
+                    fill_date = fill_time[:10]
+                else:
+                    continue
+
+                if fill_date == today:
+                    closed_pnl = float(fill.get("closedPnl", 0))
+                    today_pnl += closed_pnl
+
+            old_pnl = self.daily_pnl
+            self.daily_pnl = today_pnl
+
+            if abs(self.daily_pnl) > 0 and abs(self.daily_pnl - old_pnl) > 0.01:
+                logger.info(f"Daily PnL updated: ${self.daily_pnl:+,.2f}")
+
+            # Also update the firewall's daily loss tracker
+            if self.daily_pnl < 0:
+                self.firewall.record_trade_outcome("_portfolio", self.daily_pnl)
+
+            # Check if kill switch should trigger
+            self.check_daily_loss()
+
+        except Exception as e:
+            logger.error(f"Failed to update daily PnL from fills: {e}")
+
     def _get_mid_price(self, coin: str) -> Optional[float]:
         """Get mid price from Hyperliquid."""
         try:
@@ -304,6 +427,44 @@ class LiveTrader:
             logger.error(f"Failed to get mid price for {coin}: {e}")
 
         return None
+
+    # Price sanity: track recent mids to detect garbage prices
+    _price_history: Dict[str, float] = {}  # coin -> last known good mid
+
+    def _validate_price(self, coin: str, price: float) -> bool:
+        """
+        Validate that a price is reasonable.
+
+        Rejects:
+        - Zero, negative, NaN, Infinity
+        - Prices that deviate >10% from the last known good price
+          (protects against corrupt API responses)
+
+        Returns True if price is sane.
+        """
+        if not price or price <= 0:
+            logger.error(f"PRICE REJECTED: {coin} price={price} (zero/negative)")
+            return False
+
+        import math
+        if math.isnan(price) or math.isinf(price):
+            logger.error(f"PRICE REJECTED: {coin} price={price} (NaN/Inf)")
+            return False
+
+        last_good = self._price_history.get(coin)
+        if last_good:
+            deviation = abs(price - last_good) / last_good
+            if deviation > 0.10:  # >10% move since last check
+                logger.error(
+                    f"PRICE REJECTED: {coin} price=${price:,.2f} deviates "
+                    f"{deviation:.1%} from last known ${last_good:,.2f}. "
+                    f"Possible corrupt data — blocking order."
+                )
+                return False
+
+        # Price is sane — update history
+        self._price_history[coin] = price
+        return True
 
     def _apply_market_slippage(self, mid_price: float, side: str, slippage_pct: float = 0.05) -> float:
         """
@@ -347,6 +508,28 @@ class LiveTrader:
                 "message": "This is a dry run"
             }
 
+        # ── Idempotency check: reject duplicate orders within dedup window ──
+        now = time.time()
+        # Evict expired entries
+        expired = [h for h, (ts, _) in self._recent_order_hashes.items()
+                   if now - ts > self._ORDER_DEDUP_WINDOW]
+        for h in expired:
+            del self._recent_order_hashes[h]
+
+        if action_hash in self._recent_order_hashes:
+            prev_ts, prev_result = self._recent_order_hashes[action_hash]
+            age = now - prev_ts
+            logger.warning(
+                f"DUPLICATE ORDER blocked: action_hash={action_hash[:16]}... "
+                f"(identical order placed {age:.1f}s ago)"
+            )
+            return {
+                "status": "rejected",
+                "reason": "duplicate_order",
+                "original_result": prev_result,
+                "age_seconds": round(age, 1),
+            }
+
         try:
             if not self.signer:
                 logger.error("No signer available - cannot post order")
@@ -372,8 +555,22 @@ class LiveTrader:
             response.raise_for_status()
             result = response.json()
 
+            # Record successful order for dedup
+            self._recent_order_hashes[action_hash] = (now, result)
+
             logger.info(f"Order posted: {json.dumps(result)}")
             return result
+
+        except requests.exceptions.Timeout:
+            # CRITICAL: On timeout, the order may have been accepted on-chain.
+            # Record the hash to BLOCK retries — caller must verify via fills.
+            self._recent_order_hashes[action_hash] = (now, {"status": "timeout"})
+            logger.error(
+                f"Order TIMEOUT: action_hash={action_hash[:16]}... "
+                f"Order may have executed on-chain. Blocking retries. "
+                f"Verify position via get_positions() before retrying."
+            )
+            return {"status": "error", "message": "timeout — order may have executed, check positions"}
 
         except Exception as e:
             logger.error(f"Error posting order: {e}")
@@ -414,6 +611,11 @@ class LiveTrader:
         if not mid:
             return {"status": "error", "message": f"Could not get mid price for {coin}"}
 
+        # Validate price sanity before proceeding
+        if not self._validate_price(coin, mid):
+            return {"status": "rejected", "reason": "price_sanity_failed",
+                    "message": f"Price ${mid} for {coin} failed sanity check"}
+
         # Apply slippage
         price = self._apply_market_slippage(mid, side)
 
@@ -446,6 +648,57 @@ class LiveTrader:
             self.orders_today += 1
 
         return result
+
+    def verify_fill(self, coin: str, expected_side: str, expected_size: float,
+                    timeout: float = 10.0, poll_interval: float = 1.0) -> Optional[Dict]:
+        """
+        Poll exchange positions to verify an order actually filled.
+
+        Args:
+            coin: Expected coin
+            expected_side: "buy" or "sell"
+            expected_size: Expected position size change
+            timeout: Max seconds to wait
+            poll_interval: Seconds between polls
+
+        Returns:
+            Position dict if verified, None if not found after timeout
+        """
+        if self.dry_run:
+            return {"status": "verified", "dry_run": True}
+
+        deadline = time.time() + timeout
+        attempt = 0
+
+        while time.time() < deadline:
+            attempt += 1
+            try:
+                positions = self.get_positions()
+                for pos in positions:
+                    pos_info = pos.get("position", pos)
+                    pos_coin = pos_info.get("coin", "")
+                    pos_size = float(pos_info.get("szi", 0))
+
+                    if pos_coin == coin and abs(pos_size) > 0:
+                        logger.info(
+                            f"Fill VERIFIED: {coin} size={pos_size} "
+                            f"(attempt {attempt}, {time.time() - (deadline - timeout):.1f}s)"
+                        )
+                        return {
+                            "status": "verified",
+                            "coin": coin,
+                            "size": pos_size,
+                            "attempt": attempt,
+                        }
+            except Exception as e:
+                logger.debug(f"Fill verification poll error: {e}")
+
+            time.sleep(poll_interval)
+
+        logger.warning(
+            f"Fill NOT verified after {timeout}s: {coin} {expected_side} {expected_size}"
+        )
+        return None
 
     def place_limit_order(self, coin: str, side: str, size: float, price: float,
                           leverage: float = 1, reduce_only: bool = False) -> Dict:
@@ -831,6 +1084,24 @@ class LiveTrader:
             if entry_result.get("status") == "error":
                 logger.error(f"Failed to place entry order: {entry_result}")
                 return entry_result
+
+            # Update daily PnL after every execution to keep loss tracking current
+            self.update_daily_pnl_from_fills()
+
+            # 1b. Verify the fill actually happened before placing SL/TP
+            if not self.dry_run:
+                fill_check = self.verify_fill(coin, side, size, timeout=10.0)
+                if not fill_check:
+                    logger.error(
+                        f"FILL NOT VERIFIED for {coin} {side} {size} — "
+                        f"skipping SL/TP placement. Manual intervention required."
+                    )
+                    return {
+                        "status": "warning",
+                        "message": "order posted but fill not verified",
+                        "coin": coin,
+                        "entry_result": entry_result,
+                    }
 
             # 2. Calculate stop loss and take profit prices
             mid = self._get_mid_price(coin)

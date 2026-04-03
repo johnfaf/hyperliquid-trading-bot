@@ -323,11 +323,13 @@ class HyperliquidWebSocket:
 
     def get_mid(self, coin: str) -> Optional[float]:
         """Get latest mid price from WS feed (or None if not available)."""
-        return self.mids.get(coin)
+        with self._lock:
+            return self.mids.get(coin)
 
     def get_all_mids(self) -> Dict[str, float]:
         """Get all mid prices from WS feed."""
-        return dict(self.mids)
+        with self._lock:
+            return dict(self.mids)
 
     def is_connected(self) -> bool:
         return self._connected
@@ -371,9 +373,10 @@ class HyperliquidWebSocket:
         if was_reconnect:
             logger.info("WebSocket RECONNECTED — clearing stale local state")
             # Invalidate stale data so modules don't act on old prices
-            self.mids.clear()
-            self.l2_books.clear()
-            self.recent_trades.clear()
+            with self._lock:
+                self.mids.clear()
+                self.l2_books.clear()
+                self.recent_trades.clear()
             # Fire reconciliation callbacks so modules can re-check positions
             for cb in self._callbacks.get("_reconnect", []):
                 try:
@@ -431,30 +434,34 @@ class HyperliquidWebSocket:
 
             if channel == "allMids":
                 mids_data = data.get("data", {}).get("mids", {})
-                for coin, price_str in mids_data.items():
-                    try:
-                        self.mids[coin] = float(price_str)
-                    except (ValueError, TypeError):
-                        pass
+                with self._lock:
+                    for coin, price_str in mids_data.items():
+                        try:
+                            self.mids[coin] = float(price_str)
+                        except (ValueError, TypeError):
+                            pass
 
             elif channel == "l2Book":
                 book_data = data.get("data", {})
                 coin = book_data.get("coin")
                 if coin:
-                    self.l2_books[coin] = {
+                    book = {
                         "bids": book_data.get("levels", [[]])[0] if book_data.get("levels") else [],
                         "asks": book_data.get("levels", [[], []])[1] if len(book_data.get("levels", [])) > 1 else [],
                         "time": time.time(),
                     }
+                    with self._lock:
+                        self.l2_books[coin] = book
 
             elif channel == "trades":
                 trades_data = data.get("data", [])
                 if trades_data:
                     coin = trades_data[0].get("coin") if isinstance(trades_data[0], dict) else None
                     if coin:
-                        existing = self.recent_trades.get(coin, [])
-                        existing.extend(trades_data)
-                        self.recent_trades[coin] = existing[-100:]  # Keep last 100
+                        with self._lock:
+                            existing = self.recent_trades.get(coin, [])
+                            existing.extend(trades_data)
+                            self.recent_trades[coin] = existing[-100:]  # Keep last 100
 
             # Fire callbacks
             if channel in self._callbacks:
