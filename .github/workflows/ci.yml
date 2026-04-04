@@ -13,14 +13,40 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
           python-version: '3.11'
       - name: Install ruff
         run: pip install ruff
+      - name: Determine lint targets
+        id: lint_targets
+        shell: bash
+        run: |
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            base_sha="${{ github.event.pull_request.base.sha }}"
+          else
+            base_sha="${{ github.event.before }}"
+          fi
+
+          if [[ -z "$base_sha" || "$base_sha" =~ ^0+$ ]]; then
+            git ls-files | grep -E '^(src|tests)/.*\.py$' > lint_targets.txt || true
+          else
+            git diff --name-only "$base_sha" "${{ github.sha }}" | grep -E '^(src|tests)/.*\.py$' > lint_targets.txt || true
+          fi
+
+          count=$(wc -l < lint_targets.txt | tr -d ' ')
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+
       - name: Run ruff
-        run: ruff check src/ tests/ --select E,F,W --ignore E501,E402
+        if: steps.lint_targets.outputs.count != '0'
+        run: xargs -a lint_targets.txt python -m ruff check --select E,F,W --ignore E501,E402
+
+      - name: Skip ruff
+        if: steps.lint_targets.outputs.count == '0'
+        run: echo "No changed Python files under src/ or tests/."
 
   test:
     runs-on: ubuntu-latest

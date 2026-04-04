@@ -196,7 +196,7 @@ def _get_v2_metrics(conn) -> Dict:
 
     try:
         # Firewall stats — pulled from the global firewall instance if available
-        from src.signals.decision_firewall import DecisionFirewall
+        pass
         # We'll populate this from the /api/data handler if firewall is set
     except Exception:
         pass
@@ -825,7 +825,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
         elif parsed.path == "/api/health_report":
             # Full structured health report for Claude monitoring
-            import os, json as _json
+            import os
+            import json as _json
             report_path = "/data/health_report.json"
             if os.path.exists(report_path):
                 with open(report_path) as f:
@@ -1143,7 +1144,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 try:
                     init_golden_tables()
                     init_backtest_tables()
-                    scan_result = run_golden_scan(max_wallets=30)
+                    run_golden_scan(max_wallets=30)
                     results = run_all_backtests()
                     for r in results:
                         save_backtest_result(r)

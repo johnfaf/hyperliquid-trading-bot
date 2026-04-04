@@ -15,12 +15,13 @@ import json
 from datetime import datetime
 from typing import List, Dict, Optional
 
-import sys, os
+import sys
+import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import config
 from src.data import database as db
 from src.data import hyperliquid_client as hl
-from src.signals.signal_schema import TradeSignal, SignalSide, SignalSource, RiskParams, signal_from_strategy
+from src.signals.signal_schema import TradeSignal, SignalSide, SignalSource, RiskParams
 from src.signals.decision_firewall import DecisionFirewall
 from src.signals.agent_scoring import AgentScorer
 from src.analysis.features import FeatureEngine
@@ -68,8 +69,6 @@ class PaperTrader:
         if not account:
             return {"balance": 0, "total_pnl": 0, "total_trades": 0, "open_trades": 0}
         open_trades = db.get_open_paper_trades()
-        closed_trades = db.get_paper_trade_history(limit=100)
-
         # Calculate unrealized PnL from open trades
         unrealized_pnl = 0
         mids = hl.get_all_mids() or {}
@@ -129,7 +128,6 @@ class PaperTrader:
         coin_features = {}
         if self.feature_engine:
             try:
-                from src.analysis.regime_detector import RegimeDetector
                 for coin in set(["BTC", "ETH", "SOL"]):
                     try:
                         # Fetch candles for feature computation
@@ -616,7 +614,6 @@ class PaperTrader:
         # If strategy has no specific coins, pick from top liquid coins
         # to diversify across many assets instead of all piling into BTC
         if not coins:
-            import random
             TOP_COINS = ["BTC", "ETH", "SOL", "DOGE", "AVAX", "LINK", "ARB",
                          "OP", "SUI", "APT", "INJ", "SEI", "TIA", "JUP",
                          "WIF", "PEPE", "ONDO", "RENDER", "FET", "NEAR"]
@@ -1231,6 +1228,6 @@ if __name__ == "__main__":
     db.init_db()
     trader = PaperTrader()
     summary = trader.get_account_summary()
-    print(f"\nPaper Account Summary:")
+    print("\nPaper Account Summary:")
     for k, v in summary.items():
         print(f"  {k}: {v}")

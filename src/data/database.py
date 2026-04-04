@@ -673,7 +673,7 @@ def restore_from_json(filepath: str = None):
             if isinstance(meta, str):
                 try:
                     meta = json.loads(meta)
-                except:
+                except Exception:
                     meta = {}
             upsert_trader(
                 t["address"],
