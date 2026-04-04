@@ -1037,10 +1037,20 @@ class LiveTrader:
         regime = regime_info.get("regime", "neutral")
         confidence = regime_info.get("confidence", 0.0)
 
+        # CRIT-FIX CRIT-4 (continued): remove the position_pct * effective_size fallback.
+        # execute_signal now guarantees signal.size > 0 before calling this method.
+        # Use signal.size directly; log an error if somehow it's still unset here.
+        base_size = signal.size or 0.0
+        if base_size <= 0:
+            logger.error(
+                f"apply_regime_overlay: signal.size not set for {signal.coin} — "
+                f"skipping size adjustment (execute_signal should have computed it first)"
+            )
+            return signal
+
         # 1. CRASH regime: reduce size 60%, tighten stop loss to 3%
         if regime == "crash" and confidence > 0.4:
-            original_size = signal.size or (signal.position_pct * signal.effective_size)
-            signal.size = original_size * 0.4  # 60% reduction = multiply by 0.4
+            signal.size = base_size * 0.4  # 60% reduction = multiply by 0.4
             signal.risk.stop_loss_pct = 0.03
             logger.warning(
                 f"REGIME OVERLAY: crash detected (conf={confidence:.2f}), "
@@ -1049,8 +1059,7 @@ class LiveTrader:
 
         # 2. VOLATILE regime: reduce size 30%, widen stop loss to 8%
         elif regime == "volatile":
-            original_size = signal.size or (signal.position_pct * signal.effective_size)
-            signal.size = original_size * 0.7  # 30% reduction = multiply by 0.7
+            signal.size = base_size * 0.7  # 30% reduction = multiply by 0.7
             signal.risk.stop_loss_pct = 0.08
             logger.info(
                 f"REGIME OVERLAY: volatile detected, "
@@ -1059,8 +1068,7 @@ class LiveTrader:
 
         # 3. BULLISH regime: allow full size, boost by 10%
         elif regime == "bullish" and confidence > 0.6:
-            original_size = signal.size or (signal.position_pct * signal.effective_size)
-            signal.size = original_size * 1.1  # 10% boost
+            signal.size = base_size * 1.1  # 10% boost
             logger.info(
                 f"REGIME OVERLAY: bullish confirmed (conf={confidence:.2f}), "
                 f"boosting size 10% for {signal.coin}"
@@ -1102,13 +1110,32 @@ class LiveTrader:
             logger.warning("Daily loss limit exceeded - rejecting signal")
             return None
 
-        # Apply regime overlay for dynamic position sizing
+        # CRIT-FIX CRIT-4: resolve canonical coin quantity BEFORE the regime overlay
+        # so the overlay can apply a correct proportional multiplier.  The original
+        # fallback `position_pct * effective_size` = `position_pct²` which produced
+        # micro-orders (~0.48% of intended size) silently posted to the exchange.
+        coin = signal.coin
+        side = signal.side.value.lower()
+
+        if not (signal.size and signal.size > 0):
+            # Compute coin quantity from USD notional: position_pct × max_position_size / mid
+            mid = self._get_mid_price(coin)
+            if not mid or mid <= 0:
+                logger.warning(
+                    f"Cannot compute order size for {coin}: no mid price available — skipping"
+                )
+                return None
+            position_usd = signal.position_pct * self.max_position_size
+            signal.size = position_usd / mid
+            logger.debug(
+                f"Computed size for {coin}: ${position_usd:.2f} / ${mid:.4f} = {signal.size:.6f} coins"
+            )
+
+        # Apply regime overlay for dynamic position sizing (signal.size is now set)
         signal = self.apply_regime_overlay(signal)
 
         try:
-            coin = signal.coin
-            side = signal.side.value.lower()
-            size = signal.size or (signal.position_pct * signal.effective_size)
+            size = signal.size
 
             if not size or size <= 0:
                 logger.warning(f"Calculated size is 0 or negative for {coin} — skipping")

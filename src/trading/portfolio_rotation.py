@@ -172,7 +172,10 @@ class PortfolioRotationManager:
             side=self._side_value(getattr(signal, "side", "")),
             regime_data=regime_data,
         )
-        return round(score, 4)
+        # CRIT-FIX HIGH-3: clamp to [0.0, 1.0] — source_accuracy_weight (+0.22)
+        # and alignment_bonus (+0.08) can push score above 1.0, breaking threshold
+        # comparisons and is_high_conviction() checks.
+        return round(self._clamp(score, 0.0, 1.0), 4)
 
     def position_score(
         self,

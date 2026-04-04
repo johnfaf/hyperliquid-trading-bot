@@ -497,6 +497,30 @@ class PaperTrader:
                 })
             sig["signal_id"] = signal_id
 
+            # CRIT-FIX CRIT-6: close victim BEFORE opening replacement.
+            # Original order (open → close) left both positions alive simultaneously
+            # during the window between calls, allowing a double-exposure window and
+            # making the rollback guard dead code (DB close never raises).
+            if victim:
+                victim_price = float(
+                    mids.get(victim["coin"], victim.get("entry_price", 0)) or victim.get("entry_price", 0)
+                )
+                closed_victim = self._close_trade(
+                    victim,
+                    current_price=victim_price,
+                    close_reason=f"rotation_out:{sig['coin']}",
+                )
+                if not closed_victim:
+                    logger.warning(
+                        "Rotation victim close failed for %s — skipping replacement with %s",
+                        victim.get("coin"), sig["coin"],
+                    )
+                    _drop_counts["rotation_victim_close_failed"] = _drop_counts.get("rotation_victim_close_failed", 0) + 1
+                    continue
+                # Remove closed victim from working position list immediately so
+                # subsequent firewall checks in this batch don't double-count it.
+                open_trades = [t for t in open_trades if t.get("id") != victim.get("id")]
+
             trade = self._execute_paper_trade(account, sig["strategy"], sig)
             if trade:
                 trade["signal_id"] = signal_id
@@ -506,35 +530,6 @@ class PaperTrader:
                 open_trades.append(trade)
 
                 if victim:
-                    current_price = float(
-                        mids.get(victim["coin"], victim.get("entry_price", 0)) or victim.get("entry_price", 0)
-                    )
-                    closed_trade = self._close_trade(
-                        victim,
-                        current_price=current_price,
-                        close_reason=f"rotation_out:{sig['coin']}",
-                    )
-                    if not closed_trade:
-                        logger.warning(
-                            "Rotation close failed after opening %s; rolling back new trade %s",
-                            sig["coin"],
-                            trade.get("id"),
-                        )
-                        rollback = self._close_trade(
-                            trade,
-                            current_price=float(
-                                sig.get("price", trade.get("entry_price", 0))
-                                or trade.get("entry_price", 0)
-                            ),
-                            close_reason=f"rotation_rollback:{victim.get('coin', 'unknown')}",
-                        )
-                        open_trades = [t for t in open_trades if t.get("id") != trade.get("id")]
-                        executed = [t for t in executed if t.get("id") != trade.get("id")]
-                        if not rollback:
-                            logger.error("Rollback close also failed for trade %s", trade.get("id"))
-                        continue
-
-                    open_trades = [t for t in open_trades if t.get("id") != victim.get("id")]
                     replacements_used += 1
                     self.rotation_manager.register_replacement(
                         replaced_trade=victim,
@@ -932,7 +927,15 @@ class PaperTrader:
                 "exit_slipped_price": slipped_exit,
             }
         )
-        db.close_paper_trade(trade["id"], slipped_exit, pnl)
+        # CRIT-FIX CRIT-5: guard against phantom PnL credit on double-close or
+        # missing trade ID — close_paper_trade now returns False if 0 rows updated.
+        if not db.close_paper_trade(trade["id"], slipped_exit, pnl):
+            logger.error(
+                "_close_trade: DB close failed for trade %s (%s %s) — "
+                "skipping account PnL credit to prevent phantom balance inflation.",
+                trade["id"], trade.get("side", "?"), trade.get("coin", "?"),
+            )
+            return None
 
         account = db.get_paper_account()
         if account:
@@ -1127,10 +1130,18 @@ class PaperTrader:
                     should_close = True
                     close_reason = "take_profit"
 
-            # Time-based exit: close positions older than 24 hours
+            # Time-based exit: close positions older than 24 hours.
+            # HIGH-FIX HIGH-7: strip any timezone offset before parsing so that
+            # naive datetime.utcnow() comparisons never raise TypeError when
+            # opened_at was stored with a +00:00 suffix by a timezone-aware path.
             if not should_close and trade.get("opened_at"):
                 try:
-                    opened = datetime.fromisoformat(trade["opened_at"])
+                    opened_str = trade["opened_at"]
+                    if opened_str.endswith("Z"):
+                        opened_str = opened_str[:-1]
+                    elif "+" in opened_str:
+                        opened_str = opened_str.split("+")[0]
+                    opened = datetime.fromisoformat(opened_str)
                     age_hours = (datetime.utcnow() - opened).total_seconds() / 3600
                     if age_hours > 24:
                         should_close = True

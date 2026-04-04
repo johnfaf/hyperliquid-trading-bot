@@ -342,12 +342,19 @@ class DecisionFirewall:
                 passed, reason = self._validate_locked(signal, regime_data, positions)
                 results.append((signal, passed, reason))
 
-                # If signal passed, add to positions for subsequent checks
+                # If signal passed, add to positions for subsequent checks.
+                # CRIT-FIX CRIT-3: include size/entry_price/leverage so the aggregate
+                # exposure check inside _validate_locked sees real notional for within-batch
+                # approvals — without these fields pos.get("size", 0) returns 0 and a burst
+                # of concurrent signals can all pass the exposure cap simultaneously.
                 if passed:
                     positions.append({
                         "coin": signal.coin,
                         "side": signal.side.value,
                         "status": "open",
+                        "entry_price": float(getattr(signal, "entry_price", 0) or 0),
+                        "size": float(getattr(signal, "size", 0) or 0),
+                        "leverage": float(getattr(signal, "leverage", 1) or 1),
                     })
 
             approved = sum(1 for _, p, _ in results if p)

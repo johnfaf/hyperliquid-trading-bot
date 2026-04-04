@@ -406,13 +406,27 @@ def update_paper_trade_metadata(trade_id: int, extra: dict):
             )
 
 
-def close_paper_trade(trade_id, exit_price, pnl):
+def close_paper_trade(trade_id, exit_price, pnl) -> bool:
+    """Close a paper trade.  Returns True on success, False if trade_id not found.
+
+    CRIT-FIX CRIT-5: check rowcount — if the UPDATE matches 0 rows the trade was
+    already closed or the ID is wrong.  The caller MUST check the return value and
+    skip the account PnL credit to prevent phantom double-credit.
+    """
     now = datetime.utcnow().isoformat()
     with get_connection() as conn:
-        conn.execute("""
+        cursor = conn.execute("""
             UPDATE paper_trades SET closed_at = ?, exit_price = ?, pnl = ?, status = 'closed'
-            WHERE id = ?
+            WHERE id = ? AND status = 'open'
         """, (now, exit_price, pnl, trade_id))
+        if cursor.rowcount == 0:
+            logger.error(
+                "close_paper_trade: trade_id=%s matched 0 open rows — "
+                "possible double-close or missing record. PnL NOT credited.",
+                trade_id,
+            )
+            return False
+    return True
 
 
 def get_open_paper_trades():
