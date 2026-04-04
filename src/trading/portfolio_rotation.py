@@ -469,6 +469,11 @@ class PortfolioRotationManager:
         notional = entry * size * leverage
         if notional <= 0:
             return 0.0
+        # MED-NOTE MED-3: leverage cancels identically in numerator and denominator
+        # (pnl = delta * size * lev; notional = entry * size * lev), so this
+        # simplifies to (current - entry) / entry — a pure price return.
+        # All positions regardless of leverage receive an equivalent score for
+        # the same price move; no leverage bias in rotation decisions.
         return pnl / notional
 
     def _alignment_bonus(self, side: str, regime_data: Optional[Dict]) -> float:
@@ -533,13 +538,13 @@ class PortfolioRotationManager:
         return max(px * size * max(leverage, 1.0), 0.0)
 
     def _candidate_notional(self, signal, fallback: float) -> float:
-        price = float(getattr(signal, "entry_price", 0) or 0)
-        position_pct = float(getattr(signal, "position_pct", 0) or 0)
-        leverage = float(getattr(signal, "leverage", 1) or 1)
-        if price <= 0 or position_pct <= 0:
-            return max(fallback, 1.0)
-        # Score-space approximation: position_pct is unlevered fraction; map to exposure.
-        return max(price * position_pct * leverage * 100.0, fallback)
+        # LOW-FIX LOW-5: removed the erroneous * 100.0 multiplier.
+        # position_pct is a fraction (e.g. 0.08), not a percentage integer.
+        # Without account balance we cannot compute an accurate absolute notional,
+        # so we use the victim's notional (fallback) as the candidate proxy —
+        # in a rotation the replacement is approximately the same size as the trade
+        # it replaces, so the concentration check remains correct.
+        return max(fallback, 1.0)
 
     def _cluster_for_coin(self, coin: str) -> str:
         coin = str(coin or "").upper()
@@ -656,8 +661,15 @@ class PortfolioRotationManager:
                     if prev_side and prev_side != side:
                         return True, f"blocked immediate round-trip re-entry on {coin} ({prev_side}->{side})"
                     return True, f"blocked immediate re-entry on {coin} after forced exit"
-            except Exception:
-                pass
+            except Exception as e:
+                # MED-FIX MED-5: log warning instead of silently swallowing —
+                # a parse failure here disables the round-trip guardrail entirely
+                # for this coin, which is a safety bypass that must be visible.
+                logger.warning(
+                    "_guardrail_block_reason: could not parse forced-exit timestamp "
+                    "for %s (%r): %s — round-trip block bypassed for this signal",
+                    coin, last_exit.get("at"), e,
+                )
         return False, ""
 
     def _record_decision(self, decision: RotationDecision) -> None:

@@ -117,6 +117,9 @@ class DecisionFirewall:
             "rejected_drawdown": 0,
             "rejected_exposure": 0,
             "rejected_funding": 0,
+            # LOW-FIX LOW-1: count audit-log write failures so ops can detect
+            # when the audit trail is silently broken (DB full, locked, etc.)
+            "audit_log_failures": 0,
         }
 
         logger.info(f"DecisionFirewall initialized: max_risk={self.max_risk_per_trade:.0%}/trade, "
@@ -164,7 +167,7 @@ class DecisionFirewall:
                         details={"reason": reason_msg, "confidence": getattr(signal, "confidence", 0)},
                     )
                 except Exception:
-                    pass
+                    self.stats["audit_log_failures"] += 1
             return False, reason_msg
 
         # 1. Schema validation

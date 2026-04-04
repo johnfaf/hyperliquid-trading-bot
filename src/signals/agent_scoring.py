@@ -69,60 +69,57 @@ class AgentScorer:
         logger.info(f"AgentScorer initialized with {len(self.scores)} tracked sources")
 
     def _load_scores(self):
-        """Load existing scores from database."""
+        """Load existing scores from database.
+
+        LOW-FIX LOW-7: use db.get_connection() instead of raw sqlite3.connect
+        so all writes share the same WAL journal and avoid checkpoint stalls
+        when concurrent writes are in flight from the main trading loop.
+        """
         try:
-            # Check if agent_scores table exists
-            import sqlite3
-            import config
-            conn = sqlite3.connect(config.DB_PATH)
-            conn.row_factory = sqlite3.Row
-
-            # Create table if not exists
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS agent_scores (
-                    source_key TEXT PRIMARY KEY,
-                    total_signals INTEGER DEFAULT 0,
-                    correct_signals INTEGER DEFAULT 0,
-                    total_pnl REAL DEFAULT 0,
-                    total_return REAL DEFAULT 0,
-                    accuracy REAL DEFAULT 0,
-                    sharpe REAL DEFAULT 0,
-                    dynamic_weight REAL DEFAULT 0.5,
-                    trade_history TEXT DEFAULT '[]',
-                    last_updated TEXT
-                )
-            """)
-            # Safe migration: add total_return column if missing
-            try:
-                conn.execute("ALTER TABLE agent_scores ADD COLUMN total_return REAL DEFAULT 0")
-            except Exception:
-                pass  # Column already exists
-            conn.commit()
-
-            rows = conn.execute("SELECT * FROM agent_scores").fetchall()
-            for row in rows:
-                row = dict(row)
-                score = SourceScore(
-                    source_key=row["source_key"],
-                    total_signals=row["total_signals"],
-                    correct_signals=row["correct_signals"],
-                    total_pnl=row["total_pnl"],
-                    total_return=row.get("total_return", 0) or 0,
-                    accuracy=row["accuracy"],
-                    sharpe=row["sharpe"],
-                    dynamic_weight=row["dynamic_weight"],
-                    last_updated=row["last_updated"] or "",
-                )
-                self.scores[row["source_key"]] = score
-
-                # Load trade history for time decay
+            with db.get_connection() as conn:
+                # Create table if not exists
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS agent_scores (
+                        source_key TEXT PRIMARY KEY,
+                        total_signals INTEGER DEFAULT 0,
+                        correct_signals INTEGER DEFAULT 0,
+                        total_pnl REAL DEFAULT 0,
+                        total_return REAL DEFAULT 0,
+                        accuracy REAL DEFAULT 0,
+                        sharpe REAL DEFAULT 0,
+                        dynamic_weight REAL DEFAULT 0.5,
+                        trade_history TEXT DEFAULT '[]',
+                        last_updated TEXT
+                    )
+                """)
+                # Safe migration: add total_return column if missing
                 try:
-                    history = json.loads(row.get("trade_history", "[]"))
-                    self._trade_history[row["source_key"]] = history[-200:]  # Keep last 200
+                    conn.execute("ALTER TABLE agent_scores ADD COLUMN total_return REAL DEFAULT 0")
                 except Exception:
-                    pass
+                    pass  # Column already exists
 
-            conn.close()
+                rows = conn.execute("SELECT * FROM agent_scores").fetchall()
+                for row in rows:
+                    row = dict(row)
+                    score = SourceScore(
+                        source_key=row["source_key"],
+                        total_signals=row["total_signals"],
+                        correct_signals=row["correct_signals"],
+                        total_pnl=row["total_pnl"],
+                        total_return=row.get("total_return", 0) or 0,
+                        accuracy=row["accuracy"],
+                        sharpe=row["sharpe"],
+                        dynamic_weight=row["dynamic_weight"],
+                        last_updated=row["last_updated"] or "",
+                    )
+                    self.scores[row["source_key"]] = score
+
+                    # Load trade history for time decay
+                    try:
+                        history = json.loads(row.get("trade_history", "[]"))
+                        self._trade_history[row["source_key"]] = history[-200:]
+                    except Exception:
+                        pass
         except Exception as e:
             logger.warning(f"Could not load agent scores: {e}")
 
@@ -137,20 +134,19 @@ class AgentScorer:
 
             history_json = json.dumps(self._trade_history.get(source_key, [])[-200:])
 
-            conn = sqlite3.connect(config.DB_PATH)
-            conn.execute("""
-                INSERT OR REPLACE INTO agent_scores
-                (source_key, total_signals, correct_signals, total_pnl,
-                 total_return, accuracy, sharpe, dynamic_weight, trade_history, last_updated)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (source_key, score.total_signals, score.correct_signals,
-                  score.total_pnl, score.total_return, score.accuracy, score.sharpe,
-                  score.dynamic_weight, history_json,
-                  datetime.utcnow().isoformat()))
-            conn.commit()
-            conn.close()
+            # LOW-FIX LOW-7 (continued): use shared WAL connection pool
+            with db.get_connection() as conn:
+                conn.execute("""
+                    INSERT OR REPLACE INTO agent_scores
+                    (source_key, total_signals, correct_signals, total_pnl,
+                     total_return, accuracy, sharpe, dynamic_weight, trade_history, last_updated)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (source_key, score.total_signals, score.correct_signals,
+                      score.total_pnl, score.total_return, score.accuracy, score.sharpe,
+                      score.dynamic_weight, history_json,
+                      datetime.utcnow().isoformat()))
         except Exception as e:
-            logger.debug(f"Could not save agent score for {source_key}: {e}")
+            logger.warning(f"Could not save agent score for {source_key}: {e}")
 
     # ─── Recording ────────────────────────────────────────────
 
@@ -254,7 +250,11 @@ class AgentScorer:
         if len(returns) >= 5:
             import numpy as np
             mean_ret = np.mean(returns)
-            std_ret = np.std(returns)
+            # MED-FIX MED-6: use ddof=1 (sample std) to match statistics.stdev
+            # used by shadow_tracker.compute_sharpe_proxy — previously population
+            # std (ddof=0) underestimated variance vs sample std, making Sharpe
+            # values incomparable across the two subsystems.
+            std_ret = np.std(returns, ddof=1)
             score.sharpe = mean_ret / std_ret if std_ret > 0 else 0
             score.avg_return = mean_ret
         else:

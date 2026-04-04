@@ -91,6 +91,16 @@ class KellySizer:
 
         logger.info(f"KellySizer initialized: multiplier={self.kelly_multiplier}, "
                     f"max={self.max_position_pct:.0%}, min_trades={self.min_trades_for_kelly}")
+        # LOW-FIX LOW-2: _strategy_outcomes is in-memory only and starts empty
+        # every process restart.  Callers MUST call load_from_agent_scorer() after
+        # init to bootstrap from existing trade history.  Without it every strategy
+        # uses default (conservative) sizing until it accumulates min_trades_for_kelly
+        # live trades in the current session.
+        logger.debug(
+            "KellySizer: call load_from_agent_scorer(agent_scorer) after init "
+            "to restore trade history from DB — otherwise all strategies start "
+            "with confidence='insufficient' sizing until live trades accumulate."
+        )
 
     def record_outcome(self, strategy_key: str, pnl: float,
                         entry_price: float, size: float, leverage: float):

@@ -106,8 +106,16 @@ class StrategyScorer:
             penalty = (trade_count / config.MIN_TRADES_FOR_STRATEGY) ** 2
             return win_rate * penalty
 
-        # Win rate above 50% is good, above 65% is great
-        return min(1.0, win_rate * 1.3)
+        # MED-FIX MED-1: replace linear *1.3 clip with a sigmoid that rewards
+        # all win-rate levels proportionally.  Old formula hit 1.0 at 77% WR
+        # making 78%, 90%, and 99% indistinguishable.
+        # New: WR=0.50→0.50, WR=0.65→0.77, WR=0.80→0.93, WR=0.95→0.99
+        # LOW-FIX LOW-3: guard against None from DB (dict.get returns None when
+        # the column exists but holds NULL, not the default value).
+        win_rate = float(win_rate or 0)
+        if win_rate <= 0:
+            return 0.0
+        return float(1 / (1 + np.exp(np.clip(-8 * (win_rate - 0.5), -500, 500))))
 
     def _score_sharpe(self, strategy: Dict) -> float:
         """Score based on Sharpe ratio estimate."""
@@ -244,8 +252,17 @@ class StrategyScorer:
                             (r["strategy_id"],)
                         )
                     r["active"] = False
-                except Exception:
-                    pass
+                except Exception as e:
+                    # MED-FIX MED-7: log rather than swallow — if DB write fails
+                    # the in-memory count diverges from the real DB active set.
+                    # Still mark inactive in-memory so the cycle count is correct
+                    # and the operator gets a visible warning to investigate.
+                    logger.error(
+                        "Prune: failed to deactivate strategy %s in DB: %s — "
+                        "in-memory marked inactive but DB row may still be active=1",
+                        r["strategy_id"], e,
+                    )
+                    r["active"] = False
             logger.info(f"Pruned {len(to_deactivate)} excess strategies "
                        f"(keeping top {config.MAX_ACTIVE_STRATEGIES})")
 

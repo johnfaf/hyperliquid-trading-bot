@@ -261,8 +261,15 @@ class PaperTrader:
                     leverage=sig["leverage"],
                     position_pct=sig["size"] * sig["price"] / (db.get_paper_account() or {}).get("balance", 10000),
                     risk=RiskParams(
-                        stop_loss_pct=config.PAPER_TRADING_STOP_LOSS_PCT,
-                        take_profit_pct=config.PAPER_TRADING_TAKE_PROFIT_PCT,
+                        # LOW-FIX LOW-6: store the effective per-price stop-loss
+                        # percentage (divided by leverage) so RiskParams reflects
+                        # the actual price distance at which the stop fires.  The
+                        # _generate_signal formula computes stop_price as
+                        # target * (1 - SL_PCT / leverage), so a 5% config SL at
+                        # 5x leverage = 1% price-move trigger.  Storing 0.05 (raw)
+                        # was inconsistent with what the stop actually enforced.
+                        stop_loss_pct=config.PAPER_TRADING_STOP_LOSS_PCT / max(float(sig.get("leverage", 1) or 1), 1),
+                        take_profit_pct=config.PAPER_TRADING_TAKE_PROFIT_PCT / max(float(sig.get("leverage", 1) or 1), 1),
                         max_leverage=config.PAPER_TRADING_MAX_LEVERAGE,
                     ),
                     regime=regime_data.get("overall_regime", "") if regime_data else "",
@@ -1081,8 +1088,20 @@ class PaperTrader:
 
         for trade in open_trades:
             current_price = float(mids.get(trade["coin"], 0))
-            if current_price == 0:
-                continue
+            if current_price <= 0:
+                # MED-FIX MED-9: no market price for this coin (possibly delisted
+                # or feed gap).  Use entry_price as a fallback so that time-exit
+                # logic (24h close) can still fire.  SL/TP checks won't trigger
+                # at entry price (no P&L), which is correct — we just can't compute
+                # a real exit price.  Log a warning so operators can investigate.
+                fallback_price = float(trade.get("entry_price", 0) or 0)
+                if fallback_price <= 0:
+                    continue  # No price at all — skip entirely
+                logger.warning(
+                    "No market price for %s (trade %s) — using entry price $%.4f as fallback",
+                    trade["coin"], trade.get("id"), fallback_price,
+                )
+                current_price = fallback_price
 
             should_close = False
             close_reason = ""

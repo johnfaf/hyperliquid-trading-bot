@@ -245,15 +245,22 @@ class PredictiveRegimeForecaster:
         else:
             signal = 0.0
 
-        # Regime classification
-        if signal < CRASH_THRESHOLD:
+        confidence = min(1.0, abs(signal) * 1.8)
+
+        # MED-FIX MED-4: when only near-zero inputs are available (e.g. funding
+        # rate near 0, no Arkham/Polymarket data), the re-normalised signal is
+        # pure noise.  Classifying that noise as "crash" would fire the 80%
+        # size-reduction de-risk on false grounds.  Require a minimum confidence
+        # before assigning a non-neutral regime.
+        _MIN_CONFIDENCE_FOR_REGIME = 0.05
+        if confidence < _MIN_CONFIDENCE_FOR_REGIME:
+            regime = "neutral"
+        elif signal < CRASH_THRESHOLD:
             regime = "crash"
         elif signal > BULLISH_THRESHOLD:
             regime = "bullish"
         else:
             regime = "neutral"
-
-        confidence = min(1.0, abs(signal) * 1.8)
 
         data = {
             "signal": round(signal, 4),

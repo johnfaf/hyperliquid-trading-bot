@@ -233,10 +233,16 @@ class TradeMemory:
             rows = conn.execute(query, params).fetchall()
             conn.close()
         except Exception as e:
-            logger.debug(f"Trade memory query error: {e}")
+            # MED-FIX MED-8: elevate to WARNING and return "caution" instead of
+            # "proceed" — a DB error here means historical loss patterns on this
+            # setup are invisible.  Proceeding silently bypasses the memory system
+            # entirely; "caution" passes control to the caller but flags the gap.
+            logger.warning(
+                "Trade memory query error (defaulting to caution — loss patterns unavailable): %s", e
+            )
             return SimilarityResult(
                 similar_trades=[], total_found=0, win_rate=0, avg_pnl=0,
-                avg_return=0, recommendation="proceed",
+                avg_return=0, recommendation="caution",
                 reason=f"Query error: {e}", similarity_scores=[],
             )
 

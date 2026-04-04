@@ -402,8 +402,11 @@ class ShadowTracker:
             if std_pnl == 0:
                 return 0.0
 
-            # Annualize by sqrt(252)
-            sharpe = (avg_pnl / std_pnl) * math.sqrt(252)
+            # MED-FIX MED-2: removed sqrt(252) annualisation — pnl_list contains
+            # per-trade P&L values, not daily returns.  sqrt(252) is only valid for
+            # a daily return series.  Return the raw per-trade information ratio
+            # instead; comparisons across sources remain consistent and meaningful.
+            sharpe = avg_pnl / std_pnl
             return sharpe
         except Exception:
             return 0.0
