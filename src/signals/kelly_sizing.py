@@ -206,7 +206,31 @@ class KellySizer:
 
         win_rate = len(wins) / n_trades
         avg_win = sum(abs(o["return_pct"]) for o in wins) / len(wins) if wins else 0
-        avg_loss = sum(abs(o["return_pct"]) for o in losses) / len(losses) if losses else 0.001
+        # HIGH-FIX HIGH-1: when there are no losses yet (100% win rate history),
+        # do NOT fall back to 0.001 — that inflates reward_risk_ratio to thousands
+        # and causes Kelly to return max fraction despite no real edge data on
+        # downside.  Instead, mark has_edge=False and use default sizing so we
+        # wait for actual loss data before trusting the R:R estimate.
+        if not losses:
+            logger.info(
+                f"Kelly [{strategy_key}]: no loss history yet (all {n_trades} trades won) — "
+                f"using default sizing until loss data is available."
+            )
+            position_pct = self.default_position_pct * signal_confidence
+            position_pct = max(self.min_position_pct, min(position_pct, self.max_position_pct))
+            return SizingResult(
+                strategy_key=strategy_key,
+                kelly_fraction=0.0,
+                safe_fraction=0.0,
+                position_pct=position_pct,
+                position_usd=account_balance * position_pct,
+                win_rate=win_rate,
+                reward_risk_ratio=0.0,
+                has_edge=False,
+                trades_used=n_trades,
+                confidence="insufficient_loss_history",
+            )
+        avg_loss = sum(abs(o["return_pct"]) for o in losses) / len(losses)
 
         reward_risk_ratio = avg_win / avg_loss if avg_loss > 0 else 0
 
@@ -276,11 +300,16 @@ class KellySizer:
                 "trades": n,
                 "win_rate": wins / n,
                 "total_pnl": round(total_pnl, 2),
-                "has_edge": self.calculate_kelly(
-                    wins / n,
-                    (sum(abs(o["return_pct"]) for o in outcomes if o["win"]) / max(wins, 1)) /
-                    max(sum(abs(o["return_pct"]) for o in outcomes if not o["win"]) / max(n - wins, 1), 0.001)
-                ) > 0 if n >= self.min_trades_for_kelly else False,
+                # HIGH-FIX HIGH-1: use 0 (no edge) when no losses yet, same as get_sizing
+                "has_edge": (
+                    self.calculate_kelly(
+                        wins / n,
+                        (sum(abs(o["return_pct"]) for o in outcomes if o["win"]) / max(wins, 1)) /
+                        max(sum(abs(o["return_pct"]) for o in outcomes if not o["win"]) / max(n - wins, 1), 1e-9)
+                    ) > 0
+                    if (n >= self.min_trades_for_kelly and (n - wins) > 0)
+                    else False
+                ),
             }
         return stats
 

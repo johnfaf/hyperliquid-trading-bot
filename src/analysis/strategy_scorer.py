@@ -113,8 +113,13 @@ class StrategyScorer:
         """Score based on Sharpe ratio estimate."""
         sharpe = strategy.get("sharpe_ratio", 0)
         # Normalize: Sharpe of 1 -> 0.5, Sharpe of 2 -> 0.73, Sharpe of 3 -> 0.88
+        # HIGH-FIX HIGH-8: zero score for non-positive Sharpe.  The old formula
+        # returned 0.1–0.19 for Sharpe in (-1, 0], allowing bad strategies to
+        # persist active too long.  A non-positive Sharpe means risk-adjusted
+        # returns are at or below the risk-free rate — score 0.0 so that the
+        # composite score drives the strategy toward deactivation.
         if sharpe <= 0:
-            return max(0, 0.2 + sharpe * 0.1)  # Negative sharpe still gets some score
+            return 0.0
         return float(1 / (1 + np.exp(np.clip(-sharpe + 1, -500, 500))))
 
     def _score_consistency(self, strategy: Dict) -> float:

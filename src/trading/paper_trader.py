@@ -286,11 +286,17 @@ class PaperTrader:
             try:
                 # Use firewall if available, else fall back to legacy risk checks
                 if self.firewall:
+                    # HIGH-FIX HIGH-6/HIGH-9: do NOT bypass position limits in the
+                    # dry-run pre-screen.  The original ignore_position_limit=True
+                    # meant signals that should be blocked (8 positions open) sailed
+                    # through pre-screening and then passed the real execution validate
+                    # call too (same flag was propagated), so the limit was never
+                    # enforced end-to-end.  Use the same constraints for both passes.
                     passed, reason = self.firewall.validate(
                         trade_signal,
                         regime_data=regime_data,
                         open_positions=open_trades,
-                        ignore_position_limit=True,
+                        ignore_position_limit=False,
                         dry_run=True,
                     )
                     if not passed:
@@ -594,9 +600,14 @@ class PaperTrader:
                          "WIF", "PEPE", "ONDO", "RENDER", "FET", "NEAR"]
             available = [c for c in TOP_COINS if c in mids]
             if available:
-                # Use strategy ID as seed for deterministic but diverse selection
-                strat_id = hash(str(strategy.get("id", random.random())))
-                coins = [available[strat_id % len(available)]]
+                # HIGH-FIX HIGH-5: hash() is not stable across Python process
+                # restarts (PYTHONHASHSEED randomisation since 3.3).  Use a
+                # deterministic MD5-based int so a strategy always maps to the
+                # same coin across sessions.
+                import hashlib
+                seed_str = str(strategy.get("id", 0)).encode()
+                stable_hash = int(hashlib.md5(seed_str).hexdigest(), 16)
+                coins = [available[stable_hash % len(available)]]
             else:
                 coins = ["BTC", "ETH"]
 
