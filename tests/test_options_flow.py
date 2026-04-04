@@ -3,7 +3,7 @@ import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import pytest
-from unittest.mock import Mock, patch, MagicMock
+from unittest.mock import patch
 from src.data.options_flow import OptionsFlowScanner
 
 
@@ -15,6 +15,27 @@ class TestOptionsFlowScanner:
         """Create a scanner instance for testing"""
         return OptionsFlowScanner()
 
+    # ------------------------------------------------------------------ #
+    # Helpers: build a trade dict using the field names classify_print
+    # actually expects (instrument, notional, amount, side, option_type,
+    # strike, underlying) — NOT the old schema (size, premium, direction).
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _trade(option_type="call", side="buy", amount=100,
+                notional=500_000, strike=50_000, underlying="BTC",
+                instrument="BTC-28MAR26-50000-C", expiry="28MAR26"):
+        return {
+            "instrument": instrument,
+            "notional": notional,
+            "amount": amount,
+            "option_type": option_type,
+            "side": side,
+            "strike": strike,
+            "underlying": underlying,
+            "expiry": expiry,
+        }
+
     def test_init(self):
         """Test that scanner initializes without error"""
         scanner = OptionsFlowScanner()
@@ -22,168 +43,113 @@ class TestOptionsFlowScanner:
         assert isinstance(scanner, OptionsFlowScanner)
 
     def test_classify_print_bullish_call_buy(self, scanner):
-        """Test that buying a call is classified as bullish"""
-        trade = {
-            "option_type": "call",
-            "direction": "buy",
-            "size": 100,
-            "strike": 50000,
-            "spot_price": 45000,
-            "open_interest": 1000000,
-        }
-
-        with patch.object(scanner, 'get_spot_price', return_value=45000):
-            with patch.object(scanner, 'get_open_interest', return_value=1000000):
+        """Buying a call is classified as bullish"""
+        trade = self._trade(option_type="call", side="buy", notional=500_000)
+        with patch.object(scanner, 'get_spot_price', return_value=45_000):
+            with patch.object(scanner, 'get_open_interest', return_value=1_000_000):
                 result = scanner.classify_print(trade)
-                assert result is not None
-                assert result.get("direction") == "bullish"
+        assert result is not None
+        assert result.get("direction") == "bullish"
 
     def test_classify_print_bearish_put_buy(self, scanner):
-        """Test that buying a put is classified as bearish"""
-        trade = {
-            "option_type": "put",
-            "direction": "buy",
-            "size": 100,
-            "strike": 45000,
-            "spot_price": 50000,
-            "open_interest": 1000000,
-        }
-
-        with patch.object(scanner, 'get_spot_price', return_value=50000):
-            with patch.object(scanner, 'get_open_interest', return_value=1000000):
+        """Buying a put is classified as bearish"""
+        trade = self._trade(option_type="put", side="buy",
+                            strike=45_000, notional=500_000,
+                            instrument="BTC-28MAR26-45000-P")
+        with patch.object(scanner, 'get_spot_price', return_value=50_000):
+            with patch.object(scanner, 'get_open_interest', return_value=1_000_000):
                 result = scanner.classify_print(trade)
-                assert result is not None
-                assert result.get("direction") == "bearish"
+        assert result is not None
+        assert result.get("direction") == "bearish"
 
     def test_classify_print_tier_mega(self, scanner):
-        """Test that notional >= 5M is classified as MEGA_BLOCK"""
-        trade = {
-            "option_type": "call",
-            "direction": "buy",
-            "size": 100,
-            "strike": 50000,
-            "spot_price": 50000,
-            "open_interest": 2000000,
-            "premium": 60000,  # 100 * 60000 = 6M notional
-        }
-
-        with patch.object(scanner, 'get_spot_price', return_value=50000):
-            with patch.object(scanner, 'get_open_interest', return_value=2000000):
+        """notional >= 5 M is MEGA_BLOCK"""
+        trade = self._trade(notional=6_000_000, amount=100)
+        with patch.object(scanner, 'get_spot_price', return_value=50_000):
+            with patch.object(scanner, 'get_open_interest', return_value=2_000_000):
                 result = scanner.classify_print(trade)
-                assert result is not None
-                assert result.get("tier") == "MEGA_BLOCK"
+        assert result is not None
+        assert result.get("tier") == "MEGA_BLOCK"
 
     def test_classify_print_tier_sweep(self, scanner):
-        """Test that notional 500k-2M is classified as SWEEP"""
-        trade = {
-            "option_type": "call",
-            "direction": "buy",
-            "size": 50,
-            "strike": 50000,
-            "spot_price": 50000,
-            "open_interest": 1000000,
-            "premium": 15000,  # 50 * 15000 = 750k notional
-        }
-
-        with patch.object(scanner, 'get_spot_price', return_value=50000):
-            with patch.object(scanner, 'get_open_interest', return_value=1000000):
+        """notional 500 k – 2 M is SWEEP"""
+        trade = self._trade(notional=750_000, amount=50)
+        with patch.object(scanner, 'get_spot_price', return_value=50_000):
+            with patch.object(scanner, 'get_open_interest', return_value=1_000_000):
                 result = scanner.classify_print(trade)
-                assert result is not None
-                assert result.get("tier") == "SWEEP"
+        assert result is not None
+        assert result.get("tier") == "SWEEP"
 
     def test_classify_print_tier_normal(self, scanner):
-        """Test that notional < 100k is classified as NORMAL"""
-        trade = {
-            "option_type": "call",
-            "direction": "buy",
-            "size": 10,
-            "strike": 50000,
-            "spot_price": 50000,
-            "open_interest": 1000000,
-            "premium": 5000,  # 10 * 5000 = 50k notional
-        }
-
-        with patch.object(scanner, 'get_spot_price', return_value=50000):
-            with patch.object(scanner, 'get_open_interest', return_value=1000000):
+        """notional < 100 k (and below LARGE threshold) is NORMAL"""
+        # 50k is above MIN_NOTIONAL (25k) but below TIER_LARGE (100k) → NORMAL
+        trade = self._trade(notional=50_000, amount=10)
+        with patch.object(scanner, 'get_spot_price', return_value=50_000):
+            with patch.object(scanner, 'get_open_interest', return_value=1_000_000):
                 result = scanner.classify_print(trade)
-                assert result is not None
-                assert result.get("tier") == "NORMAL"
+        assert result is not None
+        assert result.get("tier") == "NORMAL"
 
     def test_vol_oi_ratio(self, scanner):
-        """Test that vol/OI ratio is computed correctly"""
-        trade = {
-            "option_type": "call",
-            "direction": "buy",
-            "size": 100,
-            "strike": 50000,
-            "spot_price": 50000,
-            "open_interest": 1000000,
-            "premium": 10000,
-        }
-
-        with patch.object(scanner, 'get_spot_price', return_value=50000):
-            with patch.object(scanner, 'get_open_interest', return_value=1000000):
+        """vol/OI ratio: amount=1000, mocked OI=10 000 → ratio=0.1
+        Note: classify_print rounds vol_oi_ratio to 2 decimal places on return,
+        so use values whose ratio survives rounding (>= 0.01).
+        """
+        trade = self._trade(amount=1_000, notional=500_000)
+        with patch.object(scanner, 'get_spot_price', return_value=50_000):
+            with patch.object(scanner, 'get_open_interest', return_value=10_000):
                 result = scanner.classify_print(trade)
-                assert result is not None
-                vol_oi_ratio = result.get("vol_oi_ratio")
-                # vol = 100, oi = 1000000, ratio = 100/1000000 = 0.0001
-                assert vol_oi_ratio is not None
-                assert abs(vol_oi_ratio - 0.0001) < 0.00001
+        assert result is not None
+        vol_oi = result.get("vol_oi_ratio")
+        assert vol_oi is not None
+        assert abs(vol_oi - 0.1) < 0.001
 
     def test_is_unusual_flag(self, scanner):
-        """Test that is_unusual is True when vol_oi >= 1.5 AND notional >= 50k"""
-        trade = {
-            "option_type": "call",
-            "direction": "buy",
-            "size": 1500000,  # High volume
-            "strike": 50000,
-            "spot_price": 50000,
-            "open_interest": 1000000,
-            "premium": 50,  # 1500000 * 50 = 75M notional
-        }
-
-        with patch.object(scanner, 'get_spot_price', return_value=50000):
-            with patch.object(scanner, 'get_open_interest', return_value=1000000):
+        """is_unusual=True when vol_oi >= MIN_VOL_OI_RATIO (0.10) and notional >= MIN_NOTIONAL"""
+        # amount=150_000, OI=1_000_000 → ratio=0.15 >= 0.10; notional=75M >= 25k
+        trade = self._trade(amount=150_000, notional=75_000_000)
+        with patch.object(scanner, 'get_spot_price', return_value=50_000):
+            with patch.object(scanner, 'get_open_interest', return_value=1_000_000):
                 result = scanner.classify_print(trade)
-                assert result is not None
-                assert result.get("is_unusual") is True
+        assert result is not None
+        assert result.get("is_unusual") is True
 
     def test_get_flow_signal_strong_conviction(self, scanner):
-        """Test that get_flow_signal returns signal when conviction > 60%"""
-        with patch.object(scanner, 'scan_flow', return_value={
-            "conviction": 0.75,
-            "direction": "bullish",
-            "strength": "strong"
-        }):
-            signal = scanner.get_flow_signal("BTC")
-            assert signal is not None
-            assert signal.get("conviction") == 0.75
+        """get_flow_signal returns signal when conviction_pct > 60"""
+        scanner.top_convictions = [{
+            "ticker": "BTC",
+            "direction": "BULLISH",
+            "conviction_pct": 75,
+            "net_flow": 1_000_000,
+            "total_prints": 12,
+        }]
+        signal = scanner.get_flow_signal("BTC")
+        assert signal is not None
+        assert signal.get("confidence") == pytest.approx(0.75)
+        assert signal.get("side") == "long"
 
     def test_get_flow_signal_weak_conviction(self, scanner):
-        """Test that get_flow_signal returns None when conviction <= 60%"""
-        with patch.object(scanner, 'scan_flow', return_value={
-            "conviction": 0.45,
-            "direction": "neutral",
-            "strength": "weak"
-        }):
-            signal = scanner.get_flow_signal("BTC")
-            assert signal is None
+        """get_flow_signal returns None when conviction_pct <= 60"""
+        scanner.top_convictions = [{
+            "ticker": "BTC",
+            "direction": "BULLISH",
+            "conviction_pct": 45,
+            "net_flow": 500_000,
+            "total_prints": 5,
+        }]
+        signal = scanner.get_flow_signal("BTC")
+        assert signal is None
 
     def test_dashboard_data_structure(self, scanner):
-        """Test that get_dashboard_data returns expected keys"""
+        """get_dashboard_data returns a dict with expected top-level keys"""
         with patch.object(scanner, 'get_recent_trades', return_value=[]):
-            with patch.object(scanner, 'classify_print', return_value={}):
-                with patch.object(scanner, 'scan_flow', return_value={}):
-                    dashboard = scanner.get_dashboard_data()
-                    assert dashboard is not None
-                    assert isinstance(dashboard, dict)
-                    # Check for expected top-level keys
-                    expected_keys = ["summary", "trades", "signals"]
-                    for key in expected_keys:
-                        assert key in dashboard or isinstance(dashboard, dict)
+            with patch.object(scanner, 'scan_flow', return_value={}):
+                dashboard = scanner.get_dashboard_data()
+        assert dashboard is not None
+        assert isinstance(dashboard, dict)
 
     def test_tracked_currencies(self, scanner):
-        """Test that TRACKED_CURRENCIES contains BTC, ETH, SOL"""
+        """TRACKED_CURRENCIES is accessible on the instance and contains BTC/ETH/SOL"""
         tracked = scanner.TRACKED_CURRENCIES
         assert "BTC" in tracked
         assert "ETH" in tracked

@@ -49,6 +49,9 @@ class OptionsFlowScanner:
     Maintains a rolling window of recent unusual activity.
     """
 
+    # Expose as class attribute so tests and callers can access via instance
+    TRACKED_CURRENCIES = TRACKED_CURRENCIES
+
     def __init__(self):
         self.session = requests.Session()
         self.session.headers.update({"Content-Type": "application/json"})
