@@ -240,6 +240,7 @@ DISCOVERY_CYCLE_INTERVAL = 86400     # 24h  (env: DISCOVERY_CYCLE_INTERVAL)
 | `LIGHTER_ENABLED` | `true` | Enable Lighter exchange adapter |
 | `ENABLE_PREDICTIVE_FORECASTER` | `true` | Enable regime forecaster |
 | `ENABLE_XGBOOST_FORECASTER` | `true` | Enable ML regime model |
+| `LIVE_TRADING_ENABLED` | `false` | Explicitly enable real order submission; otherwise the live trader stays disabled/dry-run |
 | `HL_WALLET_MODE` | `agent_only` | Wallet mode; only agent-wallet signing is permitted |
 | `HL_PUBLIC_ADDRESS` | _(none)_ | Trading account address (master/vault) |
 | `HL_AGENT_PRIVATE_KEY` | _(none)_ | Agent wallet private key (only for `SECRET_MANAGER_PROVIDER=none`) |
@@ -250,11 +251,18 @@ DISCOVERY_CYCLE_INTERVAL = 86400     # 24h  (env: DISCOVERY_CYCLE_INTERVAL)
 | `VAULT_ADDR` | _(none)_ | Vault address (when provider is `hashicorp`) |
 | `VAULT_TOKEN` | _(none)_ | Vault token (when provider is `hashicorp`) |
 | `VAULT_SECRET_PATH` | _(none)_ | Vault secret path (when provider is `hashicorp`) |
-| `ROTATION_ENGINE_ENABLED` | `true` | Enable rotation decision engine |
+| `ROTATION_ENGINE_ENABLED` | `false` | Enable rotation decision engine |
 | `ROTATION_DRY_RUN_TELEMETRY` | `true` | Shadow mode: simulate replacements and log telemetry only |
 | `ROTATION_SHADOW_MODE_DAYS` | `7` | Planned shadow window length for operations logging |
 | `ARKHAM_API_KEY` | _(none)_ | Optional: Arkham Intelligence API key |
 | `LOG_FORMAT` | `json` | Log format: `json` (production) or `text` (local) |
+
+### Live Mode Notes
+
+- `LIVE_TRADING_ENABLED=true` is required before any live orders can be submitted.
+- When live trading is deployable, exchange positions become the source of truth for exposure, decisioning, and health reporting.
+- The paper ledger remains as a shadow book for reporting and is reconciled back to exchange truth instead of driving live risk.
+- Paper-only paths such as standalone options-flow, liquidation-reversal, and arena champion execution are skipped while live trading is active so capital does not drift from the tracked book.
 
 ## Strategy Types
 

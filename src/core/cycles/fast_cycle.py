@@ -9,6 +9,12 @@ Extracted from ``HyperliquidResearchBot._fast_cycle``.
 import logging
 from typing import Optional
 
+from src.core.live_execution import (
+    is_live_trading_active,
+    mirror_executed_trades_to_live,
+    sync_shadow_book_to_live,
+)
+
 logger = logging.getLogger(__name__)
 logger.addHandler(logging.NullHandler())
 
@@ -19,7 +25,10 @@ def run_fast_cycle(container, cycle_count: int) -> None:
     and monitor crypto.com for whale trades.
     """
     try:
-        if container.paper_trader:
+        if is_live_trading_active(container):
+            container.live_trader.update_daily_pnl_from_fills()
+            closed = sync_shadow_book_to_live(container)
+        elif container.paper_trader:
             closed = container.paper_trader.check_open_positions()
             if closed:
                 logger.info("[fast] Closed %d positions (SL/TP)", len(closed))
@@ -30,6 +39,12 @@ def run_fast_cycle(container, cycle_count: int) -> None:
                 copy_executed = container.copy_trader.execute_copy_signals(copy_signals)
                 if copy_executed:
                     logger.info("[fast] Copy-traded %d positions", len(copy_executed))
+                    mirror_executed_trades_to_live(
+                        container,
+                        copy_executed,
+                        success_label="[fast] LIVE COPY",
+                        skip_label="[fast] Live trader requested but not deployable; skipping copy mirroring",
+                    )
 
         # Scan for whale trades on crypto.com and feed into signal pipeline
         _scan_whale_trades(container)

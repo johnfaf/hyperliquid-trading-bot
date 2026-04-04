@@ -1,30 +1,20 @@
 """
-Health Reporter — Structured JSON status for external monitoring
-================================================================
-Writes a machine-readable health report to /data/health_report.json
-every trading cycle. Designed to be consumed by a Claude scheduled
-task that reads and analyzes the bot's state, catching issues that
-would otherwise require manual log review.
+Health Reporter - Structured JSON status for external monitoring.
 
-Report includes:
-  - Timestamp and cycle number
-  - Paper account balance/PnL/ROI
-  - Open positions (coins, sides, unrealized PnL)
-  - Signal pipeline stats (in/out/dropped per source)
-  - Subsystem health (stale detection)
-  - Error log (last N errors)
-  - Performance metrics (cache hit rate, API 429s, etc.)
+Writes a machine-readable health report each trading cycle so operators can
+inspect both shadow and live state from a single artifact.
 """
 import json
 import logging
 import os
-import time
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Any, Dict, List, Optional
+
+from src.core.live_execution import is_live_trading_active
 
 logger = logging.getLogger(__name__)
 
-# Persistent across cycles — accumulates errors and warnings
+# Persistent across cycles - accumulates errors and warnings
 _error_buffer: List[Dict] = []
 _MAX_ERRORS = 50
 
@@ -38,6 +28,112 @@ def record_error(message: str, source: str = "unknown"):
     })
     if len(_error_buffer) > _MAX_ERRORS:
         _error_buffer.pop(0)
+
+
+def _account_report(container, live_active: bool) -> Dict[str, Any]:
+    from src.data import database as db
+
+    source = "paper"
+    account = None
+    if live_active and getattr(container, "live_trader", None):
+        balance = container.live_trader.get_account_value()
+        if balance is not None:
+            source = "live"
+            live_stats = container.live_trader.get_stats()
+            account = {
+                "balance": balance,
+                "total_pnl": live_stats.get("daily_pnl", 0),
+                "total_trades": None,
+                "winning_trades": None,
+            }
+
+    if not account:
+        account = db.get_paper_account()
+
+    if not account:
+        return {}
+
+    balance = float(account.get("balance", 10000) or 10000)
+    pnl = float(account.get("total_pnl", 0) or 0)
+    total_trades = account.get("total_trades", 0)
+    winning_trades = account.get("winning_trades", 0)
+    win_rate = None
+    if total_trades is not None and winning_trades is not None:
+        win_rate = round(winning_trades / max(total_trades or 1, 1) * 100, 1)
+
+    return {
+        "source": source,
+        "balance": round(balance, 2),
+        "pnl": round(pnl, 2),
+        "roi_pct": round((balance - 10000) / 10000 * 100, 2),
+        "total_trades": total_trades,
+        "winning_trades": winning_trades,
+        "win_rate": win_rate,
+    }
+
+
+def _positions_report(container, live_active: bool) -> Dict[str, Any]:
+    from src.data import database as db
+    from src.data.hyperliquid_client import get_all_mids
+
+    mids = get_all_mids() or {}
+    source = "paper"
+    if live_active and getattr(container, "live_trader", None):
+        open_trades = container.live_trader.get_positions()
+        source = "live"
+    else:
+        open_trades = db.get_open_paper_trades()
+
+    positions = []
+    total_unrealized = 0.0
+    for trade in open_trades:
+        coin = trade.get("coin", "")
+        side = trade.get("side", "?")
+        entry = float(trade.get("entry_price", trade.get("entryPx", 0)) or 0)
+        current_price = float(mids.get(coin, 0) or 0)
+        size = float(trade.get("size", 0) or 0)
+        leverage = float(trade.get("leverage", 1) or 1)
+
+        if entry and current_price:
+            if side == "long":
+                unrealized = (current_price - entry) / entry * size * entry * leverage
+            else:
+                unrealized = (entry - current_price) / entry * size * entry * leverage
+        else:
+            unrealized = float(trade.get("unrealized_pnl", trade.get("unrealizedPnl", 0)) or 0)
+        total_unrealized += unrealized
+
+        opened_at = trade.get("opened_at", "")
+        age_hours = 0.0
+        try:
+            if opened_at:
+                age_hours = round(
+                    (datetime.utcnow() - datetime.fromisoformat(opened_at)).total_seconds() / 3600,
+                    1,
+                )
+        except Exception:
+            pass
+
+        positions.append({
+            "coin": coin,
+            "side": side,
+            "entry_price": round(entry, 2),
+            "current_price": round(current_price, 2),
+            "size": round(size, 6),
+            "leverage": leverage,
+            "unrealized_pnl": round(unrealized, 2),
+            "stop_loss": trade.get("stop_loss"),
+            "take_profit": trade.get("take_profit"),
+            "age_hours": age_hours,
+            "strategy_type": trade.get("strategy_type", "unknown"),
+        })
+
+    return {
+        "source": source,
+        "count": len(positions),
+        "total_unrealized_pnl": round(total_unrealized, 2),
+        "details": positions,
+    }
 
 
 def write_health_report(
@@ -59,81 +155,21 @@ def write_health_report(
         "version": "1.0",
     }
 
-    # ── Paper Account ──
     try:
-        from src.data import database as db
-        account = db.get_paper_account()
-        if account:
-            balance = account.get("balance", 10000)
-            initial = 10000
-            pnl = account.get("total_pnl", 0)
-            report["account"] = {
-                "balance": round(balance, 2),
-                "pnl": round(pnl, 2),
-                "roi_pct": round((balance - initial) / initial * 100, 2),
-                "total_trades": account.get("total_trades", 0),
-                "winning_trades": account.get("winning_trades", 0),
-                "win_rate": round(
-                    account.get("winning_trades", 0) / max(account.get("total_trades", 1), 1) * 100, 1
-                ),
-            }
-    except Exception as e:
-        report["account"] = {"error": str(e)}
+        live_active = is_live_trading_active(container)
+    except Exception:
+        live_active = False
 
-    # ── Open Positions ──
     try:
-        from src.data import database as db
-        from src.data.hyperliquid_client import get_all_mids
-        open_trades = db.get_open_paper_trades()
-        mids = get_all_mids() or {}
-        positions = []
-        total_unrealized = 0.0
-        for t in open_trades:
-            current_price = float(mids.get(t["coin"], 0))
-            entry = t.get("entry_price", 0)
-            size = t.get("size", 0)
-            leverage = t.get("leverage", 1)
-            if entry and current_price:
-                if t.get("side") == "long":
-                    unrealized = (current_price - entry) / entry * size * entry * leverage
-                else:
-                    unrealized = (entry - current_price) / entry * size * entry * leverage
-            else:
-                unrealized = 0
-            total_unrealized += unrealized
+        report["account"] = _account_report(container, live_active)
+    except Exception as exc:
+        report["account"] = {"error": str(exc)}
 
-            opened_at = t.get("opened_at", "")
-            age_hours = 0
-            try:
-                if opened_at:
-                    age_hours = round(
-                        (datetime.utcnow() - datetime.fromisoformat(opened_at)).total_seconds() / 3600, 1
-                    )
-            except Exception:
-                pass
+    try:
+        report["positions"] = _positions_report(container, live_active)
+    except Exception as exc:
+        report["positions"] = {"error": str(exc)}
 
-            positions.append({
-                "coin": t["coin"],
-                "side": t.get("side", "?"),
-                "entry_price": round(entry, 2),
-                "current_price": round(current_price, 2),
-                "size": round(size, 6),
-                "leverage": leverage,
-                "unrealized_pnl": round(unrealized, 2),
-                "stop_loss": t.get("stop_loss"),
-                "take_profit": t.get("take_profit"),
-                "age_hours": age_hours,
-                "strategy_type": t.get("strategy_type", "unknown"),
-            })
-        report["positions"] = {
-            "count": len(positions),
-            "total_unrealized_pnl": round(total_unrealized, 2),
-            "details": positions,
-        }
-    except Exception as e:
-        report["positions"] = {"error": str(e)}
-
-    # ── Regime ──
     if regime_data:
         report["regime"] = {
             "overall": regime_data.get("overall_regime", "unknown"),
@@ -142,7 +178,6 @@ def write_health_report(
             "paused_strategies": regime_data.get("strategy_guidance", {}).get("pause", []),
         }
 
-    # ── Signal Pipeline Stats ──
     pipeline = {}
     try:
         if container.signal_processor:
@@ -164,7 +199,7 @@ def write_health_report(
     try:
         if container.kelly_sizer:
             all_stats = container.kelly_sizer.get_all_sizing_stats()
-            edge_count = sum(1 for v in all_stats.values() if v.get("has_edge"))
+            edge_count = sum(1 for value in all_stats.values() if value.get("has_edge"))
             pipeline["kelly"] = {
                 "strategies_tracked": len(all_stats),
                 "with_proven_edge": edge_count,
@@ -173,7 +208,6 @@ def write_health_report(
         pass
     report["pipeline"] = pipeline
 
-    # ── Arena ──
     try:
         if container.arena:
             arena_stats = container.arena.get_stats()
@@ -187,36 +221,42 @@ def write_health_report(
     except Exception:
         pass
 
-    # ── API Health ──
     try:
         from src.data.hyperliquid_client import get_api_stats
-        api_s = get_api_stats()
-        if api_s:
+
+        api_stats = get_api_stats()
+        if api_stats:
             report["api"] = {
-                "rest_requests": api_s["rest_requests"],
-                "cache_served": api_s["cache_served"],
-                "cache_hit_pct": api_s["cache_hit_pct"],
-                "ws_served": api_s["ws_served"],
-                "consecutive_429s": api_s["bucket"]["consecutive_429s"],
-                "tokens_available": api_s["bucket"]["tokens_available"],
+                "rest_requests": api_stats["rest_requests"],
+                "cache_served": api_stats["cache_served"],
+                "cache_hit_pct": api_stats["cache_hit_pct"],
+                "ws_served": api_stats["ws_served"],
+                "consecutive_429s": api_stats["bucket"]["consecutive_429s"],
+                "tokens_available": api_stats["bucket"]["tokens_available"],
             }
     except Exception:
         pass
 
-    # ── Subsystem Health ──
     if health_registry:
         try:
             stale = health_registry.check_stale(timeout_seconds=600)
-            stale_list = [k for k, v in stale.items() if v]
+            stale_list = [name for name, is_stale in stale.items() if is_stale]
+            detailed = {}
+            for name, status in health_registry.get_all().items():
+                detailed[name] = {
+                    "state": status.state.value,
+                    "reason": status.reason,
+                    "affects_trading": status.affects_trading,
+                }
             report["subsystems"] = {
                 "total": len(stale),
                 "stale": stale_list,
                 "all_healthy": len(stale_list) == 0,
+                "details": detailed,
             }
         except Exception:
             pass
 
-    # ── Copy Trading ──
     try:
         if container.copy_trader:
             report["copy_trading"] = {
@@ -225,22 +265,25 @@ def write_health_report(
     except Exception:
         pass
 
-    # ── Recent Errors ──
-    report["errors"] = list(_error_buffer[-20:])  # Last 20
+    try:
+        if getattr(container, "live_trader", None):
+            report["live_trading"] = container.live_trader.get_stats()
+    except Exception:
+        pass
 
-    # ── Write ──
+    report["errors"] = list(_error_buffer[-20:])
+
     try:
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
-        with open(output_path, "w") as f:
-            json.dump(report, f, indent=2, default=str)
-        logger.info(f"Health report written to {output_path}")
-    except Exception as e:
-        logger.warning(f"Failed to write health report: {e}")
-        # Fallback to /tmp
+        with open(output_path, "w") as handle:
+            json.dump(report, handle, indent=2, default=str)
+        logger.info("Health report written to %s", output_path)
+    except Exception as exc:
+        logger.warning("Failed to write health report: %s", exc)
         fallback = "/tmp/health_report.json"
         try:
-            with open(fallback, "w") as f:
-                json.dump(report, f, indent=2, default=str)
+            with open(fallback, "w") as handle:
+                json.dump(report, handle, indent=2, default=str)
             output_path = fallback
         except Exception:
             pass

@@ -308,6 +308,7 @@ class CopyTrader:
         replacements_used = 0
         rotation_enabled = bool(config.ROTATION_ENGINE_ENABLED)
         rotation_dry_run = bool(config.ROTATION_DRY_RUN_TELEMETRY)
+        shadow_mode = rotation_enabled and rotation_dry_run
         for candidate in sorted(
             pending_entries,
             key=lambda item: self.rotation_manager.candidate_score(
@@ -325,8 +326,15 @@ class CopyTrader:
             )
             victim = None
             candidate_open_positions = open_trades
+            shadow_bypass_open = (
+                shadow_mode
+                and self.rotation_manager.should_bypass_reject_in_shadow_mode(
+                    decision,
+                    len(open_trades),
+                )
+            )
 
-            if decision.action == "reject":
+            if decision.action == "reject" and not shadow_bypass_open:
                 logger.info(
                     "  Rotation skipped copy %s %s: %s",
                     signal["side"],
@@ -334,6 +342,13 @@ class CopyTrader:
                     decision.reason,
                 )
                 continue
+            if shadow_bypass_open:
+                logger.info(
+                    "  Rotation shadow mode: bypassing rotation reject for copy %s %s (%s)",
+                    signal["side"],
+                    signal["coin"],
+                    decision.reason,
+                )
 
             if decision.action == "replace":
                 if not rotation_enabled:

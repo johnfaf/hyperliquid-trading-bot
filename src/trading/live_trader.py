@@ -28,7 +28,7 @@ import json
 import hashlib
 import hmac
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 from enum import Enum
 
 import requests
@@ -46,7 +46,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import config
 from src.core.secret_manager import SecretManagerError, load_agent_private_key
 from src.signals.decision_firewall import DecisionFirewall
-from src.signals.signal_schema import TradeSignal, SignalSide
+from src.signals.signal_schema import TradeSignal, SignalSide, signal_from_execution_dict
 
 logger = logging.getLogger(__name__)
 
@@ -176,10 +176,12 @@ class LiveTrader:
             regime_forecaster: Optional PredictiveRegimeForecaster for regime-aware position sizing
         """
         self.firewall = firewall
+        self.live_requested = not dry_run
         self.dry_run = dry_run
         self.max_daily_loss = float(os.environ.get("HL_MAX_DAILY_LOSS", max_daily_loss))
         self.max_position_size = float(os.environ.get("HL_MAX_POSITION_SIZE", max_position_size))
         self.regime_forecaster = regime_forecaster
+        self.status_reason = "dry_run_requested" if dry_run else "initializing"
 
         # API endpoints (must come early since _load_* methods need these)
         self.exchange_url = "https://api.hyperliquid.xyz/exchange"
@@ -222,6 +224,13 @@ class LiveTrader:
         if not self.signer:
             logger.warning("No agent wallet signer configured - forcing dry_run mode")
             self.dry_run = True
+            self.status_reason = "missing_agent_wallet_signer"
+        elif self.live_requested and self.dry_run:
+            self.status_reason = "dry_run_forced"
+        elif self.live_requested:
+            self.status_reason = "live_ready"
+        else:
+            self.status_reason = "dry_run_requested"
 
         # Reconcile positions on startup
         if not self.dry_run and self.signer:
@@ -242,9 +251,11 @@ class LiveTrader:
 
         if not trading_address:
             logger.warning("HL_PUBLIC_ADDRESS not set; live execution remains disabled")
+            self.status_reason = "missing_trading_address"
             return
         if os.environ.get("HL_PRIVATE_KEY"):
             logger.error("HL_PRIVATE_KEY is disallowed in agent-wallet-only mode")
+            self.status_reason = "legacy_private_key_blocked"
             return
 
         try:
@@ -270,6 +281,7 @@ class LiveTrader:
 
             self.agent_wallet_address = configured_agent_address or derived_agent_address
             self.public_address = trading_address
+            self.status_reason = "credentials_loaded"
             logger.info(
                 "Agent-wallet credentials loaded (provider=%s agent=%s trading=%s)",
                 secret_provider,
@@ -281,6 +293,7 @@ class LiveTrader:
             self.signer = None
             self.agent_wallet_address = None
             self.public_address = None
+            self.status_reason = f"credential_error:{e}"
 
     def _load_asset_index_map(self):
         """Load asset index mapping from Hyperliquid meta endpoint."""
@@ -304,6 +317,78 @@ class LiveTrader:
                 logger.warning("No 'universe' in meta response")
         except Exception as e:
             logger.error(f"Failed to load asset index map: {e}")
+
+    def is_live_enabled(self) -> bool:
+        """Return True when the operator explicitly requested live execution."""
+        return bool(self.live_requested)
+
+    def is_deployable(self) -> bool:
+        """Return True when the trader can actually submit live orders."""
+        return bool(self.live_requested and not self.dry_run and self.signer and self.public_address)
+
+    def _coerce_signal(self, signal: Union[TradeSignal, Dict[str, Any]]) -> TradeSignal:
+        """Accept either TradeSignal or execution dict for safer live mirroring."""
+        if isinstance(signal, TradeSignal):
+            return signal
+        if isinstance(signal, dict):
+            return signal_from_execution_dict(signal)
+        raise TypeError(f"Unsupported signal type for live execution: {type(signal)}")
+
+    def get_account_state(self) -> Dict[str, Any]:
+        """Fetch raw clearinghouse state for the trading account."""
+        if not self.public_address:
+            return {}
+        try:
+            response = requests.post(
+                self.info_url,
+                json={"type": "clearinghouseState", "user": self.public_address},
+                timeout=10,
+            )
+            response.raise_for_status()
+            data = response.json()
+            return data if isinstance(data, dict) else {}
+        except Exception as e:
+            logger.error(f"Error getting account state: {e}")
+            return {}
+
+    def get_account_value(self) -> Optional[float]:
+        """Best-effort extraction of live account value from clearinghouse state."""
+        state = self.get_account_state()
+        candidates = [
+            state.get("marginSummary", {}).get("accountValue"),
+            state.get("crossMarginSummary", {}).get("accountValue"),
+            state.get("accountValue"),
+        ]
+        for value in candidates:
+            try:
+                if value is not None:
+                    return float(value)
+            except (TypeError, ValueError):
+                continue
+        return None
+
+    def _normalize_position(self, pos: Dict[str, Any]) -> Dict[str, Any]:
+        """Flatten Hyperliquid position payload into a consistent dict shape."""
+        pos_info = pos.get("position", pos) if isinstance(pos, dict) else {}
+        size = float(pos_info.get("szi", pos_info.get("size", 0)) or 0)
+        entry_px = float(pos_info.get("entryPx", pos_info.get("entry_price", 0)) or 0)
+        unrealized = float(pos_info.get("unrealizedPnl", pos_info.get("unrealized_pnl", 0)) or 0)
+        return {
+            "coin": pos_info.get("coin", ""),
+            "size": abs(size),
+            "szi": size,
+            "side": "long" if size > 0 else "short",
+            "entry_price": entry_px,
+            "entryPx": entry_px,
+            "unrealized_pnl": unrealized,
+            "unrealizedPnl": unrealized,
+            "leverage": float(pos_info.get("leverage", pos_info.get("lev", 1)) or 1),
+            "raw": pos,
+        }
+
+    def get_firewall_positions(self) -> List[Dict[str, Any]]:
+        """Return normalized live positions in the format the firewall expects."""
+        return self.get_positions()
 
     def _get_asset_index(self, coin: str) -> Optional[int]:
         """Get asset index for a coin."""
@@ -353,11 +438,10 @@ class LiveTrader:
             active_coins = []
 
             for pos in exchange_positions:
-                pos_info = pos.get("position", pos)
-                coin = pos_info.get("coin", "")
-                size = float(pos_info.get("szi", 0))
-                entry_px = float(pos_info.get("entryPx", 0))
-                unrealized_pnl = float(pos_info.get("unrealizedPnl", 0))
+                coin = pos.get("coin", "")
+                size = float(pos.get("szi", pos.get("size", 0)) or 0)
+                entry_px = float(pos.get("entry_price", pos.get("entryPx", 0)) or 0)
+                unrealized_pnl = float(pos.get("unrealized_pnl", pos.get("unrealizedPnl", 0)) or 0)
 
                 if abs(size) > 0:
                     side = "long" if size > 0 else "short"
@@ -719,9 +803,8 @@ class LiveTrader:
             try:
                 positions = self.get_positions()
                 for pos in positions:
-                    pos_info = pos.get("position", pos)
-                    pos_coin = pos_info.get("coin", "")
-                    pos_size = float(pos_info.get("szi", 0))
+                    pos_coin = pos.get("coin", "")
+                    pos_size = float(pos.get("szi", 0) or 0)
 
                     if pos_coin == coin and abs(pos_size) > 0:
                         logger.info(
@@ -915,7 +998,7 @@ class LiveTrader:
                 return {"status": "error", "message": "No position found"}
 
             size = abs(pos.get("size", 0))
-            side = "sell" if pos.get("size", 0) > 0 else "buy"
+            side = "sell" if pos.get("szi", 0) > 0 else "buy"
 
             return self.place_market_order(coin, side, size, reduce_only=True)
 
@@ -964,16 +1047,10 @@ class LiveTrader:
                 logger.warning("No public address configured")
                 return []
 
-            response = requests.post(
-                self.info_url,
-                json={"type": "clearinghouseState", "user": self.public_address},
-                timeout=10
-            )
-            response.raise_for_status()
-            data = response.json()
-
-            positions = data.get("assetPositions", [])
-            return positions
+            data = self.get_account_state()
+            positions = data.get("assetPositions", []) if isinstance(data, dict) else []
+            normalized = [self._normalize_position(pos) for pos in positions]
+            return [pos for pos in normalized if pos.get("coin")]
 
         except Exception as e:
             logger.error(f"Error getting positions: {e}")
@@ -1076,7 +1153,7 @@ class LiveTrader:
 
         return signal
 
-    def execute_signal(self, signal: TradeSignal) -> Optional[Dict]:
+    def execute_signal(self, signal: Union[TradeSignal, Dict[str, Any]]) -> Optional[Dict]:
         """
         Main entry point: execute a trade signal through firewall.
 
@@ -1094,8 +1171,17 @@ class LiveTrader:
         Returns:
             Execution result dict or None if rejected
         """
+        signal = self._coerce_signal(signal)
+
+        live_positions = self.get_firewall_positions() if self.is_deployable() else None
+        live_account_value = self.get_account_value() if self.is_deployable() else None
+
         # Validate through firewall
-        passed, reason = self.firewall.validate(signal)
+        passed, reason = self.firewall.validate(
+            signal,
+            open_positions=live_positions,
+            account_balance=live_account_value,
+        )
         if not passed:
             logger.info(f"Signal rejected by firewall: {reason}")
             return None
@@ -1224,10 +1310,13 @@ class LiveTrader:
         self._check_daily_reset()
 
         return {
+            "live_enabled": self.live_requested,
+            "deployable": self.is_deployable(),
             "dry_run": self.dry_run,
             "signer_available": self.signer is not None,
             "agent_wallet_address": self.agent_wallet_address,
             "public_address": self.public_address,
+            "status_reason": self.status_reason,
             "kill_switch_active": self.kill_switch_active,
             "daily_pnl": round(self.daily_pnl, 2),
             "daily_pnl_limit": self.max_daily_loss,

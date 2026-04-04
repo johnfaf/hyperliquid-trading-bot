@@ -284,10 +284,25 @@ def build_subsystems(
             "live_trader",
             lambda: LiveTrader(
                 firewall=c.firewall,
+                dry_run=not getattr(config, "LIVE_TRADING_ENABLED", False),
                 regime_forecaster=c.predictive_forecaster,
             ),
             health,
+            affects_trading=bool(getattr(config, "LIVE_TRADING_ENABLED", False)),
         )
+        if c.live_trader:
+            if not getattr(config, "LIVE_TRADING_ENABLED", False):
+                health.set_status(
+                    "live_trader",
+                    SubsystemState.DISABLED,
+                    reason="LIVE_TRADING_ENABLED=false",
+                )
+            elif not c.live_trader.is_deployable():
+                health.set_status(
+                    "live_trader",
+                    SubsystemState.DEGRADED,
+                    reason=c.live_trader.get_stats().get("status_reason", "not deployable"),
+                )
 
     # ─── Cross-venue hedger ───────────────────────────────────
     if "cross_venue_hedger" in profile:

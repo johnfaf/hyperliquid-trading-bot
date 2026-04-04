@@ -128,7 +128,8 @@ class DecisionFirewall:
     def validate(self, signal: TradeSignal, regime_data: Optional[Dict] = None,
                  open_positions: Optional[List[Dict]] = None,
                  ignore_position_limit: bool = False,
-                 dry_run: bool = False) -> Tuple[bool, str]:
+                 dry_run: bool = False,
+                 account_balance: Optional[float] = None) -> Tuple[bool, str]:
         """
         Validate a single trade signal through all checks.
         Thread-safe: acquires _lock to prevent concurrent state corruption.
@@ -144,12 +145,14 @@ class DecisionFirewall:
                 open_positions,
                 ignore_position_limit=ignore_position_limit,
                 dry_run=dry_run,
+                account_balance=account_balance,
             )
 
     def _validate_locked(self, signal: TradeSignal, regime_data: Optional[Dict] = None,
                          open_positions: Optional[List[Dict]] = None,
                          ignore_position_limit: bool = False,
-                         dry_run: bool = False) -> Tuple[bool, str]:
+                         dry_run: bool = False,
+                         account_balance: Optional[float] = None) -> Tuple[bool, str]:
         """Inner validate — must be called with _lock held."""
         if not dry_run:
             self.stats["total_signals"] += 1
@@ -197,13 +200,15 @@ class DecisionFirewall:
                           f"Max positions for {signal.coin} ({len(coin_positions)}/{self.max_per_coin})")
 
         # 5b. Aggregate portfolio exposure — hard cap across ALL positions
-        account = db.get_paper_account()
-        if account:
-            balance = account.get("balance", 10000)
+        balance = account_balance
+        if balance is None:
+            account = db.get_paper_account()
+            balance = account.get("balance", 10000) if account else None
+        if balance:
             total_exposure = 0.0
             for pos in positions:
                 pos_size = pos.get("size", 0)
-                pos_price = pos.get("entry_price", 0)
+                pos_price = pos.get("entry_price", pos.get("entryPx", 0))
                 pos_leverage = pos.get("leverage", 1)
                 total_exposure += abs(pos_size * pos_price * pos_leverage)
 

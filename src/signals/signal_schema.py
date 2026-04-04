@@ -141,7 +141,7 @@ def signal_from_strategy(strategy: Dict, coin: str, side: str,
 
 
 def signal_from_copy_trade(trader_address: str, coin: str, side: str,
-                            entry_price: float, confidence: float = 0.6) -> TradeSignal:
+                             entry_price: float, confidence: float = 0.6) -> TradeSignal:
     """Helper: create a TradeSignal from a copy trade detection."""
     return TradeSignal(
         coin=coin,
@@ -152,6 +152,44 @@ def signal_from_copy_trade(trader_address: str, coin: str, side: str,
         trader_address=trader_address,
         entry_price=entry_price,
     )
+
+
+def signal_from_execution_dict(execution: Dict[str, Any]) -> TradeSignal:
+    """
+    Build a TradeSignal from an executed paper/copy trade dict.
+
+    This keeps live mirroring resilient when upstream execution code returns
+    plain dicts instead of TradeSignal instances.
+    """
+    source_raw = str(execution.get("source", "")).strip().lower()
+    if source_raw == SignalSource.COPY_TRADE.value or execution.get("trader_address"):
+        source = SignalSource.COPY_TRADE
+    elif source_raw == SignalSource.OPTIONS_FLOW.value:
+        source = SignalSource.OPTIONS_FLOW
+    elif source_raw == SignalSource.WHALE_TRADE.value:
+        source = SignalSource.WHALE_TRADE
+    else:
+        source = SignalSource.STRATEGY
+
+    side_value = str(execution.get("side", "long")).strip().lower()
+    signal = TradeSignal(
+        coin=str(execution.get("coin", "")),
+        side=SignalSide(side_value or "long"),
+        confidence=float(execution.get("confidence", 0.5)),
+        source=source,
+        reason=str(execution.get("reason", "Mirrored execution")).strip() or "Mirrored execution",
+        entry_price=float(execution.get("entry_price", 0.0) or 0.0),
+        strategy_id=execution.get("strategy_id"),
+        strategy_type=str(execution.get("strategy_type", "")),
+        trader_address=str(execution.get("trader_address", execution.get("trader", ""))),
+        leverage=float(execution.get("leverage", 2.0) or 2.0),
+        position_pct=float(execution.get("position_pct", 0.08) or 0.08),
+        size=float(execution.get("size", 0.0) or 0.0),
+        signal_id=str(execution.get("signal_id", "")),
+        regime=str(execution.get("regime", "")),
+        source_accuracy=float(execution.get("source_accuracy", 0.0) or 0.0),
+    )
+    return signal
 
 
 def signal_from_options_flow(ticker: str, direction: str,

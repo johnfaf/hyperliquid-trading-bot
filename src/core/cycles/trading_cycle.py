@@ -13,6 +13,12 @@ from datetime import datetime
 
 import config
 from src.data import database as db
+from src.core.live_execution import (
+    get_execution_open_positions,
+    is_live_trading_active,
+    mirror_executed_trades_to_live,
+    sync_shadow_book_to_live,
+)
 
 logger = logging.getLogger(__name__)
 logger.addHandler(logging.NullHandler())
@@ -61,7 +67,7 @@ def _run_hedger(container, regime_data):
                 "regime": regime_data.get("overall_regime", "neutral"),
                 "confidence": regime_data.get("overall_confidence", 0),
             }
-        open_trades = db.get_open_paper_trades()
+        open_trades = get_execution_open_positions(container)
         hedge_result = hedger.check_and_hedge(pred_regime, open_trades)
         if hedge_result.get("action") != "idle":
             logger.info(
@@ -112,6 +118,7 @@ def run_trading_cycle(container, cycle_count: int) -> None:
 
     # Kill switch check
     if container.live_trader and not container.live_trader.dry_run:
+        container.live_trader.update_daily_pnl_from_fills()
         if container.live_trader.check_daily_loss():
             logger.error("KILL SWITCH ACTIVE — daily loss limit hit, skipping live trades")
 
@@ -293,8 +300,11 @@ def run_trading_cycle(container, cycle_count: int) -> None:
             if injected_options:
                 logger.info("  Injected %d options flow signals into decision engine", injected_options)
 
-        # Check existing positions
-        closed = container.paper_trader.check_open_positions() if container.paper_trader else []
+        # Keep the shadow ledger synced to exchange truth when live mode is active.
+        if is_live_trading_active(container):
+            closed = sync_shadow_book_to_live(container)
+        else:
+            closed = container.paper_trader.check_open_positions() if container.paper_trader else []
         if closed:
             logger.info("  Closed %d positions", len(closed))
 
@@ -302,7 +312,7 @@ def run_trading_cycle(container, cycle_count: int) -> None:
         _run_cross_venue_confirmation(container, top_strategies)
 
         # Decision engine
-        open_trades = db.get_open_paper_trades()
+        open_trades = get_execution_open_positions(container)
         kelly_stats = None
         if container.kelly_sizer:
             try:
@@ -327,19 +337,12 @@ def run_trading_cycle(container, cycle_count: int) -> None:
             )
             logger.info("  Executed %d new paper trades", len(executed))
 
-            # Mirror to live
-            if container.live_trader and executed:
-                for t in executed:
-                    try:
-                        live_result = container.live_trader.execute_signal(t)
-                        if live_result:
-                            logger.info(
-                                "  LIVE: %s %s %s",
-                                live_result.get("status", "?"),
-                                t.get("coin", "?"), t.get("side", "?"),
-                            )
-                    except Exception as exc:
-                        logger.warning("  Live execution error: %s", exc)
+            mirror_executed_trades_to_live(
+                container,
+                executed,
+                success_label="  LIVE",
+                skip_label="  Live trader requested but not deployable; skipping strategy mirroring",
+            )
 
             if tg.is_configured():
                 for t in executed:
@@ -588,10 +591,13 @@ def _execute_lcrs_signals(container, lcrs_signals, regime_data):
     """Phase 4a: execute liquidation reversal signals."""
     from src.notifications import telegram_bot as tg
     logger.info("Phase 4a: Liquidation Strategy Execution")
+    if is_live_trading_active(container):
+        logger.warning("  Skipping LCRS paper-only execution while live trading is active")
+        return
     try:
         from src.signals.signal_schema import TradeSignal, SignalSide, SignalSource, RiskParams
         lcrs_executed = []
-        open_trades = db.get_open_paper_trades()
+        open_trades = get_execution_open_positions(container)
         account = db.get_paper_account()
 
         for sig in lcrs_signals:
@@ -676,6 +682,9 @@ def _execute_options_flow_trades(container, regime_data):
     """Phase 4a2: high-conviction options flow → direct trade."""
     from src.notifications import telegram_bot as tg
     logger.info("Phase 4a2: Options Flow Trades")
+    if is_live_trading_active(container):
+        logger.warning("  Skipping options-flow paper-only execution while live trading is active")
+        return
     try:
         from src.signals.signal_schema import signal_from_options_flow
         from src.data import hyperliquid_client as hl_client
@@ -701,7 +710,7 @@ def _execute_options_flow_trades(container, regime_data):
             if container.firewall:
                 passed, reason = container.firewall.validate(
                     flow_signal, regime_data=regime_data,
-                    open_positions=db.get_open_paper_trades(),
+                    open_positions=get_execution_open_positions(container),
                 )
                 if not passed:
                     logger.info("  Firewall rejected options flow %s: %s", conv["ticker"], reason)
@@ -776,36 +785,12 @@ def _run_copy_trading(container, regime_data):
         if tg.is_configured():
             for t in copy_executed:
                 tg.notify_trade_opened(t, source="copy")
-        if container.live_trader and copy_executed:
-            from src.signals.signal_schema import TradeSignal, signal_from_copy_trade
-            for t in copy_executed:
-                try:
-                    # Convert dict → TradeSignal if needed (live_trader expects TradeSignal)
-                    if isinstance(t, dict):
-                        sig = signal_from_copy_trade(
-                            trader_address=t.get("trader_address", t.get("trader", "")),
-                            coin=t.get("coin", ""),
-                            side=t.get("side", "long"),
-                            entry_price=float(t.get("entry_price", 0)),
-                            confidence=float(t.get("confidence", 0.6)),
-                        )
-                        # Carry over any extra fields
-                        if t.get("leverage"):
-                            sig.leverage = float(t["leverage"])
-                        if t.get("position_pct"):
-                            sig.position_pct = float(t["position_pct"])
-                    else:
-                        sig = t
-                    live_result = container.live_trader.execute_signal(sig)
-                    if live_result:
-                        logger.info(
-                            "  LIVE COPY: %s %s %s",
-                            live_result.get("status", "?"),
-                            sig.coin if hasattr(sig, "coin") else t.get("coin", "?"),
-                            sig.side.value if hasattr(sig, "side") else t.get("side", "?"),
-                        )
-                except Exception as exc:
-                    logger.warning("  Live copy execution error: %s", exc)
+        mirror_executed_trades_to_live(
+            container,
+            copy_executed,
+            success_label="  LIVE COPY",
+            skip_label="  Live trader requested but not deployable; skipping copy mirroring",
+        )
 
 
 def _collect_closed_trade_events(container, initial_closed):
@@ -893,6 +878,9 @@ def _run_alpha_arena(container, regime_data):
     if not container.arena:
         return
     logger.info("Phase 5: Alpha Arena")
+    if is_live_trading_active(container):
+        logger.warning("  Skipping arena champion paper execution while live trading is active")
+        return
     try:
         import requests
         arena_candles = None

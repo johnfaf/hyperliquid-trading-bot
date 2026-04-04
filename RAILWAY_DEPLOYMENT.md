@@ -10,7 +10,7 @@
 
 ```bash
 cd "hyperliquid trading bot"
-git push origin main
+git push origin feature/portfolio-rotation-audit
 ```
 
 Railway auto-detects the Dockerfile and triggers a build.
@@ -44,6 +44,7 @@ HL_BOT_DB=/data/bot.db
 TRADING_CYCLE_INTERVAL=300         # 5 min (lower for more frequent trading)
 DISCOVERY_CYCLE_INTERVAL=86400     # 24h
 LOG_FORMAT=json                     # structured logs for Railway log viewer
+LIVE_TRADING_ENABLED=false          # leave false until live preflight is complete
 
 # Rotation shadow mode (recommended before live replacement execution)
 ROTATION_ENGINE_ENABLED=true
@@ -76,6 +77,7 @@ TELEGRAM_BOT_TOKEN=...     # Telegram alerts
 TELEGRAM_CHAT_ID=...       # Telegram chat for notifications
 
 # Agent-wallet-only live execution (legacy HL_PRIVATE_KEY is blocked)
+LIVE_TRADING_ENABLED=true
 HL_WALLET_MODE=agent_only
 HL_PUBLIC_ADDRESS=0x...              # Trading account (master/vault)
 SECRET_MANAGER_PROVIDER=aws_kms      # or hashicorp or none
@@ -94,6 +96,11 @@ VAULT_TOKEN=...
 VAULT_SECRET_PATH=kv/data/hyperliquid/prod
 VAULT_SECRET_KEY=hl_agent_private_key
 ```
+
+When `LIVE_TRADING_ENABLED=true`, exchange state becomes the source of truth for
+open positions and exposure checks. The paper ledger remains a reporting shadow
+and is reconciled back to exchange truth; paper-only execution paths are skipped
+so the monitored book cannot drift from deployed capital.
 
 ## 4. How Persistence Works
 

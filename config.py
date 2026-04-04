@@ -90,6 +90,9 @@ PAPER_TRADING_DEFAULT_EXECUTION_ROLE = os.environ.get(
 # Live trading wallet / secret-management controls.
 # Agent-wallet-only mode: signer key must be for a delegated agent wallet, and
 # HL_PUBLIC_ADDRESS points to the trading account (master/vault) being managed.
+LIVE_TRADING_ENABLED = os.environ.get(
+    "LIVE_TRADING_ENABLED", "false"
+).lower() in ("true", "1", "yes")
 HL_WALLET_MODE = os.environ.get("HL_WALLET_MODE", "agent_only").strip().lower()
 SECRET_MANAGER_PROVIDER = os.environ.get(
     "SECRET_MANAGER_PROVIDER", "none"
@@ -149,7 +152,7 @@ PORTFOLIO_MAX_CLUSTER_EXPOSURE_PCT = float(
     os.environ.get("PORTFOLIO_MAX_CLUSTER_EXPOSURE_PCT", 0.55)
 )
 ROTATION_ENGINE_ENABLED = os.environ.get(
-    "ROTATION_ENGINE_ENABLED", "true"
+    "ROTATION_ENGINE_ENABLED", "false"
 ).lower() in ("true", "1", "yes")
 ROTATION_DRY_RUN_TELEMETRY = os.environ.get(
     "ROTATION_DRY_RUN_TELEMETRY", "true"

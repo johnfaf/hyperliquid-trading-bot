@@ -408,6 +408,22 @@ class PortfolioRotationManager:
         key = reason_key or "dry_run_rotation_disabled"
         reasons[key] = reasons.get(key, 0) + 1
 
+    def should_bypass_reject_in_shadow_mode(
+        self,
+        decision: RotationDecision,
+        open_positions_count: int,
+    ) -> bool:
+        """
+        Shadow mode should not alter actual trading decisions when capacity exists.
+
+        If rotation telemetry-only mode is active and the book still has open
+        slots, a rotation-specific reject should not block the underlying trade.
+        """
+        return (
+            decision.action == "reject"
+            and open_positions_count < self.target_positions
+        )
+
     def get_stats(self) -> Dict:
         """Expose rotation telemetry for dashboards and reports."""
         return {
