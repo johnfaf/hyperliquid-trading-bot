@@ -556,9 +556,13 @@ class CopyTrader:
                 "entry_price": price,
                 "size": size,
                 "leverage": leverage,
+                "stop_loss": round(stop_loss, 2),
+                "take_profit": round(take_profit, 2),
                 "strategy_id": None,
+                "strategy_type": "copy_trade",
                 "confidence": signal.get("confidence", 0),
                 "trader_address": signal.get("source_trader", ""),
+                "source": "copy_trade",
                 "opened_at": datetime.utcnow().isoformat(),
                 "metadata": {
                     "type": signal["type"],

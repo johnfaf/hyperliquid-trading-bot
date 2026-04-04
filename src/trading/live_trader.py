@@ -137,10 +137,11 @@ class HyperliquidSigner:
             message = encode_structured_data(payload)
             signed_message = self.account.sign_message(message)
 
-            # Return signature components
+            # Return signature components using typed attributes
+            # (bytes.hex() has no 0x prefix, so raw slicing was off-by-2)
             return {
-                "r": signed_message.signature.hex()[:66],    # r component
-                "s": "0x" + signed_message.signature.hex()[66:130],  # s component
+                "r": hex(signed_message.r),
+                "s": hex(signed_message.s),
                 "v": signed_message.v
             }
         except Exception as e:
@@ -629,7 +630,10 @@ class LiveTrader:
             return bool(result)
         status = str(result.get("status", "")).strip().lower()
         if not status:
-            return True
+            # Hyperliquid returns {"status": "ok", "response": {...}} on success.
+            # Missing/empty status means malformed response — treat as failure.
+            logger.warning("Order result has no status field: %s", result)
+            return False
         return status in {"success", "simulated", "verified", "filled", "accepted", "ok"}
 
     def _post_order(self, action: Dict, dry_run_override: Optional[bool] = None) -> Dict:
@@ -832,17 +836,33 @@ class LiveTrader:
                     pos_coin = pos.get("coin", "")
                     pos_size = float(pos.get("szi", 0) or 0)
 
-                    if pos_coin == coin and abs(pos_size) > 0:
-                        logger.info(
-                            f"Fill VERIFIED: {coin} size={pos_size} "
-                            f"(attempt {attempt}, {time.time() - (deadline - timeout):.1f}s)"
+                    if pos_coin != coin or abs(pos_size) == 0:
+                        continue
+
+                    # Verify side matches (buy → positive szi, sell → negative)
+                    if expected_side == "buy" and pos_size < 0:
+                        continue
+                    if expected_side == "sell" and pos_size > 0:
+                        continue
+
+                    # Accept if position is at least 50% of expected (partial fills OK)
+                    if abs(pos_size) < expected_size * 0.5:
+                        logger.warning(
+                            f"Fill partial: {coin} got {abs(pos_size):.6f} "
+                            f"vs expected {expected_size:.6f}"
                         )
-                        return {
-                            "status": "verified",
-                            "coin": coin,
-                            "size": pos_size,
-                            "attempt": attempt,
-                        }
+
+                    logger.info(
+                        f"Fill VERIFIED: {coin} size={pos_size} "
+                        f"(expected={expected_size:.6f}, attempt {attempt}, "
+                        f"{time.time() - (deadline - timeout):.1f}s)"
+                    )
+                    return {
+                        "status": "verified",
+                        "coin": coin,
+                        "size": pos_size,
+                        "attempt": attempt,
+                    }
             except Exception as e:
                 logger.debug(f"Fill verification poll error: {e}")
 
@@ -924,6 +944,12 @@ class LiveTrader:
             Order result dict
         """
         side = self._normalize_order_side(side)
+
+        # Validate trigger price
+        import math
+        if not trigger_price or trigger_price <= 0 or math.isnan(trigger_price) or math.isinf(trigger_price):
+            logger.error("Invalid trigger price for %s %s: %s", coin, tp_or_sl, trigger_price)
+            return {"status": "error", "message": f"Invalid trigger price: {trigger_price}"}
 
         asset_idx = self._get_asset_index(coin)
         if asset_idx is None:
@@ -1294,6 +1320,22 @@ class LiveTrader:
 
             # 2. Calculate stop loss and take profit prices
             mid = self._get_mid_price(coin)
+            if not mid:
+                logger.error(
+                    "Cannot place SL/TP for %s: mid price unavailable. "
+                    "Position is UNPROTECTED — closing immediately.", coin
+                )
+                close_result = None
+                if not self.dry_run:
+                    close_result = self.close_position(coin)
+                return {
+                    "status": "error",
+                    "message": "mid_price_unavailable_for_sl_tp",
+                    "coin": coin,
+                    "entry_result": entry_result,
+                    "close_result": close_result,
+                }
+
             if mid:
                 if side == "buy":
                     sl_price = mid * (1 - signal.risk.stop_loss_pct)

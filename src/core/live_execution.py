@@ -154,8 +154,16 @@ def _rescale_size_for_live(trade: Dict, trader) -> Dict:
     paper_account = db.get_paper_account()
     paper_balance = float((paper_account or {}).get("balance", 0) or 0)
     live_balance = trader.get_account_value()
-    if not paper_balance or paper_balance <= 0 or not live_balance or live_balance <= 0:
+    if not paper_balance or paper_balance <= 0:
+        logger.warning("Cannot rescale: paper_balance=%s. Passing trade through unscaled.", paper_balance)
         return trade
+    if not live_balance or live_balance <= 0:
+        logger.error(
+            "Cannot rescale %s: live account balance unavailable (%s). "
+            "Blocking trade to prevent wrong sizing.",
+            trade.get("coin", "?"), live_balance,
+        )
+        return None
 
     scale = live_balance / paper_balance
     if abs(scale - 1.0) < 0.01:
@@ -195,9 +203,11 @@ def mirror_executed_trades_to_live(
             try:
                 # Rescale size from paper balance to live balance
                 scaled_trade = _rescale_size_for_live(trade, trader) if isinstance(trade, dict) else trade
+                if scaled_trade is None:
+                    continue  # blocked by rescale — already logged
                 live_signal = signal_from_execution_dict(scaled_trade) if isinstance(scaled_trade, dict) else scaled_trade
                 live_result = trader.execute_signal(live_signal)
-                if live_result:
+                if live_result and live_result.get("status") not in ("error", "rejected"):
                     logger.info(
                         "%s: %s %s %s",
                         success_label,
@@ -205,7 +215,16 @@ def mirror_executed_trades_to_live(
                         live_signal.coin,
                         live_signal.side.value,
                     )
+                else:
+                    logger.error(
+                        "%s FAILED: %s %s %s — result: %s",
+                        success_label,
+                        live_signal.coin,
+                        live_signal.side.value,
+                        live_signal.confidence,
+                        live_result,
+                    )
             except Exception as exc:
-                logger.warning("%s live execution error: %s", success_label, exc)
+                logger.error("%s live execution error: %s", success_label, exc)
     elif trader.is_live_enabled():
         logger.warning("%s", skip_label)
