@@ -181,9 +181,14 @@ def build_subsystems(
             )
 
     # Firewall — needs forecaster injected
+    # min_confidence is env-tunable via FIREWALL_MIN_CONFIDENCE (default 0.45)
+    import config as _fw_cfg
     c.firewall = _safe_init(
         "decision_firewall",
-        lambda: DecisionFirewall({"forecaster": c.predictive_forecaster}),
+        lambda: DecisionFirewall({
+            "forecaster": c.predictive_forecaster,
+            "min_confidence": getattr(_fw_cfg, "FIREWALL_MIN_CONFIDENCE", 0.45),
+        }),
         health,
     )
 

@@ -78,9 +78,13 @@ SCORING_WEIGHTS = {
 # ─── Paper Trading ─────────────────────────────────────────────
 PAPER_TRADING_INITIAL_BALANCE = 10_000  # USD
 PAPER_TRADING_MAX_POSITION_PCT = 0.08   # 8% of balance per trade (smaller = more concurrent trades)
-PAPER_TRADING_MAX_LEVERAGE = 5
-PAPER_TRADING_STOP_LOSS_PCT = 0.05      # 5%
-PAPER_TRADING_TAKE_PROFIT_PCT = 0.10    # 10%
+PAPER_TRADING_MAX_LEVERAGE = float(os.environ.get("PAPER_TRADING_MAX_LEVERAGE", 5))
+# Stop-loss is applied BEFORE leverage scaling in paper_trader.py (SL% / leverage).
+# At 5x leverage a 5% SL = 1% raw move — too tight for volatile crypto.
+# Raise this so the raw per-position SL allows normal intra-day noise:
+#   e.g. PAPER_TRADING_STOP_LOSS_PCT=0.15 at 5x → 3% raw move before exit.
+PAPER_TRADING_STOP_LOSS_PCT = float(os.environ.get("PAPER_TRADING_STOP_LOSS_PCT", 0.15))
+PAPER_TRADING_TAKE_PROFIT_PCT = float(os.environ.get("PAPER_TRADING_TAKE_PROFIT_PCT", 0.30))
 PAPER_TRADING_MAKER_FEE_BPS = float(os.environ.get("PAPER_TRADING_MAKER_FEE_BPS", 1.5))
 PAPER_TRADING_TAKER_FEE_BPS = float(os.environ.get("PAPER_TRADING_TAKER_FEE_BPS", 4.5))
 PAPER_TRADING_DEFAULT_EXECUTION_ROLE = os.environ.get(
@@ -162,13 +166,19 @@ ROTATION_REQUIRE_EXPLICIT_THRESHOLDS = os.environ.get(
     "ROTATION_REQUIRE_EXPLICIT_THRESHOLDS", "true"
 ).lower() in ("true", "1", "yes")
 
+# ─── Decision Firewall ─────────────────────────────────────────
+# Minimum signal confidence to pass the firewall.
+# 0.15 (15%) is far too permissive — nearly any signal passes.
+# Raise to 0.45+ to ensure only well-confirmed signals are traded.
+FIREWALL_MIN_CONFIDENCE = float(os.environ.get("FIREWALL_MIN_CONFIDENCE", 0.45))
+
 # ─── Scheduling ────────────────────────────────────────────────
 # 3-tier scheduling:
 #   Tier 1 — Fast cycle:   position checks, SL/TP, copy-trade scan
 #   Tier 2 — Trading cycle: regime detection, scoring, paper trading, arena
 #   Tier 3 — Discovery:     leaderboard scan, bot detection, strategy ID
 FAST_CYCLE_INTERVAL = 60           # 1 minute — position management
-TRADING_CYCLE_INTERVAL = int(os.environ.get("TRADING_CYCLE_INTERVAL", 300))   # 5 minutes — regime + trading
+TRADING_CYCLE_INTERVAL = int(os.environ.get("TRADING_CYCLE_INTERVAL", 900))   # 15 minutes — regime + trading (was 5 min, too frequent)
 DISCOVERY_CYCLE_INTERVAL = int(os.environ.get("DISCOVERY_CYCLE_INTERVAL", 86400))  # 24 hours — leaderboard scan
 # Env-overridable so you can change on Railway without redeploying code:
 #   TRADING_CYCLE_INTERVAL=180  → trade every 3 min (high vol)
