@@ -143,7 +143,7 @@ def sync_shadow_book_to_live(container) -> List[Dict]:
     return closed
 
 
-def _rescale_size_for_live(trade: Dict, trader) -> Dict:
+def _rescale_size_for_live(trade: Dict, trader) -> Optional[Dict]:
     """
     Rescale paper trade size proportionally to the live account balance.
 
@@ -155,8 +155,13 @@ def _rescale_size_for_live(trade: Dict, trader) -> Dict:
     paper_balance = float((paper_account or {}).get("balance", 0) or 0)
     live_balance = trader.get_account_value()
     if not paper_balance or paper_balance <= 0:
-        logger.warning("Cannot rescale: paper_balance=%s. Passing trade through unscaled.", paper_balance)
-        return trade
+        logger.error(
+            "Cannot rescale %s: paper account balance unavailable (%s). "
+            "Blocking trade to prevent wrong sizing.",
+            trade.get("coin", "?"),
+            paper_balance,
+        )
+        return None
     if not live_balance or live_balance <= 0:
         logger.error(
             "Cannot rescale %s: live account balance unavailable (%s). "

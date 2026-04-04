@@ -1,7 +1,9 @@
 import logging
 import os
 import sqlite3
+import sys
 import tempfile
+import types
 from contextlib import contextmanager
 from datetime import datetime, timezone
 
@@ -9,10 +11,14 @@ import config
 import main
 from src.core import boot
 from src.core.cycles.trading_cycle import _process_closed_trades
-from src.core.live_execution import get_execution_open_positions, sync_shadow_book_to_live
+from src.core.live_execution import (
+    _rescale_size_for_live,
+    get_execution_open_positions,
+    sync_shadow_book_to_live,
+)
 from src.signals.decision_firewall import DecisionFirewall
 from src.signals.signal_schema import TradeSignal, signal_from_execution_dict
-from src.trading.live_trader import LiveTrader
+from src.trading.live_trader import HyperliquidSigner, LiveTrader
 from src.trading.portfolio_rotation import PortfolioRotationManager, RotationDecision
 
 
@@ -195,6 +201,55 @@ def test_live_trader_maps_long_to_buy_and_places_sell_protection(monkeypatch):
     assert [call[4] for call in trigger_calls] == ["sl", "tp"]
 
 
+def test_live_trader_uses_verified_fill_size_for_protection(monkeypatch):
+    class FakeFirewall:
+        def validate(self, signal, **kwargs):
+            return True, "ok"
+
+    trigger_calls = []
+
+    monkeypatch.setattr(LiveTrader, "_load_credentials", _fake_live_credentials)
+    monkeypatch.setattr(LiveTrader, "_load_asset_index_map", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "reconcile_positions", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "get_firewall_positions", lambda self: [])
+    monkeypatch.setattr(LiveTrader, "get_account_value", lambda self: 2500.0)
+    monkeypatch.setattr(LiveTrader, "place_market_order", lambda self, *args, **kwargs: {"status": "success"})
+    monkeypatch.setattr(LiveTrader, "update_daily_pnl_from_fills", lambda self: None)
+    monkeypatch.setattr(
+        LiveTrader,
+        "verify_fill",
+        lambda self, *args, **kwargs: {"status": "verified", "size": 0.06, "partial_fill": True},
+    )
+    monkeypatch.setattr(LiveTrader, "_get_mid_price", lambda self, coin: 2000.0)
+    monkeypatch.setattr(
+        LiveTrader,
+        "place_trigger_order",
+        lambda self, coin, side, size, trigger_price, tp_or_sl="sl": (
+            trigger_calls.append((coin, side, size, trigger_price, tp_or_sl)) or {"status": "success"}
+        ),
+    )
+
+    trader = LiveTrader(firewall=FakeFirewall(), dry_run=False)
+    result = trader.execute_signal(
+        {
+            "coin": "ETH",
+            "side": "long",
+            "confidence": 0.8,
+            "entry_price": 2000.0,
+            "position_pct": 0.05,
+            "leverage": 2,
+            "size": 0.1,
+            "strategy_type": "momentum_long",
+        }
+    )
+
+    assert result is not None
+    assert result["status"] == "success"
+    assert abs(result["size"] - 0.06) < 1e-12
+    assert abs(result["requested_size"] - 0.1) < 1e-12
+    assert [call[2] for call in trigger_calls] == [0.06, 0.06]
+
+
 def test_live_trader_closes_position_when_protection_fails(monkeypatch):
     class FakeFirewall:
         def validate(self, signal, **kwargs):
@@ -242,6 +297,46 @@ def test_live_trader_closes_position_when_protection_fails(monkeypatch):
     assert result["status"] == "error"
     assert result["message"] == "protective_order_failed"
     assert close_calls == ["ETH"]
+
+
+def test_verify_fill_waits_for_minimum_meaningful_fill(monkeypatch):
+    class FakeFirewall:
+        def validate(self, signal, **kwargs):
+            return True, "ok"
+
+    class FakeClock:
+        def __init__(self):
+            self.current = 0.0
+
+        def time(self):
+            return self.current
+
+        def sleep(self, seconds):
+            self.current += seconds
+
+    positions = iter(
+        [
+            [{"coin": "ETH", "szi": 0.04}],
+            [{"coin": "ETH", "szi": 0.06}],
+        ]
+    )
+    clock = FakeClock()
+
+    monkeypatch.setattr(LiveTrader, "_load_credentials", _fake_live_credentials)
+    monkeypatch.setattr(LiveTrader, "_load_asset_index_map", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "reconcile_positions", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "get_positions", lambda self: next(positions))
+    monkeypatch.setattr("src.trading.live_trader.time.time", clock.time)
+    monkeypatch.setattr("src.trading.live_trader.time.sleep", clock.sleep)
+
+    trader = LiveTrader(firewall=FakeFirewall(), dry_run=False)
+    result = trader.verify_fill("ETH", "buy", 0.1, timeout=1.0, poll_interval=0.1)
+
+    assert result is not None
+    assert result["status"] == "verified"
+    assert result["partial_fill"] is True
+    assert abs(result["size"] - 0.06) < 1e-12
+    assert abs(result["position_size"] - 0.06) < 1e-12
 
 
 def test_execution_open_positions_prefer_live_state_when_deployable():
@@ -451,6 +546,81 @@ def test_positive_daily_pnl_does_not_trigger_kill_switch(monkeypatch):
 
     assert trader.check_daily_loss() is False
     assert trader.kill_switch_active is False
+
+
+def test_hyperliquid_signer_zero_pads_signature_components(monkeypatch):
+    class FakeAccount:
+        def sign_message(self, message):
+            return type("Signed", (), {"r": 0x1234, "s": 0xABCD, "v": 27})()
+
+    signer = HyperliquidSigner.__new__(HyperliquidSigner)
+    signer.account = FakeAccount()
+
+    monkeypatch.setattr("src.trading.live_trader.encode_structured_data", lambda payload: object(), raising=False)
+
+    signature = signer.sign_action({"type": "noop"}, nonce=123)
+
+    assert signature["r"].startswith("0x")
+    assert signature["s"].startswith("0x")
+    assert len(signature["r"]) == 66
+    assert len(signature["s"]) == 66
+    assert signature["r"].endswith("1234")
+    assert signature["s"].endswith("abcd")
+
+
+def test_rescale_size_for_live_blocks_when_paper_balance_missing(monkeypatch):
+    class FakeTrader:
+        def get_account_value(self):
+            return 2500.0
+
+    monkeypatch.setattr("src.core.live_execution.db.get_paper_account", lambda: {"balance": 0})
+
+    scaled = _rescale_size_for_live({"coin": "ETH", "size": 0.2}, FakeTrader())
+
+    assert scaled is None
+
+
+def test_copy_trade_preserves_precise_stops_for_low_priced_assets(monkeypatch):
+    opened = {}
+
+    def fake_open_paper_trade(**kwargs):
+        opened.update(kwargs)
+        return 321
+
+    monkeypatch.setitem(sys.modules, "numpy", types.SimpleNamespace(std=lambda values: 0.0))
+    monkeypatch.setattr("src.trading.copy_trader.db.open_paper_trade", fake_open_paper_trade)
+
+    from src.trading.copy_trader import CopyTrader
+
+    trader = CopyTrader()
+    price = 0.01234567
+    leverage = 4
+    trade = trader._open_copy_trade(
+        {"balance": 10000.0},
+        {
+            "coin": "FART",
+            "side": "long",
+            "price": price,
+            "leverage": leverage,
+            "type": "copy_trade_signal",
+            "confidence": 0.8,
+            "source_trader": "0xabc",
+        },
+        [],
+    )
+
+    expected_stop_loss = price * (1 - 0.04 / leverage)
+    expected_take_profit = price * (1 + 0.08 / leverage)
+
+    assert trade is not None
+    assert abs(opened["stop_loss"] - expected_stop_loss) < 1e-12
+    assert abs(opened["take_profit"] - expected_take_profit) < 1e-12
+    assert abs(trade["stop_loss"] - expected_stop_loss) < 1e-12
+    assert abs(trade["take_profit"] - expected_take_profit) < 1e-12
+
+    signal = signal_from_execution_dict(trade)
+    assert abs(signal.risk.stop_loss_pct - (0.04 / leverage)) < 1e-12
+    assert abs(signal.risk.take_profit_pct - (0.08 / leverage)) < 1e-12
 
 
 def test_discovery_time_persistence_round_trips_through_db_context(monkeypatch):

@@ -137,11 +137,11 @@ class HyperliquidSigner:
             message = encode_structured_data(payload)
             signed_message = self.account.sign_message(message)
 
-            # Return signature components using typed attributes
-            # (bytes.hex() has no 0x prefix, so raw slicing was off-by-2)
+            # Hyperliquid expects 32-byte hex components. Zero-pad r/s so
+            # signatures remain valid when either integer has leading zeros.
             return {
-                "r": hex(signed_message.r),
-                "s": hex(signed_message.s),
+                "r": f"0x{signed_message.r:064x}",
+                "s": f"0x{signed_message.s:064x}",
                 "v": signed_message.v
             }
         except Exception as e:
@@ -845,12 +845,16 @@ class LiveTrader:
                     if expected_side == "sell" and pos_size > 0:
                         continue
 
-                    # Accept if position is at least 50% of expected (partial fills OK)
-                    if abs(pos_size) < expected_size * 0.5:
+                    fill_size = abs(pos_size)
+                    if fill_size < expected_size * 0.5:
                         logger.warning(
                             f"Fill partial: {coin} got {abs(pos_size):.6f} "
                             f"vs expected {expected_size:.6f}"
                         )
+                        continue
+
+                    matched_size = min(fill_size, expected_size)
+                    partial_fill = matched_size < (expected_size * 0.99)
 
                     logger.info(
                         f"Fill VERIFIED: {coin} size={pos_size} "
@@ -860,7 +864,9 @@ class LiveTrader:
                     return {
                         "status": "verified",
                         "coin": coin,
-                        "size": pos_size,
+                        "size": matched_size,
+                        "position_size": pos_size,
+                        "partial_fill": partial_fill,
                         "attempt": attempt,
                     }
             except Exception as e:
@@ -1303,6 +1309,8 @@ class LiveTrader:
             # Update daily PnL after every execution to keep loss tracking current
             self.update_daily_pnl_from_fills()
 
+            actual_fill_size = size
+
             # 1b. Verify the fill actually happened before placing SL/TP
             if not self.dry_run:
                 fill_check = self.verify_fill(coin, entry_side, size, timeout=10.0)
@@ -1317,6 +1325,28 @@ class LiveTrader:
                         "coin": coin,
                         "entry_result": entry_result,
                     }
+                actual_fill_size = float(fill_check.get("size", size) or size)
+                if actual_fill_size <= 0:
+                    logger.error(
+                        "Fill verification returned invalid size for %s: %s",
+                        coin,
+                        fill_check,
+                    )
+                    close_result = self.close_position(coin)
+                    return {
+                        "status": "error",
+                        "message": "invalid_fill_size",
+                        "coin": coin,
+                        "entry_result": entry_result,
+                        "close_result": close_result,
+                    }
+                if fill_check.get("partial_fill"):
+                    logger.warning(
+                        "Partial fill accepted for %s: protecting %.6f of requested %.6f",
+                        coin,
+                        actual_fill_size,
+                        size,
+                    )
 
             # 2. Calculate stop loss and take profit prices
             mid = self._get_mid_price(coin)
@@ -1347,13 +1377,13 @@ class LiveTrader:
                 # 3. Place stop loss
                 sl_result = self.place_trigger_order(
                     coin, "sell" if side == "buy" else "buy",
-                    size, sl_price, tp_or_sl="sl"
+                    actual_fill_size, sl_price, tp_or_sl="sl"
                 )
 
                 # 4. Place take profit
                 tp_result = self.place_trigger_order(
                     coin, "sell" if side == "buy" else "buy",
-                    size, tp_price, tp_or_sl="tp"
+                    actual_fill_size, tp_price, tp_or_sl="tp"
                 )
 
                 if not self._is_order_result_success(sl_result) or not self._is_order_result_success(tp_result):
@@ -1383,7 +1413,8 @@ class LiveTrader:
                 "status": "success",
                 "coin": coin,
                 "side": signal_side,
-                "size": size,
+                "size": actual_fill_size,
+                "requested_size": size,
                 "leverage": signal.leverage,
                 "entry_result": entry_result,
                 "dry_run": self.dry_run,
