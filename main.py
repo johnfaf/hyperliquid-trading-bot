@@ -32,6 +32,16 @@ if hasattr(sys.stderr, 'reconfigure'):
     sys.stderr.reconfigure(line_buffering=True)
 
 sys.path.insert(0, os.path.dirname(__file__))
+
+# Load .env BEFORE importing config so os.environ.get() calls pick up values.
+# On Railway/Docker the vars come from the platform; load_dotenv() is a no-op
+# when variables are already set, so this is always safe to call.
+try:
+    from dotenv import load_dotenv
+    load_dotenv(override=False)
+except ImportError:
+    pass  # python-dotenv not installed; env vars must be set externally
+
 import config
 
 from src.core.boot import (
