@@ -934,7 +934,7 @@ class LiveTrader:
             "b": side.lower() == "buy",
             "p": "0",  # Trigger price is in trigger, not order price
             "s": str(round(size, 8)),
-            "r": False,
+            "r": True,  # SL/TP must be reduce_only to close the position
             "t": {
                 "trigger": {
                     "isMarket": True,

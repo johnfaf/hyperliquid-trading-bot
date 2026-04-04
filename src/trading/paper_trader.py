@@ -856,7 +856,10 @@ class PaperTrader:
                 "entry_price": slipped_price,
                 "size": signal["size"],
                 "leverage": signal["leverage"],
+                "stop_loss": signal["stop_loss"],
+                "take_profit": signal["take_profit"],
                 "strategy_id": strategy.get("id"),
+                "strategy_type": signal.get("strategy_type", ""),
                 "confidence": signal.get("confidence", 0),
                 "opened_at": datetime.utcnow().isoformat(),
                 "metadata": {

@@ -143,6 +143,42 @@ def sync_shadow_book_to_live(container) -> List[Dict]:
     return closed
 
 
+def _rescale_size_for_live(trade: Dict, trader) -> Dict:
+    """
+    Rescale paper trade size proportionally to the live account balance.
+
+    Paper sizes are computed from the paper account (default $10k).  When
+    mirroring to live, the coin quantity must be adjusted so the same
+    *percentage* of the live account is risked, not the same absolute size.
+    """
+    paper_account = db.get_paper_account()
+    paper_balance = float((paper_account or {}).get("balance", 0) or 0)
+    live_balance = trader.get_account_value()
+    if not paper_balance or paper_balance <= 0 or not live_balance or live_balance <= 0:
+        return trade
+
+    scale = live_balance / paper_balance
+    if abs(scale - 1.0) < 0.01:
+        return trade  # balances are similar, no rescaling needed
+
+    original_size = float(trade.get("size", 0) or 0)
+    if original_size <= 0:
+        return trade
+
+    trade = dict(trade)  # shallow copy to avoid mutating caller's dict
+    trade["size"] = original_size * scale
+    logger.info(
+        "Rescaled %s size for live: %.6f → %.6f (paper=$%.0f, live=$%.0f, scale=%.2f)",
+        trade.get("coin", "?"),
+        original_size,
+        trade["size"],
+        paper_balance,
+        live_balance,
+        scale,
+    )
+    return trade
+
+
 def mirror_executed_trades_to_live(
     container,
     executed: List[Dict],
@@ -157,7 +193,9 @@ def mirror_executed_trades_to_live(
     if is_live_trading_active(container):
         for trade in executed:
             try:
-                live_signal = signal_from_execution_dict(trade) if isinstance(trade, dict) else trade
+                # Rescale size from paper balance to live balance
+                scaled_trade = _rescale_size_for_live(trade, trader) if isinstance(trade, dict) else trade
+                live_signal = signal_from_execution_dict(scaled_trade) if isinstance(scaled_trade, dict) else scaled_trade
                 live_result = trader.execute_signal(live_signal)
                 if live_result:
                     logger.info(

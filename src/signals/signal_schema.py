@@ -172,13 +172,27 @@ def signal_from_execution_dict(execution: Dict[str, Any]) -> TradeSignal:
         source = SignalSource.STRATEGY
 
     side_value = str(execution.get("side", "long")).strip().lower()
+    entry_price = float(execution.get("entry_price", 0.0) or 0.0)
+
+    # Reconstruct RiskParams from absolute SL/TP prices when available.
+    # Paper trades carry stop_loss/take_profit as absolute prices; convert
+    # them back to percentages so the live trader places correct triggers.
+    risk = RiskParams()
+    sl_price = float(execution.get("stop_loss", 0.0) or 0.0)
+    tp_price = float(execution.get("take_profit", 0.0) or 0.0)
+    if entry_price > 0 and sl_price > 0:
+        risk.stop_loss_pct = abs(sl_price - entry_price) / entry_price
+    if entry_price > 0 and tp_price > 0:
+        risk.take_profit_pct = abs(tp_price - entry_price) / entry_price
+
     signal = TradeSignal(
         coin=str(execution.get("coin", "")),
         side=SignalSide(side_value or "long"),
         confidence=float(execution.get("confidence", 0.5)),
         source=source,
         reason=str(execution.get("reason", "Mirrored execution")).strip() or "Mirrored execution",
-        entry_price=float(execution.get("entry_price", 0.0) or 0.0),
+        entry_price=entry_price,
+        risk=risk,
         strategy_id=execution.get("strategy_id"),
         strategy_type=str(execution.get("strategy_type", "")),
         trader_address=str(execution.get("trader_address", execution.get("trader", ""))),
