@@ -1,11 +1,26 @@
 import logging
+import os
+import sqlite3
+import tempfile
+from contextlib import contextmanager
+from datetime import datetime, timezone
 
 import config
+import main
 from src.core import boot
+from src.core.cycles.trading_cycle import _process_closed_trades
 from src.core.live_execution import get_execution_open_positions, sync_shadow_book_to_live
+from src.signals.decision_firewall import DecisionFirewall
 from src.signals.signal_schema import TradeSignal, signal_from_execution_dict
 from src.trading.live_trader import LiveTrader
 from src.trading.portfolio_rotation import PortfolioRotationManager, RotationDecision
+
+
+def _fake_live_credentials(self):
+    self.signer = type("Signer", (), {"address": "0x1111111111111111111111111111111111111111"})()
+    self.agent_wallet_address = self.signer.address
+    self.public_address = "0x2222222222222222222222222222222222222222"
+    self.status_reason = "credentials_loaded"
 
 
 def test_shadow_mode_allows_missing_rotation_threshold_envs(monkeypatch):
@@ -97,13 +112,7 @@ def test_live_trader_coerces_execution_dict_and_uses_live_firewall_state(monkeyp
             assert kwargs["account_balance"] == 2500.0
             return True, "ok"
 
-    def fake_load_credentials(self):
-        self.signer = type("Signer", (), {"address": "0x1111111111111111111111111111111111111111"})()
-        self.agent_wallet_address = self.signer.address
-        self.public_address = "0x2222222222222222222222222222222222222222"
-        self.status_reason = "credentials_loaded"
-
-    monkeypatch.setattr(LiveTrader, "_load_credentials", fake_load_credentials)
+    monkeypatch.setattr(LiveTrader, "_load_credentials", _fake_live_credentials)
     monkeypatch.setattr(LiveTrader, "_load_asset_index_map", lambda self: None)
     monkeypatch.setattr(LiveTrader, "reconcile_positions", lambda self: None)
     monkeypatch.setattr(LiveTrader, "get_firewall_positions", lambda self: [
@@ -134,6 +143,107 @@ def test_live_trader_coerces_execution_dict_and_uses_live_firewall_state(monkeyp
     assert result["status"] == "success"
 
 
+def test_live_trader_maps_long_to_buy_and_places_sell_protection(monkeypatch):
+    class FakeFirewall:
+        def validate(self, signal, **kwargs):
+            return True, "ok"
+
+    entry_calls = []
+    trigger_calls = []
+
+    monkeypatch.setattr(LiveTrader, "_load_credentials", _fake_live_credentials)
+    monkeypatch.setattr(LiveTrader, "_load_asset_index_map", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "reconcile_positions", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "get_firewall_positions", lambda self: [])
+    monkeypatch.setattr(LiveTrader, "get_account_value", lambda self: 2500.0)
+    monkeypatch.setattr(
+        LiveTrader,
+        "place_market_order",
+        lambda self, coin, side, size, leverage=1, reduce_only=False: (
+            entry_calls.append((coin, side, size, reduce_only)) or {"status": "success"}
+        ),
+    )
+    monkeypatch.setattr(LiveTrader, "update_daily_pnl_from_fills", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "verify_fill", lambda self, *args, **kwargs: {"status": "verified"})
+    monkeypatch.setattr(LiveTrader, "_get_mid_price", lambda self, coin: 2000.0)
+    monkeypatch.setattr(
+        LiveTrader,
+        "place_trigger_order",
+        lambda self, coin, side, size, trigger_price, tp_or_sl="sl": (
+            trigger_calls.append((coin, side, size, trigger_price, tp_or_sl)) or {"status": "success"}
+        ),
+    )
+
+    trader = LiveTrader(firewall=FakeFirewall(), dry_run=False)
+    result = trader.execute_signal(
+        {
+            "coin": "ETH",
+            "side": "long",
+            "confidence": 0.8,
+            "entry_price": 2000.0,
+            "position_pct": 0.05,
+            "leverage": 2,
+            "size": 0.1,
+            "strategy_type": "momentum_long",
+        }
+    )
+
+    assert result is not None
+    assert result["status"] == "success"
+    assert entry_calls == [("ETH", "buy", 0.1, False)]
+    assert [call[1] for call in trigger_calls] == ["sell", "sell"]
+    assert [call[4] for call in trigger_calls] == ["sl", "tp"]
+
+
+def test_live_trader_closes_position_when_protection_fails(monkeypatch):
+    class FakeFirewall:
+        def validate(self, signal, **kwargs):
+            return True, "ok"
+
+    trigger_results = iter(
+        [
+            {"status": "success"},
+            {"status": "error", "message": "tp rejected"},
+        ]
+    )
+    close_calls = []
+
+    monkeypatch.setattr(LiveTrader, "_load_credentials", _fake_live_credentials)
+    monkeypatch.setattr(LiveTrader, "_load_asset_index_map", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "reconcile_positions", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "get_firewall_positions", lambda self: [])
+    monkeypatch.setattr(LiveTrader, "get_account_value", lambda self: 2500.0)
+    monkeypatch.setattr(LiveTrader, "place_market_order", lambda self, *args, **kwargs: {"status": "success"})
+    monkeypatch.setattr(LiveTrader, "update_daily_pnl_from_fills", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "verify_fill", lambda self, *args, **kwargs: {"status": "verified"})
+    monkeypatch.setattr(LiveTrader, "_get_mid_price", lambda self, coin: 2000.0)
+    monkeypatch.setattr(LiveTrader, "place_trigger_order", lambda self, *args, **kwargs: next(trigger_results))
+    monkeypatch.setattr(
+        LiveTrader,
+        "close_position",
+        lambda self, coin: close_calls.append(coin) or {"status": "success", "coin": coin},
+    )
+
+    trader = LiveTrader(firewall=FakeFirewall(), dry_run=False)
+    result = trader.execute_signal(
+        {
+            "coin": "ETH",
+            "side": "short",
+            "confidence": 0.75,
+            "entry_price": 2000.0,
+            "position_pct": 0.05,
+            "leverage": 2,
+            "size": 0.1,
+            "strategy_type": "momentum_short",
+        }
+    )
+
+    assert result is not None
+    assert result["status"] == "error"
+    assert result["message"] == "protective_order_failed"
+    assert close_calls == ["ETH"]
+
+
 def test_execution_open_positions_prefer_live_state_when_deployable():
     class FakeLiveTrader:
         def is_live_enabled(self):
@@ -151,6 +261,7 @@ def test_execution_open_positions_prefer_live_state_when_deployable():
 
 
 def test_sync_shadow_book_closes_paper_trade_when_live_position_missing(monkeypatch):
+    metadata_updates = []
     closed = []
 
     class FakeLiveTrader:
@@ -163,15 +274,10 @@ def test_sync_shadow_book_closes_paper_trade_when_live_position_missing(monkeypa
         def get_positions(self):
             return []
 
-    class FakePaperTrader:
-        def _close_trade(self, trade, current_price, close_reason):
-            closed.append((trade["coin"], current_price, close_reason))
-            return {"trade_id": trade["id"], "coin": trade["coin"], "reason": close_reason}
-
     container = type(
         "Container",
         (),
-        {"live_trader": FakeLiveTrader(), "paper_trader": FakePaperTrader()},
+        {"live_trader": FakeLiveTrader(), "paper_trader": object()},
     )()
 
     monkeypatch.setattr(
@@ -182,7 +288,199 @@ def test_sync_shadow_book_closes_paper_trade_when_live_position_missing(monkeypa
         "src.core.live_execution.get_all_mids",
         lambda: {"ETH": 2100.0},
     )
+    monkeypatch.setattr(
+        "src.core.live_execution.db.update_paper_trade_metadata",
+        lambda trade_id, meta: metadata_updates.append((trade_id, meta)),
+    )
+    monkeypatch.setattr(
+        "src.core.live_execution.db.close_paper_trade",
+        lambda trade_id, exit_price, pnl: closed.append((trade_id, exit_price, pnl)) or True,
+    )
 
     reconciled = sync_shadow_book_to_live(container)
-    assert reconciled == [{"trade_id": 7, "coin": "ETH", "reason": "live_reconciled_closed"}]
-    assert closed == [("ETH", 2100.0, "live_reconciled_closed")]
+    assert len(reconciled) == 1
+    assert reconciled[0]["trade_id"] == 7
+    assert reconciled[0]["coin"] == "ETH"
+    assert reconciled[0]["reason"] == "live_reconciled_closed"
+    assert reconciled[0]["pnl"] == 0.0
+    assert closed == [(7, 2100.0, 0.0)]
+    assert metadata_updates[0][0] == 7
+    assert metadata_updates[0][1]["synthetic_reconciliation"] is True
+    assert metadata_updates[0][1]["reconciliation_reason"] == "live_reconciled_closed"
+
+
+def test_process_closed_trades_skips_synthetic_reconciliation():
+    class FakeArena:
+        def __init__(self):
+            self.calls = []
+
+        def record_trade_for_strategy(self, *args):
+            self.calls.append(args)
+
+    class FakeKelly:
+        def __init__(self):
+            self.calls = []
+
+        def record_outcome(self, **kwargs):
+            self.calls.append(kwargs)
+
+    class FakeAgentScorer:
+        def __init__(self):
+            self.calls = []
+
+        def record_outcome(self, *args):
+            self.calls.append(args)
+
+    container = type(
+        "Container",
+        (),
+        {
+            "arena": FakeArena(),
+            "kelly_sizer": FakeKelly(),
+            "agent_scorer": FakeAgentScorer(),
+            "shadow_tracker": None,
+        },
+    )()
+
+    _process_closed_trades(
+        container,
+        [
+            {
+                "trade_id": 7,
+                "coin": "ETH",
+                "side": "long",
+                "entry_price": 2000.0,
+                "exit_price": 2100.0,
+                "size": 0.1,
+                "leverage": 2,
+                "pnl": 0.0,
+                "strategy_type": "momentum_long",
+                "reason": "live_reconciled_closed",
+                "metadata": {"synthetic_reconciliation": True},
+            }
+        ],
+    )
+
+    assert container.arena.calls == []
+    assert container.kelly_sizer.calls == []
+    assert container.agent_scorer.calls == []
+
+
+def test_firewall_uses_explicit_live_positions_without_falling_back(monkeypatch):
+    monkeypatch.setattr(
+        "src.signals.decision_firewall.db.get_open_paper_trades",
+        lambda: [{"coin": "BTC"}] * 10,
+    )
+    monkeypatch.setattr(
+        "src.signals.decision_firewall.db.audit_log",
+        lambda **kwargs: None,
+    )
+
+    firewall = DecisionFirewall(
+        {
+            "max_positions": 1,
+            "funding_risk_enabled": False,
+            "enable_predictive_derisk": False,
+        }
+    )
+    signal = signal_from_execution_dict(
+        {
+            "coin": "ETH",
+            "side": "long",
+            "confidence": 0.8,
+            "entry_price": 2000.0,
+            "position_pct": 0.05,
+            "leverage": 2,
+            "size": 0.1,
+        }
+    )
+
+    passed, reason = firewall.validate(signal, open_positions=[], account_balance=5000.0)
+
+    assert passed is True
+    assert reason == "approved"
+
+
+def test_firewall_daily_drawdown_uses_provided_account_balance(monkeypatch):
+    monkeypatch.setattr(
+        "src.signals.decision_firewall.db.audit_log",
+        lambda **kwargs: None,
+    )
+
+    firewall = DecisionFirewall(
+        {
+            "daily_loss_limit_pct": 0.03,
+            "funding_risk_enabled": False,
+            "enable_predictive_derisk": False,
+        }
+    )
+    firewall._daily_reset_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    firewall.set_daily_losses(40.0)
+    signal = signal_from_execution_dict(
+        {
+            "coin": "ETH",
+            "side": "long",
+            "confidence": 0.8,
+            "entry_price": 2000.0,
+            "position_pct": 0.05,
+            "leverage": 2,
+            "size": 0.1,
+        }
+    )
+
+    passed, reason = firewall.validate(signal, open_positions=[], account_balance=1000.0)
+
+    assert passed is False
+    assert "Daily loss limit hit" in reason
+
+
+def test_positive_daily_pnl_does_not_trigger_kill_switch(monkeypatch):
+    monkeypatch.setattr(LiveTrader, "_load_credentials", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "_load_asset_index_map", lambda self: None)
+
+    trader = LiveTrader(
+        firewall=DecisionFirewall(
+            {
+                "funding_risk_enabled": False,
+                "enable_predictive_derisk": False,
+            }
+        ),
+        dry_run=True,
+    )
+    trader.daily_pnl = 125.0
+
+    assert trader.check_daily_loss() is False
+    assert trader.kill_switch_active is False
+
+
+def test_discovery_time_persistence_round_trips_through_db_context(monkeypatch):
+    fd, raw_path = tempfile.mkstemp(prefix="bot_state_", suffix=".db", dir=os.getcwd())
+    os.close(fd)
+    db_path = os.path.abspath(raw_path)
+
+    @contextmanager
+    def fake_get_connection():
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        try:
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    monkeypatch.setattr(main.db, "get_connection", fake_get_connection)
+
+    try:
+        bot = main.HyperliquidResearchBot.__new__(main.HyperliquidResearchBot)
+        bot._last_discovery = 12345.67
+
+        bot._save_last_discovery_time()
+        restored = bot._restore_last_discovery_time()
+
+        assert restored == 12345.67
+    finally:
+        if os.path.exists(db_path):
+            os.remove(db_path)

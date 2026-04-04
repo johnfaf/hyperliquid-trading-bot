@@ -59,6 +59,7 @@ class DecisionFirewall:
         # Lowered from 300 → 60: 5-minute cooldown was blocking re-entries
         # during paper trading when signals fire frequently on the same coin.
         self.cooldown_seconds = cfg.get("cooldown_seconds", 60)
+        self.daily_loss_limit_pct = cfg.get("daily_loss_limit_pct", 0.03)
 
         # Portfolio-level aggregate exposure limit
         # With 2000 traders scanned and golden wallets auto-connected,
@@ -188,7 +189,7 @@ class DecisionFirewall:
             logger.info(f"Clamped leverage to {self.max_leverage}x for {signal.coin}")
 
         # 4. Position limits
-        positions = open_positions or db.get_open_paper_trades()
+        positions = open_positions if open_positions is not None else db.get_open_paper_trades()
         if not ignore_position_limit and len(positions) >= self.max_positions:
             return _reject("rejected_risk",
                           f"Max positions reached ({len(positions)}/{self.max_positions})")
@@ -266,12 +267,15 @@ class DecisionFirewall:
 
         # 10. Daily drawdown circuit breaker
         self._check_daily_reset()
-        account = db.get_paper_account()
-        if account:
-            balance = account.get("balance", 10000)
-            if self._daily_losses / balance > 0.03:  # 3% daily loss limit
+        drawdown_balance = account_balance
+        if drawdown_balance is None:
+            account = db.get_paper_account()
+            drawdown_balance = account.get("balance", 10000) if account else None
+        if drawdown_balance:
+            if self._daily_losses / drawdown_balance > self.daily_loss_limit_pct:
                 return _reject("rejected_drawdown",
-                              f"Daily loss limit hit ({self._daily_losses / balance:.1%} > 3%)")
+                              f"Daily loss limit hit ({self._daily_losses / drawdown_balance:.1%} > "
+                              f"{self.daily_loss_limit_pct:.0%})")
 
         # 11. Funding rate risk check
         #     Block new longs when funding is deeply negative (longs pay shorts heavily)
@@ -377,6 +381,11 @@ class DecisionFirewall:
             if pnl < 0:
                 self._daily_losses += abs(pnl)
 
+    def set_daily_losses(self, loss_amount: float):
+        """Set the current day's realized loss snapshot directly."""
+        with self._lock:
+            self._daily_losses = max(float(loss_amount or 0.0), 0.0)
+
     def _get_funding_rate(self, coin: str) -> float:
         """
         Fetch current funding rate from Hyperliquid (cached).
@@ -422,6 +431,7 @@ class DecisionFirewall:
         return {
             **self.stats,
             "pass_rate": self.stats["passed"] / total if total > 0 else 0,
+            "daily_losses": round(self._daily_losses, 2),
             "top_rejection_reason": max(
                 [(k, v) for k, v in self.stats.items() if k.startswith("rejected_")],
                 key=lambda x: x[1], default=("none", 0)

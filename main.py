@@ -147,29 +147,29 @@ class HyperliquidResearchBot:
 
     def _save_last_discovery_time(self):
         try:
-            conn = db.get_connection()
-            conn.execute(
-                "INSERT OR REPLACE INTO bot_state (key, value) VALUES (?, ?)",
-                ("last_discovery_ts", str(self._last_discovery)),
-            )
-            conn.commit()
-            conn.close()
+            with db.get_connection() as conn:
+                conn.execute(
+                    "CREATE TABLE IF NOT EXISTS bot_state "
+                    "(key TEXT PRIMARY KEY, value TEXT)"
+                )
+                conn.execute(
+                    "INSERT OR REPLACE INTO bot_state (key, value) VALUES (?, ?)",
+                    ("last_discovery_ts", str(self._last_discovery)),
+                )
         except Exception:
             pass
 
     def _restore_last_discovery_time(self) -> float:
         try:
-            conn = db.get_connection()
-            conn.execute(
-                "CREATE TABLE IF NOT EXISTS bot_state "
-                "(key TEXT PRIMARY KEY, value TEXT)"
-            )
-            conn.commit()
-            row = conn.execute(
-                "SELECT value FROM bot_state WHERE key = ?",
-                ("last_discovery_ts",),
-            ).fetchone()
-            conn.close()
+            with db.get_connection() as conn:
+                conn.execute(
+                    "CREATE TABLE IF NOT EXISTS bot_state "
+                    "(key TEXT PRIMARY KEY, value TEXT)"
+                )
+                row = conn.execute(
+                    "SELECT value FROM bot_state WHERE key = ?",
+                    ("last_discovery_ts",),
+                ).fetchone()
             return float(row["value"]) if row else 0.0
         except Exception:
             return 0.0

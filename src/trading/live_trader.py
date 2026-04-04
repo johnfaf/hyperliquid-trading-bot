@@ -417,7 +417,7 @@ class LiveTrader:
         """
         self._check_daily_reset()
 
-        if abs(self.daily_pnl) > self.max_daily_loss:
+        if self.daily_pnl < -self.max_daily_loss:
             logger.warning(f"⚠️  Daily loss limit exceeded: ${abs(self.daily_pnl):.2f} > ${self.max_daily_loss:.2f}")
             self.kill_switch_active = True
             return True
@@ -524,9 +524,10 @@ class LiveTrader:
             if abs(self.daily_pnl) > 0 and abs(self.daily_pnl - old_pnl) > 0.01:
                 logger.info(f"Daily PnL updated: ${self.daily_pnl:+,.2f}")
 
-            # Also update the firewall's daily loss tracker
-            if self.daily_pnl < 0:
-                self.firewall.record_trade_outcome("_portfolio", self.daily_pnl)
+            # Keep the firewall on the same realized-loss snapshot instead of
+            # re-adding the full day's losses on every refresh.
+            if hasattr(self.firewall, "set_daily_losses"):
+                self.firewall.set_daily_losses(abs(min(self.daily_pnl, 0.0)))
 
             # Check if kill switch should trigger
             self.check_daily_loss()
@@ -603,10 +604,33 @@ class LiveTrader:
         Returns:
             Adjusted price
         """
-        if side.lower() == "buy":
+        normalized_side = self._normalize_order_side(side)
+        if normalized_side == "buy":
             return mid_price * (1 + slippage_pct)
         else:
             return mid_price * (1 - slippage_pct)
+
+    @staticmethod
+    def _normalize_order_side(side: str) -> str:
+        """Normalize long/short or buy/sell inputs to buy/sell."""
+        value = str(side or "").strip().lower()
+        if value in {"buy", "long"}:
+            return "buy"
+        if value in {"sell", "short"}:
+            return "sell"
+        raise ValueError(f"Unsupported order side: {side}")
+
+    @staticmethod
+    def _is_order_result_success(result: Optional[Dict]) -> bool:
+        """Best-effort classification of exchange responses into success/failure."""
+        if not result:
+            return False
+        if not isinstance(result, dict):
+            return bool(result)
+        status = str(result.get("status", "")).strip().lower()
+        if not status:
+            return True
+        return status in {"success", "simulated", "verified", "filled", "accepted", "ok"}
 
     def _post_order(self, action: Dict, dry_run_override: Optional[bool] = None) -> Dict:
         """
@@ -719,6 +743,8 @@ class LiveTrader:
         Returns:
             Order result dict
         """
+        side = self._normalize_order_side(side)
+
         # Check kill switch
         if self.kill_switch_active:
             logger.warning(f"Kill switch active - rejecting market order {coin} {side}")
@@ -772,7 +798,7 @@ class LiveTrader:
         logger.info(f"Placing market order: {coin} {side} {size} @ ${price:.2f} (notional: ${notional:.2f})")
         result = self._post_order(action)
 
-        if result.get("status") != "error" and not self.dry_run:
+        if self._is_order_result_success(result) and not self.dry_run:
             self.orders_today += 1
 
         return result
@@ -843,6 +869,8 @@ class LiveTrader:
         Returns:
             Order result dict
         """
+        side = self._normalize_order_side(side)
+
         if self.kill_switch_active:
             logger.warning(f"Kill switch active - rejecting limit order {coin}")
             return {"status": "rejected", "reason": "kill_switch_active"}
@@ -875,7 +903,7 @@ class LiveTrader:
         logger.info(f"Placing limit order: {coin} {side} {size} @ ${price:.2f}")
         result = self._post_order(action)
 
-        if result.get("status") != "error" and not self.dry_run:
+        if self._is_order_result_success(result) and not self.dry_run:
             self.orders_today += 1
 
         return result
@@ -895,6 +923,8 @@ class LiveTrader:
         Returns:
             Order result dict
         """
+        side = self._normalize_order_side(side)
+
         asset_idx = self._get_asset_index(coin)
         if asset_idx is None:
             return {"status": "error", "message": f"Unknown coin: {coin}"}
@@ -1201,7 +1231,9 @@ class LiveTrader:
         # fallback `position_pct * effective_size` = `position_pct²` which produced
         # micro-orders (~0.48% of intended size) silently posted to the exchange.
         coin = signal.coin
-        side = signal.side.value.lower()
+        signal_side = signal.side.value.lower()
+        entry_side = self._normalize_order_side(signal_side)
+        side = entry_side
 
         if not (signal.size and signal.size > 0):
             # Compute coin quantity from USD notional: position_pct × max_position_size / mid
@@ -1227,18 +1259,18 @@ class LiveTrader:
                 logger.warning(f"Calculated size is 0 or negative for {coin} — skipping")
                 return None
 
-            logger.info(f"Executing signal: {coin} {side} {size:.4f} "
+            logger.info(f"Executing signal: {coin} {signal_side} {size:.4f} "
                        f"(confidence={signal.confidence:.0%}, "
                        f"leverage={signal.leverage}x)")
 
             # 1. Place market entry
             entry_result = self.place_market_order(
-                coin, side, size,
+                coin, entry_side, size,
                 leverage=signal.leverage,
                 reduce_only=False
             )
 
-            if entry_result.get("status") == "error":
+            if not self._is_order_result_success(entry_result):
                 logger.error(f"Failed to place entry order: {entry_result}")
                 return entry_result
 
@@ -1247,7 +1279,7 @@ class LiveTrader:
 
             # 1b. Verify the fill actually happened before placing SL/TP
             if not self.dry_run:
-                fill_check = self.verify_fill(coin, side, size, timeout=10.0)
+                fill_check = self.verify_fill(coin, entry_side, size, timeout=10.0)
                 if not fill_check:
                     logger.error(
                         f"FILL NOT VERIFIED for {coin} {side} {size} — "
@@ -1282,13 +1314,33 @@ class LiveTrader:
                     size, tp_price, tp_or_sl="tp"
                 )
 
+                if not self._is_order_result_success(sl_result) or not self._is_order_result_success(tp_result):
+                    logger.error(
+                        "Protective order placement failed for %s: sl=%s tp=%s",
+                        coin,
+                        sl_result,
+                        tp_result,
+                    )
+                    close_result = None
+                    if not self.dry_run:
+                        close_result = self.close_position(coin)
+                    return {
+                        "status": "error",
+                        "message": "protective_order_failed",
+                        "coin": coin,
+                        "entry_result": entry_result,
+                        "stop_loss_result": sl_result,
+                        "take_profit_result": tp_result,
+                        "close_result": close_result,
+                    }
+
                 logger.info(f"Placed SL @ ${sl_price:.2f}, TP @ ${tp_price:.2f}")
 
             # Return summary
             return {
                 "status": "success",
                 "coin": coin,
-                "side": side,
+                "side": signal_side,
                 "size": size,
                 "leverage": signal.leverage,
                 "entry_result": entry_result,

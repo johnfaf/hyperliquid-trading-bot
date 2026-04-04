@@ -6,6 +6,7 @@ live trading is actually enabled and deployable.
 """
 from __future__ import annotations
 
+import json
 import logging
 from typing import Dict, List, Optional
 
@@ -92,18 +93,52 @@ def sync_shadow_book_to_live(container) -> List[Dict]:
         if current_price <= 0:
             continue
 
-        closed_trade = container.paper_trader._close_trade(
-            trade,
-            current_price=current_price,
-            close_reason="live_reconciled_closed",
+        trade_id = trade.get("id")
+        if trade_id is None:
+            continue
+
+        try:
+            existing_meta = trade.get("metadata", {})
+            if isinstance(existing_meta, str):
+                existing_meta = json.loads(existing_meta or "{}")
+            existing_meta = dict(existing_meta or {})
+        except Exception:
+            existing_meta = {}
+
+        existing_meta.update({
+            "synthetic_reconciliation": True,
+            "reconciliation_reason": "live_reconciled_closed",
+            "reconciliation_exit_price": current_price,
+        })
+        db.update_paper_trade_metadata(trade_id, existing_meta)
+        if not db.close_paper_trade(trade_id, current_price, 0.0):
+            continue
+
+        closed_trade = {
+            "trade_id": trade_id,
+            "entry_price": trade.get("entry_price", 0),
+            "size": trade.get("size", 0),
+            "leverage": trade.get("leverage", 1),
+            "coin": trade.get("coin", ""),
+            "side": trade.get("side", ""),
+            "pnl": 0.0,
+            "gross_pnl": 0.0,
+            "fees_paid": 0.0,
+            "slippage_cost": 0.0,
+            "reason": "live_reconciled_closed",
+            "strategy_type": existing_meta.get("strategy_type", "unknown"),
+            "signal_id": existing_meta.get("signal_id", ""),
+            "exit_price": current_price,
+            "metadata": existing_meta,
+            "opened_at": trade.get("opened_at", ""),
+            "closed_at": trade.get("closed_at", ""),
+        }
+        closed.append(closed_trade)
+        logger.info(
+            "Shadow paper trade reconciled to exchange truth: %s %s",
+            trade.get("side", "?").upper(),
+            trade.get("coin", "?"),
         )
-        if closed_trade:
-            closed.append(closed_trade)
-            logger.info(
-                "Shadow paper trade reconciled to exchange truth: %s %s",
-                trade.get("side", "?").upper(),
-                trade.get("coin", "?"),
-            )
 
     return closed
 

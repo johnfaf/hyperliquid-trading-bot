@@ -824,6 +824,9 @@ def _process_closed_trades(container, closed):
     """Phase 4c: feed outcomes to arena, agent scorer, shadow tracker, AND Kelly sizer."""
     for c_trade in closed:
         try:
+            meta = c_trade.get("metadata") or {}
+            if meta.get("synthetic_reconciliation") or c_trade.get("reason") == "live_reconciled_closed":
+                continue
             stype = c_trade.get("strategy_type", "unknown")
             pnl = c_trade.get("pnl", 0)
             entry = c_trade.get("entry_price", 1)
@@ -841,7 +844,6 @@ def _process_closed_trades(container, closed):
             if container.kelly_sizer:
                 try:
                     # Use strategy_type as key; copy trades get source-specific key
-                    meta = c_trade.get("metadata") or {}
                     source = meta.get("source", "")
                     if source == "copy_trade":
                         kelly_key = f"copy_trade:{c_trade.get('trader_address', 'unknown')}"

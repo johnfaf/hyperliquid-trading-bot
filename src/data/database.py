@@ -150,6 +150,11 @@ def init_db():
             strategies_updated INTEGER DEFAULT 0
         );
 
+        CREATE TABLE IF NOT EXISTS bot_state (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        );
+
         -- Immutable audit trail: every trading action is logged here.
         -- INSERT-only table — rows are NEVER updated or deleted.
         -- Used for forensic analysis, compliance, and debugging.
