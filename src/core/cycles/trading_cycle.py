@@ -641,7 +641,7 @@ def _execute_lcrs_signals(container, lcrs_signals, regime_data):
         from src.signals.signal_schema import TradeSignal, SignalSide, SignalSource, RiskParams
         lcrs_executed = []
         open_trades = get_execution_open_positions(container)
-        account = db.get_paper_account()
+        account = None
 
         for sig in lcrs_signals:
             try:
@@ -697,32 +697,35 @@ def _execute_lcrs_signals(container, lcrs_signals, regime_data):
                             )
                     continue
 
-                if account:
-                    size_usd = account["balance"] * trade_signal.effective_size
-                    size = size_usd / sig["price"]
-                    trade_id = db.open_paper_trade(
-                        strategy_id=None, coin=sig["coin"], side=sig["side"],
-                        entry_price=sig["price"], size=size, leverage=sig["leverage"],
-                        stop_loss=sig["stop_loss"], take_profit=sig["take_profit"],
-                        metadata={
-                            "source": "liquidation_strategy",
-                            "strategy_type": "liquidation_reversal",
-                            "confidence": trade_signal.confidence,
-                            "setup_type": sig["features"].get("setup_type", ""),
-                            "features": sig["features"],
-                        },
+                if account is None:
+                    account = db.get_paper_account()
+                if not account:
+                    continue
+                size_usd = account["balance"] * trade_signal.effective_size
+                size = size_usd / sig["price"]
+                trade_id = db.open_paper_trade(
+                    strategy_id=None, coin=sig["coin"], side=sig["side"],
+                    entry_price=sig["price"], size=size, leverage=sig["leverage"],
+                    stop_loss=sig["stop_loss"], take_profit=sig["take_profit"],
+                    metadata={
+                        "source": "liquidation_strategy",
+                        "strategy_type": "liquidation_reversal",
+                        "confidence": trade_signal.confidence,
+                        "setup_type": sig["features"].get("setup_type", ""),
+                        "features": sig["features"],
+                    },
+                )
+                lcrs_executed.append({"id": trade_id, "coin": sig["coin"], "side": sig["side"]})
+                logger.info(
+                    "  LCRS executed: %s %s @ $%s (conf=%s)",
+                    sig["side"].upper(), sig["coin"],
+                    f"{sig['price']:,.2f}", f"{trade_signal.confidence:.0%}",
+                )
+                if tg.is_configured():
+                    tg.notify_trade_opened(
+                        {"coin": sig["coin"], "side": sig["side"], "entry_price": sig["price"]},
+                        source="liquidation_strategy",
                     )
-                    lcrs_executed.append({"id": trade_id, "coin": sig["coin"], "side": sig["side"]})
-                    logger.info(
-                        "  LCRS executed: %s %s @ $%s (conf=%s)",
-                        sig["side"].upper(), sig["coin"],
-                        f"{sig['price']:,.2f}", f"{trade_signal.confidence:.0%}",
-                    )
-                    if tg.is_configured():
-                        tg.notify_trade_opened(
-                            {"coin": sig["coin"], "side": sig["side"], "entry_price": sig["price"]},
-                            source="liquidation_strategy",
-                        )
             except Exception as exc:
                 logger.debug("  LCRS execution error %s: %s", sig.get("coin"), exc)
 
@@ -982,7 +985,7 @@ def _run_alpha_arena(container, regime_data):
                 )
                 if champion_signals:
                     logger.info("  Arena champions: %d signals", len(champion_signals))
-                    account = db.get_paper_account()
+                    account = None
                     for sig in champion_signals:
                         try:
                             price = sig.get("price", 0)
@@ -1008,6 +1011,8 @@ def _run_alpha_arena(container, regime_data):
                                 )
                                 _execute_signal_live(container, live_signal, "ARENA")
                                 continue
+                            if account is None:
+                                account = db.get_paper_account()
                             if account:
                                 size_usd = account["balance"] * 0.05 * conf
                                 size = size_usd / price

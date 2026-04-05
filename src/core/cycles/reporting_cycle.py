@@ -8,7 +8,6 @@ Extracted from the tail end of ``_run_trading_cycle`` so the trading
 module focuses purely on signal generation and execution.
 """
 import logging
-import time
 
 import config
 from src.data.database import backup_to_json

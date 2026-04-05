@@ -31,7 +31,9 @@ try:
 except ImportError:
     HAS_WEBSOCKET = False
 
-import sys, os
+import os
+import sys
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import config
 
@@ -309,7 +311,7 @@ class HyperliquidWebSocket:
         if self._ws:
             try:
                 self._ws.close()
-            except:
+            except Exception:
                 pass
 
     def subscribe_coin(self, coin: str):
