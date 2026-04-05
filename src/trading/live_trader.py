@@ -353,20 +353,65 @@ class LiveTrader:
             return {}
 
     def get_account_value(self) -> Optional[float]:
-        """Best-effort extraction of live account value from clearinghouse state."""
+        """
+        Best-effort extraction of live account value.
+
+        Checks perps margin first (clearinghouseState), then spot wallet
+        (spotClearinghouseState).  If USDC is in spot but not perps,
+        logs a clear message telling the operator to transfer.
+        """
         state = self.get_account_state()
         candidates = [
             state.get("marginSummary", {}).get("accountValue"),
             state.get("crossMarginSummary", {}).get("accountValue"),
             state.get("accountValue"),
         ]
+        perps_value = None
         for value in candidates:
             try:
                 if value is not None:
-                    return float(value)
+                    perps_value = float(value)
+                    break
             except (TypeError, ValueError):
                 continue
-        return None
+
+        if perps_value and perps_value > 0:
+            return perps_value
+
+        # Perps margin is $0 or unavailable — check spot wallet
+        spot_usdc = self._get_spot_usdc_balance()
+        if spot_usdc is not None and spot_usdc > 0:
+            logger.warning(
+                "Perps margin is $0 but spot wallet has $%.2f USDC. "
+                "Transfer USDC from Spot to Perps in the Hyperliquid UI "
+                "(Portfolio → Transfer → Spot to Perps) to enable live trading.",
+                spot_usdc,
+            )
+            # Return 0.0 (not None) — the account exists, it's just unfunded for perps
+            return 0.0
+
+        # Both are empty/failed
+        return perps_value  # 0.0 or None
+
+    def _get_spot_usdc_balance(self) -> Optional[float]:
+        """Fetch USDC balance from the spot wallet."""
+        if not self.public_address:
+            return None
+        try:
+            response = requests.post(
+                self.info_url,
+                json={"type": "spotClearinghouseState", "user": self.public_address},
+                timeout=10,
+            )
+            response.raise_for_status()
+            data = response.json()
+            for bal in data.get("balances", []):
+                if bal.get("coin") == "USDC":
+                    return float(bal.get("total", 0) or 0)
+            return 0.0
+        except Exception as e:
+            logger.debug("Error checking spot balance: %s", e)
+            return None
 
     def _normalize_position(self, pos: Dict[str, Any]) -> Dict[str, Any]:
         """Flatten Hyperliquid position payload into a consistent dict shape."""

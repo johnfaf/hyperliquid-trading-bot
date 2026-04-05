@@ -65,13 +65,25 @@ def sync_shadow_book_to_live(container) -> List[Dict]:
 
     In live mode, exchange state is the authority. This keeps the paper book as
     a reporting shadow instead of letting it drive runtime decisions.
+
+    SAFETY: If the live account has $0 perps margin, skip reconciliation
+    entirely.  Otherwise we'd close every paper trade because the exchange
+    shows 0 positions (the money is in spot or hasn't been deposited).
     """
     if not is_live_trading_active(container) or not getattr(container, "paper_trader", None):
         return []
 
+    # Guard: don't reconcile paper trades against an unfunded exchange account.
+    # With $0 perps margin the exchange will always show 0 positions, which
+    # would cause this function to close EVERY paper trade immediately.
+    trader = get_live_trader(container)
+    account_value = trader.get_account_value() if trader else None
+    if account_value is None or account_value <= 0:
+        return []
+
     live_positions = {
         pos.get("coin", ""): pos
-        for pos in (get_live_trader(container).get_positions() or [])
+        for pos in (trader.get_positions() or [])
         if pos.get("coin") and abs(float(pos.get("szi", pos.get("size", 0)) or 0)) > 0
     }
     open_trades = db.get_open_paper_trades()
@@ -171,8 +183,9 @@ def _rescale_size_for_live(trade: Dict, trader) -> Optional[Dict]:
         return None
     if live_balance <= 0:
         logger.warning(
-            "Skipping live mirror for %s: live account balance is $%.2f. "
-            "Deposit USDC to your Hyperliquid account to enable live trading.",
+            "Skipping live mirror for %s: perps margin is $%.2f. "
+            "Transfer USDC from Spot to Perps in the Hyperliquid UI "
+            "(Portfolio → Transfer → Spot to Perps).",
             trade.get("coin", "?"), live_balance,
         )
         return None

@@ -369,6 +369,9 @@ def test_sync_shadow_book_closes_paper_trade_when_live_position_missing(monkeypa
         def get_positions(self):
             return []
 
+        def get_account_value(self):
+            return 500.0  # Funded account — reconciliation should proceed
+
     container = type(
         "Container",
         (),

@@ -25,13 +25,20 @@ def run_fast_cycle(container, cycle_count: int) -> None:
     and monitor crypto.com for whale trades.
     """
     try:
-        if is_live_trading_active(container):
-            container.live_trader.update_daily_pnl_from_fills()
-            closed = sync_shadow_book_to_live(container)
-        elif container.paper_trader:
+        # Always run paper SL/TP monitoring — even when live trading is active,
+        # paper positions still need stop-loss/take-profit/time-exit checks.
+        # Previously this was skipped when live was active, leaving paper
+        # positions unmonitored and without SL/TP enforcement.
+        if container.paper_trader:
             closed = container.paper_trader.check_open_positions()
             if closed:
                 logger.info("[fast] Closed %d positions (SL/TP)", len(closed))
+
+        if is_live_trading_active(container):
+            container.live_trader.update_daily_pnl_from_fills()
+            reconciled = sync_shadow_book_to_live(container)
+            if reconciled:
+                logger.info("[fast] Reconciled %d shadow trades to exchange", len(reconciled))
 
         if container.copy_trader:
             copy_signals = container.copy_trader.scan_top_traders(top_n=10)
