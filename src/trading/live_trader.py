@@ -27,6 +27,7 @@ import time
 import json
 import hashlib
 from datetime import datetime
+from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple, Union
 from enum import Enum
 
@@ -76,6 +77,94 @@ class OrderType(str, Enum):
     LIMIT_ALO = "Alo"         # Add Liquidity Only
     TRIGGER_SL = "sl"         # Stop loss trigger
     TRIGGER_TP = "tp"         # Take profit trigger
+
+
+# ────────────────────────────────────────────────────────────────────────
+# Hyperliquid wire format helpers
+# ────────────────────────────────────────────────────────────────────────
+#
+# Hyperliquid enforces strict rules on the string form of price and size
+# fields in the signed action payload.  Violating them produces
+# ``{"error": "Order has invalid price."}`` — the outer response is still
+# ``{"status": "ok"}`` so the order looks accepted but never fills.
+#
+#   Prices (perps):
+#     • Integer prices are always allowed.
+#     • Otherwise: max 5 SIGNIFICANT FIGURES and max (6 - szDecimals)
+#       decimal places.
+#     • Canonical form: no trailing zeros (Decimal.normalize).
+#
+#   Sizes (perps):
+#     • Rounded to the asset's szDecimals.
+#     • Canonical form: no trailing zeros.
+#
+# These helpers mirror ``float_to_wire`` / ``price_to_wire`` in the
+# official ``hyperliquid-python-sdk`` so we emit byte-identical payloads.
+
+def _hl_normalize_decimal(value: Decimal) -> str:
+    """Render a Decimal in canonical (no trailing zeros) string form."""
+    # Decimal("0.100").normalize() → Decimal("0.1"), but "1E+2" for "100".
+    # Use format string to force plain-notation for large integers.
+    normalized = value.normalize()
+    as_str = format(normalized, "f")
+    if as_str == "-0":
+        return "0"
+    return as_str
+
+
+def _hl_format_price(price: float, sz_decimals: int) -> str:
+    """
+    Format a price for the Hyperliquid wire protocol.
+
+    Applies the 5-significant-figure limit and the
+    ``max_decimals = 6 - sz_decimals`` perps constraint, then renders in
+    canonical no-trailing-zeros form.  Returns ``"0"`` for non-positive
+    or non-finite input (trigger orders use "0" as a placeholder).
+    """
+    try:
+        px = float(price)
+    except (TypeError, ValueError):
+        return "0"
+    if not px or px != px or px in (float("inf"), float("-inf")):
+        return "0"
+    if px <= 0:
+        return "0"
+
+    # Integer prices are always allowed and skip the 5-sig-fig round.
+    if px == int(px):
+        return _hl_normalize_decimal(Decimal(int(px)))
+
+    # 1. Round to 5 significant figures.
+    sig_fig_rounded = float(f"{px:.5g}")
+
+    # 2. Clamp to max allowed decimal places for perps.
+    max_decimals = max(0, 6 - int(sz_decimals or 0))
+    final = round(sig_fig_rounded, max_decimals)
+
+    # 3. Canonical string via Decimal normalize.
+    return _hl_normalize_decimal(Decimal(repr(final)))
+
+
+def _hl_format_size(size: float, sz_decimals: int) -> str:
+    """
+    Format a size for the Hyperliquid wire protocol.
+
+    Rounds to the asset's ``szDecimals`` and renders in canonical
+    no-trailing-zeros form.
+    """
+    try:
+        sz = float(size)
+    except (TypeError, ValueError):
+        return "0"
+    if not sz or sz != sz or sz in (float("inf"), float("-inf")):
+        return "0"
+
+    decimals = max(0, int(sz_decimals or 0))
+    rounded = round(sz, decimals)
+    # Avoid "-0" for very small negative rounding artifacts.
+    if rounded == 0:
+        return "0"
+    return _hl_normalize_decimal(Decimal(repr(rounded)))
 
 
 class HyperliquidSigner:
@@ -330,8 +419,12 @@ class LiveTrader:
         self.public_address = None
         self._load_credentials()
 
-        # Asset index mapping (BTC=0, ETH=1, etc.)
-        self.asset_index_map = {}
+        # Asset index + szDecimals mapping (BTC=0/szDecimals=5, ETH=1/4, etc.)
+        # szDecimals drives price rounding: perps allow max
+        # (6 - szDecimals) decimal places, so we MUST know it per-coin to
+        # emit valid wire-format prices/sizes.
+        self.asset_index_map: Dict[str, int] = {}
+        self.sz_decimals_map: Dict[str, int] = {}
         self._load_asset_index_map()
 
         # State tracking
@@ -551,7 +644,13 @@ class LiveTrader:
             logger.debug("extraAgents check failed: %s — skipping validation", exc)
 
     def _load_asset_index_map(self):
-        """Load asset index mapping from Hyperliquid meta endpoint."""
+        """Load asset index and szDecimals mapping from Hyperliquid meta endpoint.
+
+        Capturing ``szDecimals`` is essential — it drives both price rounding
+        (``max_decimals = 6 - szDecimals`` on perps) and size rounding, and
+        without it we emit prices like ``"33.95015"`` that Hyperliquid rejects
+        as ``{"error": "Order has invalid price."}``.
+        """
         try:
             response = requests.post(
                 self.info_url,
@@ -566,8 +665,17 @@ class LiveTrader:
                     coin_name = coin_data.get("name", "")
                     if coin_name:
                         self.asset_index_map[coin_name] = idx
+                        try:
+                            self.sz_decimals_map[coin_name] = int(
+                                coin_data.get("szDecimals", 0) or 0
+                            )
+                        except (TypeError, ValueError):
+                            self.sz_decimals_map[coin_name] = 0
 
-                logger.info(f"Loaded {len(self.asset_index_map)} asset indices from meta")
+                logger.info(
+                    "Loaded %d asset indices + szDecimals from meta",
+                    len(self.asset_index_map),
+                )
             else:
                 logger.warning("No 'universe' in meta response")
         except Exception as e:
@@ -983,8 +1091,43 @@ class LiveTrader:
         raise ValueError(f"Unsupported order side: {side}")
 
     @staticmethod
-    def _is_order_result_success(result: Optional[Dict]) -> bool:
-        """Best-effort classification of exchange responses into success/failure."""
+    def _extract_inner_order_statuses(result: Optional[Dict]) -> List[Dict[str, Any]]:
+        """Pull the per-order ``statuses`` list out of a Hyperliquid response.
+
+        Hyperliquid wraps successful requests in
+        ``{"status": "ok", "response": {"type": "order", "data": {"statuses": [...]}}}``
+        where each entry is one of:
+          - ``{"resting": {"oid": int}}``     — posted, waiting to match
+          - ``{"filled": {"oid": int, "totalSz": str, "avgPx": str}}``
+          - ``{"error": "..."}``              — per-order rejection, outer
+                                                status is STILL ``"ok"``
+
+        Returns ``[]`` if the shape doesn't match.
+        """
+        if not isinstance(result, dict):
+            return []
+        response = result.get("response")
+        if not isinstance(response, dict):
+            return []
+        data = response.get("data")
+        if not isinstance(data, dict):
+            return []
+        statuses = data.get("statuses")
+        if isinstance(statuses, list):
+            return [s for s in statuses if isinstance(s, dict)]
+        return []
+
+    @classmethod
+    def _is_order_result_success(cls, result: Optional[Dict]) -> bool:
+        """Best-effort classification of exchange responses into success/failure.
+
+        Hyperliquid uses a two-level success model: the outer request can
+        be ``status: ok`` while the inner per-order ``statuses`` list
+        contains ``{"error": "..."}`` rejections.  We must inspect the
+        inner list — otherwise a wire-format rejection (e.g. "Order has
+        invalid price.") looks successful and fill verification polls
+        pointlessly for 10 seconds before reporting a phantom failure.
+        """
         if not result:
             return False
         if not isinstance(result, dict):
@@ -995,7 +1138,21 @@ class LiveTrader:
             # Missing/empty status means malformed response — treat as failure.
             logger.warning("Order result has no status field: %s", result)
             return False
-        return status in {"success", "simulated", "verified", "filled", "accepted", "ok"}
+        if status not in {"success", "simulated", "verified", "filled", "accepted", "ok"}:
+            return False
+
+        # Outer ok — but drill into inner statuses and fail if any entry
+        # carries an error string.
+        inner = cls._extract_inner_order_statuses(result)
+        if inner and any("error" in entry for entry in inner):
+            errors = [entry.get("error") for entry in inner if "error" in entry]
+            logger.warning(
+                "Order outer status was 'ok' but per-order statuses contain "
+                "errors: %s",
+                errors,
+            )
+            return False
+        return True
 
     def _post_order(self, action: Dict, dry_run_override: Optional[bool] = None) -> Dict:
         """
@@ -1106,6 +1263,24 @@ class LiveTrader:
             self._recent_order_hashes[action_hash] = (now, result)
 
             logger.info(f"Order posted: {json.dumps(result)}")
+
+            # Hyperliquid wraps per-order errors under an outer
+            # ``status: ok`` response.  Promote any inner-error into a
+            # clear rejection so downstream callers stop waiting on
+            # verify_fill for a fill that will never come.
+            inner_statuses = self._extract_inner_order_statuses(result)
+            if inner_statuses and any("error" in s for s in inner_statuses):
+                errors = [s["error"] for s in inner_statuses if "error" in s]
+                logger.error(
+                    "Exchange rejected order at inner level: %s (action_hash=%s)",
+                    errors, action_hash[:16],
+                )
+                return {
+                    "status": "rejected",
+                    "reason": "exchange_inner_error",
+                    "errors": errors,
+                    "raw_response": result,
+                }
             return result
 
         except requests.exceptions.Timeout:
@@ -1195,26 +1370,78 @@ class LiveTrader:
             # sending a no-op order and waiting for fill verification to
             # time out.
             if self.min_order_usd and notional < self.min_order_usd:
-                logger.warning(
-                    "place_market_order: rejecting %s %s size %.6f — notional "
-                    "$%.2f is below Hyperliquid's $%.2f minimum.  Raise "
-                    "LIVE_MAX_ORDER_USD or fund the live wallet so rescaling "
-                    "produces a larger order.",
-                    coin, side, size, notional, self.min_order_usd,
-                )
-                return {
-                    "status": "rejected",
-                    "reason": "below_exchange_minimum_notional",
-                    "notional": round(notional, 4),
-                    "min_notional": self.min_order_usd,
-                }
+                # Tiny price drift between _rescale_size_for_live (signal
+                # entry price) and here (live mid) can leave us a few cents
+                # below the $11 floor.  Floor UP to ~min*1.02 in-place as
+                # long as the bump stays under max_order_usd.  This is
+                # cheaper than rejecting the order: the caller has already
+                # paid for signal generation, firewall, rescale, and
+                # signing.
+                bumped = False
+                if self.max_order_usd and self.min_order_usd > 0:
+                    target_notional = min(
+                        self.max_order_usd,
+                        self.min_order_usd * 1.02,
+                    )
+                    candidate_size = target_notional / price if price > 0 else 0
+                    candidate_notional = candidate_size * price
+                    # Only bump if the new size is within 25% of the
+                    # original — anything larger means the rescale
+                    # computed the wrong size entirely and should fail
+                    # loudly instead of silently scaling up.
+                    if (
+                        candidate_notional >= self.min_order_usd
+                        and candidate_notional <= self.max_order_usd
+                        and candidate_size <= size * 1.25
+                    ):
+                        logger.info(
+                            "place_market_order: floor-up %s %s %.6f → "
+                            "%.6f (notional $%.2f → $%.2f) to clear "
+                            "Hyperliquid's $%.2f minimum after price drift",
+                            coin, side, size, candidate_size,
+                            notional, candidate_notional, self.min_order_usd,
+                        )
+                        size = candidate_size
+                        notional = candidate_notional
+                        bumped = True
+                if not bumped:
+                    logger.warning(
+                        "place_market_order: rejecting %s %s size %.6f — "
+                        "notional $%.2f is below Hyperliquid's $%.2f "
+                        "minimum.  Raise LIVE_MAX_ORDER_USD or fund the "
+                        "live wallet so rescaling produces a larger order.",
+                        coin, side, size, notional, self.min_order_usd,
+                    )
+                    return {
+                        "status": "rejected",
+                        "reason": "below_exchange_minimum_notional",
+                        "notional": round(notional, 4),
+                        "min_notional": self.min_order_usd,
+                    }
+
+        # Format price and size for Hyperliquid's strict wire protocol
+        # (5 sig figs, (6 - szDecimals) decimals for perps, no trailing
+        # zeros).  Emitting plain ``round(x, 8)`` produces strings like
+        # ``"33.95015"`` which the exchange rejects as "Order has invalid
+        # price." — outer response is still ``status:ok`` so the order
+        # looks accepted but silently never fills.
+        sz_decimals = self.sz_decimals_map.get(coin, 0)
+        wire_price = _hl_format_price(price, sz_decimals)
+        wire_size = _hl_format_size(size, sz_decimals)
+        if wire_size == "0":
+            logger.warning(
+                "place_market_order: %s %s rounds to zero at szDecimals=%d "
+                "(raw size %.10f). Rejecting.",
+                coin, side, sz_decimals, size,
+            )
+            return {"status": "rejected", "reason": "size_rounds_to_zero"}
 
         # Build order
         order = {
             "a": asset_idx,
             "b": side.lower() == "buy",
-            "p": str(round(price, 8)),
-            "s": str(round(size, 8)),
+            "p": wire_price,
+            "s": wire_size,
             "r": reduce_only,
             "t": {"limit": {"tif": OrderType.LIMIT_IOC.value}}
         }
@@ -1367,11 +1594,26 @@ class LiveTrader:
                     "min_notional": self.min_order_usd,
                 }
 
+        # Format for Hyperliquid wire protocol — see place_market_order
+        # for the full rationale.  Without szDecimals-aware rounding the
+        # exchange returns "Order has invalid price" under a
+        # ``status: ok`` wrapper and our fill verification times out.
+        sz_decimals = self.sz_decimals_map.get(coin, 0)
+        wire_price = _hl_format_price(price, sz_decimals)
+        wire_size = _hl_format_size(size, sz_decimals)
+        if wire_size == "0":
+            logger.warning(
+                "place_limit_order: %s %s rounds to zero at szDecimals=%d "
+                "(raw size %.10f). Rejecting.",
+                coin, side, sz_decimals, size,
+            )
+            return {"status": "rejected", "reason": "size_rounds_to_zero"}
+
         order = {
             "a": asset_idx,
             "b": side.lower() == "buy",
-            "p": str(round(price, 8)),
-            "s": str(round(size, 8)),
+            "p": wire_price,
+            "s": wire_size,
             "r": reduce_only,
             "t": {"limit": {"tif": OrderType.LIMIT_GTC.value}}
         }
@@ -1417,16 +1659,30 @@ class LiveTrader:
         if asset_idx is None:
             return {"status": "error", "message": f"Unknown coin: {coin}"}
 
+        # Format for Hyperliquid wire protocol.  Trigger price is
+        # szDecimals-aware; the order ``p`` field is "0" because the
+        # actual execution price comes from the trigger itself.
+        sz_decimals = self.sz_decimals_map.get(coin, 0)
+        wire_size = _hl_format_size(size, sz_decimals)
+        wire_trigger_px = _hl_format_price(trigger_price, sz_decimals)
+        if wire_size == "0":
+            logger.warning(
+                "place_trigger_order: %s %s rounds to zero at szDecimals=%d "
+                "(raw size %.10f). Rejecting.",
+                coin, side, sz_decimals, size,
+            )
+            return {"status": "rejected", "reason": "size_rounds_to_zero"}
+
         order = {
             "a": asset_idx,
             "b": side.lower() == "buy",
             "p": "0",  # Trigger price is in trigger, not order price
-            "s": str(round(size, 8)),
+            "s": wire_size,
             "r": True,  # SL/TP must be reduce_only to close the position
             "t": {
                 "trigger": {
                     "isMarket": True,
-                    "triggerPx": str(round(trigger_price, 8)),
+                    "triggerPx": wire_trigger_px,
                     "tpsl": tp_or_sl
                 }
             }

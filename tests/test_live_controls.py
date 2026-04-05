@@ -18,7 +18,12 @@ from src.core.live_execution import (
 )
 from src.signals.decision_firewall import DecisionFirewall
 from src.signals.signal_schema import TradeSignal, signal_from_execution_dict
-from src.trading.live_trader import HyperliquidSigner, LiveTrader
+from src.trading.live_trader import (
+    HyperliquidSigner,
+    LiveTrader,
+    _hl_format_price,
+    _hl_format_size,
+)
 from src.trading.portfolio_rotation import PortfolioRotationManager, RotationDecision
 
 
@@ -987,3 +992,274 @@ def test_discovery_time_persistence_round_trips_through_db_context(monkeypatch):
     finally:
         if os.path.exists(db_path):
             os.remove(db_path)
+
+
+# ────────────────────────────────────────────────────────────────────────
+# Hyperliquid wire-format regression tests
+# ────────────────────────────────────────────────────────────────────────
+#
+# These lock in the exact price/size string encoding the exchange
+# requires.  Violating the 5-sig-fig + (6 - szDecimals) decimal rules
+# causes Hyperliquid to return
+# ``{"status": "ok", "response": {..., "statuses": [{"error": "Order has
+# invalid price."}]}}`` — the order never fills but looks accepted.
+
+def test_hl_format_price_respects_five_sig_fig_limit():
+    # HYPE at szDecimals=2 lets up to 4 decimals, but sig-fig cap is 5.
+    # 33.95015 has 7 sig figs -> must round to 33.95.
+    assert _hl_format_price(33.95015, 2) == "33.95"
+
+
+def test_hl_format_price_strips_trailing_zeros():
+    assert _hl_format_price(33.95, 2) == "33.95"
+    assert _hl_format_price(0.23, 0) == "0.23"
+    assert _hl_format_price(2163.8, 4) == "2163.8"
+
+
+def test_hl_format_price_caps_high_sig_figs_for_large_numbers():
+    # BTC at $67544.12345 -> 5 sig figs -> 67544
+    assert _hl_format_price(67544.12345, 5) == "67544"
+
+
+def test_hl_format_price_respects_szdecimals_constraint():
+    # ETH szDecimals=4 -> max 2 decimal places (6-4).  2163.79123 -> 2163.8
+    # (5 sig figs clamps first, then decimal limit).
+    assert _hl_format_price(2163.79123, 4) == "2163.8"
+    # BTC szDecimals=5 -> max 1 decimal place.  67544.12 would need to
+    # be rounded to integer (1 decimal would be 6th sig fig).
+    assert _hl_format_price(67544.12, 5) == "67544"
+
+
+def test_hl_format_price_handles_non_finite_and_non_positive():
+    assert _hl_format_price(0, 2) == "0"
+    assert _hl_format_price(-1, 2) == "0"
+    assert _hl_format_price(float("nan"), 2) == "0"
+    assert _hl_format_price(float("inf"), 2) == "0"
+
+
+def test_hl_format_size_rounds_to_sz_decimals():
+    assert _hl_format_size(0.33580053, 2) == "0.34"
+    assert _hl_format_size(49.27625500, 0) == "49"
+    assert _hl_format_size(0.00017122, 5) == "0.00017"
+
+
+def test_hl_format_size_strips_trailing_zeros():
+    assert _hl_format_size(1.0, 4) == "1"
+    assert _hl_format_size(1.5000, 4) == "1.5"
+    assert _hl_format_size(1.50100, 4) == "1.501"
+
+
+def test_is_order_result_success_detects_inner_error():
+    """An outer ``status: ok`` with per-order ``error`` inside must be
+    classified as failure, otherwise verify_fill waits pointlessly for a
+    fill that will never come and logs FILL NOT VERIFIED even though the
+    exchange actually rejected the order."""
+    rejected_response = {
+        "status": "ok",
+        "response": {
+            "type": "order",
+            "data": {"statuses": [{"error": "Order has invalid price."}]},
+        },
+    }
+    assert LiveTrader._is_order_result_success(rejected_response) is False
+
+
+def test_is_order_result_success_allows_resting_and_filled():
+    resting = {
+        "status": "ok",
+        "response": {
+            "type": "order",
+            "data": {"statuses": [{"resting": {"oid": 12345}}]},
+        },
+    }
+    filled = {
+        "status": "ok",
+        "response": {
+            "type": "order",
+            "data": {
+                "statuses": [
+                    {"filled": {"oid": 12345, "totalSz": "1.0", "avgPx": "50000"}}
+                ]
+            },
+        },
+    }
+    assert LiveTrader._is_order_result_success(resting) is True
+    assert LiveTrader._is_order_result_success(filled) is True
+
+
+def test_extract_inner_order_statuses_handles_missing_shape():
+    assert LiveTrader._extract_inner_order_statuses(None) == []
+    assert LiveTrader._extract_inner_order_statuses({}) == []
+    assert LiveTrader._extract_inner_order_statuses({"status": "err"}) == []
+    assert LiveTrader._extract_inner_order_statuses(
+        {"status": "ok", "response": "not a dict"}
+    ) == []
+
+
+def test_place_market_order_uses_wire_format_price_and_size(monkeypatch):
+    """End-to-end: place_market_order must format price/size through
+    _hl_format_* so the payload sent to _post_order has canonical strings.
+    Regression test for the HYPE/TAO/ADA/ETH "Order has invalid price"
+    burst.
+    """
+    captured_actions = []
+
+    class FakeFirewall:
+        def validate(self, signal, **kwargs):
+            return True, "ok"
+
+    monkeypatch.setattr(LiveTrader, "_load_credentials", _fake_live_credentials)
+    monkeypatch.setattr(LiveTrader, "_load_asset_index_map", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "reconcile_positions", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "_get_mid_price", lambda self, coin: 33.95015)
+    monkeypatch.setattr(
+        LiveTrader,
+        "_post_order",
+        lambda self, action, dry_run_override=None: (
+            captured_actions.append(action) or {"status": "ok", "response": {"type": "order", "data": {"statuses": [{"resting": {"oid": 1}}]}}}
+        ),
+    )
+
+    trader = LiveTrader(firewall=FakeFirewall(), dry_run=False, max_order_usd=15.0)
+    trader.asset_index_map = {"HYPE": 42}
+    trader.sz_decimals_map = {"HYPE": 2}
+
+    result = trader.place_market_order("HYPE", "sell", 0.33580053448251734)
+    assert result.get("status") == "ok"
+    assert len(captured_actions) == 1
+    order = captured_actions[0]["orders"][0]
+    # Price must be canonical (5 sig figs, no trailing zeros).  Mid 33.95015
+    # with 5% sell slippage = 32.2526425, rounds to 32.253 at 5 sig figs.
+    assert order["p"] == "32.253", f"expected canonical price, got {order['p']!r}"
+    # Size 0.33580053 at post-slippage price 32.2526425 = $10.83 notional,
+    # which is below the $11 minimum — the floor-up logic inside
+    # place_market_order bumps it to ~$11.22 / $32.2526425 ≈ 0.3479,
+    # which rounds to "0.35" at szDecimals=2.  Critically the string is
+    # canonical (no trailing zeros, 2 decimal places max).
+    assert order["s"] == "0.35", f"expected canonical size, got {order['s']!r}"
+    # Critical: NO trailing zeros, NO sig-fig overflow
+    assert "." not in order["p"] or not order["p"].endswith("0")
+    assert "." not in order["s"] or not order["s"].endswith("0")
+
+
+def test_post_order_promotes_inner_error_to_rejection(monkeypatch):
+    """When Hyperliquid returns an outer ok with an inner error, _post_order
+    must return a ``status: rejected`` dict so downstream callers stop
+    treating it as success and waiting for a phantom fill."""
+
+    class FakeFirewall:
+        def validate(self, signal, **kwargs):
+            return True, "ok"
+
+    class FakeResponse:
+        status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "status": "ok",
+                "response": {
+                    "type": "order",
+                    "data": {"statuses": [{"error": "Order has invalid price."}]},
+                },
+            }
+
+    monkeypatch.setattr(LiveTrader, "_load_credentials", _fake_live_credentials)
+    monkeypatch.setattr(LiveTrader, "_load_asset_index_map", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "reconcile_positions", lambda self: None)
+    monkeypatch.setattr("src.trading.live_trader.requests.post", lambda *a, **kw: FakeResponse())
+
+    trader = LiveTrader(firewall=FakeFirewall(), dry_run=False, max_order_usd=15.0)
+
+    # Give the trader a fake signer so _post_order reaches the network
+    class FakeSigner:
+        address = "0x1111111111111111111111111111111111111111"
+
+        def sign_action(self, action, nonce, vault_address=None, expires_after=None):
+            return {"r": "0x" + "0" * 64, "s": "0x" + "0" * 64, "v": 27}
+
+    trader.signer = FakeSigner()
+    trader.dry_run = False
+
+    result = trader._post_order({"type": "order", "orders": [], "grouping": "na"})
+    assert result.get("status") == "rejected"
+    assert result.get("reason") == "exchange_inner_error"
+    assert "Order has invalid price." in result.get("errors", [])
+
+
+def test_rescale_size_for_live_uses_mid_price_not_signal_entry(monkeypatch):
+    """If the signal's entry_price and the live mid drift apart, the
+    rescale floor-up must target mid price so place_market_order (which
+    uses mid) doesn't flip us back below the $11 minimum.  Regression
+    test for the BTC/XRP below_exchange_minimum burst where entry was
+    $67544 but mid was $64152 (~5% drop).
+    """
+    from src.core.live_execution import _rescale_size_for_live
+
+    class FakeTrader:
+        max_order_usd = 12.0
+        min_order_usd = 11.0
+
+        def get_account_value(self):
+            return 12.44
+
+    monkeypatch.setattr("src.core.live_execution.db.get_paper_account",
+                        lambda: {"balance": 10_041.0})
+    # Mid price is noticeably LOWER than signal entry
+    monkeypatch.setattr("src.core.live_execution.get_all_mids",
+                        lambda: {"BTC": 64152.0})
+
+    scaled = _rescale_size_for_live(
+        {"coin": "BTC", "size": 0.002679, "entry_price": 67544.0, "leverage": 5},
+        FakeTrader(),
+    )
+    assert scaled is not None
+    # Notional measured at the MID price must be above $11 (with headroom)
+    notional_at_mid = scaled["size"] * 64152.0
+    assert notional_at_mid >= 11.0, (
+        f"notional at mid=${notional_at_mid:.2f} should clear $11 min "
+        f"(size={scaled['size']})"
+    )
+    assert notional_at_mid <= 12.5, (
+        f"notional at mid=${notional_at_mid:.2f} should stay under cap "
+        f"(size={scaled['size']})"
+    )
+
+
+def test_load_asset_index_map_captures_sz_decimals(monkeypatch):
+    """The meta endpoint returns szDecimals per coin — LiveTrader must
+    cache it or else _hl_format_price emits uncapped decimals and the
+    exchange rejects the order."""
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "universe": [
+                    {"name": "BTC", "szDecimals": 5, "maxLeverage": 50},
+                    {"name": "ETH", "szDecimals": 4, "maxLeverage": 50},
+                    {"name": "HYPE", "szDecimals": 2, "maxLeverage": 10},
+                ]
+            }
+
+    monkeypatch.setattr(LiveTrader, "_load_credentials", _fake_live_credentials)
+    monkeypatch.setattr(LiveTrader, "reconcile_positions", lambda self: None)
+    monkeypatch.setattr(
+        "src.trading.live_trader.requests.post",
+        lambda *a, **kw: FakeResponse(),
+    )
+
+    class FakeFirewall:
+        def validate(self, signal, **kwargs):
+            return True, "ok"
+
+    trader = LiveTrader(firewall=FakeFirewall(), dry_run=True, max_order_usd=12.0)
+    assert trader.asset_index_map["BTC"] == 0
+    assert trader.asset_index_map["ETH"] == 1
+    assert trader.asset_index_map["HYPE"] == 2
+    assert trader.sz_decimals_map["BTC"] == 5
+    assert trader.sz_decimals_map["ETH"] == 4
+    assert trader.sz_decimals_map["HYPE"] == 2

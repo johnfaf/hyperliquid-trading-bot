@@ -215,17 +215,27 @@ def _rescale_size_for_live(trade: Dict, trader) -> Optional[Dict]:
     # proportional rescale so nothing above LIVE_MAX_ORDER_USD hits the exchange.
     max_order_usd = getattr(trader, "max_order_usd", None)
     min_order_usd = getattr(trader, "min_order_usd", None) or 0.0
-    entry_price = float(
-        scaled_trade.get("entry_price")
-        or trade.get("entry_price")
-        or 0
-    )
+
+    # IMPORTANT: prefer the *live mid price* over the signal's entry_price
+    # for cap/floor calculations.  place_market_order/place_limit_order use
+    # mid price when they execute, so we must size using the same reference
+    # — otherwise a 2-5% price drift between signal generation and order
+    # placement flips our "$11.55 target notional" into "$10.97 actual
+    # notional" and the exchange rejects with below_exchange_minimum_notional.
+    coin = scaled_trade.get("coin", "") or ""
+    mids = get_all_mids() or {}
+    mid_price = 0.0
+    try:
+        mid_price = float(mids.get(coin, 0) or 0)
+    except (TypeError, ValueError):
+        mid_price = 0.0
+    entry_price = mid_price
     if entry_price <= 0:
-        mids = get_all_mids() or {}
-        try:
-            entry_price = float(mids.get(scaled_trade.get("coin", ""), 0) or 0)
-        except (TypeError, ValueError):
-            entry_price = 0.0
+        entry_price = float(
+            scaled_trade.get("entry_price")
+            or trade.get("entry_price")
+            or 0
+        )
 
     if max_order_usd and max_order_usd > 0 and entry_price > 0:
         current_size = float(scaled_trade.get("size", 0) or 0)
@@ -235,7 +245,7 @@ def _rescale_size_for_live(trade: Dict, trader) -> Optional[Dict]:
             logger.info(
                 "Capping %s live mirror to $%.2f: %.6f → %.6f "
                 "(notional $%.2f → $%.2f)",
-                scaled_trade.get("coin", "?"),
+                coin or "?",
                 max_order_usd,
                 current_size,
                 capped_size,
@@ -260,11 +270,17 @@ def _rescale_size_for_live(trade: Dict, trader) -> Optional[Dict]:
         current_size = float(scaled_trade.get("size", 0) or 0)
         notional = current_size * entry_price
         if notional < min_order_usd:
-            # Target a notional just above the exchange minimum, but do not
-            # exceed the configured per-order cap.
-            target_notional = min_order_usd
-            if max_order_usd and max_order_usd > min_order_usd:
-                target_notional = min(max_order_usd, min_order_usd * 1.05)
+            # Target 1.10x the minimum so normal price drift, slippage,
+            # and size rounding (szDecimals) don't slip us back under the
+            # floor between here and place_market_order.  Cap at
+            # max_order_usd but never fall below min * 1.10.
+            headroom_target = min_order_usd * 1.10
+            if max_order_usd and max_order_usd > headroom_target:
+                target_notional = headroom_target
+            elif max_order_usd and max_order_usd > min_order_usd:
+                target_notional = max_order_usd
+            else:
+                target_notional = headroom_target
 
             # Margin required = notional / leverage.  Fall back to 1x (the
             # most conservative assumption) if leverage is not specified.
@@ -287,7 +303,7 @@ def _rescale_size_for_live(trade: Dict, trader) -> Optional[Dict]:
                     "notional @ %.1fx = $%.2f margin) would exceed 80%% of "
                     "the live wallet ($%.2f).  Fund the wallet, lower the "
                     "minimum, or raise leverage.",
-                    scaled_trade.get("coin", "?"),
+                    coin or "?",
                     target_notional,
                     leverage,
                     required_margin,
@@ -299,16 +315,19 @@ def _rescale_size_for_live(trade: Dict, trader) -> Optional[Dict]:
             logger.info(
                 "Flooring %s live mirror UP to exchange minimum: "
                 "%.6f → %.6f (notional $%.2f → $%.2f, margin @ %.1fx = "
-                "$%.2f).  Proportional rescale from paper was below $%.2f; "
-                "this departs from strict paper-proportional sizing, "
-                "unavoidable given live wallet $%.2f vs paper $%.0f.",
-                scaled_trade.get("coin", "?"),
+                "$%.2f, ref_price=$%.4f %s).  Proportional rescale from "
+                "paper was below $%.2f; this departs from strict "
+                "paper-proportional sizing, unavoidable given live "
+                "wallet $%.2f vs paper $%.0f.",
+                coin or "?",
                 current_size,
                 floored_size,
                 notional,
                 floored_size * entry_price,
                 leverage,
                 required_margin,
+                entry_price,
+                "mid" if mid_price > 0 else "signal",
                 min_order_usd,
                 live_balance,
                 paper_balance,
