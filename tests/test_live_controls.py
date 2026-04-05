@@ -303,7 +303,7 @@ def test_post_order_routes_exchange_requests_through_api_manager(monkeypatch):
     class FakeSigner:
         address = "0x1111111111111111111111111111111111111111"
 
-        def sign_action(self, action, nonce):
+        def sign_action(self, action, nonce, vault_address=None):
             return {"r": "0x1", "s": "0x2", "v": 27}
 
     manager = FakeManager()
@@ -1952,31 +1952,35 @@ def test_load_asset_index_map_captures_sz_decimals(monkeypatch):
     """The meta endpoint returns szDecimals per coin — LiveTrader must
     cache it or else _hl_format_price emits uncapped decimals and the
     exchange rejects the order."""
-    class FakeResponse:
-        def raise_for_status(self):
-            return None
+    class FakeManager:
+        def __init__(self):
+            self.calls = []
 
-        def json(self):
-            return {
-                "universe": [
-                    {"name": "BTC", "szDecimals": 5, "maxLeverage": 50},
-                    {"name": "ETH", "szDecimals": 4, "maxLeverage": 50},
-                    {"name": "HYPE", "szDecimals": 2, "maxLeverage": 10},
-                ]
-            }
+        def post(self, payload, **kwargs):
+            self.calls.append((payload, kwargs))
+            if payload.get("type") == "meta":
+                return {
+                    "universe": [
+                        {"name": "BTC", "szDecimals": 5, "maxLeverage": 50},
+                        {"name": "ETH", "szDecimals": 4, "maxLeverage": 50},
+                        {"name": "HYPE", "szDecimals": 2, "maxLeverage": 10},
+                    ]
+                }
+            return {}
+
+    manager = FakeManager()
 
     monkeypatch.setattr(LiveTrader, "_load_credentials", _fake_live_credentials)
     monkeypatch.setattr(LiveTrader, "reconcile_positions", lambda self: None)
-    monkeypatch.setattr(
-        "src.trading.live_trader.requests.post",
-        lambda *a, **kw: FakeResponse(),
-    )
+    monkeypatch.setattr("src.trading.live_trader.get_manager", lambda: manager)
 
     class FakeFirewall:
         def validate(self, signal, **kwargs):
             return True, "ok"
 
     trader = LiveTrader(firewall=FakeFirewall(), dry_run=True, max_order_usd=12.0)
+    meta_call = next(payload for payload, kwargs in manager.calls if payload.get("type") == "meta")
+    assert meta_call["type"] == "meta"
     assert trader.asset_index_map["BTC"] == 0
     assert trader.asset_index_map["ETH"] == 1
     assert trader.asset_index_map["HYPE"] == 2
