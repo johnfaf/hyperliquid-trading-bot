@@ -1028,23 +1028,39 @@ class LiveTrader:
                 logger.error("No signer available - cannot post order")
                 return {"status": "error", "message": "No signer available"}
 
-            # When running as an agent wallet, orders are submitted on behalf
-            # of the trading account.  Hyperliquid requires the vault address
-            # to be baked into the signed hash AND echoed in the request
-            # payload — the two must match or ecrecover yields a stranger
-            # address and the exchange rejects with "User or API Wallet does
-            # not exist".
-            vault_address: Optional[str] = None
-            if (
-                self.public_address
-                and self.signer
-                and self.public_address.lower() != self.signer.address.lower()
-            ):
-                vault_address = self.public_address
+            # Vault vs agent-wallet master-account semantics:
+            # -------------------------------------------------
+            # Hyperliquid has TWO distinct "trade on behalf of" modes:
+            #
+            # 1. Agent wallet → master account (the common case, and our case):
+            #    HL_PUBLIC_ADDRESS is a regular user account.  The signer is
+            #    an approved API wallet for that account.  Orders must NOT
+            #    include ``vaultAddress`` in the request payload, and the
+            #    signed hash must NOT include a vault byte.  Hyperliquid
+            #    looks up the agent→master mapping from its approved-agents
+            #    registry and routes the order to the master automatically.
+            #
+            # 2. Trading on behalf of an actual Vault (or sub-account):
+            #    HL_VAULT_ADDRESS is set and refers to a real Hyperliquid
+            #    Vault.  The signer is authorized to trade that vault.
+            #    ``vaultAddress`` is sent in the payload AND baked into the
+            #    signed hash.
+            #
+            # The previous implementation treated case 1 as case 2 and sent
+            # HL_PUBLIC_ADDRESS as ``vaultAddress``, producing the error
+            # "Vault not registered: 0x…" (because a regular user account
+            # is not a vault).  We now only send vaultAddress when an
+            # explicit HL_VAULT_ADDRESS env var is set.
+            vault_address: Optional[str] = (
+                os.environ.get("HL_VAULT_ADDRESS", "").strip() or None
+            )
 
-            # Sign the action (vault address MUST be included in the hash
-            # if we are going to send vaultAddress in the request body).
-            signature = self.signer.sign_action(action, nonce, vault_address=vault_address)
+            # Sign the action.  vault_address MUST be included in the hash
+            # iff we are going to echo it in the request body — and MUST
+            # NOT be included otherwise.
+            signature = self.signer.sign_action(
+                action, nonce, vault_address=vault_address,
+            )
 
             # Prepare request
             payload = {
