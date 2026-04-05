@@ -384,6 +384,118 @@ def test_live_trader_uses_verified_fill_size_for_protection(monkeypatch):
     assert [call[2] for call in trigger_calls] == [0.06, 0.06]
 
 
+def test_execute_signal_uses_submitted_entry_size_for_fill_verification(monkeypatch):
+    class FakeFirewall:
+        def validate(self, signal, **kwargs):
+            return True, "ok"
+
+    verify_sizes = []
+
+    monkeypatch.setattr(LiveTrader, "_load_credentials", _fake_live_credentials)
+    monkeypatch.setattr(LiveTrader, "_load_asset_index_map", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "reconcile_positions", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "get_firewall_positions", lambda self: [])
+    monkeypatch.setattr(LiveTrader, "get_account_value", lambda self: 2500.0)
+    monkeypatch.setattr(
+        LiveTrader,
+        "place_market_order",
+        lambda self, *args, **kwargs: {"status": "success", "submitted_size": 0.09},
+    )
+    monkeypatch.setattr(LiveTrader, "update_daily_pnl_from_fills", lambda self: None)
+    monkeypatch.setattr(
+        LiveTrader,
+        "verify_fill",
+        lambda self, coin, side, expected_size, timeout=10.0, poll_interval=1.0: (
+            verify_sizes.append(expected_size) or {"status": "verified", "size": expected_size}
+        ),
+    )
+    monkeypatch.setattr(LiveTrader, "_get_mid_price", lambda self, coin: 2000.0)
+    monkeypatch.setattr(LiveTrader, "place_trigger_order", lambda self, *args, **kwargs: {"status": "success"})
+
+    trader = LiveTrader(firewall=FakeFirewall(), dry_run=False, max_order_usd=1_000_000)
+    result = trader.execute_signal(
+        {
+            "coin": "ETH",
+            "side": "long",
+            "confidence": 0.8,
+            "entry_price": 2000.0,
+            "position_pct": 0.05,
+            "leverage": 2,
+            "size": 0.1,
+            "strategy_type": "momentum_long",
+        }
+    )
+
+    assert result is not None
+    assert result["status"] == "success"
+    assert verify_sizes == [0.09]
+    assert abs(result["requested_size"] - 0.1) < 1e-12
+    assert abs(result["submitted_size"] - 0.09) < 1e-12
+
+
+def test_execute_signal_uses_exchange_reported_fill_size_for_verification(monkeypatch):
+    class FakeFirewall:
+        def validate(self, signal, **kwargs):
+            return True, "ok"
+
+    verify_sizes = []
+    trigger_sizes = []
+
+    monkeypatch.setattr(LiveTrader, "_load_credentials", _fake_live_credentials)
+    monkeypatch.setattr(LiveTrader, "_load_asset_index_map", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "reconcile_positions", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "get_firewall_positions", lambda self: [])
+    monkeypatch.setattr(LiveTrader, "get_account_value", lambda self: 2500.0)
+    monkeypatch.setattr(
+        LiveTrader,
+        "place_market_order",
+        lambda self, *args, **kwargs: {
+            "status": "ok",
+            "submitted_size": 371.1539175295995,
+            "exchange_reported_fill_size": 1.0,
+        },
+    )
+    monkeypatch.setattr(LiveTrader, "update_daily_pnl_from_fills", lambda self: None)
+    monkeypatch.setattr(
+        LiveTrader,
+        "verify_fill",
+        lambda self, coin, side, expected_size, timeout=10.0, poll_interval=1.0: (
+            verify_sizes.append(expected_size)
+            or {"status": "verified", "size": expected_size, "partial_fill": True}
+        ),
+    )
+    monkeypatch.setattr(LiveTrader, "_get_mid_price", lambda self, coin: 0.0308)
+    monkeypatch.setattr(
+        LiveTrader,
+        "place_trigger_order",
+        lambda self, coin, side, size, trigger_price, tp_or_sl="sl": (
+            trigger_sizes.append(size) or {"status": "success"}
+        ),
+    )
+
+    trader = LiveTrader(firewall=FakeFirewall(), dry_run=False, max_order_usd=1_000_000)
+    result = trader.execute_signal(
+        {
+            "coin": "KAS",
+            "side": "long",
+            "confidence": 0.8,
+            "entry_price": 0.0308,
+            "position_pct": 0.05,
+            "leverage": 1,
+            "size": 389.7116134060795,
+            "strategy_type": "copy_long",
+        }
+    )
+
+    assert result is not None
+    assert result["status"] == "success"
+    assert verify_sizes == [1.0]
+    assert trigger_sizes == [1.0, 1.0]
+    assert abs(result["requested_size"] - 389.7116134060795) < 1e-12
+    assert abs(result["submitted_size"] - 371.1539175295995) < 1e-12
+    assert result["exchange_reported_fill_size"] == 1.0
+
+
 def test_live_trader_closes_position_when_protection_fails(monkeypatch):
     class FakeFirewall:
         def validate(self, signal, **kwargs):
@@ -1484,6 +1596,24 @@ def test_extract_inner_order_statuses_handles_missing_shape():
     ) == []
 
 
+def test_extract_reported_fill_size_sums_filled_statuses():
+    result = {
+        "status": "ok",
+        "response": {
+            "type": "order",
+            "data": {
+                "statuses": [
+                    {"filled": {"oid": 1, "totalSz": "1.0", "avgPx": "0.030813"}},
+                    {"resting": {"oid": 2}},
+                    {"filled": {"oid": 3, "totalSz": "2.5", "avgPx": "0.030900"}},
+                ]
+            },
+        },
+    }
+    assert LiveTrader._extract_reported_fill_size(result) == 3.5
+    assert LiveTrader._extract_reported_fill_size({"status": "ok"}) is None
+
+
 def test_place_market_order_uses_wire_format_price_and_size(monkeypatch):
     """End-to-end: place_market_order must format price/size through
     _hl_format_* so the payload sent to _post_order has canonical strings.
@@ -1528,6 +1658,44 @@ def test_place_market_order_uses_wire_format_price_and_size(monkeypatch):
     # Critical: NO trailing zeros, NO sig-fig overflow
     assert "." not in order["p"] or not order["p"].endswith("0")
     assert "." not in order["s"] or not order["s"].endswith("0")
+
+
+def test_place_market_order_reports_submitted_and_exchange_fill_size(monkeypatch):
+    class FakeFirewall:
+        def validate(self, signal, **kwargs):
+            return True, "ok"
+
+    monkeypatch.setattr(LiveTrader, "_load_credentials", _fake_live_credentials)
+    monkeypatch.setattr(LiveTrader, "_load_asset_index_map", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "reconcile_positions", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "_get_mid_price", lambda self, coin: 0.0308)
+    monkeypatch.setattr(
+        LiveTrader,
+        "_post_order",
+        lambda self, action, dry_run_override=None: {
+            "status": "ok",
+            "response": {
+                "type": "order",
+                "data": {
+                    "statuses": [
+                        {"filled": {"oid": 123, "totalSz": "1.0", "avgPx": "0.030813"}}
+                    ]
+                },
+            },
+        },
+    )
+
+    trader = LiveTrader(firewall=FakeFirewall(), dry_run=False, max_order_usd=12.0)
+    trader.asset_index_map = {"KAS": 7}
+    trader.sz_decimals_map = {"KAS": 0}
+
+    result = trader.place_market_order("KAS", "buy", 389.7116134060795)
+
+    assert result["submitted_size"] > 0
+    assert result["submitted_size"] < result["requested_size"]
+    assert result["submitted_notional"] <= 12.0
+    assert result["exchange_reported_fill_size"] == 1.0
+    assert result["wire_size"] == "371"
 
 
 def test_post_order_promotes_inner_error_to_rejection(monkeypatch):

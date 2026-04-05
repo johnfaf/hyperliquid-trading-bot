@@ -1312,6 +1312,21 @@ class LiveTrader:
         return []
 
     @classmethod
+    def _extract_reported_fill_size(cls, result: Optional[Dict]) -> Optional[float]:
+        """Return the exchange-reported filled size from an order response, if any."""
+        total = 0.0
+        found = False
+        for entry in cls._extract_inner_order_statuses(result):
+            filled = entry.get("filled")
+            if not isinstance(filled, dict):
+                continue
+            total_sz = cls._coerce_float(filled.get("totalSz"), 0.0)
+            if total_sz > 0:
+                total += total_sz
+                found = True
+        return total if found else None
+
+    @classmethod
     def _is_order_result_success(cls, result: Optional[Dict]) -> bool:
         """Best-effort classification of exchange responses into success/failure.
 
@@ -1550,6 +1565,7 @@ class LiveTrader:
 
         # Apply slippage
         price = self._apply_market_slippage(mid, side)
+        requested_size = float(size)
 
         # Position size limit only applies to new positions, not closes.
         # A reduce_only order can never increase exposure, so blocking it
@@ -1660,6 +1676,16 @@ class LiveTrader:
 
         logger.info(f"Placing market order: {coin} {side} {size} @ ${price:.2f} (notional: ${notional:.2f})")
         result = self._post_order(action)
+        if isinstance(result, dict):
+            result = dict(result)
+            result["requested_size"] = requested_size
+            result["submitted_size"] = float(size)
+            result["submitted_notional"] = float(notional)
+            result["wire_size"] = wire_size
+            result["wire_price"] = wire_price
+            reported_fill_size = self._extract_reported_fill_size(result)
+            if reported_fill_size is not None:
+                result["exchange_reported_fill_size"] = reported_fill_size
 
         if self._is_order_result_success(result) and not self.dry_run:
             self.orders_today += 1
@@ -2327,6 +2353,7 @@ class LiveTrader:
 
         try:
             size = signal.size
+            requested_entry_size = float(size)
 
             if not size or size <= 0:
                 logger.warning(f"Calculated size is 0 or negative for {coin} — skipping")
@@ -2350,23 +2377,33 @@ class LiveTrader:
             # Update daily PnL after every execution to keep loss tracking current
             self.update_daily_pnl_from_fills()
 
-            actual_fill_size = size
+            submitted_entry_size = float(entry_result.get("submitted_size", size) or size)
+            expected_fill_size = submitted_entry_size
+            exchange_reported_fill_size = self._coerce_float(
+                entry_result.get("exchange_reported_fill_size"),
+                0.0,
+            )
+            if exchange_reported_fill_size > 0:
+                expected_fill_size = exchange_reported_fill_size
+            actual_fill_size = expected_fill_size
 
             # 1b. Verify the fill actually happened before placing SL/TP
             if not self.dry_run:
-                fill_check = self.verify_fill(coin, entry_side, size, timeout=10.0)
+                fill_check = self.verify_fill(coin, entry_side, expected_fill_size, timeout=10.0)
                 if not fill_check:
                     logger.error(
-                        f"FILL NOT VERIFIED for {coin} {side} {size} — "
+                        f"FILL NOT VERIFIED for {coin} {side} {expected_fill_size} — "
                         f"skipping SL/TP placement. Manual intervention required."
                     )
                     return {
                         "status": "warning",
                         "message": "order posted but fill not verified",
                         "coin": coin,
+                        "expected_fill_size": expected_fill_size,
+                        "submitted_size": submitted_entry_size,
                         "entry_result": entry_result,
                     }
-                actual_fill_size = float(fill_check.get("size", size) or size)
+                actual_fill_size = float(fill_check.get("size", expected_fill_size) or expected_fill_size)
                 if actual_fill_size <= 0:
                     logger.error(
                         "Fill verification returned invalid size for %s: %s",
@@ -2386,7 +2423,7 @@ class LiveTrader:
                         "Partial fill accepted for %s: protecting %.6f of requested %.6f",
                         coin,
                         actual_fill_size,
-                        size,
+                        submitted_entry_size,
                     )
 
             # 2. Calculate stop loss and take profit prices
@@ -2455,7 +2492,11 @@ class LiveTrader:
                 "coin": coin,
                 "side": signal_side,
                 "size": actual_fill_size,
-                "requested_size": size,
+                "requested_size": requested_entry_size,
+                "submitted_size": submitted_entry_size,
+                "exchange_reported_fill_size": (
+                    exchange_reported_fill_size if exchange_reported_fill_size > 0 else None
+                ),
                 "leverage": signal.leverage,
                 "entry_result": entry_result,
                 "dry_run": self.dry_run,
