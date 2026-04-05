@@ -270,18 +270,6 @@ def _rescale_size_for_live(trade: Dict, trader) -> Optional[Dict]:
         current_size = float(scaled_trade.get("size", 0) or 0)
         notional = current_size * entry_price
         if notional < min_order_usd:
-            # Target 1.10x the minimum so normal price drift, slippage,
-            # and size rounding (szDecimals) don't slip us back under the
-            # floor between here and place_market_order.  Cap at
-            # max_order_usd but never fall below min * 1.10.
-            headroom_target = min_order_usd * 1.10
-            if max_order_usd and max_order_usd > headroom_target:
-                target_notional = headroom_target
-            elif max_order_usd and max_order_usd > min_order_usd:
-                target_notional = max_order_usd
-            else:
-                target_notional = headroom_target
-
             # Margin required = notional / leverage.  Fall back to 1x (the
             # most conservative assumption) if leverage is not specified.
             leverage = float(
@@ -291,26 +279,44 @@ def _rescale_size_for_live(trade: Dict, trader) -> Optional[Dict]:
             )
             if leverage <= 0:
                 leverage = 1.0
-            required_margin = target_notional / leverage
 
-            # Do not floor up if even the minimum order would use more than
-            # ~80% of the live wallet as margin — leave some headroom for
-            # other concurrent positions, slippage, and fees.
-            max_safe_margin = live_balance * 0.8
-            if required_margin > max_safe_margin:
+            # Headroom budget: leave 5% of the wallet untouched for fees,
+            # slippage, and funding.  Leverage multiplies the notional
+            # each dollar of margin can support, so a $12 wallet at 5x
+            # can carry up to $57 notional, while at 1x it caps out at
+            # $11.40 notional (barely clearing the $11 minimum).  This
+            # is the cap the check uses — NOT 80% of wallet, which
+            # incorrectly blocked 1x trades on small wallets.
+            wallet_notional_budget = max(0.0, live_balance) * 0.95 * leverage
+
+            # Target 1.10x the minimum so normal price drift, slippage,
+            # and size rounding (szDecimals) don't slip us back under
+            # the floor.  Cap at max_order_usd AND at the wallet budget.
+            headroom_target = min_order_usd * 1.10
+            target_notional = headroom_target
+            if max_order_usd and max_order_usd > 0:
+                target_notional = min(target_notional, max_order_usd)
+            target_notional = min(target_notional, wallet_notional_budget)
+
+            # Only reject if even the bare minimum cannot fit in the
+            # wallet at this leverage.  This is the true physical limit:
+            # no amount of floor-up can make a $11 notional fit in a $10
+            # wallet at 1x leverage.
+            if target_notional < min_order_usd:
                 logger.warning(
-                    "Skipping %s live mirror: the minimum order ($%.2f "
-                    "notional @ %.1fx = $%.2f margin) would exceed 80%% of "
-                    "the live wallet ($%.2f).  Fund the wallet, lower the "
-                    "minimum, or raise leverage.",
+                    "Skipping %s live mirror: wallet $%.2f at %.1fx "
+                    "leverage supports max $%.2f notional (95%% headroom), "
+                    "which is below the $%.2f exchange minimum.  Fund "
+                    "the wallet or raise leverage for this asset.",
                     coin or "?",
-                    target_notional,
-                    leverage,
-                    required_margin,
                     live_balance,
+                    leverage,
+                    wallet_notional_budget,
+                    min_order_usd,
                 )
                 return None
 
+            required_margin = target_notional / leverage
             floored_size = target_notional / entry_price
             logger.info(
                 "Flooring %s live mirror UP to exchange minimum: "

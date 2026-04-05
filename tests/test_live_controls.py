@@ -1228,6 +1228,212 @@ def test_rescale_size_for_live_uses_mid_price_not_signal_entry(monkeypatch):
     )
 
 
+def test_coerce_float_handles_string_int_dict_and_none():
+    """Hyperliquid returns numeric fields as strings, nested dicts, or
+    None.  Plain float(x) crashes on dicts — the exact failure mode
+    that produced 'float() argument must be a string or a real number,
+    not dict' 72 times in one log and broke every verify_fill."""
+    assert LiveTrader._coerce_float("1.5") == 1.5
+    assert LiveTrader._coerce_float("") == 0.0
+    assert LiveTrader._coerce_float(None) == 0.0
+    assert LiveTrader._coerce_float(None, 99.0) == 99.0
+    assert LiveTrader._coerce_float(42) == 42.0
+    # The leverage dict shape from clearinghouseState
+    assert LiveTrader._coerce_float({"type": "cross", "value": 5}) == 5.0
+    assert LiveTrader._coerce_float({"type": "isolated", "value": 10}) == 10.0
+    # cumFunding dict shape
+    assert LiveTrader._coerce_float({"allTime": "0.123", "sinceOpen": "0.05"}) == 0.123
+    # Unknown dict shape falls back to default
+    assert LiveTrader._coerce_float({"foo": "bar"}, 77.0) == 77.0
+    # Garbage
+    assert LiveTrader._coerce_float("not a number", 99.0) == 99.0
+
+
+def test_normalize_position_handles_leverage_dict():
+    """_normalize_position must not crash when leverage is returned as a
+    dict (the clearinghouseState wire format).  Regression test for the
+    Railway crash chain:
+      get_positions() crashed -> verify_fill returned None -> SL/TP
+      placement skipped -> real positions left unprotected.
+    """
+    trader = LiveTrader.__new__(LiveTrader)
+    pos_raw = {
+        "position": {
+            "coin": "ETH",
+            "szi": "-0.0058",
+            "entryPx": "2064.9",
+            "unrealizedPnl": "0.12",
+            "leverage": {"type": "cross", "value": 5},
+            "positionValue": "11.98",
+        },
+        "type": "oneWay",
+    }
+    result = trader._normalize_position(pos_raw)
+    assert result["coin"] == "ETH"
+    assert result["szi"] == -0.0058
+    assert result["size"] == 0.0058
+    assert result["side"] == "short"
+    assert result["entry_price"] == 2064.9
+    assert result["leverage"] == 5.0
+    # Also works for isolated leverage
+    pos_raw["position"]["leverage"] = {"type": "isolated", "value": 10, "rawUsd": "1.5"}
+    assert trader._normalize_position(pos_raw)["leverage"] == 10.0
+
+
+def test_protect_orphaned_positions_places_sl_tp_for_unprotected(monkeypatch):
+    """Positions with no reduce-only orders must get default SL/TP
+    placed automatically on the next cycle.  This is the orphan
+    recovery path for the crash that left ETH/BTC/HYPE/XRP/RESOLV
+    unprotected in the latest Railway log."""
+    placed_triggers: list = []
+
+    class FakeFirewall:
+        def validate(self, signal, **kwargs):
+            return True, "ok"
+
+    monkeypatch.setattr(LiveTrader, "_load_credentials", _fake_live_credentials)
+    monkeypatch.setattr(LiveTrader, "_load_asset_index_map", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "reconcile_positions", lambda self: None)
+    monkeypatch.setattr(
+        LiveTrader,
+        "get_positions",
+        lambda self: [
+            {"coin": "ETH", "size": 0.0058, "szi": -0.0058, "side": "short", "entry_price": 2064.9, "entryPx": 2064.9},
+            {"coin": "BTC", "size": 0.00018, "szi": -0.00018, "side": "short", "entry_price": 67401.0, "entryPx": 67401.0},
+        ],
+    )
+    monkeypatch.setattr(LiveTrader, "get_open_orders", lambda self: [])  # no protection
+    monkeypatch.setattr(
+        LiveTrader,
+        "place_trigger_order",
+        lambda self, coin, side, size, trigger_price, tp_or_sl="sl": (
+            placed_triggers.append({"coin": coin, "side": side, "size": size, "price": trigger_price, "type": tp_or_sl})
+            or {"status": "ok", "response": {"type": "order", "data": {"statuses": [{"resting": {"oid": len(placed_triggers)}}]}}}
+        ),
+    )
+
+    trader = LiveTrader(firewall=FakeFirewall(), dry_run=False, max_order_usd=15.0)
+    summary = trader.protect_orphaned_positions()
+
+    assert summary["protected"] == 2
+    assert summary["failed"] == 0
+    assert summary["skipped"] == 0
+    assert len(placed_triggers) == 4  # 2 positions × (sl + tp)
+
+    eth_triggers = [t for t in placed_triggers if t["coin"] == "ETH"]
+    assert len(eth_triggers) == 2
+    # Short position → protection side is BUY
+    assert all(t["side"] == "buy" for t in eth_triggers)
+    sl = next(t for t in eth_triggers if t["type"] == "sl")
+    tp = next(t for t in eth_triggers if t["type"] == "tp")
+    # Short SL is ABOVE entry, TP is BELOW entry
+    assert sl["price"] > 2064.9
+    assert tp["price"] < 2064.9
+    # 3% SL, 6% TP
+    assert abs(sl["price"] - 2064.9 * 1.03) < 0.01
+    assert abs(tp["price"] - 2064.9 * 0.94) < 0.01
+
+
+def test_protect_orphaned_positions_skips_already_protected(monkeypatch):
+    """Positions that already have reduce-only orders should be
+    skipped — the method is safe to call on every cycle without
+    stacking duplicate SL/TPs."""
+    placed_triggers: list = []
+
+    class FakeFirewall:
+        def validate(self, signal, **kwargs):
+            return True, "ok"
+
+    monkeypatch.setattr(LiveTrader, "_load_credentials", _fake_live_credentials)
+    monkeypatch.setattr(LiveTrader, "_load_asset_index_map", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "reconcile_positions", lambda self: None)
+    monkeypatch.setattr(
+        LiveTrader,
+        "get_positions",
+        lambda self: [
+            {"coin": "ETH", "size": 0.0058, "szi": -0.0058, "side": "short", "entry_price": 2064.9, "entryPx": 2064.9},
+        ],
+    )
+    monkeypatch.setattr(
+        LiveTrader,
+        "get_open_orders",
+        lambda self: [
+            {"coin": "ETH", "reduceOnly": True, "orderType": "Stop Market"},
+            {"coin": "ETH", "reduceOnly": True, "orderType": "Take Profit Market"},
+        ],
+    )
+    monkeypatch.setattr(
+        LiveTrader,
+        "place_trigger_order",
+        lambda self, *a, **kw: placed_triggers.append(a) or {"status": "ok"},
+    )
+
+    trader = LiveTrader(firewall=FakeFirewall(), dry_run=False, max_order_usd=15.0)
+    summary = trader.protect_orphaned_positions()
+
+    assert summary["protected"] == 0
+    assert summary["skipped"] == 1
+    assert summary["failed"] == 0
+    assert len(placed_triggers) == 0  # nothing placed because already protected
+
+
+def test_rescale_size_for_live_allows_1x_leverage_on_tight_wallet(monkeypatch):
+    """1x leverage orders should not be blocked on a small wallet when
+    the wallet actually has enough headroom.  Regression test for the
+    KAS skip: $12.42 wallet at 1x leverage, $12 max order, $11 min.
+    Old code checked min_order_usd > wallet * 0.80 = $9.94 and skipped;
+    new code uses wallet * 0.95 * leverage = $11.80 as the cap and
+    targets min(max_order_usd, headroom_target, budget) instead.
+    """
+    from src.core.live_execution import _rescale_size_for_live
+
+    class FakeTrader:
+        max_order_usd = 12.0
+        min_order_usd = 11.0
+
+        def get_account_value(self):
+            return 12.42
+
+    monkeypatch.setattr("src.core.live_execution.db.get_paper_account",
+                        lambda: {"balance": 10_041.0})
+    monkeypatch.setattr("src.core.live_execution.get_all_mids",
+                        lambda: {"KAS": 0.1025})
+
+    # 5846 KAS at paper, rescales to 7.23 KAS, way below $11 min
+    scaled = _rescale_size_for_live(
+        {"coin": "KAS", "size": 5846.43, "entry_price": 0.1025, "leverage": 1},
+        FakeTrader(),
+    )
+    assert scaled is not None, "1x leverage should NOT skip when wallet fits"
+    notional = scaled["size"] * 0.1025
+    assert notional >= 11.0, f"notional ${notional:.2f} should clear $11 min"
+    assert notional <= 12.0, f"notional ${notional:.2f} should stay ≤ max_order_usd"
+
+
+def test_rescale_size_for_live_skips_when_wallet_cannot_fit_minimum(monkeypatch):
+    """If wallet * 0.95 * leverage < min_order_usd, we truly cannot
+    afford the exchange minimum at this leverage and must skip."""
+    from src.core.live_execution import _rescale_size_for_live
+
+    class FakeTrader:
+        max_order_usd = 12.0
+        min_order_usd = 11.0
+
+        def get_account_value(self):
+            return 10.0  # 10 * 0.95 * 1 = 9.50, below $11 min
+
+    monkeypatch.setattr("src.core.live_execution.db.get_paper_account",
+                        lambda: {"balance": 10_041.0})
+    monkeypatch.setattr("src.core.live_execution.get_all_mids",
+                        lambda: {"KAS": 0.1025})
+
+    scaled = _rescale_size_for_live(
+        {"coin": "KAS", "size": 5846.43, "entry_price": 0.1025, "leverage": 1},
+        FakeTrader(),
+    )
+    assert scaled is None, "wallet too small to hold $11 min at 1x — must skip"
+
+
 def test_load_asset_index_map_captures_sz_decimals(monkeypatch):
     """The meta endpoint returns szDecimals per coin — LiveTrader must
     cache it or else _hl_format_price emits uncapped decimals and the

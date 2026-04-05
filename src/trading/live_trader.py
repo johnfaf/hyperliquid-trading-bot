@@ -837,12 +837,73 @@ class LiveTrader:
         """Return the most recent balance snapshot (cached, no API call)."""
         return dict(self._last_balance_snapshot)
 
+    @staticmethod
+    def _coerce_float(value: Any, default: float = 0.0) -> float:
+        """Safely coerce a Hyperliquid API field to float.
+
+        Hyperliquid returns many numeric fields as strings ("0.123"),
+        sometimes as nested dicts ({"value": 5}), and occasionally as
+        ``null``.  Plain ``float(x)`` crashes on dicts and None — which
+        caused ``Error getting positions: float() argument must be a
+        string or a real number, not 'dict'`` to fire 72 times in one
+        log, bringing down ``verify_fill`` and leaving real positions
+        unprotected on the exchange.
+        """
+        if value is None:
+            return default
+        if isinstance(value, (int, float)):
+            return float(value)
+        if isinstance(value, str):
+            try:
+                return float(value) if value else default
+            except ValueError:
+                return default
+        if isinstance(value, dict):
+            # Hyperliquid encodes leverage as {"type": "cross", "value": 5}
+            # and cum funding as {"allTime": "0.123", ...}.  Prefer "value"
+            # then "allTime" then any numeric-looking entry.
+            for key in ("value", "allTime", "sinceOpen", "sinceChange"):
+                if key in value:
+                    return LiveTrader._coerce_float(value[key], default)
+            return default
+        return default
+
     def _normalize_position(self, pos: Dict[str, Any]) -> Dict[str, Any]:
-        """Flatten Hyperliquid position payload into a consistent dict shape."""
+        """Flatten Hyperliquid position payload into a consistent dict shape.
+
+        The clearinghouseState endpoint returns positions shaped like::
+
+            {
+              "position": {
+                "coin": "BTC",
+                "szi": "0.001",
+                "entryPx": "67000",
+                "unrealizedPnl": "1.23",
+                "leverage": {"type": "cross", "value": 5},  # DICT, not scalar
+                "positionValue": "67",
+                ...
+              },
+              "type": "oneWay"
+            }
+
+        Every numeric field must be coerced through ``_coerce_float`` to
+        handle the string-vs-number-vs-dict polymorphism without
+        crashing.
+        """
         pos_info = pos.get("position", pos) if isinstance(pos, dict) else {}
-        size = float(pos_info.get("szi", pos_info.get("size", 0)) or 0)
-        entry_px = float(pos_info.get("entryPx", pos_info.get("entry_price", 0)) or 0)
-        unrealized = float(pos_info.get("unrealizedPnl", pos_info.get("unrealized_pnl", 0)) or 0)
+        size = self._coerce_float(pos_info.get("szi", pos_info.get("size", 0)))
+        entry_px = self._coerce_float(
+            pos_info.get("entryPx", pos_info.get("entry_price", 0))
+        )
+        unrealized = self._coerce_float(
+            pos_info.get("unrealizedPnl", pos_info.get("unrealized_pnl", 0))
+        )
+        leverage = self._coerce_float(
+            pos_info.get("leverage", pos_info.get("lev", 1)),
+            default=1.0,
+        )
+        if leverage <= 0:
+            leverage = 1.0
         return {
             "coin": pos_info.get("coin", ""),
             "size": abs(size),
@@ -852,7 +913,7 @@ class LiveTrader:
             "entryPx": entry_px,
             "unrealized_pnl": unrealized,
             "unrealizedPnl": unrealized,
-            "leverage": float(pos_info.get("leverage", pos_info.get("lev", 1)) or 1),
+            "leverage": leverage,
             "raw": pos,
         }
 
@@ -896,24 +957,33 @@ class LiveTrader:
 
     def reconcile_positions(self):
         """
-        Compare exchange positions vs local state on startup.
+        Compare exchange positions vs local state and protect orphans.
 
         Logs discrepancies so the operator knows if the bot's view
-        of the world differs from reality. Triggers kill switch if
-        unexpected positions are found.
+        of the world differs from reality, then places SL/TP on any
+        position that lacks protective orders (e.g., positions opened
+        by a previous run that crashed during verify_fill, leaving SL/TP
+        un-placed).
         """
         logger.info("Reconciling positions with exchange...")
         try:
             exchange_positions = self.get_positions()
             active_coins = []
+            unprotected = []
 
             for pos in exchange_positions:
                 coin = pos.get("coin", "")
-                size = float(pos.get("szi", pos.get("size", 0)) or 0)
-                entry_px = float(pos.get("entry_price", pos.get("entryPx", 0)) or 0)
-                unrealized_pnl = float(pos.get("unrealized_pnl", pos.get("unrealizedPnl", 0)) or 0)
+                # _normalize_position already coerces everything; these
+                # are safe scalars now.
+                size = self._coerce_float(pos.get("szi", pos.get("size", 0)))
+                entry_px = self._coerce_float(
+                    pos.get("entry_price", pos.get("entryPx", 0))
+                )
+                unrealized_pnl = self._coerce_float(
+                    pos.get("unrealized_pnl", pos.get("unrealizedPnl", 0))
+                )
 
-                if abs(size) > 0:
+                if abs(size) > 0 and coin:
                     side = "long" if size > 0 else "short"
                     active_coins.append(coin)
                     self._last_known_positions[coin] = {
@@ -928,12 +998,19 @@ class LiveTrader:
                         f"size={abs(size)} entry=${entry_px:,.2f} "
                         f"uPnL=${unrealized_pnl:+,.2f}"
                     )
+                    unprotected.append(pos)
 
             if active_coins:
                 logger.warning(
                     f"Reconciliation: {len(active_coins)} open positions found on "
                     f"exchange: {', '.join(active_coins)}. These will be tracked."
                 )
+                # Place SL/TP for any position that doesn't already have
+                # protective reduce-only orders.  This catches the class
+                # of bugs where verify_fill crashed (float(dict) leverage)
+                # and SL/TP placement was skipped — leaving real money
+                # on the exchange with no downside protection.
+                self.protect_orphaned_positions(unprotected)
             else:
                 logger.info("Reconciliation: no open positions on exchange (clean state)")
 
@@ -943,6 +1020,130 @@ class LiveTrader:
                 "Could not verify exchange state on startup. "
                 "Proceeding with caution — monitor positions manually."
             )
+
+    def protect_orphaned_positions(
+        self,
+        positions: Optional[List[Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
+        """Place SL/TP on any open position that lacks reduce-only orders.
+
+        Designed to be safe to call repeatedly — checks open-order state
+        first and skips positions that already have protective orders.
+        Uses conservative default SL/TP percentages (3% SL / 6% TP) when
+        no signal context is available.
+
+        Args:
+            positions: Optional pre-fetched list of normalized positions.
+                When omitted, fetches via ``get_positions()``.
+
+        Returns:
+            Summary dict with counts of protected / skipped / failed.
+        """
+        if self.dry_run:
+            return {"status": "skipped", "reason": "dry_run"}
+
+        if positions is None:
+            positions = self.get_positions()
+
+        if not positions:
+            return {"status": "ok", "protected": 0, "skipped": 0, "failed": 0}
+
+        # One fetch of open orders, then index by coin for O(1) lookup.
+        try:
+            open_orders = self.get_open_orders()
+        except Exception as exc:
+            logger.warning("protect_orphaned_positions: open-orders fetch failed: %s", exc)
+            open_orders = []
+
+        protected_coins: Dict[str, List[str]] = {}
+        for order in open_orders:
+            if not isinstance(order, dict):
+                continue
+            coin = order.get("coin", "")
+            if not coin:
+                continue
+            reduce_only = bool(order.get("reduceOnly") or order.get("reduce_only"))
+            order_type_raw = order.get("orderType") or order.get("type") or ""
+            order_type = str(order_type_raw).lower()
+            # Trigger orders from place_trigger_order show up with
+            # orderType containing "stop" or "take" — both protect the
+            # position even without an explicit reduceOnly flag.
+            if reduce_only or "stop" in order_type or "take" in order_type or "trigger" in order_type:
+                protected_coins.setdefault(coin, []).append(order_type or "reduce_only")
+
+        protected = 0
+        skipped = 0
+        failed = 0
+        for pos in positions:
+            coin = pos.get("coin", "")
+            size = abs(self._coerce_float(pos.get("size", pos.get("szi", 0))))
+            szi = self._coerce_float(pos.get("szi", pos.get("size", 0)))
+            entry_price = self._coerce_float(
+                pos.get("entry_price", pos.get("entryPx", 0))
+            )
+            if not coin or size <= 0 or entry_price <= 0:
+                continue
+
+            if coin in protected_coins:
+                logger.info(
+                    "protect_orphaned_positions: %s already has protective "
+                    "orders (%s), skipping",
+                    coin, protected_coins[coin],
+                )
+                skipped += 1
+                continue
+
+            side = "long" if szi > 0 else "short"
+            # Conservative defaults: 3% stop loss, 6% take profit
+            sl_pct = 0.03
+            tp_pct = 0.06
+            if side == "long":
+                sl_price = entry_price * (1 - sl_pct)
+                tp_price = entry_price * (1 + tp_pct)
+                protect_side = "sell"
+            else:
+                sl_price = entry_price * (1 + sl_pct)
+                tp_price = entry_price * (1 - tp_pct)
+                protect_side = "buy"
+
+            logger.warning(
+                "UNPROTECTED POSITION: %s %s size=%.6f entry=$%.6f — "
+                "placing default 3%%/6%% SL/TP (SL=$%.6f TP=$%.6f)",
+                side.upper(), coin, size, entry_price, sl_price, tp_price,
+            )
+
+            sl_result = self.place_trigger_order(
+                coin, protect_side, size, sl_price, tp_or_sl="sl"
+            )
+            tp_result = self.place_trigger_order(
+                coin, protect_side, size, tp_price, tp_or_sl="tp"
+            )
+
+            sl_ok = self._is_order_result_success(sl_result)
+            tp_ok = self._is_order_result_success(tp_result)
+            if sl_ok and tp_ok:
+                protected += 1
+                logger.info(
+                    "Orphan protection placed for %s: SL=$%.6f TP=$%.6f",
+                    coin, sl_price, tp_price,
+                )
+            else:
+                failed += 1
+                logger.error(
+                    "Orphan protection FAILED for %s: sl=%s tp=%s — "
+                    "position remains unprotected, MANUAL INTERVENTION REQUIRED",
+                    coin, sl_result, tp_result,
+                )
+
+        summary = {
+            "status": "ok",
+            "protected": protected,
+            "skipped": skipped,
+            "failed": failed,
+        }
+        if protected or failed:
+            logger.warning("Orphan protection summary: %s", summary)
+        return summary
 
     def update_daily_pnl_from_fills(self):
         """

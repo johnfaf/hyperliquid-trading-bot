@@ -8,10 +8,8 @@ Runs every ~5 minutes to react to market changes quickly.
 Extracted from ``HyperliquidResearchBot._run_trading_cycle``.
 """
 import logging
-import time
 from datetime import datetime
 
-import config
 from src.data import database as db
 from src.core.live_execution import (
     get_execution_open_positions,
@@ -121,6 +119,16 @@ def run_trading_cycle(container, cycle_count: int) -> None:
         container.live_trader.update_daily_pnl_from_fills()
         if container.live_trader.check_daily_loss():
             logger.error("KILL SWITCH ACTIVE — daily loss limit hit, skipping live trades")
+
+        # Sweep for orphaned positions (opened successfully but SL/TP
+        # placement was skipped due to an upstream error like the
+        # get_positions float(dict) crash).  Safe to call every cycle —
+        # protect_orphaned_positions checks for existing reduce-only
+        # orders and no-ops for protected positions.
+        try:
+            container.live_trader.protect_orphaned_positions()
+        except Exception as exc:
+            logger.warning("Orphan protection sweep failed: %s", exc)
 
     logger.info("=" * 60)
     logger.info("Starting trading cycle #%d", cycle_count)
