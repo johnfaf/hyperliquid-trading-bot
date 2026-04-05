@@ -35,10 +35,29 @@ import requests
 # Try importing eth_account; if unavailable, set flag
 try:
     from eth_account import Account
-    from eth_account.messages import encode_structured_data
+    try:
+        # eth_account >= 0.8 provides encode_typed_data
+        from eth_account.messages import encode_typed_data as _encode_typed_data
+        _USE_TYPED_DATA = True
+    except ImportError:  # pragma: no cover - fallback for very old eth_account
+        from eth_account.messages import encode_structured_data as _encode_typed_data  # type: ignore
+        _USE_TYPED_DATA = False
     HAS_ETH_ACCOUNT = True
 except ImportError:
     HAS_ETH_ACCOUNT = False
+    _USE_TYPED_DATA = False
+
+try:
+    import msgpack  # type: ignore
+    HAS_MSGPACK = True
+except ImportError:
+    HAS_MSGPACK = False
+
+try:
+    from eth_utils import keccak as _keccak  # type: ignore
+    HAS_KECCAK = True
+except ImportError:
+    HAS_KECCAK = False
 
 import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -61,33 +80,74 @@ class OrderType(str, Enum):
 
 class HyperliquidSigner:
     """
-    Signs exchange requests using EIP-712 for Hyperliquid.
+    Signs L1 actions for the Hyperliquid exchange.
 
-    Implements the domain and signing requirements for Hyperliquid orders.
+    Hyperliquid uses a specific signing scheme that is NOT just an EIP-712
+    wrap of the raw action JSON.  The canonical steps (matching the
+    official ``hyperliquid-python-sdk``) are:
+
+      1. ``action_bytes = msgpack.packb(action)``
+      2. Append 8-byte big-endian nonce.
+      3. Append vault-address flag byte + 20-byte vault address, or a single
+         ``\\x00`` byte if no vault is used (the "expiresAfter" flag is a
+         second optional byte, appended after the vault block).
+      4. ``connection_id = keccak256(bytes)`` (this is a bytes32 value).
+      5. EIP-712 sign a struct::
+
+             Agent { source: string, connectionId: bytes32 }
+
+         under domain::
+
+             { name: "Exchange", version: "1",
+               chainId: 1337, verifyingContract: 0x0000…0000 }
+
+      6. ``source`` is ``"a"`` on mainnet and ``"b"`` on testnet.
+
+    Historical bug: an earlier version of this class signed
+    ``{ "action": json.dumps(action), "nonce": nonce }`` under a made-up
+    ``HyperliquidTransaction`` struct.  Hyperliquid's verifier could not
+    reproduce that hash, so ``ecrecover`` returned a garbage address on
+    every order and the exchange replied ``"User or API Wallet 0x... does
+    not exist"``.  See commit history for details.
     """
 
-    # EIP-712 domain for Hyperliquid L1 mainnet
-    # NOTE: Hyperliquid migrated from Arbitrum (42161) to its own L1.
-    # Mainnet uses chainId 1337; testnet uses 421614.
-    # Env override available for future chain changes.
+    # Signing-domain chain ID is ALWAYS 1337 on mainnet and 421614 on
+    # testnet regardless of where orders are routed.  This is distinct from
+    # Arbitrum/native L1 chain IDs.  Override via HL_CHAIN_ID only if
+    # Hyperliquid changes the signing domain.
+    CHAIN_ID = int(os.environ.get("HL_CHAIN_ID", 1337))
     DOMAIN = {
-        "name": "HyperliquidSignTransaction",
+        "name": "Exchange",
         "version": "1",
-        "chainId": int(os.environ.get("HL_CHAIN_ID", 1337)),
-        "verifyingContract": "0x0000000000000000000000000000000000000000"
+        "chainId": CHAIN_ID,
+        "verifyingContract": "0x0000000000000000000000000000000000000000",
     }
+    # "a" = mainnet, "b" = testnet.  Hyperliquid uses the signing chain ID
+    # 1337 for mainnet and 421614 for testnet, so derive source from it.
+    SOURCE = "a" if CHAIN_ID == 1337 else "b"
 
     def __init__(self, private_key: str):
         """
-        Initialize signer with Ethereum private key.
+        Initialize signer with an Ethereum private key.
 
         Args:
-            private_key: Hex string (with or without 0x prefix)
+            private_key: Hex string (with or without ``0x`` prefix)
         """
         if not HAS_ETH_ACCOUNT:
             raise RuntimeError(
                 "eth_account library not installed. "
                 "Please install: pip install eth_account"
+            )
+        if not HAS_MSGPACK:
+            raise RuntimeError(
+                "msgpack library not installed. Hyperliquid L1 action signing "
+                "requires msgpack to encode actions canonically. "
+                "Please install: pip install msgpack"
+            )
+        if not HAS_KECCAK:
+            raise RuntimeError(
+                "eth_utils keccak not available — required for Hyperliquid "
+                "action hashing.  Reinstall eth_account to pull eth_utils."
             )
 
         # Ensure 0x prefix
@@ -98,50 +158,85 @@ class HyperliquidSigner:
         self.address = self.account.address
         logger.info(f"HyperliquidSigner initialized with address: {self.address}")
 
-    def sign_action(self, action: Dict, nonce: int) -> Dict:
+    @staticmethod
+    def _action_hash(action: Dict, vault_address: Optional[str], nonce: int,
+                     expires_after: Optional[int] = None) -> bytes:
         """
-        Sign an action for submission to Hyperliquid exchange.
+        Compute the Hyperliquid L1 ``connectionId`` for an action.
+
+        This mirrors ``hyperliquid.utils.signing.action_hash`` in the
+        official Python SDK.
+        """
+        data = msgpack.packb(action)
+        data += nonce.to_bytes(8, "big")
+        if vault_address is None:
+            data += b"\x00"
+        else:
+            data += b"\x01"
+            data += bytes.fromhex(vault_address.removeprefix("0x"))
+        if expires_after is not None:
+            data += b"\x00"
+            data += expires_after.to_bytes(8, "big")
+        return _keccak(data)
+
+    def sign_action(self, action: Dict, nonce: int,
+                    vault_address: Optional[str] = None,
+                    expires_after: Optional[int] = None) -> Dict:
+        """
+        Sign an L1 action (order, cancel, modify, etc.) for Hyperliquid.
 
         Args:
-            action: The action dict (order, cancel, etc.)
-            nonce: Timestamp in milliseconds
+            action: The action dict exactly as it will be sent to
+                ``/exchange`` in the request body ``"action"`` field.
+            nonce: Millisecond timestamp used as nonce.
+            vault_address: When trading on behalf of another account (agent
+                wallet mode), pass the *trading account* address here.  It
+                MUST be baked into the signed hash or Hyperliquid will
+                recover a different address than the signer's.
+            expires_after: Optional expiry timestamp (ms since epoch).
 
         Returns:
-            Dict with 'r', 's', 'v' signature components
+            ``{"r": "0x…", "s": "0x…", "v": int}`` — zero-padded to 32
+            bytes each so signatures with leading zeros remain valid.
         """
         try:
-            # Build the EIP-712 payload
+            connection_id = self._action_hash(
+                action, vault_address, nonce, expires_after,
+            )
+
             payload = {
                 "types": {
                     "EIP712Domain": [
                         {"name": "name", "type": "string"},
                         {"name": "version", "type": "string"},
                         {"name": "chainId", "type": "uint256"},
-                        {"name": "verifyingContract", "type": "address"}
+                        {"name": "verifyingContract", "type": "address"},
                     ],
-                    "HyperliquidTransaction": [
-                        {"name": "action", "type": "string"},
-                        {"name": "nonce", "type": "uint64"}
-                    ]
+                    "Agent": [
+                        {"name": "source", "type": "string"},
+                        {"name": "connectionId", "type": "bytes32"},
+                    ],
                 },
-                "primaryType": "HyperliquidTransaction",
+                "primaryType": "Agent",
                 "domain": self.DOMAIN,
                 "message": {
-                    "action": json.dumps(action),
-                    "nonce": nonce
-                }
+                    "source": self.SOURCE,
+                    "connectionId": connection_id,
+                },
             }
 
-            # Sign using eth_account
-            message = encode_structured_data(payload)
+            if _USE_TYPED_DATA:
+                message = _encode_typed_data(full_message=payload)
+            else:  # pragma: no cover
+                message = _encode_typed_data(payload)
             signed_message = self.account.sign_message(message)
 
             # Hyperliquid expects 32-byte hex components. Zero-pad r/s so
-            # signatures remain valid when either integer has leading zeros.
+            # signatures with leading zeros remain valid.
             return {
                 "r": f"0x{signed_message.r:064x}",
                 "s": f"0x{signed_message.s:064x}",
-                "v": signed_message.v
+                "v": signed_message.v,
             }
         except Exception as e:
             logger.error(f"Error signing action: {e}")
@@ -149,7 +244,12 @@ class HyperliquidSigner:
 
     @staticmethod
     def get_action_hash(action: Dict) -> str:
-        """Compute hash of action for auditing."""
+        """Compute a stable hash of an action for dedup/auditing.
+
+        This is NOT the signing hash — it is only used locally for order
+        deduplication.  It intentionally ignores nonce and vault so that two
+        functionally-identical orders collide in the dedup cache.
+        """
         action_str = json.dumps(action, sort_keys=True)
         return hashlib.sha256(action_str.encode()).hexdigest()
 
@@ -928,18 +1028,32 @@ class LiveTrader:
                 logger.error("No signer available - cannot post order")
                 return {"status": "error", "message": "No signer available"}
 
-            # Sign the action
-            signature = self.signer.sign_action(action, nonce)
+            # When running as an agent wallet, orders are submitted on behalf
+            # of the trading account.  Hyperliquid requires the vault address
+            # to be baked into the signed hash AND echoed in the request
+            # payload — the two must match or ecrecover yields a stranger
+            # address and the exchange rejects with "User or API Wallet does
+            # not exist".
+            vault_address: Optional[str] = None
+            if (
+                self.public_address
+                and self.signer
+                and self.public_address.lower() != self.signer.address.lower()
+            ):
+                vault_address = self.public_address
+
+            # Sign the action (vault address MUST be included in the hash
+            # if we are going to send vaultAddress in the request body).
+            signature = self.signer.sign_action(action, nonce, vault_address=vault_address)
 
             # Prepare request
             payload = {
                 "action": action,
                 "nonce": nonce,
-                "signature": signature
+                "signature": signature,
             }
-            if self.public_address and self.signer:
-                if self.public_address.lower() != self.signer.address.lower():
-                    payload["vaultAddress"] = self.public_address
+            if vault_address:
+                payload["vaultAddress"] = vault_address
 
             logger.debug(f"Posting order to {self.exchange_url}: action_hash={action_hash}")
 

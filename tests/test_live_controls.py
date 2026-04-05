@@ -563,7 +563,14 @@ def test_hyperliquid_signer_zero_pads_signature_components(monkeypatch):
     signer = HyperliquidSigner.__new__(HyperliquidSigner)
     signer.account = FakeAccount()
 
-    monkeypatch.setattr("src.trading.live_trader.encode_structured_data", lambda payload: object(), raising=False)
+    # New signer uses eth_account.encode_typed_data (imported as
+    # _encode_typed_data).  Replace it with a no-op so we do not need a
+    # real eth_account install to verify zero-padding.
+    monkeypatch.setattr(
+        "src.trading.live_trader._encode_typed_data",
+        lambda *args, **kwargs: object(),
+        raising=False,
+    )
 
     signature = signer.sign_action({"type": "noop"}, nonce=123)
 
@@ -573,6 +580,78 @@ def test_hyperliquid_signer_zero_pads_signature_components(monkeypatch):
     assert len(signature["s"]) == 66
     assert signature["r"].endswith("1234")
     assert signature["s"].endswith("abcd")
+
+
+def test_hyperliquid_signer_includes_vault_address_in_hash():
+    """Regression test: the old signer ignored the vault address when
+    computing the signed hash, so agent-wallet orders signed one hash and
+    Hyperliquid reconstructed a different one — ecrecover then returned a
+    mystery address and the exchange replied "User or API Wallet 0x… does
+    not exist".  The fix includes ``vault_address`` in the keccak
+    preimage, so the same action + nonce with different vaults MUST
+    produce different hashes.
+    """
+    action = {
+        "type": "order",
+        "orders": [{"a": 0, "b": True, "p": "50000", "s": "0.001", "r": False,
+                    "t": {"limit": {"tif": "Ioc"}}}],
+        "grouping": "na",
+    }
+    nonce = 1_700_000_000_000
+
+    no_vault_hash = HyperliquidSigner._action_hash(action, None, nonce)
+    with_vault_hash = HyperliquidSigner._action_hash(
+        action, "0x1234567890abcdef1234567890abcdef12345678", nonce,
+    )
+    other_vault_hash = HyperliquidSigner._action_hash(
+        action, "0xabcdefabcdefabcdefabcdefabcdefabcdefabcd", nonce,
+    )
+
+    assert len(no_vault_hash) == 32
+    assert len(with_vault_hash) == 32
+    assert no_vault_hash != with_vault_hash
+    assert with_vault_hash != other_vault_hash
+
+
+def test_hyperliquid_signer_uses_agent_primary_type_and_exchange_domain():
+    """Regression test: the signing payload must use ``primaryType='Agent'``
+    with ``domain.name='Exchange'`` (Hyperliquid's real scheme), not the
+    legacy ``HyperliquidTransaction`` struct that produced garbage
+    ecrecover addresses.
+    """
+    captured = {}
+
+    class FakeAccount:
+        def sign_message(self, message):
+            return type("Signed", (), {"r": 1, "s": 2, "v": 27})()
+
+    def fake_encode(*args, **kwargs):
+        captured["payload"] = kwargs.get("full_message") or (args[0] if args else None)
+        return object()
+
+    signer = HyperliquidSigner.__new__(HyperliquidSigner)
+    signer.account = FakeAccount()
+
+    import src.trading.live_trader as lt
+    original = lt._encode_typed_data
+    try:
+        lt._encode_typed_data = fake_encode
+        signer.sign_action({"type": "noop"}, nonce=1, vault_address=None)
+    finally:
+        lt._encode_typed_data = original
+
+    payload = captured["payload"]
+    assert payload is not None, "encode_typed_data was not called"
+    assert payload["primaryType"] == "Agent"
+    assert payload["domain"]["name"] == "Exchange"
+    assert payload["domain"]["chainId"] == 1337
+    assert payload["domain"]["verifyingContract"] == "0x" + "0" * 40
+    assert "Agent" in payload["types"]
+    assert {"name": "source", "type": "string"} in payload["types"]["Agent"]
+    assert {"name": "connectionId", "type": "bytes32"} in payload["types"]["Agent"]
+    assert payload["message"]["source"] == "a"
+    assert isinstance(payload["message"]["connectionId"], (bytes, bytearray))
+    assert len(payload["message"]["connectionId"]) == 32
 
 
 def test_rescale_size_for_live_blocks_when_paper_balance_missing(monkeypatch):
