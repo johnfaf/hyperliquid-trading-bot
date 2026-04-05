@@ -362,7 +362,7 @@ def build_subsystems(
     # ─── Dashboard ────────────────────────────────────────────
     if "dashboard" in profile:
         try:
-            from src.ui.dashboard import start_dashboard, set_v2_components
+            from src.ui.dashboard import start_dashboard, set_v2_components, set_live_trader
             set_v2_components(
                 firewall=c.firewall,
                 regime_detector=c.regime_detector,
@@ -377,6 +377,8 @@ def build_subsystems(
                 decision_engine=c.decision_engine,
                 multi_scanner=c.multi_scanner,
             )
+            if c.live_trader:
+                set_live_trader(c.live_trader)
             c.dashboard = start_dashboard(options_scanner=c.options_scanner)
             logger.info("  ✓ dashboard")
         except Exception as exc:

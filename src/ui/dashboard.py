@@ -229,6 +229,114 @@ _arena_incubator = None
 _decision_engine = None
 _multi_scanner = None
 
+# Module-level live trader reference for closing positions on exchange
+_live_trader = None
+
+
+def set_live_trader(trader):
+    """Set the live trader reference so the dashboard can close live positions."""
+    global _live_trader  # noqa: PLW0603
+    _live_trader = trader
+
+
+def _close_paper_trade_at_market(trade_id: int) -> dict:
+    """
+    Close a single paper trade at the current market price.
+    If live trading is active, also closes the position on exchange.
+
+    Returns dict with status and details.
+    """
+    from src.data import database as db
+    from src.data.hyperliquid_client import get_all_mids
+
+    # Fetch the trade
+    conn = _get_db()
+    try:
+        row = conn.execute(
+            "SELECT * FROM paper_trades WHERE id = ? AND status = 'open'", (trade_id,)
+        ).fetchone()
+    finally:
+        conn.close()
+
+    if not row:
+        return {"error": f"Trade {trade_id} not found or already closed", "status": "error"}
+
+    trade = dict(row)
+    coin = trade.get("coin", "")
+    side = trade.get("side", "")
+    entry_price = float(trade.get("entry_price", 0) or 0)
+    size = float(trade.get("size", 0) or 0)
+    leverage = float(trade.get("leverage", 1) or 1)
+
+    # Get current market price
+    mids = get_all_mids() or {}
+    current_price = float(mids.get(coin, 0) or 0)
+    if current_price <= 0:
+        return {"error": f"Cannot get market price for {coin}", "status": "error"}
+
+    # Calculate PnL
+    if side == "long":
+        pnl = (current_price - entry_price) * size * leverage
+    else:
+        pnl = (entry_price - current_price) * size * leverage
+    pnl = round(pnl, 2)
+
+    # Update metadata
+    try:
+        existing_meta = trade.get("metadata", {})
+        if isinstance(existing_meta, str):
+            existing_meta = json.loads(existing_meta or "{}")
+        existing_meta = dict(existing_meta or {})
+    except Exception:
+        existing_meta = {}
+    existing_meta["manual_close"] = True
+    existing_meta["close_source"] = "dashboard"
+    db.update_paper_trade_metadata(trade_id, existing_meta)
+
+    # Close the paper trade in DB
+    if not db.close_paper_trade(trade_id, current_price, pnl):
+        return {"error": f"Failed to close trade {trade_id} in DB", "status": "error"}
+
+    # Update paper account balance
+    account = db.get_paper_account()
+    if not account:
+        # Account row missing — initialize with default balance
+        db.init_paper_account(config.PAPER_TRADING_INITIAL_BALANCE)
+        account = db.get_paper_account()
+    if account:
+        new_balance = float(account.get("balance", 0) or 0) + pnl
+        total_pnl = float(account.get("total_pnl", 0) or 0) + pnl
+        total_trades = int(account.get("total_trades", 0) or 0) + 1
+        winning = int(account.get("winning_trades", 0) or 0) + (1 if pnl > 0 else 0)
+        db.update_paper_account(new_balance, total_pnl, total_trades, winning)
+
+    # If live trading is active, also close the position on exchange
+    live_close_result = None
+    if _live_trader:
+        try:
+            if hasattr(_live_trader, 'is_live_enabled') and _live_trader.is_live_enabled():
+                if hasattr(_live_trader, 'is_deployable') and _live_trader.is_deployable():
+                    live_close_result = _live_trader.close_position(coin)
+                    logger.info("Live position closed for %s: %s", coin, live_close_result)
+        except Exception as e:
+            logger.error("Failed to close live position for %s: %s", coin, e)
+            live_close_result = {"status": "error", "message": str(e)}
+
+    logger.info(
+        "Manually closed trade #%d: %s %s @ $%.2f -> $%.2f, PnL: $%.2f",
+        trade_id, side.upper(), coin, entry_price, current_price, pnl,
+    )
+    return {
+        "status": "ok",
+        "trade_id": trade_id,
+        "coin": coin,
+        "side": side,
+        "entry_price": entry_price,
+        "exit_price": current_price,
+        "pnl": pnl,
+        "live_close": live_close_result,
+    }
+
 
 def set_v2_components(firewall=None, regime_detector=None, arena=None,
                        kelly_sizer=None, trade_memory=None, calibration=None,
@@ -287,6 +395,14 @@ tr:hover{background:#141b2d}
 .flex-row{display:flex;gap:16px;flex-wrap:wrap}
 .flex-row>*{flex:1;min-width:300px}
 canvas{width:100%!important;height:200px!important}
+.btn{padding:4px 10px;border-radius:4px;border:none;cursor:pointer;font-size:0.75em;font-weight:600;transition:opacity 0.2s}
+.btn:hover{opacity:0.8}
+.btn:disabled{opacity:0.4;cursor:not-allowed}
+.btn-close{background:#ff475733;color:#ff4757;border:1px solid #ff4757}
+.btn-close-all{background:#ff475722;color:#ff4757;border:1px solid #ff4757;padding:6px 14px;font-size:0.8em}
+.btn-reset{background:#ffa50222;color:#ffa502;border:1px solid #ffa502;padding:6px 14px;font-size:0.8em}
+.btn-success{background:#00d4aa22;color:#00d4aa;border:1px solid #00d4aa}
+.action-bar{display:flex;gap:10px;align-items:center;margin-bottom:10px}
 </style>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
 </head>
@@ -305,8 +421,14 @@ canvas{width:100%!important;height:200px!important}
 
 <div class="flex-row">
 <div class="section">
+<div style="display:flex;justify-content:space-between;align-items:center">
 <h2>Open Positions</h2>
-<table><thead><tr><th>Coin</th><th>Side</th><th>Entry</th><th>Current</th><th>Size</th><th>Lev</th><th>Unreal. PnL</th><th>SL</th><th>TP</th><th>Strategy</th></tr></thead>
+<div class="action-bar">
+<button class="btn btn-close-all" onclick="closeAllTrades()" id="btn-close-all" title="Close all open positions at market price">Close All</button>
+<button class="btn btn-reset" onclick="resetPaperTrading()" id="btn-reset" title="Reset paper trading history (keeps discovered traders & strategies)">Reset History</button>
+</div>
+</div>
+<table><thead><tr><th>Coin</th><th>Side</th><th>Entry</th><th>Current</th><th>Size</th><th>Lev</th><th>Unreal. PnL</th><th>SL</th><th>TP</th><th>Strategy</th><th>Action</th></tr></thead>
 <tbody id="open-trades"></tbody></table>
 </div>
 </div>
@@ -478,8 +600,12 @@ function renderOpenTrades(trades){
     <td>${fmt(t.size,4)}</td><td>${t.leverage}x</td>
     <td class="${pnlCls}">${unrealPnL !== '—' ? fmtUsd(unrealPnL) : '—'}</td>
     <td>${fmtUsd(t.stop_loss)}</td><td>${fmtUsd(t.take_profit)}</td>
-    <td>${t.strategy_id||'—'}</td></tr>`;
-  }).join('') : '<tr><td colspan="10" style="color:#555">No open positions</td></tr>';
+    <td>${t.strategy_id||'—'}</td>
+    <td><button class="btn btn-close" onclick="closeTrade(${t.id},'${t.coin}')" id="close-btn-${t.id}" title="Close this position at market price">Close</button></td></tr>`;
+  }).join('') : '<tr><td colspan="11" style="color:#555">No open positions</td></tr>';
+  // Show/hide close-all button based on open trades
+  const closeAllBtn = document.getElementById('btn-close-all');
+  if(closeAllBtn) closeAllBtn.style.display = trades.length ? '' : 'none';
 }
 
 function renderStrategies(strats){
@@ -572,6 +698,77 @@ function renderEquityChart(closed){
       scales:{x:{ticks:{color:'#555',maxTicksLimit:10}},y:{ticks:{color:'#7b8ab8'}}},
       plugins:{legend:{labels:{color:'#7b8ab8'}}}}
   });
+}
+
+async function closeTrade(tradeId, coin){
+  if(!confirm(`Close ${coin} position at market price?`)) return;
+  const btn = document.getElementById('close-btn-'+tradeId);
+  if(btn){btn.disabled=true;btn.textContent='Closing...';}
+  try {
+    const resp = await fetch('/api/trade/close', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({trade_id: tradeId})
+    });
+    const d = await resp.json();
+    if(d.status === 'ok'){
+      if(btn){btn.textContent='Closed';btn.classList.remove('btn-close');btn.classList.add('btn-success');}
+      setTimeout(refresh, 500);
+    } else {
+      alert('Close failed: '+(d.error||d.message||'Unknown error'));
+      if(btn){btn.disabled=false;btn.textContent='Close';}
+    }
+  } catch(e){
+    alert('Close error: '+e.message);
+    if(btn){btn.disabled=false;btn.textContent='Close';}
+  }
+}
+
+async function closeAllTrades(){
+  const count = (window.currentOpenTrades||[]).length;
+  if(!count) return alert('No open positions to close.');
+  if(!confirm(`Close ALL ${count} open position(s) at market price?`)) return;
+  const btn = document.getElementById('btn-close-all');
+  if(btn){btn.disabled=true;btn.textContent='Closing all...';}
+  try {
+    const resp = await fetch('/api/trade/close-all', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({})
+    });
+    const d = await resp.json();
+    if(d.status === 'ok'){
+      if(btn){btn.textContent=`Closed ${d.closed||0} positions`;btn.classList.remove('btn-close-all');btn.classList.add('btn-success');}
+      setTimeout(()=>{refresh();if(btn){btn.textContent='Close All';btn.classList.add('btn-close-all');btn.classList.remove('btn-success');btn.disabled=false;}}, 1500);
+    } else {
+      alert('Close all failed: '+(d.error||'Unknown error'));
+      if(btn){btn.disabled=false;btn.textContent='Close All';}
+    }
+  } catch(e){
+    alert('Close all error: '+e.message);
+    if(btn){btn.disabled=false;btn.textContent='Close All';}
+  }
+}
+
+async function resetPaperTrading(){
+  if(!confirm('Reset paper trading history?\\n\\nThis will:\\n- Close & delete all paper trades\\n- Reset balance to initial ($10,000)\\n- Reset PnL, win rate, and trade count\\n\\nDiscovered traders, strategies, and research data will be KEPT.')) return;
+  const btn = document.getElementById('btn-reset');
+  if(btn){btn.disabled=true;btn.textContent='Resetting...';}
+  try {
+    const resp = await fetch('/api/paper/reset', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({})
+    });
+    const d = await resp.json();
+    if(d.status === 'ok'){
+      if(btn){btn.textContent=`Reset done (${d.open_deleted||0}+${d.closed_deleted||0} trades cleared)`;btn.classList.remove('btn-reset');btn.classList.add('btn-success');}
+      setTimeout(()=>{refresh();if(btn){btn.textContent='Reset History';btn.classList.add('btn-reset');btn.classList.remove('btn-success');btn.disabled=false;}}, 2000);
+    } else {
+      alert('Reset failed: '+(d.error||'Unknown error'));
+      if(btn){btn.disabled=false;btn.textContent='Reset History';}
+    }
+  } catch(e){
+    alert('Reset error: '+e.message);
+    if(btn){btn.disabled=false;btn.textContent='Reset History';}
+  }
 }
 
 async function refresh(){
@@ -869,6 +1066,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._handle_backtest_run()
         elif parsed.path == "/api/paper/reset":
             self._handle_paper_reset()
+        elif parsed.path == "/api/trade/close":
+            self._handle_close_trade()
+        elif parsed.path == "/api/trade/close-all":
+            self._handle_close_all_trades()
         elif parsed.path == "/api/candle-backtest/run":
             self._handle_candle_backtest()
         elif parsed.path == "/api/candle-backtest/fetch":
@@ -895,6 +1096,50 @@ class DashboardHandler(BaseHTTPRequestHandler):
             result = reset_paper_trades(balance)
             self._json_response({"status": "ok", **result})
         except Exception as e:
+            self._json_response({"error": str(e)}, code=500)
+
+    def _handle_close_trade(self):
+        """Close a single paper trade at current market price."""
+        try:
+            content_len = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(content_len)) if content_len > 0 else {}
+            trade_id = body.get("trade_id")
+            if not trade_id:
+                self._json_response({"error": "trade_id required"}, code=400)
+                return
+
+            result = _close_paper_trade_at_market(trade_id)
+            self._json_response(result, code=200 if result.get("status") == "ok" else 400)
+        except Exception as e:
+            logger.error("Close trade error: %s", e)
+            self._json_response({"error": str(e)}, code=500)
+
+    def _handle_close_all_trades(self):
+        """Close all open paper trades at current market prices."""
+        try:
+            from src.data import database as db
+            open_trades = db.get_open_paper_trades()
+            if not open_trades:
+                self._json_response({"status": "ok", "closed": 0, "message": "No open trades"})
+                return
+
+            closed = 0
+            errors = []
+            for trade in open_trades:
+                result = _close_paper_trade_at_market(trade["id"])
+                if result.get("status") == "ok":
+                    closed += 1
+                else:
+                    errors.append(f"{trade.get('coin','?')}: {result.get('error','unknown')}")
+
+            self._json_response({
+                "status": "ok",
+                "closed": closed,
+                "total": len(open_trades),
+                "errors": errors if errors else None,
+            })
+        except Exception as e:
+            logger.error("Close all trades error: %s", e)
             self._json_response({"error": str(e)}, code=500)
 
     def _serve_stress_html(self):

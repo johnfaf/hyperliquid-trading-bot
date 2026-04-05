@@ -782,8 +782,8 @@ class LiveTrader:
         # Position size limit only applies to new positions, not closes.
         # A reduce_only order can never increase exposure, so blocking it
         # would leave the position stuck open (un-closeable).
+        notional = size * price
         if not reduce_only:
-            notional = size * price
             if notional > self.max_position_size:
                 logger.warning(f"Position size ${notional:.2f} exceeds limit ${self.max_position_size:.2f}")
                 return {"status": "rejected", "reason": "position_size_exceeded"}
@@ -902,19 +902,23 @@ class LiveTrader:
         """
         side = self._normalize_order_side(side)
 
-        if self.kill_switch_active:
-            logger.warning(f"Kill switch active - rejecting limit order {coin}")
-            return {"status": "rejected", "reason": "kill_switch_active"}
+        # Kill switch and position size limit only block NEW positions.
+        # reduce_only orders MUST go through so the bot can exit positions.
+        if not reduce_only:
+            if self.kill_switch_active:
+                logger.warning(f"Kill switch active - rejecting limit order {coin}")
+                return {"status": "rejected", "reason": "kill_switch_active"}
 
         asset_idx = self._get_asset_index(coin)
         if asset_idx is None:
             return {"status": "error", "message": f"Unknown coin: {coin}"}
 
-        # Check position size
+        # Position size check only for new positions
         notional = size * price
-        if notional > self.max_position_size:
-            logger.warning(f"Position size ${notional:.2f} exceeds limit")
-            return {"status": "rejected", "reason": "position_size_exceeded"}
+        if not reduce_only:
+            if notional > self.max_position_size:
+                logger.warning(f"Position size ${notional:.2f} exceeds limit")
+                return {"status": "rejected", "reason": "position_size_exceeded"}
 
         order = {
             "a": asset_idx,
@@ -931,7 +935,7 @@ class LiveTrader:
             "grouping": "na"
         }
 
-        logger.info(f"Placing limit order: {coin} {side} {size} @ ${price:.2f}")
+        logger.info(f"Placing limit order: {coin} {side} {size} @ ${price:.2f} (notional: ${notional:.2f})")
         result = self._post_order(action)
 
         if self._is_order_result_success(result) and not self.dry_run:
