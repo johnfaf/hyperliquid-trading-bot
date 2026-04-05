@@ -104,6 +104,44 @@ def _record_shadow_trade(container, closed_trade, pnl, return_pct, entry):
         logger.debug("  ShadowTracker record error: %s", exc)
 
 
+def _execute_signal_live(container, trade_signal, source_label: str):
+    """Execute a TradeSignal directly on the live trader and log the outcome."""
+    trader = getattr(container, "live_trader", None)
+    if not trader or not is_live_trading_active(container):
+        return None
+
+    try:
+        result = trader.execute_signal(trade_signal, bypass_firewall=True)
+    except Exception as exc:
+        logger.error(
+            "  LIVE %s execution error for %s %s: %s",
+            source_label,
+            trade_signal.side.value.upper(),
+            trade_signal.coin,
+            exc,
+        )
+        return None
+
+    if result and result.get("status") not in ("error", "rejected"):
+        logger.info(
+            "  LIVE %s executed: %s %s (%s)",
+            source_label,
+            trade_signal.side.value.upper(),
+            trade_signal.coin,
+            result.get("status", "ok"),
+        )
+        return result
+
+    logger.error(
+        "  LIVE %s failed: %s %s -> %s",
+        source_label,
+        trade_signal.side.value.upper(),
+        trade_signal.coin,
+        result,
+    )
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Main trading cycle
 # ---------------------------------------------------------------------------
@@ -599,9 +637,6 @@ def _execute_lcrs_signals(container, lcrs_signals, regime_data):
     """Phase 4a: execute liquidation reversal signals."""
     from src.notifications import telegram_bot as tg
     logger.info("Phase 4a: Liquidation Strategy Execution")
-    if is_live_trading_active(container):
-        logger.warning("  Skipping LCRS paper-only execution while live trading is active")
-        return
     try:
         from src.signals.signal_schema import TradeSignal, SignalSide, SignalSource, RiskParams
         lcrs_executed = []
@@ -651,6 +686,17 @@ def _execute_lcrs_signals(container, lcrs_signals, regime_data):
                         continue
                     trade_signal.confidence = adj_conf
 
+                if is_live_trading_active(container):
+                    live_result = _execute_signal_live(container, trade_signal, "LCRS")
+                    if live_result:
+                        lcrs_executed.append(live_result)
+                        if tg.is_configured():
+                            tg.notify_trade_opened(
+                                {"coin": sig["coin"], "side": sig["side"], "entry_price": sig["price"]},
+                                source="liquidation_strategy",
+                            )
+                    continue
+
                 if account:
                     size_usd = account["balance"] * trade_signal.effective_size
                     size = size_usd / sig["price"]
@@ -690,9 +736,6 @@ def _execute_options_flow_trades(container, regime_data):
     """Phase 4a2: high-conviction options flow → direct trade."""
     from src.notifications import telegram_bot as tg
     logger.info("Phase 4a2: Options Flow Trades")
-    if is_live_trading_active(container):
-        logger.warning("  Skipping options-flow paper-only execution while live trading is active")
-        return
     try:
         from src.signals.signal_schema import signal_from_options_flow
         from src.data import hyperliquid_client as hl_client
@@ -730,6 +773,17 @@ def _execute_options_flow_trades(container, regime_data):
                     "confidence": flow_signal.confidence,
                 })
 
+            if is_live_trading_active(container):
+                live_result = _execute_signal_live(container, flow_signal, "OPTIONS FLOW")
+                if live_result:
+                    options_executed.append(live_result)
+                    if tg.is_configured():
+                        tg.notify_trade_opened(
+                            {"coin": conv["ticker"], "side": flow_signal.side.value, "entry_price": price},
+                            source="options_flow",
+                        )
+                continue
+
             account = db.get_paper_account()
             if account:
                 size_usd = account["balance"] * flow_signal.effective_size
@@ -740,7 +794,7 @@ def _execute_options_flow_trades(container, regime_data):
                 trade_id = db.open_paper_trade(
                     strategy_id=None, coin=conv["ticker"], side=side,
                     entry_price=price, size=size, leverage=2,
-                    stop_loss=round(sl, 2), take_profit=round(tp, 2),
+                    stop_loss=sl, take_profit=tp,
                     metadata={
                         "source": "options_flow",
                         "conviction": conv["conviction_pct"],
@@ -888,9 +942,6 @@ def _run_alpha_arena(container, regime_data):
     if not container.arena:
         return
     logger.info("Phase 5: Alpha Arena")
-    if is_live_trading_active(container):
-        logger.warning("  Skipping arena champion paper execution while live trading is active")
-        return
     try:
         import requests
         arena_candles = None
@@ -925,6 +976,7 @@ def _run_alpha_arena(container, regime_data):
         # Champion signals → paper trading
         if arena_candles and len(arena_candles) >= 30:
             try:
+                from src.signals.signal_schema import TradeSignal, SignalSide, SignalSource, RiskParams
                 champion_signals = container.arena.get_champion_signals(
                     current_candles=arena_candles[-100:], min_fitness=0.15, min_trades=10,
                 )
@@ -940,13 +992,29 @@ def _run_alpha_arena(container, regime_data):
                             conf = sig["confidence"]
                             sl = price * (0.95 if side == "long" else 1.05)
                             tp = price * (1.10 if side == "long" else 0.90)
+                            if is_live_trading_active(container):
+                                live_signal = TradeSignal(
+                                    coin=sig["coin"],
+                                    side=SignalSide(side),
+                                    confidence=conf,
+                                    source=SignalSource.STRATEGY,
+                                    reason=f"Arena champion: {sig['agent_name']}",
+                                    strategy_type=sig["strategy_type"],
+                                    entry_price=price,
+                                    leverage=2,
+                                    position_pct=0.05 * conf,
+                                    risk=RiskParams(stop_loss_pct=0.05, take_profit_pct=0.10),
+                                    regime=regime_data.get("overall_regime", "") if regime_data else "",
+                                )
+                                _execute_signal_live(container, live_signal, "ARENA")
+                                continue
                             if account:
                                 size_usd = account["balance"] * 0.05 * conf
                                 size = size_usd / price
                                 db.open_paper_trade(
                                     strategy_id=None, coin=sig["coin"], side=side,
                                     entry_price=price, size=size, leverage=2,
-                                    stop_loss=round(sl, 2), take_profit=round(tp, 2),
+                                    stop_loss=sl, take_profit=tp,
                                     metadata={
                                         "source": "arena_champion",
                                         "agent_id": sig["agent_id"],

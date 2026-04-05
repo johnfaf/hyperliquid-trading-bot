@@ -63,6 +63,7 @@ except ImportError:
 import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import config
+from src.core.api_manager import Priority, get_manager
 from src.core.secret_manager import SecretManagerError, load_agent_private_key
 from src.signals.decision_firewall import DecisionFirewall
 from src.signals.signal_schema import TradeSignal, signal_from_execution_dict
@@ -410,8 +411,9 @@ class LiveTrader:
         self.status_reason = "dry_run_requested" if dry_run else "initializing"
 
         # API endpoints (must come early since _load_* methods need these)
-        self.exchange_url = "https://api.hyperliquid.xyz/exchange"
-        self.info_url = "https://api.hyperliquid.xyz/info"
+        self.exchange_url = config.HYPERLIQUID_EXCHANGE_URL
+        self.info_url = config.HYPERLIQUID_INFO_URL
+        self.api_manager = get_manager()
 
         # Signer (loaded from env)
         self.signer = None
@@ -652,15 +654,12 @@ class LiveTrader:
         as ``{"error": "Order has invalid price."}``.
         """
         try:
-            response = requests.post(
-                self.info_url,
-                json={"type": "meta"},
-                timeout=10
+            data = self.api_manager.post(
+                {"type": "meta"},
+                priority=Priority.LOW,
+                timeout=10,
             )
-            response.raise_for_status()
-            data = response.json()
-
-            if "universe" in data:
+            if isinstance(data, dict) and "universe" in data:
                 for idx, coin_data in enumerate(data["universe"]):
                     coin_name = coin_data.get("name", "")
                     if coin_name:
@@ -702,13 +701,11 @@ class LiveTrader:
         if not self.public_address:
             return {}
         try:
-            response = requests.post(
-                self.info_url,
-                json={"type": "clearinghouseState", "user": self.public_address},
+            data = self.api_manager.post(
+                {"type": "clearinghouseState", "user": self.public_address},
+                priority=Priority.HIGH,
                 timeout=10,
             )
-            response.raise_for_status()
-            data = response.json()
             return data if isinstance(data, dict) else {}
         except Exception as e:
             logger.error(f"Error getting account state: {e}")
@@ -760,13 +757,13 @@ class LiveTrader:
         if not self.public_address:
             return None
         try:
-            response = requests.post(
-                self.info_url,
-                json={"type": "spotClearinghouseState", "user": self.public_address},
+            data = self.api_manager.post(
+                {"type": "spotClearinghouseState", "user": self.public_address},
+                priority=Priority.HIGH,
                 timeout=10,
             )
-            response.raise_for_status()
-            data = response.json()
+            if not isinstance(data, dict):
+                return None
             for bal in data.get("balances", []):
                 if bal.get("coin") == "USDC":
                     return float(bal.get("total", 0) or 0)
@@ -794,15 +791,14 @@ class LiveTrader:
         perps = None
         try:
             if self.public_address:
-                response = requests.post(
-                    self.info_url,
-                    json={"type": "clearinghouseState", "user": self.public_address},
+                data = self.api_manager.post(
+                    {"type": "clearinghouseState", "user": self.public_address},
+                    priority=Priority.HIGH,
                     timeout=10,
                 )
-                response.raise_for_status()
-                data = response.json()
-                margin_summary = data.get("marginSummary", {}) or {}
-                perps = float(margin_summary.get("accountValue", 0) or 0)
+                if isinstance(data, dict):
+                    margin_summary = data.get("marginSummary", {}) or {}
+                    perps = float(margin_summary.get("accountValue", 0) or 0)
         except Exception as e:
             logger.debug("snapshot_balance: perps fetch error: %s", e)
             perps = None
@@ -1159,14 +1155,11 @@ class LiveTrader:
             if not self.public_address:
                 return
 
-            response = requests.post(
-                self.info_url,
-                json={"type": "userFills", "user": self.public_address},
+            fills = self.api_manager.post(
+                {"type": "userFills", "user": self.public_address},
+                priority=Priority.NORMAL,
                 timeout=10,
             )
-            response.raise_for_status()
-            fills = response.json()
-
             if not isinstance(fills, list):
                 return
 
@@ -1209,13 +1202,13 @@ class LiveTrader:
     def _get_mid_price(self, coin: str) -> Optional[float]:
         """Get mid price from Hyperliquid."""
         try:
-            response = requests.post(
-                self.info_url,
-                json={"type": "allMids"},
-                timeout=10
+            mids = self.api_manager.post(
+                {"type": "allMids"},
+                priority=Priority.HIGH,
+                timeout=10,
             )
-            response.raise_for_status()
-            mids = response.json()
+            if not isinstance(mids, dict):
+                return None
 
             price = mids.get(coin)
             if price:
@@ -1452,13 +1445,19 @@ class LiveTrader:
 
             logger.debug(f"Posting order to {self.exchange_url}: action_hash={action_hash}")
 
-            response = requests.post(
-                self.exchange_url,
-                json=payload,
-                timeout=30
+            result = self.api_manager.post(
+                payload,
+                priority=Priority.CRITICAL,
+                retries=1,
+                endpoint_url=self.exchange_url,
+                cache_response=False,
+                req_type="exchange",
+                timeout=30,
+                raise_on_timeout=True,
             )
-            response.raise_for_status()
-            result = response.json()
+            if result is None:
+                logger.error("Exchange request failed for action_hash=%s", action_hash[:16])
+                return {"status": "error", "message": "exchange request failed"}
 
             logger.info(f"Order posted: {json.dumps(result)}")
 
@@ -2077,13 +2076,11 @@ class LiveTrader:
                 logger.warning("No public address configured")
                 return []
 
-            response = requests.post(
-                self.info_url,
-                json={"type": "openOrders", "user": self.public_address},
-                timeout=10
+            data = self.api_manager.post(
+                {"type": "openOrders", "user": self.public_address},
+                priority=Priority.HIGH,
+                timeout=10,
             )
-            response.raise_for_status()
-            data = response.json()
 
             orders = data.get("orders", []) if isinstance(data, dict) else data
             return orders

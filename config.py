@@ -6,6 +6,7 @@ import os
 # ─── API Endpoints ─────────────────────────────────────────────
 HYPERLIQUID_API_URL = "https://api.hyperliquid.xyz"
 HYPERLIQUID_INFO_URL = f"{HYPERLIQUID_API_URL}/info"
+HYPERLIQUID_EXCHANGE_URL = f"{HYPERLIQUID_API_URL}/exchange"
 
 # ─── Database ──────────────────────────────────────────────────
 # Priority: HL_BOT_DB env var > /data/ volume > local ./data/

@@ -106,12 +106,23 @@ def _safe_init(name: str, factory, health: SubsystemHealthRegistry,
     health.register(name, affects_trading=affects_trading)
     try:
         instance = factory()
-        health.set_status(name, SubsystemState.HEALTHY)
+        health.set_status(
+            name,
+            SubsystemState.HEALTHY,
+            dependency_ready=True,
+            startup_status="READY",
+        )
         health.heartbeat(name)
         logger.info("  ✓ %s", name)
         return instance
     except Exception as exc:
-        health.set_status(name, SubsystemState.FAILED, reason=str(exc)[:120])
+        health.set_status(
+            name,
+            SubsystemState.FAILED,
+            reason=str(exc)[:120],
+            dependency_ready=False,
+            startup_status="FAILED",
+        )
         logger.warning("  ✗ %s — %s", name, exc)
         return None
 
@@ -301,12 +312,16 @@ def build_subsystems(
                     "live_trader",
                     SubsystemState.DISABLED,
                     reason="LIVE_TRADING_ENABLED=false",
+                    dependency_ready=False,
+                    startup_status="DISABLED",
                 )
             elif not c.live_trader.is_deployable():
                 health.set_status(
                     "live_trader",
                     SubsystemState.DEGRADED,
                     reason=c.live_trader.get_stats().get("status_reason", "not deployable"),
+                    dependency_ready=False,
+                    startup_status="WAITING_FOR_DEPENDENCIES",
                 )
 
     # ─── Cross-venue hedger ───────────────────────────────────

@@ -146,8 +146,9 @@ def run_reporting(container, cycle_count: int, health_registry=None) -> None:
     if health_registry:
         try:
             stale = health_registry.check_stale(timeout_seconds=600)
-            if stale:
-                logger.warning("  Stale subsystems: %s", stale)
+            stale_names = {name: state for name, state in stale.items() if state}
+            if stale_names:
+                logger.warning("  Stale subsystems: %s", stale_names)
         except Exception:
             pass
 

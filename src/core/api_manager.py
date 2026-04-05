@@ -223,6 +223,7 @@ CACHE_TTLS = {
 
 # Priority by request type
 REQUEST_PRIORITIES = {
+    "exchange": Priority.CRITICAL,
     "clearinghouseState": Priority.HIGH,    # Position checks for stop losses
     "allMids": Priority.HIGH,              # Price data for execution
     "userFills": Priority.NORMAL,
@@ -534,31 +535,48 @@ class APIManager:
                 self.ws.subscribe_coin(coin)
         self.ws.start()
 
-    def post(self, payload: dict, priority: Priority = None,
-             cache_ttl: Optional[float] = None,
-             retries: int = 3) -> Optional[Any]:
+    def post(
+        self,
+        payload: dict,
+        priority: Priority = None,
+        cache_ttl: Optional[float] = None,
+        retries: int = 3,
+        endpoint_url: Optional[str] = None,
+        cache_response: bool = True,
+        req_type: Optional[str] = None,
+        timeout: int = 30,
+        raise_on_timeout: bool = False,
+    ) -> Optional[Any]:
         """
         Central API call with rate limiting + caching.
         All modules should use this instead of direct requests.post().
         """
-        req_type = payload.get("type", "unknown")
+        req_type = req_type or payload.get("type", "unknown")
+        endpoint_url = endpoint_url or config.HYPERLIQUID_INFO_URL
 
         # Determine priority
         if priority is None:
             priority = REQUEST_PRIORITIES.get(req_type, Priority.NORMAL)
 
         # Build cache key from payload
-        cache_key = self._cache_key(payload)
+        cache_key = self._cache_key(endpoint_url, payload)
 
         # Check cache first
-        cached = self.cache.get(cache_key)
-        if cached is not None:
-            with self._lock:
-                self._cache_served += 1
-            return cached
+        if cache_response:
+            cached = self.cache.get(cache_key)
+            if cached is not None:
+                with self._lock:
+                    self._cache_served += 1
+                return cached
 
         # For allMids, try WebSocket first
-        if req_type == "allMids" and self.ws.is_connected() and self.ws.mids:
+        if (
+            cache_response
+            and endpoint_url == config.HYPERLIQUID_INFO_URL
+            and req_type == "allMids"
+            and self.ws.is_connected()
+            and self.ws.mids
+        ):
             # Convert back to string format like the REST API returns
             mids = {k: str(v) for k, v in self.ws.get_all_mids().items()}
             if mids:
@@ -584,7 +602,19 @@ class APIManager:
             self._total_requests += 1
             self._rest_requests += 1
 
-        result = self._do_request(payload, retries=retries)
+        try:
+            result = self._do_request(
+                payload,
+                endpoint_url=endpoint_url,
+                req_type=req_type,
+                retries=retries,
+                timeout=timeout,
+                raise_on_timeout=raise_on_timeout,
+            )
+        except requests.exceptions.Timeout:
+            with self._lock:
+                self._recent_failures += 1
+            raise
 
         # Track failures for circuit breaker
         with self._lock:
@@ -602,13 +632,21 @@ class APIManager:
                 self._recent_failures = max(0, self._recent_failures - 1)
 
         # Cache the result
-        if result is not None:
+        if cache_response and result is not None:
             ttl = cache_ttl or CACHE_TTLS.get(req_type, self.cache.default_ttl)
             self.cache.put(cache_key, result, ttl=ttl)
 
         return result
 
-    def _do_request(self, payload: dict, retries: int = 3) -> Optional[Any]:
+    def _do_request(
+        self,
+        payload: dict,
+        endpoint_url: str,
+        req_type: Optional[str] = None,
+        retries: int = 3,
+        timeout: int = 30,
+        raise_on_timeout: bool = False,
+    ) -> Optional[Any]:
         """
         Execute the HTTP request with classified error handling.
 
@@ -620,15 +658,15 @@ class APIManager:
         - 5xx (server): retry with backoff — transient
         - Network errors: retry with backoff — transient
         """
-        req_type = payload.get("type", "unknown")
+        req_type = req_type or payload.get("type", "unknown")
 
         for attempt in range(retries):
             try:
                 resp = requests.post(
-                    config.HYPERLIQUID_INFO_URL,
+                    endpoint_url,
                     json=payload,
                     headers={"Content-Type": "application/json"},
-                    timeout=30,
+                    timeout=timeout,
                 )
 
                 # ── 429: Rate limited — always retry with hard backoff ──
@@ -682,6 +720,8 @@ class APIManager:
                 return resp.json()
 
             except requests.exceptions.Timeout:
+                if raise_on_timeout:
+                    raise
                 wait = jittered_backoff(attempt, base=2.0, cap=20.0)
                 logger.warning(
                     f"TIMEOUT type='{req_type}' — retry in {wait:.1f}s "
@@ -708,10 +748,10 @@ class APIManager:
 
         return None
 
-    def _cache_key(self, payload: dict) -> str:
+    def _cache_key(self, endpoint_url: str, payload: dict) -> str:
         """Generate a deterministic cache key from a payload."""
         # Sort keys for deterministic ordering
-        raw = json.dumps(payload, sort_keys=True)
+        raw = json.dumps({"endpoint": endpoint_url, "payload": payload}, sort_keys=True)
         return hashlib.md5(raw.encode()).hexdigest()
 
     def get_stats(self) -> Dict:

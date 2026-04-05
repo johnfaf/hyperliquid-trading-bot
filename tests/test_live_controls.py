@@ -10,7 +10,15 @@ from datetime import datetime, timezone
 import config
 import main
 from src.core import boot
-from src.core.cycles.trading_cycle import _process_closed_trades
+from src.core.api_manager import Priority
+from src.core.cycles.reporting_cycle import run_reporting
+from src.core.cycles.trading_cycle import (
+    _execute_lcrs_signals,
+    _execute_options_flow_trades,
+    _process_closed_trades,
+    _run_alpha_arena,
+)
+from src.core.health_registry import SubsystemHealthRegistry, SubsystemState
 from src.core.live_execution import (
     _rescale_size_for_live,
     get_execution_open_positions,
@@ -114,6 +122,50 @@ def test_shadow_mode_bypasses_rotation_reject_when_capacity_exists():
     assert manager.should_bypass_reject_in_shadow_mode(decision, open_positions_count=8) is False
 
 
+def test_health_registry_requires_dependency_ready_for_trading_safety():
+    registry = SubsystemHealthRegistry()
+    registry.register("strategy_scorer", affects_trading=True)
+
+    assert registry.is_trading_safe("strategy_scorer") is False
+    assert registry.is_all_trading_safe() is False
+
+    registry.set_status(
+        "strategy_scorer",
+        SubsystemState.HEALTHY,
+        dependency_ready=True,
+        startup_status="READY",
+    )
+
+    assert registry.is_trading_safe("strategy_scorer") is True
+    assert registry.is_all_trading_safe() is True
+
+
+def test_run_reporting_skips_false_positive_stale_warning(monkeypatch):
+    warnings = []
+    container = type(
+        "Container",
+        (),
+        {
+            "reporter": None,
+            "paper_trader": None,
+            "shadow_tracker": None,
+            "cross_venue_hedger": None,
+            "scorer": None,
+        },
+    )()
+
+    class FakeHealth:
+        def check_stale(self, timeout_seconds=600):
+            return {"live_trader": False, "paper_trader": False}
+
+    monkeypatch.setattr("src.core.cycles.reporting_cycle._log_module_stats", lambda container: None)
+    monkeypatch.setattr("src.core.cycles.reporting_cycle.logger.warning", lambda msg, *args: warnings.append(msg % args))
+
+    run_reporting(container, cycle_count=1, health_registry=FakeHealth())
+
+    assert warnings == []
+
+
 def test_live_trader_coerces_execution_dict_and_uses_live_firewall_state(monkeypatch):
     class FakeFirewall:
         def validate(self, signal, **kwargs):
@@ -206,6 +258,80 @@ def test_live_trader_maps_long_to_buy_and_places_sell_protection(monkeypatch):
     assert entry_calls == [("ETH", "buy", 0.1, False)]
     assert [call[1] for call in trigger_calls] == ["sell", "sell"]
     assert [call[4] for call in trigger_calls] == ["sl", "tp"]
+
+
+def test_live_trader_routes_info_calls_through_api_manager(monkeypatch):
+    class FakeManager:
+        def __init__(self):
+            self.calls = []
+
+        def post(self, payload, **kwargs):
+            self.calls.append((payload, kwargs))
+            if payload.get("type") == "meta":
+                return {"universe": [{"name": "ETH"}]}
+            if payload.get("type") == "allMids":
+                return {"ETH": "2000.0"}
+            raise AssertionError(f"unexpected payload: {payload}")
+
+    manager = FakeManager()
+
+    class FakeFirewall:
+        def validate(self, signal, **kwargs):
+            return True, "ok"
+
+    monkeypatch.setattr("src.trading.live_trader.get_manager", lambda: manager)
+    monkeypatch.setattr(LiveTrader, "_load_credentials", _fake_live_credentials)
+
+    trader = LiveTrader(firewall=FakeFirewall(), dry_run=True)
+    price = trader._get_mid_price("ETH")
+
+    assert price == 2000.0
+    assert manager.calls[0][0]["type"] == "meta"
+    assert manager.calls[1][0]["type"] == "allMids"
+    assert manager.calls[1][1]["priority"] == Priority.HIGH
+
+
+def test_post_order_routes_exchange_requests_through_api_manager(monkeypatch):
+    class FakeManager:
+        def __init__(self):
+            self.calls = []
+
+        def post(self, payload, **kwargs):
+            self.calls.append((payload, kwargs))
+            return {"status": "ok"}
+
+    class FakeSigner:
+        address = "0x1111111111111111111111111111111111111111"
+
+        def sign_action(self, action, nonce):
+            return {"r": "0x1", "s": "0x2", "v": 27}
+
+    manager = FakeManager()
+
+    def _load_credentials(self):
+        self.signer = FakeSigner()
+        self.agent_wallet_address = self.signer.address
+        self.public_address = "0x2222222222222222222222222222222222222222"
+        self.status_reason = "credentials_loaded"
+
+    class FakeFirewall:
+        def validate(self, signal, **kwargs):
+            return True, "ok"
+
+    monkeypatch.setattr("src.trading.live_trader.get_manager", lambda: manager)
+    monkeypatch.setattr(LiveTrader, "_load_credentials", _load_credentials)
+    monkeypatch.setattr(LiveTrader, "_load_asset_index_map", lambda self: None)
+
+    trader = LiveTrader(firewall=FakeFirewall(), dry_run=False)
+    result = trader._post_order({"type": "order", "orders": []})
+
+    assert result["status"] == "ok"
+    exchange_call = next(
+        kwargs for payload, kwargs in manager.calls if kwargs.get("req_type") == "exchange"
+    )
+    assert exchange_call["endpoint_url"] == config.HYPERLIQUID_EXCHANGE_URL
+    assert exchange_call["cache_response"] is False
+    assert exchange_call["priority"] == Priority.CRITICAL
 
 
 def test_live_trader_uses_verified_fill_size_for_protection(monkeypatch):
@@ -346,6 +472,268 @@ def test_verify_fill_waits_for_minimum_meaningful_fill(monkeypatch):
     assert result["partial_fill"] is True
     assert abs(result["size"] - 0.06) < 1e-12
     assert abs(result["position_size"] - 0.06) < 1e-12
+
+
+def test_execute_lcrs_signals_live_path_executes_signal(monkeypatch):
+    executed = []
+
+    class FakeLiveTrader:
+        def execute_signal(self, signal, bypass_firewall=False):
+            executed.append((signal.coin, signal.side.value, bypass_firewall))
+            return {"status": "success", "coin": signal.coin}
+
+    class FakeFirewall:
+        def validate(self, signal, **kwargs):
+            return True, "ok"
+
+    container = type(
+        "Container",
+        (),
+        {
+            "live_trader": FakeLiveTrader(),
+            "firewall": FakeFirewall(),
+            "kelly_sizer": None,
+            "trade_memory": None,
+            "llm_filter": None,
+        },
+    )()
+
+    monkeypatch.setattr("src.core.cycles.trading_cycle.is_live_trading_active", lambda container: True)
+    monkeypatch.setattr("src.core.cycles.trading_cycle.get_execution_open_positions", lambda container: [])
+    monkeypatch.setattr("src.notifications.telegram_bot.is_configured", lambda: False)
+
+    _execute_lcrs_signals(
+        container,
+        [
+            {
+                "coin": "ETH",
+                "side": "long",
+                "confidence": 0.7,
+                "price": 2000.0,
+                "leverage": 2,
+                "stop_loss": 1950.0,
+                "take_profit": 2100.0,
+                "features": {"setup_type": "reversal"},
+            }
+        ],
+        {"overall_regime": "neutral"},
+    )
+
+    assert executed == [("ETH", "long", True)]
+
+
+def test_execute_options_flow_live_path_executes_signal(monkeypatch):
+    executed = []
+
+    class FakeLiveTrader:
+        def execute_signal(self, signal, bypass_firewall=False):
+            executed.append((signal.coin, signal.side.value, bypass_firewall))
+            return {"status": "success", "coin": signal.coin}
+
+    class FakeFirewall:
+        def validate(self, signal, **kwargs):
+            return True, "ok"
+
+    class FakeAgentScorer:
+        def record_signal(self, *args, **kwargs):
+            return None
+
+    container = type(
+        "Container",
+        (),
+        {
+            "live_trader": FakeLiveTrader(),
+            "firewall": FakeFirewall(),
+            "agent_scorer": FakeAgentScorer(),
+            "options_scanner": type(
+                "Scanner",
+                (),
+                {
+                    "top_convictions": [
+                        {
+                            "ticker": "ETH",
+                            "direction": "BULLISH",
+                            "conviction_pct": 75,
+                            "net_flow": 100000.0,
+                            "total_prints": 3,
+                        }
+                    ]
+                },
+            )(),
+        },
+    )()
+
+    monkeypatch.setattr("src.core.cycles.trading_cycle.is_live_trading_active", lambda container: True)
+    monkeypatch.setattr("src.core.cycles.trading_cycle.get_execution_open_positions", lambda container: [])
+    monkeypatch.setattr("src.data.hyperliquid_client.get_all_mids", lambda: {"ETH": "2000.0"})
+    monkeypatch.setattr("src.notifications.telegram_bot.is_configured", lambda: False)
+
+    _execute_options_flow_trades(container, {"overall_regime": "neutral"})
+
+    assert executed == [("ETH", "long", True)]
+
+
+def test_execute_options_flow_paper_trade_preserves_precise_stops(monkeypatch):
+    opened = {}
+    price = 0.01234567
+
+    class FakeFirewall:
+        def validate(self, signal, **kwargs):
+            return True, "ok"
+
+    container = type(
+        "Container",
+        (),
+        {
+            "live_trader": None,
+            "firewall": FakeFirewall(),
+            "agent_scorer": None,
+            "options_scanner": type(
+                "Scanner",
+                (),
+                {
+                    "top_convictions": [
+                        {
+                            "ticker": "FART",
+                            "direction": "BULLISH",
+                            "conviction_pct": 80,
+                            "net_flow": 50000.0,
+                            "total_prints": 2,
+                        }
+                    ]
+                },
+            )(),
+        },
+    )()
+
+    monkeypatch.setattr("src.core.cycles.trading_cycle.is_live_trading_active", lambda container: False)
+    monkeypatch.setattr("src.core.cycles.trading_cycle.get_execution_open_positions", lambda container: [])
+    monkeypatch.setattr("src.data.hyperliquid_client.get_all_mids", lambda: {"FART": str(price)})
+    monkeypatch.setattr("src.core.cycles.trading_cycle.db.get_paper_account", lambda: {"balance": 10000.0})
+    monkeypatch.setattr(
+        "src.core.cycles.trading_cycle.db.open_paper_trade",
+        lambda **kwargs: opened.update(kwargs) or 1,
+    )
+    monkeypatch.setattr("src.notifications.telegram_bot.is_configured", lambda: False)
+
+    _execute_options_flow_trades(container, {"overall_regime": "neutral"})
+
+    assert abs(opened["stop_loss"] - (price * 0.95)) < 1e-12
+    assert abs(opened["take_profit"] - (price * 1.10)) < 1e-12
+
+
+def test_run_alpha_arena_live_path_executes_signal(monkeypatch):
+    executed = []
+
+    class FakeResponse:
+        status_code = 200
+
+        def json(self):
+            return [
+                {"o": "1.0", "h": "1.1", "l": "0.9", "c": "1.0", "v": "10"}
+                for _ in range(60)
+            ]
+
+    class FakeLiveTrader:
+        def execute_signal(self, signal, bypass_firewall=False):
+            executed.append((signal.coin, signal.side.value, bypass_firewall, signal.position_pct))
+            return {"status": "success", "coin": signal.coin}
+
+    class FakeArena:
+        def run_cycle(self, historical_candles=None):
+            return None
+
+        def get_stats(self):
+            return {"active_agents": 1, "champions": 1, "total_arena_pnl": 0.0}
+
+        def get_champion_signals(self, **kwargs):
+            return [
+                {
+                    "coin": "FART",
+                    "side": "long",
+                    "confidence": 0.6,
+                    "price": 0.01234567,
+                    "agent_id": "a1",
+                    "agent_name": "alpha",
+                    "strategy_type": "arena_breakout",
+                    "agent_fitness": 1.2,
+                    "agent_elo": 1100,
+                }
+            ]
+
+    container = type(
+        "Container",
+        (),
+        {
+            "arena": FakeArena(),
+            "live_trader": FakeLiveTrader(),
+        },
+    )()
+
+    monkeypatch.setattr("src.core.cycles.trading_cycle.is_live_trading_active", lambda container: True)
+    monkeypatch.setattr("requests.post", lambda *args, **kwargs: FakeResponse())
+
+    _run_alpha_arena(container, {"overall_regime": "neutral"})
+
+    assert executed == [("FART", "long", True, 0.03)]
+
+
+def test_run_alpha_arena_paper_trade_preserves_precise_stops(monkeypatch):
+    opened = {}
+    price = 0.01234567
+
+    class FakeResponse:
+        status_code = 200
+
+        def json(self):
+            return [
+                {"o": "1.0", "h": "1.1", "l": "0.9", "c": "1.0", "v": "10"}
+                for _ in range(60)
+            ]
+
+    class FakeArena:
+        def run_cycle(self, historical_candles=None):
+            return None
+
+        def get_stats(self):
+            return {"active_agents": 1, "champions": 1, "total_arena_pnl": 0.0}
+
+        def get_champion_signals(self, **kwargs):
+            return [
+                {
+                    "coin": "FART",
+                    "side": "short",
+                    "confidence": 0.6,
+                    "price": price,
+                    "agent_id": "a1",
+                    "agent_name": "alpha",
+                    "strategy_type": "arena_breakout",
+                    "agent_fitness": 1.2,
+                    "agent_elo": 1100,
+                }
+            ]
+
+    container = type(
+        "Container",
+        (),
+        {
+            "arena": FakeArena(),
+            "live_trader": None,
+        },
+    )()
+
+    monkeypatch.setattr("src.core.cycles.trading_cycle.is_live_trading_active", lambda container: False)
+    monkeypatch.setattr("src.core.cycles.trading_cycle.db.get_paper_account", lambda: {"balance": 10000.0})
+    monkeypatch.setattr(
+        "src.core.cycles.trading_cycle.db.open_paper_trade",
+        lambda **kwargs: opened.update(kwargs) or 1,
+    )
+    monkeypatch.setattr("requests.post", lambda *args, **kwargs: FakeResponse())
+
+    _run_alpha_arena(container, {"overall_regime": "neutral"})
+
+    assert abs(opened["stop_loss"] - (price * 1.05)) < 1e-12
+    assert abs(opened["take_profit"] - (price * 0.90)) < 1e-12
 
 
 def test_execution_open_positions_prefer_live_state_when_deployable():

@@ -40,7 +40,11 @@ class SubsystemStatus:
 
     def is_trading_safe(self) -> bool:
         """Check if this subsystem is safe for trading operations."""
-        return self.state in (SubsystemState.HEALTHY, SubsystemState.DEGRADED) and self.affects_trading
+        return (
+            self.state in (SubsystemState.HEALTHY, SubsystemState.DEGRADED)
+            and self.affects_trading
+            and self.dependency_ready
+        )
 
     def __str__(self) -> str:
         """Human-readable status representation."""
@@ -114,7 +118,9 @@ class SubsystemHealthRegistry:
         self,
         name: str,
         state: SubsystemState,
-        reason: str = ""
+        reason: str = "",
+        dependency_ready: Optional[bool] = None,
+        startup_status: Optional[str] = None,
     ) -> None:
         """
         Update the state of a registered subsystem.
@@ -136,6 +142,10 @@ class SubsystemHealthRegistry:
             old_state = sub.state
             sub.state = state
             sub.reason = reason
+            if dependency_ready is not None:
+                sub.dependency_ready = dependency_ready
+            if startup_status is not None:
+                sub.startup_status = startup_status
 
             if old_state != state:
                 # Only WARN on transitions into FAILED — everything else is INFO
@@ -205,7 +215,7 @@ class SubsystemHealthRegistry:
             if not trading_subsystems:
                 return True
             return all(
-                s.state in (SubsystemState.HEALTHY, SubsystemState.DEGRADED)
+                s.state in (SubsystemState.HEALTHY, SubsystemState.DEGRADED) and s.dependency_ready
                 for s in trading_subsystems
             )
 
