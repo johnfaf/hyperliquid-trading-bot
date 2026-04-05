@@ -769,7 +769,10 @@ def test_execute_signal_caps_notional_at_max_order_usd(monkeypatch):
     monkeypatch.setattr(LiveTrader, "_get_mid_price", lambda self, coin: 2000.0)
     monkeypatch.setattr(LiveTrader, "place_trigger_order", lambda self, *args, **kwargs: {"status": "success"})
 
-    trader = LiveTrader(firewall=FakeFirewall(), dry_run=False, max_order_usd=3.0)
+    # Use a cap above the $10 exchange minimum so the test is not fighting
+    # LiveTrader's min-notional auto-raise.  $15 is comfortably above the
+    # $11 default min and proves the cap logic still shrinks large orders.
+    trader = LiveTrader(firewall=FakeFirewall(), dry_run=False, max_order_usd=15.0)
     result = trader.execute_signal(
         {
             "coin": "ETH",
@@ -778,7 +781,7 @@ def test_execute_signal_caps_notional_at_max_order_usd(monkeypatch):
             "entry_price": 2000.0,
             "position_pct": 0.05,
             "leverage": 2,
-            "size": 0.5,  # $1000 notional — should be capped to $3 → 0.0015 ETH
+            "size": 0.5,  # $1000 notional — should be capped to $15 → 0.0075 ETH
             "strategy_type": "momentum_long",
         }
     )
@@ -786,7 +789,72 @@ def test_execute_signal_caps_notional_at_max_order_usd(monkeypatch):
     assert result is not None
     assert result["status"] == "success"
     assert len(placed_sizes) == 1
-    assert abs(placed_sizes[0] * 2000.0 - 3.0) < 1e-9
+    assert abs(placed_sizes[0] * 2000.0 - 15.0) < 1e-9
+
+
+def test_live_trader_raises_cap_to_exchange_minimum(monkeypatch):
+    """Regression test: LIVE_MAX_ORDER_USD below Hyperliquid's $10 minimum
+    notional makes every live order silently fail (matching engine drops
+    it, then fill verification times out as "FILL NOT VERIFIED").  The
+    LiveTrader should raise the cap to the exchange minimum at startup
+    with a warning rather than allow the impossible state."""
+    class FakeFirewall:
+        def validate(self, signal, **kwargs):
+            return True, "ok"
+
+    monkeypatch.setattr(LiveTrader, "_load_credentials", _fake_live_credentials)
+    monkeypatch.setattr(LiveTrader, "_load_asset_index_map", lambda self: None)
+
+    trader = LiveTrader(firewall=FakeFirewall(), dry_run=False, max_order_usd=3.0)
+
+    # Cap was below the $10 min — should have been raised to min (default 11)
+    assert trader.max_order_usd >= 10.0
+    assert trader.max_order_usd == trader.min_order_usd
+
+
+def test_execute_signal_rejects_below_exchange_minimum(monkeypatch):
+    """An order whose rescaled notional is under the exchange minimum
+    must be rejected up front, not sent and then fail fill verification."""
+    placed_sizes = []
+
+    class FakeFirewall:
+        def validate(self, signal, **kwargs):
+            return True, "ok"
+
+    monkeypatch.setattr(LiveTrader, "_load_credentials", _fake_live_credentials)
+    monkeypatch.setattr(LiveTrader, "_load_asset_index_map", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "reconcile_positions", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "get_firewall_positions", lambda self: [])
+    monkeypatch.setattr(LiveTrader, "get_account_value", lambda self: 20.0)
+    monkeypatch.setattr(
+        LiveTrader,
+        "place_market_order",
+        lambda self, coin, side, size, leverage=1, reduce_only=False: (
+            placed_sizes.append(size) or {"status": "success"}
+        ),
+    )
+    monkeypatch.setattr(LiveTrader, "update_daily_pnl_from_fills", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "verify_fill", lambda self, *a, **kw: {"status": "verified"})
+    monkeypatch.setattr(LiveTrader, "_get_mid_price", lambda self, coin: 2.5)
+
+    trader = LiveTrader(firewall=FakeFirewall(), dry_run=False, max_order_usd=12.0)
+    # Force a tiny order whose notional is well below $11: 0.172 * $2.50 = $0.43
+    result = trader.execute_signal(
+        {
+            "coin": "XRP",
+            "side": "short",
+            "confidence": 0.8,
+            "entry_price": 2.5,
+            "position_pct": 0.01,
+            "leverage": 5,
+            "size": 0.172,
+            "strategy_type": "momentum_short",
+        }
+    )
+
+    # Should be rejected before hitting place_market_order
+    assert result is None or result.get("status") in {"rejected", "error"}
+    assert placed_sizes == []
 
 
 def test_copy_trade_preserves_precise_stops_for_low_priced_assets(monkeypatch):

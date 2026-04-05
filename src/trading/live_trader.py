@@ -286,6 +286,12 @@ class LiveTrader:
         self.dry_run = dry_run
         self.max_daily_loss = float(os.environ.get("HL_MAX_DAILY_LOSS", max_daily_loss))
         self.max_position_size = float(os.environ.get("HL_MAX_POSITION_SIZE", max_position_size))
+        # Exchange-enforced minimum notional per order.  Hyperliquid silently
+        # drops any order below $10 — we keep a small buffer (default $11)
+        # so rounding and price drift do not push us under the floor.
+        self.min_order_usd = float(
+            getattr(config, "LIVE_MIN_ORDER_USD", 11.0)
+        )
         # Hard per-order $ cap (safety net during live bootstrap).
         env_max_order = os.environ.get("LIVE_MAX_ORDER_USD")
         if env_max_order is not None:
@@ -296,6 +302,21 @@ class LiveTrader:
             self.max_order_usd = float(
                 getattr(config, "LIVE_MAX_ORDER_USD", self.max_position_size)
             )
+        # Guard: the exchange enforces a hard minimum notional, so any cap
+        # below that would make live trading physically impossible (every
+        # order would be dropped by the matching engine, then fail fill
+        # verification).  Raise the cap to the floor and warn loudly.
+        if self.max_order_usd < self.min_order_usd:
+            logger.warning(
+                "LIVE_MAX_ORDER_USD=$%.2f is below Hyperliquid's $%.2f minimum "
+                "notional per order.  Raising cap to $%.2f so orders can "
+                "actually execute.  Set LIVE_MAX_ORDER_USD to a higher value "
+                "on Railway to give the bot more headroom.",
+                self.max_order_usd,
+                self.min_order_usd,
+                self.min_order_usd,
+            )
+            self.max_order_usd = self.min_order_usd
         self.regime_forecaster = regime_forecaster
         self.status_reason = "dry_run_requested" if dry_run else "initializing"
 
@@ -1169,6 +1190,24 @@ class LiveTrader:
                 notional = size * price
                 if size <= 0:
                     return {"status": "rejected", "reason": "order_cap_zero_size"}
+            # Exchange-enforced minimum notional: Hyperliquid silently drops
+            # orders below $10.  Reject here with a clear reason instead of
+            # sending a no-op order and waiting for fill verification to
+            # time out.
+            if self.min_order_usd and notional < self.min_order_usd:
+                logger.warning(
+                    "place_market_order: rejecting %s %s size %.6f — notional "
+                    "$%.2f is below Hyperliquid's $%.2f minimum.  Raise "
+                    "LIVE_MAX_ORDER_USD or fund the live wallet so rescaling "
+                    "produces a larger order.",
+                    coin, side, size, notional, self.min_order_usd,
+                )
+                return {
+                    "status": "rejected",
+                    "reason": "below_exchange_minimum_notional",
+                    "notional": round(notional, 4),
+                    "min_notional": self.min_order_usd,
+                }
 
         # Build order
         order = {
@@ -1313,6 +1352,20 @@ class LiveTrader:
                 notional = size * price
                 if size <= 0:
                     return {"status": "rejected", "reason": "order_cap_zero_size"}
+            # Exchange-enforced minimum notional — Hyperliquid silently
+            # drops orders below $10.  Reject here with a clear reason.
+            if self.min_order_usd and notional < self.min_order_usd:
+                logger.warning(
+                    "place_limit_order: rejecting %s %s size %.6f — notional "
+                    "$%.2f is below Hyperliquid's $%.2f minimum.",
+                    coin, side, size, notional, self.min_order_usd,
+                )
+                return {
+                    "status": "rejected",
+                    "reason": "below_exchange_minimum_notional",
+                    "notional": round(notional, 4),
+                    "min_notional": self.min_order_usd,
+                }
 
         order = {
             "a": asset_idx,
@@ -1653,30 +1706,43 @@ class LiveTrader:
             return None
 
         notional = size * mid
-        if notional <= self.max_order_usd:
-            return signal
+        if notional > self.max_order_usd:
+            capped_size = self.max_order_usd / mid
+            if capped_size <= 0:
+                logger.warning(
+                    "Order cap $%.2f produces zero size for %s @ $%.4f — dropping trade",
+                    self.max_order_usd,
+                    signal.coin,
+                    mid,
+                )
+                return None
 
-        capped_size = self.max_order_usd / mid
-        if capped_size <= 0:
-            logger.warning(
-                "Order cap $%.2f produces zero size for %s @ $%.4f — dropping trade",
-                self.max_order_usd,
+            logger.info(
+                "Capping %s size to honor LIVE_MAX_ORDER_USD=$%.2f: "
+                "%.6f → %.6f (notional $%.2f → $%.2f)",
                 signal.coin,
-                mid,
+                self.max_order_usd,
+                size,
+                capped_size,
+                notional,
+                capped_size * mid,
+            )
+            signal.size = capped_size
+            notional = capped_size * mid
+
+        # Reject anything below the exchange minimum — Hyperliquid silently
+        # drops sub-$10 orders and fill verification times out.
+        if self.min_order_usd and notional < self.min_order_usd:
+            logger.warning(
+                "Dropping %s trade: notional $%.2f is below Hyperliquid's "
+                "$%.2f minimum per order.  Raise LIVE_MAX_ORDER_USD or fund "
+                "the live wallet so the rescaled size clears the minimum.",
+                signal.coin,
+                notional,
+                self.min_order_usd,
             )
             return None
 
-        logger.info(
-            "Capping %s size to honor LIVE_MAX_ORDER_USD=$%.2f: "
-            "%.6f → %.6f (notional $%.2f → $%.2f)",
-            signal.coin,
-            self.max_order_usd,
-            size,
-            capped_size,
-            notional,
-            capped_size * mid,
-        )
-        signal.size = capped_size
         return signal
 
     def execute_signal(

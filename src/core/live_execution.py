@@ -214,34 +214,57 @@ def _rescale_size_for_live(trade: Dict, trader) -> Optional[Dict]:
     # Enforce per-order $ cap (bootstrap safety net).  Applied on top of the
     # proportional rescale so nothing above LIVE_MAX_ORDER_USD hits the exchange.
     max_order_usd = getattr(trader, "max_order_usd", None)
-    if max_order_usd and max_order_usd > 0:
-        entry_price = float(
-            scaled_trade.get("entry_price")
-            or trade.get("entry_price")
-            or 0
-        )
-        if entry_price <= 0:
-            mids = get_all_mids() or {}
-            try:
-                entry_price = float(mids.get(scaled_trade.get("coin", ""), 0) or 0)
-            except (TypeError, ValueError):
-                entry_price = 0.0
-        if entry_price > 0:
-            current_size = float(scaled_trade.get("size", 0) or 0)
-            notional = current_size * entry_price
-            if notional > max_order_usd:
-                capped_size = max_order_usd / entry_price
-                logger.info(
-                    "Capping %s live mirror to $%.2f: %.6f → %.6f "
-                    "(notional $%.2f → $%.2f)",
-                    scaled_trade.get("coin", "?"),
-                    max_order_usd,
-                    current_size,
-                    capped_size,
-                    notional,
-                    capped_size * entry_price,
-                )
-                scaled_trade["size"] = capped_size
+    min_order_usd = getattr(trader, "min_order_usd", None) or 0.0
+    entry_price = float(
+        scaled_trade.get("entry_price")
+        or trade.get("entry_price")
+        or 0
+    )
+    if entry_price <= 0:
+        mids = get_all_mids() or {}
+        try:
+            entry_price = float(mids.get(scaled_trade.get("coin", ""), 0) or 0)
+        except (TypeError, ValueError):
+            entry_price = 0.0
+
+    if max_order_usd and max_order_usd > 0 and entry_price > 0:
+        current_size = float(scaled_trade.get("size", 0) or 0)
+        notional = current_size * entry_price
+        if notional > max_order_usd:
+            capped_size = max_order_usd / entry_price
+            logger.info(
+                "Capping %s live mirror to $%.2f: %.6f → %.6f "
+                "(notional $%.2f → $%.2f)",
+                scaled_trade.get("coin", "?"),
+                max_order_usd,
+                current_size,
+                capped_size,
+                notional,
+                capped_size * entry_price,
+            )
+            scaled_trade["size"] = capped_size
+
+    # Skip the mirror entirely if the rescaled+capped notional is below the
+    # exchange's minimum.  Otherwise the order is sent to Hyperliquid, the
+    # matching engine silently drops it for being too small, and the bot
+    # waits 10s on fill verification before logging "FILL NOT VERIFIED".
+    if min_order_usd > 0 and entry_price > 0:
+        current_size = float(scaled_trade.get("size", 0) or 0)
+        notional = current_size * entry_price
+        if notional < min_order_usd:
+            logger.warning(
+                "Skipping %s live mirror: rescaled notional $%.2f is below "
+                "Hyperliquid's $%.2f minimum.  Live wallet ($%.2f) is too "
+                "small relative to paper balance ($%.0f) to produce a "
+                "meaningful order.  Fund the live wallet or raise "
+                "LIVE_MAX_ORDER_USD.",
+                scaled_trade.get("coin", "?"),
+                notional,
+                min_order_usd,
+                live_balance,
+                paper_balance,
+            )
+            return None
 
     return scaled_trade
 

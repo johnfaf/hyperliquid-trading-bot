@@ -99,12 +99,23 @@ LIVE_TRADING_ENABLED = os.environ.get(
 ).lower() in ("true", "1", "yes")
 
 # ─── Live Order Caps (cautious bootstrap) ─────────────────────
+# Hyperliquid enforces a $10 minimum notional per order on both perps and
+# spot.  Any order below this silently does not fill (the matching engine
+# drops it and clearinghouseState never shows the position) — you only
+# notice because fill-verification times out with "FILL NOT VERIFIED".
+# This floor is PHYSICALLY enforced by the exchange and cannot be lowered
+# by config.
+LIVE_MIN_ORDER_USD = float(os.environ.get("LIVE_MIN_ORDER_USD", 11.0))
+
 # Hard ceiling on the notional ($ USDC) of any single live order.  This is a
 # safety net while the bot is ramping on a small live balance — even if paper
 # sizing, rescaling, or the firewall suggest a larger trade, nothing above
 # LIVE_MAX_ORDER_USD is ever sent to the exchange.
-# Set to a small value like $3 during bootstrap; raise as confidence grows.
-LIVE_MAX_ORDER_USD = float(os.environ.get("LIVE_MAX_ORDER_USD", 3.0))
+# The default is set slightly above the exchange minimum so fresh bootstraps
+# can actually execute; set a higher value via env var as confidence grows.
+# NOTE: a value below LIVE_MIN_ORDER_USD is impossible to honor — the
+# LiveTrader will raise it to LIVE_MIN_ORDER_USD at startup with a warning.
+LIVE_MAX_ORDER_USD = float(os.environ.get("LIVE_MAX_ORDER_USD", 12.0))
 # Daily loss limit for the live account in USD (forwarded to LiveTrader).
 LIVE_MAX_DAILY_LOSS_USD = float(os.environ.get("LIVE_MAX_DAILY_LOSS_USD", 5.0))
 HL_WALLET_MODE = os.environ.get("HL_WALLET_MODE", "agent_only").strip().lower()
