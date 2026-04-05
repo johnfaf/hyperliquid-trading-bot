@@ -270,6 +270,13 @@ class LiveTrader:
         Security model:
         - Agent private key comes from secret manager or HL_AGENT_PRIVATE_KEY.
         - HL_PUBLIC_ADDRESS is the trading account (master/vault) to manage.
+        - HL_AGENT_WALLET_ADDRESS, when set, is the AUTHORITATIVE expected
+          address of the agent wallet approved on Hyperliquid.  The private
+          key loaded from secrets MUST derive to this address.  If it does
+          not, the mismatch is logged prominently and live execution is
+          disabled — this prevents silently submitting orders signed by the
+          wrong key (which Hyperliquid rejects with
+          "User or API Wallet 0x... does not exist").
         - Agent signer address must differ from HL_PUBLIC_ADDRESS.
         """
         trading_address = os.environ.get("HL_PUBLIC_ADDRESS", "").strip()
@@ -297,10 +304,39 @@ class LiveTrader:
 
             self.signer = HyperliquidSigner(private_key)
             derived_agent_address = self.signer.address
-            if configured_agent_address and configured_agent_address.lower() != derived_agent_address.lower():
-                raise RuntimeError(
-                    "HL_AGENT_WALLET_ADDRESS does not match signer address derived from secret"
+
+            # HL_AGENT_WALLET_ADDRESS is authoritative when set.  Validate that
+            # the private key actually corresponds to the expected wallet.
+            if configured_agent_address:
+                if configured_agent_address.lower() != derived_agent_address.lower():
+                    logger.error(
+                        "AGENT WALLET MISMATCH: HL_AGENT_WALLET_ADDRESS=%s but "
+                        "HL_AGENT_PRIVATE_KEY derives address %s. The private key "
+                        "does not belong to the configured agent wallet. Update "
+                        "HL_AGENT_PRIVATE_KEY on Railway to the key for %s, or "
+                        "update HL_AGENT_WALLET_ADDRESS to %s. Live trading DISABLED.",
+                        configured_agent_address,
+                        derived_agent_address,
+                        configured_agent_address,
+                        derived_agent_address,
+                    )
+                    self.signer = None
+                    self.agent_wallet_address = configured_agent_address
+                    self.public_address = None
+                    self.status_reason = "agent_wallet_address_mismatch"
+                    return
+                logger.info(
+                    "HL_AGENT_WALLET_ADDRESS matches signer-derived address (%s)",
+                    configured_agent_address,
                 )
+            else:
+                logger.warning(
+                    "HL_AGENT_WALLET_ADDRESS not set on Railway. Using signer-derived "
+                    "address %s. Set HL_AGENT_WALLET_ADDRESS to enable startup "
+                    "validation and catch private-key/wallet mismatches before trading.",
+                    derived_agent_address,
+                )
+
             if derived_agent_address.lower() == trading_address.lower():
                 raise RuntimeError(
                     "Agent wallet must be different from HL_PUBLIC_ADDRESS trading wallet"
@@ -315,12 +351,83 @@ class LiveTrader:
                 self.agent_wallet_address,
                 self.public_address,
             )
+
+            # Verify the agent wallet is actually approved on Hyperliquid.
+            # Catches the "User or API Wallet 0x... does not exist" case at
+            # startup instead of at first order placement.
+            self._verify_agent_wallet_registered()
         except (SecretManagerError, Exception) as e:
             logger.error(f"Failed to load agent-wallet credentials: {e}")
             self.signer = None
             self.agent_wallet_address = None
             self.public_address = None
             self.status_reason = f"credential_error:{e}"
+
+    def _verify_agent_wallet_registered(self) -> None:
+        """
+        Check with Hyperliquid whether the loaded agent wallet is actually
+        registered as an API wallet for HL_PUBLIC_ADDRESS.
+
+        Queries the `extraAgents` field on the user's clearinghouse state —
+        each registered API wallet appears there by address.  If the signer
+        address is not in that list, log a prominent warning telling the
+        operator to approve the wallet in the Hyperliquid UI before trading.
+        This is best-effort: on network errors or unexpected payloads we log
+        a debug message and continue (the order path will still surface the
+        "User or API Wallet does not exist" error if the check is wrong).
+        """
+        if not self.signer or not self.public_address:
+            return
+        try:
+            response = requests.post(
+                self.info_url,
+                json={"type": "extraAgents", "user": self.public_address},
+                timeout=10,
+            )
+            if response.status_code != 200:
+                logger.debug(
+                    "extraAgents check returned HTTP %s — skipping validation",
+                    response.status_code,
+                )
+                return
+            data = response.json()
+            agents = data if isinstance(data, list) else data.get("agents", []) if isinstance(data, dict) else []
+            signer_addr = self.signer.address.lower()
+            approved = [
+                str(a.get("address", "")).lower()
+                for a in agents
+                if isinstance(a, dict) and a.get("address")
+            ]
+            if signer_addr in approved:
+                logger.info(
+                    "Agent wallet %s is registered on Hyperliquid for %s",
+                    self.signer.address,
+                    self.public_address,
+                )
+                return
+            if not approved:
+                logger.warning(
+                    "Could not confirm agent wallet registration (empty extraAgents "
+                    "response). Signer=%s. Trading account=%s. If orders fail with "
+                    "'User or API Wallet does not exist', approve the agent wallet "
+                    "in the Hyperliquid UI (Account → API → Generate/Approve).",
+                    self.signer.address,
+                    self.public_address,
+                )
+                return
+            logger.error(
+                "AGENT WALLET NOT APPROVED: signer %s is NOT in the approved API "
+                "wallets for %s. Approved wallets: %s. Live trading DISABLED. "
+                "Approve the wallet in the Hyperliquid UI (Account → API → Approve) "
+                "or update HL_AGENT_PRIVATE_KEY to one that IS approved.",
+                self.signer.address,
+                self.public_address,
+                approved,
+            )
+            self.signer = None
+            self.status_reason = "agent_wallet_not_approved_on_exchange"
+        except Exception as exc:
+            logger.debug("extraAgents check failed: %s — skipping validation", exc)
 
     def _load_asset_index_map(self):
         """Load asset index mapping from Hyperliquid meta endpoint."""
