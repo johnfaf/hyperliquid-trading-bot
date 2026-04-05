@@ -89,6 +89,8 @@ def get_user_state(address: str):
     Get a trader's clearinghouse state: positions, margin, account value.
     This is the main endpoint for analyzing what a trader is doing.
     """
+    if not address or not isinstance(address, str) or len(address) < 10:
+        return None
     data = _post({"type": "clearinghouseState", "user": address},
                  priority=Priority.HIGH)
     if not data:

@@ -162,10 +162,17 @@ def _rescale_size_for_live(trade: Dict, trader) -> Optional[Dict]:
             paper_balance,
         )
         return None
-    if not live_balance or live_balance <= 0:
+    if live_balance is None:
         logger.error(
-            "Cannot rescale %s: live account balance unavailable (%s). "
+            "Cannot rescale %s: live account balance API call failed. "
             "Blocking trade to prevent wrong sizing.",
+            trade.get("coin", "?"),
+        )
+        return None
+    if live_balance <= 0:
+        logger.warning(
+            "Skipping live mirror for %s: live account balance is $%.2f. "
+            "Deposit USDC to your Hyperliquid account to enable live trading.",
             trade.get("coin", "?"), live_balance,
         )
         return None
