@@ -26,8 +26,7 @@ import os
 import time
 import json
 import hashlib
-import hmac
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple, Union
 from enum import Enum
 
@@ -46,7 +45,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import config
 from src.core.secret_manager import SecretManagerError, load_agent_private_key
 from src.signals.decision_firewall import DecisionFirewall
-from src.signals.signal_schema import TradeSignal, SignalSide, signal_from_execution_dict
+from src.signals.signal_schema import TradeSignal, signal_from_execution_dict
 
 logger = logging.getLogger(__name__)
 

@@ -7,7 +7,6 @@ Runs every 60s between trading cycles.
 Extracted from ``HyperliquidResearchBot._fast_cycle``.
 """
 import logging
-from typing import Optional
 
 from src.core.live_execution import (
     is_live_trading_active,

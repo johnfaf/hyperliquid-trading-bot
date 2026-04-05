@@ -17,8 +17,7 @@ Usage::
     # container.firewall, container.paper_trader, etc.
 """
 import logging
-import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional, Any
 
 from src.core.health_registry import SubsystemHealthRegistry, SubsystemState
@@ -126,7 +125,6 @@ def build_subsystems(
     Subsystems not in the profile are skipped (left as None).
     """
     import config
-    from src.data.database import init_db, get_active_traders
 
     if profile is None:
         profile = FULL_PROFILE
@@ -340,7 +338,6 @@ def build_subsystems(
 
     # ─── Position monitor (WebSocket) ─────────────────────────
     if "position_monitor" in profile:
-        from src.notifications.ws_position_monitor import PositionMonitor
         try:
             import src.data.database as db
             top_traders = db.get_active_traders()[:20]
