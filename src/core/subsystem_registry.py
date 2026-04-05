@@ -290,6 +290,8 @@ def build_subsystems(
             lambda: LiveTrader(
                 firewall=c.firewall,
                 dry_run=not getattr(config, "LIVE_TRADING_ENABLED", False),
+                max_daily_loss=float(getattr(config, "LIVE_MAX_DAILY_LOSS_USD", 500)),
+                max_order_usd=float(getattr(config, "LIVE_MAX_ORDER_USD", 3.0)),
                 regime_forecaster=c.predictive_forecaster,
             ),
             health,

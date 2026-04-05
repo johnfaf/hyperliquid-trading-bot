@@ -165,6 +165,7 @@ class LiveTrader:
 
     def __init__(self, firewall: DecisionFirewall, dry_run: bool = True,
                  max_daily_loss: float = 500, max_position_size: float = 1000,
+                 max_order_usd: Optional[float] = None,
                  regime_forecaster: Optional[object] = None):
         """
         Initialize live trader.
@@ -174,6 +175,11 @@ class LiveTrader:
             dry_run: If True, log what WOULD happen but don't execute (default True)
             max_daily_loss: Daily loss limit in USD (default $500)
             max_position_size: Max notional per position in USD (default $1000)
+            max_order_usd: Hard cap on $ notional for any single live order.
+                Acts as a safety net on top of max_position_size — even if the
+                computed size would be larger, nothing above this value is sent
+                to the exchange.  When None, falls back to config.LIVE_MAX_ORDER_USD
+                and finally to max_position_size.
             regime_forecaster: Optional PredictiveRegimeForecaster for regime-aware position sizing
         """
         self.firewall = firewall
@@ -181,6 +187,16 @@ class LiveTrader:
         self.dry_run = dry_run
         self.max_daily_loss = float(os.environ.get("HL_MAX_DAILY_LOSS", max_daily_loss))
         self.max_position_size = float(os.environ.get("HL_MAX_POSITION_SIZE", max_position_size))
+        # Hard per-order $ cap (safety net during live bootstrap).
+        env_max_order = os.environ.get("LIVE_MAX_ORDER_USD")
+        if env_max_order is not None:
+            self.max_order_usd = float(env_max_order)
+        elif max_order_usd is not None:
+            self.max_order_usd = float(max_order_usd)
+        else:
+            self.max_order_usd = float(
+                getattr(config, "LIVE_MAX_ORDER_USD", self.max_position_size)
+            )
         self.regime_forecaster = regime_forecaster
         self.status_reason = "dry_run_requested" if dry_run else "initializing"
 
@@ -213,10 +229,21 @@ class LiveTrader:
         self._recent_order_hashes: Dict[str, Tuple[float, Dict]] = {}
         self._ORDER_DEDUP_WINDOW = 30  # seconds to remember recent orders
 
+        # Wallet balance tracking (last-known snapshots for dashboards/cycles).
+        self._last_balance_snapshot: Dict[str, Optional[float]] = {
+            "perps_margin": None,
+            "spot_usdc": None,
+            "total": None,
+            "timestamp": None,
+        }
+        self._balance_log_interval_s = 300  # log balance at most once per 5 min
+        self._last_balance_log_ts: float = 0.0
+
         logger.info(
             f"LiveTrader initialized: dry_run={dry_run}, "
             f"max_daily_loss=${self.max_daily_loss:.2f}, "
-            f"max_position_size=${self.max_position_size:.2f}"
+            f"max_position_size=${self.max_position_size:.2f}, "
+            f"max_order_usd=${self.max_order_usd:.2f}"
         )
 
         if dry_run:
@@ -412,6 +439,68 @@ class LiveTrader:
         except Exception as e:
             logger.debug("Error checking spot balance: %s", e)
             return None
+
+    def snapshot_balance(self, log: bool = True) -> Dict[str, Optional[float]]:
+        """
+        Refresh the cached wallet balance snapshot (perps + spot + total).
+
+        This is the canonical place the bot fetches and caches the live
+        wallet state.  Called periodically from the fast cycle so the
+        dashboard, logs, and audit trail all see a consistent view.
+
+        Args:
+            log: When True, emit an INFO log at most once every
+                 self._balance_log_interval_s (default 5 min) so operators
+                 can see balance updates without spamming the log.
+
+        Returns:
+            Dict with keys: perps_margin, spot_usdc, total, timestamp.
+        """
+        perps = None
+        try:
+            if self.public_address:
+                response = requests.post(
+                    self.info_url,
+                    json={"type": "clearinghouseState", "user": self.public_address},
+                    timeout=10,
+                )
+                response.raise_for_status()
+                data = response.json()
+                margin_summary = data.get("marginSummary", {}) or {}
+                perps = float(margin_summary.get("accountValue", 0) or 0)
+        except Exception as e:
+            logger.debug("snapshot_balance: perps fetch error: %s", e)
+            perps = None
+
+        spot = self._get_spot_usdc_balance()
+        total: Optional[float]
+        if perps is None and spot is None:
+            total = None
+        else:
+            total = float(perps or 0) + float(spot or 0)
+
+        now = time.time()
+        self._last_balance_snapshot = {
+            "perps_margin": perps,
+            "spot_usdc": spot,
+            "total": total,
+            "timestamp": datetime.utcnow().isoformat(),
+        }
+
+        if log and (now - self._last_balance_log_ts) >= self._balance_log_interval_s:
+            self._last_balance_log_ts = now
+            logger.info(
+                "Wallet balance: perps=$%s, spot=$%s, total=$%s",
+                f"{perps:.2f}" if perps is not None else "n/a",
+                f"{spot:.2f}" if spot is not None else "n/a",
+                f"{total:.2f}" if total is not None else "n/a",
+            )
+
+        return self._last_balance_snapshot
+
+    def get_balance_snapshot(self) -> Dict[str, Optional[float]]:
+        """Return the most recent balance snapshot (cached, no API call)."""
+        return dict(self._last_balance_snapshot)
 
     def _normalize_position(self, pos: Dict[str, Any]) -> Dict[str, Any]:
         """Flatten Hyperliquid position payload into a consistent dict shape."""
@@ -832,6 +921,18 @@ class LiveTrader:
             if notional > self.max_position_size:
                 logger.warning(f"Position size ${notional:.2f} exceeds limit ${self.max_position_size:.2f}")
                 return {"status": "rejected", "reason": "position_size_exceeded"}
+            # Hard $ cap on any single live order (bootstrap safety net).
+            if self.max_order_usd and notional > self.max_order_usd:
+                capped_size = self.max_order_usd / price
+                logger.warning(
+                    "place_market_order: capping %s %s size %.6f → %.6f "
+                    "to honor LIVE_MAX_ORDER_USD=$%.2f (was $%.2f notional)",
+                    coin, side, size, capped_size, self.max_order_usd, notional,
+                )
+                size = capped_size
+                notional = size * price
+                if size <= 0:
+                    return {"status": "rejected", "reason": "order_cap_zero_size"}
 
         # Build order
         order = {
@@ -964,6 +1065,18 @@ class LiveTrader:
             if notional > self.max_position_size:
                 logger.warning(f"Position size ${notional:.2f} exceeds limit")
                 return {"status": "rejected", "reason": "position_size_exceeded"}
+            # Hard $ cap on any single live order (bootstrap safety net).
+            if self.max_order_usd and notional > self.max_order_usd:
+                capped_size = self.max_order_usd / price
+                logger.warning(
+                    "place_limit_order: capping %s %s size %.6f → %.6f "
+                    "to honor LIVE_MAX_ORDER_USD=$%.2f (was $%.2f notional)",
+                    coin, side, size, capped_size, self.max_order_usd, notional,
+                )
+                size = capped_size
+                notional = size * price
+                if size <= 0:
+                    return {"status": "rejected", "reason": "order_cap_zero_size"}
 
         order = {
             "a": asset_idx,
@@ -1269,12 +1382,77 @@ class LiveTrader:
 
         return signal
 
-    def execute_signal(self, signal: Union[TradeSignal, Dict[str, Any]]) -> Optional[Dict]:
+    def _apply_order_usd_cap(self, signal: TradeSignal) -> Optional[TradeSignal]:
+        """
+        Clamp signal.size so its notional never exceeds self.max_order_usd.
+
+        This is a *hard* safety net for the live-trading bootstrap phase.
+        Even when paper sizing, rescaling, or regime overlay produce a larger
+        size, nothing above max_order_usd ($3 by default) is sent to the
+        exchange.  If the required minimum coin quantity would round to zero,
+        the trade is dropped entirely (returns None).
+
+        Args:
+            signal: TradeSignal with signal.size already computed.
+
+        Returns:
+            Same signal (possibly with shrunken size), or None if the cap
+            would require a zero-sized order.
+        """
+        if self.max_order_usd is None or self.max_order_usd <= 0:
+            return signal
+
+        size = float(signal.size or 0)
+        if size <= 0:
+            return signal
+
+        mid = self._get_mid_price(signal.coin)
+        if not mid or mid <= 0:
+            # Cannot evaluate notional — err on the side of caution and drop
+            logger.warning(
+                "Cannot apply $%.2f cap to %s: mid price unavailable — dropping trade",
+                self.max_order_usd,
+                signal.coin,
+            )
+            return None
+
+        notional = size * mid
+        if notional <= self.max_order_usd:
+            return signal
+
+        capped_size = self.max_order_usd / mid
+        if capped_size <= 0:
+            logger.warning(
+                "Order cap $%.2f produces zero size for %s @ $%.4f — dropping trade",
+                self.max_order_usd,
+                signal.coin,
+                mid,
+            )
+            return None
+
+        logger.info(
+            "Capping %s size to honor LIVE_MAX_ORDER_USD=$%.2f: "
+            "%.6f → %.6f (notional $%.2f → $%.2f)",
+            signal.coin,
+            self.max_order_usd,
+            size,
+            capped_size,
+            notional,
+            capped_size * mid,
+        )
+        signal.size = capped_size
+        return signal
+
+    def execute_signal(
+        self,
+        signal: Union[TradeSignal, Dict[str, Any]],
+        bypass_firewall: bool = False,
+    ) -> Optional[Dict]:
         """
         Main entry point: execute a trade signal through firewall.
 
         Pipeline:
-          1. Validate signal through DecisionFirewall
+          1. Validate signal through DecisionFirewall (unless bypassed)
           2. Check kill switch and daily loss
           3. Place market entry order
           4. Place stop loss trigger
@@ -1283,24 +1461,36 @@ class LiveTrader:
 
         Args:
             signal: TradeSignal object
+            bypass_firewall: If True, skip DecisionFirewall validation.  This
+                is used by the paper→live mirror path — the paper trade has
+                already passed the firewall, so re-running it would always
+                fail on the cooldown check ("COIN traded Ns ago") because the
+                paper execution just happened.  Kill-switch, daily loss, and
+                per-order caps still apply.
 
         Returns:
             Execution result dict or None if rejected
         """
         signal = self._coerce_signal(signal)
 
-        live_positions = self.get_firewall_positions() if self.is_deployable() else None
-        live_account_value = self.get_account_value() if self.is_deployable() else None
+        if not bypass_firewall:
+            live_positions = self.get_firewall_positions() if self.is_deployable() else None
+            live_account_value = self.get_account_value() if self.is_deployable() else None
 
-        # Validate through firewall
-        passed, reason = self.firewall.validate(
-            signal,
-            open_positions=live_positions,
-            account_balance=live_account_value,
-        )
-        if not passed:
-            logger.info(f"Signal rejected by firewall: {reason}")
-            return None
+            # Validate through firewall
+            passed, reason = self.firewall.validate(
+                signal,
+                open_positions=live_positions,
+                account_balance=live_account_value,
+            )
+            if not passed:
+                logger.info(f"Signal rejected by firewall: {reason}")
+                return None
+        else:
+            logger.debug(
+                "Firewall bypass active for %s (mirror path — paper trade already validated)",
+                signal.coin,
+            )
 
         # Check kill switch
         if self.kill_switch_active:
@@ -1337,6 +1527,13 @@ class LiveTrader:
 
         # Apply regime overlay for dynamic position sizing (signal.size is now set)
         signal = self.apply_regime_overlay(signal)
+
+        # Hard per-order $ cap — applied AFTER regime overlay and any paper→live
+        # rescaling so nothing above max_order_usd ever hits the exchange.
+        capped_signal = self._apply_order_usd_cap(signal)
+        if capped_signal is None:
+            return None
+        signal = capped_signal
 
         try:
             size = signal.size
@@ -1502,6 +1699,8 @@ class LiveTrader:
             "orders_today": self.orders_today,
             "fills_today": self.fills_today,
             "max_position_size": self.max_position_size,
+            "max_order_usd": self.max_order_usd,
+            "wallet_balance": dict(self._last_balance_snapshot),
             "asset_indices_loaded": len(self.asset_index_map),
             "timestamp": datetime.utcnow().isoformat()
         }

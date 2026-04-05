@@ -97,6 +97,16 @@ PAPER_TRADING_DEFAULT_EXECUTION_ROLE = os.environ.get(
 LIVE_TRADING_ENABLED = os.environ.get(
     "LIVE_TRADING_ENABLED", "false"
 ).lower() in ("true", "1", "yes")
+
+# ─── Live Order Caps (cautious bootstrap) ─────────────────────
+# Hard ceiling on the notional ($ USDC) of any single live order.  This is a
+# safety net while the bot is ramping on a small live balance — even if paper
+# sizing, rescaling, or the firewall suggest a larger trade, nothing above
+# LIVE_MAX_ORDER_USD is ever sent to the exchange.
+# Set to a small value like $3 during bootstrap; raise as confidence grows.
+LIVE_MAX_ORDER_USD = float(os.environ.get("LIVE_MAX_ORDER_USD", 3.0))
+# Daily loss limit for the live account in USD (forwarded to LiveTrader).
+LIVE_MAX_DAILY_LOSS_USD = float(os.environ.get("LIVE_MAX_DAILY_LOSS_USD", 5.0))
 HL_WALLET_MODE = os.environ.get("HL_WALLET_MODE", "agent_only").strip().lower()
 SECRET_MANAGER_PROVIDER = os.environ.get(
     "SECRET_MANAGER_PROVIDER", "none"

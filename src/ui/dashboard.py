@@ -1006,6 +1006,21 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     v25["api_manager"] = get_api_stats()
                 except Exception:
                     pass
+                try:
+                    if _live_trader:
+                        live_stats = _live_trader.get_stats()
+                        # Refresh balance cache so dashboard never shows stale
+                        # numbers when the fast cycle hasn't run recently.
+                        if hasattr(_live_trader, "snapshot_balance"):
+                            try:
+                                live_stats["wallet_balance"] = (
+                                    _live_trader.snapshot_balance(log=False)
+                                )
+                            except Exception:
+                                pass
+                        v25["live_trader"] = live_stats
+                except Exception:
+                    pass
                 if v25:
                     data["v25"] = v25
 

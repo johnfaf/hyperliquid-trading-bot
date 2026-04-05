@@ -131,7 +131,8 @@ def test_live_trader_coerces_execution_dict_and_uses_live_firewall_state(monkeyp
     monkeypatch.setattr(LiveTrader, "_get_mid_price", lambda self, coin: 2000.0)
     monkeypatch.setattr(LiveTrader, "place_trigger_order", lambda self, *args, **kwargs: {"status": "success"})
 
-    trader = LiveTrader(firewall=FakeFirewall(), dry_run=False)
+    # Disable the bootstrap $ cap so the test exercises the original sizing path.
+    trader = LiveTrader(firewall=FakeFirewall(), dry_run=False, max_order_usd=1_000_000)
     result = trader.execute_signal(
         {
             "coin": "ETH",
@@ -180,7 +181,8 @@ def test_live_trader_maps_long_to_buy_and_places_sell_protection(monkeypatch):
         ),
     )
 
-    trader = LiveTrader(firewall=FakeFirewall(), dry_run=False)
+    # Disable the bootstrap $ cap so entry_calls reflects the requested 0.1 ETH.
+    trader = LiveTrader(firewall=FakeFirewall(), dry_run=False, max_order_usd=1_000_000)
     result = trader.execute_signal(
         {
             "coin": "ETH",
@@ -229,7 +231,8 @@ def test_live_trader_uses_verified_fill_size_for_protection(monkeypatch):
         ),
     )
 
-    trader = LiveTrader(firewall=FakeFirewall(), dry_run=False)
+    # Disable the bootstrap $ cap so fill verification preserves the requested 0.1 size.
+    trader = LiveTrader(firewall=FakeFirewall(), dry_run=False, max_order_usd=1_000_000)
     result = trader.execute_signal(
         {
             "coin": "ETH",
@@ -279,7 +282,8 @@ def test_live_trader_closes_position_when_protection_fails(monkeypatch):
         lambda self, coin: close_calls.append(coin) or {"status": "success", "coin": coin},
     )
 
-    trader = LiveTrader(firewall=FakeFirewall(), dry_run=False)
+    # Disable the bootstrap $ cap so the sizing reaches place_trigger_order unmodified.
+    trader = LiveTrader(firewall=FakeFirewall(), dry_run=False, max_order_usd=1_000_000)
     result = trader.execute_signal(
         {
             "coin": "ETH",
@@ -581,6 +585,129 @@ def test_rescale_size_for_live_blocks_when_paper_balance_missing(monkeypatch):
     scaled = _rescale_size_for_live({"coin": "ETH", "size": 0.2}, FakeTrader())
 
     assert scaled is None
+
+
+def test_rescale_size_for_live_enforces_max_order_usd_cap(monkeypatch):
+    """After rescaling, notional must never exceed trader.max_order_usd."""
+    class FakeTrader:
+        max_order_usd = 3.0
+
+        def get_account_value(self):
+            return 10_000.0  # equal to paper — scale = 1.0
+
+    monkeypatch.setattr("src.core.live_execution.db.get_paper_account", lambda: {"balance": 10_000.0})
+    monkeypatch.setattr("src.core.live_execution.get_all_mids", lambda: {"ETH": 2000.0})
+
+    # 0.5 ETH @ $2000 = $1000 notional, should be capped to $3 → 0.0015 ETH
+    scaled = _rescale_size_for_live(
+        {"coin": "ETH", "size": 0.5, "entry_price": 2000.0},
+        FakeTrader(),
+    )
+    assert scaled is not None
+    assert abs(scaled["size"] * 2000.0 - 3.0) < 1e-9
+
+
+def test_execute_signal_bypass_firewall_skips_validation(monkeypatch):
+    """When bypass_firewall=True, DecisionFirewall.validate must NOT be called."""
+    validate_calls = []
+
+    class FakeFirewall:
+        def validate(self, signal, **kwargs):
+            validate_calls.append(signal.coin)
+            return False, "Cooldown: ETH traded 58s ago"
+
+    monkeypatch.setattr(LiveTrader, "_load_credentials", _fake_live_credentials)
+    monkeypatch.setattr(LiveTrader, "_load_asset_index_map", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "reconcile_positions", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "get_firewall_positions", lambda self: [])
+    monkeypatch.setattr(LiveTrader, "get_account_value", lambda self: 2500.0)
+    monkeypatch.setattr(LiveTrader, "place_market_order", lambda self, *args, **kwargs: {"status": "success"})
+    monkeypatch.setattr(LiveTrader, "update_daily_pnl_from_fills", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "verify_fill", lambda self, *args, **kwargs: {"status": "verified"})
+    monkeypatch.setattr(LiveTrader, "_get_mid_price", lambda self, coin: 2000.0)
+    monkeypatch.setattr(LiveTrader, "place_trigger_order", lambda self, *args, **kwargs: {"status": "success"})
+
+    trader = LiveTrader(firewall=FakeFirewall(), dry_run=False, max_order_usd=1_000_000)
+
+    # Without bypass: firewall rejects, result is None
+    r_strict = trader.execute_signal(
+        {
+            "coin": "ETH",
+            "side": "long",
+            "confidence": 0.8,
+            "entry_price": 2000.0,
+            "position_pct": 0.05,
+            "leverage": 2,
+            "size": 0.1,
+            "strategy_type": "momentum_long",
+        }
+    )
+    assert r_strict is None
+    assert validate_calls == ["ETH"]
+
+    # With bypass: firewall is NOT called, trade proceeds
+    validate_calls.clear()
+    r_bypass = trader.execute_signal(
+        {
+            "coin": "ETH",
+            "side": "long",
+            "confidence": 0.8,
+            "entry_price": 2000.0,
+            "position_pct": 0.05,
+            "leverage": 2,
+            "size": 0.1,
+            "strategy_type": "momentum_long",
+        },
+        bypass_firewall=True,
+    )
+    assert r_bypass is not None
+    assert r_bypass["status"] == "success"
+    assert validate_calls == []
+
+
+def test_execute_signal_caps_notional_at_max_order_usd(monkeypatch):
+    """A large computed size must be shrunk so notional <= max_order_usd."""
+    placed_sizes = []
+
+    class FakeFirewall:
+        def validate(self, signal, **kwargs):
+            return True, "ok"
+
+    monkeypatch.setattr(LiveTrader, "_load_credentials", _fake_live_credentials)
+    monkeypatch.setattr(LiveTrader, "_load_asset_index_map", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "reconcile_positions", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "get_firewall_positions", lambda self: [])
+    monkeypatch.setattr(LiveTrader, "get_account_value", lambda self: 2500.0)
+    monkeypatch.setattr(
+        LiveTrader,
+        "place_market_order",
+        lambda self, coin, side, size, leverage=1, reduce_only=False: (
+            placed_sizes.append(size) or {"status": "success"}
+        ),
+    )
+    monkeypatch.setattr(LiveTrader, "update_daily_pnl_from_fills", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "verify_fill", lambda self, *args, **kwargs: {"status": "verified"})
+    monkeypatch.setattr(LiveTrader, "_get_mid_price", lambda self, coin: 2000.0)
+    monkeypatch.setattr(LiveTrader, "place_trigger_order", lambda self, *args, **kwargs: {"status": "success"})
+
+    trader = LiveTrader(firewall=FakeFirewall(), dry_run=False, max_order_usd=3.0)
+    result = trader.execute_signal(
+        {
+            "coin": "ETH",
+            "side": "long",
+            "confidence": 0.8,
+            "entry_price": 2000.0,
+            "position_pct": 0.05,
+            "leverage": 2,
+            "size": 0.5,  # $1000 notional — should be capped to $3 → 0.0015 ETH
+            "strategy_type": "momentum_long",
+        }
+    )
+
+    assert result is not None
+    assert result["status"] == "success"
+    assert len(placed_sizes) == 1
+    assert abs(placed_sizes[0] * 2000.0 - 3.0) < 1e-9
 
 
 def test_copy_trade_preserves_precise_stops_for_low_priced_assets(monkeypatch):

@@ -162,6 +162,9 @@ def _rescale_size_for_live(trade: Dict, trader) -> Optional[Dict]:
     Paper sizes are computed from the paper account (default $10k).  When
     mirroring to live, the coin quantity must be adjusted so the same
     *percentage* of the live account is risked, not the same absolute size.
+
+    After rescaling, the final notional is clamped to trader.max_order_usd
+    (if set) so nothing above the bootstrap cap ever hits the exchange.
     """
     paper_account = db.get_paper_account()
     paper_balance = float((paper_account or {}).get("balance", 0) or 0)
@@ -191,25 +194,56 @@ def _rescale_size_for_live(trade: Dict, trader) -> Optional[Dict]:
         return None
 
     scale = live_balance / paper_balance
-    if abs(scale - 1.0) < 0.01:
-        return trade  # balances are similar, no rescaling needed
-
     original_size = float(trade.get("size", 0) or 0)
     if original_size <= 0:
         return trade
 
-    trade = dict(trade)  # shallow copy to avoid mutating caller's dict
-    trade["size"] = original_size * scale
-    logger.info(
-        "Rescaled %s size for live: %.6f → %.6f (paper=$%.0f, live=$%.0f, scale=%.2f)",
-        trade.get("coin", "?"),
-        original_size,
-        trade["size"],
-        paper_balance,
-        live_balance,
-        scale,
-    )
-    return trade
+    scaled_trade = dict(trade)  # shallow copy to avoid mutating caller's dict
+    if abs(scale - 1.0) >= 0.01:
+        scaled_trade["size"] = original_size * scale
+        logger.info(
+            "Rescaled %s size for live: %.6f → %.6f (paper=$%.0f, live=$%.2f, scale=%.4f)",
+            trade.get("coin", "?"),
+            original_size,
+            scaled_trade["size"],
+            paper_balance,
+            live_balance,
+            scale,
+        )
+
+    # Enforce per-order $ cap (bootstrap safety net).  Applied on top of the
+    # proportional rescale so nothing above LIVE_MAX_ORDER_USD hits the exchange.
+    max_order_usd = getattr(trader, "max_order_usd", None)
+    if max_order_usd and max_order_usd > 0:
+        entry_price = float(
+            scaled_trade.get("entry_price")
+            or trade.get("entry_price")
+            or 0
+        )
+        if entry_price <= 0:
+            mids = get_all_mids() or {}
+            try:
+                entry_price = float(mids.get(scaled_trade.get("coin", ""), 0) or 0)
+            except (TypeError, ValueError):
+                entry_price = 0.0
+        if entry_price > 0:
+            current_size = float(scaled_trade.get("size", 0) or 0)
+            notional = current_size * entry_price
+            if notional > max_order_usd:
+                capped_size = max_order_usd / entry_price
+                logger.info(
+                    "Capping %s live mirror to $%.2f: %.6f → %.6f "
+                    "(notional $%.2f → $%.2f)",
+                    scaled_trade.get("coin", "?"),
+                    max_order_usd,
+                    current_size,
+                    capped_size,
+                    notional,
+                    capped_size * entry_price,
+                )
+                scaled_trade["size"] = capped_size
+
+    return scaled_trade
 
 
 def mirror_executed_trades_to_live(
@@ -231,7 +265,12 @@ def mirror_executed_trades_to_live(
                 if scaled_trade is None:
                     continue  # blocked by rescale — already logged
                 live_signal = signal_from_execution_dict(scaled_trade) if isinstance(scaled_trade, dict) else scaled_trade
-                live_result = trader.execute_signal(live_signal)
+                # Mirror path: the paper trade has already passed the firewall
+                # (cooldown, risk checks, etc.), so bypass firewall validation
+                # here.  Otherwise the firewall's cooldown check rejects every
+                # mirrored trade as "COIN traded Ns ago" — the paper trade that
+                # triggered the mirror.  Kill-switch and daily loss still apply.
+                live_result = trader.execute_signal(live_signal, bypass_firewall=True)
                 if live_result and live_result.get("status") not in ("error", "rejected"):
                     logger.info(
                         "%s: %s %s %s",
