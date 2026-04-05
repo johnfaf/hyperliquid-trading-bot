@@ -13,13 +13,12 @@ import logging
 import math
 import json
 import time
-from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Tuple
+from datetime import datetime
+from typing import Dict, List
 from collections import defaultdict
 from dataclasses import dataclass, asdict
 
 from src.data import database as db
-from src.signals.signal_schema import SignalSource
 
 logger = logging.getLogger(__name__)
 
@@ -126,8 +125,6 @@ class AgentScorer:
     def _save_score(self, source_key: str):
         """Persist a single source's score to DB."""
         try:
-            import sqlite3
-            import config
             score = self.scores.get(source_key)
             if not score:
                 return
@@ -289,6 +286,11 @@ class AgentScorer:
 
     def get_source_key(self, signal) -> str:
         """Generate a source_key from a TradeSignal."""
+        if hasattr(signal, "source_key") and getattr(signal, "source_key", ""):
+            return str(signal.source_key)
+        if isinstance(signal, dict) and signal.get("source_key"):
+            return str(signal["source_key"])
+
         if hasattr(signal, 'source'):
             source = signal.source.value if hasattr(signal.source, 'value') else str(signal.source)
         else:

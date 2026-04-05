@@ -39,20 +39,22 @@ class DecisionEngine:
         cfg = config or {}
 
         # Weights for composite ranking score
-        self.w_score = cfg.get("w_score", 0.35)          # Strategy score from scorer
-        self.w_regime = cfg.get("w_regime", 0.25)         # Regime alignment bonus
-        self.w_diversity = cfg.get("w_diversity", 0.20)   # Diversification bonus
-        self.w_freshness = cfg.get("w_freshness", 0.10)   # Prefer strategies with recent activity
-        self.w_consensus = cfg.get("w_consensus", 0.10)   # Dedup consensus boost
+        self.w_score = cfg.get("w_score", 0.25)             # Strategy score from scorer
+        self.w_regime = cfg.get("w_regime", 0.20)           # Regime alignment bonus
+        self.w_diversity = cfg.get("w_diversity", 0.15)     # Diversification bonus
+        self.w_freshness = cfg.get("w_freshness", 0.05)     # Prefer strategies with recent activity
+        self.w_consensus = cfg.get("w_consensus", 0.05)     # Dedup consensus boost
+        self.w_confidence = cfg.get("w_confidence", 0.15)   # Calibrated trade confidence
+        self.w_source_quality = cfg.get("w_source_quality", 0.10)  # Agent-scorer / accuracy quality
+        self.w_confirmation = cfg.get("w_confirmation", 0.05)      # External confirmations
 
         # Minimum composite score to even consider executing
-        # Lowered from 0.30 → 0.20: with thin trade history the composite
-        # scores are suppressed by sample-size penalties. 0.20 lets
-        # promising-but-young strategies through for paper validation.
-        self.min_decision_score = cfg.get("min_decision_score", 0.20)
+        self.min_decision_score = cfg.get("min_decision_score", 0.34)
+        self.min_signal_confidence = cfg.get("min_signal_confidence", 0.58)
+        self.min_source_weight = cfg.get("min_source_weight", 0.35)
 
         # Max trades to execute per cycle (independent of position slots)
-        self.max_trades_per_cycle = cfg.get("max_trades_per_cycle", 3)
+        self.max_trades_per_cycle = cfg.get("max_trades_per_cycle", 2)
 
         # Track decisions for audit
         self._decision_history: deque = deque(maxlen=100)
@@ -64,6 +66,7 @@ class DecisionEngine:
             "total_executions": 0,
             "total_no_trade": 0,
             "total_candidates": 0,
+            "total_filtered": 0,
         }
 
     def decide(self, strategies: List[Dict],
@@ -87,7 +90,6 @@ class DecisionEngine:
         self._cycle_count += 1
         open_positions = open_positions or []
         open_coins = {t["coin"] for t in open_positions}
-        open_sides = {(t["coin"], t.get("side", "")): True for t in open_positions}
         available_slots = max(0, 8 - len(open_positions))
 
         self.stats["total_candidates"] += len(strategies)
@@ -164,8 +166,15 @@ class DecisionEngine:
         scored.sort(key=lambda x: x["_composite_score"], reverse=True)
 
         # ─── Filter by minimum threshold ─────────────────
-        qualified = [s for s in scored if s["_composite_score"] >= self.min_decision_score]
-        disqualified = [s for s in scored if s["_composite_score"] < self.min_decision_score]
+        qualified = []
+        disqualified = []
+        for strategy in scored:
+            blockers = self._decision_blockers(strategy)
+            strategy["_decision_blockers"] = blockers
+            if blockers or strategy["_composite_score"] < self.min_decision_score:
+                disqualified.append(strategy)
+            else:
+                qualified.append(strategy)
 
         # ─── Limit by cycle trade cap AND available slots ─
         max_this_cycle = min(self.max_trades_per_cycle, available_slots)
@@ -183,6 +192,7 @@ class DecisionEngine:
 
         # ─── Update stats ────────────────────────────────
         self.stats["total_decisions"] += 1
+        self.stats["total_filtered"] += len(disqualified)
         if executions:
             self.stats["total_executions"] += len(executions)
         else:
@@ -223,6 +233,7 @@ class DecisionEngine:
 
         strategy_type = strategy.get("strategy_type", strategy.get("type", ""))
         raw_score = strategy.get("current_score", 0)
+        confidence = min(max(float(strategy.get("confidence", raw_score) or raw_score), 0.0), 1.0)
 
         # 1. Base score (normalized 0-1)
         base = min(raw_score, 1.0)
@@ -305,13 +316,27 @@ class DecisionEngine:
         # 5. Consensus boost (from dedup)
         consensus = min(strategy.get("_dedup_count", 1) / 5.0, 1.0)
 
+        source_quality = min(
+            max(
+                float(
+                    strategy.get("agent_scorer_weight", strategy.get("source_accuracy", 0.5)) or 0.5
+                ),
+                0.0,
+            ),
+            1.0,
+        )
+        confirmation = self._confirmation_score(strategy)
+
         # Weighted composite
         total = (
             base * self.w_score +
             regime_bonus * self.w_regime +
             diversity_bonus * self.w_diversity +
             freshness * self.w_freshness +
-            consensus * self.w_consensus
+            consensus * self.w_consensus +
+            confidence * self.w_confidence +
+            source_quality * self.w_source_quality +
+            confirmation * self.w_confirmation
         )
 
         return {
@@ -321,7 +346,52 @@ class DecisionEngine:
             "diversity": round(diversity_bonus, 3),
             "freshness": round(freshness, 3),
             "consensus": round(consensus, 3),
+            "confidence": round(confidence, 3),
+            "source_quality": round(source_quality, 3),
+            "confirmation": round(confirmation, 3),
         }
+
+    def _decision_blockers(self, strategy: Dict) -> List[str]:
+        """Hard floors that keep low-quality candidates out before execution."""
+        blockers: List[str] = []
+        confidence = float(strategy.get("confidence", 0.0) or 0.0)
+        source_quality = float(
+            strategy.get("agent_scorer_weight", strategy.get("source_accuracy", 0.5)) or 0.5
+        )
+
+        if confidence < self.min_signal_confidence:
+            blockers.append(f"confidence<{self.min_signal_confidence:.2f}")
+        if source_quality < self.min_source_weight:
+            blockers.append(f"source_weight<{self.min_source_weight:.2f}")
+
+        return blockers
+
+    def _confirmation_score(self, strategy: Dict) -> float:
+        """Score how much independent confirmation a candidate has."""
+        metadata = strategy.get("metadata", {})
+        if not isinstance(metadata, dict):
+            metadata = {}
+
+        confirmations = []
+        if strategy.get("options_flow_aligned") is True:
+            confirmations.append(1.0)
+        elif strategy.get("options_flow_aligned") is False:
+            confirmations.append(0.0)
+
+        if strategy.get("volume_confirmed") is True:
+            confirmations.append(1.0)
+
+        cross_venue = float(metadata.get("cross_venue_score", 0.0) or 0.0)
+        if cross_venue:
+            confirmations.append(min(max(cross_venue, 0.0), 1.0))
+
+        source = str(strategy.get("source", metadata.get("source", "strategy"))).strip().lower()
+        if source in ("polymarket", "options_flow", "arena_champion"):
+            confirmations.append(0.8)
+
+        if not confirmations:
+            return 0.25
+        return round(sum(confirmations) / len(confirmations), 3)
 
     def _aggregate_directional_scores(self, scored: List[Dict]) -> Tuple[float, float]:
         """

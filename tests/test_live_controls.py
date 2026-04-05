@@ -13,6 +13,7 @@ from src.core import boot
 from src.core.api_manager import Priority
 from src.core.cycles.reporting_cycle import run_reporting
 from src.core.cycles.trading_cycle import (
+    _apply_agent_scorer_weights,
     _execute_lcrs_signals,
     _execute_options_flow_trades,
     _process_closed_trades,
@@ -109,6 +110,22 @@ def test_signal_from_execution_dict_preserves_trade_metadata():
     assert signal.size == 0.15
     assert signal.signal_id == "abc123"
     assert signal.source_accuracy == 0.61
+
+
+def test_signal_from_execution_dict_builds_external_source_key():
+    signal = signal_from_execution_dict(
+        {
+            "coin": "BTC",
+            "side": "long",
+            "confidence": 0.71,
+            "entry_price": 101000,
+            "strategy_type": "event_driven",
+            "source": "polymarket",
+        }
+    )
+
+    assert signal.source.value == "polymarket"
+    assert signal.source_key == "polymarket:BTC"
 
 
 def test_shadow_mode_bypasses_rotation_reject_when_capacity_exists():
@@ -647,6 +664,12 @@ def test_execute_options_flow_live_path_executes_signal(monkeypatch):
             return True, "ok"
 
     class FakeAgentScorer:
+        def get_weight(self, source_key):
+            return 0.8
+
+        def get_accuracy(self, source_key):
+            return 0.7
+
         def record_signal(self, *args, **kwargs):
             return None
 
@@ -665,7 +688,7 @@ def test_execute_options_flow_live_path_executes_signal(monkeypatch):
                         {
                             "ticker": "ETH",
                             "direction": "BULLISH",
-                            "conviction_pct": 75,
+                            "conviction_pct": 80,
                             "net_flow": 100000.0,
                             "total_prints": 3,
                         }
@@ -734,9 +757,7 @@ def test_execute_options_flow_paper_trade_preserves_precise_stops(monkeypatch):
     assert abs(opened["take_profit"] - (price * 1.10)) < 1e-12
 
 
-def test_run_alpha_arena_live_path_executes_signal(monkeypatch):
-    executed = []
-
+def test_run_alpha_arena_returns_rankable_candidates(monkeypatch):
     class FakeResponse:
         status_code = 200
 
@@ -745,11 +766,6 @@ def test_run_alpha_arena_live_path_executes_signal(monkeypatch):
                 {"o": "1.0", "h": "1.1", "l": "0.9", "c": "1.0", "v": "10"}
                 for _ in range(60)
             ]
-
-    class FakeLiveTrader:
-        def execute_signal(self, signal, bypass_firewall=False):
-            executed.append((signal.coin, signal.side.value, bypass_firewall, signal.position_pct))
-            return {"status": "success", "coin": signal.coin}
 
     class FakeArena:
         def run_cycle(self, historical_candles=None):
@@ -778,74 +794,20 @@ def test_run_alpha_arena_live_path_executes_signal(monkeypatch):
         (),
         {
             "arena": FakeArena(),
-            "live_trader": FakeLiveTrader(),
         },
     )()
 
-    monkeypatch.setattr("src.core.cycles.trading_cycle.is_live_trading_active", lambda container: True)
     monkeypatch.setattr("requests.post", lambda *args, **kwargs: FakeResponse())
 
-    _run_alpha_arena(container, {"overall_regime": "neutral"})
+    candidates = _run_alpha_arena(container, {"overall_regime": "neutral"})
 
-    assert executed == [("FART", "long", True, 0.03)]
-
-
-def test_run_alpha_arena_paper_trade_preserves_precise_stops(monkeypatch):
-    opened = {}
-    price = 0.01234567
-
-    class FakeResponse:
-        status_code = 200
-
-        def json(self):
-            return [
-                {"o": "1.0", "h": "1.1", "l": "0.9", "c": "1.0", "v": "10"}
-                for _ in range(60)
-            ]
-
-    class FakeArena:
-        def run_cycle(self, historical_candles=None):
-            return None
-
-        def get_stats(self):
-            return {"active_agents": 1, "champions": 1, "total_arena_pnl": 0.0}
-
-        def get_champion_signals(self, **kwargs):
-            return [
-                {
-                    "coin": "FART",
-                    "side": "short",
-                    "confidence": 0.6,
-                    "price": price,
-                    "agent_id": "a1",
-                    "agent_name": "alpha",
-                    "strategy_type": "arena_breakout",
-                    "agent_fitness": 1.2,
-                    "agent_elo": 1100,
-                }
-            ]
-
-    container = type(
-        "Container",
-        (),
-        {
-            "arena": FakeArena(),
-            "live_trader": None,
-        },
-    )()
-
-    monkeypatch.setattr("src.core.cycles.trading_cycle.is_live_trading_active", lambda container: False)
-    monkeypatch.setattr("src.core.cycles.trading_cycle.db.get_paper_account", lambda: {"balance": 10000.0})
-    monkeypatch.setattr(
-        "src.core.cycles.trading_cycle.db.open_paper_trade",
-        lambda **kwargs: opened.update(kwargs) or 1,
-    )
-    monkeypatch.setattr("requests.post", lambda *args, **kwargs: FakeResponse())
-
-    _run_alpha_arena(container, {"overall_regime": "neutral"})
-
-    assert abs(opened["stop_loss"] - (price * 1.05)) < 1e-12
-    assert abs(opened["take_profit"] - (price * 0.90)) < 1e-12
+    assert len(candidates) == 1
+    candidate = candidates[0]
+    assert candidate["source"] == "arena_champion"
+    assert candidate["source_key"] == "arena_champion:a1"
+    assert candidate["side"] == "long"
+    assert candidate["parameters"]["coins"] == ["FART"]
+    assert candidate["metadata"]["agent_name"] == "alpha"
 
 
 def test_execution_open_positions_prefer_live_state_when_deployable():
@@ -971,6 +933,155 @@ def test_process_closed_trades_skips_synthetic_reconciliation():
     assert container.arena.calls == []
     assert container.kelly_sizer.calls == []
     assert container.agent_scorer.calls == []
+
+
+def test_apply_agent_scorer_weights_uses_external_source_keys():
+    class FakeAgentScorer:
+        def get_weight(self, source_key):
+            return {
+                "polymarket:BTC": 0.9,
+                "options_flow:ETH": 0.8,
+                "arena_champion:a1": 0.7,
+            }[source_key]
+
+        def get_accuracy(self, source_key):
+            return {
+                "polymarket:BTC": 0.75,
+                "options_flow:ETH": 0.65,
+                "arena_champion:a1": 0.60,
+            }[source_key]
+
+    container = type("Container", (), {"agent_scorer": FakeAgentScorer()})()
+    strategies = [
+        {
+            "strategy_type": "event_driven",
+            "confidence": 0.6,
+            "source": "polymarket",
+            "parameters": {"coins": ["BTC"]},
+        },
+        {
+            "strategy_type": "options_momentum",
+            "confidence": 0.7,
+            "source": "options_flow",
+            "parameters": {"coins": ["ETH"]},
+        },
+        {
+            "strategy_type": "arena_breakout",
+            "confidence": 0.8,
+            "source": "arena_champion",
+            "agent_id": "a1",
+            "parameters": {"coins": ["BTC"]},
+            "metadata": {"agent_id": "a1"},
+        },
+    ]
+
+    _apply_agent_scorer_weights(container, strategies)
+
+    assert strategies[0]["source_key"] == "polymarket:BTC"
+    assert strategies[0]["agent_scorer_weight"] == 0.9
+    assert strategies[1]["source_key"] == "options_flow:ETH"
+    assert strategies[1]["agent_scorer_weight"] == 0.8
+    assert strategies[2]["source_key"] == "arena_champion:a1"
+    assert strategies[2]["agent_scorer_weight"] == 0.7
+
+
+def test_paper_trader_generate_signal_preserves_external_source_identity(monkeypatch):
+    monkeypatch.setitem(sys.modules, "numpy", types.SimpleNamespace(std=lambda values: 0.0))
+    monkeypatch.setattr(
+        "src.trading.paper_trader.db.get_paper_account",
+        lambda: {"balance": 10000.0},
+    )
+
+    from src.trading.paper_trader import PaperTrader
+
+    trader = PaperTrader()
+    signal = trader._generate_signal(
+        {
+            "id": None,
+            "name": "polymarket_btc_long",
+            "strategy_type": "event_driven",
+            "current_score": 0.72,
+            "confidence": 0.72,
+            "source": "polymarket",
+            "parameters": {"coins": ["BTC"]},
+            "metadata": {"source": "polymarket", "reason": "Odds moved sharply higher"},
+        },
+        {"BTC": 100000.0},
+        {"overall_regime": "neutral", "overall_confidence": 0.2},
+    )
+
+    assert signal is not None
+    assert signal["source"] == "polymarket"
+    assert signal["source_key"] == "polymarket:BTC"
+    assert signal["reason"] == "Odds moved sharply higher"
+
+
+def test_process_closed_trades_routes_arena_outcomes_to_specific_agent():
+    class FakeArena:
+        def __init__(self):
+            self.agent_calls = []
+            self.strategy_calls = []
+
+        def record_trade_result(self, agent_id, pnl, return_pct=0.0):
+            self.agent_calls.append((agent_id, pnl, return_pct))
+
+        def record_trade_for_strategy(self, *args):
+            self.strategy_calls.append(args)
+
+    class FakeKelly:
+        def __init__(self):
+            self.calls = []
+
+        def record_outcome(self, **kwargs):
+            self.calls.append(kwargs)
+
+    class FakeAgentScorer:
+        def __init__(self):
+            self.calls = []
+
+        def record_outcome(self, *args):
+            self.calls.append(args)
+
+    container = type(
+        "Container",
+        (),
+        {
+            "arena": FakeArena(),
+            "kelly_sizer": FakeKelly(),
+            "agent_scorer": FakeAgentScorer(),
+            "shadow_tracker": None,
+        },
+    )()
+
+    _process_closed_trades(
+        container,
+        [
+            {
+                "trade_id": 42,
+                "coin": "BTC",
+                "side": "long",
+                "entry_price": 100000.0,
+                "exit_price": 102000.0,
+                "size": 0.01,
+                "leverage": 2,
+                "pnl": 40.0,
+                "strategy_type": "arena_breakout",
+                "signal_id": "arena-42",
+                "metadata": {
+                    "source": "arena_champion",
+                    "source_key": "arena_champion:a1",
+                    "agent_id": "a1",
+                    "signal_id": "arena-42",
+                },
+            }
+        ],
+    )
+
+    assert container.arena.agent_calls
+    assert container.arena.agent_calls[0][0] == "a1"
+    assert container.arena.strategy_calls == []
+    assert container.kelly_sizer.calls[0]["strategy_key"] == "arena_champion:a1"
+    assert container.agent_scorer.calls[0][0] == "arena_champion:a1"
 
 
 def test_firewall_uses_explicit_live_positions_without_falling_back(monkeypatch):

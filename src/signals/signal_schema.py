@@ -22,6 +22,8 @@ class SignalSource(str, Enum):
     STRATEGY = "strategy"
     COPY_TRADE = "copy_trade"
     OPTIONS_FLOW = "options_flow"
+    POLYMARKET = "polymarket"
+    ARENA_CHAMPION = "arena_champion"
     MANUAL = "manual"
     WHALE_TRADE = "whale_trade"
 
@@ -74,6 +76,7 @@ class TradeSignal:
     strategy_id: Optional[int] = None # Link to strategy if from strategy scorer
     strategy_type: str = ""           # e.g. "momentum_long", "mean_reversion"
     trader_address: str = ""          # Link to trader if from copy trade
+    source_key: str = ""              # Stable attribution key used by learning systems
 
     # Metadata
     timestamp: str = field(default_factory=lambda: datetime.utcnow().isoformat())
@@ -125,9 +128,51 @@ class TradeSignal:
         return True
 
 
+def resolve_signal_source(raw_source: Any) -> SignalSource:
+    """Best-effort normalization of signal source names to the enum."""
+    if isinstance(raw_source, SignalSource):
+        return raw_source
+    normalized = str(raw_source or "").strip().lower()
+    for source in SignalSource:
+        if normalized == source.value:
+            return source
+    return SignalSource.STRATEGY
+
+
+def build_source_key(
+    source: Any,
+    *,
+    strategy_type: str = "",
+    trader_address: str = "",
+    coin: str = "",
+    agent_id: str = "",
+) -> str:
+    """Build a stable attribution key for scoring, calibration, and Kelly sizing."""
+    source_enum = resolve_signal_source(source)
+    normalized_coin = str(coin or "").strip().upper()
+    normalized_strategy = str(strategy_type or "").strip() or "unknown"
+
+    if source_enum == SignalSource.COPY_TRADE:
+        trader = str(trader_address or "unknown").strip() or "unknown"
+        return f"copy_trade:{trader}"
+    if source_enum == SignalSource.OPTIONS_FLOW:
+        return f"options_flow:{normalized_coin or normalized_strategy}"
+    if source_enum == SignalSource.POLYMARKET:
+        return f"polymarket:{normalized_coin or normalized_strategy}"
+    if source_enum == SignalSource.ARENA_CHAMPION:
+        agent = str(agent_id or "").strip() or normalized_strategy or normalized_coin or "unknown"
+        return f"arena_champion:{agent}"
+    if source_enum == SignalSource.WHALE_TRADE:
+        return f"whale_trade:{normalized_coin or 'unknown'}"
+    if source_enum == SignalSource.MANUAL:
+        return "manual"
+    return f"strategy:{normalized_strategy or normalized_coin or 'unknown'}"
+
+
 def signal_from_strategy(strategy: Dict, coin: str, side: str,
                           entry_price: float, confidence: float = 0.5) -> TradeSignal:
     """Helper: create a TradeSignal from a strategy dict."""
+    strategy_type = strategy.get("strategy_type", "")
     return TradeSignal(
         coin=coin,
         side=SignalSide(side),
@@ -135,8 +180,13 @@ def signal_from_strategy(strategy: Dict, coin: str, side: str,
         source=SignalSource.STRATEGY,
         reason=f"Strategy: {strategy.get('name', 'unknown')} ({strategy.get('strategy_type', '')})",
         strategy_id=strategy.get("id"),
-        strategy_type=strategy.get("strategy_type", ""),
+        strategy_type=strategy_type,
         entry_price=entry_price,
+        source_key=build_source_key(
+            SignalSource.STRATEGY,
+            strategy_type=strategy_type,
+            coin=coin,
+        ),
     )
 
 
@@ -151,6 +201,11 @@ def signal_from_copy_trade(trader_address: str, coin: str, side: str,
         reason=f"Copy: {trader_address[:10]}... opened {side} {coin}",
         trader_address=trader_address,
         entry_price=entry_price,
+        source_key=build_source_key(
+            SignalSource.COPY_TRADE,
+            trader_address=trader_address,
+            coin=coin,
+        ),
     )
 
 
@@ -164,12 +219,8 @@ def signal_from_execution_dict(execution: Dict[str, Any]) -> TradeSignal:
     source_raw = str(execution.get("source", "")).strip().lower()
     if source_raw == SignalSource.COPY_TRADE.value or execution.get("trader_address"):
         source = SignalSource.COPY_TRADE
-    elif source_raw == SignalSource.OPTIONS_FLOW.value:
-        source = SignalSource.OPTIONS_FLOW
-    elif source_raw == SignalSource.WHALE_TRADE.value:
-        source = SignalSource.WHALE_TRADE
     else:
-        source = SignalSource.STRATEGY
+        source = resolve_signal_source(source_raw)
 
     side_value = str(execution.get("side", "long")).strip().lower()
     entry_price = float(execution.get("entry_price", 0.0) or 0.0)
@@ -202,6 +253,14 @@ def signal_from_execution_dict(execution: Dict[str, Any]) -> TradeSignal:
         signal_id=str(execution.get("signal_id", "")),
         regime=str(execution.get("regime", "")),
         source_accuracy=float(execution.get("source_accuracy", 0.0) or 0.0),
+        source_key=str(execution.get("source_key", "")).strip()
+        or build_source_key(
+            source,
+            strategy_type=str(execution.get("strategy_type", "")),
+            trader_address=str(execution.get("trader_address", execution.get("trader", ""))),
+            coin=str(execution.get("coin", "")),
+            agent_id=str(execution.get("agent_id", "")),
+        ),
     )
     return signal
 
@@ -219,6 +278,11 @@ def signal_from_options_flow(ticker: str, direction: str,
         source=SignalSource.OPTIONS_FLOW,
         reason=f"Options flow: net ${net_flow:,.0f} {direction} across {prints} prints",
         options_flow_aligned=True,
+        source_key=build_source_key(
+            SignalSource.OPTIONS_FLOW,
+            coin=ticker,
+            strategy_type="options_momentum",
+        ),
     )
 
 
@@ -247,4 +311,8 @@ def signal_from_whale_trade(coin: str, whale_side: str, notional: float,
         source=SignalSource.WHALE_TRADE,
         reason=f"Whale {whale_side.upper()} ${notional:,.0f} on {exchange}",
         entry_price=0.0,  # No specific entry price for whale signals
+        source_key=build_source_key(
+            SignalSource.WHALE_TRADE,
+            coin=coin,
+        ),
     )

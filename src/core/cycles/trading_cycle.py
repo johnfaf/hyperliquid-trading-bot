@@ -10,6 +10,7 @@ Extracted from ``HyperliquidResearchBot._run_trading_cycle``.
 import logging
 from datetime import datetime
 
+import config
 from src.data import database as db
 from src.core.live_execution import (
     get_execution_open_positions,
@@ -17,6 +18,7 @@ from src.core.live_execution import (
     mirror_executed_trades_to_live,
     sync_shadow_book_to_live,
 )
+from src.signals.signal_schema import build_source_key
 
 logger = logging.getLogger(__name__)
 logger.addHandler(logging.NullHandler())
@@ -85,7 +87,7 @@ def _record_shadow_trade(container, closed_trade, pnl, return_pct, entry):
     try:
         meta = closed_trade.get("metadata") or {}
         stype = closed_trade.get("strategy_type", "unknown")
-        source = meta.get("source", f"strategy:{stype}")
+        source = meta.get("source_key") or meta.get("source", f"strategy:{stype}")
         tracker.record_trade({
             "signal_source": source,
             "coin": closed_trade.get("coin", "UNK"),
@@ -102,6 +104,64 @@ def _record_shadow_trade(container, closed_trade, pnl, return_pct, entry):
         })
     except Exception as exc:
         logger.debug("  ShadowTracker record error: %s", exc)
+
+
+def _coerce_metadata(metadata):
+    if isinstance(metadata, dict):
+        return dict(metadata)
+    if isinstance(metadata, str):
+        try:
+            import json
+
+            parsed = json.loads(metadata)
+            if isinstance(parsed, dict):
+                return parsed
+        except (json.JSONDecodeError, TypeError):
+            return {}
+    return {}
+
+
+def _strategy_source_key(strategy: dict) -> str:
+    metadata = _coerce_metadata(strategy.get("metadata", {}))
+    source_key = str(strategy.get("source_key", "")).strip() or str(metadata.get("source_key", "")).strip()
+    if source_key:
+        return source_key
+
+    params = strategy.get("parameters", {})
+    if isinstance(params, dict):
+        coins = params.get("coins", params.get("coins_traded", []))
+    else:
+        coins = []
+    if isinstance(coins, str):
+        coins = [coins]
+    coin = strategy.get("_decision_coin") or (coins[0] if coins else "")
+    return build_source_key(
+        strategy.get("source", metadata.get("source", "strategy")),
+        strategy_type=strategy.get("strategy_type", strategy.get("type", "")),
+        trader_address=str(strategy.get("trader_address", metadata.get("source_trader", ""))),
+        coin=str(coin),
+        agent_id=str(strategy.get("agent_id", metadata.get("agent_id", ""))),
+    )
+
+
+def _apply_calibration_adjustments(container, top_strategies):
+    """Adjust confidence using realized calibration data before ranking."""
+    if not top_strategies or not getattr(container, "calibration", None):
+        return
+    try:
+        for strategy in top_strategies:
+            source_key = _strategy_source_key(strategy)
+            original_conf = float(strategy.get("confidence", strategy.get("current_score", 0.5)) or 0.5)
+            adjusted_conf = container.calibration.get_adjustment_factor(source_key, original_conf)
+            strategy["confidence"] = round(adjusted_conf, 3)
+            if "current_score" in strategy:
+                strategy["current_score"] = round(
+                    max(0.0, min((float(strategy.get("current_score", 0.5)) * 0.6) + (adjusted_conf * 0.4), 1.0)),
+                    3,
+                )
+            strategy["source_key"] = source_key
+    except Exception as exc:
+        logger.debug("  Calibration weight apply error: %s", exc)
 
 
 def _execute_signal_live(container, trade_signal, source_label: str):
@@ -286,17 +346,27 @@ def run_trading_cycle(container, cycle_count: int) -> None:
 
         # Inject Polymarket signals as synthetic strategies
         if polymarket_signals:
+            injected_polymarket = 0
             for pm in polymarket_signals:
+                confidence = float(pm.get("confidence", 0.5) or 0.5)
+                if confidence < config.POLYMARKET_MIN_DECISION_CONFIDENCE:
+                    continue
+                source_key = build_source_key(
+                    "polymarket",
+                    strategy_type="event_driven",
+                    coin=pm.get("coin", "BTC"),
+                )
                 synthetic = {
                     "id": None,
                     "name": f"polymarket_{pm.get('coin', 'UNK')}_{pm.get('side', '?')}",
                     "strategy_type": "event_driven",
                     "trader_address": "polymarket",
-                    "current_score": pm.get("confidence", 0.5),
-                    "confidence": pm.get("confidence", 0.5),
+                    "current_score": confidence,
+                    "confidence": confidence,
                     "direction": pm.get("side", "long"),
                     "side": pm.get("side", "long"),
                     "source": "polymarket",
+                    "source_key": source_key,
                     "parameters": {
                         "coins": [pm.get("coin", "BTC")],
                         "market": pm.get("polymarket_market", ""),
@@ -304,12 +374,15 @@ def run_trading_cycle(container, cycle_count: int) -> None:
                     },
                     "metrics": {},
                     "metadata": {
+                        "source": "polymarket",
+                        "source_key": source_key,
                         "polymarket_volume_24h": pm.get("polymarket_volume_24h", 0),
                         "reason": pm.get("reason", ""),
                     },
                 }
                 top_strategies.append(synthetic)
-            logger.info("  Injected %d Polymarket signals", len(polymarket_signals))
+                injected_polymarket += 1
+            logger.info("  Injected %d Polymarket signals", injected_polymarket)
 
         # Inject high-conviction options flow as synthetic strategies
         # (Phase 4a2 still handles direct trades; this feeds the decision engine too)
@@ -317,10 +390,15 @@ def run_trading_cycle(container, cycle_count: int) -> None:
             convictions = getattr(container.options_scanner, "top_convictions", None) or []
             injected_options = 0
             for conv in convictions:
-                if conv.get("conviction_pct", 0) < 70:
+                if conv.get("conviction_pct", 0) < config.OPTIONS_FLOW_INJECTION_MIN_CONVICTION:
                     continue
                 direction = conv.get("direction", "bullish")
                 side = "long" if direction == "bullish" else "short"
+                source_key = build_source_key(
+                    "options_flow",
+                    strategy_type="options_momentum",
+                    coin=conv.get("ticker", "BTC"),
+                )
                 synthetic = {
                     "id": None,
                     "name": f"options_flow_{conv.get('ticker', 'UNK')}_{side}",
@@ -331,11 +409,14 @@ def run_trading_cycle(container, cycle_count: int) -> None:
                     "direction": side,
                     "side": side,
                     "source": "options_flow",
+                    "source_key": source_key,
                     "parameters": {
                         "coins": [conv.get("ticker", "BTC")],
                     },
                     "metrics": {},
                     "metadata": {
+                        "source": "options_flow",
+                        "source_key": source_key,
                         "net_flow": conv.get("net_flow", 0),
                         "total_prints": conv.get("total_prints", 0),
                         "conviction_pct": conv.get("conviction_pct", 0),
@@ -354,8 +435,28 @@ def run_trading_cycle(container, cycle_count: int) -> None:
         if closed:
             logger.info("  Closed %d positions", len(closed))
 
+        closed = _collect_closed_trade_events(container, closed)
+        if closed and tg.is_configured():
+            for c_trade in closed:
+                tg.notify_trade_closed(
+                    c_trade, c_trade.get("exit_price", 0),
+                    c_trade.get("pnl", 0), c_trade.get("reason", ""),
+                )
+        if closed:
+            _process_closed_trades(container, closed)
+
+        arena_candidates = _run_alpha_arena(container, regime_data)
+        if arena_candidates:
+            top_strategies.extend(arena_candidates)
+            logger.info("  Injected %d arena champion signals into decision engine", len(arena_candidates))
+
         # Cross-venue signal confirmation
         _run_cross_venue_confirmation(container, top_strategies)
+
+        # Source-quality and calibration adjustments must happen BEFORE ranking
+        # so the decision engine sees which systems are improving over time.
+        _apply_agent_scorer_weights(container, top_strategies)
+        _apply_calibration_adjustments(container, top_strategies)
 
         # Decision engine
         open_trades = get_execution_open_positions(container)
@@ -370,9 +471,6 @@ def run_trading_cycle(container, cycle_count: int) -> None:
                 top_strategies, regime_data=regime_data,
                 open_positions=open_trades, kelly_stats=kelly_stats,
             )
-
-        # AgentScorer dynamic weights
-        _apply_agent_scorer_weights(container, top_strategies)
 
         # Execute new signals
         if top_strategies and container.paper_trader:
@@ -404,7 +502,7 @@ def run_trading_cycle(container, cycle_count: int) -> None:
         # Phase 4b: Copy trading
         _run_copy_trading(container, regime_data)
 
-        closed = _collect_closed_trade_events(container, closed)
+        closed = _collect_closed_trade_events(container, [])
         if closed and tg.is_configured():
             for c_trade in closed:
                 tg.notify_trade_closed(
@@ -415,9 +513,6 @@ def run_trading_cycle(container, cycle_count: int) -> None:
         # Phase 4c: Feed closed trade outcomes
         if closed:
             _process_closed_trades(container, closed)
-
-        # Phase 5: Alpha Arena
-        _run_alpha_arena(container, regime_data)
 
         logger.info("Trading cycle #%d complete.", cycle_count)
 
@@ -621,14 +716,15 @@ def _apply_agent_scorer_weights(container, top_strategies):
     if not top_strategies or not container.agent_scorer:
         return
     try:
-        if hasattr(container.agent_scorer, "apply_weights_to_signals"):
-            for s in top_strategies:
-                stype = s.get("strategy_type", "unknown")
-                source_key = f"strategy:{stype}"
-                weight = container.agent_scorer.get_weight(source_key)
-                orig_conf = float(s.get("confidence", 0.5))
-                s["confidence"] = round(orig_conf * 0.6 + weight * 0.4, 3)
-                s["agent_scorer_weight"] = round(weight, 3)
+        for s in top_strategies:
+            source_key = _strategy_source_key(s)
+            weight = container.agent_scorer.get_weight(source_key)
+            accuracy = container.agent_scorer.get_accuracy(source_key)
+            orig_conf = float(s.get("confidence", 0.5))
+            s["confidence"] = round(orig_conf * 0.7 + weight * 0.3, 3)
+            s["agent_scorer_weight"] = round(weight, 3)
+            s["source_accuracy"] = round(accuracy, 3)
+            s["source_key"] = source_key
     except Exception as exc:
         logger.debug("  AgentScorer weight apply error: %s", exc)
 
@@ -747,19 +843,37 @@ def _execute_options_flow_trades(container, regime_data):
 
         convictions = getattr(container.options_scanner, "top_convictions", None) or []
         for conv in convictions:
-            if conv.get("conviction_pct", 0) < 70:
+            if conv.get("conviction_pct", 0) < config.OPTIONS_FLOW_DIRECT_MIN_CONVICTION:
                 continue
             flow_signal = signal_from_options_flow(
                 ticker=conv["ticker"], direction=conv["direction"],
                 net_flow=conv["net_flow"], prints=conv["total_prints"],
                 conviction_pct=conv["conviction_pct"],
             )
+            flow_signal.strategy_type = "options_momentum"
             flow_signal.position_pct = 0.04
             flow_signal.leverage = 2.0
             price = float(mids.get(conv["ticker"], 0))
             if price <= 0:
                 continue
             flow_signal.entry_price = price
+            source_key = build_source_key(
+                flow_signal.source,
+                strategy_type=flow_signal.strategy_type,
+                coin=conv["ticker"],
+            )
+            flow_signal.source_key = source_key
+
+            if container.agent_scorer:
+                weight = container.agent_scorer.get_weight(source_key)
+                flow_signal.confidence = min(flow_signal.confidence * 0.7 + weight * 0.3, 1.0)
+                flow_signal.source_accuracy = container.agent_scorer.get_accuracy(source_key)
+
+            if getattr(container, "calibration", None):
+                flow_signal.confidence = container.calibration.get_adjustment_factor(
+                    source_key,
+                    flow_signal.confidence,
+                )
 
             if container.firewall:
                 passed, reason = container.firewall.validate(
@@ -770,8 +884,26 @@ def _execute_options_flow_trades(container, regime_data):
                     logger.info("  Firewall rejected options flow %s: %s", conv["ticker"], reason)
                     continue
 
+            if getattr(container, "arena", None):
+                try:
+                    approved, consensus_conf = container.arena.get_consensus_on_signal(
+                        flow_signal,
+                        features={
+                            "net_flow": conv.get("net_flow", 0),
+                            "total_prints": conv.get("total_prints", 0),
+                            "conviction_pct": conv.get("conviction_pct", 0),
+                        },
+                    )
+                    if not approved:
+                        logger.info("  Arena consensus rejected options flow %s", conv["ticker"])
+                        continue
+                    flow_signal.confidence = consensus_conf
+                except Exception as exc:
+                    logger.debug("  Arena consensus error for options flow %s: %s", conv["ticker"], exc)
+
+            signal_id = ""
             if container.agent_scorer:
-                container.agent_scorer.record_signal("options_flow", {
+                signal_id = container.agent_scorer.record_signal(source_key, {
                     "coin": conv["ticker"], "side": flow_signal.side.value,
                     "confidence": flow_signal.confidence,
                 })
@@ -779,6 +911,15 @@ def _execute_options_flow_trades(container, regime_data):
             if is_live_trading_active(container):
                 live_result = _execute_signal_live(container, flow_signal, "OPTIONS FLOW")
                 if live_result:
+                    live_result.update(
+                        {
+                            "source": "options_flow",
+                            "source_key": source_key,
+                            "signal_id": signal_id,
+                            "strategy_type": "options_momentum",
+                            "confidence": flow_signal.confidence,
+                        }
+                    )
                     options_executed.append(live_result)
                     if tg.is_configured():
                         tg.notify_trade_opened(
@@ -800,6 +941,11 @@ def _execute_options_flow_trades(container, regime_data):
                     stop_loss=sl, take_profit=tp,
                     metadata={
                         "source": "options_flow",
+                        "source_key": source_key,
+                        "signal_id": signal_id,
+                        "strategy_type": "options_momentum",
+                        "confidence": flow_signal.confidence,
+                        "source_accuracy": flow_signal.source_accuracy,
                         "conviction": conv["conviction_pct"],
                         "net_flow": conv["net_flow"],
                         "prints": conv["total_prints"],
@@ -809,7 +955,29 @@ def _execute_options_flow_trades(container, regime_data):
                     "  Options flow trade: %s %s @ $%s (conviction: %d%%)",
                     side.upper(), conv["ticker"], f"{price:,.2f}", conv["conviction_pct"],
                 )
-                options_executed.append({"id": trade_id, "coin": conv["ticker"], "side": side})
+                options_executed.append(
+                    {
+                        "id": trade_id,
+                        "coin": conv["ticker"],
+                        "side": side,
+                        "strategy_type": "options_momentum",
+                        "source": "options_flow",
+                        "source_key": source_key,
+                        "signal_id": signal_id,
+                        "confidence": flow_signal.confidence,
+                        "entry_price": price,
+                        "stop_loss": sl,
+                        "take_profit": tp,
+                        "metadata": {
+                            "source": "options_flow",
+                            "source_key": source_key,
+                            "signal_id": signal_id,
+                            "strategy_type": "options_momentum",
+                            "confidence": flow_signal.confidence,
+                            "source_accuracy": flow_signal.source_accuracy,
+                        },
+                    }
+                )
                 if tg.is_configured():
                     tg.notify_trade_opened(
                         {"coin": conv["ticker"], "side": side, "entry_price": price},
@@ -889,10 +1057,18 @@ def _process_closed_trades(container, closed):
     """Phase 4c: feed outcomes to arena, agent scorer, shadow tracker, AND Kelly sizer."""
     for c_trade in closed:
         try:
-            meta = c_trade.get("metadata") or {}
+            meta = _coerce_metadata(c_trade.get("metadata") or {})
             if meta.get("synthetic_reconciliation") or c_trade.get("reason") == "live_reconciled_closed":
                 continue
             stype = c_trade.get("strategy_type", "unknown")
+            source_name = str(meta.get("source", c_trade.get("source", "strategy"))).strip() or "strategy"
+            source_key = str(meta.get("source_key", c_trade.get("source_key", ""))).strip() or build_source_key(
+                source_name,
+                strategy_type=stype,
+                trader_address=str(meta.get("source_trader", c_trade.get("trader_address", ""))),
+                coin=c_trade.get("coin", ""),
+                agent_id=str(meta.get("agent_id", "")),
+            )
             pnl = c_trade.get("pnl", 0)
             entry = c_trade.get("entry_price", 1)
             size = c_trade.get("size", 0)
@@ -901,23 +1077,19 @@ def _process_closed_trades(container, closed):
             return_pct = pnl / max(notional, 1)
 
             if container.arena:
-                container.arena.record_trade_for_strategy(stype, pnl, return_pct)
+                agent_id = str(meta.get("agent_id", "")).strip()
+                if source_name == "arena_champion" and agent_id:
+                    container.arena.record_trade_result(agent_id, pnl, return_pct)
+                else:
+                    container.arena.record_trade_for_strategy(stype, pnl, return_pct)
 
             _record_shadow_trade(container, c_trade, pnl, return_pct, entry)
 
             # Kelly sizer: feed trade outcomes so it can compute win_rate + reward/risk
             if container.kelly_sizer:
                 try:
-                    # Use strategy_type as key; copy trades get source-specific key
-                    source = meta.get("source", "")
-                    if source == "copy_trade":
-                        kelly_key = f"copy_trade:{c_trade.get('trader_address', 'unknown')}"
-                    elif source == "options_flow":
-                        kelly_key = f"options_flow:{c_trade.get('coin', 'UNK')}"
-                    else:
-                        kelly_key = stype or "unknown"
                     container.kelly_sizer.record_outcome(
-                        strategy_key=kelly_key,
+                        strategy_key=source_key or stype or "unknown",
                         pnl=pnl,
                         entry_price=entry,
                         size=max(size, 1e-8),
@@ -929,9 +1101,7 @@ def _process_closed_trades(container, closed):
             # AgentScorer outcome
             if container.agent_scorer:
                 try:
-                    meta = c_trade.get("metadata") or {}
-                    signal_id = meta.get("signal_id", "")
-                    source_key = f"strategy:{stype}"
+                    signal_id = meta.get("signal_id", c_trade.get("signal_id", ""))
                     if signal_id:
                         container.agent_scorer.record_outcome(source_key, signal_id, pnl, return_pct)
                 except Exception:
@@ -941,10 +1111,10 @@ def _process_closed_trades(container, closed):
 
 
 def _run_alpha_arena(container, regime_data):
-    """Phase 5: Alpha Arena cycle."""
+    """Run the arena maintenance cycle and return champion candidates for ranking."""
     if not container.arena:
-        return
-    logger.info("Phase 5: Alpha Arena")
+        return []
+    logger.info("Phase 3d3: Alpha Arena")
     try:
         import requests
         arena_candles = None
@@ -976,67 +1146,64 @@ def _run_alpha_arena(container, regime_data):
             stats["active_agents"], stats["champions"], stats["total_arena_pnl"],
         )
 
-        # Champion signals → paper trading
+        candidates = []
         if arena_candles and len(arena_candles) >= 30:
             try:
-                from src.signals.signal_schema import TradeSignal, SignalSide, SignalSource, RiskParams
                 champion_signals = container.arena.get_champion_signals(
-                    current_candles=arena_candles[-100:], min_fitness=0.15, min_trades=10,
+                    current_candles=arena_candles[-100:],
+                    min_fitness=config.ARENA_MIN_FITNESS,
+                    min_trades=config.ARENA_MIN_TRADES,
                 )
                 if champion_signals:
                     logger.info("  Arena champions: %d signals", len(champion_signals))
-                    account = None
                     for sig in champion_signals:
                         try:
                             price = sig.get("price", 0)
                             if price <= 0:
                                 continue
-                            side = sig["side"]
-                            conf = sig["confidence"]
-                            sl = price * (0.95 if side == "long" else 1.05)
-                            tp = price * (1.10 if side == "long" else 0.90)
-                            if is_live_trading_active(container):
-                                live_signal = TradeSignal(
-                                    coin=sig["coin"],
-                                    side=SignalSide(side),
-                                    confidence=conf,
-                                    source=SignalSource.STRATEGY,
-                                    reason=f"Arena champion: {sig['agent_name']}",
-                                    strategy_type=sig["strategy_type"],
-                                    entry_price=price,
-                                    leverage=2,
-                                    position_pct=0.05 * conf,
-                                    risk=RiskParams(stop_loss_pct=0.05, take_profit_pct=0.10),
-                                    regime=regime_data.get("overall_regime", "") if regime_data else "",
-                                )
-                                _execute_signal_live(container, live_signal, "ARENA")
-                                continue
-                            if account is None:
-                                account = db.get_paper_account()
-                            if account:
-                                size_usd = account["balance"] * 0.05 * conf
-                                size = size_usd / price
-                                db.open_paper_trade(
-                                    strategy_id=None, coin=sig["coin"], side=side,
-                                    entry_price=price, size=size, leverage=2,
-                                    stop_loss=sl, take_profit=tp,
-                                    metadata={
-                                        "source": "arena_champion",
-                                        "agent_id": sig["agent_id"],
-                                        "agent_name": sig["agent_name"],
-                                        "strategy_type": sig["strategy_type"],
-                                        "agent_fitness": sig["agent_fitness"],
-                                        "agent_elo": sig["agent_elo"],
-                                        "confidence": conf,
+                            source_key = build_source_key(
+                                "arena_champion",
+                                strategy_type=sig["strategy_type"],
+                                coin=sig.get("coin", "BTC"),
+                                agent_id=sig.get("agent_id", ""),
+                            )
+                            fitness = float(sig.get("agent_fitness", 0.0) or 0.0)
+                            conf = float(sig.get("confidence", 0.0) or 0.0)
+                            composite = min(0.98, max(conf * 0.7 + min(max(fitness, 0.0), 1.0) * 0.3, 0.0))
+                            candidates.append(
+                                {
+                                    "id": None,
+                                    "name": f"arena_{sig.get('agent_name', 'champion')}_{sig.get('side', 'long')}",
+                                    "strategy_type": sig["strategy_type"],
+                                    "current_score": round(composite, 3),
+                                    "confidence": round(conf, 3),
+                                    "direction": sig.get("side", "long"),
+                                    "side": sig.get("side", "long"),
+                                    "source": "arena_champion",
+                                    "source_key": source_key,
+                                    "agent_id": sig.get("agent_id", ""),
+                                    "agent_name": sig.get("agent_name", ""),
+                                    "parameters": {
+                                        "coins": [sig.get("coin", "BTC")],
                                     },
-                                )
-                                logger.info(
-                                    "  Champion trade: %s %s @ $%s | agent=%s",
-                                    side.upper(), sig["coin"], f"{price:,.2f}", sig["agent_name"],
-                                )
+                                    "metrics": {},
+                                    "metadata": {
+                                        "source": "arena_champion",
+                                        "source_key": source_key,
+                                        "reason": f"Arena champion: {sig.get('agent_name', 'unknown')}",
+                                        "agent_id": sig.get("agent_id", ""),
+                                        "agent_name": sig.get("agent_name", ""),
+                                        "agent_fitness": sig.get("agent_fitness", 0),
+                                        "agent_elo": sig.get("agent_elo", 0),
+                                        "atr_pct": sig.get("atr_pct", 0.02),
+                                    },
+                                }
+                            )
                         except Exception as exc:
-                            logger.debug("  Champion trade exec error: %s", exc)
+                            logger.debug("  Champion candidate error: %s", exc)
             except Exception as exc:
                 logger.debug("  Champion signals error: %s", exc)
+        return candidates
     except Exception as exc:
         logger.warning("  Arena error: %s", exc)
+        return []

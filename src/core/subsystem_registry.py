@@ -234,7 +234,26 @@ def build_subsystems(
 
     if "decision_engine" in profile:
         from src.signals.decision_engine import DecisionEngine
-        c.decision_engine = _safe_init("decision_engine", DecisionEngine, health)
+        c.decision_engine = _safe_init(
+            "decision_engine",
+            lambda: DecisionEngine(
+                {
+                    "w_score": config.DECISION_W_SCORE,
+                    "w_regime": config.DECISION_W_REGIME,
+                    "w_diversity": config.DECISION_W_DIVERSITY,
+                    "w_freshness": config.DECISION_W_FRESHNESS,
+                    "w_consensus": config.DECISION_W_CONSENSUS,
+                    "w_confidence": config.DECISION_W_CONFIDENCE,
+                    "w_source_quality": config.DECISION_W_SOURCE_QUALITY,
+                    "w_confirmation": config.DECISION_W_CONFIRMATION,
+                    "min_decision_score": config.DECISION_MIN_SCORE,
+                    "min_signal_confidence": config.DECISION_MIN_CONFIDENCE,
+                    "min_source_weight": config.DECISION_MIN_SOURCE_WEIGHT,
+                    "max_trades_per_cycle": config.DECISION_MAX_TRADES_PER_CYCLE,
+                }
+            ),
+            health,
+        )
 
     if "alpha_arena" in profile:
         from src.signals.alpha_arena import AlphaArena

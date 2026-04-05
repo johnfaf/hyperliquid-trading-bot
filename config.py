@@ -194,6 +194,34 @@ ROTATION_REQUIRE_EXPLICIT_THRESHOLDS = os.environ.get(
 # Raise to 0.45+ to ensure only well-confirmed signals are traded.
 FIREWALL_MIN_CONFIDENCE = float(os.environ.get("FIREWALL_MIN_CONFIDENCE", 0.45))
 
+# Decision engine tightening: these weights and floors make the ranking layer
+# care about calibrated confidence and source quality, not just raw scorer output.
+DECISION_W_SCORE = float(os.environ.get("DECISION_W_SCORE", 0.25))
+DECISION_W_REGIME = float(os.environ.get("DECISION_W_REGIME", 0.20))
+DECISION_W_DIVERSITY = float(os.environ.get("DECISION_W_DIVERSITY", 0.15))
+DECISION_W_FRESHNESS = float(os.environ.get("DECISION_W_FRESHNESS", 0.05))
+DECISION_W_CONSENSUS = float(os.environ.get("DECISION_W_CONSENSUS", 0.05))
+DECISION_W_CONFIDENCE = float(os.environ.get("DECISION_W_CONFIDENCE", 0.15))
+DECISION_W_SOURCE_QUALITY = float(os.environ.get("DECISION_W_SOURCE_QUALITY", 0.10))
+DECISION_W_CONFIRMATION = float(os.environ.get("DECISION_W_CONFIRMATION", 0.05))
+DECISION_MIN_SCORE = float(os.environ.get("DECISION_MIN_SCORE", 0.34))
+DECISION_MIN_CONFIDENCE = float(os.environ.get("DECISION_MIN_CONFIDENCE", 0.58))
+DECISION_MIN_SOURCE_WEIGHT = float(os.environ.get("DECISION_MIN_SOURCE_WEIGHT", 0.35))
+DECISION_MAX_TRADES_PER_CYCLE = int(os.environ.get("DECISION_MAX_TRADES_PER_CYCLE", 2))
+
+# External-signal thresholds used before signals enter the decision engine.
+POLYMARKET_MIN_DECISION_CONFIDENCE = float(
+    os.environ.get("POLYMARKET_MIN_DECISION_CONFIDENCE", 0.60)
+)
+OPTIONS_FLOW_INJECTION_MIN_CONVICTION = float(
+    os.environ.get("OPTIONS_FLOW_INJECTION_MIN_CONVICTION", 75.0)
+)
+OPTIONS_FLOW_DIRECT_MIN_CONVICTION = float(
+    os.environ.get("OPTIONS_FLOW_DIRECT_MIN_CONVICTION", 80.0)
+)
+ARENA_MIN_FITNESS = float(os.environ.get("ARENA_MIN_FITNESS", 0.20))
+ARENA_MIN_TRADES = int(os.environ.get("ARENA_MIN_TRADES", 12))
+
 # ─── Scheduling ────────────────────────────────────────────────
 # 3-tier scheduling:
 #   Tier 1 — Fast cycle:   position checks, SL/TP, copy-trade scan

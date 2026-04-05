@@ -21,7 +21,14 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import config
 from src.data import database as db
 from src.data import hyperliquid_client as hl
-from src.signals.signal_schema import TradeSignal, SignalSide, SignalSource, RiskParams
+from src.signals.signal_schema import (
+    TradeSignal,
+    SignalSide,
+    SignalSource,
+    RiskParams,
+    build_source_key,
+    resolve_signal_source,
+)
 from src.signals.decision_firewall import DecisionFirewall
 from src.signals.agent_scoring import AgentScorer
 from src.analysis.features import FeatureEngine
@@ -93,6 +100,56 @@ class PaperTrader:
                         if account and account["total_trades"] > 0 else 0),
             "open_positions": len(open_trades),
             "roi_pct": round(((total_equity / config.PAPER_TRADING_INITIAL_BALANCE) - 1) * 100, 2),
+        }
+
+    @staticmethod
+    def _coerce_metadata(metadata) -> Dict:
+        if isinstance(metadata, dict):
+            return dict(metadata)
+        if isinstance(metadata, str):
+            try:
+                parsed = json.loads(metadata)
+                if isinstance(parsed, dict):
+                    return parsed
+            except (json.JSONDecodeError, TypeError):
+                return {}
+        return {}
+
+    @classmethod
+    def _derive_source_context(cls, strategy: Dict, coin: str = "") -> Dict:
+        metadata = cls._coerce_metadata(strategy.get("metadata", {}))
+        strategy_type = str(strategy.get("strategy_type", strategy.get("type", "")) or "")
+        source_raw = (
+            strategy.get("source")
+            or metadata.get("source")
+            or SignalSource.STRATEGY.value
+        )
+        source = resolve_signal_source(source_raw)
+        trader_address = str(
+            strategy.get("trader_address", metadata.get("source_trader", ""))
+        ).strip()
+        agent_id = str(strategy.get("agent_id", metadata.get("agent_id", ""))).strip()
+        agent_name = str(strategy.get("agent_name", metadata.get("agent_name", ""))).strip()
+        source_key = (
+            str(strategy.get("source_key", "")).strip()
+            or str(metadata.get("source_key", "")).strip()
+            or build_source_key(
+                source,
+                strategy_type=strategy_type,
+                trader_address=trader_address,
+                coin=coin,
+                agent_id=agent_id,
+            )
+        )
+        return {
+            "metadata": metadata,
+            "source": source,
+            "source_name": source.value,
+            "source_key": source_key,
+            "strategy_type": strategy_type,
+            "trader_address": trader_address,
+            "agent_id": agent_id,
+            "agent_name": agent_name,
         }
 
     def execute_strategy_signals(self, strategies: List[Dict], exchange_agg=None,
@@ -247,12 +304,16 @@ class PaperTrader:
         trade_signals = []
         for sig in raw_signals:
             try:
+                source = resolve_signal_source(sig.get("source", SignalSource.STRATEGY.value))
                 trade_signal = TradeSignal(
                     coin=sig["coin"],
                     side=SignalSide(sig["side"]),
                     confidence=sig.get("confidence", 0.5),
-                    source=SignalSource.STRATEGY,
-                    reason=f"Strategy: {sig['strategy'].get('name', '?')} ({sig.get('strategy_type', '')})",
+                    source=source,
+                    reason=sig.get(
+                        "reason",
+                        f"Strategy: {sig['strategy'].get('name', '?')} ({sig.get('strategy_type', '')})",
+                    ),
                     strategy_id=sig["strategy"].get("id"),
                     strategy_type=sig.get("strategy_type", ""),
                     entry_price=sig["price"],
@@ -274,6 +335,9 @@ class PaperTrader:
                     regime_size_modifier=sig["strategy"].get("regime_size_modifier", 1.0),
                     options_flow_aligned=sig.get("options_flow_aligned"),
                     volume_confirmed=sig.get("volume_confirmed"),
+                    trader_address=sig.get("trader_address", ""),
+                    source_accuracy=float(sig.get("source_accuracy", 0.0) or 0.0),
+                    source_key=sig.get("source_key", ""),
                 )
                 trade_signals.append((trade_signal, sig))
             except Exception as e:
@@ -282,9 +346,19 @@ class PaperTrader:
 
         # Apply agent scoring weights (higher-performing sources get boosted)
         if self.agent_scorer and trade_signals:
-            signals_only = [ts for ts, _ in trade_signals]
-            self.agent_scorer.apply_weights_to_signals(signals_only)
-            logger.info(f"Agent scoring applied to {len(signals_only)} signals")
+            already_weighted = any(sig.get("agent_scorer_weight") is not None for _, sig in trade_signals)
+            if not already_weighted:
+                signals_only = [ts for ts, _ in trade_signals]
+                self.agent_scorer.apply_weights_to_signals(signals_only)
+                logger.info(f"Agent scoring applied to {len(signals_only)} signals")
+            for trade_signal, sig in trade_signals:
+                if already_weighted:
+                    source_key = self.agent_scorer.get_source_key(trade_signal)
+                    trade_signal.source_accuracy = self.agent_scorer.get_accuracy(source_key)
+                sig["confidence"] = trade_signal.confidence
+                sig["source_accuracy"] = trade_signal.source_accuracy
+                sig["source_key"] = trade_signal.source_key
+                sig["source"] = trade_signal.source.value
 
         # Route through Decision Firewall
         for trade_signal, sig in trade_signals:
@@ -521,6 +595,9 @@ class PaperTrader:
                     "side": sig["side"],
                     "confidence": trade_signal.confidence,
                 })
+                sig["source_key"] = source_key
+                sig["source"] = trade_signal.source.value
+                sig["source_accuracy"] = trade_signal.source_accuracy
             sig["signal_id"] = signal_id
 
             # CRIT-FIX CRIT-6: close victim BEFORE opening replacement.
@@ -596,6 +673,8 @@ class PaperTrader:
 
         strategy_type = strategy.get("strategy_type", strategy.get("type", ""))
         score = strategy.get("current_score", 0)
+        confidence = min(max(float(strategy.get("confidence", score) or score), 0.0), 1.0)
+        strategy_meta = self._coerce_metadata(strategy.get("metadata", {}))
 
         # Only trade strategies with decent scores
         if score < 0.3:
@@ -695,7 +774,7 @@ class PaperTrader:
         if not account or account.get("balance", 0) <= 0:
             return None
         max_position = account["balance"] * config.PAPER_TRADING_MAX_POSITION_PCT
-        size_usd = max_position * (score / 1.0)  # Scale by confidence
+        size_usd = max_position * confidence
         size = size_usd / target_price
 
         # Stop loss and take profit
@@ -706,16 +785,30 @@ class PaperTrader:
             stop_loss = target_price * (1 + config.PAPER_TRADING_STOP_LOSS_PCT / leverage)
             take_profit = target_price * (1 - config.PAPER_TRADING_TAKE_PROFIT_PCT / leverage)
 
+        source_ctx = self._derive_source_context(strategy, coin=target_coin)
         return {
             "coin": target_coin,
             "side": side,
             "price": target_price,
             "size": size,
             "leverage": leverage,
-            "stop_loss": round(stop_loss, 2),
-            "take_profit": round(take_profit, 2),
+            "stop_loss": stop_loss,
+            "take_profit": take_profit,
             "strategy_type": strategy_type,
-            "confidence": score,
+            "confidence": confidence,
+            "reason": strategy_meta.get(
+                "reason",
+                f"Strategy: {strategy.get('name', '?')} ({strategy_type})",
+            ),
+            "source": source_ctx["source_name"],
+            "source_key": source_ctx["source_key"],
+            "source_accuracy": float(
+                strategy.get("source_accuracy", strategy.get("agent_scorer_weight", 0.0)) or 0.0
+            ),
+            "trader_address": source_ctx["trader_address"],
+            "agent_id": source_ctx["agent_id"],
+            "agent_name": source_ctx["agent_name"],
+            "metadata": source_ctx["metadata"],
         }
 
     def _check_risk_limits(self, account: Dict, signal: Dict, open_trades: List) -> bool:
@@ -829,16 +922,30 @@ class PaperTrader:
                     "strategy_type": signal.get("strategy_type", ""),
                     "confidence": signal.get("confidence", 0),
                     "signal_id": signal.get("signal_id", ""),
+                    "source": signal.get("source", SignalSource.STRATEGY.value),
+                    "source_key": signal.get(
+                        "source_key",
+                        build_source_key(
+                            signal.get("source", SignalSource.STRATEGY.value),
+                            strategy_type=signal.get("strategy_type", ""),
+                            trader_address=signal.get("trader_address", ""),
+                            coin=signal.get("coin", ""),
+                            agent_id=signal.get("agent_id", ""),
+                        ),
+                    ),
                     "execution_role": signal.get("execution_role", config.PAPER_TRADING_DEFAULT_EXECUTION_ROLE),
                     "maker_fee_bps": config.PAPER_TRADING_MAKER_FEE_BPS,
                     "taker_fee_bps": config.PAPER_TRADING_TAKER_FEE_BPS,
                     "intended_entry_price": signal["price"],
                     "entry_slipped_price": slipped_price,
                     "features": signal.get("features", {}),
+                    "upstream_metadata": signal.get("metadata", {}),
                     "source_accuracy": signal.get("source_accuracy", 0),
                     "regime": signal.get("regime", ""),
                     "options_flow_aligned": signal.get("options_flow_aligned"),
                     "volume_confirmed": signal.get("volume_confirmed"),
+                    "agent_id": signal.get("agent_id", ""),
+                    "agent_name": signal.get("agent_name", ""),
                 },
             )
 
@@ -861,21 +968,50 @@ class PaperTrader:
                 "strategy_id": strategy.get("id"),
                 "strategy_type": signal.get("strategy_type", ""),
                 "confidence": signal.get("confidence", 0),
+                "source": signal.get("source", SignalSource.STRATEGY.value),
+                "source_key": signal.get(
+                    "source_key",
+                    build_source_key(
+                        signal.get("source", SignalSource.STRATEGY.value),
+                        strategy_type=signal.get("strategy_type", ""),
+                        trader_address=signal.get("trader_address", ""),
+                        coin=signal.get("coin", ""),
+                        agent_id=signal.get("agent_id", ""),
+                    ),
+                ),
+                "reason": signal.get("reason", ""),
                 "opened_at": datetime.utcnow().isoformat(),
+                "trader_address": signal.get("trader_address", ""),
+                "agent_id": signal.get("agent_id", ""),
+                "agent_name": signal.get("agent_name", ""),
                 "metadata": {
                     "strategy_type": signal.get("strategy_type", ""),
                     "confidence": signal.get("confidence", 0),
                     "signal_id": signal.get("signal_id", ""),
+                    "source": signal.get("source", SignalSource.STRATEGY.value),
+                    "source_key": signal.get(
+                        "source_key",
+                        build_source_key(
+                            signal.get("source", SignalSource.STRATEGY.value),
+                            strategy_type=signal.get("strategy_type", ""),
+                            trader_address=signal.get("trader_address", ""),
+                            coin=signal.get("coin", ""),
+                            agent_id=signal.get("agent_id", ""),
+                        ),
+                    ),
                     "execution_role": signal.get("execution_role", config.PAPER_TRADING_DEFAULT_EXECUTION_ROLE),
                     "maker_fee_bps": config.PAPER_TRADING_MAKER_FEE_BPS,
                     "taker_fee_bps": config.PAPER_TRADING_TAKER_FEE_BPS,
                     "intended_entry_price": signal["price"],
                     "entry_slipped_price": slipped_price,
                     "features": signal.get("features", {}),
+                    "upstream_metadata": signal.get("metadata", {}),
                     "source_accuracy": signal.get("source_accuracy", 0),
                     "regime": signal.get("regime", ""),
                     "options_flow_aligned": signal.get("options_flow_aligned"),
                     "volume_confirmed": signal.get("volume_confirmed"),
+                    "agent_id": signal.get("agent_id", ""),
+                    "agent_name": signal.get("agent_name", ""),
                 },
             }
         except Exception as e:
@@ -992,6 +1128,14 @@ class PaperTrader:
 
         strategy_type = trade_meta.get("strategy_type", "unknown")
         signal_id = trade_meta.get("signal_id", "")
+        source_name = str(trade_meta.get("source", SignalSource.STRATEGY.value)).strip() or SignalSource.STRATEGY.value
+        source_key = str(trade_meta.get("source_key", "")).strip() or build_source_key(
+            source_name,
+            strategy_type=strategy_type,
+            trader_address=str(trade_meta.get("source_trader", trade.get("trader_address", ""))),
+            coin=trade.get("coin", ""),
+            agent_id=str(trade_meta.get("agent_id", "")),
+        )
         return_pct = pnl / max(
             trade["entry_price"] * max(trade["size"], 1e-8) * max(trade.get("leverage", 1), 1),
             1e-8,
@@ -999,7 +1143,6 @@ class PaperTrader:
 
         if self.agent_scorer:
             try:
-                source_key = f"strategy:{strategy_type}"
                 self.agent_scorer.record_outcome(source_key, signal_id, pnl, return_pct)
             except Exception as e:
                 logger.debug(f"Agent scorer outcome error: {e}")
@@ -1013,7 +1156,7 @@ class PaperTrader:
         if self.kelly_sizer:
             try:
                 self.kelly_sizer.record_outcome(
-                    strategy_key=strategy_type,
+                    strategy_key=source_key or strategy_type,
                     pnl=pnl,
                     entry_price=trade["entry_price"],
                     size=trade["size"],
@@ -1024,7 +1167,6 @@ class PaperTrader:
 
         if self.calibration:
             try:
-                source_key = f"strategy:{strategy_type}"
                 predicted_conf = trade_meta.get("confidence", 0.5)
                 self.calibration.record(
                     source_key=source_key,
@@ -1051,7 +1193,7 @@ class PaperTrader:
                     opened_at=trade.get("opened_at", ""),
                     closed_at=datetime.utcnow().isoformat(),
                     confidence=trade_meta.get("confidence", 0),
-                    source="strategy",
+                    source=source_name,
                     regime=trade_meta.get("regime", ""),
                     setup_type=trade_meta.get("setup_type", strategy_type),
                     features=trade_meta.get("features", {}),
@@ -1073,6 +1215,8 @@ class PaperTrader:
             "reason": close_reason,
             "strategy_type": strategy_type,
             "signal_id": signal_id,
+            "source": source_name,
+            "source_key": source_key,
             "exit_price": slipped_exit,
             "metadata": trade_meta,
             "opened_at": trade.get("opened_at", ""),
