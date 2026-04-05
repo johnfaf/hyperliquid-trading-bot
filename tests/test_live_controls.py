@@ -1410,6 +1410,132 @@ def test_rescale_size_for_live_allows_1x_leverage_on_tight_wallet(monkeypatch):
     assert notional <= 12.0, f"notional ${notional:.2f} should stay ≤ max_order_usd"
 
 
+def test_place_trigger_order_sends_wire_format_limit_and_trigger_price(monkeypatch):
+    """Regression for the orphan-protection burst that left BTC/ETH/SOL/XRP/
+    HYPE/RESOLV unprotected: place_trigger_order was sending ``p="0"`` which
+    Hyperliquid rejects with "Order has invalid price" under a ``status: ok``
+    wrapper.  The ``p`` field must be the slippage-padded limit cap in
+    canonical wire format, and triggerPx must be canonical too.
+    """
+    captured_actions = []
+
+    class FakeFirewall:
+        def validate(self, signal, **kwargs):
+            return True, "ok"
+
+    monkeypatch.setattr(LiveTrader, "_load_credentials", _fake_live_credentials)
+    monkeypatch.setattr(LiveTrader, "_load_asset_index_map", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "reconcile_positions", lambda self: None)
+    monkeypatch.setattr(
+        LiveTrader,
+        "_post_order",
+        lambda self, action, dry_run_override=None: (
+            captured_actions.append(action)
+            or {"status": "ok", "response": {"type": "order", "data": {"statuses": [{"resting": {"oid": 1}}]}}}
+        ),
+    )
+
+    trader = LiveTrader(firewall=FakeFirewall(), dry_run=False, max_order_usd=15.0)
+    trader.asset_index_map = {"ETH": 1, "BTC": 0}
+    trader.sz_decimals_map = {"ETH": 4, "BTC": 5}
+
+    # SHORT ETH stop loss: close with BUY at 2123.14 (3% above entry 2061.3).
+    # p must be > trigger (buy direction) → 2123.14 * 1.05 = 2229.297, rounds
+    # to 2229.3 at 5 sig figs.
+    result = trader.place_trigger_order("ETH", "buy", 0.0174, 2123.139, tp_or_sl="sl")
+    assert result.get("status") == "ok"
+    assert len(captured_actions) == 1
+    order = captured_actions[0]["orders"][0]
+
+    # p must NOT be "0" — that was the bug
+    assert order["p"] != "0", "place_trigger_order must not send p=0"
+    # p is slippage-padded ABOVE trigger for a buy (closing a short)
+    assert float(order["p"]) > 2123.139
+    # p should be ~5% above trigger
+    assert abs(float(order["p"]) - 2123.139 * 1.05) / (2123.139 * 1.05) < 0.01
+    # triggerPx is canonical wire format
+    assert order["t"]["trigger"]["triggerPx"] != "0"
+    assert order["t"]["trigger"]["isMarket"] is True
+    assert order["t"]["trigger"]["tpsl"] == "sl"
+    # reduce-only flag is set
+    assert order["r"] is True
+    # size rounds to szDecimals=4: 0.0174 → "0.0174"
+    assert order["s"] == "0.0174"
+
+    # LONG take profit: close with SELL at 72000.  p must be < trigger for sell.
+    captured_actions.clear()
+    result = trader.place_trigger_order("BTC", "sell", 0.00036, 72000.0, tp_or_sl="tp")
+    assert result.get("status") == "ok"
+    order = captured_actions[0]["orders"][0]
+    assert order["p"] != "0"
+    assert float(order["p"]) < 72000.0  # slippage BELOW for sell
+    assert abs(float(order["p"]) - 72000.0 * 0.95) / (72000.0 * 0.95) < 0.01
+    assert order["t"]["trigger"]["tpsl"] == "tp"
+    assert order["b"] is False  # sell
+
+
+def test_post_order_does_not_cache_inner_error_rejections(monkeypatch):
+    """When the exchange rejects an order at the inner level (e.g. "Order has
+    invalid price"), the action_hash must NOT be cached — otherwise the next
+    orphan-protection sweep that tries the same action is silently blocked by
+    the dedup cache instead of being allowed to retry (after a fix) or to
+    surface the same rejection again.
+    """
+    call_count = {"n": 0}
+
+    class FakeResponse:
+        status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            call_count["n"] += 1
+            return {
+                "status": "ok",
+                "response": {
+                    "type": "order",
+                    "data": {"statuses": [{"error": "Order has invalid price."}]},
+                },
+            }
+
+    class FakeFirewall:
+        def validate(self, signal, **kwargs):
+            return True, "ok"
+
+    class FakeSigner:
+        address = "0x1111111111111111111111111111111111111111"
+
+        def sign_action(self, action, nonce, vault_address=None, expires_after=None):
+            return {"r": "0x" + "0" * 64, "s": "0x" + "0" * 64, "v": 27}
+
+    monkeypatch.setattr(LiveTrader, "_load_credentials", _fake_live_credentials)
+    monkeypatch.setattr(LiveTrader, "_load_asset_index_map", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "reconcile_positions", lambda self: None)
+    monkeypatch.setattr("src.trading.live_trader.requests.post", lambda *a, **kw: FakeResponse())
+
+    trader = LiveTrader(firewall=FakeFirewall(), dry_run=False, max_order_usd=15.0)
+    trader.signer = FakeSigner()
+    trader.dry_run = False
+
+    action = {"type": "order", "orders": [{"a": 0, "b": True, "p": "0", "s": "1", "r": False, "t": {"limit": {"tif": "Ioc"}}}], "grouping": "na"}
+
+    # First call: hits the exchange, gets inner error
+    r1 = trader._post_order(action)
+    assert r1["status"] == "rejected"
+    assert r1["reason"] == "exchange_inner_error"
+    assert call_count["n"] == 1
+
+    # Second call with the SAME action: must reach the exchange again
+    # (not be silently blocked by the dedup cache)
+    r2 = trader._post_order(action)
+    assert r2["status"] == "rejected"
+    assert r2["reason"] == "exchange_inner_error"
+    assert call_count["n"] == 2, (
+        "dedup cache must not block retries of inner-error rejections"
+    )
+
+
 def test_rescale_size_for_live_skips_when_wallet_cannot_fit_minimum(monkeypatch):
     """If wallet * 0.95 * leverage < min_order_usd, we truly cannot
     afford the exchange minimum at this leverage and must skip."""

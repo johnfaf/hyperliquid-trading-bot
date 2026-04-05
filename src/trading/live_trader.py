@@ -1460,9 +1460,6 @@ class LiveTrader:
             response.raise_for_status()
             result = response.json()
 
-            # Record successful order for dedup
-            self._recent_order_hashes[action_hash] = (now, result)
-
             logger.info(f"Order posted: {json.dumps(result)}")
 
             # Hyperliquid wraps per-order errors under an outer
@@ -1476,12 +1473,21 @@ class LiveTrader:
                     "Exchange rejected order at inner level: %s (action_hash=%s)",
                     errors, action_hash[:16],
                 )
+                # Do NOT cache inner-error rejections — the order did not
+                # execute, so retries (e.g. from the next orphan-protection
+                # sweep after the caller has fixed the price) must be
+                # allowed to reach the exchange instead of being silently
+                # swallowed by the dedup cache.
                 return {
                     "status": "rejected",
                     "reason": "exchange_inner_error",
                     "errors": errors,
                     "raw_response": result,
                 }
+
+            # Only cache successfully accepted orders.  Rejected orders
+            # are not "placed" and must remain retryable.
+            self._recent_order_hashes[action_hash] = (now, result)
             return result
 
         except requests.exceptions.Timeout:
@@ -1860,12 +1866,27 @@ class LiveTrader:
         if asset_idx is None:
             return {"status": "error", "message": f"Unknown coin: {coin}"}
 
-        # Format for Hyperliquid wire protocol.  Trigger price is
-        # szDecimals-aware; the order ``p`` field is "0" because the
-        # actual execution price comes from the trigger itself.
+        # Hyperliquid's trigger orders need BOTH a trigger price AND a
+        # limit price in the ``p`` field.  ``p="0"`` was wrong — the
+        # exchange rejects it with "Order has invalid price" under a
+        # ``status: ok`` wrapper, and the position sits unprotected.
+        #
+        # ``p`` is the limit cap applied once the trigger fires, so we
+        # pad the trigger_price by a slippage buffer in the direction
+        # that lets the resulting market order match:
+        #   buy  (closing short) → p = trigger * (1 + slippage)
+        #   sell (closing long)  → p = trigger * (1 - slippage)
+        # 5% slippage is the Hyperliquid SDK default for market_close.
+        slippage = 0.05
+        if side.lower() == "buy":
+            limit_px = trigger_price * (1 + slippage)
+        else:
+            limit_px = trigger_price * (1 - slippage)
+
         sz_decimals = self.sz_decimals_map.get(coin, 0)
         wire_size = _hl_format_size(size, sz_decimals)
         wire_trigger_px = _hl_format_price(trigger_price, sz_decimals)
+        wire_limit_px = _hl_format_price(limit_px, sz_decimals)
         if wire_size == "0":
             logger.warning(
                 "place_trigger_order: %s %s rounds to zero at szDecimals=%d "
@@ -1873,18 +1894,28 @@ class LiveTrader:
                 coin, side, sz_decimals, size,
             )
             return {"status": "rejected", "reason": "size_rounds_to_zero"}
+        if wire_trigger_px == "0" or wire_limit_px == "0":
+            logger.error(
+                "place_trigger_order: formatted price rounded to 0 for %s "
+                "(trigger=%s, limit=%s, raw_trigger=%s, raw_limit=%s). Rejecting.",
+                coin, wire_trigger_px, wire_limit_px, trigger_price, limit_px,
+            )
+            return {
+                "status": "rejected",
+                "reason": "price_rounds_to_zero",
+            }
 
         order = {
             "a": asset_idx,
             "b": side.lower() == "buy",
-            "p": "0",  # Trigger price is in trigger, not order price
+            "p": wire_limit_px,
             "s": wire_size,
             "r": True,  # SL/TP must be reduce_only to close the position
             "t": {
                 "trigger": {
                     "isMarket": True,
                     "triggerPx": wire_trigger_px,
-                    "tpsl": tp_or_sl
+                    "tpsl": tp_or_sl,
                 }
             }
         }
@@ -1895,7 +1926,10 @@ class LiveTrader:
             "grouping": "na"
         }
 
-        logger.info(f"Placing {tp_or_sl} trigger: {coin} {size} @ ${trigger_price:.2f}")
+        logger.info(
+            "Placing %s trigger: %s %s size=%s trigger=%s limit=%s",
+            tp_or_sl, coin, side, wire_size, wire_trigger_px, wire_limit_px,
+        )
         result = self._post_order(action)
 
         return result
