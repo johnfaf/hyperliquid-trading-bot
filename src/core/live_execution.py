@@ -244,27 +244,76 @@ def _rescale_size_for_live(trade: Dict, trader) -> Optional[Dict]:
             )
             scaled_trade["size"] = capped_size
 
-    # Skip the mirror entirely if the rescaled+capped notional is below the
-    # exchange's minimum.  Otherwise the order is sent to Hyperliquid, the
-    # matching engine silently drops it for being too small, and the bot
-    # waits 10s on fill verification before logging "FILL NOT VERIFIED".
+    # Floor-up to the exchange minimum when proportional rescaling would
+    # otherwise produce an un-fillable order.  A small live wallet relative
+    # to the paper book (e.g. $12 live vs $10k paper = 0.0012 scale factor)
+    # makes every proportional rescale tiny, but Hyperliquid drops anything
+    # under $10.  Rather than skipping every mirror, we floor up to the
+    # exchange minimum — the LiveTrader's max_order_usd cap still bounds the
+    # absolute max, so at most we send an $11 notional order.
+    #
+    # Safety: check that the *margin* required (notional / leverage) fits
+    # in the live wallet with headroom for other positions.  Checking
+    # notional would be wrong — a $11 notional at 5x leverage only ties up
+    # $2.20 of margin, so a $12 wallet can comfortably hold 4+ of them.
     if min_order_usd > 0 and entry_price > 0:
         current_size = float(scaled_trade.get("size", 0) or 0)
         notional = current_size * entry_price
         if notional < min_order_usd:
-            logger.warning(
-                "Skipping %s live mirror: rescaled notional $%.2f is below "
-                "Hyperliquid's $%.2f minimum.  Live wallet ($%.2f) is too "
-                "small relative to paper balance ($%.0f) to produce a "
-                "meaningful order.  Fund the live wallet or raise "
-                "LIVE_MAX_ORDER_USD.",
+            # Target a notional just above the exchange minimum, but do not
+            # exceed the configured per-order cap.
+            target_notional = min_order_usd
+            if max_order_usd and max_order_usd > min_order_usd:
+                target_notional = min(max_order_usd, min_order_usd * 1.05)
+
+            # Margin required = notional / leverage.  Fall back to 1x (the
+            # most conservative assumption) if leverage is not specified.
+            leverage = float(
+                scaled_trade.get("leverage")
+                or trade.get("leverage")
+                or 1
+            )
+            if leverage <= 0:
+                leverage = 1.0
+            required_margin = target_notional / leverage
+
+            # Do not floor up if even the minimum order would use more than
+            # ~80% of the live wallet as margin — leave some headroom for
+            # other concurrent positions, slippage, and fees.
+            max_safe_margin = live_balance * 0.8
+            if required_margin > max_safe_margin:
+                logger.warning(
+                    "Skipping %s live mirror: the minimum order ($%.2f "
+                    "notional @ %.1fx = $%.2f margin) would exceed 80%% of "
+                    "the live wallet ($%.2f).  Fund the wallet, lower the "
+                    "minimum, or raise leverage.",
+                    scaled_trade.get("coin", "?"),
+                    target_notional,
+                    leverage,
+                    required_margin,
+                    live_balance,
+                )
+                return None
+
+            floored_size = target_notional / entry_price
+            logger.info(
+                "Flooring %s live mirror UP to exchange minimum: "
+                "%.6f → %.6f (notional $%.2f → $%.2f, margin @ %.1fx = "
+                "$%.2f).  Proportional rescale from paper was below $%.2f; "
+                "this departs from strict paper-proportional sizing, "
+                "unavoidable given live wallet $%.2f vs paper $%.0f.",
                 scaled_trade.get("coin", "?"),
+                current_size,
+                floored_size,
                 notional,
+                floored_size * entry_price,
+                leverage,
+                required_margin,
                 min_order_usd,
                 live_balance,
                 paper_balance,
             )
-            return None
+            scaled_trade["size"] = floored_size
 
     return scaled_trade
 

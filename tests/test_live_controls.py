@@ -686,6 +686,62 @@ def test_rescale_size_for_live_enforces_max_order_usd_cap(monkeypatch):
     assert abs(scaled["size"] * 2000.0 - 3.0) < 1e-9
 
 
+def test_rescale_size_for_live_floors_up_to_exchange_minimum(monkeypatch):
+    """Small live wallet vs large paper book: proportional rescaling
+    produces sub-minimum orders that Hyperliquid silently drops.  The
+    rescaler should floor UP to the exchange minimum rather than skip,
+    so the bot actually trades.  Regression test for the XRP copy-mirror
+    scenario where 0.172 XRP @ $1.24 = $0.21 notional got skipped.
+    """
+    class FakeTrader:
+        max_order_usd = 12.0
+        min_order_usd = 11.0
+
+        def get_account_value(self):
+            return 12.44  # the real problem case
+
+    monkeypatch.setattr("src.core.live_execution.db.get_paper_account",
+                        lambda: {"balance": 10_041.0})
+    monkeypatch.setattr("src.core.live_execution.get_all_mids",
+                        lambda: {"XRP": 1.24})
+
+    # 138.7 XRP × $1.24 = $172 paper notional, rescales to 0.172 XRP
+    # (= $0.21) at scale factor 0.00124.  Should floor UP to ~$11 notional.
+    scaled = _rescale_size_for_live(
+        {"coin": "XRP", "size": 138.7, "entry_price": 1.24, "leverage": 5},
+        FakeTrader(),
+    )
+    assert scaled is not None, "floor-up should succeed, not skip"
+    notional = scaled["size"] * 1.24
+    assert notional >= 11.0, f"notional ${notional:.2f} should be >= $11 min"
+    assert notional <= 12.0, f"notional ${notional:.2f} should be <= $12 cap"
+
+
+def test_rescale_size_for_live_skips_when_margin_exceeds_wallet_headroom(monkeypatch):
+    """If even the minimum order's margin requirement exceeds 80% of the
+    live wallet, skip instead of flooring up — the wallet is too small
+    to safely carry any position at the configured leverage."""
+    class FakeTrader:
+        max_order_usd = 11.0
+        min_order_usd = 11.0
+
+        def get_account_value(self):
+            return 5.0  # wallet too small for $11 notional at 1x
+
+    monkeypatch.setattr("src.core.live_execution.db.get_paper_account",
+                        lambda: {"balance": 10_000.0})
+    monkeypatch.setattr("src.core.live_execution.get_all_mids",
+                        lambda: {"BTC": 50_000.0})
+
+    # 0.01 BTC × $50k = $500 paper, rescales to 0.00001 BTC = $0.25.
+    # Min order $11 at 1x leverage = $11 margin > 80% of $5 wallet ($4).
+    scaled = _rescale_size_for_live(
+        {"coin": "BTC", "size": 0.01, "entry_price": 50_000.0, "leverage": 1},
+        FakeTrader(),
+    )
+    assert scaled is None, "should skip: margin too large for wallet"
+
+
 def test_execute_signal_bypass_firewall_skips_validation(monkeypatch):
     """When bypass_firewall=True, DecisionFirewall.validate must NOT be called."""
     validate_calls = []

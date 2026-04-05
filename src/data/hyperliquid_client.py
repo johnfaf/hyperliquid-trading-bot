@@ -6,18 +6,33 @@ V3: All requests route through the centralized APIManager (token bucket +
     TTL cache + WebSocket feed).  The public function signatures are unchanged
     so every module that imports this file keeps working.
 """
-import requests
-import time
+import json
 import logging
-import random
+import os
+import re
+import sys
 from typing import Optional
 
-import sys, os
+import requests
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-import config
-from src.core.api_manager import get_manager, Priority
+from src.core.api_manager import get_manager, Priority  # noqa: E402
 
 logger = logging.getLogger(__name__)
+
+# Hyperliquid's /info endpoint requires `user` to be a well-formed 0x-prefixed
+# 40-hex-char Ethereum address.  Anything else returns HTTP 422
+# "Failed to deserialize the JSON body into the target type".  The discovery
+# pipeline occasionally inserts placeholder / truncated addresses into the
+# DB — filter them out here instead of spamming the log with 422 warnings.
+_ETH_ADDRESS_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
+
+
+def _is_valid_eth_address(address: Optional[str]) -> bool:
+    """Return True iff the string is a canonical 0x + 40-hex-char address."""
+    if not address or not isinstance(address, str):
+        return False
+    return bool(_ETH_ADDRESS_RE.match(address.strip()))
 
 
 # ─── Internal post — now delegates to APIManager ─────────────────
@@ -89,9 +104,13 @@ def get_user_state(address: str):
     Get a trader's clearinghouse state: positions, margin, account value.
     This is the main endpoint for analyzing what a trader is doing.
     """
-    if not address or not isinstance(address, str) or len(address) < 10:
+    if not _is_valid_eth_address(address):
+        logger.debug(
+            "get_user_state: skipping malformed address %r",
+            (address[:16] + "...") if isinstance(address, str) and len(address) > 16 else address,
+        )
         return None
-    data = _post({"type": "clearinghouseState", "user": address},
+    data = _post({"type": "clearinghouseState", "user": address.strip()},
                  priority=Priority.HIGH)
     if not data:
         return None
@@ -129,7 +148,9 @@ def get_user_fills(address: str, start_time: Optional[int] = None):
     Get a trader's recent fills (executed trades).
     start_time is in milliseconds epoch.
     """
-    payload = {"type": "userFills", "user": address}
+    if not _is_valid_eth_address(address):
+        return []
+    payload = {"type": "userFills", "user": address.strip()}
     if start_time:
         payload["startTime"] = start_time
     # LOW priority: historical fill downloads should yield to live trading/monitoring
@@ -159,7 +180,9 @@ def get_user_fills(address: str, start_time: Optional[int] = None):
 
 def get_user_funding(address: str, start_time: Optional[int] = None):
     """Get a trader's funding payment history."""
-    payload = {"type": "userFunding", "user": address}
+    if not _is_valid_eth_address(address):
+        return []
+    payload = {"type": "userFunding", "user": address.strip()}
     if start_time:
         payload["startTime"] = start_time
     return _post(payload) or []
@@ -167,7 +190,9 @@ def get_user_funding(address: str, start_time: Optional[int] = None):
 
 def get_user_non_funding_ledger(address: str, start_time: Optional[int] = None):
     """Get non-funding ledger updates (deposits, withdrawals, liquidations, etc.)."""
-    payload = {"type": "userNonFundingLedgerUpdates", "user": address}
+    if not _is_valid_eth_address(address):
+        return []
+    payload = {"type": "userNonFundingLedgerUpdates", "user": address.strip()}
     if start_time:
         payload["startTime"] = start_time
     return _post(payload) or []
