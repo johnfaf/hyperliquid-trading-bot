@@ -749,15 +749,17 @@ class LiveTrader:
         """
         side = self._normalize_order_side(side)
 
-        # Check kill switch
-        if self.kill_switch_active:
-            logger.warning(f"Kill switch active - rejecting market order {coin} {side}")
-            return {"status": "rejected", "reason": "kill_switch_active"}
+        # Kill switch and daily loss only block NEW positions (not closes).
+        # reduce_only orders MUST always go through so the bot can exit
+        # positions during emergencies and when protective orders fail.
+        if not reduce_only:
+            if self.kill_switch_active:
+                logger.warning(f"Kill switch active - rejecting market order {coin} {side}")
+                return {"status": "rejected", "reason": "kill_switch_active"}
 
-        # Check daily loss
-        if self.check_daily_loss():
-            logger.warning(f"Daily loss limit exceeded - rejecting market order {coin} {side}")
-            return {"status": "rejected", "reason": "daily_loss_exceeded"}
+            if self.check_daily_loss():
+                logger.warning(f"Daily loss limit exceeded - rejecting market order {coin} {side}")
+                return {"status": "rejected", "reason": "daily_loss_exceeded"}
 
         # Get asset index
         asset_idx = self._get_asset_index(coin)
@@ -777,11 +779,14 @@ class LiveTrader:
         # Apply slippage
         price = self._apply_market_slippage(mid, side)
 
-        # Check position size
-        notional = size * price
-        if notional > self.max_position_size:
-            logger.warning(f"Position size ${notional:.2f} exceeds limit ${self.max_position_size:.2f}")
-            return {"status": "rejected", "reason": "position_size_exceeded"}
+        # Position size limit only applies to new positions, not closes.
+        # A reduce_only order can never increase exposure, so blocking it
+        # would leave the position stuck open (un-closeable).
+        if not reduce_only:
+            notional = size * price
+            if notional > self.max_position_size:
+                logger.warning(f"Position size ${notional:.2f} exceeds limit ${self.max_position_size:.2f}")
+                return {"status": "rejected", "reason": "position_size_exceeded"}
 
         # Build order
         order = {
@@ -1366,47 +1371,47 @@ class LiveTrader:
                     "close_result": close_result,
                 }
 
-            if mid:
-                if side == "buy":
-                    sl_price = mid * (1 - signal.risk.stop_loss_pct)
-                    tp_price = mid * (1 + signal.risk.take_profit_pct)
-                else:
-                    sl_price = mid * (1 + signal.risk.stop_loss_pct)
-                    tp_price = mid * (1 - signal.risk.take_profit_pct)
+            # mid is guaranteed non-None here (early return above)
+            if side == "buy":
+                sl_price = mid * (1 - signal.risk.stop_loss_pct)
+                tp_price = mid * (1 + signal.risk.take_profit_pct)
+            else:
+                sl_price = mid * (1 + signal.risk.stop_loss_pct)
+                tp_price = mid * (1 - signal.risk.take_profit_pct)
 
-                # 3. Place stop loss
-                sl_result = self.place_trigger_order(
-                    coin, "sell" if side == "buy" else "buy",
-                    actual_fill_size, sl_price, tp_or_sl="sl"
+            # 3. Place stop loss
+            sl_result = self.place_trigger_order(
+                coin, "sell" if side == "buy" else "buy",
+                actual_fill_size, sl_price, tp_or_sl="sl"
+            )
+
+            # 4. Place take profit
+            tp_result = self.place_trigger_order(
+                coin, "sell" if side == "buy" else "buy",
+                actual_fill_size, tp_price, tp_or_sl="tp"
+            )
+
+            if not self._is_order_result_success(sl_result) or not self._is_order_result_success(tp_result):
+                logger.error(
+                    "Protective order placement failed for %s: sl=%s tp=%s",
+                    coin,
+                    sl_result,
+                    tp_result,
                 )
+                close_result = None
+                if not self.dry_run:
+                    close_result = self.close_position(coin)
+                return {
+                    "status": "error",
+                    "message": "protective_order_failed",
+                    "coin": coin,
+                    "entry_result": entry_result,
+                    "stop_loss_result": sl_result,
+                    "take_profit_result": tp_result,
+                    "close_result": close_result,
+                }
 
-                # 4. Place take profit
-                tp_result = self.place_trigger_order(
-                    coin, "sell" if side == "buy" else "buy",
-                    actual_fill_size, tp_price, tp_or_sl="tp"
-                )
-
-                if not self._is_order_result_success(sl_result) or not self._is_order_result_success(tp_result):
-                    logger.error(
-                        "Protective order placement failed for %s: sl=%s tp=%s",
-                        coin,
-                        sl_result,
-                        tp_result,
-                    )
-                    close_result = None
-                    if not self.dry_run:
-                        close_result = self.close_position(coin)
-                    return {
-                        "status": "error",
-                        "message": "protective_order_failed",
-                        "coin": coin,
-                        "entry_result": entry_result,
-                        "stop_loss_result": sl_result,
-                        "take_profit_result": tp_result,
-                        "close_result": close_result,
-                    }
-
-                logger.info(f"Placed SL @ ${sl_price:.2f}, TP @ ${tp_price:.2f}")
+            logger.info(f"Placed SL @ ${sl_price:.2f}, TP @ ${tp_price:.2f}")
 
             # Return summary
             return {
