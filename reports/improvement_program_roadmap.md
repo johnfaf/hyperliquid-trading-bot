@@ -41,6 +41,7 @@ This branch is the staged upgrade path for making the bot more measurable, more 
 
 ## Phase 6: Experiment Discipline
 
+- Status: shipped on `codex/live-ledger-foundation`
 - Add benchmark and challenger packs for strategy changes.
 - Require out-of-sample comparisons before promoting new ranking logic.
 - Publish decision funnels, source attribution, and divergence between paper, shadow, and live.

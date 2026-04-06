@@ -455,6 +455,7 @@ def build_subsystems(
                 arena_incubator=c.arena_incubator,
                 decision_engine=c.decision_engine,
                 multi_scanner=c.multi_scanner,
+                shadow_tracker=c.shadow_tracker,
             )
             if c.live_trader:
                 set_live_trader(c.live_trader)

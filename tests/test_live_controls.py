@@ -10,6 +10,7 @@ from datetime import datetime, timedelta, timezone
 
 import config
 import main
+from src.analysis.experiment_discipline import build_experiment_benchmark_pack
 from src.core import boot
 from src.core.api_manager import Priority
 from src.core.cycles.reporting_cycle import run_reporting
@@ -957,6 +958,66 @@ def test_dashboard_live_account_summary_includes_ledger_metrics(monkeypatch):
     assert summary["last_equity_timestamp"] == "2026-04-05T12:00:00"
 
 
+def test_dashboard_experiment_discipline_metrics_include_report_and_shadow(monkeypatch):
+    fd, raw_path = tempfile.mkstemp(prefix="experiment_report_", suffix=".json", dir=os.getcwd())
+    os.close(fd)
+    report_path = os.path.abspath(raw_path)
+
+    with open(report_path, "w", encoding="utf-8") as handle:
+        json.dump(
+            {
+                "generated_at": "2026-04-05T12:00:00",
+                "cycle_count": 12,
+                "in_sample_cycles": 8,
+                "out_of_sample_cycles": 4,
+                "promotion_gate": {
+                    "baseline": "baseline_current",
+                    "approved_profiles": ["challenger_execution_strict"],
+                    "winner": "challenger_execution_strict",
+                },
+                "profiles": {
+                    "baseline_current": {"out_of_sample": {"cycles": 4}, "promotion": {"approved": True}},
+                    "challenger_execution_strict": {
+                        "out_of_sample": {"cycles": 4, "avg_selected_ev_pct": 0.012},
+                        "promotion": {"approved": True, "ev_delta_pct": 0.003},
+                    },
+                },
+            },
+            handle,
+        )
+
+    monkeypatch.setattr(config, "EXPERIMENT_BENCHMARK_REPORT_PATH", report_path)
+    monkeypatch.setattr(
+        dashboard_ui.db,
+        "get_decision_funnel_summary",
+        lambda limit_cycles=120: {"cycles": 4, "selected_count": 3},
+    )
+    monkeypatch.setattr(
+        dashboard_ui.db,
+        "get_source_attribution_summary",
+        lambda limit_cycles=120, lookback_hours=168: [{"source_key": "strategy:trend", "selected_count": 2}],
+    )
+    monkeypatch.setattr(
+        dashboard_ui.db,
+        "get_runtime_divergence_summary",
+        lambda lookback_hours=24: {"paper_live_open_gap": 1},
+    )
+
+    class FakeShadowTracker:
+        def get_attribution(self, days=7):
+            return {"strategy:trend": {"trades": 5, "pnl": 12.5}}
+
+    metrics = dashboard_ui._build_experiment_discipline_metrics(FakeShadowTracker())
+
+    assert metrics["decision_funnel"]["cycles"] == 4
+    assert metrics["source_attribution"][0]["source_key"] == "strategy:trend"
+    assert metrics["divergence"]["paper_live_open_gap"] == 1
+    assert metrics["benchmark_pack"]["promotion_gate"]["winner"] == "challenger_execution_strict"
+    assert metrics["shadow_attribution"]["strategy:trend"]["trades"] == 5
+
+    os.remove(report_path)
+
+
 def test_live_ledger_helpers_persist_snapshots_and_deduplicate_fills(monkeypatch):
     fd, raw_path = tempfile.mkstemp(prefix="live_ledger_", suffix=".db", dir=os.getcwd())
     os.close(fd)
@@ -1261,6 +1322,252 @@ def test_live_trader_records_execution_quality_events(monkeypatch):
     assert event["fill_ratio"] == 1.0
     assert event["realized_slippage_bps"] == 50.0
     assert event["expected_slippage_bps"] == 6.0
+
+
+def test_decision_funnel_source_attribution_and_divergence_summaries(monkeypatch):
+    fd, raw_path = tempfile.mkstemp(prefix="experiment_metrics_", suffix=".db", dir=os.getcwd())
+    os.close(fd)
+    db_path = os.path.abspath(raw_path)
+    original_path = db._DB_PATH
+    monkeypatch.setattr(db, "_DB_PATH", db_path)
+
+    try:
+        db.init_db()
+        now = datetime.utcnow().isoformat()
+        db.save_decision_research_snapshot(
+            {
+                "timestamp": now,
+                "cycle_number": 10,
+                "available_slots": 3,
+                "candidate_count": 3,
+                "qualified_count": 2,
+                "executed_count": 1,
+                "context": {"open_positions": [{"coin": "SOL", "side": "long"}]},
+                "candidates": [
+                    {
+                        "rank": 1,
+                        "status": "selected",
+                        "name": "btc_options",
+                        "source": "options_flow",
+                        "source_key": "options_flow:BTC",
+                        "strategy_type": "options_momentum",
+                        "coin": "BTC",
+                        "side": "short",
+                        "route": "paper_strategy",
+                        "composite_score": 0.83,
+                        "confidence": 0.72,
+                        "expected_value_pct": 0.018,
+                        "execution_cost_pct": 0.002,
+                        "blockers": [],
+                        "score_breakdown": {},
+                        "raw_candidate": {
+                            "name": "btc_options",
+                            "source": "options_flow",
+                            "source_key": "options_flow:BTC",
+                            "strategy_type": "options_momentum",
+                            "current_score": 0.83,
+                            "confidence": 0.72,
+                            "entry_price": 100.0,
+                            "stop_loss": 103.0,
+                            "take_profit": 94.0,
+                            "parameters": {"coins": ["BTC"]},
+                            "metadata": {"source": "options_flow", "source_key": "options_flow:BTC"},
+                        },
+                    },
+                    {
+                        "rank": 2,
+                        "status": "blocked",
+                        "name": "trend_eth",
+                        "source": "strategy",
+                        "source_key": "strategy:trend_following",
+                        "strategy_type": "trend_following",
+                        "coin": "ETH",
+                        "side": "long",
+                        "route": "paper_strategy",
+                        "composite_score": 0.42,
+                        "confidence": 0.51,
+                        "expected_value_pct": 0.0004,
+                        "execution_cost_pct": 0.001,
+                        "blockers": ["net_ev<0.0015"],
+                        "score_breakdown": {},
+                        "raw_candidate": {
+                            "name": "trend_eth",
+                            "source": "strategy",
+                            "source_key": "strategy:trend_following",
+                            "strategy_type": "trend_following",
+                            "current_score": 0.42,
+                            "confidence": 0.51,
+                            "entry_price": 100.0,
+                            "stop_loss": 97.0,
+                            "take_profit": 101.0,
+                            "parameters": {"coins": ["ETH"]},
+                            "metadata": {"source": "strategy", "source_key": "strategy:trend_following"},
+                        },
+                    },
+                    {
+                        "rank": 3,
+                        "status": "overflow",
+                        "name": "sol_mean_revert",
+                        "source": "strategy",
+                        "source_key": "strategy:mean_reversion",
+                        "strategy_type": "mean_reversion",
+                        "coin": "SOL",
+                        "side": "long",
+                        "route": "paper_strategy",
+                        "composite_score": 0.63,
+                        "confidence": 0.66,
+                        "expected_value_pct": 0.012,
+                        "execution_cost_pct": 0.0014,
+                        "blockers": [],
+                        "score_breakdown": {},
+                        "raw_candidate": {
+                            "name": "sol_mean_revert",
+                            "source": "strategy",
+                            "source_key": "strategy:mean_reversion",
+                            "strategy_type": "mean_reversion",
+                            "current_score": 0.63,
+                            "confidence": 0.66,
+                            "entry_price": 100.0,
+                            "stop_loss": 97.0,
+                            "take_profit": 107.0,
+                            "parameters": {"coins": ["SOL"]},
+                            "metadata": {"source": "strategy", "source_key": "strategy:mean_reversion"},
+                        },
+                    },
+                ],
+            }
+        )
+
+        trade_id = db.open_paper_trade(
+            strategy_id=1,
+            coin="BTC",
+            side="short",
+            entry_price=100.0,
+            size=1.0,
+            metadata={"source": "options_flow", "source_key": "options_flow:BTC"},
+        )
+        db.close_paper_trade(trade_id, exit_price=95.0, pnl=5.0)
+        db.open_paper_trade(
+            strategy_id=2,
+            coin="SOL",
+            side="long",
+            entry_price=50.0,
+            size=2.0,
+            metadata={"source": "strategy", "source_key": "strategy:mean_reversion"},
+        )
+        db.save_live_position_snapshot(
+            public_address="0xabc",
+            positions=[{"coin": "BTC", "side": "short", "szi": -1.0, "entry_price": 100.0}],
+            timestamp=now,
+        )
+        db.save_live_execution_event(
+            "0xabc",
+            timestamp=now,
+            signal_id="live-1",
+            source="options_flow",
+            source_key="options_flow:BTC",
+            coin="BTC",
+            side="short",
+            status="success",
+            filled_size=1.0,
+            fill_ratio=1.0,
+            realized_slippage_bps=9.0,
+            protective_status="placed",
+        )
+
+        funnel = db.get_decision_funnel_summary(limit_cycles=10)
+        attribution = db.get_source_attribution_summary(limit_cycles=10, lookback_hours=24)
+        divergence = db.get_runtime_divergence_summary(lookback_hours=24)
+
+        assert funnel["cycles"] == 1
+        assert funnel["selected_count"] == 1
+        assert funnel["blocked_count"] == 1
+        assert funnel["overflow_count"] == 1
+        assert funnel["blocker_mix"]["net_ev<0.0015"] == 1
+        options_row = next(row for row in attribution if row["source_key"] == "options_flow:BTC")
+        assert options_row["selected_count"] == 1
+        assert options_row["paper_closed_count"] == 1
+        assert options_row["live_events"] == 1
+        assert divergence["shadow_selected_count"] == 1
+        assert divergence["paper_open_count"] == 1
+        assert divergence["live_open_positions"] == 1
+    finally:
+        monkeypatch.setattr(db, "_DB_PATH", original_path)
+        if os.path.exists(db_path):
+            os.remove(db_path)
+
+
+def test_experiment_benchmark_pack_replays_profiles_and_builds_promotion_gate():
+    cycles = []
+    for idx in range(6):
+        confidence = 0.68 if idx < 3 else 0.78
+        cycles.append(
+            {
+                "timestamp": f"2026-04-05T1{idx}:00:00",
+                "context": {
+                    "regime_data": {"overall_regime": "neutral"},
+                    "open_positions": [],
+                    "kelly_summary": {},
+                },
+                "candidates": [
+                    {
+                        "status": "selected",
+                        "raw_candidate": {
+                            "name": f"good_{idx}",
+                            "source": "strategy",
+                            "source_key": "strategy:trend_following",
+                            "strategy_type": "trend_following",
+                            "current_score": 0.72,
+                            "confidence": confidence,
+                            "source_accuracy": 0.64,
+                            "entry_price": 100.0,
+                            "stop_loss": 97.0,
+                            "take_profit": 108.0,
+                            "parameters": {"coins": ["BTC"]},
+                            "metadata": {"source": "strategy", "source_key": "strategy:trend_following"},
+                        },
+                    },
+                    {
+                        "status": "blocked",
+                        "raw_candidate": {
+                            "name": f"bad_{idx}",
+                            "source": "options_flow",
+                            "source_key": "options_flow:ETH",
+                            "strategy_type": "options_momentum",
+                            "current_score": 0.70,
+                            "confidence": 0.52,
+                            "source_accuracy": 0.55,
+                            "entry_price": 100.0,
+                            "stop_loss": 95.0,
+                            "take_profit": 101.0,
+                            "parameters": {"coins": ["ETH"]},
+                            "metadata": {"source": "options_flow", "source_key": "options_flow:ETH"},
+                        },
+                    },
+                ],
+            }
+        )
+
+    report = build_experiment_benchmark_pack(
+        cycles,
+        profiles={
+            "baseline_current": {},
+            "challenger_selective": {
+                "min_signal_confidence": 0.75,
+                "min_expected_value_pct": 0.005,
+            },
+        },
+        out_of_sample_ratio=0.5,
+        min_oos_cycles=2,
+        min_ev_delta_pct=0.0,
+    )
+
+    assert report["cycle_count"] == 6
+    assert report["out_of_sample_cycles"] == 3
+    assert "baseline_current" in report["profiles"]
+    assert "challenger_selective" in report["profiles"]
+    assert report["profiles"]["baseline_current"]["out_of_sample"]["cycles"] == 3
+    assert "approved" in report["profiles"]["challenger_selective"]["promotion"]
 
 
 def test_decision_engine_prefers_higher_net_expectancy_over_raw_score():

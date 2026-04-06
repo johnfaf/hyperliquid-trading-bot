@@ -70,6 +70,18 @@ def _normalize_live_side(value):
     return text
 
 
+def _parse_iso_timestamp(value):
+    if value in (None, ""):
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is not None:
+        return parsed.replace(tzinfo=None)
+    return parsed
+
+
 def _make_live_fill_uid(fill):
     for key in ("tid", "fillId", "id", "oid"):
         value = fill.get(key)
@@ -811,46 +823,55 @@ def upsert_live_fill_events(public_address: str, fills: list):
 
 
 def get_latest_live_equity_snapshot(public_address: str = None):
-    with get_connection() as conn:
-        query = "SELECT * FROM live_equity_snapshots"
-        params = []
-        if public_address:
-            query += " WHERE public_address = ?"
-            params.append(public_address)
-        query += " ORDER BY id DESC LIMIT 1"
-        row = conn.execute(query, params).fetchone()
+    try:
+        with get_connection() as conn:
+            query = "SELECT * FROM live_equity_snapshots"
+            params = []
+            if public_address:
+                query += " WHERE public_address = ?"
+                params.append(public_address)
+            query += " ORDER BY id DESC LIMIT 1"
+            row = conn.execute(query, params).fetchone()
+    except sqlite3.OperationalError:
+        return None
     return dict(row) if row else None
 
 
 def get_recent_live_equity_snapshots(limit: int = 100, public_address: str = None):
-    with get_connection() as conn:
-        query = "SELECT * FROM live_equity_snapshots"
-        params = []
-        if public_address:
-            query += " WHERE public_address = ?"
-            params.append(public_address)
-        query += " ORDER BY id DESC LIMIT ?"
-        params.append(int(limit))
-        rows = conn.execute(query, params).fetchall()
+    try:
+        with get_connection() as conn:
+            query = "SELECT * FROM live_equity_snapshots"
+            params = []
+            if public_address:
+                query += " WHERE public_address = ?"
+                params.append(public_address)
+            query += " ORDER BY id DESC LIMIT ?"
+            params.append(int(limit))
+            rows = conn.execute(query, params).fetchall()
+    except sqlite3.OperationalError:
+        return []
     return [dict(r) for r in reversed(rows)]
 
 
 def get_latest_live_positions(public_address: str = None):
-    with get_connection() as conn:
-        query = "SELECT * FROM live_position_batches"
-        params = []
-        if public_address:
-            query += " WHERE public_address = ?"
-            params.append(public_address)
-        query += " ORDER BY id DESC LIMIT 1"
-        batch = conn.execute(query, params).fetchone()
-        if not batch:
-            return {"snapshot": None, "positions": []}
-        rows = conn.execute("""
-            SELECT * FROM live_position_snapshots
-            WHERE snapshot_id = ?
-            ORDER BY ABS(signed_size) DESC, coin ASC
-        """, (batch["snapshot_id"],)).fetchall()
+    try:
+        with get_connection() as conn:
+            query = "SELECT * FROM live_position_batches"
+            params = []
+            if public_address:
+                query += " WHERE public_address = ?"
+                params.append(public_address)
+            query += " ORDER BY id DESC LIMIT 1"
+            batch = conn.execute(query, params).fetchone()
+            if not batch:
+                return {"snapshot": None, "positions": []}
+            rows = conn.execute("""
+                SELECT * FROM live_position_snapshots
+                WHERE snapshot_id = ?
+                ORDER BY ABS(signed_size) DESC, coin ASC
+            """, (batch["snapshot_id"],)).fetchall()
+    except sqlite3.OperationalError:
+        return {"snapshot": None, "positions": []}
     return {
         "snapshot": dict(batch),
         "positions": [dict(r) for r in rows],
@@ -858,20 +879,23 @@ def get_latest_live_positions(public_address: str = None):
 
 
 def get_live_fill_summary(public_address: str = None):
-    with get_connection() as conn:
-        query = """
-            SELECT
-                COUNT(*) AS fill_count,
-                COALESCE(SUM(closed_pnl), 0) AS realized_pnl,
-                COALESCE(SUM(fee), 0) AS fees_paid,
-                MAX(timestamp) AS last_fill_timestamp
-            FROM live_fill_events
-        """
-        params = []
-        if public_address:
-            query += " WHERE public_address = ?"
-            params.append(public_address)
-        row = conn.execute(query, params).fetchone()
+    try:
+        with get_connection() as conn:
+            query = """
+                SELECT
+                    COUNT(*) AS fill_count,
+                    COALESCE(SUM(closed_pnl), 0) AS realized_pnl,
+                    COALESCE(SUM(fee), 0) AS fees_paid,
+                    MAX(timestamp) AS last_fill_timestamp
+                FROM live_fill_events
+            """
+            params = []
+            if public_address:
+                query += " WHERE public_address = ?"
+                params.append(public_address)
+            row = conn.execute(query, params).fetchone()
+    except sqlite3.OperationalError:
+        row = None
     return dict(row) if row else {
         "fill_count": 0,
         "realized_pnl": 0.0,
@@ -1164,22 +1188,28 @@ def save_decision_research_snapshot(snapshot: dict) -> int:
 
 
 def get_decision_research_candidates(research_cycle_id: int) -> list:
-    with get_connection() as conn:
-        rows = conn.execute("""
-            SELECT * FROM decision_research_candidates
-            WHERE research_cycle_id = ?
-            ORDER BY candidate_rank ASC, id ASC
-        """, (int(research_cycle_id),)).fetchall()
+    try:
+        with get_connection() as conn:
+            rows = conn.execute("""
+                SELECT * FROM decision_research_candidates
+                WHERE research_cycle_id = ?
+                ORDER BY candidate_rank ASC, id ASC
+            """, (int(research_cycle_id),)).fetchall()
+    except sqlite3.OperationalError:
+        return []
     return [dict(r) for r in rows]
 
 
 def get_recent_decision_research(limit: int = 20, include_candidates: bool = False) -> list:
-    with get_connection() as conn:
-        rows = conn.execute("""
-            SELECT * FROM decision_research_cycles
-            ORDER BY id DESC
-            LIMIT ?
-        """, (int(limit),)).fetchall()
+    try:
+        with get_connection() as conn:
+            rows = conn.execute("""
+                SELECT * FROM decision_research_cycles
+                ORDER BY id DESC
+                LIMIT ?
+            """, (int(limit),)).fetchall()
+    except sqlite3.OperationalError:
+        return []
 
     cycles = []
     for row in reversed(rows):
@@ -1208,6 +1238,260 @@ def get_recent_decision_research(limit: int = 20, include_candidates: bool = Fal
             cycle["candidates"] = candidates
         cycles.append(cycle)
     return cycles
+
+
+def get_decision_funnel_summary(limit_cycles: int = 50) -> dict:
+    cycles = get_recent_decision_research(limit=limit_cycles, include_candidates=True)
+    summary = {
+        "cycles": len(cycles),
+        "candidate_count": 0,
+        "selected_count": 0,
+        "blocked_count": 0,
+        "overflow_count": 0,
+        "ranked_count": 0,
+        "no_trade_cycles": 0,
+        "selection_rate": 0.0,
+        "avg_candidates_per_cycle": 0.0,
+        "blocker_mix": {},
+        "status_mix": {},
+    }
+    blocker_mix = {}
+    status_mix = {}
+
+    for cycle in cycles:
+        candidates = cycle.get("candidates", []) or []
+        summary["candidate_count"] += len(candidates)
+        selected_this_cycle = 0
+        for candidate in candidates:
+            status = str(candidate.get("status", "unknown") or "unknown")
+            status_mix[status] = status_mix.get(status, 0) + 1
+            if status == "selected":
+                summary["selected_count"] += 1
+                selected_this_cycle += 1
+            elif status == "blocked":
+                summary["blocked_count"] += 1
+                blockers = candidate.get("blockers") or ["unknown"]
+                for blocker in blockers:
+                    label = str(blocker or "unknown")
+                    blocker_mix[label] = blocker_mix.get(label, 0) + 1
+            elif status == "overflow":
+                summary["overflow_count"] += 1
+            else:
+                summary["ranked_count"] += 1
+        if selected_this_cycle == 0:
+            summary["no_trade_cycles"] += 1
+
+    if summary["candidate_count"] > 0:
+        summary["selection_rate"] = round(
+            summary["selected_count"] / summary["candidate_count"],
+            4,
+        )
+    if summary["cycles"] > 0:
+        summary["avg_candidates_per_cycle"] = round(
+            summary["candidate_count"] / summary["cycles"],
+            2,
+        )
+
+    summary["status_mix"] = dict(
+        sorted(status_mix.items(), key=lambda item: (-item[1], item[0]))
+    )
+    summary["blocker_mix"] = dict(
+        sorted(blocker_mix.items(), key=lambda item: (-item[1], item[0]))
+    )
+    return summary
+
+
+def get_source_attribution_summary(limit_cycles: int = 50, lookback_hours: float = 24.0 * 7) -> list:
+    cycles = get_recent_decision_research(limit=limit_cycles, include_candidates=True)
+    cutoff = None
+    if lookback_hours and float(lookback_hours) > 0:
+        cutoff = datetime.utcnow() - timedelta(hours=float(lookback_hours))
+
+    by_source = {}
+
+    def _bucket_for(source_key: str, source: str):
+        key = str(source_key or source or "unknown").strip() or "unknown"
+        bucket = by_source.setdefault(
+            key,
+            {
+                "source_key": key,
+                "source": str(source or "unknown").strip().lower() or "unknown",
+                "candidate_count": 0,
+                "selected_count": 0,
+                "blocked_count": 0,
+                "overflow_count": 0,
+                "avg_composite_score": 0.0,
+                "avg_expected_value_pct": 0.0,
+                "_composite_total": 0.0,
+                "_expected_value_total": 0.0,
+                "paper_open_count": 0,
+                "paper_closed_count": 0,
+                "paper_realized_pnl": 0.0,
+            },
+        )
+        if source and bucket["source"] == "unknown":
+            bucket["source"] = str(source).strip().lower() or "unknown"
+        return bucket
+
+    for cycle in cycles:
+        cycle_ts = _parse_iso_timestamp(cycle.get("timestamp"))
+        if cutoff and cycle_ts and cycle_ts < cutoff:
+            continue
+        for candidate in cycle.get("candidates", []) or []:
+            bucket = _bucket_for(candidate.get("source_key"), candidate.get("source"))
+            bucket["candidate_count"] += 1
+            bucket["_composite_total"] += _safe_float(candidate.get("composite_score"), 0.0)
+            bucket["_expected_value_total"] += _safe_float(candidate.get("expected_value_pct"), 0.0)
+            status = str(candidate.get("status", "") or "").lower()
+            if status == "selected":
+                bucket["selected_count"] += 1
+            elif status == "blocked":
+                bucket["blocked_count"] += 1
+            elif status == "overflow":
+                bucket["overflow_count"] += 1
+
+    try:
+        with get_connection() as conn:
+            paper_rows = conn.execute(
+                """
+                SELECT status, pnl, metadata
+                FROM paper_trades
+                """
+            ).fetchall()
+    except sqlite3.OperationalError:
+        paper_rows = []
+
+    for row in paper_rows:
+        metadata = {}
+        try:
+            metadata = json.loads(row["metadata"] or "{}")
+        except Exception:
+            metadata = {}
+        source_key = str(metadata.get("source_key", "") or "").strip()
+        source = str(metadata.get("source", metadata.get("signal_source", "")) or "").strip().lower()
+        bucket = _bucket_for(source_key, source)
+        status = str(row["status"] or "").lower()
+        if status == "open":
+            bucket["paper_open_count"] += 1
+        elif status == "closed":
+            bucket["paper_closed_count"] += 1
+            bucket["paper_realized_pnl"] += _safe_float(row["pnl"], 0.0)
+
+    live_by_source = {
+        row["source_key"]: row
+        for row in get_execution_quality_by_source(
+            lookback_hours=lookback_hours,
+            limit=max(len(by_source), 1) + 20,
+        )
+    }
+
+    rows = []
+    for bucket in by_source.values():
+        candidate_count = bucket["candidate_count"] or 0
+        if candidate_count > 0:
+            bucket["avg_composite_score"] = round(bucket["_composite_total"] / candidate_count, 4)
+            bucket["avg_expected_value_pct"] = round(bucket["_expected_value_total"] / candidate_count, 4)
+        live_row = live_by_source.get(bucket["source_key"], {})
+        bucket["live_events"] = int(live_row.get("total_events", 0) or 0)
+        bucket["live_success_rate"] = round(
+            _safe_float(live_row.get("success_rate"), 0.0),
+            4,
+        )
+        bucket["live_rejection_rate"] = round(
+            _safe_float(live_row.get("rejection_rate"), 0.0),
+            4,
+        )
+        bucket["live_avg_slippage_bps"] = round(
+            _safe_float(live_row.get("avg_realized_slippage_bps"), 0.0),
+            4,
+        )
+        bucket["live_avg_fill_ratio"] = round(
+            _safe_float(live_row.get("avg_fill_ratio"), 0.0),
+            4,
+        )
+        bucket["paper_realized_pnl"] = round(bucket["paper_realized_pnl"], 2)
+        bucket.pop("_composite_total", None)
+        bucket.pop("_expected_value_total", None)
+        rows.append(bucket)
+
+    rows.sort(
+        key=lambda item: (
+            -item["selected_count"],
+            -item["live_events"],
+            -item["candidate_count"],
+            item["source_key"],
+        )
+    )
+    return rows
+
+
+def get_runtime_divergence_summary(lookback_hours: float = 24.0) -> dict:
+    cutoff = None
+    if lookback_hours and float(lookback_hours) > 0:
+        cutoff = datetime.utcnow() - timedelta(hours=float(lookback_hours))
+
+    cycles = get_recent_decision_research(limit=200, include_candidates=True)
+    shadow_selected_count = 0
+    for cycle in cycles:
+        cycle_ts = _parse_iso_timestamp(cycle.get("timestamp"))
+        if cutoff and cycle_ts and cycle_ts < cutoff:
+            continue
+        shadow_selected_count += sum(
+            1
+            for candidate in cycle.get("candidates", []) or []
+            if str(candidate.get("status", "") or "").lower() == "selected"
+        )
+
+    paper_open_count = len(get_open_paper_trades())
+    paper_recent_open_count = 0
+    paper_recent_closed_count = 0
+    try:
+        with get_connection() as conn:
+            rows = conn.execute(
+                "SELECT opened_at, closed_at, status FROM paper_trades"
+            ).fetchall()
+    except sqlite3.OperationalError:
+        rows = []
+
+    for row in rows:
+        opened_at = _parse_iso_timestamp(row["opened_at"])
+        closed_at = _parse_iso_timestamp(row["closed_at"])
+        if cutoff is None or (opened_at and opened_at >= cutoff):
+            paper_recent_open_count += 1
+        if str(row["status"] or "").lower() == "closed" and (cutoff is None or (closed_at and closed_at >= cutoff)):
+            paper_recent_closed_count += 1
+
+    live_positions = get_latest_live_positions()
+    live_open_positions = len(live_positions.get("positions", []) or [])
+    live_execution = get_execution_quality_summary(lookback_hours=lookback_hours)
+    live_execution_total = int(live_execution.get("total_events", 0) or 0)
+    live_success_count = int(live_execution.get("success_count", 0) or 0)
+    live_rejection_count = int(live_execution.get("rejection_count", 0) or 0)
+
+    paper_live_gap = paper_open_count - live_open_positions
+    shadow_live_gap = shadow_selected_count - live_execution_total
+
+    return {
+        "lookback_hours": float(lookback_hours or 0.0),
+        "shadow_selected_count": shadow_selected_count,
+        "paper_open_count": paper_open_count,
+        "paper_recent_open_count": paper_recent_open_count,
+        "paper_recent_closed_count": paper_recent_closed_count,
+        "live_open_positions": live_open_positions,
+        "live_execution_total": live_execution_total,
+        "live_success_count": live_success_count,
+        "live_rejection_count": live_rejection_count,
+        "paper_live_open_gap": paper_live_gap,
+        "paper_live_open_gap_ratio": round(
+            abs(paper_live_gap) / max(1, max(paper_open_count, live_open_positions)),
+            4,
+        ),
+        "shadow_live_execution_gap": shadow_live_gap,
+        "shadow_live_execution_gap_ratio": round(
+            abs(shadow_live_gap) / max(1, max(shadow_selected_count, live_execution_total)),
+            4,
+        ),
+    }
 
 
 # ─── Research Logs ─────────────────────────────────────────────

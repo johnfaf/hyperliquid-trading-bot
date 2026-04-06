@@ -391,6 +391,61 @@ def _get_v2_metrics(conn) -> Dict:
     return v2
 
 
+def _load_experiment_benchmark_summary() -> Dict:
+    report_path = os.path.abspath(getattr(config, "EXPERIMENT_BENCHMARK_REPORT_PATH", ""))
+    if not report_path or not os.path.exists(report_path):
+        return {}
+    try:
+        with open(report_path, "r", encoding="utf-8") as handle:
+            report = json.load(handle)
+    except Exception as exc:
+        logger.debug("dashboard benchmark report error: %s", exc)
+        return {}
+
+    profiles = {}
+    for name, profile in (report.get("profiles") or {}).items():
+        profiles[name] = {
+            "out_of_sample": profile.get("out_of_sample", {}),
+            "promotion": profile.get("promotion", {}),
+        }
+
+    return {
+        "generated_at": report.get("generated_at"),
+        "cycle_count": report.get("cycle_count", 0),
+        "in_sample_cycles": report.get("in_sample_cycles", 0),
+        "out_of_sample_cycles": report.get("out_of_sample_cycles", 0),
+        "promotion_gate": report.get("promotion_gate", {}),
+        "profiles": profiles,
+    }
+
+
+def _build_experiment_discipline_metrics(shadow_tracker=None) -> Dict:
+    metrics = {
+        "decision_funnel": db.get_decision_funnel_summary(
+            limit_cycles=getattr(config, "EXPERIMENT_REPORT_LIMIT_CYCLES", 120)
+        ),
+        "source_attribution": db.get_source_attribution_summary(
+            limit_cycles=getattr(config, "EXPERIMENT_REPORT_LIMIT_CYCLES", 120),
+            lookback_hours=getattr(config, "EXPERIMENT_ATTRIBUTION_LOOKBACK_HOURS", 168),
+        ),
+        "divergence": db.get_runtime_divergence_summary(
+            lookback_hours=getattr(config, "EXPERIMENT_DIVERGENCE_LOOKBACK_HOURS", 24)
+        ),
+        "benchmark_pack": _load_experiment_benchmark_summary(),
+    }
+
+    if shadow_tracker:
+        try:
+            metrics["shadow_attribution"] = shadow_tracker.get_attribution(
+                days=max(1, int(getattr(config, "EXPERIMENT_ATTRIBUTION_LOOKBACK_HOURS", 168) / 24))
+            )
+        except Exception as exc:
+            logger.debug("dashboard shadow attribution error: %s", exc)
+    else:
+        metrics["shadow_attribution"] = {}
+    return metrics
+
+
 # Module-level references for V2 + V2.5 + V3 components (set by set_v2_components)
 _firewall = None
 _regime_detector = None
@@ -405,6 +460,7 @@ _signal_processor = None
 _arena_incubator = None
 _decision_engine = None
 _multi_scanner = None
+_shadow_tracker = None
 
 # Module-level live trader reference for closing positions on exchange
 _live_trader = None
@@ -519,12 +575,12 @@ def set_v2_components(firewall=None, regime_detector=None, arena=None,
                        kelly_sizer=None, portfolio_sizer=None, trade_memory=None, calibration=None,
                        llm_filter=None, liquidation_strategy=None,
                        signal_processor=None, arena_incubator=None,
-                       decision_engine=None, multi_scanner=None):
+                       decision_engine=None, multi_scanner=None, shadow_tracker=None):
     """Set V2 + V2.5 + V3 + V4 component references for dashboard metrics."""
     global _firewall, _regime_detector, _arena  # noqa: PLW0603
     global _kelly_sizer, _portfolio_sizer, _trade_memory, _calibration, _llm_filter, _liquidation_strategy  # noqa
     global _signal_processor, _arena_incubator, _decision_engine  # noqa
-    global _multi_scanner  # noqa
+    global _multi_scanner, _shadow_tracker  # noqa
     _firewall = firewall
     _regime_detector = regime_detector
     _arena = arena
@@ -538,6 +594,7 @@ def set_v2_components(firewall=None, regime_detector=None, arena=None,
     _arena_incubator = arena_incubator
     _decision_engine = decision_engine
     _multi_scanner = multi_scanner
+    _shadow_tracker = shadow_tracker
 
 
 DASHBOARD_HTML = """<!DOCTYPE html>
@@ -1225,6 +1282,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
                                 limit=8,
                             ),
                         }
+                except Exception:
+                    pass
+                try:
+                    v25["experiment_discipline"] = _build_experiment_discipline_metrics(_shadow_tracker)
                 except Exception:
                     pass
                 if v25:
