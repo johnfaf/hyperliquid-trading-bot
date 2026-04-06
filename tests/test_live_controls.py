@@ -1250,6 +1250,163 @@ def test_decision_engine_uses_kelly_edge_to_improve_expected_value():
     assert with_kelly["expected_value"] > no_kelly["expected_value"]
 
 
+def test_decision_research_snapshot_round_trips(monkeypatch):
+    fd, raw_path = tempfile.mkstemp(prefix="decision_research_", suffix=".db", dir=os.getcwd())
+    os.close(fd)
+    db_path = os.path.abspath(raw_path)
+    original_path = db._DB_PATH
+    monkeypatch.setattr(db, "_DB_PATH", db_path)
+
+    try:
+        db.init_db()
+        research_id = db.save_decision_research_snapshot(
+            {
+                "timestamp": "2026-04-05T15:00:00",
+                "cycle_number": 12,
+                "regime": "trending_up",
+                "available_slots": 5,
+                "candidate_count": 2,
+                "qualified_count": 1,
+                "executed_count": 1,
+                "long_score": 1.4,
+                "short_score": 0.6,
+                "market_bias": "long",
+                "context": {
+                    "regime_data": {"overall_regime": "trending_up"},
+                    "open_positions": [{"coin": "SOL", "side": "long"}],
+                },
+                "candidates": [
+                    {
+                        "rank": 1,
+                        "status": "selected",
+                        "name": "good_ev",
+                        "source": "strategy",
+                        "source_key": "strategy:trend_following",
+                        "strategy_type": "trend_following",
+                        "coin": "BTC",
+                        "side": "long",
+                        "route": "paper_strategy",
+                        "composite_score": 0.84,
+                        "confidence": 0.66,
+                        "expected_value_pct": 0.014,
+                        "execution_cost_pct": 0.0011,
+                        "blockers": [],
+                        "score_breakdown": {"expected_value": 0.82},
+                        "raw_candidate": {"name": "good_ev", "metadata": {"source": "strategy"}},
+                    },
+                    {
+                        "rank": 2,
+                        "status": "blocked",
+                        "name": "bad_ev",
+                        "source": "options_flow",
+                        "source_key": "options_flow:ETH",
+                        "strategy_type": "options_momentum",
+                        "coin": "ETH",
+                        "side": "short",
+                        "route": "paper_strategy",
+                        "composite_score": 0.28,
+                        "confidence": 0.55,
+                        "expected_value_pct": -0.002,
+                        "execution_cost_pct": 0.004,
+                        "blockers": ["net_ev<0.0015"],
+                        "score_breakdown": {"expected_value": 0.12},
+                        "raw_candidate": {"name": "bad_ev", "metadata": {"source": "options_flow"}},
+                    },
+                ],
+            }
+        )
+
+        recent = db.get_recent_decision_research(limit=5, include_candidates=True)
+
+        assert research_id > 0
+        assert len(recent) == 1
+        assert recent[0]["cycle_number"] == 12
+        assert recent[0]["context"]["regime_data"]["overall_regime"] == "trending_up"
+        assert len(recent[0]["candidates"]) == 2
+        assert recent[0]["candidates"][0]["status"] == "selected"
+        assert recent[0]["candidates"][1]["blockers"] == ["net_ev<0.0015"]
+    finally:
+        monkeypatch.setattr(db, "_DB_PATH", original_path)
+        if os.path.exists(db_path):
+            os.remove(db_path)
+
+
+def test_decision_engine_persists_research_cycle(monkeypatch):
+    saved_snapshots = []
+
+    monkeypatch.setattr(
+        "src.signals.decision_engine.db.save_decision_research_snapshot",
+        lambda snapshot: saved_snapshots.append(snapshot) or 77,
+    )
+
+    engine = DecisionEngine(
+        {
+            "persist_research": True,
+            "min_decision_score": 0.0,
+            "min_signal_confidence": 0.4,
+            "min_source_weight": 0.3,
+            "min_expected_value_pct": 0.0,
+        }
+    )
+    candidate = {
+        "name": "persist_me",
+        "strategy_type": "trend_following",
+        "source": "strategy",
+        "source_key": "strategy:trend_following",
+        "current_score": 0.7,
+        "confidence": 0.66,
+        "source_accuracy": 0.62,
+        "side": "long",
+        "entry_price": 100.0,
+        "stop_loss": 97.0,
+        "take_profit": 107.0,
+        "parameters": {"coins": ["BTC"]},
+        "metadata": {"source": "strategy"},
+    }
+
+    selected = engine.decide(
+        [candidate],
+        regime_data={"overall_regime": "neutral"},
+        open_positions=[{"coin": "SOL", "side": "long"}],
+        kelly_stats={"strategy:trend_following": {"trades": 25, "win_rate": 0.64, "has_edge": True}},
+    )
+
+    assert selected
+    assert saved_snapshots
+    assert saved_snapshots[0]["candidate_count"] == 1
+    assert saved_snapshots[0]["candidates"][0]["status"] == "selected"
+    assert saved_snapshots[0]["context"]["kelly_summary"]["strategy:trend_following"]["has_edge"] is True
+    assert engine.get_stats()["last_research_cycle_id"] == 77
+
+
+def test_get_v2_metrics_includes_persisted_decision_research(monkeypatch):
+    class EmptyConn:
+        def execute(self, query):
+            class Result:
+                def fetchall(self):
+                    return []
+
+            return Result()
+
+    monkeypatch.setattr(
+        dashboard_ui.db,
+        "get_recent_decision_research",
+        lambda limit=8, include_candidates=True: [
+            {
+                "id": 1,
+                "cycle_number": 3,
+                "market_bias": "long",
+                "candidates": [{"name": "btc_long", "status": "selected"}],
+            }
+        ],
+    )
+
+    metrics = dashboard_ui._get_v2_metrics(EmptyConn())
+
+    assert metrics["decision_research"][0]["cycle_number"] == 3
+    assert metrics["decision_research"][0]["candidates"][0]["name"] == "btc_long"
+
+
 def test_run_trading_cycle_does_not_fall_through_to_standalone_options_flow(monkeypatch):
     class FakeScorer:
         def score_all_strategies(self):

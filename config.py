@@ -228,6 +228,10 @@ DECISION_DEFAULT_EXECUTION_ROLE = os.environ.get(
     "DECISION_DEFAULT_EXECUTION_ROLE",
     PAPER_TRADING_DEFAULT_EXECUTION_ROLE,
 )
+DECISION_PERSIST_RESEARCH = os.environ.get(
+    "DECISION_PERSIST_RESEARCH",
+    "true",
+).lower() in ("true", "1", "yes")
 
 # External-signal thresholds used before signals enter the decision engine.
 POLYMARKET_MIN_DECISION_CONFIDENCE = float(

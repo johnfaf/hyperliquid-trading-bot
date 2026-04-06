@@ -20,6 +20,7 @@ This branch is the staged upgrade path for making the bot more measurable, more 
 
 ## Phase 3: Research And Feature Store
 
+- Status: shipped on `codex/live-ledger-foundation`
 - Persist every cycle's candidate set, rejections, selected trades, and realized outcomes.
 - Store regime, cross-venue, options-flow, polymarket, and arena context with each decision.
 - Make every live and paper decision replayable for later training and audit.

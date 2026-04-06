@@ -22,9 +22,12 @@ NOT forcing to 1 trade (ChatGPT's suggestion) because:
 Instead: ranked execution with clear priority + decision logging.
 """
 import logging
+import json
 from typing import Dict, List, Optional, Tuple
 from datetime import datetime
 from collections import deque
+
+from src.data import database as db
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +68,8 @@ class DecisionEngine:
         self.expected_slippage_bps = cfg.get("expected_slippage_bps", 3.0)
         self.churn_penalty_bps = cfg.get("churn_penalty_bps", 2.0)
         self.default_execution_role = str(cfg.get("default_execution_role", "taker") or "taker").lower()
+        self.persist_research = bool(cfg.get("persist_research", False))
+        self._last_research_cycle_id: Optional[int] = None
 
         # Track decisions for audit
         self._decision_history: deque = deque(maxlen=100)
@@ -227,10 +232,135 @@ class DecisionEngine:
                 for e in executions
             ],
         })
+        if self.persist_research:
+            self._persist_decision_research(
+                scored=scored,
+                executions=executions,
+                disqualified=disqualified,
+                overflow=overflow,
+                regime_data=regime_data,
+                open_positions=open_positions,
+                available_slots=available_slots,
+                long_score=long_score,
+                short_score=short_score,
+                kelly_stats=kelly_stats,
+            )
 
         # deque(maxlen=100) auto-trims old entries
 
         return executions
+
+    def _persist_decision_research(
+        self,
+        *,
+        scored: List[Dict],
+        executions: List[Dict],
+        disqualified: List[Dict],
+        overflow: List[Dict],
+        regime_data: Optional[Dict],
+        open_positions: Optional[List[Dict]],
+        available_slots: int,
+        long_score: float,
+        short_score: float,
+        kelly_stats: Optional[Dict],
+    ) -> None:
+        execution_ids = {id(item) for item in executions}
+        disqualified_ids = {id(item) for item in disqualified}
+        overflow_ids = {id(item) for item in overflow}
+
+        serialized_candidates = []
+        for rank, candidate in enumerate(scored, start=1):
+            if id(candidate) in execution_ids:
+                status = "selected"
+            elif id(candidate) in disqualified_ids:
+                status = "blocked"
+            elif id(candidate) in overflow_ids:
+                status = "overflow"
+            else:
+                status = "ranked"
+
+            serialized_candidates.append(
+                {
+                    "rank": rank,
+                    "status": status,
+                    "name": candidate.get("name"),
+                    "source": str(candidate.get("source", "")),
+                    "source_key": candidate.get("source_key"),
+                    "strategy_type": candidate.get("strategy_type"),
+                    "coin": candidate.get("_decision_coin"),
+                    "side": candidate.get("_decision_side"),
+                    "route": str(candidate.get("_decision_route", "paper_strategy") or "paper_strategy"),
+                    "composite_score": candidate.get("_composite_score", 0.0),
+                    "confidence": candidate.get("confidence", 0.0),
+                    "expected_value_pct": candidate.get("_expected_value_pct", 0.0),
+                    "execution_cost_pct": candidate.get("_execution_cost_pct", 0.0),
+                    "blockers": candidate.get("_decision_blockers", []),
+                    "score_breakdown": candidate.get("_score_breakdown", {}),
+                    "raw_candidate": self._sanitize_candidate_for_research(candidate),
+                }
+            )
+
+        tracked_keys = {
+            candidate.get("source_key")
+            for candidate in scored
+            if candidate.get("source_key")
+        }
+        kelly_summary = {}
+        if isinstance(kelly_stats, dict):
+            for key in tracked_keys:
+                if key in kelly_stats and isinstance(kelly_stats[key], dict):
+                    kelly_summary[key] = dict(kelly_stats[key])
+
+        market_bias = (
+            "long" if long_score > short_score else "short" if short_score > long_score else "neutral"
+        )
+        snapshot = {
+            "timestamp": datetime.utcnow().isoformat(),
+            "cycle_number": self._cycle_count,
+            "regime": regime_data.get("overall_regime", "unknown") if regime_data else "unknown",
+            "available_slots": available_slots,
+            "candidate_count": len(scored),
+            "qualified_count": len(scored) - len(disqualified),
+            "executed_count": len(executions),
+            "long_score": long_score,
+            "short_score": short_score,
+            "market_bias": market_bias,
+            "context": {
+                "regime_data": regime_data or {},
+                "open_positions": open_positions or [],
+                "kelly_summary": kelly_summary,
+            },
+            "candidates": serialized_candidates,
+        }
+
+        try:
+            self._last_research_cycle_id = db.save_decision_research_snapshot(snapshot)
+        except Exception as exc:
+            logger.debug("Decision research persistence error: %s", exc)
+
+    def _sanitize_candidate_for_research(self, candidate: Dict) -> Dict:
+        """Strip transient fields that are noisy or unserializable for research storage."""
+        payload = {}
+        for key, value in candidate.items():
+            if key in {"_lcrs_signal", "_copy_signal"}:
+                payload[key] = value
+                continue
+            if key == "raw":
+                continue
+            if key.startswith("_") and key not in {
+                "_decision_coin",
+                "_decision_side",
+                "_decision_route",
+                "_composite_score",
+                "_expected_value_pct",
+                "_execution_cost_pct",
+                "_decision_blockers",
+                "_score_breakdown",
+            }:
+                continue
+            payload[key] = value
+        # Round-trip through JSON so datetimes/enums become stable strings.
+        return json.loads(json.dumps(payload, default=str))
 
     def _compute_composite_score(self, strategy: Dict,
                                   regime_data: Optional[Dict],
@@ -698,6 +828,8 @@ class DecisionEngine:
                               max(self.stats["total_candidates"], 1)),
             "no_trade_rate": (self.stats["total_no_trade"] /
                              max(self.stats["total_decisions"], 1)),
+            "research_persistence_enabled": self.persist_research,
+            "last_research_cycle_id": self._last_research_cycle_id,
             "recent_decisions": list(self._decision_history)[-10:],
         }
 

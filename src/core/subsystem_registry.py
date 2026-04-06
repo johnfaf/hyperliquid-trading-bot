@@ -257,6 +257,7 @@ def build_subsystems(
                     "expected_slippage_bps": config.DECISION_EXPECTED_SLIPPAGE_BPS,
                     "churn_penalty_bps": config.DECISION_CHURN_PENALTY_BPS,
                     "default_execution_role": config.DECISION_DEFAULT_EXECUTION_ROLE,
+                    "persist_research": config.DECISION_PERSIST_RESEARCH,
                 }
             ),
             health,

@@ -362,6 +362,7 @@ def _get_v2_metrics(conn) -> Dict:
         "firewall": {},
         "agent_scores": [],
         "regime": {},
+        "decision_research": [],
     }
 
     try:
@@ -381,6 +382,11 @@ def _get_v2_metrics(conn) -> Dict:
         v2["agent_scores"] = [dict(r) for r in rows]
     except Exception:
         pass  # Table may not exist yet
+
+    try:
+        v2["decision_research"] = db.get_recent_decision_research(limit=8, include_candidates=True)
+    except Exception:
+        pass
 
     return v2
 

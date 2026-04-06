@@ -284,6 +284,49 @@ def init_db():
         );
         CREATE INDEX IF NOT EXISTS idx_live_fill_timestamp ON live_fill_events(timestamp);
         CREATE INDEX IF NOT EXISTS idx_live_fill_coin ON live_fill_events(coin);
+
+        CREATE TABLE IF NOT EXISTS decision_research_cycles (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            cycle_number INTEGER DEFAULT 0,
+            regime TEXT DEFAULT 'unknown',
+            available_slots INTEGER DEFAULT 0,
+            candidate_count INTEGER DEFAULT 0,
+            qualified_count INTEGER DEFAULT 0,
+            executed_count INTEGER DEFAULT 0,
+            long_score REAL DEFAULT 0,
+            short_score REAL DEFAULT 0,
+            market_bias TEXT DEFAULT 'neutral',
+            context_json TEXT DEFAULT '{}'
+        );
+        CREATE INDEX IF NOT EXISTS idx_decision_research_cycles_timestamp
+            ON decision_research_cycles(timestamp);
+
+        CREATE TABLE IF NOT EXISTS decision_research_candidates (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            research_cycle_id INTEGER NOT NULL,
+            candidate_rank INTEGER DEFAULT 0,
+            status TEXT NOT NULL,
+            name TEXT,
+            source TEXT,
+            source_key TEXT,
+            strategy_type TEXT,
+            coin TEXT,
+            side TEXT,
+            route TEXT,
+            composite_score REAL DEFAULT 0,
+            confidence REAL DEFAULT 0,
+            expected_value_pct REAL DEFAULT 0,
+            execution_cost_pct REAL DEFAULT 0,
+            blockers_json TEXT DEFAULT '[]',
+            score_breakdown_json TEXT DEFAULT '{}',
+            candidate_json TEXT DEFAULT '{}',
+            FOREIGN KEY (research_cycle_id) REFERENCES decision_research_cycles(id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_decision_research_candidates_cycle
+            ON decision_research_candidates(research_cycle_id, candidate_rank);
+        CREATE INDEX IF NOT EXISTS idx_decision_research_candidates_status
+            ON decision_research_candidates(status);
         """)
 
 
@@ -803,6 +846,109 @@ def get_live_fill_summary(public_address: str = None):
         "fees_paid": 0.0,
         "last_fill_timestamp": None,
     }
+
+
+def save_decision_research_snapshot(snapshot: dict) -> int:
+    """Persist a replayable decision-cycle snapshot and all candidate rows."""
+    timestamp = _normalize_live_timestamp(snapshot.get("timestamp"))
+    candidates = snapshot.get("candidates", []) or []
+    with get_connection() as conn:
+        cursor = conn.execute("""
+            INSERT INTO decision_research_cycles
+            (timestamp, cycle_number, regime, available_slots, candidate_count,
+             qualified_count, executed_count, long_score, short_score,
+             market_bias, context_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            timestamp,
+            int(snapshot.get("cycle_number", 0) or 0),
+            str(snapshot.get("regime", "unknown") or "unknown"),
+            int(snapshot.get("available_slots", 0) or 0),
+            int(snapshot.get("candidate_count", len(candidates)) or 0),
+            int(snapshot.get("qualified_count", 0) or 0),
+            int(snapshot.get("executed_count", 0) or 0),
+            _safe_float(snapshot.get("long_score", 0.0), 0.0),
+            _safe_float(snapshot.get("short_score", 0.0), 0.0),
+            str(snapshot.get("market_bias", "neutral") or "neutral"),
+            json.dumps(snapshot.get("context", {}), sort_keys=True, default=str),
+        ))
+        research_cycle_id = cursor.lastrowid
+
+        for index, candidate in enumerate(candidates, start=1):
+            conn.execute("""
+                INSERT INTO decision_research_candidates
+                (research_cycle_id, candidate_rank, status, name, source, source_key,
+                 strategy_type, coin, side, route, composite_score, confidence,
+                 expected_value_pct, execution_cost_pct, blockers_json,
+                 score_breakdown_json, candidate_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                research_cycle_id,
+                int(candidate.get("rank", index) or index),
+                str(candidate.get("status", "unknown") or "unknown"),
+                candidate.get("name"),
+                candidate.get("source"),
+                candidate.get("source_key"),
+                candidate.get("strategy_type"),
+                candidate.get("coin"),
+                candidate.get("side"),
+                candidate.get("route"),
+                _safe_float(candidate.get("composite_score", 0.0), 0.0),
+                _safe_float(candidate.get("confidence", 0.0), 0.0),
+                _safe_float(candidate.get("expected_value_pct", 0.0), 0.0),
+                _safe_float(candidate.get("execution_cost_pct", 0.0), 0.0),
+                json.dumps(candidate.get("blockers", []), sort_keys=True, default=str),
+                json.dumps(candidate.get("score_breakdown", {}), sort_keys=True, default=str),
+                json.dumps(candidate.get("raw_candidate", {}), sort_keys=True, default=str),
+            ))
+    return research_cycle_id
+
+
+def get_decision_research_candidates(research_cycle_id: int) -> list:
+    with get_connection() as conn:
+        rows = conn.execute("""
+            SELECT * FROM decision_research_candidates
+            WHERE research_cycle_id = ?
+            ORDER BY candidate_rank ASC, id ASC
+        """, (int(research_cycle_id),)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_recent_decision_research(limit: int = 20, include_candidates: bool = False) -> list:
+    with get_connection() as conn:
+        rows = conn.execute("""
+            SELECT * FROM decision_research_cycles
+            ORDER BY id DESC
+            LIMIT ?
+        """, (int(limit),)).fetchall()
+
+    cycles = []
+    for row in reversed(rows):
+        cycle = dict(row)
+        try:
+            cycle["context"] = json.loads(cycle.get("context_json") or "{}")
+        except Exception:
+            cycle["context"] = {}
+        if include_candidates:
+            candidates = get_decision_research_candidates(cycle["id"])
+            for candidate in candidates:
+                for key in ("blockers_json", "score_breakdown_json", "candidate_json"):
+                    try:
+                        parsed = json.loads(candidate.get(key) or ("[]" if key == "blockers_json" else "{}"))
+                    except Exception:
+                        parsed = [] if key == "blockers_json" else {}
+                    if key == "blockers_json":
+                        candidate["blockers"] = parsed
+                    elif key == "score_breakdown_json":
+                        candidate["score_breakdown"] = parsed
+                    else:
+                        candidate["raw_candidate"] = parsed
+                candidate.pop("blockers_json", None)
+                candidate.pop("score_breakdown_json", None)
+                candidate.pop("candidate_json", None)
+            cycle["candidates"] = candidates
+        cycles.append(cycle)
+    return cycles
 
 
 # ─── Research Logs ─────────────────────────────────────────────
