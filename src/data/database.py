@@ -6,7 +6,7 @@ import json
 import os
 import logging
 import hashlib
-from datetime import datetime
+from datetime import datetime, timedelta
 from contextlib import contextmanager
 
 import sys
@@ -284,6 +284,38 @@ def init_db():
         );
         CREATE INDEX IF NOT EXISTS idx_live_fill_timestamp ON live_fill_events(timestamp);
         CREATE INDEX IF NOT EXISTS idx_live_fill_coin ON live_fill_events(coin);
+
+        CREATE TABLE IF NOT EXISTS live_execution_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            public_address TEXT,
+            signal_id TEXT,
+            source TEXT,
+            source_key TEXT,
+            coin TEXT,
+            side TEXT,
+            status TEXT NOT NULL,
+            execution_role TEXT DEFAULT 'taker',
+            requested_size REAL DEFAULT 0,
+            submitted_size REAL DEFAULT 0,
+            filled_size REAL DEFAULT 0,
+            requested_notional REAL DEFAULT 0,
+            submitted_notional REAL DEFAULT 0,
+            mid_price REAL DEFAULT 0,
+            execution_price REAL DEFAULT 0,
+            expected_slippage_bps REAL DEFAULT 0,
+            realized_slippage_bps REAL DEFAULT 0,
+            fill_ratio REAL DEFAULT 0,
+            rejection_reason TEXT,
+            protective_status TEXT DEFAULT '',
+            metadata TEXT DEFAULT '{}'
+        );
+        CREATE INDEX IF NOT EXISTS idx_live_execution_timestamp
+            ON live_execution_events(timestamp);
+        CREATE INDEX IF NOT EXISTS idx_live_execution_source_key
+            ON live_execution_events(source_key, timestamp);
+        CREATE INDEX IF NOT EXISTS idx_live_execution_status
+            ON live_execution_events(status);
 
         CREATE TABLE IF NOT EXISTS decision_research_cycles (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -846,6 +878,233 @@ def get_live_fill_summary(public_address: str = None):
         "fees_paid": 0.0,
         "last_fill_timestamp": None,
     }
+
+
+def save_live_execution_event(public_address: str, **event):
+    timestamp = _normalize_live_timestamp(event.get("timestamp"))
+    source = str(event.get("source", "") or "").strip().lower() or None
+    source_key = str(event.get("source_key", "") or "").strip() or None
+    coin = str(event.get("coin", "") or "").strip().upper() or None
+    side = str(event.get("side", "") or "").strip().lower() or None
+    status = str(event.get("status", "unknown") or "unknown").strip().lower()
+    execution_role = str(event.get("execution_role", "taker") or "taker").strip().lower()
+    if execution_role not in {"maker", "taker"}:
+        execution_role = "taker"
+
+    with get_connection() as conn:
+        cursor = conn.execute("""
+            INSERT INTO live_execution_events
+            (timestamp, public_address, signal_id, source, source_key, coin, side,
+             status, execution_role, requested_size, submitted_size, filled_size,
+             requested_notional, submitted_notional, mid_price, execution_price,
+             expected_slippage_bps, realized_slippage_bps, fill_ratio,
+             rejection_reason, protective_status, metadata)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            timestamp,
+            public_address,
+            str(event.get("signal_id", "") or "").strip() or None,
+            source,
+            source_key,
+            coin,
+            side,
+            status,
+            execution_role,
+            _safe_float(event.get("requested_size"), 0.0),
+            _safe_float(event.get("submitted_size"), 0.0),
+            _safe_float(event.get("filled_size"), 0.0),
+            _safe_float(event.get("requested_notional"), 0.0),
+            _safe_float(event.get("submitted_notional"), 0.0),
+            _safe_float(event.get("mid_price"), 0.0),
+            _safe_float(event.get("execution_price"), 0.0),
+            _safe_float(event.get("expected_slippage_bps"), 0.0),
+            _safe_float(event.get("realized_slippage_bps"), 0.0),
+            _safe_float(event.get("fill_ratio"), 0.0),
+            str(event.get("rejection_reason", "") or "").strip() or None,
+            str(event.get("protective_status", "") or "").strip().lower(),
+            json.dumps(event.get("metadata", {}) or {}, sort_keys=True, default=str),
+        ))
+        return cursor.lastrowid
+
+
+def _get_execution_quality_row(
+    *,
+    public_address: str = None,
+    source_key: str = None,
+    source: str = None,
+    lookback_hours: float = 24.0 * 7,
+):
+    conditions = []
+    params = []
+    if public_address:
+        conditions.append("public_address = ?")
+        params.append(public_address)
+    if source_key:
+        conditions.append("source_key = ?")
+        params.append(source_key)
+    if source:
+        conditions.append("source = ?")
+        params.append(str(source).strip().lower())
+    if lookback_hours and float(lookback_hours) > 0:
+        since = (datetime.utcnow() - timedelta(hours=float(lookback_hours))).isoformat()
+        conditions.append("timestamp >= ?")
+        params.append(since)
+
+    where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+    query = f"""
+        SELECT
+            COUNT(*) AS total_events,
+            COALESCE(SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END), 0) AS success_count,
+            COALESCE(SUM(CASE WHEN status = 'warning' THEN 1 ELSE 0 END), 0) AS warning_count,
+            COALESCE(SUM(CASE WHEN status IN ('rejected', 'error') THEN 1 ELSE 0 END), 0) AS rejection_count,
+            COALESCE(SUM(CASE WHEN protective_status = 'failed' THEN 1 ELSE 0 END), 0) AS protective_failure_count,
+            AVG(CASE WHEN status = 'success' THEN realized_slippage_bps END) AS avg_realized_slippage_bps,
+            AVG(CASE WHEN status = 'success' THEN expected_slippage_bps END) AS avg_expected_slippage_bps,
+            AVG(CASE WHEN status = 'success' THEN fill_ratio END) AS avg_fill_ratio,
+            AVG(
+                CASE
+                    WHEN status = 'success' AND execution_role = 'maker' THEN 1.0
+                    WHEN status = 'success' AND execution_role = 'taker' THEN 0.0
+                    ELSE NULL
+                END
+            ) AS maker_ratio,
+            MAX(timestamp) AS last_event_timestamp
+        FROM live_execution_events
+        {where_clause}
+    """
+
+    try:
+        with get_connection() as conn:
+            row = conn.execute(query, params).fetchone()
+    except sqlite3.OperationalError:
+        return {}
+    return dict(row) if row else {}
+
+
+def get_execution_quality_summary(
+    public_address: str = None,
+    source_key: str = None,
+    source: str = None,
+    lookback_hours: float = 24.0 * 7,
+):
+    row = _get_execution_quality_row(
+        public_address=public_address,
+        source_key=source_key,
+        source=source,
+        lookback_hours=lookback_hours,
+    )
+    total_events = int(row.get("total_events", 0) or 0)
+    success_count = int(row.get("success_count", 0) or 0)
+    warning_count = int(row.get("warning_count", 0) or 0)
+    rejection_count = int(row.get("rejection_count", 0) or 0)
+    protective_failure_count = int(row.get("protective_failure_count", 0) or 0)
+    maker_ratio = _safe_float(row.get("maker_ratio"), 0.0)
+
+    return {
+        "total_events": total_events,
+        "success_count": success_count,
+        "warning_count": warning_count,
+        "rejection_count": rejection_count,
+        "protective_failure_count": protective_failure_count,
+        "success_rate": round(success_count / total_events, 4) if total_events else 0.0,
+        "warning_rate": round(warning_count / total_events, 4) if total_events else 0.0,
+        "rejection_rate": round(rejection_count / total_events, 4) if total_events else 0.0,
+        "protective_failure_rate": (
+            round(protective_failure_count / success_count, 4) if success_count else 0.0
+        ),
+        "avg_realized_slippage_bps": round(
+            _safe_float(row.get("avg_realized_slippage_bps"), 0.0), 4
+        ),
+        "avg_expected_slippage_bps": round(
+            _safe_float(row.get("avg_expected_slippage_bps"), 0.0), 4
+        ),
+        "avg_fill_ratio": round(_safe_float(row.get("avg_fill_ratio"), 0.0), 4),
+        "maker_ratio": round(maker_ratio, 4),
+        "taker_ratio": round(max(0.0, 1.0 - maker_ratio), 4) if success_count else 0.0,
+        "dominant_execution_role": "maker" if success_count and maker_ratio >= 0.5 else "taker",
+        "last_event_timestamp": row.get("last_event_timestamp"),
+        "lookback_hours": float(lookback_hours or 0.0),
+    }
+
+
+def get_execution_quality_by_source(
+    public_address: str = None,
+    lookback_hours: float = 24.0 * 7,
+    limit: int = 10,
+):
+    conditions = []
+    params = []
+    if public_address:
+        conditions.append("public_address = ?")
+        params.append(public_address)
+    if lookback_hours and float(lookback_hours) > 0:
+        since = (datetime.utcnow() - timedelta(hours=float(lookback_hours))).isoformat()
+        conditions.append("timestamp >= ?")
+        params.append(since)
+
+    where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+    query = f"""
+        SELECT
+            COALESCE(source_key, source, 'unknown') AS source_key,
+            COALESCE(source, 'unknown') AS source,
+            COUNT(*) AS total_events,
+            COALESCE(SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END), 0) AS success_count,
+            COALESCE(SUM(CASE WHEN status = 'warning' THEN 1 ELSE 0 END), 0) AS warning_count,
+            COALESCE(SUM(CASE WHEN status IN ('rejected', 'error') THEN 1 ELSE 0 END), 0) AS rejection_count,
+            COALESCE(SUM(CASE WHEN protective_status = 'failed' THEN 1 ELSE 0 END), 0) AS protective_failure_count,
+            AVG(CASE WHEN status = 'success' THEN realized_slippage_bps END) AS avg_realized_slippage_bps,
+            AVG(CASE WHEN status = 'success' THEN fill_ratio END) AS avg_fill_ratio,
+            AVG(
+                CASE
+                    WHEN status = 'success' AND execution_role = 'maker' THEN 1.0
+                    WHEN status = 'success' AND execution_role = 'taker' THEN 0.0
+                    ELSE NULL
+                END
+            ) AS maker_ratio,
+            MAX(timestamp) AS last_event_timestamp
+        FROM live_execution_events
+        {where_clause}
+        GROUP BY COALESCE(source_key, source, 'unknown'), COALESCE(source, 'unknown')
+        ORDER BY total_events DESC, last_event_timestamp DESC
+        LIMIT ?
+    """
+
+    try:
+        with get_connection() as conn:
+            rows = conn.execute(query, [*params, int(limit)]).fetchall()
+    except sqlite3.OperationalError:
+        return []
+
+    results = []
+    for row in rows:
+        payload = dict(row)
+        total_events = int(payload.get("total_events", 0) or 0)
+        success_count = int(payload.get("success_count", 0) or 0)
+        warning_count = int(payload.get("warning_count", 0) or 0)
+        rejection_count = int(payload.get("rejection_count", 0) or 0)
+        maker_ratio = _safe_float(payload.get("maker_ratio"), 0.0)
+        results.append(
+            {
+                "source_key": payload.get("source_key"),
+                "source": payload.get("source"),
+                "total_events": total_events,
+                "success_count": success_count,
+                "warning_count": warning_count,
+                "rejection_count": rejection_count,
+                "success_rate": round(success_count / total_events, 4) if total_events else 0.0,
+                "warning_rate": round(warning_count / total_events, 4) if total_events else 0.0,
+                "rejection_rate": round(rejection_count / total_events, 4) if total_events else 0.0,
+                "protective_failure_count": int(payload.get("protective_failure_count", 0) or 0),
+                "avg_realized_slippage_bps": round(
+                    _safe_float(payload.get("avg_realized_slippage_bps"), 0.0), 4
+                ),
+                "avg_fill_ratio": round(_safe_float(payload.get("avg_fill_ratio"), 0.0), 4),
+                "maker_ratio": round(maker_ratio, 4),
+                "taker_ratio": round(max(0.0, 1.0 - maker_ratio), 4) if success_count else 0.0,
+                "last_event_timestamp": payload.get("last_event_timestamp"),
+            }
+        )
+    return results
 
 
 def save_decision_research_snapshot(snapshot: dict) -> int:

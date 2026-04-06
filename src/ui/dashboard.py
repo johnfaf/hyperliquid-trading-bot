@@ -1215,6 +1215,18 @@ class DashboardHandler(BaseHTTPRequestHandler):
                         v25["live_trader"] = live_stats
                 except Exception:
                     pass
+                try:
+                    if _live_trader:
+                        public_address = getattr(_live_trader, "public_address", None)
+                        v25["execution_quality"] = {
+                            "summary": db.get_execution_quality_summary(public_address=public_address),
+                            "by_source": db.get_execution_quality_by_source(
+                                public_address=public_address,
+                                limit=8,
+                            ),
+                        }
+                except Exception:
+                    pass
                 if v25:
                     data["v25"] = v25
 

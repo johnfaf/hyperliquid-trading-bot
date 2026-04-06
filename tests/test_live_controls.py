@@ -1114,6 +1114,155 @@ def test_live_trader_persists_live_ledger_snapshots(monkeypatch):
     assert saved_fills[-1][0] == "0x2222222222222222222222222222222222222222"
 
 
+def test_execution_quality_helpers_round_trip_and_group_by_source(monkeypatch):
+    fd, raw_path = tempfile.mkstemp(prefix="execution_quality_", suffix=".db", dir=os.getcwd())
+    os.close(fd)
+    db_path = os.path.abspath(raw_path)
+    original_path = db._DB_PATH
+    monkeypatch.setattr(db, "_DB_PATH", db_path)
+
+    now = datetime.utcnow().isoformat()
+
+    try:
+        db.init_db()
+        db.save_live_execution_event(
+            "0xabc",
+            timestamp=now,
+            signal_id="sig-1",
+            source="options_flow",
+            source_key="options_flow:BTC",
+            coin="BTC",
+            side="short",
+            status="success",
+            execution_role="taker",
+            requested_size=1.0,
+            submitted_size=1.0,
+            filled_size=0.8,
+            requested_notional=100.0,
+            submitted_notional=80.4,
+            mid_price=100.0,
+            execution_price=100.5,
+            expected_slippage_bps=6.0,
+            realized_slippage_bps=50.0,
+            fill_ratio=0.8,
+            protective_status="placed",
+        )
+        db.save_live_execution_event(
+            "0xabc",
+            timestamp=now,
+            signal_id="sig-2",
+            source="options_flow",
+            source_key="options_flow:BTC",
+            coin="BTC",
+            side="short",
+            status="rejected",
+            requested_size=1.0,
+            mid_price=100.0,
+            rejection_reason="below_exchange_minimum_notional",
+        )
+        db.save_live_execution_event(
+            "0xabc",
+            timestamp=now,
+            signal_id="sig-3",
+            source="strategy",
+            source_key="strategy:trend_following",
+            coin="ETH",
+            side="long",
+            status="error",
+            requested_size=2.0,
+            mid_price=200.0,
+            rejection_reason="protective_order_failed",
+            protective_status="failed",
+        )
+
+        summary = db.get_execution_quality_summary("0xabc")
+        source_rows = db.get_execution_quality_by_source("0xabc", limit=5)
+
+        assert summary["total_events"] == 3
+        assert summary["success_count"] == 1
+        assert summary["rejection_count"] == 2
+        assert summary["avg_realized_slippage_bps"] == 50.0
+        assert summary["avg_fill_ratio"] == 0.8
+        assert summary["protective_failure_count"] == 1
+        assert source_rows[0]["source_key"] in {"options_flow:BTC", "strategy:trend_following"}
+        btc_row = next(row for row in source_rows if row["source_key"] == "options_flow:BTC")
+        assert btc_row["total_events"] == 2
+        assert btc_row["rejection_rate"] == 0.5
+    finally:
+        monkeypatch.setattr(db, "_DB_PATH", original_path)
+        if os.path.exists(db_path):
+            os.remove(db_path)
+
+
+def test_live_trader_records_execution_quality_events(monkeypatch):
+    class FakeFirewall:
+        def validate(self, signal, **kwargs):
+            return True, "ok"
+
+    saved_events = []
+
+    monkeypatch.setattr(LiveTrader, "_load_credentials", _fake_live_credentials)
+    monkeypatch.setattr(LiveTrader, "_load_asset_index_map", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "reconcile_positions", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "check_daily_loss", lambda self: False)
+    monkeypatch.setattr(LiveTrader, "_get_mid_price", lambda self, coin: 100.0)
+    monkeypatch.setattr(LiveTrader, "update_daily_pnl_from_fills", lambda self: None)
+    monkeypatch.setattr(
+        LiveTrader,
+        "place_market_order",
+        lambda self, coin, side, size, leverage=1, reduce_only=False: {
+            "status": "success",
+            "requested_size": size,
+            "requested_notional": size * 100.0,
+            "submitted_size": size,
+            "submitted_notional": size * 100.5,
+            "mid_price": 100.0,
+            "wire_price": 100.5,
+            "exchange_reported_fill_size": size,
+            "exchange_reported_fill_price": 100.5,
+        },
+    )
+    monkeypatch.setattr(
+        LiveTrader,
+        "verify_fill",
+        lambda self, *a, **kw: {"status": "verified", "size": 1.0, "partial_fill": False},
+    )
+    monkeypatch.setattr(LiveTrader, "place_trigger_order", lambda self, *a, **kw: {"status": "ok"})
+    monkeypatch.setattr(
+        "src.trading.live_trader.db.save_live_execution_event",
+        lambda public_address, **event: saved_events.append((public_address, event)) or 1,
+    )
+
+    trader = LiveTrader(firewall=FakeFirewall(), dry_run=False, max_order_usd=1_000_000)
+    result = trader.execute_signal(
+        {
+            "coin": "BTC",
+            "side": "long",
+            "confidence": 0.82,
+            "entry_price": 100.0,
+            "size": 1.0,
+            "leverage": 2,
+            "strategy_type": "options_momentum",
+            "source": "options_flow",
+            "source_key": "options_flow:BTC",
+            "metadata": {
+                "expected_slippage_bps": 6.0,
+                "route": "paper_strategy",
+            },
+        }
+    )
+
+    assert result["status"] == "success"
+    assert saved_events
+    public_address, event = saved_events[-1]
+    assert public_address == "0x2222222222222222222222222222222222222222"
+    assert event["source_key"] == "options_flow:BTC"
+    assert event["status"] == "success"
+    assert event["fill_ratio"] == 1.0
+    assert event["realized_slippage_bps"] == 50.0
+    assert event["expected_slippage_bps"] == 6.0
+
+
 def test_decision_engine_prefers_higher_net_expectancy_over_raw_score():
     engine = DecisionEngine(
         {
@@ -1250,6 +1399,93 @@ def test_decision_engine_uses_kelly_edge_to_improve_expected_value():
 
     assert with_kelly["net_expectancy_pct"] > no_kelly["net_expectancy_pct"]
     assert with_kelly["expected_value"] > no_kelly["expected_value"]
+
+
+def test_decision_engine_penalizes_sources_with_bad_execution_history(monkeypatch):
+    def fake_execution_quality_summary(public_address=None, source_key=None, source=None, lookback_hours=None):
+        if source_key == "options_flow:BTC":
+            return {
+                "total_events": 10,
+                "rejection_rate": 0.5,
+                "avg_fill_ratio": 0.62,
+                "avg_realized_slippage_bps": 21.0,
+                "protective_failure_rate": 0.2,
+                "maker_ratio": 0.0,
+            }
+        return {"total_events": 0}
+
+    monkeypatch.setattr(
+        "src.signals.decision_engine.db.get_execution_quality_summary",
+        fake_execution_quality_summary,
+    )
+
+    engine = DecisionEngine(
+        {
+            "w_score": 0.10,
+            "w_regime": 0.05,
+            "w_diversity": 0.05,
+            "w_freshness": 0.0,
+            "w_consensus": 0.0,
+            "w_confidence": 0.15,
+            "w_source_quality": 0.10,
+            "w_confirmation": 0.05,
+            "w_expected_value": 0.50,
+            "min_decision_score": 0.0,
+            "min_signal_confidence": 0.4,
+            "min_source_weight": 0.3,
+            "min_expected_value_pct": 0.0,
+            "execution_quality_enabled": True,
+            "execution_quality_min_events": 3,
+        }
+    )
+
+    bad_execution = {
+        "name": "bad_execution",
+        "strategy_type": "options_momentum",
+        "source": "options_flow",
+        "source_key": "options_flow:BTC",
+        "current_score": 0.76,
+        "confidence": 0.67,
+        "source_accuracy": 0.64,
+        "side": "long",
+        "entry_price": 100.0,
+        "stop_loss": 97.0,
+        "take_profit": 108.0,
+        "parameters": {"coins": ["BTC"]},
+        "metadata": {},
+    }
+    clean_execution = {
+        "name": "clean_execution",
+        "strategy_type": "trend_following",
+        "source": "strategy",
+        "source_key": "strategy:trend_following",
+        "current_score": 0.74,
+        "confidence": 0.67,
+        "source_accuracy": 0.64,
+        "side": "long",
+        "entry_price": 100.0,
+        "stop_loss": 97.0,
+        "take_profit": 108.0,
+        "parameters": {"coins": ["ETH"]},
+        "metadata": {},
+    }
+
+    bad_breakdown = engine._compute_composite_score(
+        dict(bad_execution), regime_data={"overall_regime": "neutral"}, open_coins=set(), kelly_stats=None
+    )
+    clean_breakdown = engine._compute_composite_score(
+        dict(clean_execution), regime_data={"overall_regime": "neutral"}, open_coins=set(), kelly_stats=None
+    )
+    selected = engine.decide(
+        [bad_execution, clean_execution],
+        regime_data={"overall_regime": "neutral"},
+    )
+
+    assert selected
+    assert selected[0]["name"] == "clean_execution"
+    assert bad_breakdown["execution_quality_events"] == 10
+    assert bad_breakdown["execution_penalty_bps"] > 0
+    assert clean_breakdown["net_expectancy_pct"] > bad_breakdown["net_expectancy_pct"]
 
 
 def test_decision_research_snapshot_round_trips(monkeypatch):

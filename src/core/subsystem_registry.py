@@ -285,6 +285,14 @@ def build_subsystems(
                     "churn_penalty_bps": config.DECISION_CHURN_PENALTY_BPS,
                     "default_execution_role": config.DECISION_DEFAULT_EXECUTION_ROLE,
                     "persist_research": config.DECISION_PERSIST_RESEARCH,
+                    "execution_quality_enabled": config.DECISION_EXECUTION_QUALITY_ENABLED,
+                    "execution_quality_lookback_hours": config.DECISION_EXECUTION_QUALITY_LOOKBACK_HOURS,
+                    "execution_quality_min_events": config.DECISION_EXECUTION_QUALITY_MIN_EVENTS,
+                    "execution_rejection_penalty_bps": config.DECISION_EXECUTION_REJECTION_PENALTY_BPS,
+                    "execution_fill_gap_penalty_bps": config.DECISION_EXECUTION_FILL_GAP_PENALTY_BPS,
+                    "execution_protective_failure_penalty_bps": (
+                        config.DECISION_EXECUTION_PROTECTIVE_FAILURE_PENALTY_BPS
+                    ),
                 }
             ),
             health,

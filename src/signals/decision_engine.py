@@ -70,6 +70,14 @@ class DecisionEngine:
         self.default_execution_role = str(cfg.get("default_execution_role", "taker") or "taker").lower()
         self.persist_research = bool(cfg.get("persist_research", False))
         self._last_research_cycle_id: Optional[int] = None
+        self.execution_quality_enabled = bool(cfg.get("execution_quality_enabled", True))
+        self.execution_quality_lookback_hours = float(cfg.get("execution_quality_lookback_hours", 24.0 * 7))
+        self.execution_quality_min_events = int(cfg.get("execution_quality_min_events", 3))
+        self.execution_rejection_penalty_bps = float(cfg.get("execution_rejection_penalty_bps", 12.0))
+        self.execution_fill_gap_penalty_bps = float(cfg.get("execution_fill_gap_penalty_bps", 8.0))
+        self.execution_protective_failure_penalty_bps = float(
+            cfg.get("execution_protective_failure_penalty_bps", 18.0)
+        )
 
         # Track decisions for audit
         self._decision_history: deque = deque(maxlen=100)
@@ -466,6 +474,10 @@ class DecisionEngine:
             ),
             1.0,
         )
+        execution_quality = self._apply_execution_quality_feedback(strategy, source_quality)
+        source_quality = execution_quality["source_quality"]
+        strategy["_metadata_for_decision"] = execution_quality["metadata"]
+        strategy["_execution_quality"] = execution_quality["profile"]
         confirmation = self._confirmation_score(strategy)
         expected_value = self._expected_value_score(
             strategy,
@@ -519,6 +531,22 @@ class DecisionEngine:
             "net_expectancy_pct": round(expected_value["net_expectancy_pct"], 4),
             "execution_cost_pct": round(expected_value["execution_cost_pct"], 4),
             "kelly_has_edge": expected_value["kelly_has_edge"],
+            "execution_quality_events": int(
+                execution_quality["profile"].get("total_events", 0) or 0
+            ),
+            "execution_rejection_rate": round(
+                float(execution_quality["profile"].get("rejection_rate", 0.0) or 0.0),
+                4,
+            ),
+            "execution_fill_ratio": round(
+                float(execution_quality["profile"].get("avg_fill_ratio", 0.0) or 0.0),
+                4,
+            ),
+            "execution_slippage_bps": round(
+                float(execution_quality["profile"].get("avg_realized_slippage_bps", 0.0) or 0.0),
+                4,
+            ),
+            "execution_penalty_bps": round(float(execution_quality["penalty_bps"] or 0.0), 4),
         }
 
     def _decision_blockers(self, strategy: Dict) -> List[str]:
@@ -551,10 +579,101 @@ class DecisionEngine:
         return max(lower, min(value, upper))
 
     def _get_metadata(self, strategy: Dict) -> Dict:
+        staged = strategy.get("_metadata_for_decision", {})
+        if isinstance(staged, dict):
+            return staged
         metadata = strategy.get("metadata", {})
         if isinstance(metadata, dict):
             return metadata
         return {}
+
+    def _lookup_execution_quality(self, strategy: Dict) -> Dict:
+        if not self.execution_quality_enabled:
+            return {}
+
+        metadata = strategy.get("metadata", {})
+        if not isinstance(metadata, dict):
+            metadata = {}
+
+        candidate_keys = []
+        for key in (strategy.get("source_key"), metadata.get("source_key")):
+            normalized = str(key or "").strip()
+            if normalized and normalized not in candidate_keys:
+                candidate_keys.append(normalized)
+
+        source = str(
+            strategy.get("source", metadata.get("source", "strategy")) or "strategy"
+        ).strip().lower()
+
+        for source_key in candidate_keys:
+            profile = db.get_execution_quality_summary(
+                source_key=source_key,
+                lookback_hours=self.execution_quality_lookback_hours,
+            )
+            if int(profile.get("total_events", 0) or 0) >= self.execution_quality_min_events:
+                return profile
+
+        profile = db.get_execution_quality_summary(
+            source=source,
+            lookback_hours=self.execution_quality_lookback_hours,
+        )
+        if int(profile.get("total_events", 0) or 0) >= self.execution_quality_min_events:
+            return profile
+        return {}
+
+    def _apply_execution_quality_feedback(self, strategy: Dict, source_quality: float) -> Dict:
+        metadata = dict(strategy.get("metadata", {}) if isinstance(strategy.get("metadata", {}), dict) else {})
+        profile = self._lookup_execution_quality(strategy)
+        if not profile:
+            return {
+                "metadata": metadata,
+                "source_quality": source_quality,
+                "profile": {},
+                "penalty_bps": 0.0,
+            }
+
+        avg_slippage_bps = float(profile.get("avg_realized_slippage_bps", 0.0) or 0.0)
+        avg_fill_ratio = float(profile.get("avg_fill_ratio", 1.0) or 1.0)
+        rejection_rate = float(profile.get("rejection_rate", 0.0) or 0.0)
+        protective_failure_rate = float(profile.get("protective_failure_rate", 0.0) or 0.0)
+        maker_ratio = float(profile.get("maker_ratio", 0.0) or 0.0)
+
+        penalty_bps = (
+            rejection_rate * self.execution_rejection_penalty_bps
+            + max(0.0, 1.0 - avg_fill_ratio) * self.execution_fill_gap_penalty_bps
+            + protective_failure_rate * self.execution_protective_failure_penalty_bps
+        )
+
+        current_slippage_bps = float(
+            metadata.get(
+                "expected_slippage_bps",
+                metadata.get("slippage_bps", self.expected_slippage_bps),
+            )
+            or self.expected_slippage_bps
+        )
+        metadata["expected_slippage_bps"] = max(current_slippage_bps, avg_slippage_bps + penalty_bps)
+        metadata["execution_quality_penalty_bps"] = round(penalty_bps, 4)
+        metadata["historical_fill_ratio"] = round(avg_fill_ratio, 4)
+        metadata["historical_rejection_rate"] = round(rejection_rate, 4)
+        metadata["historical_protective_failure_rate"] = round(protective_failure_rate, 4)
+        if not metadata.get("execution_role"):
+            metadata["execution_role"] = "maker" if maker_ratio >= 0.55 else self.default_execution_role
+
+        quality_multiplier = self._clamp(
+            1.0
+            - (rejection_rate * 0.55)
+            - (max(0.0, 1.0 - avg_fill_ratio) * 0.25)
+            - (protective_failure_rate * 0.45),
+            0.25,
+            1.0,
+        )
+
+        return {
+            "metadata": metadata,
+            "source_quality": self._clamp(source_quality * quality_multiplier, 0.0, 1.0),
+            "profile": profile,
+            "penalty_bps": penalty_bps,
+        }
 
     def _extract_risk_geometry(self, strategy: Dict, direction: str) -> Dict[str, float]:
         metadata = self._get_metadata(strategy)
@@ -829,6 +948,9 @@ class DecisionEngine:
             "no_trade_rate": (self.stats["total_no_trade"] /
                              max(self.stats["total_decisions"], 1)),
             "research_persistence_enabled": self.persist_research,
+            "execution_quality_enabled": self.execution_quality_enabled,
+            "execution_quality_lookback_hours": self.execution_quality_lookback_hours,
+            "execution_quality_min_events": self.execution_quality_min_events,
             "last_research_cycle_id": self._last_research_cycle_id,
             "recent_decisions": list(self._decision_history)[-10:],
         }

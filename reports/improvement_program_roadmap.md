@@ -34,6 +34,7 @@ This branch is the staged upgrade path for making the bot more measurable, more 
 
 ## Phase 5: Execution Quality
 
+- Status: shipped on `codex/live-ledger-foundation`
 - Push all exchange traffic through shared infra and execution telemetry.
 - Track realized slippage, fill quality, maker/taker mix, and rejection reasons by source.
 - Feed execution quality back into source scoring and expected-value penalties.

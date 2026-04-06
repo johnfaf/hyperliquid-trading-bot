@@ -601,18 +601,19 @@ class LiveTrader:
         if not self.signer or not self.public_address:
             return
         try:
-            response = requests.post(
-                self.info_url,
-                json={"type": "extraAgents", "user": self.public_address},
+            data = self.api_manager.post(
+                {"type": "extraAgents", "user": self.public_address},
+                priority=Priority.HIGH,
+                endpoint_url=self.info_url,
+                cache_response=False,
+                req_type="extraAgents",
                 timeout=10,
             )
-            if response.status_code != 200:
+            if data is None:
                 logger.debug(
                     "extraAgents check returned HTTP %s — skipping validation",
-                    response.status_code,
                 )
                 return
-            data = response.json()
             agents = data if isinstance(data, list) else data.get("agents", []) if isinstance(data, dict) else []
             signer_addr = self.signer.address.lower()
             approved = [
@@ -701,6 +702,128 @@ class LiveTrader:
         if isinstance(signal, dict):
             return signal_from_execution_dict(signal)
         raise TypeError(f"Unsupported signal type for live execution: {type(signal)}")
+
+    @staticmethod
+    def _extract_signal_metadata(signal: Union[TradeSignal, Dict[str, Any]]) -> Dict[str, Any]:
+        if not isinstance(signal, dict):
+            return {}
+
+        metadata = signal.get("metadata", {})
+        payload = dict(metadata) if isinstance(metadata, dict) else {}
+        for key in (
+            "execution_role",
+            "expected_slippage_bps",
+            "maker_fee_bps",
+            "taker_fee_bps",
+            "route",
+            "strategy_type",
+            "source",
+            "source_key",
+        ):
+            if key in signal and key not in payload:
+                payload[key] = signal.get(key)
+        return payload
+
+    def _record_execution_quality_event(
+        self,
+        *,
+        signal: TradeSignal,
+        source_metadata: Optional[Dict[str, Any]] = None,
+        status: str,
+        entry_result: Optional[Dict[str, Any]] = None,
+        filled_size: Optional[float] = None,
+        rejection_reason: str = "",
+        protective_status: str = "",
+        bypass_firewall: bool = False,
+        extra_metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        if self.dry_run or not self.public_address:
+            return
+
+        source_value = getattr(signal.source, "value", signal.source)
+        source_key = str(signal.source_key or "").strip()
+        entry_result = entry_result or {}
+        source_metadata = source_metadata or {}
+        extra_metadata = extra_metadata or {}
+
+        requested_size = self._coerce_float(
+            entry_result.get("requested_size", signal.size or 0.0),
+            0.0,
+        )
+        submitted_size = self._coerce_float(
+            entry_result.get("submitted_size", requested_size),
+            requested_size,
+        )
+        final_filled_size = self._coerce_float(
+            filled_size if filled_size is not None else entry_result.get("exchange_reported_fill_size"),
+            0.0,
+        )
+        mid_price = self._coerce_float(entry_result.get("mid_price"), 0.0)
+        requested_notional = self._coerce_float(entry_result.get("requested_notional"), 0.0)
+        if requested_notional <= 0 and requested_size > 0 and mid_price > 0:
+            requested_notional = requested_size * mid_price
+
+        execution_price = self._coerce_float(
+            entry_result.get("exchange_reported_fill_price", entry_result.get("wire_price")),
+            0.0,
+        )
+        submitted_notional = self._coerce_float(entry_result.get("submitted_notional"), 0.0)
+        if submitted_notional <= 0 and submitted_size > 0 and execution_price > 0:
+            submitted_notional = submitted_size * execution_price
+
+        expected_slippage_bps = self._coerce_float(
+            source_metadata.get("expected_slippage_bps"),
+            0.0,
+        )
+        realized_slippage_bps = 0.0
+        if execution_price > 0 and mid_price > 0:
+            realized_slippage_bps = abs(execution_price - mid_price) / mid_price * 10_000.0
+
+        fill_ratio = 0.0
+        if submitted_size > 0 and final_filled_size > 0:
+            fill_ratio = min(final_filled_size / submitted_size, 1.0)
+
+        execution_role = str(source_metadata.get("execution_role", "taker") or "taker").strip().lower()
+        if execution_role not in {"maker", "taker"}:
+            execution_role = "taker"
+
+        metadata = {
+            "reason": signal.reason,
+            "strategy_type": signal.strategy_type,
+            "bypass_firewall": bool(bypass_firewall),
+            "entry_status": entry_result.get("status"),
+            "entry_message": entry_result.get("message"),
+            "entry_errors": entry_result.get("errors"),
+            "route": source_metadata.get("route"),
+            **extra_metadata,
+        }
+
+        try:
+            db.save_live_execution_event(
+                self.public_address,
+                signal_id=signal.signal_id,
+                source=source_value,
+                source_key=source_key,
+                coin=signal.coin,
+                side=signal.side.value if hasattr(signal.side, "value") else str(signal.side),
+                status=status,
+                execution_role=execution_role,
+                requested_size=requested_size,
+                submitted_size=submitted_size,
+                filled_size=final_filled_size,
+                requested_notional=requested_notional,
+                submitted_notional=submitted_notional,
+                mid_price=mid_price,
+                execution_price=execution_price,
+                expected_slippage_bps=expected_slippage_bps,
+                realized_slippage_bps=realized_slippage_bps,
+                fill_ratio=fill_ratio,
+                rejection_reason=rejection_reason,
+                protective_status=protective_status,
+                metadata=metadata,
+            )
+        except Exception as exc:
+            logger.debug("Failed to persist execution quality event: %s", exc)
 
     def get_account_state(self) -> Dict[str, Any]:
         """Fetch raw clearinghouse state for the trading account."""
@@ -1447,6 +1570,21 @@ class LiveTrader:
         return total if found else None
 
     @classmethod
+    def _extract_reported_fill_price(cls, result: Optional[Dict]) -> Optional[float]:
+        """Return the exchange-reported average fill price from an order response, if any."""
+        prices: List[float] = []
+        for entry in cls._extract_inner_order_statuses(result):
+            filled = entry.get("filled")
+            if not isinstance(filled, dict):
+                continue
+            avg_price = cls._coerce_float(filled.get("avgPx"), 0.0)
+            if avg_price > 0:
+                prices.append(avg_price)
+        if not prices:
+            return None
+        return sum(prices) / len(prices)
+
+    @classmethod
     def _is_order_result_success(cls, result: Optional[Dict]) -> bool:
         """Best-effort classification of exchange responses into success/failure.
 
@@ -1798,14 +1936,21 @@ class LiveTrader:
         result = self._post_order(action)
         if isinstance(result, dict):
             result = dict(result)
+            result["coin"] = coin
+            result["side"] = side
             result["requested_size"] = requested_size
+            result["requested_notional"] = float(requested_size * mid)
             result["submitted_size"] = float(size)
             result["submitted_notional"] = float(notional)
+            result["mid_price"] = float(mid)
             result["wire_size"] = wire_size
             result["wire_price"] = wire_price
             reported_fill_size = self._extract_reported_fill_size(result)
             if reported_fill_size is not None:
                 result["exchange_reported_fill_size"] = reported_fill_size
+            reported_fill_price = self._extract_reported_fill_price(result)
+            if reported_fill_price is not None:
+                result["exchange_reported_fill_price"] = reported_fill_price
 
         if self._is_order_result_success(result) and not self.dry_run:
             self.orders_today += 1
@@ -2409,7 +2554,9 @@ class LiveTrader:
         Returns:
             Execution result dict or None if rejected
         """
-        signal = self._coerce_signal(signal)
+        raw_signal = signal
+        source_metadata = self._extract_signal_metadata(raw_signal)
+        signal = self._coerce_signal(raw_signal)
 
         if not bypass_firewall:
             live_positions = self.get_firewall_positions() if self.is_deployable() else None
@@ -2494,6 +2641,16 @@ class LiveTrader:
 
             if not self._is_order_result_success(entry_result):
                 logger.error(f"Failed to place entry order: {entry_result}")
+                self._record_execution_quality_event(
+                    signal=signal,
+                    source_metadata=source_metadata,
+                    status="error" if str(entry_result.get("status", "")).lower() == "error" else "rejected",
+                    entry_result=entry_result,
+                    rejection_reason=str(
+                        entry_result.get("reason", entry_result.get("message", "entry_order_failed"))
+                    ),
+                    bypass_firewall=bypass_firewall,
+                )
                 return entry_result
 
             # Update daily PnL after every execution to keep loss tracking current
@@ -2513,6 +2670,16 @@ class LiveTrader:
             if not self.dry_run:
                 fill_check = self.verify_fill(coin, entry_side, expected_fill_size, timeout=10.0)
                 if not fill_check:
+                    self._record_execution_quality_event(
+                        signal=signal,
+                        source_metadata=source_metadata,
+                        status="warning",
+                        entry_result=entry_result,
+                        filled_size=exchange_reported_fill_size if exchange_reported_fill_size > 0 else 0.0,
+                        rejection_reason="fill_not_verified",
+                        protective_status="not_placed",
+                        bypass_firewall=bypass_firewall,
+                    )
                     logger.error(
                         f"FILL NOT VERIFIED for {coin} {side} {expected_fill_size} — "
                         f"skipping SL/TP placement. Manual intervention required."
@@ -2527,6 +2694,15 @@ class LiveTrader:
                     }
                 actual_fill_size = float(fill_check.get("size", expected_fill_size) or expected_fill_size)
                 if actual_fill_size <= 0:
+                    self._record_execution_quality_event(
+                        signal=signal,
+                        source_metadata=source_metadata,
+                        status="error",
+                        entry_result=entry_result,
+                        rejection_reason="invalid_fill_size",
+                        protective_status="failed",
+                        bypass_firewall=bypass_firewall,
+                    )
                     logger.error(
                         "Fill verification returned invalid size for %s: %s",
                         coin,
@@ -2558,6 +2734,16 @@ class LiveTrader:
                 close_result = None
                 if not self.dry_run:
                     close_result = self.close_position(coin)
+                self._record_execution_quality_event(
+                    signal=signal,
+                    source_metadata=source_metadata,
+                    status="error",
+                    entry_result=entry_result,
+                    filled_size=actual_fill_size,
+                    rejection_reason="mid_price_unavailable_for_sl_tp",
+                    protective_status="failed",
+                    bypass_firewall=bypass_firewall,
+                )
                 return {
                     "status": "error",
                     "message": "mid_price_unavailable_for_sl_tp",
@@ -2596,6 +2782,20 @@ class LiveTrader:
                 close_result = None
                 if not self.dry_run:
                     close_result = self.close_position(coin)
+                self._record_execution_quality_event(
+                    signal=signal,
+                    source_metadata=source_metadata,
+                    status="error",
+                    entry_result=entry_result,
+                    filled_size=actual_fill_size,
+                    rejection_reason="protective_order_failed",
+                    protective_status="failed",
+                    bypass_firewall=bypass_firewall,
+                    extra_metadata={
+                        "stop_loss_status": sl_result.get("status") if isinstance(sl_result, dict) else None,
+                        "take_profit_status": tp_result.get("status") if isinstance(tp_result, dict) else None,
+                    },
+                )
                 return {
                     "status": "error",
                     "message": "protective_order_failed",
@@ -2607,6 +2807,15 @@ class LiveTrader:
                 }
 
             logger.info(f"Placed SL @ ${sl_price:.2f}, TP @ ${tp_price:.2f}")
+            self._record_execution_quality_event(
+                signal=signal,
+                source_metadata=source_metadata,
+                status="success",
+                entry_result=entry_result,
+                filled_size=actual_fill_size,
+                protective_status="placed",
+                bypass_firewall=bypass_firewall,
+            )
 
             # Return summary
             return {
@@ -2627,6 +2836,14 @@ class LiveTrader:
 
         except Exception as e:
             logger.error(f"Error executing signal: {e}")
+            self._record_execution_quality_event(
+                signal=signal,
+                source_metadata=source_metadata,
+                status="error",
+                rejection_reason=str(e),
+                protective_status="failed",
+                bypass_firewall=bypass_firewall,
+            )
             return {"status": "error", "message": str(e)}
 
     def get_stats(self) -> Dict:
