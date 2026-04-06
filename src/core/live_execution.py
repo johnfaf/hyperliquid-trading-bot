@@ -12,8 +12,6 @@ from typing import Dict, List, Optional
 
 from src.data import database as db
 from src.data.hyperliquid_client import get_all_mids
-from src.signals.signal_schema import signal_from_execution_dict
-
 logger = logging.getLogger(__name__)
 
 
@@ -361,7 +359,7 @@ def mirror_executed_trades_to_live(
                 scaled_trade = _rescale_size_for_live(trade, trader) if isinstance(trade, dict) else trade
                 if scaled_trade is None:
                     continue  # blocked by rescale — already logged
-                live_signal = signal_from_execution_dict(scaled_trade) if isinstance(scaled_trade, dict) else scaled_trade
+                live_signal = scaled_trade
                 # Mirror path: the paper trade has already passed the firewall
                 # (cooldown, risk checks, etc.), so bypass firewall validation
                 # here.  Otherwise the firewall's cooldown check rejects every
@@ -373,16 +371,36 @@ def mirror_executed_trades_to_live(
                         "%s: %s %s %s",
                         success_label,
                         live_result.get("status", "?"),
-                        live_signal.coin,
-                        live_signal.side.value,
+                        (
+                            live_signal.get("coin", "?")
+                            if isinstance(live_signal, dict)
+                            else live_signal.coin
+                        ),
+                        (
+                            str(live_signal.get("side", "?"))
+                            if isinstance(live_signal, dict)
+                            else live_signal.side.value
+                        ),
                     )
                 else:
                     logger.error(
                         "%s FAILED: %s %s %s — result: %s",
                         success_label,
-                        live_signal.coin,
-                        live_signal.side.value,
-                        live_signal.confidence,
+                        (
+                            live_signal.get("coin", "?")
+                            if isinstance(live_signal, dict)
+                            else live_signal.coin
+                        ),
+                        (
+                            str(live_signal.get("side", "?"))
+                            if isinstance(live_signal, dict)
+                            else live_signal.side.value
+                        ),
+                        (
+                            float(live_signal.get("confidence", 0.0) or 0.0)
+                            if isinstance(live_signal, dict)
+                            else live_signal.confidence
+                        ),
                         live_result,
                     )
             except Exception as exc:

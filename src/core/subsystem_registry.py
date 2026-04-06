@@ -40,7 +40,7 @@ FULL_PROFILE = FUNDABLE_CORE | {
     "predictive_forecaster", "xgboost_forecaster", "multi_scanner",
     "liquidation_strategy", "kelly_sizer", "portfolio_sizer", "trade_memory", "calibration",
     "llm_filter", "signal_processor", "arena_incubator", "decision_engine",
-    "alpha_arena", "adaptive_learning", "position_monitor", "dashboard", "telegram",
+    "alpha_arena", "adaptive_learning", "execution_policy", "position_monitor", "dashboard", "telegram",
     "cross_venue_hedger", "shadow_tracker", "adaptive_bot_detector",
     "regime_strategy_filter", "exchange_aggregator",
 }
@@ -81,6 +81,7 @@ class SubsystemContainer:
     trade_memory: Any = None
     calibration: Any = None
     adaptive_learning: Any = None
+    execution_policy: Any = None
     llm_filter: Any = None
     signal_processor: Any = None
     arena_incubator: Any = None
@@ -284,6 +285,47 @@ def build_subsystems(
             affects_trading=False,
         )
 
+    if "execution_policy" in profile:
+        from src.signals.execution_policy import ExecutionPolicyManager
+        c.execution_policy = _safe_init(
+            "execution_policy",
+            lambda: ExecutionPolicyManager(
+                {
+                    "enabled": config.DECISION_EXECUTION_POLICY_ENABLED,
+                    "lookback_hours": config.DECISION_EXECUTION_POLICY_LOOKBACK_HOURS,
+                    "min_events": config.DECISION_EXECUTION_POLICY_MIN_EVENTS,
+                    "maker_rejection_ceiling": config.DECISION_EXECUTION_POLICY_MAKER_REJECTION_CEILING,
+                    "maker_fill_floor": config.DECISION_EXECUTION_POLICY_MAKER_FILL_FLOOR,
+                    "maker_confidence_ceiling": config.DECISION_EXECUTION_POLICY_MAKER_CONFIDENCE_CEILING,
+                    "maker_source_quality_floor": config.DECISION_EXECUTION_POLICY_MAKER_SOURCE_QUALITY_FLOOR,
+                    "maker_offset_bps": config.DECISION_EXECUTION_POLICY_MAKER_OFFSET_BPS,
+                    "min_maker_offset_bps": config.DECISION_EXECUTION_POLICY_MIN_MAKER_OFFSET_BPS,
+                    "max_maker_offset_bps": config.DECISION_EXECUTION_POLICY_MAX_MAKER_OFFSET_BPS,
+                    "maker_timeout_seconds": config.DECISION_EXECUTION_POLICY_MAKER_TIMEOUT_SECONDS,
+                    "fallback_confidence_threshold": (
+                        config.DECISION_EXECUTION_POLICY_FALLBACK_CONFIDENCE_THRESHOLD
+                    ),
+                    "fallback_source_quality_threshold": (
+                        config.DECISION_EXECUTION_POLICY_FALLBACK_SOURCE_QUALITY_THRESHOLD
+                    ),
+                    "market_slippage_multiplier": (
+                        config.DECISION_EXECUTION_POLICY_MARKET_SLIPPAGE_MULTIPLIER
+                    ),
+                    "maker_slippage_floor_bps": (
+                        config.DECISION_EXECUTION_POLICY_MAKER_SLIPPAGE_FLOOR_BPS
+                    ),
+                    "default_market_slippage_bps": (
+                        config.DECISION_EXECUTION_POLICY_DEFAULT_MARKET_SLIPPAGE_BPS
+                    ),
+                    "default_execution_role": config.DECISION_DEFAULT_EXECUTION_ROLE,
+                    "urgent_sources": config.DECISION_EXECUTION_POLICY_URGENT_SOURCES,
+                },
+                adaptive_learning=c.adaptive_learning,
+            ),
+            health,
+            affects_trading=False,
+        )
+
     if "llm_filter" in profile:
         from src.signals.llm_filter import LLMFilter
         c.llm_filter = _safe_init("llm_filter", LLMFilter, health)
@@ -327,6 +369,8 @@ def build_subsystems(
                     "execution_protective_failure_penalty_bps": (
                         config.DECISION_EXECUTION_PROTECTIVE_FAILURE_PENALTY_BPS
                     ),
+                    "execution_policy": c.execution_policy,
+                    "execution_policy_enabled": config.DECISION_EXECUTION_POLICY_ENABLED,
                     "adaptive_learning": c.adaptive_learning,
                     "adaptive_learning_enabled": config.ADAPTIVE_LEARNING_ENABLED,
                     "adaptive_learning_block_on_status": config.ADAPTIVE_LEARNING_BLOCK_ON_STATUS,
@@ -500,6 +544,7 @@ def build_subsystems(
                 decision_engine=c.decision_engine,
                 multi_scanner=c.multi_scanner,
                 shadow_tracker=c.shadow_tracker,
+                execution_policy=c.execution_policy,
             )
             if c.live_trader:
                 set_live_trader(c.live_trader)
@@ -546,6 +591,7 @@ _FIELD_TO_HEALTH_NAME: dict = {
     "kelly_sizer":            "kelly_sizer",
     "trade_memory":           "trade_memory",
     "calibration":            "calibration",
+    "execution_policy":       "execution_policy",
     "llm_filter":             "llm_filter",
     "signal_processor":       "signal_processor",
     "arena_incubator":        "arena_incubator",

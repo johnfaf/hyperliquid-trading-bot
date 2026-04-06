@@ -27,12 +27,14 @@ from src.core.health_registry import SubsystemHealthRegistry, SubsystemState
 from src.core.live_execution import (
     _rescale_size_for_live,
     get_execution_open_positions,
+    mirror_executed_trades_to_live,
     sync_shadow_book_to_live,
 )
 from src.data import database as db
 from src.signals.adaptive_learning import AdaptiveLearningManager
 from src.signals.decision_engine import DecisionEngine
 from src.signals.decision_firewall import DecisionFirewall
+from src.signals.execution_policy import ExecutionPolicyManager
 from src.signals.portfolio_sizer import PortfolioSizer
 from src.signals.signal_schema import RiskParams, SignalSide, SignalSource, TradeSignal, signal_from_execution_dict
 from src.trading.live_trader import (
@@ -4088,3 +4090,228 @@ def test_load_asset_index_map_captures_sz_decimals(monkeypatch):
     assert trader.sz_decimals_map["BTC"] == 5
     assert trader.sz_decimals_map["ETH"] == 4
     assert trader.sz_decimals_map["HYPE"] == 2
+
+
+def test_execution_policy_manager_prefers_maker_for_low_urgency_source(monkeypatch):
+    monkeypatch.setattr(
+        "src.signals.execution_policy.db.get_execution_quality_summary",
+        lambda **kwargs: {
+            "total_events": 12,
+            "avg_realized_slippage_bps": 2.2,
+            "maker_ratio": 0.64,
+            "avg_fill_ratio": 0.92,
+            "rejection_rate": 0.03,
+        },
+    )
+
+    manager = ExecutionPolicyManager({"enabled": True, "min_events": 3})
+    recommendation = manager.recommend(
+        strategy={
+            "source": "strategy",
+            "source_key": "strategy:momentum:ETH",
+        },
+        metadata={"expected_slippage_bps": 3.0},
+        confidence=0.58,
+        source_quality=0.71,
+    )
+
+    assert recommendation["execution_route"] == "maker_limit"
+    assert recommendation["execution_role"] == "maker"
+    assert recommendation["limit_tif"] == "Alo"
+    assert recommendation["fallback_to_market"] is True
+    assert recommendation["expected_slippage_bps"] < 3.0
+
+
+def test_decision_engine_applies_execution_policy_metadata():
+    class FakeExecutionPolicy:
+        def recommend(self, **kwargs):
+            return {
+                "route": "maker_limit",
+                "execution_route": "maker_limit",
+                "execution_role": "maker",
+                "expected_slippage_bps": 1.1,
+                "maker_price_offset_bps": 1.8,
+                "maker_timeout_seconds": 4.0,
+                "fallback_to_market": True,
+                "limit_tif": "Alo",
+                "policy_reason": "maker_cost_saving",
+                "urgency_score": 0.41,
+            }
+
+        def get_stats(self):
+            return {"enabled": True}
+
+    engine = DecisionEngine(
+        {
+            "execution_quality_enabled": False,
+            "adaptive_learning_enabled": False,
+            "execution_policy_enabled": True,
+            "execution_policy": FakeExecutionPolicy(),
+        }
+    )
+
+    strategy = {
+        "name": "momentum_eth",
+        "strategy_type": "momentum_long",
+        "current_score": 0.71,
+        "confidence": 0.69,
+        "parameters": {"coins": ["ETH"], "direction": "long"},
+        "metadata": {"source": "strategy", "source_key": "strategy:momentum_long:ETH"},
+        "source": "strategy",
+        "source_key": "strategy:momentum_long:ETH",
+    }
+
+    breakdown = engine._compute_composite_score(
+        strategy,
+        regime_data={"overall_regime": "trending_up", "overall_confidence": 0.8},
+        open_coins=set(),
+        kelly_stats={},
+    )
+
+    assert strategy["metadata"]["execution_route"] == "maker_limit"
+    assert strategy["metadata"]["execution_role"] == "maker"
+    assert strategy["_execution_policy"]["policy_reason"] == "maker_cost_saving"
+    assert breakdown["execution_route"] == "maker_limit"
+    assert breakdown["execution_policy_reason"] == "maker_cost_saving"
+    assert breakdown["maker_price_offset_bps"] == 1.8
+
+
+def test_execute_signal_uses_maker_limit_route_and_falls_back_to_market(monkeypatch):
+    class FakeFirewall:
+        def validate(self, signal, **kwargs):
+            return True, "ok"
+
+    limit_calls = []
+    market_calls = []
+    verify_calls = []
+    trigger_calls = []
+
+    monkeypatch.setattr(LiveTrader, "_load_credentials", _fake_live_credentials)
+    monkeypatch.setattr(LiveTrader, "_load_asset_index_map", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "reconcile_positions", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "get_firewall_positions", lambda self: [])
+    monkeypatch.setattr(LiveTrader, "get_account_value", lambda self: 2500.0)
+    monkeypatch.setattr(LiveTrader, "_compute_passive_limit_price", lambda self, coin, side, offset_bps: 1998.0)
+    monkeypatch.setattr(
+        LiveTrader,
+        "place_limit_order",
+        lambda self, coin, side, size, price, leverage=1, reduce_only=False, tif=None: (
+            limit_calls.append((coin, side, size, price, tif))
+            or {"status": "ok", "submitted_size": size, "mid_price": 2000.0, "wire_price": "1998"}
+        ),
+    )
+    monkeypatch.setattr(
+        LiveTrader,
+        "place_market_order",
+        lambda self, coin, side, size, leverage=1, reduce_only=False: (
+            market_calls.append((coin, side, size, reduce_only))
+            or {"status": "success", "submitted_size": size, "mid_price": 2000.0, "wire_price": "2001"}
+        ),
+    )
+    monkeypatch.setattr(LiveTrader, "update_daily_pnl_from_fills", lambda self: None)
+    verify_results = iter(
+        [
+            None,
+            {"status": "verified", "size": 0.1, "partial_fill": False},
+        ]
+    )
+    monkeypatch.setattr(
+        LiveTrader,
+        "verify_fill",
+        lambda self, coin, side, expected_size, timeout=10.0, poll_interval=1.0: (
+            verify_calls.append((coin, side, expected_size, timeout))
+            or next(verify_results)
+        ),
+    )
+    monkeypatch.setattr(
+        LiveTrader,
+        "_cancel_open_entry_orders",
+        lambda self, coin: {"attempted": 1, "cancelled": 1, "failed": 0, "remaining": []},
+    )
+    monkeypatch.setattr(LiveTrader, "_get_mid_price", lambda self, coin: 2000.0)
+    monkeypatch.setattr(
+        LiveTrader,
+        "place_trigger_order",
+        lambda self, coin, side, size, trigger_price, tp_or_sl="sl": (
+            trigger_calls.append((coin, side, size, tp_or_sl)) or {"status": "success"}
+        ),
+    )
+
+    trader = LiveTrader(firewall=FakeFirewall(), dry_run=False, max_order_usd=1_000_000)
+    result = trader.execute_signal(
+        {
+            "coin": "ETH",
+            "side": "long",
+            "confidence": 0.67,
+            "entry_price": 2000.0,
+            "position_pct": 0.05,
+            "leverage": 2,
+            "size": 0.1,
+            "strategy_type": "momentum_long",
+            "metadata": {
+                "execution_route": "maker_limit",
+                "execution_role": "maker",
+                "maker_price_offset_bps": 1.5,
+                "maker_timeout_seconds": 4.0,
+                "fallback_to_market": True,
+                "limit_tif": "Alo",
+                "policy_reason": "maker_cost_saving",
+            },
+        }
+    )
+
+    assert result is not None
+    assert result["status"] == "success"
+    assert result["execution_route"] == "maker_limit_fallback_market"
+    assert limit_calls == [("ETH", "buy", 0.1, 1998.0, "Alo")]
+    assert market_calls == [("ETH", "buy", 0.1, False)]
+    assert verify_calls[0] == ("ETH", "buy", 0.1, 4.0)
+    assert verify_calls[1][0:3] == ("ETH", "buy", 0.1)
+    assert [call[1] for call in trigger_calls] == ["sell", "sell"]
+
+
+def test_mirror_executed_trades_to_live_preserves_execution_metadata(monkeypatch):
+    captured = []
+
+    class FakeTrader:
+        def is_live_enabled(self):
+            return True
+
+        def is_deployable(self):
+            return True
+
+        def execute_signal(self, payload, bypass_firewall=False):
+            captured.append((payload, bypass_firewall))
+            return {"status": "success"}
+
+    container = types.SimpleNamespace(live_trader=FakeTrader())
+    trade = {
+        "coin": "ETH",
+        "side": "long",
+        "confidence": 0.66,
+        "size": 0.1,
+        "entry_price": 2000.0,
+        "metadata": {
+            "execution_role": "maker",
+            "upstream_metadata": {
+                "execution_route": "maker_limit",
+                "maker_price_offset_bps": 1.5,
+                "policy_reason": "maker_cost_saving",
+            },
+        },
+    }
+
+    monkeypatch.setattr("src.core.live_execution._rescale_size_for_live", lambda trade, trader: trade)
+
+    mirror_executed_trades_to_live(
+        container,
+        [trade],
+        success_label="LIVE",
+        skip_label="SKIP",
+    )
+
+    assert len(captured) == 1
+    payload, bypass_firewall = captured[0]
+    assert bypass_firewall is True
+    assert isinstance(payload, dict)
+    assert payload["metadata"]["upstream_metadata"]["execution_route"] == "maker_limit"

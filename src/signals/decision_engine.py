@@ -78,6 +78,10 @@ class DecisionEngine:
         self.execution_protective_failure_penalty_bps = float(
             cfg.get("execution_protective_failure_penalty_bps", 18.0)
         )
+        self.execution_policy = cfg.get("execution_policy")
+        self.execution_policy_enabled = bool(
+            cfg.get("execution_policy_enabled", self.execution_policy is not None)
+        )
         self.adaptive_learning = cfg.get("adaptive_learning")
         self.adaptive_learning_enabled = bool(cfg.get("adaptive_learning_enabled", True))
         self.adaptive_learning_block_on_status = bool(
@@ -491,6 +495,10 @@ class DecisionEngine:
         source_quality = adaptive_feedback["source_quality"]
         strategy["_metadata_for_decision"] = adaptive_feedback["metadata"]
         strategy["_adaptive_learning"] = adaptive_feedback["profile"]
+        execution_policy = self._apply_execution_policy_feedback(strategy, confidence, source_quality)
+        strategy["_metadata_for_decision"] = execution_policy["metadata"]
+        strategy["_execution_policy"] = execution_policy["recommendation"]
+        strategy["metadata"] = dict(strategy["_metadata_for_decision"])
         strategy["_decision_confidence"] = confidence
         strategy["_decision_source_quality"] = source_quality
         confirmation = self._confirmation_score(strategy)
@@ -562,6 +570,16 @@ class DecisionEngine:
                 4,
             ),
             "execution_penalty_bps": round(float(execution_quality["penalty_bps"] or 0.0), 4),
+            "execution_route": execution_policy["recommendation"].get("execution_route", "market"),
+            "execution_policy_reason": execution_policy["recommendation"].get("policy_reason", ""),
+            "maker_price_offset_bps": round(
+                float(execution_policy["recommendation"].get("maker_price_offset_bps", 0.0) or 0.0),
+                4,
+            ),
+            "execution_urgency_score": round(
+                float(execution_policy["recommendation"].get("urgency_score", 0.0) or 0.0),
+                4,
+            ),
             "adaptive_health_score": round(
                 float(adaptive_feedback["profile"].get("health_score", 0.0) or 0.0),
                 4,
@@ -740,6 +758,46 @@ class DecisionEngine:
         except Exception as exc:
             logger.debug("adaptive learning lookup error: %s", exc)
             return {}
+
+    def _apply_execution_policy_feedback(
+        self,
+        strategy: Dict,
+        confidence: float,
+        source_quality: float,
+    ) -> Dict:
+        metadata = dict(self._get_metadata(strategy))
+        if not self.execution_policy_enabled or not self.execution_policy:
+            return {
+                "metadata": metadata,
+                "recommendation": {},
+            }
+
+        try:
+            recommendation = self.execution_policy.recommend(
+                strategy=strategy,
+                metadata=metadata,
+                confidence=confidence,
+                source_quality=source_quality,
+            ) or {}
+        except Exception as exc:
+            logger.debug("execution policy lookup error: %s", exc)
+            recommendation = {}
+
+        if recommendation:
+            execution_route = recommendation.get(
+                "execution_route",
+                recommendation.get("route", "market"),
+            )
+            recommendation["execution_route"] = execution_route
+            recommendation.setdefault("route", execution_route)
+            for key, value in recommendation.items():
+                if value is not None:
+                    metadata[key] = value
+
+        return {
+            "metadata": metadata,
+            "recommendation": recommendation,
+        }
 
     def _apply_adaptive_learning_feedback(
         self,
@@ -1058,6 +1116,12 @@ class DecisionEngine:
             "execution_quality_enabled": self.execution_quality_enabled,
             "execution_quality_lookback_hours": self.execution_quality_lookback_hours,
             "execution_quality_min_events": self.execution_quality_min_events,
+            "execution_policy_enabled": self.execution_policy_enabled,
+            "execution_policy": (
+                self.execution_policy.get_stats()
+                if self.execution_policy_enabled and self.execution_policy
+                else {}
+            ),
             "adaptive_learning_enabled": self.adaptive_learning_enabled,
             "adaptive_learning_block_on_status": self.adaptive_learning_block_on_status,
             "adaptive_learning_min_health_score": self.adaptive_learning_min_health_score,

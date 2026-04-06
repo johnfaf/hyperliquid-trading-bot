@@ -224,6 +224,10 @@ def _log_module_stats(container):
         getattr(container, "adaptive_learning", None) and
         _fmt_adaptive(container.adaptive_learning.get_stats())
     ))
+    _safe_stat("ExecutionPolicy", lambda: (
+        getattr(container, "execution_policy", None) and
+        _fmt_execution_policy(container.execution_policy.get_stats())
+    ))
     _safe_stat("MultiExchange", lambda: (
         container.multi_scanner and
         _fmt_multi(container.multi_scanner.get_stats())
@@ -269,4 +273,13 @@ def _fmt_adaptive(stats):
         f"active={counts.get('active', 0)}, "
         f"caution={counts.get('caution', 0)}, "
         f"blocked={counts.get('blocked', 0)}"
+    )
+
+
+def _fmt_execution_policy(stats):
+    return (
+        f"enabled={stats.get('enabled', False)}, "
+        f"recs={stats.get('recommendations', 0)}, "
+        f"maker_rate={stats.get('maker_route_rate', 0.0):.0%}, "
+        f"market_rate={stats.get('market_route_rate', 0.0):.0%}"
     )

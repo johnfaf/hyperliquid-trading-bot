@@ -54,6 +54,13 @@ This branch is the staged upgrade path for making the bot more measurable, more 
 - Review arena agents continuously so degraded champions are demoted and recovered agents can return.
 - Expose source health, arena review actions, and adaptive learning state in reporting and the dashboard.
 
+## Phase 8: Adaptive Execution Policy
+
+- Status: shipped on `codex/live-ledger-foundation`
+- Add maker/taker-aware execution policy recommendations before final expected-value ranking.
+- Route low-urgency live entries through bounded ALO maker orders with safe market fallback.
+- Persist execution-policy metadata end to end across paper, mirror, live, reporting, and dashboard telemetry.
+
 ## Branch Operating Rule
 
 Each phase should be landed in a reviewable commit with tests before moving to the next phase.

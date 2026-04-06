@@ -480,6 +480,7 @@ _decision_engine = None
 _multi_scanner = None
 _shadow_tracker = None
 _adaptive_learning = None
+_execution_policy = None
 
 # Module-level live trader reference for closing positions on exchange
 _live_trader = None
@@ -595,12 +596,12 @@ def set_v2_components(firewall=None, regime_detector=None, arena=None,
                        llm_filter=None, liquidation_strategy=None,
                        signal_processor=None, arena_incubator=None,
                        decision_engine=None, multi_scanner=None, shadow_tracker=None,
-                       adaptive_learning=None):
+                       adaptive_learning=None, execution_policy=None):
     """Set V2 + V2.5 + V3 + V4 component references for dashboard metrics."""
     global _firewall, _regime_detector, _arena  # noqa: PLW0603
     global _kelly_sizer, _portfolio_sizer, _trade_memory, _calibration, _llm_filter, _liquidation_strategy  # noqa
     global _signal_processor, _arena_incubator, _decision_engine  # noqa
-    global _multi_scanner, _shadow_tracker, _adaptive_learning  # noqa
+    global _multi_scanner, _shadow_tracker, _adaptive_learning, _execution_policy  # noqa
     _firewall = firewall
     _regime_detector = regime_detector
     _arena = arena
@@ -616,6 +617,7 @@ def set_v2_components(firewall=None, regime_detector=None, arena=None,
     _multi_scanner = multi_scanner
     _shadow_tracker = shadow_tracker
     _adaptive_learning = adaptive_learning
+    _execution_policy = execution_policy
 
 
 DASHBOARD_HTML = """<!DOCTYPE html>
@@ -1311,6 +1313,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     pass
                 try:
                     v25["adaptive_learning"] = _build_adaptive_learning_metrics(_adaptive_learning)
+                except Exception:
+                    pass
+                try:
+                    if _execution_policy:
+                        v25["execution_policy"] = _execution_policy.get_stats()
                 except Exception:
                     pass
                 if v25:

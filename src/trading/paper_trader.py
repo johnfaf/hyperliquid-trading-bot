@@ -900,6 +900,34 @@ class PaperTrader:
             "trader_address": source_ctx["trader_address"],
             "agent_id": source_ctx["agent_id"],
             "agent_name": source_ctx["agent_name"],
+            "execution_role": source_ctx["metadata"].get(
+                "execution_role",
+                config.PAPER_TRADING_DEFAULT_EXECUTION_ROLE,
+            ),
+            "expected_slippage_bps": float(
+                source_ctx["metadata"].get("expected_slippage_bps", 0.0) or 0.0
+            ),
+            "maker_fee_bps": float(
+                source_ctx["metadata"].get("maker_fee_bps", config.PAPER_TRADING_MAKER_FEE_BPS)
+                or config.PAPER_TRADING_MAKER_FEE_BPS
+            ),
+            "taker_fee_bps": float(
+                source_ctx["metadata"].get("taker_fee_bps", config.PAPER_TRADING_TAKER_FEE_BPS)
+                or config.PAPER_TRADING_TAKER_FEE_BPS
+            ),
+            "execution_route": source_ctx["metadata"].get(
+                "execution_route",
+                source_ctx["metadata"].get("route", ""),
+            ),
+            "maker_price_offset_bps": float(
+                source_ctx["metadata"].get("maker_price_offset_bps", 0.0) or 0.0
+            ),
+            "maker_timeout_seconds": float(
+                source_ctx["metadata"].get("maker_timeout_seconds", 0.0) or 0.0
+            ),
+            "fallback_to_market": bool(source_ctx["metadata"].get("fallback_to_market", False)),
+            "limit_tif": source_ctx["metadata"].get("limit_tif"),
+            "policy_reason": str(source_ctx["metadata"].get("policy_reason", "") or ""),
             "metadata": source_ctx["metadata"],
         }
 
@@ -951,7 +979,12 @@ class PaperTrader:
         return True
 
     @staticmethod
-    def _apply_slippage(price: float, side: str, is_entry: bool = True) -> float:
+    def _apply_slippage(
+        price: float,
+        side: str,
+        is_entry: bool = True,
+        slippage_bps: float = None,
+    ) -> float:
         """
         Simulate realistic slippage for paper trading.
 
@@ -964,7 +997,8 @@ class PaperTrader:
         Entry longs get a higher price, entry shorts get a lower price.
         Exit is the reverse.
         """
-        slippage_bps = random.uniform(1, 5)  # 0.01% to 0.05%
+        if slippage_bps is None:
+            slippage_bps = random.uniform(1, 5)  # 0.01% to 0.05%
         slippage_pct = slippage_bps / 10_000
 
         if is_entry:
@@ -979,11 +1013,21 @@ class PaperTrader:
         return price * (1 + slippage_pct)
 
     @staticmethod
-    def _fee_rate_for_role(role: str) -> float:
+    def _fee_rate_for_role(role: str, maker_fee_bps: float = None, taker_fee_bps: float = None) -> float:
         role = str(role or "").lower()
         if role == "maker":
-            return max(config.PAPER_TRADING_MAKER_FEE_BPS, 0.0) / 10_000
-        return max(config.PAPER_TRADING_TAKER_FEE_BPS, 0.0) / 10_000
+            return max(
+                float(
+                    config.PAPER_TRADING_MAKER_FEE_BPS if maker_fee_bps is None else maker_fee_bps
+                ),
+                0.0,
+            ) / 10_000
+        return max(
+            float(
+                config.PAPER_TRADING_TAKER_FEE_BPS if taker_fee_bps is None else taker_fee_bps
+            ),
+            0.0,
+        ) / 10_000
 
     @staticmethod
     def _slippage_cost(side: str, intended_price: float, filled_price: float, size: float, leverage: float) -> float:
@@ -997,7 +1041,12 @@ class PaperTrader:
         """Execute a paper trade and record it (with slippage simulation)."""
         try:
             # Apply entry slippage — paper trades should reflect realistic fills
-            slipped_price = self._apply_slippage(signal["price"], signal["side"], is_entry=True)
+            slipped_price = self._apply_slippage(
+                signal["price"],
+                signal["side"],
+                is_entry=True,
+                slippage_bps=float(signal.get("expected_slippage_bps", 0.0) or 0.0) or None,
+            )
             logger.debug(f"Slippage: {signal['coin']} entry {signal['price']:.2f} → {slipped_price:.2f} "
                         f"({signal['side']})")
 
@@ -1026,8 +1075,21 @@ class PaperTrader:
                         ),
                     ),
                     "execution_role": signal.get("execution_role", config.PAPER_TRADING_DEFAULT_EXECUTION_ROLE),
-                    "maker_fee_bps": config.PAPER_TRADING_MAKER_FEE_BPS,
-                    "taker_fee_bps": config.PAPER_TRADING_TAKER_FEE_BPS,
+                    "maker_fee_bps": float(
+                        signal.get("maker_fee_bps", config.PAPER_TRADING_MAKER_FEE_BPS)
+                        or config.PAPER_TRADING_MAKER_FEE_BPS
+                    ),
+                    "taker_fee_bps": float(
+                        signal.get("taker_fee_bps", config.PAPER_TRADING_TAKER_FEE_BPS)
+                        or config.PAPER_TRADING_TAKER_FEE_BPS
+                    ),
+                    "expected_slippage_bps": float(signal.get("expected_slippage_bps", 0.0) or 0.0),
+                    "execution_route": signal.get("execution_route", ""),
+                    "maker_price_offset_bps": float(signal.get("maker_price_offset_bps", 0.0) or 0.0),
+                    "maker_timeout_seconds": float(signal.get("maker_timeout_seconds", 0.0) or 0.0),
+                    "fallback_to_market": bool(signal.get("fallback_to_market", False)),
+                    "limit_tif": signal.get("limit_tif"),
+                    "policy_reason": signal.get("policy_reason", ""),
                     "intended_entry_price": signal["price"],
                     "entry_slipped_price": slipped_price,
                     "features": signal.get("features", {}),
@@ -1098,8 +1160,21 @@ class PaperTrader:
                         ),
                     ),
                     "execution_role": signal.get("execution_role", config.PAPER_TRADING_DEFAULT_EXECUTION_ROLE),
-                    "maker_fee_bps": config.PAPER_TRADING_MAKER_FEE_BPS,
-                    "taker_fee_bps": config.PAPER_TRADING_TAKER_FEE_BPS,
+                    "maker_fee_bps": float(
+                        signal.get("maker_fee_bps", config.PAPER_TRADING_MAKER_FEE_BPS)
+                        or config.PAPER_TRADING_MAKER_FEE_BPS
+                    ),
+                    "taker_fee_bps": float(
+                        signal.get("taker_fee_bps", config.PAPER_TRADING_TAKER_FEE_BPS)
+                        or config.PAPER_TRADING_TAKER_FEE_BPS
+                    ),
+                    "expected_slippage_bps": float(signal.get("expected_slippage_bps", 0.0) or 0.0),
+                    "execution_route": signal.get("execution_route", ""),
+                    "maker_price_offset_bps": float(signal.get("maker_price_offset_bps", 0.0) or 0.0),
+                    "maker_timeout_seconds": float(signal.get("maker_timeout_seconds", 0.0) or 0.0),
+                    "fallback_to_market": bool(signal.get("fallback_to_market", False)),
+                    "limit_tif": signal.get("limit_tif"),
+                    "policy_reason": signal.get("policy_reason", ""),
                     "intended_entry_price": signal["price"],
                     "entry_slipped_price": slipped_price,
                     "features": signal.get("features", {}),
@@ -1135,10 +1210,19 @@ class PaperTrader:
         except Exception:
             trade_meta = {}
 
-        slipped_exit = self._apply_slippage(current_price, trade["side"], is_entry=False)
+        slipped_exit = self._apply_slippage(
+            current_price,
+            trade["side"],
+            is_entry=False,
+            slippage_bps=float(trade_meta.get("expected_slippage_bps", 0.0) or 0.0) or None,
+        )
         gross_pnl = self._calculate_pnl(trade, slipped_exit)
         execution_role = trade_meta.get("execution_role", config.PAPER_TRADING_DEFAULT_EXECUTION_ROLE)
-        fee_rate = self._fee_rate_for_role(execution_role)
+        fee_rate = self._fee_rate_for_role(
+            execution_role,
+            maker_fee_bps=trade_meta.get("maker_fee_bps"),
+            taker_fee_bps=trade_meta.get("taker_fee_bps"),
+        )
         entry_notional = max(float(trade.get("entry_price", 0)), 0.0) * max(float(trade.get("size", 0)), 0.0) * max(float(trade.get("leverage", 1)), 1.0)
         exit_notional = max(float(slipped_exit), 0.0) * max(float(trade.get("size", 0)), 0.0) * max(float(trade.get("leverage", 1)), 1.0)
         entry_fee = entry_notional * fee_rate

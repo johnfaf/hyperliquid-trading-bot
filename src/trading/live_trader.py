@@ -710,12 +710,22 @@ class LiveTrader:
 
         metadata = signal.get("metadata", {})
         payload = dict(metadata) if isinstance(metadata, dict) else {}
+        upstream_metadata = payload.get("upstream_metadata")
+        if isinstance(upstream_metadata, dict):
+            for key, value in upstream_metadata.items():
+                payload.setdefault(key, value)
         for key in (
             "execution_role",
             "expected_slippage_bps",
             "maker_fee_bps",
             "taker_fee_bps",
+            "execution_route",
             "route",
+            "maker_price_offset_bps",
+            "maker_timeout_seconds",
+            "fallback_to_market",
+            "limit_tif",
+            "policy_reason",
             "strategy_type",
             "source",
             "source_key",
@@ -794,7 +804,13 @@ class LiveTrader:
             "entry_status": entry_result.get("status"),
             "entry_message": entry_result.get("message"),
             "entry_errors": entry_result.get("errors"),
-            "route": source_metadata.get("route"),
+            "route": source_metadata.get("execution_route", source_metadata.get("route")),
+            "policy_reason": source_metadata.get("policy_reason"),
+            "fallback_to_market": bool(source_metadata.get("fallback_to_market", False)),
+            "maker_price_offset_bps": self._coerce_float(
+                source_metadata.get("maker_price_offset_bps"),
+                0.0,
+            ),
             **extra_metadata,
         }
 
@@ -2029,8 +2045,67 @@ class LiveTrader:
         )
         return None
 
+    def _compute_passive_limit_price(self, coin: str, side: str, offset_bps: float) -> Optional[float]:
+        """Derive a passive maker price that stays on the correct side of mid."""
+        mid = self._get_mid_price(coin)
+        if not mid or mid <= 0:
+            return None
+
+        normalized_side = self._normalize_order_side(side)
+        offset_pct = max(float(offset_bps or 0.0), 0.01) / 10_000.0
+        if normalized_side == "buy":
+            return max(mid * (1.0 - offset_pct), 0.0)
+        return max(mid * (1.0 + offset_pct), 0.0)
+
+    def _get_open_entry_orders(self, coin: str) -> List[Dict[str, Any]]:
+        """Return non-reduce-only entry orders for a specific coin."""
+        try:
+            orders = self.get_open_orders()
+        except Exception as exc:
+            logger.debug("open-entry order lookup failed for %s: %s", coin, exc)
+            return []
+
+        entry_orders: List[Dict[str, Any]] = []
+        normalized_coin = str(coin or "").strip().upper()
+        for order in orders:
+            if not isinstance(order, dict):
+                continue
+            order_coin = str(order.get("coin", order.get("asset", "")) or "").strip().upper()
+            if order_coin != normalized_coin:
+                continue
+            if bool(order.get("reduceOnly", order.get("r", False))):
+                continue
+            order_id = order.get("oid", order.get("id"))
+            if order_id is None:
+                continue
+            try:
+                normalized_id = int(order_id)
+            except (TypeError, ValueError):
+                continue
+            entry_orders.append({"coin": normalized_coin, "id": normalized_id, "raw": order})
+        return entry_orders
+
+    def _cancel_open_entry_orders(self, coin: str) -> Dict[str, Any]:
+        """Cancel any resting entry orders for a coin before fallback/protection."""
+        orders = self._get_open_entry_orders(coin)
+        cancelled = 0
+        failed = 0
+        for order in orders:
+            if self.cancel_order(order["coin"], order["id"]):
+                cancelled += 1
+            else:
+                failed += 1
+        remaining = self._get_open_entry_orders(coin)
+        return {
+            "attempted": len(orders),
+            "cancelled": cancelled,
+            "failed": failed,
+            "remaining": remaining,
+        }
+
     def place_limit_order(self, coin: str, side: str, size: float, price: float,
-                          leverage: float = 1, reduce_only: bool = False) -> Dict:
+                          leverage: float = 1, reduce_only: bool = False,
+                          tif: Optional[str] = None) -> Dict:
         """
         Place a limit order on Hyperliquid.
 
@@ -2046,6 +2121,7 @@ class LiveTrader:
             Order result dict
         """
         side = self._normalize_order_side(side)
+        requested_size = float(size)
 
         # Kill switch and position size limit only block NEW positions.
         # reduce_only orders MUST go through so the bot can exit positions.
@@ -2106,13 +2182,15 @@ class LiveTrader:
             )
             return {"status": "rejected", "reason": "size_rounds_to_zero"}
 
+        tif_value = str(tif or OrderType.LIMIT_GTC.value)
+
         order = {
             "a": asset_idx,
             "b": side.lower() == "buy",
             "p": wire_price,
             "s": wire_size,
             "r": reduce_only,
-            "t": {"limit": {"tif": OrderType.LIMIT_GTC.value}}
+            "t": {"limit": {"tif": tif_value}}
         }
 
         action = {
@@ -2123,6 +2201,25 @@ class LiveTrader:
 
         logger.info(f"Placing limit order: {coin} {side} {size} @ ${price:.2f} (notional: ${notional:.2f})")
         result = self._post_order(action)
+        if isinstance(result, dict):
+            result = dict(result)
+            mid = self._get_mid_price(coin) or price
+            result["coin"] = coin
+            result["side"] = side
+            result["requested_size"] = requested_size
+            result["requested_notional"] = float(requested_size * mid)
+            result["submitted_size"] = float(size)
+            result["submitted_notional"] = float(notional)
+            result["mid_price"] = float(mid)
+            result["wire_size"] = wire_size
+            result["wire_price"] = wire_price
+            result["tif"] = tif_value
+            reported_fill_size = self._extract_reported_fill_size(result)
+            if reported_fill_size is not None:
+                result["exchange_reported_fill_size"] = reported_fill_size
+            reported_fill_price = self._extract_reported_fill_price(result)
+            if reported_fill_price is not None:
+                result["exchange_reported_fill_price"] = reported_fill_price
 
         if self._is_order_result_success(result) and not self.dry_run:
             self.orders_today += 1
@@ -2623,6 +2720,26 @@ class LiveTrader:
         try:
             size = signal.size
             requested_entry_size = float(size)
+            route = str(
+                source_metadata.get(
+                    "execution_route",
+                    source_metadata.get("route", "market"),
+                ) or "market"
+            ).strip().lower()
+            if route not in {"market", "maker_limit"}:
+                route = "market"
+            maker_timeout_seconds = max(
+                self._coerce_float(source_metadata.get("maker_timeout_seconds"), 0.0),
+                0.0,
+            )
+            fallback_to_market = bool(source_metadata.get("fallback_to_market", False))
+            maker_price_offset_bps = self._coerce_float(
+                source_metadata.get("maker_price_offset_bps"),
+                0.0,
+            )
+            limit_tif = source_metadata.get("limit_tif") or OrderType.LIMIT_ALO.value
+            entry_fill_check = None
+            entry_result = None
 
             if not size or size <= 0:
                 logger.warning(f"Calculated size is 0 or negative for {coin} — skipping")
@@ -2631,13 +2748,141 @@ class LiveTrader:
             logger.info(f"Executing signal: {coin} {signal_side} {size:.4f} "
                        f"(confidence={signal.confidence:.0%}, "
                        f"leverage={signal.leverage}x)")
-
-            # 1. Place market entry
-            entry_result = self.place_market_order(
-                coin, entry_side, size,
-                leverage=signal.leverage,
-                reduce_only=False
+            logger.info(
+                "Execution route for %s: %s%s",
+                coin,
+                route,
+                (
+                    f" ({source_metadata.get('policy_reason', '')})"
+                    if source_metadata.get("policy_reason")
+                    else ""
+                ),
             )
+
+            if route == "maker_limit":
+                passive_price = self._compute_passive_limit_price(coin, entry_side, maker_price_offset_bps)
+                if not passive_price or passive_price <= 0:
+                    logger.warning(
+                        "Maker route requested for %s but no passive price was available; falling back to market",
+                        coin,
+                    )
+                    route = "market"
+                    source_metadata["execution_route"] = "market"
+                    source_metadata["route"] = "market"
+                    source_metadata["execution_role"] = "taker"
+                else:
+                    entry_result = self.place_limit_order(
+                        coin,
+                        entry_side,
+                        size,
+                        passive_price,
+                        leverage=signal.leverage,
+                        reduce_only=False,
+                        tif=limit_tif,
+                    )
+                    entry_result["execution_route"] = "maker_limit"
+                    if self._is_order_result_success(entry_result):
+                        self.update_daily_pnl_from_fills()
+                        maker_expected_size = float(entry_result.get("submitted_size", size) or size)
+                        maker_fill = (
+                            self.verify_fill(
+                                coin,
+                                entry_side,
+                                maker_expected_size,
+                                timeout=maker_timeout_seconds or 5.0,
+                            )
+                            if not self.dry_run
+                            else {"status": "verified", "size": maker_expected_size}
+                        )
+                        entry_fill_check = maker_fill
+                        cancel_summary = (
+                            self._cancel_open_entry_orders(coin)
+                            if not self.dry_run
+                            else {"attempted": 0, "cancelled": 0, "failed": 0, "remaining": []}
+                        )
+                        if maker_fill and cancel_summary.get("remaining"):
+                            self._record_execution_quality_event(
+                                signal=signal,
+                                source_metadata=source_metadata,
+                                status="error",
+                                entry_result=entry_result,
+                                filled_size=float(maker_fill.get("size", maker_expected_size) or maker_expected_size),
+                                rejection_reason="maker_entry_cancel_failed",
+                                protective_status="failed",
+                                bypass_firewall=bypass_firewall,
+                                extra_metadata={"entry_cancel_summary": cancel_summary},
+                            )
+                            close_result = self.close_position(coin)
+                            return {
+                                "status": "error",
+                                "message": "maker_entry_cancel_failed",
+                                "coin": coin,
+                                "entry_result": entry_result,
+                                "close_result": close_result,
+                            }
+                        if not maker_fill:
+                            source_metadata["execution_role"] = "taker"
+                            if fallback_to_market:
+                                if cancel_summary.get("remaining"):
+                                    self._record_execution_quality_event(
+                                        signal=signal,
+                                        source_metadata=source_metadata,
+                                        status="warning",
+                                        entry_result=entry_result,
+                                        rejection_reason="maker_resting_order_not_cancelled",
+                                        protective_status="not_placed",
+                                        bypass_firewall=bypass_firewall,
+                                        extra_metadata={"entry_cancel_summary": cancel_summary},
+                                    )
+                                    return {
+                                        "status": "warning",
+                                        "message": "maker_order_still_resting",
+                                        "coin": coin,
+                                        "entry_result": entry_result,
+                                    }
+
+                                source_metadata["execution_route"] = "maker_limit_fallback_market"
+                                source_metadata["route"] = "maker_limit_fallback_market"
+                                logger.info(
+                                    "Maker entry timed out for %s; falling back to market",
+                                    coin,
+                                )
+                                market_result = self.place_market_order(
+                                    coin,
+                                    entry_side,
+                                    size,
+                                    leverage=signal.leverage,
+                                    reduce_only=False,
+                                )
+                                market_result["maker_attempt_result"] = entry_result
+                                market_result["execution_route"] = "maker_limit_fallback_market"
+                                entry_result = market_result
+                                route = "market"
+                            else:
+                                self._record_execution_quality_event(
+                                    signal=signal,
+                                    source_metadata=source_metadata,
+                                    status="warning",
+                                    entry_result=entry_result,
+                                    rejection_reason="maker_not_filled_no_fallback",
+                                    protective_status="not_placed",
+                                    bypass_firewall=bypass_firewall,
+                                    extra_metadata={"entry_cancel_summary": cancel_summary},
+                                )
+                                return {
+                                    "status": "warning",
+                                    "message": "maker_order_not_filled",
+                                    "coin": coin,
+                                    "entry_result": entry_result,
+                                }
+
+            if route == "market" and entry_result is None:
+                entry_result = self.place_market_order(
+                    coin, entry_side, size,
+                    leverage=signal.leverage,
+                    reduce_only=False
+                )
+                entry_result["execution_route"] = "market"
 
             if not self._is_order_result_success(entry_result):
                 logger.error(f"Failed to place entry order: {entry_result}")
@@ -2653,8 +2898,9 @@ class LiveTrader:
                 )
                 return entry_result
 
-            # Update daily PnL after every execution to keep loss tracking current
-            self.update_daily_pnl_from_fills()
+            if route != "maker_limit":
+                # Maker flow already refreshed around the passive-entry branch.
+                self.update_daily_pnl_from_fills()
 
             submitted_entry_size = float(entry_result.get("submitted_size", size) or size)
             expected_fill_size = submitted_entry_size
@@ -2668,7 +2914,12 @@ class LiveTrader:
 
             # 1b. Verify the fill actually happened before placing SL/TP
             if not self.dry_run:
-                fill_check = self.verify_fill(coin, entry_side, expected_fill_size, timeout=10.0)
+                fill_check = entry_fill_check or self.verify_fill(
+                    coin,
+                    entry_side,
+                    expected_fill_size,
+                    timeout=10.0,
+                )
                 if not fill_check:
                     self._record_execution_quality_event(
                         signal=signal,
@@ -2823,6 +3074,7 @@ class LiveTrader:
                 "coin": coin,
                 "side": signal_side,
                 "size": actual_fill_size,
+                "execution_route": entry_result.get("execution_route", route),
                 "requested_size": requested_entry_size,
                 "submitted_size": submitted_entry_size,
                 "exchange_reported_fill_size": (
