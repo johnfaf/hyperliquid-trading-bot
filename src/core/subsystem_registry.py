@@ -32,13 +32,13 @@ logger.addHandler(logging.NullHandler())
 FUNDABLE_CORE = {
     "discovery", "strategy_identifier", "strategy_scorer", "decision_firewall",
     "paper_trader", "golden_wallet", "backtester", "database", "reporter",
-    "regime_detector", "feature_engine", "agent_scorer",
+    "regime_detector", "feature_engine", "agent_scorer", "portfolio_sizer",
 }
 
 FULL_PROFILE = FUNDABLE_CORE | {
     "copy_trader", "live_trader", "options_flow", "polymarket",
     "predictive_forecaster", "xgboost_forecaster", "multi_scanner",
-    "liquidation_strategy", "kelly_sizer", "trade_memory", "calibration",
+    "liquidation_strategy", "kelly_sizer", "portfolio_sizer", "trade_memory", "calibration",
     "llm_filter", "signal_processor", "arena_incubator", "decision_engine",
     "alpha_arena", "position_monitor", "dashboard", "telegram",
     "cross_venue_hedger", "shadow_tracker", "adaptive_bot_detector",
@@ -77,6 +77,7 @@ class SubsystemContainer:
     multi_scanner: Any = None
     liquidation_strategy: Any = None
     kelly_sizer: Any = None
+    portfolio_sizer: Any = None
     trade_memory: Any = None
     calibration: Any = None
     llm_filter: Any = None
@@ -215,6 +216,32 @@ def build_subsystems(
             except Exception:
                 pass
 
+    if "portfolio_sizer" in profile:
+        from src.signals.portfolio_sizer import PortfolioSizer
+        c.portfolio_sizer = _safe_init(
+            "portfolio_sizer",
+            lambda: PortfolioSizer(
+                {
+                    "enabled": config.PORTFOLIO_SIZER_ENABLED,
+                    "min_position_pct": config.PORTFOLIO_MIN_POSITION_PCT,
+                    "max_position_pct": getattr(config, "PAPER_TRADING_MAX_POSITION_PCT", 0.08),
+                    "max_coin_exposure_pct": config.PORTFOLIO_MAX_COIN_EXPOSURE_PCT,
+                    "max_side_exposure_pct": config.PORTFOLIO_MAX_SIDE_EXPOSURE_PCT,
+                    "max_cluster_exposure_pct": config.PORTFOLIO_MAX_CLUSTER_EXPOSURE_PCT,
+                    "max_beta_abs": config.PORTFOLIO_MAX_BETA_ABS,
+                    "target_volatility_pct": config.PORTFOLIO_TARGET_VOLATILITY_PCT,
+                    "stop_loss_vol_multiplier": config.PORTFOLIO_STOP_LOSS_VOL_MULTIPLIER,
+                    "trend_reward_risk": config.PORTFOLIO_TREND_REWARD_RISK,
+                    "base_reward_risk": config.PORTFOLIO_BASE_REWARD_RISK,
+                    "volatile_reward_risk": config.PORTFOLIO_VOLATILE_REWARD_RISK,
+                    "trend_time_limit_hours": config.PORTFOLIO_TREND_TIME_LIMIT_HOURS,
+                    "base_time_limit_hours": config.PORTFOLIO_BASE_TIME_LIMIT_HOURS,
+                    "volatile_time_limit_hours": config.PORTFOLIO_VOLATILE_TIME_LIMIT_HOURS,
+                }
+            ),
+            health,
+        )
+
     if "trade_memory" in profile:
         from src.trading.trade_memory import TradeMemory
         c.trade_memory = _safe_init("trade_memory", TradeMemory, health, affects_trading=False)
@@ -295,6 +322,7 @@ def build_subsystems(
                 firewall=c.firewall,
                 agent_scorer=c.agent_scorer,
                 kelly_sizer=c.kelly_sizer,
+                portfolio_sizer=c.portfolio_sizer,
                 trade_memory=c.trade_memory,
                 calibration=c.calibration,
                 regime_forecaster=c.predictive_forecaster,
@@ -311,6 +339,7 @@ def build_subsystems(
             agent_scorer=c.agent_scorer,
             feature_engine=c.feature_engine,
             kelly_sizer=c.kelly_sizer,
+            portfolio_sizer=c.portfolio_sizer,
             trade_memory=c.trade_memory,
             calibration=c.calibration,
             llm_filter=c.llm_filter,
@@ -409,6 +438,7 @@ def build_subsystems(
                 regime_detector=c.regime_detector,
                 arena=c.arena,
                 kelly_sizer=c.kelly_sizer,
+                portfolio_sizer=c.portfolio_sizer,
                 trade_memory=c.trade_memory,
                 calibration=c.calibration,
                 llm_filter=c.llm_filter,

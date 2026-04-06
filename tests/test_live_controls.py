@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 import sqlite3
@@ -5,7 +6,7 @@ import sys
 import tempfile
 import types
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import config
 import main
@@ -30,7 +31,8 @@ from src.core.live_execution import (
 from src.data import database as db
 from src.signals.decision_engine import DecisionEngine
 from src.signals.decision_firewall import DecisionFirewall
-from src.signals.signal_schema import TradeSignal, signal_from_execution_dict
+from src.signals.portfolio_sizer import PortfolioSizer
+from src.signals.signal_schema import RiskParams, SignalSide, SignalSource, TradeSignal, signal_from_execution_dict
 from src.trading.live_trader import (
     HyperliquidSigner,
     LiveTrader,
@@ -1405,6 +1407,183 @@ def test_get_v2_metrics_includes_persisted_decision_research(monkeypatch):
 
     assert metrics["decision_research"][0]["cycle_number"] == 3
     assert metrics["decision_research"][0]["candidates"][0]["name"] == "btc_long"
+
+
+def test_portfolio_sizer_reduces_size_and_adapts_exits_for_loaded_book():
+    sizer = PortfolioSizer(
+        {
+            "min_position_pct": 0.01,
+            "max_coin_exposure_pct": 0.45,
+            "max_side_exposure_pct": 0.65,
+            "max_cluster_exposure_pct": 0.55,
+            "target_volatility_pct": 0.025,
+        }
+    )
+    signal = TradeSignal(
+        coin="SOL",
+        side=SignalSide.LONG,
+        confidence=0.72,
+        source=SignalSource.STRATEGY,
+        reason="loaded-book test",
+        position_pct=0.08,
+        leverage=3.0,
+        risk=RiskParams(stop_loss_pct=0.01, take_profit_pct=0.02, time_limit_hours=24.0),
+    )
+    open_positions = [
+        {
+            "coin": "ETH",
+            "side": "long",
+            "size": 0.5,
+            "entry_price": 3000.0,
+            "leverage": 3.0,
+        }
+    ]
+    decision = sizer.adjust_signal(
+        signal,
+        open_positions=open_positions,
+        account_balance=10_000.0,
+        regime_data={
+            "overall_regime": "volatile",
+            "strategy_guidance": {"size_modifier": 0.4},
+            "per_coin": {"SOL": {"atr_pct": 0.05}},
+        },
+        features={"volatility": 0.05},
+    )
+
+    assert not decision.blocked
+    assert 0.01 <= decision.position_pct < 0.08
+    assert decision.stop_loss_pct > 0.01
+    assert decision.time_limit_hours <= 12.0
+    assert "cluster_exposure_cap" in decision.reasons
+
+
+def test_portfolio_sizer_blocks_when_same_side_book_is_full():
+    sizer = PortfolioSizer({"max_side_exposure_pct": 0.65})
+    signal = TradeSignal(
+        coin="ETH",
+        side=SignalSide.LONG,
+        confidence=0.7,
+        source=SignalSource.STRATEGY,
+        reason="headroom test",
+        position_pct=0.05,
+        leverage=2.0,
+        risk=RiskParams(),
+    )
+    open_positions = [
+        {
+            "coin": "BTC",
+            "side": "long",
+            "size": 2.2,
+            "entry_price": 1000.0,
+            "leverage": 3.0,
+        }
+    ]
+
+    decision = sizer.adjust_signal(
+        signal,
+        open_positions=open_positions,
+        account_balance=10_000.0,
+        regime_data={"overall_regime": "trending_up"},
+    )
+
+    assert decision.blocked is True
+    assert "headroom" in decision.block_reason
+
+
+def test_paper_trader_syncs_adjusted_trade_signal_into_execution_payload():
+    fake_features = types.ModuleType("src.analysis.features")
+    fake_features.FeatureEngine = object
+    sys.modules["src.analysis.features"] = fake_features
+    fake_kelly = types.ModuleType("src.signals.kelly_sizing")
+    fake_kelly.KellySizer = object
+    sys.modules["src.signals.kelly_sizing"] = fake_kelly
+    fake_trade_memory = types.ModuleType("src.trading.trade_memory")
+    fake_trade_memory.TradeMemory = object
+    sys.modules["src.trading.trade_memory"] = fake_trade_memory
+    import importlib
+
+    sys.modules.pop("src.trading.paper_trader", None)
+    PaperTrader = importlib.import_module("src.trading.paper_trader").PaperTrader
+    trader = PaperTrader()
+    trade_signal = TradeSignal(
+        coin="BTC",
+        side=SignalSide.LONG,
+        confidence=0.8,
+        source=SignalSource.STRATEGY,
+        reason="sync sizing",
+        position_pct=0.02,
+        leverage=2.0,
+        risk=RiskParams(stop_loss_pct=0.01, take_profit_pct=0.03, time_limit_hours=18.0),
+    )
+    signal = {
+        "coin": "BTC",
+        "side": "long",
+        "price": 100.0,
+        "size": 8.0,
+        "leverage": 2.0,
+        "stop_loss": 95.0,
+        "take_profit": 110.0,
+    }
+
+    assert trader._sync_signal_from_trade_signal(
+        trade_signal,
+        signal,
+        account_balance=10_000.0,
+    )
+    assert abs(signal["size"] - 2.0) < 1e-9
+    assert abs(signal["stop_loss"] - 99.0) < 1e-9
+    assert abs(signal["take_profit"] - 103.0) < 1e-9
+    assert signal["time_limit_hours"] == 18.0
+
+
+def test_check_open_positions_uses_trade_specific_time_limit(monkeypatch):
+    fake_features = types.ModuleType("src.analysis.features")
+    fake_features.FeatureEngine = object
+    sys.modules["src.analysis.features"] = fake_features
+    fake_kelly = types.ModuleType("src.signals.kelly_sizing")
+    fake_kelly.KellySizer = object
+    sys.modules["src.signals.kelly_sizing"] = fake_kelly
+    fake_trade_memory = types.ModuleType("src.trading.trade_memory")
+    fake_trade_memory.TradeMemory = object
+    sys.modules["src.trading.trade_memory"] = fake_trade_memory
+    import importlib
+
+    sys.modules.pop("src.trading.paper_trader", None)
+    PaperTrader = importlib.import_module("src.trading.paper_trader").PaperTrader
+    monkeypatch.setattr(
+        db,
+        "get_paper_account",
+        lambda: {"balance": 10_000.0, "total_pnl": 0.0, "total_trades": 0, "winning_trades": 0},
+    )
+    trader = PaperTrader()
+    opened_at = (datetime.utcnow() - timedelta(hours=8)).isoformat()
+    trade = {
+        "id": 7,
+        "coin": "BTC",
+        "side": "long",
+        "entry_price": 100.0,
+        "size": 1.0,
+        "leverage": 2.0,
+        "stop_loss": 90.0,
+        "take_profit": 120.0,
+        "opened_at": opened_at,
+        "metadata": json.dumps({"time_limit_hours": 6.0}),
+    }
+    monkeypatch.setattr(db, "get_open_paper_trades", lambda: [trade])
+    monkeypatch.setattr("src.trading.paper_trader.hl.get_all_mids", lambda: {"BTC": 100.0})
+
+    closed_reasons = []
+
+    def fake_close_trade(trade_obj, current_price, close_reason):
+        closed_reasons.append(close_reason)
+        return {"trade_id": trade_obj["id"], "reason": close_reason}
+
+    monkeypatch.setattr(trader, "_close_trade", fake_close_trade)
+
+    closed = trader.check_open_positions()
+
+    assert closed_reasons == ["time_exit"]
+    assert closed[0]["reason"] == "time_exit"
 
 
 def test_run_trading_cycle_does_not_fall_through_to_standalone_options_flow(monkeypatch):

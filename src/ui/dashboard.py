@@ -396,6 +396,7 @@ _firewall = None
 _regime_detector = None
 _arena = None
 _kelly_sizer = None
+_portfolio_sizer = None
 _trade_memory = None
 _calibration = None
 _llm_filter = None
@@ -515,19 +516,20 @@ def _close_paper_trade_at_market(trade_id: int) -> dict:
 
 
 def set_v2_components(firewall=None, regime_detector=None, arena=None,
-                       kelly_sizer=None, trade_memory=None, calibration=None,
+                       kelly_sizer=None, portfolio_sizer=None, trade_memory=None, calibration=None,
                        llm_filter=None, liquidation_strategy=None,
                        signal_processor=None, arena_incubator=None,
                        decision_engine=None, multi_scanner=None):
     """Set V2 + V2.5 + V3 + V4 component references for dashboard metrics."""
     global _firewall, _regime_detector, _arena  # noqa: PLW0603
-    global _kelly_sizer, _trade_memory, _calibration, _llm_filter, _liquidation_strategy  # noqa
+    global _kelly_sizer, _portfolio_sizer, _trade_memory, _calibration, _llm_filter, _liquidation_strategy  # noqa
     global _signal_processor, _arena_incubator, _decision_engine  # noqa
     global _multi_scanner  # noqa
     _firewall = firewall
     _regime_detector = regime_detector
     _arena = arena
     _kelly_sizer = kelly_sizer
+    _portfolio_sizer = portfolio_sizer
     _trade_memory = trade_memory
     _calibration = calibration
     _llm_filter = llm_filter
@@ -1140,6 +1142,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 try:
                     if _kelly_sizer:
                         v25["kelly"] = _kelly_sizer.get_all_sizing_stats()
+                except Exception:
+                    pass
+                try:
+                    if _portfolio_sizer:
+                        v25["portfolio_sizer"] = _portfolio_sizer.get_stats()
                 except Exception:
                     pass
                 try:

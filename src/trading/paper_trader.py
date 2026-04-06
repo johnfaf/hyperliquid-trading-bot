@@ -33,6 +33,7 @@ from src.signals.decision_firewall import DecisionFirewall
 from src.signals.agent_scoring import AgentScorer
 from src.analysis.features import FeatureEngine
 from src.signals.kelly_sizing import KellySizer
+from src.signals.portfolio_sizer import PortfolioSizer
 from src.trading.trade_memory import TradeMemory
 from src.trading.portfolio_rotation import PortfolioRotationManager
 from src.signals.calibration import CalibrationTracker
@@ -49,6 +50,7 @@ class PaperTrader:
                  agent_scorer: Optional[AgentScorer] = None,
                  feature_engine: Optional[FeatureEngine] = None,
                  kelly_sizer: Optional[KellySizer] = None,
+                 portfolio_sizer: Optional[PortfolioSizer] = None,
                  trade_memory: Optional[TradeMemory] = None,
                  calibration: Optional[CalibrationTracker] = None,
                  llm_filter: Optional[LLMFilter] = None):
@@ -56,6 +58,7 @@ class PaperTrader:
         self.agent_scorer = agent_scorer
         self.feature_engine = feature_engine
         self.kelly_sizer = kelly_sizer
+        self.portfolio_sizer = portfolio_sizer
         self.trade_memory = trade_memory
         self.calibration = calibration
         self.llm_filter = llm_filter
@@ -151,6 +154,81 @@ class PaperTrader:
             "agent_id": agent_id,
             "agent_name": agent_name,
         }
+
+    @staticmethod
+    def _sync_signal_from_trade_signal(
+        trade_signal: TradeSignal,
+        signal: Dict,
+        *,
+        account_balance: float,
+    ) -> bool:
+        """Carry sizing and adaptive risk from TradeSignal into the execution dict."""
+        price = float(signal.get("price", trade_signal.entry_price) or trade_signal.entry_price or 0.0)
+        if price <= 0 or account_balance <= 0:
+            return False
+
+        position_pct = max(float(trade_signal.position_pct or 0.0), 0.0)
+        if position_pct <= 0:
+            return False
+
+        size_usd = account_balance * position_pct
+        signal["position_pct"] = position_pct
+        signal["size"] = size_usd / price
+        signal["stop_loss_pct"] = float(trade_signal.risk.stop_loss_pct or 0.0)
+        signal["take_profit_pct"] = float(trade_signal.risk.take_profit_pct or 0.0)
+        signal["time_limit_hours"] = float(trade_signal.risk.time_limit_hours or 24.0)
+
+        if signal.get("side") == "long":
+            signal["stop_loss"] = price * (1 - signal["stop_loss_pct"])
+            signal["take_profit"] = price * (1 + signal["take_profit_pct"])
+        else:
+            signal["stop_loss"] = price * (1 + signal["stop_loss_pct"])
+            signal["take_profit"] = price * (1 - signal["take_profit_pct"])
+        return True
+
+    def _apply_portfolio_sizing(
+        self,
+        trade_signal: TradeSignal,
+        signal: Dict,
+        *,
+        open_positions: List[Dict],
+        account_balance: float,
+        regime_data: Optional[Dict],
+    ) -> bool:
+        """Apply portfolio-aware sizing and propagate it to the execution payload."""
+        sizing_context = None
+        if self.portfolio_sizer:
+            try:
+                sizing_context = self.portfolio_sizer.apply_to_signal(
+                    trade_signal,
+                    open_positions=open_positions,
+                    account_balance=account_balance,
+                    regime_data=regime_data,
+                    features=signal.get("features", {}),
+                )
+            except Exception as exc:
+                logger.debug("Portfolio sizing error for %s %s: %s", signal.get("side"), signal.get("coin"), exc)
+
+        if sizing_context and sizing_context.blocked:
+            logger.info(
+                "Portfolio sizing blocked %s %s: %s",
+                signal.get("side"),
+                signal.get("coin"),
+                sizing_context.block_reason,
+            )
+            return False
+
+        if not self._sync_signal_from_trade_signal(
+            trade_signal,
+            signal,
+            account_balance=account_balance,
+        ):
+            return False
+
+        if sizing_context:
+            signal["portfolio_sizing"] = sizing_context.to_dict()
+            signal["cluster"] = sizing_context.cluster
+        return True
 
     def execute_strategy_signals(self, strategies: List[Dict], exchange_agg=None,
                                   options_scanner=None,
@@ -572,6 +650,20 @@ class PaperTrader:
                     trade for trade in open_trades if trade.get("id") != victim.get("id")
                 ]
 
+            if not self._apply_portfolio_sizing(
+                trade_signal,
+                sig,
+                open_positions=candidate_open_positions,
+                account_balance=float(account.get("balance", 0) or 0),
+                regime_data=regime_data,
+            ):
+                logger.info(
+                    "Sizing skipped %s %s before execution",
+                    sig["side"],
+                    sig["coin"],
+                )
+                continue
+
             if self.firewall:
                 passed, reason = self.firewall.validate(
                     trade_signal,
@@ -946,6 +1038,10 @@ class PaperTrader:
                     "volume_confirmed": signal.get("volume_confirmed"),
                     "agent_id": signal.get("agent_id", ""),
                     "agent_name": signal.get("agent_name", ""),
+                    "position_pct": signal.get("position_pct", 0),
+                    "time_limit_hours": signal.get("time_limit_hours", 24.0),
+                    "portfolio_sizing": signal.get("portfolio_sizing", {}),
+                    "cluster": signal.get("cluster", ""),
                 },
             )
 
@@ -962,9 +1058,11 @@ class PaperTrader:
                 "side": signal["side"],
                 "entry_price": slipped_price,
                 "size": signal["size"],
+                "position_pct": signal.get("position_pct", 0),
                 "leverage": signal["leverage"],
                 "stop_loss": signal["stop_loss"],
                 "take_profit": signal["take_profit"],
+                "time_limit_hours": signal.get("time_limit_hours", 24.0),
                 "strategy_id": strategy.get("id"),
                 "strategy_type": signal.get("strategy_type", ""),
                 "confidence": signal.get("confidence", 0),
@@ -1012,6 +1110,10 @@ class PaperTrader:
                     "volume_confirmed": signal.get("volume_confirmed"),
                     "agent_id": signal.get("agent_id", ""),
                     "agent_name": signal.get("agent_name", ""),
+                    "position_pct": signal.get("position_pct", 0),
+                    "time_limit_hours": signal.get("time_limit_hours", 24.0),
+                    "portfolio_sizing": signal.get("portfolio_sizing", {}),
+                    "cluster": signal.get("cluster", ""),
                 },
             }
         except Exception as e:
@@ -1319,12 +1421,15 @@ class PaperTrader:
                     should_close = True
                     close_reason = "take_profit"
 
-            # Time-based exit: close positions older than 24 hours.
+            # Time-based exit: close positions using the per-trade limit when
+            # present, otherwise fall back to 24 hours.
             # HIGH-FIX HIGH-7: strip any timezone offset before parsing so that
             # naive datetime.utcnow() comparisons never raise TypeError when
             # opened_at was stored with a +00:00 suffix by a timezone-aware path.
             if not should_close and trade.get("opened_at"):
                 try:
+                    trade_meta = self._coerce_metadata(trade.get("metadata", {}))
+                    time_limit_hours = float(trade_meta.get("time_limit_hours", 24.0) or 24.0)
                     opened_str = trade["opened_at"]
                     if opened_str.endswith("Z"):
                         opened_str = opened_str[:-1]
@@ -1332,9 +1437,9 @@ class PaperTrader:
                         opened_str = opened_str.split("+")[0]
                     opened = datetime.fromisoformat(opened_str)
                     age_hours = (datetime.utcnow() - opened).total_seconds() / 3600
-                    if age_hours > 24:
+                    if age_hours > time_limit_hours:
                         should_close = True
-                        close_reason = "time_exit_24h"
+                        close_reason = "time_exit"
                 except (ValueError, TypeError):
                     pass
 

@@ -27,6 +27,7 @@ This branch is the staged upgrade path for making the bot more measurable, more 
 
 ## Phase 4: Portfolio Construction And Sizing
 
+- Status: shipped on `codex/live-ledger-foundation`
 - Move from per-trade sizing to portfolio-aware sizing.
 - Add cluster exposure, side exposure, BTC beta, and volatility targeting controls.
 - Make stops, targets, and time-in-trade exits adaptive instead of mostly fixed.

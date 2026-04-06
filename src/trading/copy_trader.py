@@ -9,17 +9,19 @@ V2: Signals routed through DecisionFirewall and tracked by AgentScorer.
 import logging
 import json
 from datetime import datetime
-from typing import List, Dict, Optional, Set, Tuple
+from typing import Dict, List, Optional
 
-import sys, os
+import os
+import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import config
 from src.data import database as db
 from src.data import hyperliquid_client as hl
-from src.signals.signal_schema import TradeSignal, SignalSide, SignalSource, RiskParams, signal_from_copy_trade
+from src.signals.signal_schema import TradeSignal, signal_from_copy_trade
 from src.signals.decision_firewall import DecisionFirewall
 from src.signals.agent_scoring import AgentScorer
 from src.signals.kelly_sizing import KellySizer
+from src.signals.portfolio_sizer import PortfolioSizer
 from src.trading.trade_memory import TradeMemory
 from src.trading.portfolio_rotation import PortfolioRotationManager
 from src.signals.calibration import CalibrationTracker
@@ -33,6 +35,7 @@ class CopyTrader:
     def __init__(self, firewall: Optional[DecisionFirewall] = None,
                  agent_scorer: Optional[AgentScorer] = None,
                  kelly_sizer: Optional[KellySizer] = None,
+                 portfolio_sizer: Optional[PortfolioSizer] = None,
                  trade_memory: Optional[TradeMemory] = None,
                  calibration: Optional[CalibrationTracker] = None,
                  regime_forecaster: Optional[object] = None):
@@ -42,6 +45,7 @@ class CopyTrader:
         self.firewall = firewall
         self.agent_scorer = agent_scorer
         self.kelly_sizer = kelly_sizer
+        self.portfolio_sizer = portfolio_sizer
         self.trade_memory = trade_memory
         self.calibration = calibration
         self.regime_forecaster = regime_forecaster
@@ -224,6 +228,89 @@ class CopyTrader:
         signal["confidence"] = adjusted_confidence
         return signal
 
+    @staticmethod
+    def _sync_signal_from_trade_signal(
+        trade_signal: TradeSignal,
+        signal: Dict,
+        *,
+        account_balance: float,
+    ) -> bool:
+        price = float(signal.get("price", trade_signal.entry_price) or trade_signal.entry_price or 0.0)
+        if price <= 0 or account_balance <= 0:
+            return False
+
+        position_pct = max(float(trade_signal.position_pct or 0.0), 0.0)
+        if position_pct <= 0:
+            return False
+
+        signal["position_pct"] = position_pct
+        signal["size"] = (account_balance * position_pct) / price
+        signal["stop_loss_pct"] = float(trade_signal.risk.stop_loss_pct or 0.0)
+        signal["take_profit_pct"] = float(trade_signal.risk.take_profit_pct or 0.0)
+        signal["time_limit_hours"] = float(trade_signal.risk.time_limit_hours or 24.0)
+        if signal.get("side") == "long":
+            signal["stop_loss"] = price * (1 - signal["stop_loss_pct"])
+            signal["take_profit"] = price * (1 + signal["take_profit_pct"])
+        else:
+            signal["stop_loss"] = price * (1 + signal["stop_loss_pct"])
+            signal["take_profit"] = price * (1 - signal["take_profit_pct"])
+        return True
+
+    def _apply_portfolio_sizing(
+        self,
+        trade_signal: TradeSignal,
+        signal: Dict,
+        *,
+        open_positions: List[Dict],
+        account_balance: float,
+        regime_data: Optional[Dict],
+    ) -> bool:
+        if self.kelly_sizer:
+            try:
+                source_key = signal.get("_source_key") or f"copy_trade:{signal.get('source_trader', 'unknown')}"
+                sizing = self.kelly_sizer.get_sizing(
+                    strategy_key=source_key,
+                    account_balance=account_balance,
+                    signal_confidence=trade_signal.confidence,
+                )
+                trade_signal.position_pct = sizing.position_pct
+            except Exception as exc:
+                logger.debug("Copy Kelly sizing error for %s: %s", signal.get("coin"), exc)
+
+        sizing_context = None
+        if self.portfolio_sizer:
+            try:
+                sizing_context = self.portfolio_sizer.apply_to_signal(
+                    trade_signal,
+                    open_positions=open_positions,
+                    account_balance=account_balance,
+                    regime_data=regime_data,
+                    features=signal.get("features", {}),
+                )
+            except Exception as exc:
+                logger.debug("Copy portfolio sizing error for %s: %s", signal.get("coin"), exc)
+
+        if sizing_context and sizing_context.blocked:
+            logger.info(
+                "  Portfolio sizing blocked copy %s %s: %s",
+                signal.get("side"),
+                signal.get("coin"),
+                sizing_context.block_reason,
+            )
+            return False
+
+        if not self._sync_signal_from_trade_signal(
+            trade_signal,
+            signal,
+            account_balance=account_balance,
+        ):
+            return False
+
+        if sizing_context:
+            signal["portfolio_sizing"] = sizing_context.to_dict()
+            signal["cluster"] = sizing_context.cluster
+        return True
+
     def execute_copy_signals(self, signals: List[Dict],
                               regime_data: Optional[Dict] = None) -> List[Dict]:
         """
@@ -271,6 +358,18 @@ class CopyTrader:
                             source_key = f"copy_trade:{signal.get('source_trader', 'unknown')}"
                             weight = self.agent_scorer.get_weight(source_key)
                             trade_signal.confidence = trade_signal.confidence * 0.6 + weight * 0.4
+
+                        if self.kelly_sizer:
+                            try:
+                                source_key = f"copy_trade:{signal.get('source_trader', 'unknown')}"
+                                sizing = self.kelly_sizer.get_sizing(
+                                    strategy_key=source_key,
+                                    account_balance=account["balance"],
+                                    signal_confidence=trade_signal.confidence,
+                                )
+                                trade_signal.position_pct = sizing.position_pct
+                            except Exception as exc:
+                                logger.debug("Copy Kelly pre-screen sizing error for %s: %s", signal.get("coin"), exc)
 
                         passed, reason = self.firewall.validate(
                             trade_signal,
@@ -393,6 +492,20 @@ class CopyTrader:
                     trade for trade in open_trades if trade.get("id") != victim.get("id")
                 ]
 
+            if not self._apply_portfolio_sizing(
+                trade_signal,
+                signal,
+                open_positions=candidate_open_positions,
+                account_balance=float(account.get("balance", 0) or 0),
+                regime_data=regime_data,
+            ):
+                logger.info(
+                    "  Copy sizing skipped %s %s before execution",
+                    signal["side"],
+                    signal["coin"],
+                )
+                continue
+
             if self.firewall:
                 passed, reason = self.firewall.validate(
                     trade_signal,
@@ -475,8 +588,14 @@ class CopyTrader:
 
     def _open_copy_trade(self, account: Dict, signal: Dict, open_trades: List) -> Optional[Dict]:
         """Open a paper trade based on a copy signal."""
-        # Kelly-based position sizing if available, else default 5%
-        if self.kelly_sizer:
+        price = signal["price"]
+        if price <= 0:
+            return None
+
+        position_pct = float(signal.get("position_pct", 0.0) or 0.0)
+        if position_pct > 0:
+            size_usd = account["balance"] * position_pct
+        elif self.kelly_sizer:
             try:
                 source_key = f"copy_trade:{signal.get('source_trader', 'unknown')}"
                 sizing = self.kelly_sizer.get_sizing(
@@ -485,15 +604,12 @@ class CopyTrader:
                     signal_confidence=signal.get("confidence", 0.5),
                 )
                 size_usd = sizing.position_usd
+                position_pct = sizing.position_pct
             except Exception:
                 size_usd = account["balance"] * 0.05 * signal.get("confidence", 0.5)
         else:
             size_usd = account["balance"] * 0.05 * signal.get("confidence", 0.5)
-        price = signal["price"]
-        if price <= 0:
-            return None
-
-        size = size_usd / price
+        size = signal.get("size") or (size_usd / price)
         leverage = signal.get("leverage", 2)
         side = signal["side"]
 
@@ -508,13 +624,15 @@ class CopyTrader:
         if coin_copies >= 5:
             return None
 
-        # SL/TP
-        if side == "long":
-            stop_loss = price * (1 - 0.04 / leverage)
-            take_profit = price * (1 + 0.08 / leverage)
-        else:
-            stop_loss = price * (1 + 0.04 / leverage)
-            take_profit = price * (1 - 0.08 / leverage)
+        stop_loss = signal.get("stop_loss")
+        take_profit = signal.get("take_profit")
+        if not stop_loss or not take_profit:
+            if side == "long":
+                stop_loss = price * (1 - 0.04 / leverage)
+                take_profit = price * (1 + 0.08 / leverage)
+            else:
+                stop_loss = price * (1 + 0.04 / leverage)
+                take_profit = price * (1 - 0.08 / leverage)
 
         try:
             execution_role = signal.get("execution_role", config.PAPER_TRADING_DEFAULT_EXECUTION_ROLE)
@@ -543,6 +661,10 @@ class CopyTrader:
                     "taker_fee_bps": config.PAPER_TRADING_TAKER_FEE_BPS,
                     "intended_entry_price": price,
                     "entry_slipped_price": price,
+                    "position_pct": position_pct,
+                    "time_limit_hours": signal.get("time_limit_hours", 24.0),
+                    "portfolio_sizing": signal.get("portfolio_sizing", {}),
+                    "cluster": signal.get("cluster", ""),
                 },
             )
             logger.info(
@@ -555,9 +677,11 @@ class CopyTrader:
                 "side": side,
                 "entry_price": price,
                 "size": size,
+                "position_pct": position_pct,
                 "leverage": leverage,
                 "stop_loss": stop_loss,
                 "take_profit": take_profit,
+                "time_limit_hours": signal.get("time_limit_hours", 24.0),
                 "strategy_id": None,
                 "strategy_type": "copy_trade",
                 "confidence": signal.get("confidence", 0),
@@ -580,6 +704,10 @@ class CopyTrader:
                     "taker_fee_bps": config.PAPER_TRADING_TAKER_FEE_BPS,
                     "intended_entry_price": price,
                     "entry_slipped_price": price,
+                    "position_pct": position_pct,
+                    "time_limit_hours": signal.get("time_limit_hours", 24.0),
+                    "portfolio_sizing": signal.get("portfolio_sizing", {}),
+                    "cluster": signal.get("cluster", ""),
                 },
             }
         except Exception as e:
