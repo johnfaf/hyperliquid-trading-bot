@@ -446,6 +446,24 @@ def _build_experiment_discipline_metrics(shadow_tracker=None) -> Dict:
     return metrics
 
 
+def _build_adaptive_learning_metrics(adaptive_learning=None) -> Dict:
+    latest = db.get_latest_source_health_snapshot(limit=12)
+    metrics = {
+        "latest_snapshot": latest.get("snapshot"),
+        "profiles": latest.get("profiles", []),
+        "recent_arena_reviews": db.get_recent_arena_review_events(limit=10),
+    }
+    if adaptive_learning:
+        try:
+            metrics["runtime"] = adaptive_learning.get_dashboard_payload(limit=12)
+        except Exception as exc:
+            logger.debug("dashboard adaptive learning error: %s", exc)
+            metrics["runtime"] = {}
+    else:
+        metrics["runtime"] = {}
+    return metrics
+
+
 # Module-level references for V2 + V2.5 + V3 components (set by set_v2_components)
 _firewall = None
 _regime_detector = None
@@ -461,6 +479,7 @@ _arena_incubator = None
 _decision_engine = None
 _multi_scanner = None
 _shadow_tracker = None
+_adaptive_learning = None
 
 # Module-level live trader reference for closing positions on exchange
 _live_trader = None
@@ -575,12 +594,13 @@ def set_v2_components(firewall=None, regime_detector=None, arena=None,
                        kelly_sizer=None, portfolio_sizer=None, trade_memory=None, calibration=None,
                        llm_filter=None, liquidation_strategy=None,
                        signal_processor=None, arena_incubator=None,
-                       decision_engine=None, multi_scanner=None, shadow_tracker=None):
+                       decision_engine=None, multi_scanner=None, shadow_tracker=None,
+                       adaptive_learning=None):
     """Set V2 + V2.5 + V3 + V4 component references for dashboard metrics."""
     global _firewall, _regime_detector, _arena  # noqa: PLW0603
     global _kelly_sizer, _portfolio_sizer, _trade_memory, _calibration, _llm_filter, _liquidation_strategy  # noqa
     global _signal_processor, _arena_incubator, _decision_engine  # noqa
-    global _multi_scanner, _shadow_tracker  # noqa
+    global _multi_scanner, _shadow_tracker, _adaptive_learning  # noqa
     _firewall = firewall
     _regime_detector = regime_detector
     _arena = arena
@@ -595,6 +615,7 @@ def set_v2_components(firewall=None, regime_detector=None, arena=None,
     _decision_engine = decision_engine
     _multi_scanner = multi_scanner
     _shadow_tracker = shadow_tracker
+    _adaptive_learning = adaptive_learning
 
 
 DASHBOARD_HTML = """<!DOCTYPE html>
@@ -1286,6 +1307,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     pass
                 try:
                     v25["experiment_discipline"] = _build_experiment_discipline_metrics(_shadow_tracker)
+                except Exception:
+                    pass
+                try:
+                    v25["adaptive_learning"] = _build_adaptive_learning_metrics(_adaptive_learning)
                 except Exception:
                     pass
                 if v25:

@@ -40,7 +40,7 @@ FULL_PROFILE = FUNDABLE_CORE | {
     "predictive_forecaster", "xgboost_forecaster", "multi_scanner",
     "liquidation_strategy", "kelly_sizer", "portfolio_sizer", "trade_memory", "calibration",
     "llm_filter", "signal_processor", "arena_incubator", "decision_engine",
-    "alpha_arena", "position_monitor", "dashboard", "telegram",
+    "alpha_arena", "adaptive_learning", "position_monitor", "dashboard", "telegram",
     "cross_venue_hedger", "shadow_tracker", "adaptive_bot_detector",
     "regime_strategy_filter", "exchange_aggregator",
 }
@@ -80,6 +80,7 @@ class SubsystemContainer:
     portfolio_sizer: Any = None
     trade_memory: Any = None
     calibration: Any = None
+    adaptive_learning: Any = None
     llm_filter: Any = None
     signal_processor: Any = None
     arena_incubator: Any = None
@@ -250,6 +251,39 @@ def build_subsystems(
         from src.signals.calibration import CalibrationTracker
         c.calibration = _safe_init("calibration", CalibrationTracker, health, affects_trading=False)
 
+    if "adaptive_learning" in profile:
+        from src.signals.adaptive_learning import AdaptiveLearningManager
+        c.adaptive_learning = _safe_init(
+            "adaptive_learning",
+            lambda: AdaptiveLearningManager(
+                {
+                    "enabled": config.ADAPTIVE_LEARNING_ENABLED,
+                    "lookback_hours": config.ADAPTIVE_LEARNING_LOOKBACK_HOURS,
+                    "recent_lookback_hours": config.ADAPTIVE_LEARNING_RECENT_LOOKBACK_HOURS,
+                    "report_limit_cycles": config.EXPERIMENT_REPORT_LIMIT_CYCLES,
+                    "refresh_interval_cycles": config.ADAPTIVE_LEARNING_REFRESH_INTERVAL_CYCLES,
+                    "min_closed_trades": config.ADAPTIVE_LEARNING_MIN_CLOSED_TRADES,
+                    "min_recent_closed_trades": config.ADAPTIVE_LEARNING_MIN_RECENT_CLOSED_TRADES,
+                    "min_selected_candidates": config.ADAPTIVE_LEARNING_MIN_SELECTED_CANDIDATES,
+                    "caution_health_floor": config.ADAPTIVE_LEARNING_CAUTION_HEALTH_FLOOR,
+                    "promotion_health_floor": config.ADAPTIVE_LEARNING_PROMOTION_HEALTH_FLOOR,
+                    "caution_drift_threshold": config.ADAPTIVE_LEARNING_CAUTION_DRIFT_THRESHOLD,
+                    "block_drift_threshold": config.ADAPTIVE_LEARNING_BLOCK_DRIFT_THRESHOLD,
+                    "max_calibration_ece": config.ADAPTIVE_LEARNING_MAX_CALIBRATION_ECE,
+                    "min_weight_multiplier": config.ADAPTIVE_LEARNING_MIN_WEIGHT_MULTIPLIER,
+                    "return_scale": config.ADAPTIVE_LEARNING_RETURN_SCALE,
+                    "arena_min_trades": config.ADAPTIVE_ARENA_MIN_TRADES,
+                    "arena_min_win_rate": config.ADAPTIVE_ARENA_MIN_WIN_RATE,
+                    "arena_min_sharpe": config.ADAPTIVE_ARENA_MIN_SHARPE,
+                    "arena_max_drawdown": config.ADAPTIVE_ARENA_MAX_DRAWDOWN,
+                },
+                agent_scorer=c.agent_scorer,
+                calibration=c.calibration,
+            ),
+            health,
+            affects_trading=False,
+        )
+
     if "llm_filter" in profile:
         from src.signals.llm_filter import LLMFilter
         c.llm_filter = _safe_init("llm_filter", LLMFilter, health)
@@ -293,6 +327,10 @@ def build_subsystems(
                     "execution_protective_failure_penalty_bps": (
                         config.DECISION_EXECUTION_PROTECTIVE_FAILURE_PENALTY_BPS
                     ),
+                    "adaptive_learning": c.adaptive_learning,
+                    "adaptive_learning_enabled": config.ADAPTIVE_LEARNING_ENABLED,
+                    "adaptive_learning_block_on_status": config.ADAPTIVE_LEARNING_BLOCK_ON_STATUS,
+                    "adaptive_learning_min_health_score": config.ADAPTIVE_LEARNING_MIN_HEALTH_SCORE,
                 }
             ),
             health,
@@ -301,6 +339,11 @@ def build_subsystems(
     if "alpha_arena" in profile:
         from src.signals.alpha_arena import AlphaArena
         c.arena = _safe_init("alpha_arena", AlphaArena, health, affects_trading=False)
+        if c.adaptive_learning:
+            try:
+                c.adaptive_learning.attach(arena=c.arena)
+            except Exception:
+                pass
 
     # ─── Options Flow ─────────────────────────────────────────
     if "options_flow" in profile:
@@ -449,6 +492,7 @@ def build_subsystems(
                 portfolio_sizer=c.portfolio_sizer,
                 trade_memory=c.trade_memory,
                 calibration=c.calibration,
+                adaptive_learning=c.adaptive_learning,
                 llm_filter=c.llm_filter,
                 liquidation_strategy=c.liquidation_strategy,
                 signal_processor=c.signal_processor,

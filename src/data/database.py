@@ -371,6 +371,65 @@ def init_db():
             ON decision_research_candidates(research_cycle_id, candidate_rank);
         CREATE INDEX IF NOT EXISTS idx_decision_research_candidates_status
             ON decision_research_candidates(status);
+
+        CREATE TABLE IF NOT EXISTS source_health_batches (
+            snapshot_id TEXT PRIMARY KEY,
+            timestamp TEXT NOT NULL,
+            profile_count INTEGER DEFAULT 0,
+            metadata TEXT DEFAULT '{}'
+        );
+        CREATE INDEX IF NOT EXISTS idx_source_health_batches_timestamp
+            ON source_health_batches(timestamp);
+
+        CREATE TABLE IF NOT EXISTS source_health_profiles (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            snapshot_id TEXT NOT NULL,
+            source_key TEXT NOT NULL,
+            source TEXT,
+            status TEXT DEFAULT 'warming_up',
+            training_label TEXT DEFAULT 'monitor',
+            recommended_action TEXT DEFAULT 'monitor',
+            health_score REAL DEFAULT 0,
+            weight_multiplier REAL DEFAULT 1,
+            confidence_multiplier REAL DEFAULT 1,
+            sample_size INTEGER DEFAULT 0,
+            recent_sample_size INTEGER DEFAULT 0,
+            selection_count INTEGER DEFAULT 0,
+            closed_trades INTEGER DEFAULT 0,
+            recent_closed_trades INTEGER DEFAULT 0,
+            win_rate REAL DEFAULT 0,
+            recent_win_rate REAL DEFAULT 0,
+            avg_return_pct REAL DEFAULT 0,
+            recent_avg_return_pct REAL DEFAULT 0,
+            realized_pnl REAL DEFAULT 0,
+            calibration_ece REAL,
+            drift_score REAL DEFAULT 0,
+            live_success_rate REAL DEFAULT 0,
+            live_rejection_rate REAL DEFAULT 0,
+            metadata TEXT DEFAULT '{}',
+            FOREIGN KEY (snapshot_id) REFERENCES source_health_batches(snapshot_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_source_health_profiles_snapshot
+            ON source_health_profiles(snapshot_id, health_score DESC);
+        CREATE INDEX IF NOT EXISTS idx_source_health_profiles_source
+            ON source_health_profiles(source_key, snapshot_id);
+
+        CREATE TABLE IF NOT EXISTS arena_review_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            agent_id TEXT NOT NULL,
+            agent_name TEXT,
+            strategy_type TEXT,
+            previous_status TEXT,
+            new_status TEXT,
+            action TEXT,
+            reason TEXT,
+            metrics TEXT DEFAULT '{}'
+        );
+        CREATE INDEX IF NOT EXISTS idx_arena_review_events_timestamp
+            ON arena_review_events(timestamp);
+        CREATE INDEX IF NOT EXISTS idx_arena_review_events_agent
+            ON arena_review_events(agent_id, timestamp);
         """)
 
 
@@ -1423,6 +1482,295 @@ def get_source_attribution_summary(limit_cycles: int = 50, lookback_hours: float
         )
     )
     return rows
+
+
+def get_source_trade_outcome_summary(lookback_hours: float = 24.0 * 30) -> list:
+    cutoff = None
+    if lookback_hours and float(lookback_hours) > 0:
+        cutoff = datetime.utcnow() - timedelta(hours=float(lookback_hours))
+
+    try:
+        with get_connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT coin, side, entry_price, size, pnl, status, metadata, opened_at, closed_at
+                FROM paper_trades
+                """
+            ).fetchall()
+    except sqlite3.OperationalError:
+        return []
+
+    by_source = {}
+
+    def _bucket_for(source_key: str, source: str):
+        key = str(source_key or source or "unknown").strip() or "unknown"
+        bucket = by_source.setdefault(
+            key,
+            {
+                "source_key": key,
+                "source": str(source or "unknown").strip().lower() or "unknown",
+                "open_trades": 0,
+                "closed_trades": 0,
+                "winning_trades": 0,
+                "losing_trades": 0,
+                "realized_pnl": 0.0,
+                "gross_profit": 0.0,
+                "gross_loss": 0.0,
+                "avg_return_pct": 0.0,
+                "_return_total": 0.0,
+                "last_closed_at": None,
+            },
+        )
+        if source and bucket["source"] == "unknown":
+            bucket["source"] = str(source).strip().lower() or "unknown"
+        return bucket
+
+    for row in rows:
+        metadata = {}
+        try:
+            metadata = json.loads(row["metadata"] or "{}")
+        except Exception:
+            metadata = {}
+
+        source_key = str(metadata.get("source_key", "") or "").strip()
+        source = str(metadata.get("source", metadata.get("signal_source", "")) or "").strip().lower()
+        bucket = _bucket_for(source_key, source)
+
+        status = str(row["status"] or "").lower()
+        opened_at = _parse_iso_timestamp(row["opened_at"])
+        closed_at = _parse_iso_timestamp(row["closed_at"])
+
+        if status == "open":
+            if cutoff is None or (opened_at and opened_at >= cutoff):
+                bucket["open_trades"] += 1
+            continue
+
+        if status != "closed":
+            continue
+        if cutoff is not None and (closed_at is None or closed_at < cutoff):
+            continue
+
+        pnl = _safe_float(row["pnl"], 0.0)
+        entry_price = _safe_float(row["entry_price"], 0.0)
+        size = abs(_safe_float(row["size"], 0.0))
+        notional = max(entry_price * max(size, 1e-8), 1e-8)
+        return_pct = pnl / notional if notional > 0 else 0.0
+
+        bucket["closed_trades"] += 1
+        bucket["realized_pnl"] += pnl
+        bucket["_return_total"] += return_pct
+        if pnl > 0:
+            bucket["winning_trades"] += 1
+            bucket["gross_profit"] += pnl
+        elif pnl < 0:
+            bucket["losing_trades"] += 1
+            bucket["gross_loss"] += abs(pnl)
+        if closed_at:
+            last_closed = bucket.get("last_closed_at")
+            if not last_closed or str(closed_at.isoformat()) > str(last_closed):
+                bucket["last_closed_at"] = closed_at.isoformat()
+
+    results = []
+    for bucket in by_source.values():
+        closed_trades = int(bucket["closed_trades"] or 0)
+        bucket["win_rate"] = round(
+            bucket["winning_trades"] / closed_trades,
+            4,
+        ) if closed_trades else 0.0
+        bucket["profit_factor"] = round(
+            bucket["gross_profit"] / max(bucket["gross_loss"], 1e-8),
+            4,
+        ) if bucket["gross_profit"] > 0 and bucket["gross_loss"] > 0 else (
+            999.0 if bucket["gross_profit"] > 0 and bucket["gross_loss"] == 0 else 0.0
+        )
+        bucket["avg_return_pct"] = round(
+            bucket["_return_total"] / closed_trades,
+            4,
+        ) if closed_trades else 0.0
+        bucket["realized_pnl"] = round(bucket["realized_pnl"], 2)
+        bucket.pop("_return_total", None)
+        results.append(bucket)
+
+    results.sort(
+        key=lambda item: (
+            -item["closed_trades"],
+            -item["realized_pnl"],
+            item["source_key"],
+        )
+    )
+    return results
+
+
+def save_source_health_snapshot(snapshot: dict) -> str:
+    timestamp = _normalize_live_timestamp(snapshot.get("timestamp"))
+    profiles = snapshot.get("profiles", []) or []
+    metadata = snapshot.get("metadata", {}) or {}
+    snapshot_id = str(
+        snapshot.get("snapshot_id")
+        or f"source-health:{hashlib.sha256(f'{timestamp}:{len(profiles)}'.encode()).hexdigest()[:16]}"
+    )
+
+    with get_connection() as conn:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO source_health_batches
+            (snapshot_id, timestamp, profile_count, metadata)
+            VALUES (?, ?, ?, ?)
+            """,
+            (
+                snapshot_id,
+                timestamp,
+                len(profiles),
+                json.dumps(metadata, sort_keys=True, default=str),
+            ),
+        )
+        conn.execute(
+            "DELETE FROM source_health_profiles WHERE snapshot_id = ?",
+            (snapshot_id,),
+        )
+        for profile in profiles:
+            conn.execute(
+                """
+                INSERT INTO source_health_profiles
+                (snapshot_id, source_key, source, status, training_label, recommended_action,
+                 health_score, weight_multiplier, confidence_multiplier, sample_size,
+                 recent_sample_size, selection_count, closed_trades, recent_closed_trades,
+                 win_rate, recent_win_rate, avg_return_pct, recent_avg_return_pct,
+                 realized_pnl, calibration_ece, drift_score, live_success_rate,
+                 live_rejection_rate, metadata)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    snapshot_id,
+                    str(profile.get("source_key", "") or "").strip() or "unknown",
+                    str(profile.get("source", "") or "").strip().lower() or "unknown",
+                    str(profile.get("status", "warming_up") or "warming_up").strip().lower(),
+                    str(profile.get("training_label", "monitor") or "monitor").strip().lower(),
+                    str(profile.get("recommended_action", "monitor") or "monitor").strip().lower(),
+                    _safe_float(profile.get("health_score"), 0.0),
+                    _safe_float(profile.get("weight_multiplier"), 1.0),
+                    _safe_float(profile.get("confidence_multiplier"), 1.0),
+                    int(profile.get("sample_size", 0) or 0),
+                    int(profile.get("recent_sample_size", 0) or 0),
+                    int(profile.get("selection_count", 0) or 0),
+                    int(profile.get("closed_trades", 0) or 0),
+                    int(profile.get("recent_closed_trades", 0) or 0),
+                    _safe_float(profile.get("win_rate"), 0.0),
+                    _safe_float(profile.get("recent_win_rate"), 0.0),
+                    _safe_float(profile.get("avg_return_pct"), 0.0),
+                    _safe_float(profile.get("recent_avg_return_pct"), 0.0),
+                    _safe_float(profile.get("realized_pnl"), 0.0),
+                    (
+                        None
+                        if profile.get("calibration_ece") in (None, "")
+                        else _safe_float(profile.get("calibration_ece"), 0.0)
+                    ),
+                    _safe_float(profile.get("drift_score"), 0.0),
+                    _safe_float(profile.get("live_success_rate"), 0.0),
+                    _safe_float(profile.get("live_rejection_rate"), 0.0),
+                    json.dumps(profile.get("metadata", {}) or {}, sort_keys=True, default=str),
+                ),
+            )
+    return snapshot_id
+
+
+def get_latest_source_health_snapshot(limit: int = 25) -> dict:
+    try:
+        with get_connection() as conn:
+            batch = conn.execute(
+                """
+                SELECT * FROM source_health_batches
+                ORDER BY timestamp DESC, snapshot_id DESC
+                LIMIT 1
+                """
+            ).fetchone()
+            if not batch:
+                return {"snapshot": None, "profiles": []}
+            rows = conn.execute(
+                """
+                SELECT * FROM source_health_profiles
+                WHERE snapshot_id = ?
+                ORDER BY health_score DESC, sample_size DESC, source_key ASC
+                LIMIT ?
+                """,
+                (batch["snapshot_id"], int(limit)),
+            ).fetchall()
+    except sqlite3.OperationalError:
+        return {"snapshot": None, "profiles": []}
+
+    snapshot = dict(batch)
+    try:
+        snapshot["metadata"] = json.loads(snapshot.get("metadata") or "{}")
+    except Exception:
+        snapshot["metadata"] = {}
+
+    profiles = []
+    for row in rows:
+        payload = dict(row)
+        try:
+            payload["metadata"] = json.loads(payload.get("metadata") or "{}")
+        except Exception:
+            payload["metadata"] = {}
+        profiles.append(payload)
+
+    return {
+        "snapshot": snapshot,
+        "profiles": profiles,
+    }
+
+
+def save_arena_review_events(events: list) -> int:
+    if not events:
+        return 0
+    inserted = 0
+    with get_connection() as conn:
+        for event in events:
+            conn.execute(
+                """
+                INSERT INTO arena_review_events
+                (timestamp, agent_id, agent_name, strategy_type, previous_status,
+                 new_status, action, reason, metrics)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    _normalize_live_timestamp(event.get("timestamp")),
+                    str(event.get("agent_id", "") or "").strip(),
+                    str(event.get("agent_name", "") or "").strip(),
+                    str(event.get("strategy_type", "") or "").strip(),
+                    str(event.get("previous_status", "") or "").strip().lower(),
+                    str(event.get("new_status", "") or "").strip().lower(),
+                    str(event.get("action", "") or "").strip().lower(),
+                    str(event.get("reason", "") or "").strip(),
+                    json.dumps(event.get("metrics", {}) or {}, sort_keys=True, default=str),
+                ),
+            )
+            inserted += 1
+    return inserted
+
+
+def get_recent_arena_review_events(limit: int = 20) -> list:
+    try:
+        with get_connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM arena_review_events
+                ORDER BY timestamp DESC, id DESC
+                LIMIT ?
+                """,
+                (int(limit),),
+            ).fetchall()
+    except sqlite3.OperationalError:
+        return []
+
+    events = []
+    for row in rows:
+        payload = dict(row)
+        try:
+            payload["metrics"] = json.loads(payload.get("metrics") or "{}")
+        except Exception:
+            payload["metrics"] = {}
+        events.append(payload)
+    return events
 
 
 def get_runtime_divergence_summary(lookback_hours: float = 24.0) -> dict:

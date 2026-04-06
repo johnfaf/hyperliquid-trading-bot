@@ -78,6 +78,14 @@ class DecisionEngine:
         self.execution_protective_failure_penalty_bps = float(
             cfg.get("execution_protective_failure_penalty_bps", 18.0)
         )
+        self.adaptive_learning = cfg.get("adaptive_learning")
+        self.adaptive_learning_enabled = bool(cfg.get("adaptive_learning_enabled", True))
+        self.adaptive_learning_block_on_status = bool(
+            cfg.get("adaptive_learning_block_on_status", True)
+        )
+        self.adaptive_learning_min_health_score = float(
+            cfg.get("adaptive_learning_min_health_score", 0.42)
+        )
 
         # Track decisions for audit
         self._decision_history: deque = deque(maxlen=100)
@@ -478,6 +486,13 @@ class DecisionEngine:
         source_quality = execution_quality["source_quality"]
         strategy["_metadata_for_decision"] = execution_quality["metadata"]
         strategy["_execution_quality"] = execution_quality["profile"]
+        adaptive_feedback = self._apply_adaptive_learning_feedback(strategy, confidence, source_quality)
+        confidence = adaptive_feedback["confidence"]
+        source_quality = adaptive_feedback["source_quality"]
+        strategy["_metadata_for_decision"] = adaptive_feedback["metadata"]
+        strategy["_adaptive_learning"] = adaptive_feedback["profile"]
+        strategy["_decision_confidence"] = confidence
+        strategy["_decision_source_quality"] = source_quality
         confirmation = self._confirmation_score(strategy)
         expected_value = self._expected_value_score(
             strategy,
@@ -547,14 +562,34 @@ class DecisionEngine:
                 4,
             ),
             "execution_penalty_bps": round(float(execution_quality["penalty_bps"] or 0.0), 4),
+            "adaptive_health_score": round(
+                float(adaptive_feedback["profile"].get("health_score", 0.0) or 0.0),
+                4,
+            ),
+            "adaptive_drift_score": round(
+                float(adaptive_feedback["profile"].get("drift_score", 0.0) or 0.0),
+                4,
+            ),
+            "adaptive_status": adaptive_feedback["profile"].get("status", "inactive"),
+            "adaptive_weight_multiplier": round(float(adaptive_feedback["weight_multiplier"] or 1.0), 4),
+            "adaptive_confidence_multiplier": round(
+                float(adaptive_feedback["confidence_multiplier"] or 1.0),
+                4,
+            ),
         }
 
     def _decision_blockers(self, strategy: Dict) -> List[str]:
         """Hard floors that keep low-quality candidates out before execution."""
         blockers: List[str] = []
-        confidence = float(strategy.get("confidence", 0.0) or 0.0)
+        confidence = float(
+            strategy.get("_decision_confidence", strategy.get("confidence", 0.0)) or 0.0
+        )
         source_quality = float(
-            strategy.get("agent_scorer_weight", strategy.get("source_accuracy", 0.5)) or 0.5
+            strategy.get(
+                "_decision_source_quality",
+                strategy.get("agent_scorer_weight", strategy.get("source_accuracy", 0.5)),
+            )
+            or 0.5
         )
 
         if confidence < self.min_signal_confidence:
@@ -571,6 +606,21 @@ class DecisionEngine:
         )
         if net_expectancy_pct < self.min_expected_value_pct:
             blockers.append(f"net_ev<{self.min_expected_value_pct:.4f}")
+
+        adaptive_profile = strategy.get("_adaptive_learning", {}) or {}
+        adaptive_status = str(adaptive_profile.get("status", "") or "").strip().lower()
+        adaptive_health_score = float(adaptive_profile.get("health_score", 1.0) or 1.0)
+        if (
+            self.adaptive_learning_enabled
+            and self.adaptive_learning_block_on_status
+            and adaptive_status == "blocked"
+        ):
+            blockers.append("adaptive_blocked")
+        elif (
+            self.adaptive_learning_enabled
+            and adaptive_health_score < self.adaptive_learning_min_health_score
+        ):
+            blockers.append(f"adaptive_health<{self.adaptive_learning_min_health_score:.2f}")
 
         return blockers
 
@@ -673,6 +723,63 @@ class DecisionEngine:
             "source_quality": self._clamp(source_quality * quality_multiplier, 0.0, 1.0),
             "profile": profile,
             "penalty_bps": penalty_bps,
+        }
+
+    def _lookup_adaptive_profile(self, strategy: Dict) -> Dict:
+        if not self.adaptive_learning_enabled or not self.adaptive_learning:
+            return {}
+        metadata = self._get_metadata(strategy)
+        source_key = str(
+            strategy.get("source_key", metadata.get("source_key", "")) or ""
+        ).strip()
+        source = str(
+            strategy.get("source", metadata.get("source", "strategy")) or "strategy"
+        ).strip().lower()
+        try:
+            return self.adaptive_learning.get_source_profile(source_key=source_key, source=source) or {}
+        except Exception as exc:
+            logger.debug("adaptive learning lookup error: %s", exc)
+            return {}
+
+    def _apply_adaptive_learning_feedback(
+        self,
+        strategy: Dict,
+        confidence: float,
+        source_quality: float,
+    ) -> Dict:
+        metadata = dict(self._get_metadata(strategy))
+        profile = self._lookup_adaptive_profile(strategy)
+        if not profile:
+            return {
+                "metadata": metadata,
+                "confidence": confidence,
+                "source_quality": source_quality,
+                "profile": {},
+                "weight_multiplier": 1.0,
+                "confidence_multiplier": 1.0,
+            }
+
+        weight_multiplier = float(profile.get("weight_multiplier", 1.0) or 1.0)
+        confidence_multiplier = float(profile.get("confidence_multiplier", 1.0) or 1.0)
+        metadata["adaptive_status"] = profile.get("status", "active")
+        metadata["adaptive_health_score"] = round(
+            float(profile.get("health_score", 0.0) or 0.0),
+            4,
+        )
+        metadata["adaptive_drift_score"] = round(
+            float(profile.get("drift_score", 0.0) or 0.0),
+            4,
+        )
+        metadata["adaptive_training_label"] = profile.get("training_label", "monitor")
+        metadata["adaptive_recommended_action"] = profile.get("recommended_action", "monitor")
+
+        return {
+            "metadata": metadata,
+            "confidence": self._clamp(confidence * confidence_multiplier, 0.0, 1.0),
+            "source_quality": self._clamp(source_quality * weight_multiplier, 0.0, 1.0),
+            "profile": profile,
+            "weight_multiplier": weight_multiplier,
+            "confidence_multiplier": confidence_multiplier,
         }
 
     def _extract_risk_geometry(self, strategy: Dict, direction: str) -> Dict[str, float]:
@@ -951,6 +1058,9 @@ class DecisionEngine:
             "execution_quality_enabled": self.execution_quality_enabled,
             "execution_quality_lookback_hours": self.execution_quality_lookback_hours,
             "execution_quality_min_events": self.execution_quality_min_events,
+            "adaptive_learning_enabled": self.adaptive_learning_enabled,
+            "adaptive_learning_block_on_status": self.adaptive_learning_block_on_status,
+            "adaptive_learning_min_health_score": self.adaptive_learning_min_health_score,
             "last_research_cycle_id": self._last_research_cycle_id,
             "recent_decisions": list(self._decision_history)[-10:],
         }

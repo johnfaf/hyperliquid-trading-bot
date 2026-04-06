@@ -50,6 +50,7 @@ def build_decision_engine_config(overrides: Optional[Dict] = None) -> Dict:
         "execution_protective_failure_penalty_bps": (
             config.DECISION_EXECUTION_PROTECTIVE_FAILURE_PENALTY_BPS
         ),
+        "adaptive_learning_enabled": False,
     }
     if overrides:
         cfg.update(overrides)

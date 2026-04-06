@@ -46,6 +46,14 @@ This branch is the staged upgrade path for making the bot more measurable, more 
 - Require out-of-sample comparisons before promoting new ranking logic.
 - Publish decision funnels, source attribution, and divergence between paper, shadow, and live.
 
+## Phase 7: Adaptive Learning And Promotion
+
+- Status: shipped on `codex/live-ledger-foundation`
+- Build drift-aware source-health profiles from realized paper/live outcomes.
+- Feed adaptive health, calibration, and drift back into the main decision engine.
+- Review arena agents continuously so degraded champions are demoted and recovered agents can return.
+- Expose source health, arena review actions, and adaptive learning state in reporting and the dashboard.
+
 ## Branch Operating Rule
 
 Each phase should be landed in a reviewable commit with tests before moving to the next phase.

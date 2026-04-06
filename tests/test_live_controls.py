@@ -30,6 +30,7 @@ from src.core.live_execution import (
     sync_shadow_book_to_live,
 )
 from src.data import database as db
+from src.signals.adaptive_learning import AdaptiveLearningManager
 from src.signals.decision_engine import DecisionEngine
 from src.signals.decision_firewall import DecisionFirewall
 from src.signals.portfolio_sizer import PortfolioSizer
@@ -1497,6 +1498,334 @@ def test_decision_funnel_source_attribution_and_divergence_summaries(monkeypatch
             os.remove(db_path)
 
 
+def test_source_trade_outcome_summary_and_health_snapshot_round_trip(monkeypatch):
+    fd, raw_path = tempfile.mkstemp(prefix="adaptive_learning_", suffix=".db", dir=os.getcwd())
+    os.close(fd)
+    db_path = os.path.abspath(raw_path)
+    original_path = db._DB_PATH
+    monkeypatch.setattr(db, "_DB_PATH", db_path)
+
+    try:
+        db.init_db()
+        trade_id = db.open_paper_trade(
+            strategy_id=1,
+            coin="BTC",
+            side="long",
+            entry_price=100.0,
+            size=1.0,
+            metadata={"source": "polymarket", "source_key": "polymarket:BTC"},
+        )
+        db.close_paper_trade(trade_id, exit_price=107.0, pnl=7.0)
+        with db.get_connection() as conn:
+            conn.execute(
+                "UPDATE paper_trades SET closed_at = ? WHERE id = ?",
+                (datetime.utcnow().isoformat(), trade_id),
+            )
+
+        summary = db.get_source_trade_outcome_summary(lookback_hours=48)
+        snapshot_id = db.save_source_health_snapshot(
+            {
+                "timestamp": datetime.utcnow().isoformat(),
+                "metadata": {"summary": {"sources_tracked": 1}},
+                "profiles": [
+                    {
+                        "source_key": "polymarket:BTC",
+                        "source": "polymarket",
+                        "status": "active",
+                        "training_label": "promote",
+                        "recommended_action": "increase weight and keep in main ranking set",
+                        "health_score": 0.81,
+                        "weight_multiplier": 1.12,
+                        "confidence_multiplier": 1.05,
+                        "sample_size": 6,
+                        "recent_sample_size": 3,
+                        "selection_count": 8,
+                        "closed_trades": 1,
+                        "recent_closed_trades": 1,
+                        "win_rate": 1.0,
+                        "recent_win_rate": 1.0,
+                        "avg_return_pct": 0.07,
+                        "recent_avg_return_pct": 0.07,
+                        "realized_pnl": 7.0,
+                        "calibration_ece": 0.03,
+                        "drift_score": 0.01,
+                        "live_success_rate": 1.0,
+                        "live_rejection_rate": 0.0,
+                        "metadata": {"selection_share": 1.0},
+                    }
+                ],
+            }
+        )
+        latest = db.get_latest_source_health_snapshot(limit=5)
+
+        assert summary[0]["source_key"] == "polymarket:BTC"
+        assert summary[0]["closed_trades"] == 1
+        assert summary[0]["win_rate"] == 1.0
+        assert latest["snapshot"]["snapshot_id"] == snapshot_id
+        assert latest["profiles"][0]["source_key"] == "polymarket:BTC"
+        assert latest["profiles"][0]["training_label"] == "promote"
+    finally:
+        monkeypatch.setattr(db, "_DB_PATH", original_path)
+        if os.path.exists(db_path):
+            os.remove(db_path)
+
+
+def test_adaptive_learning_manager_refreshes_profiles_and_reviews_arena(monkeypatch):
+    fd, raw_path = tempfile.mkstemp(prefix="adaptive_manager_", suffix=".db", dir=os.getcwd())
+    os.close(fd)
+    db_path = os.path.abspath(raw_path)
+    original_path = db._DB_PATH
+    monkeypatch.setattr(db, "_DB_PATH", db_path)
+
+    class FakeScorer:
+        def get_all_scores(self):
+            return [
+                {
+                    "source_key": "polymarket:BTC",
+                    "total_signals": 14,
+                    "accuracy": 0.72,
+                    "weighted_accuracy": 0.75,
+                    "sharpe": 1.3,
+                    "dynamic_weight": 0.84,
+                    "total_pnl": 42.0,
+                },
+                {
+                    "source_key": "arena_champion:seed_breakout",
+                    "total_signals": 12,
+                    "accuracy": 0.33,
+                    "weighted_accuracy": 0.31,
+                    "sharpe": -0.4,
+                    "dynamic_weight": 0.34,
+                    "total_pnl": -21.0,
+                },
+            ]
+
+    class FakeCalibration:
+        def get_ece(self, source_key="global"):
+            if source_key == "polymarket:BTC":
+                return 0.04
+            if source_key == "arena_champion:seed_breakout":
+                return 0.27
+            return 0.08
+
+        def get_adjustment_factor(self, source_key, predicted_confidence):
+            if source_key == "polymarket:BTC":
+                return predicted_confidence * 1.05
+            if source_key == "arena_champion:seed_breakout":
+                return predicted_confidence * 0.78
+            return predicted_confidence
+
+        def get_all_stats(self):
+            return {
+                "global": {"total_records": 10},
+                "polymarket:BTC": {"total_records": 8},
+                "arena_champion:seed_breakout": {"total_records": 8},
+            }
+
+    class FakeAgent:
+        def __init__(self):
+            self.agent_id = "seed_breakout"
+            self.name = "Seed_breakout"
+            self.strategy_type = "breakout"
+            self.status = "champion"
+            self.total_trades = 14
+            self.win_rate = 0.36
+            self.sharpe_ratio = -0.22
+            self.max_drawdown = 0.31
+
+    class FakeArena:
+        def __init__(self):
+            self.agents = {"seed_breakout": FakeAgent()}
+            self.saved = False
+
+        def _save_agents(self):
+            self.saved = True
+
+    try:
+        db.init_db()
+        now = datetime.utcnow().isoformat()
+        db.save_decision_research_snapshot(
+            {
+                "timestamp": now,
+                "cycle_number": 22,
+                "available_slots": 3,
+                "candidate_count": 2,
+                "qualified_count": 2,
+                "executed_count": 2,
+                "candidates": [
+                    {
+                        "rank": 1,
+                        "status": "selected",
+                        "name": "poly_btc",
+                        "source": "polymarket",
+                        "source_key": "polymarket:BTC",
+                        "strategy_type": "event_driven",
+                        "coin": "BTC",
+                        "side": "long",
+                        "route": "paper_strategy",
+                        "composite_score": 0.82,
+                        "confidence": 0.74,
+                        "expected_value_pct": 0.018,
+                        "execution_cost_pct": 0.001,
+                        "blockers": [],
+                        "score_breakdown": {},
+                        "raw_candidate": {
+                            "name": "poly_btc",
+                            "source": "polymarket",
+                            "source_key": "polymarket:BTC",
+                            "strategy_type": "event_driven",
+                            "current_score": 0.82,
+                            "confidence": 0.74,
+                            "entry_price": 100.0,
+                            "stop_loss": 97.0,
+                            "take_profit": 108.0,
+                            "parameters": {"coins": ["BTC"]},
+                            "metadata": {"source": "polymarket", "source_key": "polymarket:BTC"},
+                        },
+                    },
+                    {
+                        "rank": 2,
+                        "status": "selected",
+                        "name": "arena_breakout",
+                        "source": "arena_champion",
+                        "source_key": "arena_champion:seed_breakout",
+                        "strategy_type": "breakout",
+                        "coin": "BTC",
+                        "side": "short",
+                        "route": "paper_strategy",
+                        "composite_score": 0.61,
+                        "confidence": 0.62,
+                        "expected_value_pct": 0.006,
+                        "execution_cost_pct": 0.002,
+                        "blockers": [],
+                        "score_breakdown": {},
+                        "raw_candidate": {
+                            "name": "arena_breakout",
+                            "source": "arena_champion",
+                            "source_key": "arena_champion:seed_breakout",
+                            "strategy_type": "breakout",
+                            "current_score": 0.61,
+                            "confidence": 0.62,
+                            "entry_price": 100.0,
+                            "stop_loss": 103.0,
+                            "take_profit": 94.0,
+                            "parameters": {"coins": ["BTC"]},
+                            "metadata": {"source": "arena_champion", "source_key": "arena_champion:seed_breakout"},
+                        },
+                    },
+                ],
+            }
+        )
+
+        good_trade = db.open_paper_trade(
+            strategy_id=1,
+            coin="BTC",
+            side="long",
+            entry_price=100.0,
+            size=1.0,
+            metadata={"source": "polymarket", "source_key": "polymarket:BTC"},
+        )
+        bad_trade = db.open_paper_trade(
+            strategy_id=2,
+            coin="BTC",
+            side="short",
+            entry_price=100.0,
+            size=1.0,
+            metadata={"source": "arena_champion", "source_key": "arena_champion:seed_breakout"},
+        )
+        db.close_paper_trade(good_trade, exit_price=108.0, pnl=8.0)
+        db.close_paper_trade(bad_trade, exit_price=103.0, pnl=-3.0)
+        with db.get_connection() as conn:
+            conn.execute(
+                "UPDATE paper_trades SET closed_at = ? WHERE id = ?",
+                (datetime.utcnow().isoformat(), good_trade),
+            )
+            conn.execute(
+                "UPDATE paper_trades SET closed_at = ? WHERE id = ?",
+                (datetime.utcnow().isoformat(), bad_trade),
+            )
+
+        db.save_live_execution_event(
+            "0xabc",
+            timestamp=now,
+            source="arena_champion",
+            source_key="arena_champion:seed_breakout",
+            coin="BTC",
+            side="short",
+            status="rejected",
+            fill_ratio=0.0,
+            rejection_reason="adaptive_test",
+            protective_status="failed",
+        )
+
+        arena = FakeArena()
+        manager = AdaptiveLearningManager(
+            {
+                "enabled": True,
+                "lookback_hours": 72,
+                "recent_lookback_hours": 72,
+                "min_closed_trades": 1,
+                "min_recent_closed_trades": 1,
+                "min_selected_candidates": 1,
+                "caution_health_floor": 0.50,
+                "promotion_health_floor": 0.68,
+                "caution_drift_threshold": 0.12,
+                "block_drift_threshold": 0.25,
+                "arena_min_trades": 5,
+                "arena_max_drawdown": 0.25,
+            },
+            agent_scorer=FakeScorer(),
+            calibration=FakeCalibration(),
+            arena=arena,
+        )
+
+        stats = manager.refresh(force=True, cycle_count=96)
+        poly = manager.get_source_profile("polymarket:BTC")
+        arena_profile = manager.get_source_profile("arena_champion:seed_breakout")
+        latest = db.get_latest_source_health_snapshot(limit=10)
+        review_events = db.get_recent_arena_review_events(limit=10)
+
+        assert stats["summary"]["sources_tracked"] >= 2
+        assert poly["status"] == "active"
+        assert poly["training_label"] == "promote"
+        assert arena_profile["status"] in {"caution", "blocked"}
+        assert arena.agents["seed_breakout"].status == "probation"
+        assert arena.saved is True
+        assert latest["profiles"]
+        assert review_events[0]["agent_id"] == "seed_breakout"
+    finally:
+        monkeypatch.setattr(db, "_DB_PATH", original_path)
+        if os.path.exists(db_path):
+            os.remove(db_path)
+
+
+def test_dashboard_adaptive_learning_metrics_include_runtime_and_snapshot(monkeypatch):
+    monkeypatch.setattr(
+        dashboard_ui.db,
+        "get_latest_source_health_snapshot",
+        lambda limit=12: {
+            "snapshot": {"snapshot_id": "snap-1", "profile_count": 2},
+            "profiles": [{"source_key": "polymarket:BTC", "status": "active"}],
+        },
+    )
+    monkeypatch.setattr(
+        dashboard_ui.db,
+        "get_recent_arena_review_events",
+        lambda limit=10: [{"agent_id": "seed_breakout", "action": "demote"}],
+    )
+
+    class FakeAdaptive:
+        def get_dashboard_payload(self, limit=12):
+            return {"summary": {"sources_tracked": 2}, "profiles": [{"source_key": "options_flow:BTC"}]}
+
+    metrics = dashboard_ui._build_adaptive_learning_metrics(FakeAdaptive())
+
+    assert metrics["latest_snapshot"]["snapshot_id"] == "snap-1"
+    assert metrics["profiles"][0]["source_key"] == "polymarket:BTC"
+    assert metrics["runtime"]["summary"]["sources_tracked"] == 2
+    assert metrics["recent_arena_reviews"][0]["agent_id"] == "seed_breakout"
+
+
 def test_experiment_benchmark_pack_replays_profiles_and_builds_promotion_gate():
     cycles = []
     for idx in range(6):
@@ -1568,6 +1897,57 @@ def test_experiment_benchmark_pack_replays_profiles_and_builds_promotion_gate():
     assert "challenger_selective" in report["profiles"]
     assert report["profiles"]["baseline_current"]["out_of_sample"]["cycles"] == 3
     assert "approved" in report["profiles"]["challenger_selective"]["promotion"]
+
+
+def test_decision_engine_blocks_source_when_adaptive_profile_is_blocked():
+    class FakeAdaptive:
+        def get_source_profile(self, source_key="", source=""):
+            assert source_key == "options_flow:BTC"
+            return {
+                "status": "blocked",
+                "health_score": 0.22,
+                "drift_score": 0.44,
+                "weight_multiplier": 0.25,
+                "confidence_multiplier": 0.70,
+                "training_label": "freeze",
+                "recommended_action": "disable source until retrained",
+            }
+
+    engine = DecisionEngine(
+        {
+            "adaptive_learning": FakeAdaptive(),
+            "adaptive_learning_enabled": True,
+            "adaptive_learning_block_on_status": True,
+            "min_decision_score": 0.0,
+            "min_signal_confidence": 0.4,
+            "min_source_weight": 0.2,
+            "min_expected_value_pct": -1.0,
+        }
+    )
+    candidate = {
+        "name": "blocked_flow",
+        "source": "options_flow",
+        "source_key": "options_flow:BTC",
+        "strategy_type": "options_momentum",
+        "current_score": 0.82,
+        "confidence": 0.82,
+        "source_accuracy": 0.88,
+        "entry_price": 100.0,
+        "stop_loss": 97.0,
+        "take_profit": 107.0,
+        "parameters": {"coins": ["BTC"]},
+        "metadata": {"source": "options_flow", "source_key": "options_flow:BTC"},
+    }
+
+    selected = engine.decide([candidate], regime_data={"overall_regime": "neutral"}, open_positions=[], kelly_stats={})
+    decision = engine.get_decision_history(limit=1)[0]
+    blockers = engine._decision_blockers(candidate)
+
+    assert selected == []
+    assert decision["executed"] == 0
+    assert candidate["_adaptive_learning"]["status"] == "blocked"
+    assert candidate["_decision_confidence"] < 0.82
+    assert "adaptive_blocked" in blockers
 
 
 def test_decision_engine_prefers_higher_net_expectancy_over_raw_score():

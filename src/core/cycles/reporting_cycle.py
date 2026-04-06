@@ -59,6 +59,21 @@ def run_reporting(container, cycle_count: int, health_registry=None) -> None:
     # ── Module stats ──
     logger.info("Module Status:")
     _log_module_stats(container)
+    try:
+        if getattr(container, "adaptive_learning", None):
+            adaptive_stats = container.adaptive_learning.run_cycle(cycle_count=cycle_count)
+            summary = adaptive_stats.get("summary", {})
+            counts = summary.get("status_counts", {})
+            logger.info(
+                "  AdaptiveLearning: %d sources (%d active, %d caution, %d blocked, %d warming)",
+                summary.get("sources_tracked", 0),
+                counts.get("active", 0),
+                counts.get("caution", 0),
+                counts.get("blocked", 0),
+                counts.get("warming_up", 0),
+            )
+    except Exception as exc:
+        logger.debug("  Adaptive learning error: %s", exc)
 
     # ── Shadow tracker + hedger stats ──
     try:
@@ -205,6 +220,10 @@ def _log_module_stats(container):
         _fmt("decisions={total_decisions}, executions={total_executions}",
              container.decision_engine.get_stats())
     ))
+    _safe_stat("AdaptiveLearning", lambda: (
+        getattr(container, "adaptive_learning", None) and
+        _fmt_adaptive(container.adaptive_learning.get_stats())
+    ))
     _safe_stat("MultiExchange", lambda: (
         container.multi_scanner and
         _fmt_multi(container.multi_scanner.get_stats())
@@ -239,4 +258,15 @@ def _fmt_multi(stats):
     return (
         f"{stats['venue_count']} venues ({', '.join(stats['venues'])}), "
         f"{stats['scan_count']} scans, {stats['cached_traders']} cached"
+    )
+
+
+def _fmt_adaptive(stats):
+    summary = stats.get("summary", {})
+    counts = summary.get("status_counts", {})
+    return (
+        f"sources={summary.get('sources_tracked', 0)}, "
+        f"active={counts.get('active', 0)}, "
+        f"caution={counts.get('caution', 0)}, "
+        f"blocked={counts.get('blocked', 0)}"
     )
