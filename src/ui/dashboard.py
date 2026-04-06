@@ -79,6 +79,94 @@ def _parse_trade_costs(trade: Dict) -> Dict:
     }
 
 
+def _safe_float(value, default=0.0):
+    """Best-effort numeric coercion for dashboard summaries."""
+    try:
+        if value is None:
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _build_live_account_summary(trader) -> Dict:
+    """Build a live-account summary separate from paper metrics."""
+    summary = {
+        "available": False,
+        "live_enabled": False,
+        "deployable": False,
+        "dry_run": True,
+        "status_reason": "unavailable",
+        "wallet_total": None,
+        "perps_margin": None,
+        "spot_usdc": None,
+        "realized_pnl_today": 0.0,
+        "open_unrealized_pnl": 0.0,
+        "open_positions": 0,
+        "orders_today": 0,
+        "fills_today": 0,
+        "daily_pnl_limit": 0.0,
+        "timestamp": None,
+    }
+    if not trader:
+        return summary
+
+    summary["available"] = True
+    live_stats = {}
+    try:
+        live_stats = trader.get_stats() or {}
+    except Exception as exc:
+        logger.debug("dashboard live stats error: %s", exc)
+
+    wallet = live_stats.get("wallet_balance", {}) or {}
+    try:
+        if hasattr(trader, "snapshot_balance"):
+            wallet = trader.snapshot_balance(log=False) or wallet
+    except Exception as exc:
+        logger.debug("dashboard live balance snapshot error: %s", exc)
+    if not isinstance(wallet, dict):
+        wallet = {}
+
+    positions = []
+    try:
+        if hasattr(trader, "get_positions"):
+            positions = trader.get_positions() or []
+    except Exception as exc:
+        logger.debug("dashboard live positions error: %s", exc)
+
+    open_positions = 0
+    open_unrealized = 0.0
+    for position in positions:
+        size = _safe_float(position.get("szi", position.get("size", 0)), 0.0)
+        if abs(size) <= 0:
+            continue
+        open_positions += 1
+        open_unrealized += _safe_float(
+            position.get("unrealized_pnl", position.get("unrealizedPnl", 0)),
+            0.0,
+        )
+
+    summary.update(
+        {
+            "live_enabled": bool(live_stats.get("live_enabled", False)),
+            "deployable": bool(live_stats.get("deployable", False)),
+            "dry_run": bool(live_stats.get("dry_run", True)),
+            "status_reason": str(live_stats.get("status_reason", "unknown") or "unknown"),
+            "wallet_total": wallet.get("total"),
+            "perps_margin": wallet.get("perps_margin"),
+            "spot_usdc": wallet.get("spot_usdc"),
+            "realized_pnl_today": round(_safe_float(live_stats.get("daily_pnl", 0.0), 0.0), 2),
+            "open_unrealized_pnl": round(open_unrealized, 2),
+            "open_positions": open_positions,
+            "orders_today": int(live_stats.get("orders_today", 0) or 0),
+            "fills_today": int(live_stats.get("fills_today", 0) or 0),
+            "daily_pnl_limit": round(_safe_float(live_stats.get("daily_pnl_limit", 0.0), 0.0), 2),
+            "timestamp": live_stats.get("timestamp") or wallet.get("timestamp"),
+        }
+    )
+    return summary
+
+
 def get_dashboard_data():
     """Collect all data needed for the dashboard."""
     conn = _get_db()
@@ -172,6 +260,7 @@ def get_dashboard_data():
                 "win_rate": round(account["winning_trades"] / account["total_trades"] * 100, 1) if account.get("total_trades", 0) > 0 else 0,
                 "initial_balance": initial_balance,
             },
+            "live_account": _build_live_account_summary(_live_trader),
             "traders": traders,
             "strategies": strategies,
             "open_trades": open_trades,
@@ -422,7 +511,7 @@ canvas{width:100%!important;height:200px!important}
 <div class="flex-row">
 <div class="section">
 <div style="display:flex;justify-content:space-between;align-items:center">
-<h2>Open Positions</h2>
+<h2>Open Paper Positions</h2>
 <div class="action-bar">
 <button class="btn btn-close-all" onclick="closeAllTrades()" id="btn-close-all" title="Close all open positions at market price">Close All</button>
 <button class="btn btn-reset" onclick="resetPaperTrading()" id="btn-reset" title="Reset paper trading history (keeps discovered traders & strategies)">Reset History</button>
@@ -452,7 +541,7 @@ canvas{width:100%!important;height:200px!important}
 <canvas id="type-chart"></canvas>
 </div>
 <div class="section">
-<h2>Equity Curve</h2>
+<h2>Paper Equity Curve</h2>
 <canvas id="equity-chart"></canvas>
 </div>
 </div>
@@ -467,7 +556,7 @@ canvas{width:100%!important;height:200px!important}
 
 <div class="flex-row">
 <div class="section">
-<h2>Closed Trades History</h2>
+<h2>Closed Paper Trades History</h2>
 <table><thead><tr><th>Coin</th><th>Side</th><th>Entry</th><th>Exit</th><th>Gross PnL</th><th>Fees</th><th>Slippage</th><th>Net PnL</th><th>Lev</th><th>Closed</th></tr></thead>
 <tbody id="closed-trades"></tbody></table>
 </div>
@@ -568,15 +657,26 @@ function shortAddr(a){ return a ? a.slice(0,6)+'...'+a.slice(-4) : '—' }
 
 function renderCards(d){
   const a = d.account;
+  const live = d.live_account || {};
+  const livePnlNow = Number(live.realized_pnl_today || 0) + Number(live.open_unrealized_pnl || 0);
+  const liveStatus = live.deployable && !live.dry_run
+    ? 'live deployable'
+    : live.dry_run
+      ? 'live dry-run'
+      : (live.status_reason || 'live unavailable');
   const cards = [
     {label:'Paper Balance', value:fmtUsd(a.balance), cls:pnlClass(a.total_pnl)},
-    {label:'Total PnL', value:fmtUsd(a.total_pnl), cls:pnlClass(a.total_pnl), sub:`ROI: ${a.roi_pct>0?'+':''}${a.roi_pct}%`},
-    {label:'Gross PnL (Est.)', value:fmtUsd(a.gross_pnl_estimate), cls:pnlClass(a.gross_pnl_estimate)},
-    {label:'Execution Costs', value:fmtUsd(-(a.lifetime_execution_cost||0)), cls:'red', sub:`Fees ${fmtUsd(a.lifetime_fees||0)} + Slip ${fmtUsd(a.lifetime_slippage||0)}`},
+    {label:'Paper Net PnL', value:fmtUsd(a.total_pnl), cls:pnlClass(a.total_pnl), sub:`ROI: ${a.roi_pct>0?'+':''}${a.roi_pct}%`},
+    {label:'Paper Gross PnL (Est.)', value:fmtUsd(a.gross_pnl_estimate), cls:pnlClass(a.gross_pnl_estimate)},
+    {label:'Paper Execution Costs', value:fmtUsd(-(a.lifetime_execution_cost||0)), cls:'red', sub:`Fees ${fmtUsd(a.lifetime_fees||0)} + Slip ${fmtUsd(a.lifetime_slippage||0)}`},
+    {label:'Live Wallet Total', value:fmtUsd(live.wallet_total), cls:pnlClass(livePnlNow), sub:`Perps ${fmtUsd(live.perps_margin)} · Spot ${fmtUsd(live.spot_usdc)}`},
+    {label:'Live Realized PnL (Today)', value:fmtUsd(live.realized_pnl_today), cls:pnlClass(live.realized_pnl_today), sub:`Loss cap ${fmtUsd(-(live.daily_pnl_limit||0))}`},
+    {label:'Live Open uPnL', value:fmtUsd(live.open_unrealized_pnl), cls:pnlClass(live.open_unrealized_pnl), sub:`${live.open_positions||0} live positions`},
+    {label:'Live Orders / Fills', value:`${live.orders_today||0} / ${live.fills_today||0}`, cls:(live.deployable && !live.dry_run) ? 'blue' : 'yellow', sub:liveStatus},
     {label:'Win Rate', value:a.win_rate+'%', cls:a.win_rate>=50?'green':'yellow', sub:`${a.winning_trades}/${a.total_trades} trades`},
     {label:'Tracked Traders', value:d.traders.length, cls:'blue'},
     {label:'Active Strategies', value:d.strategies.length, cls:'green'},
-    {label:'Open Positions', value:d.open_trades.length, cls:'yellow'},
+    {label:'Open Paper Positions', value:d.open_trades.length, cls:'yellow'},
   ];
   document.getElementById('stats-cards').innerHTML = cards.map(c=>`
     <div class="card"><div class="label">${c.label}</div>

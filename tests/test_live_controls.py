@@ -36,6 +36,7 @@ from src.trading.live_trader import (
     _hl_format_size,
 )
 from src.trading.portfolio_rotation import PortfolioRotationManager, RotationDecision
+from src.ui import dashboard as dashboard_ui
 
 
 def _fake_live_credentials(self):
@@ -819,6 +820,58 @@ def test_execute_selected_decisions_routes_only_engine_choices(monkeypatch):
     assert lcrs_batches == [["ETH"]]
     assert copy_batches == [["SOL"]]
     assert mirrors == [("  LIVE", 1), ("  LIVE COPY", 1)]
+
+
+def test_dashboard_live_account_summary_stays_separate_from_paper_metrics():
+    class FakeLiveTrader:
+        def get_stats(self):
+            return {
+                "live_enabled": True,
+                "deployable": True,
+                "dry_run": False,
+                "status_reason": "ready",
+                "daily_pnl": 42.25,
+                "daily_pnl_limit": 150.0,
+                "orders_today": 7,
+                "fills_today": 5,
+                "wallet_balance": {
+                    "perps_margin": 1200.0,
+                    "spot_usdc": 50.0,
+                    "total": 1250.0,
+                    "timestamp": "2026-04-05T12:00:00",
+                },
+                "timestamp": "2026-04-05T12:00:00",
+            }
+
+        def snapshot_balance(self, log=False):
+            return {
+                "perps_margin": 1200.0,
+                "spot_usdc": 50.0,
+                "total": 1250.0,
+                "timestamp": "2026-04-05T12:00:00",
+            }
+
+        def get_positions(self):
+            return [
+                {"coin": "BTC", "szi": 0.1, "unrealized_pnl": 15.5},
+                {"coin": "ETH", "size": -0.2, "unrealizedPnl": -4.0},
+                {"coin": "SOL", "szi": 0.0, "unrealized_pnl": 99.0},
+            ]
+
+    summary = dashboard_ui._build_live_account_summary(FakeLiveTrader())
+
+    assert summary["available"] is True
+    assert summary["live_enabled"] is True
+    assert summary["deployable"] is True
+    assert summary["dry_run"] is False
+    assert summary["wallet_total"] == 1250.0
+    assert summary["perps_margin"] == 1200.0
+    assert summary["spot_usdc"] == 50.0
+    assert summary["realized_pnl_today"] == 42.25
+    assert summary["open_unrealized_pnl"] == 11.5
+    assert summary["open_positions"] == 2
+    assert summary["orders_today"] == 7
+    assert summary["fills_today"] == 5
 
 
 def test_run_trading_cycle_does_not_fall_through_to_standalone_options_flow(monkeypatch):
