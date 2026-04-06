@@ -14,10 +14,12 @@ from src.core.api_manager import Priority
 from src.core.cycles.reporting_cycle import run_reporting
 from src.core.cycles.trading_cycle import (
     _apply_agent_scorer_weights,
+    _execute_selected_decisions,
     _execute_lcrs_signals,
     _execute_options_flow_trades,
     _process_closed_trades,
     _run_alpha_arena,
+    run_trading_cycle,
 )
 from src.core.health_registry import SubsystemHealthRegistry, SubsystemState
 from src.core.live_execution import (
@@ -755,6 +757,138 @@ def test_execute_options_flow_paper_trade_preserves_precise_stops(monkeypatch):
 
     assert abs(opened["stop_loss"] - (price * 0.95)) < 1e-12
     assert abs(opened["take_profit"] - (price * 1.10)) < 1e-12
+
+
+def test_execute_selected_decisions_routes_only_engine_choices(monkeypatch):
+    paper_batches = []
+    copy_batches = []
+    mirrors = []
+    lcrs_batches = []
+
+    class FakePaperTrader:
+        def execute_strategy_signals(self, strategies, **kwargs):
+            paper_batches.append([strategy["name"] for strategy in strategies])
+            return [{"coin": "BTC", "side": "long"}]
+
+    class FakeCopyTrader:
+        def execute_copy_signals(self, signals, regime_data=None):
+            copy_batches.append([signal["coin"] for signal in signals])
+            return [{"coin": signals[0]["coin"], "side": signals[0]["side"]}] if signals else []
+
+    container = type(
+        "Container",
+        (),
+        {
+            "paper_trader": FakePaperTrader(),
+            "copy_trader": FakeCopyTrader(),
+            "exchange_agg": None,
+            "options_scanner": None,
+            "arena": None,
+        },
+    )()
+
+    monkeypatch.setattr(
+        "src.core.cycles.trading_cycle._execute_lcrs_signals",
+        lambda container, signals, regime_data: lcrs_batches.append([signal["coin"] for signal in signals]),
+    )
+    monkeypatch.setattr(
+        "src.core.cycles.trading_cycle.mirror_executed_trades_to_live",
+        lambda container, trades, success_label, skip_label: mirrors.append((success_label, len(trades))),
+    )
+    monkeypatch.setattr("src.notifications.telegram_bot.is_configured", lambda: False)
+
+    _execute_selected_decisions(
+        container,
+        [
+            {"name": "ranked_strategy", "strategy_type": "trend_following"},
+            {
+                "name": "lcrs_eth",
+                "_decision_route": "lcrs",
+                "_lcrs_signal": {"coin": "ETH", "side": "long", "confidence": 0.7},
+            },
+            {
+                "name": "copy_sol",
+                "_decision_route": "copy_trade",
+                "_copy_signal": {"coin": "SOL", "side": "short", "type": "copy_open"},
+            },
+        ],
+        {"overall_regime": "neutral"},
+    )
+
+    assert paper_batches == [["ranked_strategy"]]
+    assert lcrs_batches == [["ETH"]]
+    assert copy_batches == [["SOL"]]
+    assert mirrors == [("  LIVE", 1), ("  LIVE COPY", 1)]
+
+
+def test_run_trading_cycle_does_not_fall_through_to_standalone_options_flow(monkeypatch):
+    class FakeScorer:
+        def score_all_strategies(self):
+            return []
+
+        def get_top_strategies(self):
+            return []
+
+    class FakeOptionsScanner:
+        top_convictions = [
+            {
+                "ticker": "ETH",
+                "direction": "bullish",
+                "conviction_pct": 82,
+                "net_flow": 100000.0,
+                "total_prints": 3,
+            }
+        ]
+
+        def scan_flow(self):
+            return {"unusual_prints": 1, "top_convictions": 1}
+
+    class FakePaperTrader:
+        def check_open_positions(self):
+            return []
+
+    class FakeDecisionEngine:
+        def decide(self, strategies, **kwargs):
+            return []
+
+    container = type(
+        "Container",
+        (),
+        {
+            "live_trader": None,
+            "scorer": FakeScorer(),
+            "exchange_agg": None,
+            "options_scanner": FakeOptionsScanner(),
+            "regime_detector": None,
+            "regime_strategy_filter": None,
+            "signal_processor": None,
+            "polymarket": None,
+            "predictive_forecaster": None,
+            "cross_venue_hedger": None,
+            "liquidation_strategy": None,
+            "paper_trader": FakePaperTrader(),
+            "firewall": None,
+            "position_monitor": None,
+            "copy_trader": None,
+            "arena": None,
+            "decision_engine": FakeDecisionEngine(),
+            "kelly_sizer": None,
+            "multi_scanner": None,
+            "agent_scorer": None,
+            "calibration": None,
+            "shadow_tracker": None,
+        },
+    )()
+
+    monkeypatch.setattr("src.core.cycles.trading_cycle._run_liquidation_scan", lambda container, regime_data: [])
+    monkeypatch.setattr("src.core.cycles.trading_cycle._run_alpha_arena", lambda container, regime_data: [])
+    monkeypatch.setattr("src.core.cycles.trading_cycle._run_cross_venue_confirmation", lambda container, strategies: None)
+    monkeypatch.setattr("src.core.cycles.trading_cycle.get_execution_open_positions", lambda container: [])
+    monkeypatch.setattr("src.core.cycles.trading_cycle._execute_options_flow_trades", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("standalone options flow should not run")))
+    monkeypatch.setattr("src.core.cycles.trading_cycle._execute_selected_decisions", lambda container, selected_strategies, regime_data: None)
+    monkeypatch.setattr("src.notifications.telegram_bot.is_configured", lambda: False)
+
+    run_trading_cycle(container, 1)
 
 
 def test_run_alpha_arena_returns_rankable_candidates(monkeypatch):

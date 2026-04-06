@@ -202,6 +202,268 @@ def _execute_signal_live(container, trade_signal, source_label: str):
     return None
 
 
+def _decision_route(strategy):
+    """Return the execution route selected for a decision candidate."""
+    return str(strategy.get("_decision_route", "paper_strategy") or "paper_strategy").strip()
+
+
+def _build_lcrs_decision_candidates(container, lcrs_signals, regime_data):
+    """Convert liquidation-reversal signals into decision-engine candidates."""
+    if not lcrs_signals:
+        return []
+
+    from src.signals.signal_schema import RiskParams, SignalSide, SignalSource, TradeSignal
+
+    candidates = []
+    open_positions = get_execution_open_positions(container)
+    for sig in lcrs_signals:
+        try:
+            trade_signal = TradeSignal(
+                coin=sig["coin"],
+                side=SignalSide(sig["side"]),
+                confidence=float(sig.get("confidence", 0.0) or 0.0),
+                source=SignalSource.STRATEGY,
+                reason=f"LCRS: {sig.get('features', {}).get('setup_type', 'unknown')}",
+                strategy_type="liquidation_reversal",
+                entry_price=float(sig.get("price", 0) or 0),
+                leverage=float(sig.get("leverage", 1) or 1),
+                position_pct=float(sig.get("position_pct", 0.06) or 0.06),
+                risk=RiskParams(stop_loss_pct=0.025, take_profit_pct=0.05),
+                regime=regime_data.get("overall_regime", "") if regime_data else "",
+            )
+
+            if container.firewall:
+                passed, reason = container.firewall.validate(
+                    trade_signal,
+                    regime_data=regime_data,
+                    open_positions=open_positions,
+                )
+                if not passed:
+                    logger.info("  LCRS firewall rejected %s before decision engine: %s", sig["coin"], reason)
+                    continue
+
+            source_key = build_source_key(
+                "liquidation_strategy",
+                strategy_type="liquidation_reversal",
+                coin=sig["coin"],
+            )
+            candidates.append(
+                {
+                    "id": None,
+                    "name": f"lcrs_{sig['coin']}_{sig['side']}",
+                    "strategy_type": "liquidation_reversal",
+                    "trader_address": "liquidation_strategy",
+                    "current_score": float(sig.get("confidence", 0.0) or 0.0),
+                    "confidence": float(sig.get("confidence", 0.0) or 0.0),
+                    "direction": sig["side"],
+                    "side": sig["side"],
+                    "source": "liquidation_strategy",
+                    "source_key": source_key,
+                    "parameters": {"coins": [sig["coin"]]},
+                    "metrics": {},
+                    "metadata": {
+                        "source": "liquidation_strategy",
+                        "source_key": source_key,
+                        "reason": trade_signal.reason,
+                        "setup_type": sig.get("features", {}).get("setup_type", ""),
+                        "features": sig.get("features", {}),
+                    },
+                    "_decision_route": "lcrs",
+                    "_lcrs_signal": dict(sig),
+                }
+            )
+        except Exception as exc:
+            logger.debug("  LCRS candidate build error %s: %s", sig.get("coin"), exc)
+    return candidates
+
+
+def _gather_copy_trade_signals(container):
+    """Gather copy-trade signals without executing them yet."""
+    if not container.copy_trader:
+        return []
+
+    signals = []
+    if container.position_monitor:
+        ws_signals = container.position_monitor.drain_signals()
+        if ws_signals:
+            logger.info("  WebSocket: %d real-time copy signals", len(ws_signals))
+            signals.extend(ws_signals)
+
+    try:
+        rest_signals = container.copy_trader.scan_top_traders(top_n=10)
+        if rest_signals:
+            signals.extend(rest_signals)
+    except Exception as exc:
+        logger.debug("  Copy-trader scan skipped: %s", exc)
+
+    try:
+        from src.discovery.golden_bridge import get_golden_copy_signals, auto_connect_golden_wallets
+
+        auto_connect_golden_wallets()
+        golden_signals = get_golden_copy_signals()
+        if golden_signals:
+            logger.info("  Golden bridge: %d signals", len(golden_signals))
+            signals = golden_signals + signals
+    except Exception as exc:
+        logger.debug("  Golden bridge skipped: %s", exc)
+
+    return signals
+
+
+def _process_copy_trade_closures(container, copy_signals, regime_data):
+    """Process copy-trader exit signals before ranking new entries."""
+    if not container.copy_trader or not copy_signals:
+        return
+
+    close_signals = [dict(signal) for signal in copy_signals if signal.get("type") == "copy_close"]
+    if not close_signals:
+        return
+
+    container.copy_trader.execute_copy_signals(close_signals, regime_data=regime_data)
+    logger.info("  Processed %d copy-trade exits before decision engine", len(close_signals))
+
+
+def _build_copy_decision_candidates(container, copy_signals, regime_data):
+    """Convert copy-entry signals into decision-engine candidates."""
+    if not container.copy_trader or not copy_signals:
+        return []
+
+    from src.signals.signal_schema import signal_from_copy_trade
+
+    open_positions = get_execution_open_positions(container)
+    candidates = []
+    for raw_signal in copy_signals:
+        if raw_signal.get("type") not in ("copy_open", "copy_scale_in", "copy_flip", "golden_copy"):
+            continue
+
+        try:
+            signal = dict(raw_signal)
+            signal = container.copy_trader._apply_regime_weight(signal, signal["coin"])
+
+            trade_signal = signal_from_copy_trade(
+                trader_address=signal.get("source_trader", ""),
+                coin=signal["coin"],
+                side=signal["side"],
+                entry_price=float(signal.get("price", 0) or 0),
+                confidence=float(signal.get("confidence", 0.5) or 0.5),
+            )
+            trade_signal.leverage = float(signal.get("leverage", 2) or 2)
+            trade_signal.regime = regime_data.get("overall_regime", "") if regime_data else ""
+
+            if container.firewall:
+                passed, reason = container.firewall.validate(
+                    trade_signal,
+                    regime_data=regime_data,
+                    open_positions=open_positions,
+                    ignore_position_limit=True,
+                    dry_run=True,
+                )
+                if not passed:
+                    logger.info(
+                        "  Firewall rejected copy %s %s before decision engine: %s",
+                        signal["side"],
+                        signal["coin"],
+                        reason,
+                    )
+                    continue
+
+            source_trader = str(signal.get("source_trader", "unknown")).strip() or "unknown"
+            source_key = f"copy_trade:{source_trader}"
+            signal["confidence"] = trade_signal.confidence
+            signal["source_accuracy"] = getattr(trade_signal, "source_accuracy", 0.0)
+            signal["regime"] = trade_signal.regime
+
+            candidates.append(
+                {
+                    "id": None,
+                    "name": f"copy_{source_trader}_{signal['coin']}_{signal['side']}",
+                    "strategy_type": "copy_trade",
+                    "trader_address": source_trader,
+                    "current_score": float(signal.get("confidence", 0.5) or 0.5),
+                    "confidence": float(signal.get("confidence", 0.5) or 0.5),
+                    "direction": signal["side"],
+                    "side": signal["side"],
+                    "source": "copy_trade",
+                    "source_key": source_key,
+                    "parameters": {"coins": [signal["coin"]]},
+                    "metrics": {},
+                    "metadata": {
+                        "source": "copy_trade",
+                        "source_key": source_key,
+                        "source_trader": source_trader,
+                        "type": signal.get("type", ""),
+                        "source_pnl": signal.get("source_pnl", 0),
+                        "reason": f"Copy {source_trader}: {signal['side']} {signal['coin']}",
+                    },
+                    "_decision_route": "copy_trade",
+                    "_copy_signal": signal,
+                }
+            )
+        except Exception as exc:
+            logger.debug("  Copy candidate build error %s: %s", raw_signal.get("coin"), exc)
+
+    return candidates
+
+
+def _execute_selected_decisions(container, selected_strategies, regime_data):
+    """Execute only the candidates selected by the main decision engine."""
+    from src.notifications import telegram_bot as tg
+
+    if not selected_strategies:
+        return
+
+    standard = []
+    lcrs = []
+    copy_entries = []
+    for strategy in selected_strategies:
+        route = _decision_route(strategy)
+        if route == "lcrs":
+            lcrs.append(strategy)
+        elif route == "copy_trade":
+            copy_entries.append(strategy)
+        else:
+            standard.append(strategy)
+
+    if standard and container.paper_trader:
+        executed = container.paper_trader.execute_strategy_signals(
+            standard,
+            exchange_agg=container.exchange_agg,
+            options_scanner=container.options_scanner,
+            regime_data=regime_data,
+            arena=container.arena,
+        )
+        logger.info("  Executed %d decision-engine paper trades", len(executed))
+        mirror_executed_trades_to_live(
+            container,
+            executed,
+            success_label="  LIVE",
+            skip_label="  Live trader requested but not deployable; skipping strategy mirroring",
+        )
+        if tg.is_configured():
+            for trade in executed:
+                tg.notify_trade_opened(trade, source="strategy")
+
+    if lcrs:
+        selected_lcrs = [dict(strategy["_lcrs_signal"]) for strategy in lcrs if strategy.get("_lcrs_signal")]
+        if selected_lcrs:
+            _execute_lcrs_signals(container, selected_lcrs, regime_data)
+
+    if copy_entries and container.copy_trader:
+        selected_copy_signals = [dict(strategy["_copy_signal"]) for strategy in copy_entries if strategy.get("_copy_signal")]
+        if selected_copy_signals:
+            copy_executed = container.copy_trader.execute_copy_signals(selected_copy_signals, regime_data=regime_data)
+            logger.info("  Executed %d decision-engine copy trades", len(copy_executed))
+            if tg.is_configured():
+                for trade in copy_executed:
+                    tg.notify_trade_opened(trade, source="copy")
+            mirror_executed_trades_to_live(
+                container,
+                copy_executed,
+                success_label="  LIVE COPY",
+                skip_label="  Live trader requested but not deployable; skipping copy mirroring",
+            )
+
+
 # ---------------------------------------------------------------------------
 # Main trading cycle
 # ---------------------------------------------------------------------------
@@ -324,6 +586,9 @@ def run_trading_cycle(container, cycle_count: int) -> None:
         # ── Phase 3f: Liquidation Strategy ──
         lcrs_signals = _run_liquidation_scan(container, regime_data)
 
+        # ── Phase 3f2: Copy-trade signal harvest ──
+        copy_signals = _gather_copy_trade_signals(container)
+
         # ── Phase 4: Paper Trading (regime-aware) ──
         logger.info("Phase 4: Paper Trading (regime-aware)")
         top_strategies = container.scorer.get_top_strategies() if container.scorer else []
@@ -385,7 +650,6 @@ def run_trading_cycle(container, cycle_count: int) -> None:
             logger.info("  Injected %d Polymarket signals", injected_polymarket)
 
         # Inject high-conviction options flow as synthetic strategies
-        # (Phase 4a2 still handles direct trades; this feeds the decision engine too)
         if container.options_scanner:
             convictions = getattr(container.options_scanner, "top_convictions", None) or []
             injected_options = 0
@@ -445,10 +709,23 @@ def run_trading_cycle(container, cycle_count: int) -> None:
         if closed:
             _process_closed_trades(container, closed)
 
+        # Copy exits are risk-management events; process them before ranking new entries.
+        _process_copy_trade_closures(container, copy_signals, regime_data)
+
+        lcrs_candidates = _build_lcrs_decision_candidates(container, lcrs_signals, regime_data)
+        if lcrs_candidates:
+            top_strategies.extend(lcrs_candidates)
+            logger.info("  Injected %d LCRS signals into decision engine", len(lcrs_candidates))
+
         arena_candidates = _run_alpha_arena(container, regime_data)
         if arena_candidates:
             top_strategies.extend(arena_candidates)
             logger.info("  Injected %d arena champion signals into decision engine", len(arena_candidates))
+
+        copy_candidates = _build_copy_decision_candidates(container, copy_signals, regime_data)
+        if copy_candidates:
+            top_strategies.extend(copy_candidates)
+            logger.info("  Injected %d copy-trade signals into decision engine", len(copy_candidates))
 
         # Cross-venue signal confirmation
         _run_cross_venue_confirmation(container, top_strategies)
@@ -466,41 +743,15 @@ def run_trading_cycle(container, cycle_count: int) -> None:
                 kelly_stats = container.kelly_sizer.get_all_sizing_stats()
             except Exception:
                 pass
+        selected_strategies = top_strategies
         if container.decision_engine:
-            top_strategies = container.decision_engine.decide(
+            selected_strategies = container.decision_engine.decide(
                 top_strategies, regime_data=regime_data,
                 open_positions=open_trades, kelly_stats=kelly_stats,
             )
 
-        # Execute new signals
-        if top_strategies and container.paper_trader:
-            executed = container.paper_trader.execute_strategy_signals(
-                top_strategies, exchange_agg=container.exchange_agg,
-                options_scanner=container.options_scanner,
-                regime_data=regime_data, arena=container.arena,
-            )
-            logger.info("  Executed %d new paper trades", len(executed))
-
-            mirror_executed_trades_to_live(
-                container,
-                executed,
-                success_label="  LIVE",
-                skip_label="  Live trader requested but not deployable; skipping strategy mirroring",
-            )
-
-            if tg.is_configured():
-                for t in executed:
-                    tg.notify_trade_opened(t, source="strategy")
-
-        # Phase 4a: LCRS execution
-        if lcrs_signals:
-            _execute_lcrs_signals(container, lcrs_signals, regime_data)
-
-        # Phase 4a2: Options flow standalone trades
-        _execute_options_flow_trades(container, regime_data)
-
-        # Phase 4b: Copy trading
-        _run_copy_trading(container, regime_data)
+        # Execute only what the main decision engine selected.
+        _execute_selected_decisions(container, selected_strategies, regime_data)
 
         closed = _collect_closed_trade_events(container, [])
         if closed and tg.is_configured():
