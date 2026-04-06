@@ -47,14 +47,24 @@ class DecisionEngine:
         self.w_confidence = cfg.get("w_confidence", 0.15)   # Calibrated trade confidence
         self.w_source_quality = cfg.get("w_source_quality", 0.10)  # Agent-scorer / accuracy quality
         self.w_confirmation = cfg.get("w_confirmation", 0.05)      # External confirmations
+        self.w_expected_value = cfg.get("w_expected_value", 0.20)  # Net expectancy after costs
 
         # Minimum composite score to even consider executing
         self.min_decision_score = cfg.get("min_decision_score", 0.34)
         self.min_signal_confidence = cfg.get("min_signal_confidence", 0.58)
         self.min_source_weight = cfg.get("min_source_weight", 0.35)
+        self.min_expected_value_pct = cfg.get("min_expected_value_pct", 0.0015)
 
         # Max trades to execute per cycle (independent of position slots)
         self.max_trades_per_cycle = cfg.get("max_trades_per_cycle", 2)
+
+        # Economic quality defaults used when the signal does not explicitly
+        # carry enough execution metadata to estimate trade expectancy.
+        self.maker_fee_bps = cfg.get("maker_fee_bps", 1.5)
+        self.taker_fee_bps = cfg.get("taker_fee_bps", 4.5)
+        self.expected_slippage_bps = cfg.get("expected_slippage_bps", 3.0)
+        self.churn_penalty_bps = cfg.get("churn_penalty_bps", 2.0)
+        self.default_execution_role = str(cfg.get("default_execution_role", "taker") or "taker").lower()
 
         # Track decisions for audit
         self._decision_history: deque = deque(maxlen=100)
@@ -212,7 +222,8 @@ class DecisionEngine:
             "decisions": [
                 {"coin": e.get("_decision_coin", "?"),
                  "side": e.get("_decision_side", "?"),
-                 "composite": e["_composite_score"]}
+                 "composite": e["_composite_score"],
+                 "net_expectancy_pct": round(float(e.get("_expected_value_pct", 0.0) or 0.0), 4)}
                 for e in executions
             ],
         })
@@ -238,19 +249,19 @@ class DecisionEngine:
         # 1. Base score (normalized 0-1)
         base = min(raw_score, 1.0)
 
-        # 2. Regime alignment bonus
-        regime_bonus = 0.0
+        # 2. Regime alignment
+        regime_alignment = 0.55
         if regime_data:
             guidance = regime_data.get("strategy_guidance", {})
             activate_list = guidance.get("activate", [])
             pause_list = guidance.get("pause", [])
 
             if strategy_type in activate_list:
-                regime_bonus = 1.0
+                regime_alignment = 1.0
             elif strategy_type in pause_list:
-                regime_bonus = -0.5  # Penalize (should've been filtered, but safety net)
+                regime_alignment = 0.0
             else:
-                regime_bonus = 0.3  # Neutral — neither activated nor paused
+                regime_alignment = 0.55
 
         # 3. Diversification bonus — prefer coins we DON'T already have
         params = strategy.get("parameters", "{}")
@@ -326,29 +337,58 @@ class DecisionEngine:
             1.0,
         )
         confirmation = self._confirmation_score(strategy)
-
-        # Weighted composite
-        total = (
-            base * self.w_score +
-            regime_bonus * self.w_regime +
-            diversity_bonus * self.w_diversity +
-            freshness * self.w_freshness +
-            consensus * self.w_consensus +
-            confidence * self.w_confidence +
-            source_quality * self.w_source_quality +
-            confirmation * self.w_confirmation
+        expected_value = self._expected_value_score(
+            strategy,
+            confidence=confidence,
+            source_quality=source_quality,
+            confirmation=confirmation,
+            direction=direction,
+            target_coin=target_coin,
+            regime_alignment=regime_alignment,
+            open_coins=open_coins,
+            kelly_stats=kelly_stats,
         )
+
+        components = [
+            (base, self.w_score),
+            (regime_alignment, self.w_regime),
+            (diversity_bonus, self.w_diversity),
+            (freshness, self.w_freshness),
+            (consensus, self.w_consensus),
+            (confidence, self.w_confidence),
+            (source_quality, self.w_source_quality),
+            (confirmation, self.w_confirmation),
+            (expected_value["score"], self.w_expected_value),
+        ]
+        weight_total = sum(weight for _, weight in components if weight > 0)
+        total = (
+            sum(score * weight for score, weight in components) / weight_total
+            if weight_total > 0
+            else 0.0
+        )
+
+        strategy["_expected_value_pct"] = expected_value["net_expectancy_pct"]
+        strategy["_execution_cost_pct"] = expected_value["execution_cost_pct"]
+        strategy["_estimated_win_prob"] = expected_value["win_probability"]
+        strategy["_risk_reward_ratio"] = expected_value["reward_risk_ratio"]
 
         return {
             "total": round(total, 4),
             "base_score": round(base, 3),
-            "regime_alignment": round(regime_bonus, 3),
+            "regime_alignment": round(regime_alignment, 3),
             "diversity": round(diversity_bonus, 3),
             "freshness": round(freshness, 3),
             "consensus": round(consensus, 3),
             "confidence": round(confidence, 3),
             "source_quality": round(source_quality, 3),
             "confirmation": round(confirmation, 3),
+            "expected_value": round(expected_value["score"], 3),
+            "win_probability": round(expected_value["win_probability"], 3),
+            "reward_risk_ratio": round(expected_value["reward_risk_ratio"], 3),
+            "gross_expectancy_pct": round(expected_value["gross_expectancy_pct"], 4),
+            "net_expectancy_pct": round(expected_value["net_expectancy_pct"], 4),
+            "execution_cost_pct": round(expected_value["execution_cost_pct"], 4),
+            "kelly_has_edge": expected_value["kelly_has_edge"],
         }
 
     def _decision_blockers(self, strategy: Dict) -> List[str]:
@@ -363,14 +403,198 @@ class DecisionEngine:
             blockers.append(f"confidence<{self.min_signal_confidence:.2f}")
         if source_quality < self.min_source_weight:
             blockers.append(f"source_weight<{self.min_source_weight:.2f}")
+        breakdown = strategy.get("_score_breakdown", {})
+        net_expectancy_pct = float(
+            breakdown.get(
+                "net_expectancy_pct",
+                strategy.get("_expected_value_pct", 0.0),
+            )
+            or 0.0
+        )
+        if net_expectancy_pct < self.min_expected_value_pct:
+            blockers.append(f"net_ev<{self.min_expected_value_pct:.4f}")
 
         return blockers
 
+    @staticmethod
+    def _clamp(value: float, lower: float = 0.0, upper: float = 1.0) -> float:
+        return max(lower, min(value, upper))
+
+    def _get_metadata(self, strategy: Dict) -> Dict:
+        metadata = strategy.get("metadata", {})
+        if isinstance(metadata, dict):
+            return metadata
+        return {}
+
+    def _extract_risk_geometry(self, strategy: Dict, direction: str) -> Dict[str, float]:
+        metadata = self._get_metadata(strategy)
+        params = strategy.get("parameters", {})
+        if not isinstance(params, dict):
+            params = {}
+
+        entry_price = float(
+            strategy.get("entry_price", metadata.get("entry_price", params.get("entry_price", 0.0))) or 0.0
+        )
+        stop_loss = float(
+            strategy.get("stop_loss", metadata.get("stop_loss", params.get("stop_loss", 0.0))) or 0.0
+        )
+        take_profit = float(
+            strategy.get("take_profit", metadata.get("take_profit", params.get("take_profit", 0.0))) or 0.0
+        )
+
+        risk_pct = 0.0
+        reward_pct = 0.0
+        if entry_price > 0:
+            if direction == "short":
+                if stop_loss > entry_price:
+                    risk_pct = (stop_loss - entry_price) / entry_price
+                if 0 < take_profit < entry_price:
+                    reward_pct = (entry_price - take_profit) / entry_price
+            else:
+                if 0 < stop_loss < entry_price:
+                    risk_pct = (entry_price - stop_loss) / entry_price
+                if take_profit > entry_price:
+                    reward_pct = (take_profit - entry_price) / entry_price
+
+        if risk_pct <= 0:
+            risk_pct = float(
+                metadata.get(
+                    "stop_loss_pct",
+                    metadata.get("risk_pct", params.get("stop_loss_pct", 0.0)),
+                )
+                or 0.0
+            )
+        if reward_pct <= 0:
+            reward_pct = float(
+                metadata.get(
+                    "take_profit_pct",
+                    metadata.get("reward_pct", params.get("take_profit_pct", 0.0)),
+                )
+                or 0.0
+            )
+
+        source = str(strategy.get("source", metadata.get("source", "strategy"))).strip().lower()
+        if risk_pct <= 0 or reward_pct <= 0:
+            atr_pct = float(metadata.get("atr_pct", 0.0) or 0.0)
+            if atr_pct > 0:
+                risk_pct = risk_pct or max(0.0125, min(atr_pct * 1.2, 0.06))
+                reward_pct = reward_pct or max(risk_pct * 2.0, atr_pct * 1.8)
+
+        if risk_pct <= 0 or reward_pct <= 0:
+            if source == "copy_trade":
+                risk_pct = risk_pct or 0.04
+                reward_pct = reward_pct or 0.08
+            elif source in ("options_flow", "liquidation_strategy", "arena_champion"):
+                risk_pct = risk_pct or 0.025
+                reward_pct = reward_pct or 0.05
+            else:
+                risk_pct = risk_pct or 0.03
+                reward_pct = reward_pct or 0.06
+
+        risk_pct = max(risk_pct, 0.005)
+        reward_pct = max(reward_pct, 0.005)
+        return {
+            "risk_pct": risk_pct,
+            "reward_pct": reward_pct,
+            "reward_risk_ratio": reward_pct / risk_pct if risk_pct > 0 else 0.0,
+        }
+
+    def _lookup_kelly_stats(self, strategy: Dict, kelly_stats: Optional[Dict]) -> Dict:
+        if not isinstance(kelly_stats, dict):
+            return {}
+        keys = [
+            strategy.get("source_key"),
+            strategy.get("strategy_type"),
+            strategy.get("name"),
+        ]
+        for key in keys:
+            if key and key in kelly_stats:
+                stats = kelly_stats.get(key)
+                if isinstance(stats, dict):
+                    return stats
+        return {}
+
+    def _expected_value_score(
+        self,
+        strategy: Dict,
+        *,
+        confidence: float,
+        source_quality: float,
+        confirmation: float,
+        direction: str,
+        target_coin: str,
+        regime_alignment: float,
+        open_coins: set,
+        kelly_stats: Optional[Dict],
+    ) -> Dict[str, float]:
+        metadata = self._get_metadata(strategy)
+        geometry = self._extract_risk_geometry(strategy, direction)
+        kelly = self._lookup_kelly_stats(strategy, kelly_stats)
+        kelly_win_rate = None
+        if kelly:
+            try:
+                kelly_win_rate = float(kelly.get("win_rate", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                kelly_win_rate = None
+
+        weighted_inputs = [
+            (confidence, 0.50),
+            (source_quality, 0.25),
+            (confirmation, 0.15),
+        ]
+        if kelly_win_rate is not None:
+            weighted_inputs.append((self._clamp(kelly_win_rate, 0.0, 1.0), 0.10))
+
+        weight_sum = sum(weight for _, weight in weighted_inputs) or 1.0
+        win_probability = sum(value * weight for value, weight in weighted_inputs) / weight_sum
+        win_probability += (regime_alignment - 0.5) * 0.06
+        if kelly and kelly.get("has_edge") is True:
+            win_probability += 0.03
+        elif kelly and int(kelly.get("trades", 0) or 0) >= 15:
+            win_probability -= 0.02
+        win_probability = self._clamp(win_probability, 0.01, 0.99)
+
+        execution_role = str(
+            metadata.get("execution_role", self.default_execution_role) or self.default_execution_role
+        ).lower()
+        if execution_role == "maker":
+            fee_bps = float(metadata.get("maker_fee_bps", self.maker_fee_bps) or self.maker_fee_bps)
+        else:
+            fee_bps = float(metadata.get("taker_fee_bps", self.taker_fee_bps) or self.taker_fee_bps)
+
+        slippage_bps = float(
+            metadata.get(
+                "expected_slippage_bps",
+                metadata.get("slippage_bps", self.expected_slippage_bps),
+            )
+            or self.expected_slippage_bps
+        )
+        churn_penalty_bps = float(metadata.get("churn_penalty_bps", self.churn_penalty_bps) or self.churn_penalty_bps)
+        if target_coin in open_coins:
+            churn_penalty_bps *= 1.5
+
+        execution_cost_pct = ((fee_bps + slippage_bps) * 2.0 + churn_penalty_bps) / 10_000.0
+        gross_expectancy_pct = (
+            win_probability * geometry["reward_pct"]
+            - (1.0 - win_probability) * geometry["risk_pct"]
+        )
+        net_expectancy_pct = gross_expectancy_pct - execution_cost_pct
+        score_bound = max(geometry["reward_pct"] + geometry["risk_pct"], 0.04)
+        normalized_score = self._clamp(0.5 + (net_expectancy_pct / score_bound), 0.0, 1.0)
+
+        return {
+            "score": normalized_score,
+            "win_probability": win_probability,
+            "reward_risk_ratio": geometry["reward_risk_ratio"],
+            "gross_expectancy_pct": gross_expectancy_pct,
+            "net_expectancy_pct": net_expectancy_pct,
+            "execution_cost_pct": execution_cost_pct,
+            "kelly_has_edge": bool(kelly.get("has_edge", False)) if kelly else False,
+        }
+
     def _confirmation_score(self, strategy: Dict) -> float:
         """Score how much independent confirmation a candidate has."""
-        metadata = strategy.get("metadata", {})
-        if not isinstance(metadata, dict):
-            metadata = {}
+        metadata = self._get_metadata(strategy)
 
         confirmations = []
         if strategy.get("options_flow_aligned") is True:
@@ -443,8 +667,19 @@ class DecisionEngine:
             coin = s.get("_decision_coin", "?")
             side = s.get("_decision_side", "?")
             composite = s.get("_composite_score", 0)
+            expected_value_pct = float(s.get("_expected_value_pct", 0.0) or 0.0) * 100.0
+            execution_cost_pct = float(s.get("_execution_cost_pct", 0.0) or 0.0) * 100.0
             marker = " ← EXEC" if s in executions else ""
-            logger.info("  #%d %s %s composite=%.4f%s", i + 1, side.upper(), coin, composite, marker)
+            logger.info(
+                "  #%d %s %s composite=%.4f ev=%+.2f%% cost=%.2f%%%s",
+                i + 1,
+                side.upper(),
+                coin,
+                composite,
+                expected_value_pct,
+                execution_cost_pct,
+                marker,
+            )
 
         if executions:
             logger.info("→ EXECUTING %d trade(s) this cycle", len(executions))

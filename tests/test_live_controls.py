@@ -28,6 +28,7 @@ from src.core.live_execution import (
     sync_shadow_book_to_live,
 )
 from src.data import database as db
+from src.signals.decision_engine import DecisionEngine
 from src.signals.decision_firewall import DecisionFirewall
 from src.signals.signal_schema import TradeSignal, signal_from_execution_dict
 from src.trading.live_trader import (
@@ -1109,6 +1110,144 @@ def test_live_trader_persists_live_ledger_snapshots(monkeypatch):
     assert saved_positions[-1]["positions"][0]["coin"] == "BTC"
     assert saved_fills
     assert saved_fills[-1][0] == "0x2222222222222222222222222222222222222222"
+
+
+def test_decision_engine_prefers_higher_net_expectancy_over_raw_score():
+    engine = DecisionEngine(
+        {
+            "w_score": 0.10,
+            "w_regime": 0.05,
+            "w_diversity": 0.05,
+            "w_freshness": 0.0,
+            "w_consensus": 0.0,
+            "w_confidence": 0.15,
+            "w_source_quality": 0.10,
+            "w_confirmation": 0.05,
+            "w_expected_value": 0.50,
+            "min_decision_score": 0.0,
+            "min_signal_confidence": 0.4,
+            "min_source_weight": 0.3,
+            "min_expected_value_pct": 0.0,
+            "expected_slippage_bps": 3.0,
+            "taker_fee_bps": 4.5,
+            "churn_penalty_bps": 2.0,
+        }
+    )
+
+    high_score_bad_ev = {
+        "name": "bad_ev",
+        "strategy_type": "trend_following",
+        "current_score": 0.92,
+        "confidence": 0.59,
+        "source_accuracy": 0.55,
+        "side": "long",
+        "entry_price": 100.0,
+        "stop_loss": 94.0,
+        "take_profit": 101.0,
+        "parameters": {"coins": ["BTC"]},
+        "metadata": {"taker_fee_bps": 12.0, "expected_slippage_bps": 20.0},
+    }
+    lower_score_good_ev = {
+        "name": "good_ev",
+        "strategy_type": "trend_following",
+        "current_score": 0.66,
+        "confidence": 0.67,
+        "source_accuracy": 0.64,
+        "side": "long",
+        "entry_price": 100.0,
+        "stop_loss": 97.0,
+        "take_profit": 109.0,
+        "parameters": {"coins": ["ETH"]},
+        "metadata": {"taker_fee_bps": 4.5, "expected_slippage_bps": 3.0},
+    }
+
+    bad_breakdown = engine._compute_composite_score(
+        dict(high_score_bad_ev), regime_data={"overall_regime": "neutral"}, open_coins=set(), kelly_stats=None
+    )
+    good_breakdown = engine._compute_composite_score(
+        dict(lower_score_good_ev), regime_data={"overall_regime": "neutral"}, open_coins=set(), kelly_stats=None
+    )
+    selected = engine.decide([high_score_bad_ev, lower_score_good_ev], regime_data={"overall_regime": "neutral"})
+
+    assert selected
+    assert selected[0]["name"] == "good_ev"
+    assert good_breakdown["net_expectancy_pct"] > bad_breakdown["net_expectancy_pct"]
+    assert good_breakdown["expected_value"] > bad_breakdown["expected_value"]
+
+
+def test_decision_engine_blocks_negative_expected_value_candidates():
+    engine = DecisionEngine(
+        {
+            "min_decision_score": 0.0,
+            "min_signal_confidence": 0.4,
+            "min_source_weight": 0.3,
+            "min_expected_value_pct": 0.0015,
+        }
+    )
+
+    candidate = {
+        "name": "negative_ev",
+        "strategy_type": "mean_reversion",
+        "current_score": 0.8,
+        "confidence": 0.55,
+        "source_accuracy": 0.5,
+        "side": "long",
+        "entry_price": 100.0,
+        "stop_loss": 94.0,
+        "take_profit": 101.0,
+        "parameters": {"coins": ["SOL"]},
+        "metadata": {"taker_fee_bps": 15.0, "expected_slippage_bps": 25.0},
+    }
+
+    breakdown = engine._compute_composite_score(candidate, regime_data=None, open_coins=set(), kelly_stats=None)
+    candidate["_score_breakdown"] = breakdown
+    blockers = engine._decision_blockers(candidate)
+
+    assert breakdown["net_expectancy_pct"] < 0.0015
+    assert any(blocker.startswith("net_ev<") for blocker in blockers)
+
+
+def test_decision_engine_uses_kelly_edge_to_improve_expected_value():
+    engine = DecisionEngine(
+        {
+            "min_decision_score": 0.0,
+            "min_signal_confidence": 0.4,
+            "min_source_weight": 0.3,
+            "min_expected_value_pct": 0.0,
+        }
+    )
+
+    candidate = {
+        "name": "kelly_candidate",
+        "strategy_type": "trend_following",
+        "source_key": "strategy:trend_following",
+        "current_score": 0.7,
+        "confidence": 0.62,
+        "source_accuracy": 0.58,
+        "side": "long",
+        "entry_price": 100.0,
+        "stop_loss": 97.0,
+        "take_profit": 106.0,
+        "parameters": {"coins": ["BTC"]},
+        "metadata": {},
+    }
+
+    no_kelly = engine._compute_composite_score(dict(candidate), regime_data=None, open_coins=set(), kelly_stats={})
+    with_kelly = engine._compute_composite_score(
+        dict(candidate),
+        regime_data=None,
+        open_coins=set(),
+        kelly_stats={
+            "strategy:trend_following": {
+                "trades": 40,
+                "win_rate": 0.71,
+                "has_edge": True,
+            }
+        },
+    )
+
+    assert with_kelly["net_expectancy_pct"] > no_kelly["net_expectancy_pct"]
+    assert with_kelly["expected_value"] > no_kelly["expected_value"]
 
 
 def test_run_trading_cycle_does_not_fall_through_to_standalone_options_flow(monkeypatch):

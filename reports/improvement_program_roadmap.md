@@ -4,6 +4,7 @@ This branch is the staged upgrade path for making the bot more measurable, more 
 
 ## Phase 1: Live Ledger Foundation
 
+- Status: shipped on `codex/live-ledger-foundation`
 - Persist live equity snapshots across cycles.
 - Persist live position snapshots across cycles, including zero-position batches.
 - Persist exchange fill events idempotently for lifetime realized PnL and fee tracking.
@@ -12,6 +13,7 @@ This branch is the staged upgrade path for making the bot more measurable, more 
 
 ## Phase 2: Expected-Value Decision Engine
 
+- Status: shipped on `codex/live-ledger-foundation`
 - Replace pure composite-score ranking with expected net value ranking.
 - Model fees, slippage, funding, churn cost, and regime-adjusted expectancy.
 - Add source, coin, and regime calibration before final ranking.

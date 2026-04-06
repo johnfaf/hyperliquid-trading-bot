@@ -195,19 +195,39 @@ ROTATION_REQUIRE_EXPLICIT_THRESHOLDS = os.environ.get(
 FIREWALL_MIN_CONFIDENCE = float(os.environ.get("FIREWALL_MIN_CONFIDENCE", 0.45))
 
 # Decision engine tightening: these weights and floors make the ranking layer
-# care about calibrated confidence and source quality, not just raw scorer output.
-DECISION_W_SCORE = float(os.environ.get("DECISION_W_SCORE", 0.25))
-DECISION_W_REGIME = float(os.environ.get("DECISION_W_REGIME", 0.20))
-DECISION_W_DIVERSITY = float(os.environ.get("DECISION_W_DIVERSITY", 0.15))
+# care about calibrated confidence, source quality, and net expectancy after costs.
+DECISION_W_SCORE = float(os.environ.get("DECISION_W_SCORE", 0.18))
+DECISION_W_REGIME = float(os.environ.get("DECISION_W_REGIME", 0.14))
+DECISION_W_DIVERSITY = float(os.environ.get("DECISION_W_DIVERSITY", 0.10))
 DECISION_W_FRESHNESS = float(os.environ.get("DECISION_W_FRESHNESS", 0.05))
-DECISION_W_CONSENSUS = float(os.environ.get("DECISION_W_CONSENSUS", 0.05))
-DECISION_W_CONFIDENCE = float(os.environ.get("DECISION_W_CONFIDENCE", 0.15))
-DECISION_W_SOURCE_QUALITY = float(os.environ.get("DECISION_W_SOURCE_QUALITY", 0.10))
-DECISION_W_CONFIRMATION = float(os.environ.get("DECISION_W_CONFIRMATION", 0.05))
+DECISION_W_CONSENSUS = float(os.environ.get("DECISION_W_CONSENSUS", 0.04))
+DECISION_W_CONFIDENCE = float(os.environ.get("DECISION_W_CONFIDENCE", 0.13))
+DECISION_W_SOURCE_QUALITY = float(os.environ.get("DECISION_W_SOURCE_QUALITY", 0.09))
+DECISION_W_CONFIRMATION = float(os.environ.get("DECISION_W_CONFIRMATION", 0.07))
+DECISION_W_EXPECTED_VALUE = float(os.environ.get("DECISION_W_EXPECTED_VALUE", 0.20))
 DECISION_MIN_SCORE = float(os.environ.get("DECISION_MIN_SCORE", 0.34))
 DECISION_MIN_CONFIDENCE = float(os.environ.get("DECISION_MIN_CONFIDENCE", 0.58))
 DECISION_MIN_SOURCE_WEIGHT = float(os.environ.get("DECISION_MIN_SOURCE_WEIGHT", 0.35))
+DECISION_MIN_EXPECTED_VALUE_PCT = float(
+    os.environ.get("DECISION_MIN_EXPECTED_VALUE_PCT", 0.0015)
+)
 DECISION_MAX_TRADES_PER_CYCLE = int(os.environ.get("DECISION_MAX_TRADES_PER_CYCLE", 2))
+DECISION_MAKER_FEE_BPS = float(
+    os.environ.get("DECISION_MAKER_FEE_BPS", PAPER_TRADING_MAKER_FEE_BPS)
+)
+DECISION_TAKER_FEE_BPS = float(
+    os.environ.get("DECISION_TAKER_FEE_BPS", PAPER_TRADING_TAKER_FEE_BPS)
+)
+DECISION_EXPECTED_SLIPPAGE_BPS = float(
+    os.environ.get("DECISION_EXPECTED_SLIPPAGE_BPS", PORTFOLIO_EXPECTED_SLIPPAGE_BPS)
+)
+DECISION_CHURN_PENALTY_BPS = float(
+    os.environ.get("DECISION_CHURN_PENALTY_BPS", 2.0)
+)
+DECISION_DEFAULT_EXECUTION_ROLE = os.environ.get(
+    "DECISION_DEFAULT_EXECUTION_ROLE",
+    PAPER_TRADING_DEFAULT_EXECUTION_ROLE,
+)
 
 # External-signal thresholds used before signals enter the decision engine.
 POLYMARKET_MIN_DECISION_CONFIDENCE = float(
