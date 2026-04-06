@@ -20,6 +20,7 @@ import logging
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import config
+from src.data import database as db
 
 logger = logging.getLogger(__name__)
 logger.addHandler(logging.NullHandler())
@@ -97,18 +98,69 @@ def _build_live_account_summary(trader) -> Dict:
         "deployable": False,
         "dry_run": True,
         "status_reason": "unavailable",
+        "ledger_ready": False,
         "wallet_total": None,
         "perps_margin": None,
         "spot_usdc": None,
         "realized_pnl_today": 0.0,
+        "lifetime_realized_pnl": 0.0,
+        "lifetime_fees_paid": 0.0,
+        "lifetime_fill_count": 0,
         "open_unrealized_pnl": 0.0,
         "open_positions": 0,
         "orders_today": 0,
         "fills_today": 0,
         "daily_pnl_limit": 0.0,
+        "last_fill_timestamp": None,
+        "last_equity_timestamp": None,
         "timestamp": None,
     }
+    public_address = getattr(trader, "public_address", None) if trader else None
+    try:
+        fill_summary = db.get_live_fill_summary(public_address=public_address)
+        latest_equity = db.get_latest_live_equity_snapshot(public_address=public_address)
+        latest_positions = db.get_latest_live_positions(public_address=public_address)
+    except Exception as exc:
+        logger.debug("dashboard live ledger error: %s", exc)
+        fill_summary = {}
+        latest_equity = None
+        latest_positions = {"snapshot": None, "positions": []}
+
+    if fill_summary or latest_equity or latest_positions.get("snapshot"):
+        summary["ledger_ready"] = bool(
+            latest_equity
+            or latest_positions.get("snapshot")
+            or (fill_summary.get("fill_count", 0) or 0) > 0
+        )
+        summary["lifetime_realized_pnl"] = round(_safe_float(fill_summary.get("realized_pnl", 0.0), 0.0), 2)
+        summary["lifetime_fees_paid"] = round(_safe_float(fill_summary.get("fees_paid", 0.0), 0.0), 2)
+        summary["lifetime_fill_count"] = int(fill_summary.get("fill_count", 0) or 0)
+        summary["last_fill_timestamp"] = fill_summary.get("last_fill_timestamp")
+        if latest_equity:
+            summary["last_equity_timestamp"] = latest_equity.get("timestamp")
+
     if not trader:
+        if latest_equity:
+            summary["wallet_total"] = latest_equity.get("total")
+            summary["perps_margin"] = latest_equity.get("perps_margin")
+            summary["spot_usdc"] = latest_equity.get("spot_usdc")
+            summary["realized_pnl_today"] = round(
+                _safe_float(latest_equity.get("daily_realized_pnl", 0.0), 0.0), 2
+            )
+            summary["orders_today"] = int(latest_equity.get("orders_today", 0) or 0)
+            summary["fills_today"] = int(latest_equity.get("fills_today", 0) or 0)
+            summary["timestamp"] = latest_equity.get("timestamp")
+        if latest_positions.get("snapshot"):
+            summary["open_positions"] = int(
+                latest_positions["snapshot"].get("position_count", len(latest_positions.get("positions", []))) or 0
+            )
+            summary["open_unrealized_pnl"] = round(
+                sum(
+                    _safe_float(position.get("unrealized_pnl", 0.0), 0.0)
+                    for position in latest_positions.get("positions", [])
+                ),
+                2,
+            )
         return summary
 
     summary["available"] = True
@@ -126,6 +178,26 @@ def _build_live_account_summary(trader) -> Dict:
         logger.debug("dashboard live balance snapshot error: %s", exc)
     if not isinstance(wallet, dict):
         wallet = {}
+
+    if latest_equity:
+        wallet = {
+            "perps_margin": (
+                wallet.get("perps_margin")
+                if wallet.get("perps_margin") is not None
+                else latest_equity.get("perps_margin")
+            ),
+            "spot_usdc": (
+                wallet.get("spot_usdc")
+                if wallet.get("spot_usdc") is not None
+                else latest_equity.get("spot_usdc")
+            ),
+            "total": (
+                wallet.get("total")
+                if wallet.get("total") is not None
+                else latest_equity.get("total")
+            ),
+            "timestamp": wallet.get("timestamp") or latest_equity.get("timestamp"),
+        }
 
     positions = []
     try:
@@ -161,6 +233,8 @@ def _build_live_account_summary(trader) -> Dict:
             "orders_today": int(live_stats.get("orders_today", 0) or 0),
             "fills_today": int(live_stats.get("fills_today", 0) or 0),
             "daily_pnl_limit": round(_safe_float(live_stats.get("daily_pnl_limit", 0.0), 0.0), 2),
+            "last_fill_timestamp": summary.get("last_fill_timestamp"),
+            "last_equity_timestamp": wallet.get("timestamp") or summary.get("last_equity_timestamp"),
             "timestamp": live_stats.get("timestamp") or wallet.get("timestamp"),
         }
     )
@@ -261,6 +335,13 @@ def get_dashboard_data():
                 "initial_balance": initial_balance,
             },
             "live_account": _build_live_account_summary(_live_trader),
+            "live_equity_curve": [
+                {"t": row.get("timestamp"), "v": row.get("total")}
+                for row in db.get_recent_live_equity_snapshots(
+                    limit=120,
+                    public_address=getattr(_live_trader, "public_address", None) if _live_trader else None,
+                )
+            ],
             "traders": traders,
             "strategies": strategies,
             "open_trades": open_trades,
@@ -669,10 +750,10 @@ function renderCards(d){
     {label:'Paper Net PnL', value:fmtUsd(a.total_pnl), cls:pnlClass(a.total_pnl), sub:`ROI: ${a.roi_pct>0?'+':''}${a.roi_pct}%`},
     {label:'Paper Gross PnL (Est.)', value:fmtUsd(a.gross_pnl_estimate), cls:pnlClass(a.gross_pnl_estimate)},
     {label:'Paper Execution Costs', value:fmtUsd(-(a.lifetime_execution_cost||0)), cls:'red', sub:`Fees ${fmtUsd(a.lifetime_fees||0)} + Slip ${fmtUsd(a.lifetime_slippage||0)}`},
-    {label:'Live Wallet Total', value:fmtUsd(live.wallet_total), cls:pnlClass(livePnlNow), sub:`Perps ${fmtUsd(live.perps_margin)} · Spot ${fmtUsd(live.spot_usdc)}`},
-    {label:'Live Realized PnL (Today)', value:fmtUsd(live.realized_pnl_today), cls:pnlClass(live.realized_pnl_today), sub:`Loss cap ${fmtUsd(-(live.daily_pnl_limit||0))}`},
+    {label:'Live Wallet Total', value:fmtUsd(live.wallet_total), cls:pnlClass(livePnlNow), sub:`Perps ${fmtUsd(live.perps_margin)} · Spot ${fmtUsd(live.spot_usdc)}${live.ledger_ready ? ' · Ledger live' : ''}`},
+    {label:'Live Realized PnL (Today)', value:fmtUsd(live.realized_pnl_today), cls:pnlClass(live.realized_pnl_today), sub:`Lifetime ${fmtUsd(live.lifetime_realized_pnl||0)} · Loss cap ${fmtUsd(-(live.daily_pnl_limit||0))}`},
     {label:'Live Open uPnL', value:fmtUsd(live.open_unrealized_pnl), cls:pnlClass(live.open_unrealized_pnl), sub:`${live.open_positions||0} live positions`},
-    {label:'Live Orders / Fills', value:`${live.orders_today||0} / ${live.fills_today||0}`, cls:(live.deployable && !live.dry_run) ? 'blue' : 'yellow', sub:liveStatus},
+    {label:'Live Orders / Fills', value:`${live.orders_today||0} / ${live.fills_today||0}`, cls:(live.deployable && !live.dry_run) ? 'blue' : 'yellow', sub:`${liveStatus} · lifetime ${live.lifetime_fill_count||0} fills`},
     {label:'Win Rate', value:a.win_rate+'%', cls:a.win_rate>=50?'green':'yellow', sub:`${a.winning_trades}/${a.total_trades} trades`},
     {label:'Tracked Traders', value:d.traders.length, cls:'blue'},
     {label:'Active Strategies', value:d.strategies.length, cls:'green'},

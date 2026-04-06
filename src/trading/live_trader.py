@@ -63,6 +63,7 @@ except ImportError:
 import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import config
+from src.data import database as db
 from src.core.api_manager import Priority, get_manager
 from src.core.secret_manager import SecretManagerError, load_agent_private_key
 from src.signals.decision_firewall import DecisionFirewall
@@ -453,6 +454,11 @@ class LiveTrader:
         }
         self._balance_log_interval_s = 300  # log balance at most once per 5 min
         self._last_balance_log_ts: float = 0.0
+        self._last_ledger_balance_signature: Optional[str] = None
+        self._last_ledger_balance_ts: float = 0.0
+        self._last_ledger_position_signature: Optional[str] = None
+        self._last_ledger_position_ts: float = 0.0
+        self._ledger_snapshot_interval_s: float = 60.0
 
         logger.info(
             f"LiveTrader initialized: dry_run={dry_run}, "
@@ -817,6 +823,7 @@ class LiveTrader:
             "total": total,
             "timestamp": datetime.utcnow().isoformat(),
         }
+        self._persist_live_balance_snapshot()
 
         if log and (now - self._last_balance_log_ts) >= self._balance_log_interval_s:
             self._last_balance_log_ts = now
@@ -832,6 +839,113 @@ class LiveTrader:
     def get_balance_snapshot(self) -> Dict[str, Optional[float]]:
         """Return the most recent balance snapshot (cached, no API call)."""
         return dict(self._last_balance_snapshot)
+
+    def _persist_live_balance_snapshot(self, force: bool = False) -> None:
+        """Persist the latest live equity snapshot with change-aware throttling."""
+        if not self.public_address:
+            return
+
+        snapshot = dict(self._last_balance_snapshot)
+        signature = json.dumps(
+            {
+                "public_address": self.public_address,
+                "snapshot": snapshot,
+                "daily_pnl": round(self.daily_pnl, 8),
+                "orders_today": self.orders_today,
+                "fills_today": self.fills_today,
+            },
+            sort_keys=True,
+            default=str,
+        )
+        now = time.time()
+        if (
+            not force
+            and signature == self._last_ledger_balance_signature
+            and (now - self._last_ledger_balance_ts) < self._ledger_snapshot_interval_s
+        ):
+            return
+
+        try:
+            db.save_live_equity_snapshot(
+                public_address=self.public_address,
+                perps_margin=snapshot.get("perps_margin"),
+                spot_usdc=snapshot.get("spot_usdc"),
+                total=snapshot.get("total"),
+                daily_realized_pnl=self.daily_pnl,
+                orders_today=self.orders_today,
+                fills_today=self.fills_today,
+                metadata={
+                    "dry_run": self.dry_run,
+                    "status_reason": self.status_reason,
+                },
+                timestamp=snapshot.get("timestamp"),
+            )
+            self._last_ledger_balance_signature = signature
+            self._last_ledger_balance_ts = now
+        except Exception as exc:
+            logger.debug("Failed to persist live balance snapshot: %s", exc)
+
+    def _persist_live_positions(self, positions: List[Dict[str, Any]], force: bool = False) -> None:
+        """Persist normalized live positions with change-aware throttling."""
+        if not self.public_address:
+            return
+
+        simplified = []
+        for position in positions:
+            simplified.append(
+                {
+                    "coin": position.get("coin"),
+                    "side": position.get("side"),
+                    "szi": self._coerce_float(position.get("szi", position.get("size", 0))),
+                    "entry_price": self._coerce_float(
+                        position.get("entry_price", position.get("entryPx", 0))
+                    ),
+                    "unrealized_pnl": self._coerce_float(
+                        position.get("unrealized_pnl", position.get("unrealizedPnl", 0))
+                    ),
+                    "leverage": self._coerce_float(position.get("leverage", 1), default=1.0),
+                }
+            )
+
+        signature = json.dumps(
+            {
+                "public_address": self.public_address,
+                "positions": sorted(simplified, key=lambda item: (item["coin"] or "", item["side"] or "")),
+            },
+            sort_keys=True,
+            default=str,
+        )
+        now = time.time()
+        if (
+            not force
+            and signature == self._last_ledger_position_signature
+            and (now - self._last_ledger_position_ts) < self._ledger_snapshot_interval_s
+        ):
+            return
+
+        try:
+            db.save_live_position_snapshot(
+                public_address=self.public_address,
+                positions=positions,
+                metadata={
+                    "dry_run": self.dry_run,
+                    "status_reason": self.status_reason,
+                },
+            )
+            self._last_ledger_position_signature = signature
+            self._last_ledger_position_ts = now
+        except Exception as exc:
+            logger.debug("Failed to persist live positions: %s", exc)
+
+    def _persist_live_fills(self, fills: List[Dict[str, Any]]) -> None:
+        """Persist live fill events idempotently for lifetime reporting."""
+        if not self.public_address or not fills:
+            return
+
+        try:
+            db.upsert_live_fill_events(self.public_address, fills)
+        except Exception as exc:
+            logger.debug("Failed to persist live fills: %s", exc)
 
     @staticmethod
     def _coerce_float(value: Any, default: float = 0.0) -> float:
@@ -1163,9 +1277,12 @@ class LiveTrader:
             if not isinstance(fills, list):
                 return
 
+            self._persist_live_fills(fills)
+
             # Sum closed PnL from today's fills
             today = datetime.utcnow().strftime("%Y-%m-%d")
             today_pnl = 0.0
+            today_fill_count = 0
             for fill in fills:
                 fill_time = fill.get("time", "")
                 if isinstance(fill_time, (int, float)):
@@ -1181,9 +1298,11 @@ class LiveTrader:
                 if fill_date == today:
                     closed_pnl = float(fill.get("closedPnl", 0))
                     today_pnl += closed_pnl
+                    today_fill_count += 1
 
             old_pnl = self.daily_pnl
             self.daily_pnl = today_pnl
+            self.fills_today = today_fill_count
 
             if abs(self.daily_pnl) > 0 and abs(self.daily_pnl - old_pnl) > 0.01:
                 logger.info(f"Daily PnL updated: ${self.daily_pnl:+,.2f}")
@@ -1195,6 +1314,7 @@ class LiveTrader:
 
             # Check if kill switch should trigger
             self.check_daily_loss()
+            self._persist_live_balance_snapshot(force=True)
 
         except Exception as e:
             logger.error(f"Failed to update daily PnL from fills: {e}")
@@ -2084,7 +2204,9 @@ class LiveTrader:
             data = self.get_account_state()
             positions = data.get("assetPositions", []) if isinstance(data, dict) else []
             normalized = [self._normalize_position(pos) for pos in positions]
-            return [pos for pos in normalized if pos.get("coin")]
+            filtered = [pos for pos in normalized if pos.get("coin")]
+            self._persist_live_positions(filtered)
+            return filtered
 
         except Exception as e:
             logger.error(f"Error getting positions: {e}")

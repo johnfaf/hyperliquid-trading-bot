@@ -5,6 +5,7 @@ import sqlite3
 import json
 import os
 import logging
+import hashlib
 from datetime import datetime
 from contextlib import contextmanager
 
@@ -36,6 +37,56 @@ def get_connection():
         raise
     finally:
         conn.close()
+
+
+def _safe_float(value, default=0.0):
+    try:
+        if value is None or value == "":
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _normalize_live_timestamp(value=None):
+    if value in (None, ""):
+        return datetime.utcnow().isoformat()
+    if isinstance(value, (int, float)):
+        timestamp = float(value)
+        if timestamp > 1_000_000_000_000:
+            timestamp /= 1000.0
+        return datetime.utcfromtimestamp(timestamp).isoformat()
+    return str(value)
+
+
+def _normalize_live_side(value):
+    text = str(value or "").strip().lower()
+    if not text:
+        return "unknown"
+    if "buy" in text or "long" in text:
+        return "buy"
+    if "sell" in text or "short" in text:
+        return "sell"
+    return text
+
+
+def _make_live_fill_uid(fill):
+    for key in ("tid", "fillId", "id", "oid"):
+        value = fill.get(key)
+        if value not in (None, ""):
+            return f"{key}:{value}"
+
+    fallback = {
+        "time": fill.get("time"),
+        "coin": fill.get("coin"),
+        "dir": fill.get("dir") or fill.get("side"),
+        "size": fill.get("sz") or fill.get("size"),
+        "price": fill.get("px") or fill.get("price"),
+        "closedPnl": fill.get("closedPnl"),
+        "fee": fill.get("fee"),
+    }
+    payload = json.dumps(fallback, sort_keys=True, default=str)
+    return hashlib.sha256(payload.encode()).hexdigest()
 
 
 def init_db():
@@ -173,6 +224,66 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_audit_timestamp ON audit_trail(timestamp);
         CREATE INDEX IF NOT EXISTS idx_audit_action ON audit_trail(action);
         CREATE INDEX IF NOT EXISTS idx_audit_coin ON audit_trail(coin);
+
+        CREATE TABLE IF NOT EXISTS live_equity_snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            public_address TEXT,
+            perps_margin REAL,
+            spot_usdc REAL,
+            total REAL,
+            daily_realized_pnl REAL DEFAULT 0,
+            orders_today INTEGER DEFAULT 0,
+            fills_today INTEGER DEFAULT 0,
+            metadata TEXT DEFAULT '{}'
+        );
+        CREATE INDEX IF NOT EXISTS idx_live_equity_timestamp ON live_equity_snapshots(timestamp);
+
+        CREATE TABLE IF NOT EXISTS live_position_batches (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            snapshot_id TEXT NOT NULL UNIQUE,
+            timestamp TEXT NOT NULL,
+            public_address TEXT,
+            position_count INTEGER DEFAULT 0,
+            metadata TEXT DEFAULT '{}'
+        );
+        CREATE INDEX IF NOT EXISTS idx_live_position_batches_timestamp ON live_position_batches(timestamp);
+
+        CREATE TABLE IF NOT EXISTS live_position_snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            snapshot_id TEXT NOT NULL,
+            coin TEXT NOT NULL,
+            side TEXT NOT NULL,
+            size REAL NOT NULL,
+            signed_size REAL NOT NULL,
+            entry_price REAL DEFAULT 0,
+            unrealized_pnl REAL DEFAULT 0,
+            leverage REAL DEFAULT 1,
+            metadata TEXT DEFAULT '{}',
+            FOREIGN KEY (snapshot_id) REFERENCES live_position_batches(snapshot_id)
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_live_position_snapshot_unique
+            ON live_position_snapshots(snapshot_id, coin, side, signed_size);
+        CREATE INDEX IF NOT EXISTS idx_live_position_snapshot_coin ON live_position_snapshots(coin);
+
+        CREATE TABLE IF NOT EXISTS live_fill_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            fill_uid TEXT NOT NULL UNIQUE,
+            timestamp TEXT NOT NULL,
+            public_address TEXT,
+            coin TEXT,
+            side TEXT,
+            dir TEXT,
+            size REAL DEFAULT 0,
+            price REAL DEFAULT 0,
+            fee REAL DEFAULT 0,
+            closed_pnl REAL DEFAULT 0,
+            order_id TEXT,
+            start_position TEXT,
+            raw_fill TEXT DEFAULT '{}'
+        );
+        CREATE INDEX IF NOT EXISTS idx_live_fill_timestamp ON live_fill_events(timestamp);
+        CREATE INDEX IF NOT EXISTS idx_live_fill_coin ON live_fill_events(coin);
         """)
 
 
@@ -479,6 +590,218 @@ def reset_paper_trades(initial_balance: float = None):
         "open_deleted": open_count,
         "closed_deleted": closed_count,
         "new_balance": initial_balance,
+    }
+
+
+def save_live_equity_snapshot(public_address: str, perps_margin=None, spot_usdc=None,
+                              total=None, daily_realized_pnl=0.0, orders_today=0,
+                              fills_today=0, metadata=None, timestamp=None):
+    snapshot_time = _normalize_live_timestamp(timestamp)
+    with get_connection() as conn:
+        cursor = conn.execute("""
+            INSERT INTO live_equity_snapshots
+            (timestamp, public_address, perps_margin, spot_usdc, total,
+             daily_realized_pnl, orders_today, fills_today, metadata)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            snapshot_time,
+            public_address,
+            perps_margin,
+            spot_usdc,
+            total,
+            _safe_float(daily_realized_pnl, 0.0),
+            int(orders_today or 0),
+            int(fills_today or 0),
+            json.dumps(metadata or {}),
+        ))
+        return cursor.lastrowid
+
+
+def save_live_position_snapshot(public_address: str, positions: list,
+                                metadata=None, timestamp=None):
+    snapshot_time = _normalize_live_timestamp(timestamp)
+    normalized_positions = []
+    for position in positions or []:
+        coin = str(position.get("coin", "") or "").strip().upper()
+        if not coin:
+            continue
+        signed_size = _safe_float(position.get("szi", position.get("size", 0)), 0.0)
+        size = abs(signed_size) if signed_size else abs(_safe_float(position.get("size", 0), 0.0))
+        side = str(position.get("side", "") or "").strip().lower()
+        if not side:
+            side = "long" if signed_size > 0 else "short" if signed_size < 0 else "flat"
+        normalized_positions.append(
+            {
+                "coin": coin,
+                "side": side,
+                "size": size,
+                "signed_size": signed_size,
+                "entry_price": _safe_float(position.get("entry_price", position.get("entryPx", 0)), 0.0),
+                "unrealized_pnl": _safe_float(position.get("unrealized_pnl", position.get("unrealizedPnl", 0)), 0.0),
+                "leverage": _safe_float(position.get("leverage", 1), 1.0),
+                "metadata": json.dumps({"raw": position.get("raw", position)}),
+            }
+        )
+
+    signature = json.dumps(
+        {
+            "public_address": public_address,
+            "timestamp": snapshot_time,
+            "positions": normalized_positions,
+        },
+        sort_keys=True,
+        default=str,
+    )
+    snapshot_id = hashlib.sha256(signature.encode()).hexdigest()
+
+    with get_connection() as conn:
+        conn.execute("""
+            INSERT INTO live_position_batches
+            (snapshot_id, timestamp, public_address, position_count, metadata)
+            VALUES (?, ?, ?, ?, ?)
+        """, (
+            snapshot_id,
+            snapshot_time,
+            public_address,
+            len(normalized_positions),
+            json.dumps(metadata or {}),
+        ))
+        for position in normalized_positions:
+            conn.execute("""
+                INSERT INTO live_position_snapshots
+                (snapshot_id, coin, side, size, signed_size, entry_price,
+                 unrealized_pnl, leverage, metadata)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                snapshot_id,
+                position["coin"],
+                position["side"],
+                position["size"],
+                position["signed_size"],
+                position["entry_price"],
+                position["unrealized_pnl"],
+                position["leverage"],
+                position["metadata"],
+            ))
+    return snapshot_id
+
+
+def upsert_live_fill_events(public_address: str, fills: list):
+    inserted = 0
+    updated = 0
+    with get_connection() as conn:
+        for fill in fills or []:
+            fill_uid = _make_live_fill_uid(fill)
+            cursor = conn.execute("""
+                INSERT INTO live_fill_events
+                (fill_uid, timestamp, public_address, coin, side, dir, size, price,
+                 fee, closed_pnl, order_id, start_position, raw_fill)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(fill_uid) DO UPDATE SET
+                    timestamp = excluded.timestamp,
+                    public_address = excluded.public_address,
+                    coin = excluded.coin,
+                    side = excluded.side,
+                    dir = excluded.dir,
+                    size = excluded.size,
+                    price = excluded.price,
+                    fee = excluded.fee,
+                    closed_pnl = excluded.closed_pnl,
+                    order_id = excluded.order_id,
+                    start_position = excluded.start_position,
+                    raw_fill = excluded.raw_fill
+            """, (
+                fill_uid,
+                _normalize_live_timestamp(fill.get("time")),
+                public_address,
+                str(fill.get("coin", "") or "").strip().upper() or None,
+                _normalize_live_side(fill.get("side") or fill.get("dir")),
+                str(fill.get("dir", fill.get("side", "")) or ""),
+                _safe_float(fill.get("sz", fill.get("size", 0)), 0.0),
+                _safe_float(fill.get("px", fill.get("price", 0)), 0.0),
+                _safe_float(fill.get("fee", 0), 0.0),
+                _safe_float(fill.get("closedPnl", 0), 0.0),
+                str(fill.get("oid", fill.get("orderId", "")) or ""),
+                str(fill.get("startPosition", "") or ""),
+                json.dumps(fill, sort_keys=True, default=str),
+            ))
+            if cursor.rowcount:
+                inserted += 1
+
+    return {
+        "seen": len(fills or []),
+        "upserted": inserted,
+        "updated": updated,
+    }
+
+
+def get_latest_live_equity_snapshot(public_address: str = None):
+    with get_connection() as conn:
+        query = "SELECT * FROM live_equity_snapshots"
+        params = []
+        if public_address:
+            query += " WHERE public_address = ?"
+            params.append(public_address)
+        query += " ORDER BY id DESC LIMIT 1"
+        row = conn.execute(query, params).fetchone()
+    return dict(row) if row else None
+
+
+def get_recent_live_equity_snapshots(limit: int = 100, public_address: str = None):
+    with get_connection() as conn:
+        query = "SELECT * FROM live_equity_snapshots"
+        params = []
+        if public_address:
+            query += " WHERE public_address = ?"
+            params.append(public_address)
+        query += " ORDER BY id DESC LIMIT ?"
+        params.append(int(limit))
+        rows = conn.execute(query, params).fetchall()
+    return [dict(r) for r in reversed(rows)]
+
+
+def get_latest_live_positions(public_address: str = None):
+    with get_connection() as conn:
+        query = "SELECT * FROM live_position_batches"
+        params = []
+        if public_address:
+            query += " WHERE public_address = ?"
+            params.append(public_address)
+        query += " ORDER BY id DESC LIMIT 1"
+        batch = conn.execute(query, params).fetchone()
+        if not batch:
+            return {"snapshot": None, "positions": []}
+        rows = conn.execute("""
+            SELECT * FROM live_position_snapshots
+            WHERE snapshot_id = ?
+            ORDER BY ABS(signed_size) DESC, coin ASC
+        """, (batch["snapshot_id"],)).fetchall()
+    return {
+        "snapshot": dict(batch),
+        "positions": [dict(r) for r in rows],
+    }
+
+
+def get_live_fill_summary(public_address: str = None):
+    with get_connection() as conn:
+        query = """
+            SELECT
+                COUNT(*) AS fill_count,
+                COALESCE(SUM(closed_pnl), 0) AS realized_pnl,
+                COALESCE(SUM(fee), 0) AS fees_paid,
+                MAX(timestamp) AS last_fill_timestamp
+            FROM live_fill_events
+        """
+        params = []
+        if public_address:
+            query += " WHERE public_address = ?"
+            params.append(public_address)
+        row = conn.execute(query, params).fetchone()
+    return dict(row) if row else {
+        "fill_count": 0,
+        "realized_pnl": 0.0,
+        "fees_paid": 0.0,
+        "last_fill_timestamp": None,
     }
 
 

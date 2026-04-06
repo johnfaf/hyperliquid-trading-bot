@@ -27,6 +27,7 @@ from src.core.live_execution import (
     get_execution_open_positions,
     sync_shadow_book_to_live,
 )
+from src.data import database as db
 from src.signals.decision_firewall import DecisionFirewall
 from src.signals.signal_schema import TradeSignal, signal_from_execution_dict
 from src.trading.live_trader import (
@@ -872,6 +873,242 @@ def test_dashboard_live_account_summary_stays_separate_from_paper_metrics():
     assert summary["open_positions"] == 2
     assert summary["orders_today"] == 7
     assert summary["fills_today"] == 5
+
+
+def test_dashboard_live_account_summary_includes_ledger_metrics(monkeypatch):
+    monkeypatch.setattr(
+        dashboard_ui.db,
+        "get_live_fill_summary",
+        lambda public_address=None: {
+            "fill_count": 3,
+            "realized_pnl": 64.5,
+            "fees_paid": 2.25,
+            "last_fill_timestamp": "2026-04-05T12:02:00",
+        },
+    )
+    monkeypatch.setattr(
+        dashboard_ui.db,
+        "get_latest_live_equity_snapshot",
+        lambda public_address=None: {
+            "timestamp": "2026-04-05T12:00:00",
+            "perps_margin": 1300.0,
+            "spot_usdc": 25.0,
+            "total": 1325.0,
+            "daily_realized_pnl": 18.0,
+            "orders_today": 4,
+            "fills_today": 3,
+        },
+    )
+    monkeypatch.setattr(
+        dashboard_ui.db,
+        "get_latest_live_positions",
+        lambda public_address=None: {
+            "snapshot": {"position_count": 2},
+            "positions": [
+                {"coin": "BTC", "unrealized_pnl": 5.0},
+                {"coin": "ETH", "unrealized_pnl": -2.0},
+            ],
+        },
+    )
+
+    class FakeLiveTrader:
+        public_address = "0xabc"
+
+        def get_stats(self):
+            return {
+                "live_enabled": True,
+                "deployable": True,
+                "dry_run": False,
+                "status_reason": "ready",
+                "daily_pnl": 18.0,
+                "daily_pnl_limit": 150.0,
+                "orders_today": 4,
+                "fills_today": 3,
+                "wallet_balance": {
+                    "perps_margin": 1300.0,
+                    "spot_usdc": 25.0,
+                    "total": 1325.0,
+                    "timestamp": "2026-04-05T12:00:00",
+                },
+                "timestamp": "2026-04-05T12:00:00",
+            }
+
+        def snapshot_balance(self, log=False):
+            return {
+                "perps_margin": 1300.0,
+                "spot_usdc": 25.0,
+                "total": 1325.0,
+                "timestamp": "2026-04-05T12:00:00",
+            }
+
+        def get_positions(self):
+            return [{"coin": "BTC", "szi": 0.2, "unrealized_pnl": 5.0}]
+
+    summary = dashboard_ui._build_live_account_summary(FakeLiveTrader())
+
+    assert summary["ledger_ready"] is True
+    assert summary["lifetime_realized_pnl"] == 64.5
+    assert summary["lifetime_fees_paid"] == 2.25
+    assert summary["lifetime_fill_count"] == 3
+    assert summary["last_fill_timestamp"] == "2026-04-05T12:02:00"
+    assert summary["last_equity_timestamp"] == "2026-04-05T12:00:00"
+
+
+def test_live_ledger_helpers_persist_snapshots_and_deduplicate_fills(monkeypatch):
+    fd, raw_path = tempfile.mkstemp(prefix="live_ledger_", suffix=".db", dir=os.getcwd())
+    os.close(fd)
+    db_path = os.path.abspath(raw_path)
+    original_path = db._DB_PATH
+    monkeypatch.setattr(db, "_DB_PATH", db_path)
+
+    try:
+        db.init_db()
+        db.save_live_equity_snapshot(
+            public_address="0xabc",
+            perps_margin=1200.0,
+            spot_usdc=50.0,
+            total=1250.0,
+            daily_realized_pnl=21.5,
+            orders_today=7,
+            fills_today=4,
+            timestamp="2026-04-05T12:00:00",
+        )
+        db.save_live_position_snapshot(
+            public_address="0xabc",
+            positions=[{"coin": "BTC", "side": "long", "szi": 0.1, "entry_price": 100000.0, "unrealized_pnl": 15.0, "leverage": 2}],
+            timestamp="2026-04-05T12:01:00",
+        )
+        db.save_live_position_snapshot(
+            public_address="0xabc",
+            positions=[],
+            timestamp="2026-04-05T12:02:00",
+        )
+        db.upsert_live_fill_events(
+            "0xabc",
+            [
+                {
+                    "time": 1_775_437_200_000,
+                    "coin": "BTC",
+                    "dir": "Open Long",
+                    "sz": "0.1",
+                    "px": "100500",
+                    "fee": "0.75",
+                    "closedPnl": "-12.5",
+                    "oid": "123",
+                },
+                {
+                    "time": 1_775_437_200_000,
+                    "coin": "BTC",
+                    "dir": "Open Long",
+                    "sz": "0.1",
+                    "px": "100500",
+                    "fee": "0.75",
+                    "closedPnl": "-12.5",
+                    "oid": "123",
+                },
+            ],
+        )
+
+        latest_equity = db.get_latest_live_equity_snapshot("0xabc")
+        latest_positions = db.get_latest_live_positions("0xabc")
+        fill_summary = db.get_live_fill_summary("0xabc")
+        equity_curve = db.get_recent_live_equity_snapshots(10, "0xabc")
+
+        assert latest_equity["total"] == 1250.0
+        assert latest_equity["daily_realized_pnl"] == 21.5
+        assert latest_positions["snapshot"]["position_count"] == 0
+        assert latest_positions["positions"] == []
+        assert fill_summary["fill_count"] == 1
+        assert fill_summary["realized_pnl"] == -12.5
+        assert fill_summary["fees_paid"] == 0.75
+        assert len(equity_curve) == 1
+    finally:
+        monkeypatch.setattr(db, "_DB_PATH", original_path)
+        if os.path.exists(db_path):
+            os.remove(db_path)
+
+
+def test_live_trader_persists_live_ledger_snapshots(monkeypatch):
+    class FakeFirewall:
+        def validate(self, signal, **kwargs):
+            return True, "ok"
+
+    saved_balance = []
+    saved_positions = []
+    saved_fills = []
+
+    class FakeApiManager:
+        def post(self, payload, priority=Priority.NORMAL, timeout=10):
+            request_type = payload.get("type")
+            if request_type == "clearinghouseState":
+                return {"marginSummary": {"accountValue": "1200"}}
+            if request_type == "spotClearinghouseState":
+                return {"balances": [{"coin": "USDC", "total": "50"}]}
+            if request_type == "userFills":
+                return [
+                    {
+                        "time": 1_775_437_200_000,
+                        "coin": "BTC",
+                        "dir": "Open Long",
+                        "sz": "0.1",
+                        "px": "100500",
+                        "fee": "0.25",
+                        "closedPnl": "5.5",
+                        "oid": "123",
+                    }
+                ]
+            return {}
+
+    monkeypatch.setattr(LiveTrader, "_load_credentials", _fake_live_credentials)
+    monkeypatch.setattr(LiveTrader, "_load_asset_index_map", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "reconcile_positions", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "check_daily_loss", lambda self: None)
+    monkeypatch.setattr(
+        LiveTrader,
+        "get_account_state",
+        lambda self: {
+            "assetPositions": [
+                {
+                    "position": {
+                        "coin": "BTC",
+                        "szi": "0.1",
+                        "entryPx": "100000",
+                        "unrealizedPnl": "12.0",
+                        "leverage": {"value": 2},
+                    }
+                }
+            ]
+        },
+    )
+    monkeypatch.setattr(
+        "src.trading.live_trader.db.save_live_equity_snapshot",
+        lambda **kwargs: saved_balance.append(kwargs) or 1,
+    )
+    monkeypatch.setattr(
+        "src.trading.live_trader.db.save_live_position_snapshot",
+        lambda **kwargs: saved_positions.append(kwargs) or "snapshot-1",
+    )
+    monkeypatch.setattr(
+        "src.trading.live_trader.db.upsert_live_fill_events",
+        lambda public_address, fills: saved_fills.append((public_address, fills)) or {"seen": len(fills)},
+    )
+
+    trader = LiveTrader(firewall=FakeFirewall(), dry_run=False, max_order_usd=1_000_000)
+    trader.api_manager = FakeApiManager()
+
+    balance = trader.snapshot_balance(log=False)
+    positions = trader.get_positions()
+    trader.update_daily_pnl_from_fills()
+
+    assert balance["total"] == 1250.0
+    assert positions[0]["coin"] == "BTC"
+    assert trader.fills_today == 1
+    assert saved_balance
+    assert saved_balance[-1]["total"] == 1250.0
+    assert saved_positions
+    assert saved_positions[-1]["positions"][0]["coin"] == "BTC"
+    assert saved_fills
+    assert saved_fills[-1][0] == "0x2222222222222222222222222222222222222222"
 
 
 def test_run_trading_cycle_does_not_fall_through_to_standalone_options_flow(monkeypatch):
