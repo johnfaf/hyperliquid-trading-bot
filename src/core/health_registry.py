@@ -12,6 +12,8 @@ from datetime import datetime
 from enum import Enum
 from typing import Dict, Optional
 
+from src.core.time_utils import utc_now
+
 logger = logging.getLogger(__name__)
 # Prevent "No handler found" warnings and stderr lastResort output
 # when the library is used before the application configures logging.
@@ -36,7 +38,7 @@ class SubsystemStatus:
     startup_status: str = "PENDING"
     dependency_ready: bool = False
     affects_trading: bool = True
-    registered_at: datetime = field(default_factory=datetime.utcnow)
+    registered_at: datetime = field(default_factory=utc_now)
 
     def is_trading_safe(self) -> bool:
         """Check if this subsystem is safe for trading operations."""
@@ -95,7 +97,7 @@ class SubsystemHealthRegistry:
                 startup_status="PENDING",
                 dependency_ready=False,
                 affects_trading=affects_trading,
-                registered_at=datetime.utcnow()
+                registered_at=utc_now()
             )
             self._subsystems[name] = status
             logger.debug("Registered subsystem '%s' (affects_trading=%s)", name, affects_trading)
@@ -112,7 +114,7 @@ class SubsystemHealthRegistry:
             if sub is None:
                 logger.debug("heartbeat() for unknown subsystem '%s' — ignored", name)
                 return
-            sub.last_heartbeat = datetime.utcnow()
+            sub.last_heartbeat = utc_now()
 
     def set_status(
         self,
@@ -232,7 +234,7 @@ class SubsystemHealthRegistry:
         Returns:
             Dictionary mapping subsystem names to whether they were auto-degraded
         """
-        now = datetime.utcnow()
+        now = utc_now()
         degraded = {}
 
         with self._lock:
@@ -318,7 +320,7 @@ class SubsystemHealthRegistry:
                             lines.append(f"      Reason: {status.reason}")
                         if status.last_heartbeat:
                             time_since = (
-                                datetime.utcnow() - status.last_heartbeat
+                                utc_now() - status.last_heartbeat
                             ).total_seconds()
                             lines.append(f"      Last Heartbeat: {time_since:.1f}s ago")
 
@@ -334,7 +336,7 @@ class SubsystemHealthRegistry:
     @staticmethod
     def _format_uptime(registered_at: datetime) -> str:
         """Format uptime duration as human-readable string."""
-        now = datetime.utcnow()
+        now = utc_now()
         delta = now - registered_at
         seconds = int(delta.total_seconds())
 

@@ -3,6 +3,75 @@ Configuration for the Hyperliquid Trading Research Bot.
 """
 import os
 
+_TRUE_VALUES = ("true", "1", "yes")
+_RUNTIME_PROFILES = ("paper", "shadow", "live")
+
+
+def _env_bool(name: str, default: str) -> bool:
+    return str(os.environ.get(name, default)).strip().lower() in _TRUE_VALUES
+
+
+def _resolve_runtime_profile() -> str:
+    if not RUNTIME_PROFILE_VALID:
+        return "paper"
+    return RUNTIME_PROFILE_RAW
+
+
+RUNTIME_PROFILE_RAW = str(os.environ.get("BOT_RUNTIME_PROFILE", "paper") or "paper").strip().lower()
+RUNTIME_PROFILE_VALID = RUNTIME_PROFILE_RAW in _RUNTIME_PROFILES
+RUNTIME_PROFILE = _resolve_runtime_profile()
+RUNTIME_PROFILE_DEFAULTS = {
+    "paper": {
+        "LIVE_TRADING_ENABLED": "false",
+        "LIVE_PREFLIGHT_REQUIRED": "false",
+        "LIVE_ACTIVATION_GUARD_ENABLED": "false",
+        "ROTATION_ENGINE_ENABLED": "false",
+        "ROTATION_DRY_RUN_TELEMETRY": "false",
+    },
+    "shadow": {
+        "LIVE_TRADING_ENABLED": "false",
+        "LIVE_PREFLIGHT_REQUIRED": "false",
+        "LIVE_ACTIVATION_GUARD_ENABLED": "false",
+        "ROTATION_ENGINE_ENABLED": "true",
+        "ROTATION_DRY_RUN_TELEMETRY": "true",
+    },
+    "live": {
+        "LIVE_TRADING_ENABLED": "true",
+        "LIVE_PREFLIGHT_REQUIRED": "true",
+        "LIVE_ACTIVATION_GUARD_ENABLED": "true",
+        "ROTATION_ENGINE_ENABLED": "true",
+        "ROTATION_DRY_RUN_TELEMETRY": "false",
+    },
+}
+
+
+def _profile_env(name: str, default: str) -> str:
+    if name in os.environ:
+        return str(os.environ[name])
+    return str(RUNTIME_PROFILE_DEFAULTS.get(RUNTIME_PROFILE, {}).get(name, default))
+
+
+def get_runtime_profile_summary() -> dict:
+    controls = {}
+    for env_name in (
+        "LIVE_TRADING_ENABLED",
+        "LIVE_PREFLIGHT_REQUIRED",
+        "LIVE_ACTIVATION_GUARD_ENABLED",
+        "ROTATION_ENGINE_ENABLED",
+        "ROTATION_DRY_RUN_TELEMETRY",
+    ):
+        controls[env_name] = {
+            "effective": _profile_env(env_name, ""),
+            "source": "env" if env_name in os.environ else f"profile:{RUNTIME_PROFILE}",
+        }
+    return {
+        "profile": RUNTIME_PROFILE,
+        "requested_profile": RUNTIME_PROFILE_RAW,
+        "profile_valid": RUNTIME_PROFILE_VALID,
+        "allowed_profiles": list(_RUNTIME_PROFILES),
+        "controls": controls,
+    }
+
 # ─── API Endpoints ─────────────────────────────────────────────
 HYPERLIQUID_API_URL = "https://api.hyperliquid.xyz"
 HYPERLIQUID_INFO_URL = f"{HYPERLIQUID_API_URL}/info"
@@ -95,9 +164,8 @@ PAPER_TRADING_DEFAULT_EXECUTION_ROLE = os.environ.get(
 # Live trading wallet / secret-management controls.
 # Agent-wallet-only mode: signer key must be for a delegated agent wallet, and
 # HL_PUBLIC_ADDRESS points to the trading account (master/vault) being managed.
-LIVE_TRADING_ENABLED = os.environ.get(
-    "LIVE_TRADING_ENABLED", "false"
-).lower() in ("true", "1", "yes")
+_LIVE_TRADING_TEXT = _profile_env("LIVE_TRADING_ENABLED", "false").strip().lower()
+LIVE_TRADING_ENABLED = _LIVE_TRADING_TEXT in _TRUE_VALUES
 
 # ─── Live Order Caps (cautious bootstrap) ─────────────────────
 # Hyperliquid enforces a $10 minimum notional per order on both perps and
@@ -119,15 +187,15 @@ LIVE_MIN_ORDER_USD = float(os.environ.get("LIVE_MIN_ORDER_USD", 11.0))
 LIVE_MAX_ORDER_USD = float(os.environ.get("LIVE_MAX_ORDER_USD", 12.0))
 # Daily loss limit for the live account in USD (forwarded to LiveTrader).
 LIVE_MAX_DAILY_LOSS_USD = float(os.environ.get("LIVE_MAX_DAILY_LOSS_USD", 5.0))
-LIVE_PREFLIGHT_REQUIRED = os.environ.get(
-    "LIVE_PREFLIGHT_REQUIRED", "true"
-).lower() in ("true", "1", "yes")
+LIVE_PREFLIGHT_REQUIRED = _profile_env(
+    "LIVE_PREFLIGHT_REQUIRED", "true" if LIVE_TRADING_ENABLED else "false"
+).strip().lower() in _TRUE_VALUES
 LIVE_PREFLIGHT_REFRESH_SECONDS = float(
     os.environ.get("LIVE_PREFLIGHT_REFRESH_SECONDS", 600)
 )
-LIVE_ACTIVATION_GUARD_ENABLED = os.environ.get(
-    "LIVE_ACTIVATION_GUARD_ENABLED", "true"
-).lower() in ("true", "1", "yes")
+LIVE_ACTIVATION_GUARD_ENABLED = _profile_env(
+    "LIVE_ACTIVATION_GUARD_ENABLED", "true" if LIVE_TRADING_ENABLED else "false"
+).strip().lower() in _TRUE_VALUES
 LIVE_ACTIVATION_APPROVED_AT = os.environ.get("LIVE_ACTIVATION_APPROVED_AT", "").strip()
 LIVE_ACTIVATION_APPROVED_BY = os.environ.get("LIVE_ACTIVATION_APPROVED_BY", "").strip()
 LIVE_ACTIVATION_MAX_AGE_HOURS = float(
@@ -216,12 +284,12 @@ PORTFOLIO_BASE_TIME_LIMIT_HOURS = float(
 PORTFOLIO_VOLATILE_TIME_LIMIT_HOURS = float(
     os.environ.get("PORTFOLIO_VOLATILE_TIME_LIMIT_HOURS", 12.0)
 )
-ROTATION_ENGINE_ENABLED = os.environ.get(
+ROTATION_ENGINE_ENABLED = _profile_env(
     "ROTATION_ENGINE_ENABLED", "false"
-).lower() in ("true", "1", "yes")
-ROTATION_DRY_RUN_TELEMETRY = os.environ.get(
+).strip().lower() in _TRUE_VALUES
+ROTATION_DRY_RUN_TELEMETRY = _profile_env(
     "ROTATION_DRY_RUN_TELEMETRY", "true"
-).lower() in ("true", "1", "yes")
+).strip().lower() in _TRUE_VALUES
 ROTATION_SHADOW_MODE_DAYS = int(os.environ.get("ROTATION_SHADOW_MODE_DAYS", "7"))
 ROTATION_REQUIRE_EXPLICIT_THRESHOLDS = os.environ.get(
     "ROTATION_REQUIRE_EXPLICIT_THRESHOLDS", "true"

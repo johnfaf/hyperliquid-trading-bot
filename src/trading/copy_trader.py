@@ -8,7 +8,6 @@ V2: Signals routed through DecisionFirewall and tracked by AgentScorer.
 """
 import logging
 import json
-from datetime import datetime
 from typing import Dict, List, Optional
 
 import os
@@ -17,6 +16,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import config
 from src.data import database as db
 from src.data import hyperliquid_client as hl
+from src.core.time_utils import utc_now_iso
 from src.signals.signal_schema import TradeSignal, signal_from_copy_trade
 from src.signals.decision_firewall import DecisionFirewall
 from src.signals.agent_scoring import AgentScorer
@@ -724,7 +724,7 @@ class CopyTrader:
                 "trader_address": signal.get("source_trader", ""),
                 "source": "copy_trade",
                 "source_key": source_key,
-                "opened_at": datetime.utcnow().isoformat(),
+                "opened_at": utc_now_iso(),
                 "source_budget": signal.get("source_budget", {}),
                 "metadata": {
                     "type": signal["type"],
@@ -901,7 +901,7 @@ class CopyTrader:
                     pnl=pnl,
                     return_pct=return_pct,
                     opened_at=trade.get("opened_at", ""),
-                    closed_at=datetime.utcnow().isoformat(),
+            closed_at=utc_now_iso(),
                     confidence=meta.get("confidence", 0),
                     source="copy_trade",
                 )
@@ -925,7 +925,7 @@ class CopyTrader:
             "strategy_type": "copy_trade",
             "trader_address": meta.get("source_trader", ""),
             "opened_at": trade.get("opened_at", ""),
-            "closed_at": datetime.utcnow().isoformat(),
+                        "closed_at": utc_now_iso(),
         }
         self._closed_events.append(closed_event)
         return closed_event

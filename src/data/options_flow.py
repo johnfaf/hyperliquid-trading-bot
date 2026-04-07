@@ -10,13 +10,13 @@ Data sources:
 """
 import logging
 import time
-import json
 import threading
 from datetime import datetime, timedelta
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional
 from collections import defaultdict
 
 import requests
+from src.core.time_utils import utc_now, utc_now_iso, utc_now_naive
 
 logger = logging.getLogger(__name__)
 
@@ -361,7 +361,7 @@ class OptionsFlowScanner:
             # Deribit format: 28MAR26
             from datetime import datetime
             exp_date = datetime.strptime(expiry_str, "%d%b%y")
-            days_to_expiry = (exp_date - datetime.utcnow()).days
+            days_to_expiry = (exp_date - utc_now_naive()).days
             if days_to_expiry <= 7:
                 return "weekly"
             elif days_to_expiry <= 35:
@@ -423,7 +423,7 @@ class OptionsFlowScanner:
                     existing_ids.add(p["trade_id"])
 
             # Trim to last 24h and cap at 500
-            cutoff = int((datetime.utcnow() - timedelta(hours=24)).timestamp() * 1000)
+            cutoff = int((utc_now() - timedelta(hours=24)).timestamp() * 1000)
             self.unusual_prints = [
                 p for p in self.unusual_prints if p.get("timestamp", 0) > cutoff
             ][-500:]
@@ -442,7 +442,7 @@ class OptionsFlowScanner:
             "unusual_prints": len(all_unusual),
             "total_tracked": len(self.unusual_prints),
             "top_convictions": len(self.top_convictions),
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": utc_now_iso(),
         }
         logger.info(f"Flow scan complete: {len(all_unusual)} new unusual prints, "
                     f"{len(self.unusual_prints)} total tracked")
@@ -558,7 +558,7 @@ class OptionsFlowScanner:
                 })
 
             return {
-                "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": utc_now_iso(),
                 "convictions": self.top_convictions,
                 "heatmap": heatmap_data,
                 "flow_bars": flow_bars,

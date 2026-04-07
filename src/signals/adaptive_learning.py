@@ -12,6 +12,7 @@ from datetime import datetime, timedelta
 from typing import Dict, Optional
 
 from src.data import database as db
+from src.core.time_utils import utc_now_iso, utc_now_naive
 from src.signals.signal_schema import build_source_key
 
 logger = logging.getLogger(__name__)
@@ -275,7 +276,7 @@ class AdaptiveLearningManager:
         if not self.enabled and not force:
             return self.get_stats()
 
-        now = datetime.utcnow()
+        now = utc_now_naive()
         attribution_rows = db.get_source_attribution_summary(
             limit_cycles=self.report_limit_cycles,
             lookback_hours=self.lookback_hours,
@@ -779,7 +780,7 @@ class AdaptiveLearningManager:
         if reference is None:
             return True
 
-        now = now or datetime.utcnow()
+        now = now or utc_now_naive()
         return now - reference >= timedelta(hours=max(self.recalibration_interval_hours, 0.0))
 
     def _resolve_recalibration_state(
@@ -1299,7 +1300,7 @@ class AdaptiveLearningManager:
                 agent.status = new_status
                 events.append(
                     {
-                        "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": utc_now_iso(),
                         "agent_id": agent.agent_id,
                         "agent_name": agent.name,
                         "strategy_type": agent.strategy_type,

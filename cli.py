@@ -7,11 +7,10 @@ paper-trade reset logic.  Keeps ``main.py`` focused on orchestration.
 Extracted from the bottom ~400 lines of the old monolithic main.py.
 """
 import argparse
-import os
-import time
 from datetime import datetime
 
 import config
+from src.core.time_utils import utc_from_timestamp_naive
 from src.data import database as db
 from src.data.database import init_db, backup_to_json
 
@@ -141,8 +140,8 @@ def run_cli_backtest(logger, args):
             for t in result.trades:
                 writer.writerow([
                     t.coin, t.side, t.entry_price, t.exit_price, t.size, t.leverage,
-                    datetime.utcfromtimestamp(t.entry_time_ms / 1000).isoformat(),
-                    datetime.utcfromtimestamp(t.exit_time_ms / 1000).isoformat(),
+                    utc_from_timestamp_naive(t.entry_time_ms / 1000).isoformat(),
+                    utc_from_timestamp_naive(t.exit_time_ms / 1000).isoformat(),
                     round(t.pnl, 2), round(t.pnl_pct, 6), t.exit_reason,
                     t.source_wallet, round(t.hold_time_hours, 2),
                 ])
@@ -273,6 +272,12 @@ def run_cache_clear(logger):
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Hyperliquid Auto-Research Trading Bot")
+    parser.add_argument(
+        "--runtime-profile",
+        choices=("paper", "shadow", "live"),
+        default=None,
+        help="Apply the named runtime profile before config loads.",
+    )
     parser.add_argument("--once", action="store_true", help="Run a single cycle then exit")
     parser.add_argument("--report", action="store_true", help="Generate a report and exit")
     parser.add_argument("--status", action="store_true", help="Print current status and exit")

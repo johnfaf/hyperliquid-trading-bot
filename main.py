@@ -15,6 +15,7 @@ Usage:
     python main.py              # Run the full bot loop
     python main.py --once       # Run a single cycle then exit
     python main.py --core-only  # Run with fundable-core profile only
+    python main.py --runtime-profile shadow
     python main.py --report     # Generate a report and exit
     python main.py --status     # Print current status and exit
     python main.py --bootstrap  # Cold-start DB seeding
@@ -33,6 +34,20 @@ if hasattr(sys.stderr, 'reconfigure'):
 
 sys.path.insert(0, os.path.dirname(__file__))
 
+
+def _extract_runtime_profile(argv):
+    for index, arg in enumerate(argv):
+        if arg.startswith("--runtime-profile="):
+            return arg.split("=", 1)[1].strip()
+        if arg == "--runtime-profile" and index + 1 < len(argv):
+            return str(argv[index + 1]).strip()
+    return ""
+
+
+_runtime_profile_override = _extract_runtime_profile(sys.argv[1:])
+if _runtime_profile_override:
+    os.environ["BOT_RUNTIME_PROFILE"] = _runtime_profile_override
+
 # Load .env BEFORE importing config so os.environ.get() calls pick up values.
 # On Railway/Docker the vars come from the platform; load_dotenv() is a no-op
 # when variables are already set, so this is always safe to call.
@@ -50,14 +65,13 @@ from src.core.boot import (
     init_database,
     log_persistence_info,
 )
-from src.core.health_registry import registry as health_registry, SubsystemState
+from src.core.health_registry import registry as health_registry
 from src.core.task_runner import SupervisedTaskRunner
 from src.core.subsystem_registry import (
     build_subsystems,
     heartbeat_active,
     FUNDABLE_CORE,
     FULL_PROFILE,
-    SubsystemContainer,
 )
 from src.core.cycles.research_cycle import run_discovery
 from src.core.cycles.trading_cycle import run_trading_cycle

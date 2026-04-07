@@ -12,6 +12,7 @@ from contextlib import contextmanager
 import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import config
+from src.core.time_utils import utc_from_timestamp_naive, utc_now_naive
 
 logger = logging.getLogger(__name__)
 
@@ -50,12 +51,12 @@ def _safe_float(value, default=0.0):
 
 def _normalize_live_timestamp(value=None):
     if value in (None, ""):
-        return datetime.utcnow().isoformat()
+        return utc_now_naive().isoformat()
     if isinstance(value, (int, float)):
         timestamp = float(value)
         if timestamp > 1_000_000_000_000:
             timestamp /= 1000.0
-        return datetime.utcfromtimestamp(timestamp).isoformat()
+        return utc_from_timestamp_naive(timestamp).isoformat()
     return str(value)
 
 
@@ -473,7 +474,7 @@ def init_db():
 
 def upsert_trader(address, total_pnl=0, roi_pct=0, account_value=0,
                   win_rate=0, trade_count=0, metadata=None, is_active=True):
-    now = datetime.utcnow().isoformat()
+    now = utc_now_naive().isoformat()
     meta_json = json.dumps(metadata or {})
     active_int = 1 if is_active else 0
     with get_connection() as conn:
@@ -499,7 +500,7 @@ def mark_trader_inactive(address):
     """Mark a trader as inactive (e.g. detected as bot)."""
     with get_connection() as conn:
         conn.execute("UPDATE traders SET active = 0, last_updated = ? WHERE address = ?",
-                     (datetime.utcnow().isoformat(), address))
+                     (utc_now_naive().isoformat(), address))
 
 
 def get_active_traders():
@@ -542,7 +543,7 @@ def get_all_traders_including_bots():
 
 def save_position_snapshot(trader_address, coin, side, size, entry_price,
                            leverage=1, unrealized_pnl=0, margin_used=0, metadata=None):
-    now = datetime.utcnow().isoformat()
+    now = utc_now_naive().isoformat()
     with get_connection() as conn:
         conn.execute("""
             INSERT INTO position_snapshots
@@ -567,7 +568,7 @@ def get_trader_position_history(trader_address, limit=100):
 
 def save_strategy(name, description, strategy_type, parameters=None,
                   total_pnl=0, trade_count=0, win_rate=0, sharpe_ratio=0):
-    now = datetime.utcnow().isoformat()
+    now = utc_now_naive().isoformat()
     with get_connection() as conn:
         cursor = conn.execute("""
             INSERT INTO strategies
@@ -581,7 +582,7 @@ def save_strategy(name, description, strategy_type, parameters=None,
 
 def save_strategies_batch(strategies_data):
     """Batch insert multiple strategies in a single transaction."""
-    now = datetime.utcnow().isoformat()
+    now = utc_now_naive().isoformat()
     saved_ids = []
     with get_connection() as conn:
         for s in strategies_data:
@@ -599,7 +600,7 @@ def save_strategies_batch(strategies_data):
 
 
 def update_strategy_score(strategy_id, score):
-    now = datetime.utcnow().isoformat()
+    now = utc_now_naive().isoformat()
     with get_connection() as conn:
         conn.execute("""
             UPDATE strategies SET current_score = ?, last_scored = ? WHERE id = ?
@@ -624,7 +625,7 @@ def get_strategy(strategy_id):
 
 def save_strategy_score(strategy_id, score, pnl_score=0, win_rate_score=0,
                         sharpe_score=0, consistency_score=0, risk_adj_score=0, notes=""):
-    now = datetime.utcnow().isoformat()
+    now = utc_now_naive().isoformat()
     with get_connection() as conn:
         conn.execute("""
             INSERT INTO strategy_scores
@@ -648,7 +649,7 @@ def get_strategy_score_history(strategy_id, limit=30):
 # ─── Paper Trading ─────────────────────────────────────────────
 
 def init_paper_account(balance):
-    now = datetime.utcnow().isoformat()
+    now = utc_now_naive().isoformat()
     with get_connection() as conn:
         conn.execute("""
             INSERT OR REPLACE INTO paper_account (id, balance, total_pnl, total_trades, winning_trades, last_updated)
@@ -663,7 +664,7 @@ def get_paper_account():
 
 
 def update_paper_account(balance, total_pnl, total_trades, winning_trades):
-    now = datetime.utcnow().isoformat()
+    now = utc_now_naive().isoformat()
     with get_connection() as conn:
         conn.execute("""
             UPDATE paper_account
@@ -674,7 +675,7 @@ def update_paper_account(balance, total_pnl, total_trades, winning_trades):
 
 def open_paper_trade(strategy_id, coin, side, entry_price, size, leverage=1,
                      stop_loss=None, take_profit=None, metadata=None):
-    now = datetime.utcnow().isoformat()
+    now = utc_now_naive().isoformat()
     with get_connection() as conn:
         cursor = conn.execute("""
             INSERT INTO paper_trades
@@ -711,7 +712,7 @@ def close_paper_trade(trade_id, exit_price, pnl) -> bool:
     already closed or the ID is wrong.  The caller MUST check the return value and
     skip the account PnL credit to prevent phantom double-credit.
     """
-    now = datetime.utcnow().isoformat()
+    now = utc_now_naive().isoformat()
     with get_connection() as conn:
         cursor = conn.execute("""
             UPDATE paper_trades SET closed_at = ?, exit_price = ?, pnl = ?, status = 'closed'
@@ -764,7 +765,7 @@ def reset_paper_trades(initial_balance: float = None):
         conn.execute("""
             INSERT OR REPLACE INTO paper_account (id, balance, total_pnl, total_trades, winning_trades, last_updated)
             VALUES (1, ?, 0, 0, 0, ?)
-        """, (initial_balance, datetime.utcnow().isoformat()))
+        """, (initial_balance, utc_now_naive().isoformat()))
 
     logger.info(f"Paper trades reset: cleared {open_count} open + {closed_count} closed trades, "
                f"balance reset to ${initial_balance:,.2f}")
@@ -1065,7 +1066,7 @@ def _get_execution_quality_row(
         conditions.append("source = ?")
         params.append(str(source).strip().lower())
     if lookback_hours and float(lookback_hours) > 0:
-        since = (datetime.utcnow() - timedelta(hours=float(lookback_hours))).isoformat()
+        since = (utc_now_naive() - timedelta(hours=float(lookback_hours))).isoformat()
         conditions.append("timestamp >= ?")
         params.append(since)
 
@@ -1157,7 +1158,7 @@ def get_execution_quality_by_source(
         conditions.append("public_address = ?")
         params.append(public_address)
     if lookback_hours and float(lookback_hours) > 0:
-        since = (datetime.utcnow() - timedelta(hours=float(lookback_hours))).isoformat()
+        since = (utc_now_naive() - timedelta(hours=float(lookback_hours))).isoformat()
         conditions.append("timestamp >= ?")
         params.append(since)
 
@@ -1400,7 +1401,7 @@ def get_source_attribution_summary(limit_cycles: int = 50, lookback_hours: float
     cycles = get_recent_decision_research(limit=limit_cycles, include_candidates=True)
     cutoff = None
     if lookback_hours and float(lookback_hours) > 0:
-        cutoff = datetime.utcnow() - timedelta(hours=float(lookback_hours))
+        cutoff = utc_now_naive() - timedelta(hours=float(lookback_hours))
 
     by_source = {}
 
@@ -1523,7 +1524,7 @@ def get_source_attribution_summary(limit_cycles: int = 50, lookback_hours: float
 def get_source_trade_outcome_summary(lookback_hours: float = 24.0 * 30) -> list:
     cutoff = None
     if lookback_hours and float(lookback_hours) > 0:
-        cutoff = datetime.utcnow() - timedelta(hours=float(lookback_hours))
+        cutoff = utc_now_naive() - timedelta(hours=float(lookback_hours))
 
     try:
         with get_connection() as conn:
@@ -1649,7 +1650,7 @@ def get_context_trade_outcome_summary(
 ) -> list:
     cutoff = None
     if lookback_hours and float(lookback_hours) > 0:
-        cutoff = datetime.utcnow() - timedelta(hours=float(lookback_hours))
+        cutoff = utc_now_naive() - timedelta(hours=float(lookback_hours))
 
     try:
         with get_connection() as conn:
@@ -2154,7 +2155,7 @@ def get_adaptive_promotion_states(limit: int = 0) -> list:
 def get_runtime_divergence_summary(lookback_hours: float = 24.0) -> dict:
     cutoff = None
     if lookback_hours and float(lookback_hours) > 0:
-        cutoff = datetime.utcnow() - timedelta(hours=float(lookback_hours))
+        cutoff = utc_now_naive() - timedelta(hours=float(lookback_hours))
 
     cycles = get_recent_decision_research(limit=200, include_candidates=True)
     shadow_selected_count = 0
@@ -2302,7 +2303,7 @@ def _compute_return_stats(returns: list) -> dict:
 def get_capital_governor_summary(lookback_hours: float = 24.0 * 14, health_limit: int = 200) -> dict:
     cutoff = None
     if lookback_hours and float(lookback_hours) > 0:
-        cutoff = datetime.utcnow() - timedelta(hours=float(lookback_hours))
+        cutoff = utc_now_naive() - timedelta(hours=float(lookback_hours))
 
     paper_account = get_paper_account() or {}
     paper_balance = _safe_float(paper_account.get("balance"), 0.0)
@@ -2435,7 +2436,7 @@ def get_capital_governor_summary(lookback_hours: float = 24.0 * 14, health_limit
 
 def log_research_cycle(cycle_type, summary, details=None,
                        traders_analyzed=0, strategies_found=0, strategies_updated=0):
-    now = datetime.utcnow().isoformat()
+    now = utc_now_naive().isoformat()
     with get_connection() as conn:
         conn.execute("""
             INSERT INTO research_logs
@@ -2461,7 +2462,7 @@ def audit_log(action: str, coin: str = None, side: str = None,
              circuit_breaker_triggered, rate_limit_hit, websocket_reconnect,
              golden_wallet_connected, bot_detected, error
     """
-    now = datetime.utcnow().isoformat()
+    now = utc_now_naive().isoformat()
     with get_connection() as conn:
         conn.execute("""
             INSERT INTO audit_trail (timestamp, action, coin, side, price, size, pnl, source, details)
@@ -2511,7 +2512,7 @@ def backup_to_json(filepath: str = None):
     try:
         data = {
             "version": 2,
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": utc_now_naive().isoformat(),
             "paper_account": get_paper_account(),
             "traders": get_active_traders()[:200],
             "bot_traders": [t for t in get_all_traders_including_bots() if not t.get("active", 1)],
@@ -2678,7 +2679,7 @@ def restore_from_json(filepath: str = None):
                                 gw.get("is_golden", 0),
                                 gw.get("coins_traded", ""),
                                 gw.get("best_coin", ""),
-                                gw.get("evaluated_at", datetime.utcnow().isoformat()),
+                                gw.get("evaluated_at", utc_now_naive().isoformat()),
                                 gw.get("connected_to_live", 0),
                             ))
                             golden_count += 1

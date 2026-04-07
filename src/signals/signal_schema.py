@@ -8,9 +8,10 @@ Every signal source (strategy scorer, copy trader, options flow)
 must produce a TradeSignal before it reaches the decision firewall.
 """
 from dataclasses import dataclass, field, asdict
-from datetime import datetime
 from typing import Optional, Dict, Any
 from enum import Enum
+
+from src.core.time_utils import utc_now_iso
 
 
 class SignalSide(str, Enum):
@@ -79,7 +80,7 @@ class TradeSignal:
     source_key: str = ""              # Stable attribution key used by learning systems
 
     # Metadata
-    timestamp: str = field(default_factory=lambda: datetime.utcnow().isoformat())
+    timestamp: str = field(default_factory=utc_now_iso)
     signal_id: str = ""               # Unique ID for tracking
     regime: str = ""                  # Market regime when signal was generated
     regime_size_modifier: float = 1.0 # Size adjustment from regime

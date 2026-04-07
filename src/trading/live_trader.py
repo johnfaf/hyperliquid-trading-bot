@@ -66,6 +66,7 @@ import config
 from src.data import database as db
 from src.core.api_manager import Priority, get_manager
 from src.core.secret_manager import SecretManagerError, load_agent_private_key
+from src.core.time_utils import utc_now_iso, utc_today_str
 from src.signals.decision_firewall import DecisionFirewall
 from src.signals.signal_schema import TradeSignal, signal_from_execution_dict
 
@@ -459,9 +460,22 @@ class LiveTrader:
         self._last_ledger_position_signature: Optional[str] = None
         self._last_ledger_position_ts: float = 0.0
         self._ledger_snapshot_interval_s: float = 60.0
-        self.preflight_required = bool(
+        configured_live_enabled = bool(
+            getattr(config, "LIVE_TRADING_ENABLED", self.live_requested)
+        )
+        configured_preflight_required = bool(
             getattr(config, "LIVE_PREFLIGHT_REQUIRED", True)
-            and getattr(config, "LIVE_TRADING_ENABLED", self.live_requested)
+        )
+        if configured_live_enabled and self.live_requested and not configured_preflight_required:
+            logger.warning(
+                "LIVE_PREFLIGHT_REQUIRED resolved false while live trading is requested; "
+                "forcing preflight_required for safety"
+            )
+            configured_preflight_required = True
+        self.preflight_required = bool(
+            configured_live_enabled
+            and self.live_requested
+            and configured_preflight_required
         )
         self._preflight_refresh_seconds = float(
             getattr(config, "LIVE_PREFLIGHT_REFRESH_SECONDS", 600.0)
@@ -896,7 +910,7 @@ class LiveTrader:
 
         deployable = self._basic_deployable() and not blocking_checks
         status = "ready" if deployable else ("blocked" if blocking_checks else "warning")
-        checked_at = datetime.utcnow().isoformat()
+        checked_at = utc_now_iso()
         report = {
             "status": status,
             "deployable": deployable,
@@ -921,7 +935,7 @@ class LiveTrader:
 
     def evaluate_activation_guard(self) -> Dict[str, Any]:
         """Validate the explicit operator acknowledgement required for live mode."""
-        checked_at = datetime.utcnow().isoformat()
+        checked_at = utc_now_iso()
         report: Dict[str, Any] = {
             "status": "not_requested",
             "deployable": False,
@@ -1383,7 +1397,7 @@ class LiveTrader:
             "perps_margin": perps,
             "spot_usdc": spot,
             "total": total,
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": utc_now_iso(),
         }
         self._persist_live_balance_snapshot()
 
@@ -1602,7 +1616,7 @@ class LiveTrader:
 
     def _check_daily_reset(self):
         """Reset daily counters at midnight UTC."""
-        today = datetime.utcnow().strftime("%Y-%m-%d")
+        today = utc_today_str()
         if today != self.daily_reset_date:
             self.daily_reset_date = today
             self.daily_pnl = 0.0
@@ -1842,7 +1856,7 @@ class LiveTrader:
             self._persist_live_fills(fills)
 
             # Sum closed PnL from today's fills
-            today = datetime.utcnow().strftime("%Y-%m-%d")
+            today = utc_today_str()
             today_pnl = 0.0
             today_fill_count = 0
             for fill in fills:
@@ -3515,7 +3529,7 @@ class LiveTrader:
                 "leverage": signal.leverage,
                 "entry_result": entry_result,
                 "dry_run": self.dry_run,
-                "timestamp": datetime.utcnow().isoformat()
+                "timestamp": utc_now_iso()
             }
 
         except Exception as e:
@@ -3560,5 +3574,5 @@ class LiveTrader:
             "preflight": dict(self._preflight_report),
             "activation_guard": dict(self._activation_report),
             "live_readiness": self.get_live_readiness(),
-            "timestamp": datetime.utcnow().isoformat()
+            "timestamp": utc_now_iso()
         }

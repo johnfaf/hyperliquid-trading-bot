@@ -12,6 +12,7 @@ import config
 import main
 from src.analysis.experiment_discipline import build_experiment_benchmark_pack
 from src.core import boot
+from src.core.time_utils import utc_now, utc_now_iso, utc_now_naive
 from src.core.api_manager import Priority
 from src.core.cycles.reporting_cycle import run_reporting
 from src.core.cycles.trading_cycle import (
@@ -98,6 +99,87 @@ def test_live_mode_still_requires_explicit_rotation_threshold_envs(monkeypatch):
         assert False, "Expected RuntimeError when live mode lacks explicit thresholds"
     except RuntimeError as exc:
         assert "PORTFOLIO_REPLACEMENT_THRESHOLD" in str(exc)
+
+
+def test_shadow_runtime_profile_allows_missing_live_envs(monkeypatch):
+    logger = logging.getLogger("test-shadow-profile")
+    monkeypatch.setattr(config, "RUNTIME_PROFILE", "shadow")
+    monkeypatch.setattr(config, "LIVE_TRADING_ENABLED", False)
+    monkeypatch.setattr(config, "LIVE_PREFLIGHT_REQUIRED", False)
+    monkeypatch.setattr(config, "LIVE_ACTIVATION_GUARD_ENABLED", False)
+
+    for env_name in (
+        "LIVE_TRADING_ENABLED",
+        "LIVE_MIN_ORDER_USD",
+        "LIVE_MAX_ORDER_USD",
+        "LIVE_MAX_DAILY_LOSS_USD",
+        "LIVE_PREFLIGHT_REQUIRED",
+        "LIVE_ACTIVATION_GUARD_ENABLED",
+        "LIVE_ACTIVATION_APPROVED_AT",
+        "LIVE_ACTIVATION_APPROVED_BY",
+        "LIVE_ACTIVATION_MAX_AGE_HOURS",
+        "HL_WALLET_MODE",
+        "SECRET_MANAGER_PROVIDER",
+    ):
+        monkeypatch.delenv(env_name, raising=False)
+
+    boot.validate_runtime_profile_controls(logger)
+
+
+def test_live_runtime_profile_requires_explicit_live_envs(monkeypatch):
+    logger = logging.getLogger("test-live-profile")
+    monkeypatch.setattr(config, "RUNTIME_PROFILE", "live")
+    monkeypatch.setattr(config, "LIVE_TRADING_ENABLED", True)
+    monkeypatch.setattr(config, "LIVE_PREFLIGHT_REQUIRED", True)
+    monkeypatch.setattr(config, "LIVE_ACTIVATION_GUARD_ENABLED", True)
+
+    for env_name in (
+        "LIVE_TRADING_ENABLED",
+        "LIVE_MIN_ORDER_USD",
+        "LIVE_MAX_ORDER_USD",
+        "LIVE_MAX_DAILY_LOSS_USD",
+        "LIVE_PREFLIGHT_REQUIRED",
+        "LIVE_ACTIVATION_GUARD_ENABLED",
+        "LIVE_ACTIVATION_APPROVED_AT",
+        "LIVE_ACTIVATION_APPROVED_BY",
+        "LIVE_ACTIVATION_MAX_AGE_HOURS",
+        "HL_WALLET_MODE",
+        "SECRET_MANAGER_PROVIDER",
+    ):
+        monkeypatch.delenv(env_name, raising=False)
+
+    try:
+        boot.validate_runtime_profile_controls(logger)
+        assert False, "Expected RuntimeError for incomplete live runtime profile envs"
+    except RuntimeError as exc:
+        assert "BOT_RUNTIME_PROFILE=live" in str(exc)
+        assert "LIVE_MIN_ORDER_USD" in str(exc)
+
+
+def test_live_runtime_profile_accepts_explicit_live_envs(monkeypatch):
+    logger = logging.getLogger("test-live-profile-ready")
+    monkeypatch.setattr(config, "RUNTIME_PROFILE", "live")
+    monkeypatch.setattr(config, "LIVE_TRADING_ENABLED", True)
+    monkeypatch.setattr(config, "LIVE_PREFLIGHT_REQUIRED", True)
+    monkeypatch.setattr(config, "LIVE_ACTIVATION_GUARD_ENABLED", True)
+
+    env_values = {
+        "LIVE_TRADING_ENABLED": "true",
+        "LIVE_MIN_ORDER_USD": "11",
+        "LIVE_MAX_ORDER_USD": "25",
+        "LIVE_MAX_DAILY_LOSS_USD": "10",
+        "LIVE_PREFLIGHT_REQUIRED": "true",
+        "LIVE_ACTIVATION_GUARD_ENABLED": "true",
+        "LIVE_ACTIVATION_APPROVED_AT": "2026-04-07T00:00:00Z",
+        "LIVE_ACTIVATION_APPROVED_BY": "codex-test",
+        "LIVE_ACTIVATION_MAX_AGE_HOURS": "24",
+        "HL_WALLET_MODE": "agent_only",
+        "SECRET_MANAGER_PROVIDER": "none",
+    }
+    for env_name, value in env_values.items():
+        monkeypatch.setenv(env_name, value)
+
+    boot.validate_runtime_profile_controls(logger)
 
 
 def test_signal_from_execution_dict_preserves_trade_metadata():
@@ -1316,7 +1398,7 @@ def test_live_trader_persists_live_ledger_snapshots(monkeypatch):
             if request_type == "userFills":
                 return [
                     {
-                        "time": int(datetime.utcnow().timestamp() * 1000),
+            "time": int(utc_now().timestamp() * 1000),
                         "coin": "BTC",
                         "dir": "Open Long",
                         "sz": "0.1",
@@ -1387,7 +1469,7 @@ def test_execution_quality_helpers_round_trip_and_group_by_source(monkeypatch):
     original_path = db._DB_PATH
     monkeypatch.setattr(db, "_DB_PATH", db_path)
 
-    now = datetime.utcnow().isoformat()
+    now = utc_now_iso()
 
     try:
         db.init_db()
@@ -1538,7 +1620,7 @@ def test_decision_funnel_source_attribution_and_divergence_summaries(monkeypatch
 
     try:
         db.init_db()
-        now = datetime.utcnow().isoformat()
+        now = utc_now_iso()
         db.save_decision_research_snapshot(
             {
                 "timestamp": now,
@@ -1723,13 +1805,13 @@ def test_source_trade_outcome_summary_and_health_snapshot_round_trip(monkeypatch
         with db.get_connection() as conn:
             conn.execute(
                 "UPDATE paper_trades SET closed_at = ? WHERE id = ?",
-                (datetime.utcnow().isoformat(), trade_id),
+            (utc_now_iso(), trade_id),
             )
 
         summary = db.get_source_trade_outcome_summary(lookback_hours=48)
         snapshot_id = db.save_source_health_snapshot(
             {
-                "timestamp": datetime.utcnow().isoformat(),
+        "timestamp": utc_now_iso(),
                 "metadata": {"summary": {"sources_tracked": 1}},
                 "profiles": [
                     {
@@ -1839,7 +1921,7 @@ def test_context_trade_outcome_summary_groups_by_coin_side_and_regime(monkeypatc
             for trade_id in closed_ids:
                 conn.execute(
                     "UPDATE paper_trades SET closed_at = ? WHERE id = ?",
-                    (datetime.utcnow().isoformat(), trade_id),
+            (utc_now_iso(), trade_id),
                 )
 
         trending_up_rows = db.get_context_trade_outcome_summary(
@@ -1941,7 +2023,7 @@ def test_adaptive_learning_manager_refreshes_profiles_and_reviews_arena(monkeypa
 
     try:
         db.init_db()
-        now = datetime.utcnow().isoformat()
+        now = utc_now_iso()
         db.save_decision_research_snapshot(
             {
                 "timestamp": now,
@@ -2036,11 +2118,11 @@ def test_adaptive_learning_manager_refreshes_profiles_and_reviews_arena(monkeypa
         with db.get_connection() as conn:
             conn.execute(
                 "UPDATE paper_trades SET closed_at = ? WHERE id = ?",
-                (datetime.utcnow().isoformat(), good_trade),
+            (utc_now_iso(), good_trade),
             )
             conn.execute(
                 "UPDATE paper_trades SET closed_at = ? WHERE id = ?",
-                (datetime.utcnow().isoformat(), bad_trade),
+            (utc_now_iso(), bad_trade),
             )
 
         db.save_live_execution_event(
@@ -2673,7 +2755,7 @@ def test_decision_engine_blocks_underperforming_context(monkeypatch):
                     "avg_return_pct": -0.025,
                     "win_rate": 0.1667,
                     "profit_factor": 0.1429,
-                    "last_closed_at": datetime.utcnow().isoformat(),
+                "last_closed_at": utc_now_iso(),
                 }
             ]
         return []
@@ -2749,7 +2831,7 @@ def test_decision_engine_prefers_candidates_with_better_recent_context(monkeypat
                     "avg_return_pct": 0.04,
                     "win_rate": 0.75,
                     "profit_factor": 4.0,
-                    "last_closed_at": datetime.utcnow().isoformat(),
+                "last_closed_at": utc_now_iso(),
                 }
             ]
         if source_key == "strategy:trend_following:ETH" and regime == "trending_up":
@@ -2769,7 +2851,7 @@ def test_decision_engine_prefers_candidates_with_better_recent_context(monkeypat
                     "avg_return_pct": -0.002,
                     "win_rate": 0.5,
                     "profit_factor": 0.9,
-                    "last_closed_at": datetime.utcnow().isoformat(),
+                "last_closed_at": utc_now_iso(),
                 }
             ]
         return []
@@ -4008,7 +4090,7 @@ def test_check_open_positions_uses_trade_specific_time_limit(monkeypatch):
         lambda: {"balance": 10_000.0, "total_pnl": 0.0, "total_trades": 0, "winning_trades": 0},
     )
     trader = PaperTrader()
-    opened_at = (datetime.utcnow() - timedelta(hours=8)).isoformat()
+    opened_at = (utc_now_naive() - timedelta(hours=8)).isoformat()
     trade = {
         "id": 7,
         "coin": "BTC",

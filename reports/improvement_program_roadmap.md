@@ -138,6 +138,13 @@ This branch is the staged upgrade path for making the bot more measurable, more 
 - Enforce combined live readiness inside the execution path so failed preflight or missing activation state blocks new orders instead of only degrading health.
 - Surface activation readiness through subsystem health, reporting, dashboard summaries, and the live preflight operator script.
 
+## Phase 20: Time And Environment Hardening
+
+- Status: shipped on `codex/live-ledger-foundation`
+- Replace the remaining stable-path `datetime.utcnow()` / `utcfromtimestamp()` usage with shared UTC helpers so runtime timestamps stay consistent and deprecation warnings stop polluting validation.
+- Add explicit `paper`, `shadow`, and `live` runtime profile controls that can be selected before config import in the main entrypoints and operator scripts.
+- Fail fast on live-profile boot when the required live-control env vars are missing, and force live preflight on any live-requested session so deployability cannot drift from safety defaults.
+
 ## Branch Operating Rule
 
 Each phase should be landed in a reviewable commit with tests before moving to the next phase.

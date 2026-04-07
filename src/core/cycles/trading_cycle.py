@@ -8,10 +8,10 @@ Runs every ~5 minutes to react to market changes quickly.
 Extracted from ``HyperliquidResearchBot._run_trading_cycle``.
 """
 import logging
-from datetime import datetime
 
 import config
 from src.data import database as db
+from src.core.time_utils import utc_now
 from src.core.live_execution import (
     get_execution_open_positions,
     is_live_trading_active,
@@ -856,8 +856,8 @@ def _run_liquidation_scan(container, regime_data):
                             "type": "candleSnapshot",
                             "req": {
                                 "coin": coin, "interval": "1h",
-                                "startTime": int((datetime.utcnow().timestamp() - 100 * 3600) * 1000),
-                                "endTime": int(datetime.utcnow().timestamp() * 1000),
+                        "startTime": int((utc_now().timestamp() - 100 * 3600) * 1000),
+                        "endTime": int(utc_now().timestamp() * 1000),
                             },
                         }
                         resp = requests.post("https://api.hyperliquid.xyz/info", json=payload, timeout=10)
@@ -1374,8 +1374,8 @@ def _run_alpha_arena(container, regime_data):
                 "type": "candleSnapshot",
                 "req": {
                     "coin": "BTC", "interval": "1h",
-                    "startTime": int((datetime.utcnow().timestamp() - 720 * 3600) * 1000),
-                    "endTime": int(datetime.utcnow().timestamp() * 1000),
+                    "startTime": int((utc_now().timestamp() - 720 * 3600) * 1000),
+                    "endTime": int(utc_now().timestamp() * 1000),
                 },
             }
             resp = requests.post("https://api.hyperliquid.xyz/info", json=payload, timeout=15)

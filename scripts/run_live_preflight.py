@@ -11,6 +11,20 @@ import sys
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, ROOT)
 
+
+def _extract_runtime_profile(argv):
+    for index, arg in enumerate(argv):
+        if arg.startswith("--runtime-profile="):
+            return arg.split("=", 1)[1].strip()
+        if arg == "--runtime-profile" and index + 1 < len(argv):
+            return str(argv[index + 1]).strip()
+    return ""
+
+
+_runtime_profile_override = _extract_runtime_profile(sys.argv[1:])
+if _runtime_profile_override:
+    os.environ["BOT_RUNTIME_PROFILE"] = _runtime_profile_override
+
 import config  # noqa: E402
 from src.core.boot import init_database, setup_logging, validate_dependencies  # noqa: E402
 from src.signals.decision_firewall import DecisionFirewall  # noqa: E402
@@ -19,6 +33,12 @@ from src.trading.live_trader import LiveTrader  # noqa: E402
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run the live trading preflight.")
+    parser.add_argument(
+        "--runtime-profile",
+        choices=("paper", "shadow", "live"),
+        default=None,
+        help="Apply the named runtime profile before config loads.",
+    )
     parser.add_argument(
         "--output",
         default="",
@@ -47,6 +67,7 @@ def main() -> None:
     activation = trader.evaluate_activation_guard()
     readiness = trader.get_live_readiness(force_preflight=False)
     report = {
+        "runtime_profile": getattr(config, "RUNTIME_PROFILE", "paper"),
         "preflight": preflight,
         "activation_guard": activation,
         "live_readiness": readiness,
@@ -59,6 +80,7 @@ def main() -> None:
             json.dump(report, handle, indent=2, sort_keys=True)
 
     print("Live preflight complete")
+    print(f"Runtime profile: {getattr(config, 'RUNTIME_PROFILE', 'paper')}")
     print(f"Preflight: {preflight.get('status', 'unknown')} (deployable={preflight.get('deployable', False)})")
     print(
         f"Activation: {activation.get('status', 'unknown')} "

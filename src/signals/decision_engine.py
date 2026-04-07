@@ -28,6 +28,7 @@ from datetime import datetime
 from collections import deque
 
 from src.data import database as db
+from src.core.time_utils import utc_now_iso, utc_now_naive
 
 logger = logging.getLogger(__name__)
 
@@ -329,7 +330,7 @@ class DecisionEngine:
         # ─── Store decision for audit trail ──────────────
         self._decision_history.append({
             "cycle": self._cycle_count,
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": utc_now_iso(),
             "candidates": len(strategies),
             "qualified": len(qualified),
             "executed": len(executions),
@@ -432,7 +433,7 @@ class DecisionEngine:
             "long" if long_score > short_score else "short" if short_score > long_score else "neutral"
         )
         snapshot = {
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": utc_now_iso(),
             "cycle_number": self._cycle_count,
             "regime": regime_data.get("overall_regime", "unknown") if regime_data else "unknown",
             "available_slots": available_slots,
@@ -669,7 +670,7 @@ class DecisionEngine:
         if discovered:
             try:
                 disc_dt = datetime.fromisoformat(discovered.replace("Z", "+00:00"))
-                age_hours = (datetime.utcnow() - disc_dt.replace(tzinfo=None)).total_seconds() / 3600
+                age_hours = (utc_now_naive() - disc_dt.replace(tzinfo=None)).total_seconds() / 3600
                 if age_hours < 24:
                     freshness = 1.0
                 elif age_hours < 72:

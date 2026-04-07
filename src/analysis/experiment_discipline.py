@@ -8,11 +8,11 @@ from __future__ import annotations
 
 import copy
 import json
-from datetime import datetime
 from typing import Dict, List, Optional
 
 import config
 from src.data import database as db
+from src.core.time_utils import utc_now_iso
 from src.signals.decision_engine import DecisionEngine
 
 
@@ -355,7 +355,7 @@ def build_experiment_benchmark_pack(
     partitions = _split_cycles(ordered_cycles, out_of_sample_ratio)
 
     report = {
-        "generated_at": datetime.utcnow().isoformat(),
+        "generated_at": utc_now_iso(),
         "cycle_count": len(ordered_cycles),
         "in_sample_cycles": len(partitions["in_sample"]),
         "out_of_sample_cycles": len(partitions["out_of_sample"]),

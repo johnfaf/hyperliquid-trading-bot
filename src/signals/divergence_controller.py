@@ -14,6 +14,7 @@ import logging
 from typing import Dict, List, Optional, Tuple
 
 import config
+from src.core.time_utils import utc_now
 from src.data import database as db
 
 logger = logging.getLogger(__name__)
@@ -352,7 +353,7 @@ class DivergenceController:
         )
 
     def _refresh(self, force: bool = False) -> None:
-        now = datetime.utcnow()
+        now = utc_now()
         if (
             not force
             and self._last_refresh_at

@@ -11,6 +11,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from src.core.live_execution import is_live_trading_active
+from src.core.time_utils import utc_now_iso, utc_now_naive
 
 logger = logging.getLogger(__name__)
 
@@ -22,7 +23,7 @@ _MAX_ERRORS = 50
 def record_error(message: str, source: str = "unknown"):
     """Call from anywhere to record an error for the health report."""
     _error_buffer.append({
-        "ts": datetime.utcnow().isoformat(),
+        "ts": utc_now_iso(),
         "source": source,
         "message": str(message)[:500],
     })
@@ -108,7 +109,7 @@ def _positions_report(container, live_active: bool) -> Dict[str, Any]:
         try:
             if opened_at:
                 age_hours = round(
-                    (datetime.utcnow() - datetime.fromisoformat(opened_at)).total_seconds() / 3600,
+                    (utc_now_naive() - datetime.fromisoformat(opened_at)).total_seconds() / 3600,
                     1,
                 )
         except Exception:
@@ -150,7 +151,7 @@ def write_health_report(
         Path to the written file.
     """
     report: Dict[str, Any] = {
-        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "timestamp": utc_now_iso(suffix_z=True),
         "cycle": cycle_count,
         "version": "1.0",
     }

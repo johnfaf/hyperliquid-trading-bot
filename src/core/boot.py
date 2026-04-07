@@ -20,6 +20,7 @@ import sys
 from datetime import datetime, timedelta, timezone
 
 import config
+from src.core.time_utils import utc_date_str
 
 
 # ─── Secret scrubbing ─────────────────────────────────────────
@@ -67,7 +68,7 @@ class JSONFormatter(logging.Formatter):
 def setup_logging() -> logging.Logger:
     """Configure root logger with file + console handlers. Returns module logger."""
     os.makedirs(config.LOG_DIR, exist_ok=True)
-    log_file = os.path.join(config.LOG_DIR, f"bot_{datetime.utcnow().strftime('%Y%m%d')}.log")
+    log_file = os.path.join(config.LOG_DIR, f"bot_{utc_date_str('%Y%m%d')}.log")
 
     json_fmt = JSONFormatter()
     text_fmt = logging.Formatter(
@@ -100,8 +101,69 @@ def validate_dependencies(logger: logging.Logger) -> None:
     from src.core.dependency_validator import validate_or_fail, get_boot_report
     logger.info(get_boot_report(config))
     validate_or_fail(config_module=config)
+    validate_runtime_profile_controls(logger)
     validate_operational_controls(logger)
     validate_wallet_security_controls(logger)
+
+
+def validate_runtime_profile_controls(logger: logging.Logger) -> None:
+    """Validate runtime profile selection and explicit live-mode controls."""
+    summary = getattr(config, "get_runtime_profile_summary", lambda: {})() or {}
+    requested_profile = str(summary.get("requested_profile", "") or "").strip().lower()
+    profile_valid = bool(summary.get("profile_valid", True))
+    profile = str(getattr(config, "RUNTIME_PROFILE", "paper") or "paper").strip().lower()
+    allowed = set(summary.get("allowed_profiles", []) or ("paper", "shadow", "live"))
+    if not profile_valid:
+        raise RuntimeError(
+            f"Unsupported BOT_RUNTIME_PROFILE '{requested_profile}'. Expected one of: {', '.join(sorted(allowed))}."
+        )
+    if profile not in allowed:
+        raise RuntimeError(
+            f"Unsupported BOT_RUNTIME_PROFILE '{profile}'. Expected one of: {', '.join(sorted(allowed))}."
+        )
+
+    logger.info("Runtime profile resolved: %s", profile)
+
+    if profile != "live":
+        return
+
+    required_envs = [
+        "LIVE_TRADING_ENABLED",
+        "LIVE_MIN_ORDER_USD",
+        "LIVE_MAX_ORDER_USD",
+        "LIVE_MAX_DAILY_LOSS_USD",
+        "LIVE_PREFLIGHT_REQUIRED",
+        "LIVE_ACTIVATION_GUARD_ENABLED",
+        "LIVE_ACTIVATION_APPROVED_AT",
+        "LIVE_ACTIVATION_APPROVED_BY",
+        "LIVE_ACTIVATION_MAX_AGE_HOURS",
+        "HL_WALLET_MODE",
+        "SECRET_MANAGER_PROVIDER",
+    ]
+    missing = [env_name for env_name in required_envs if not str(os.environ.get(env_name, "")).strip()]
+    if missing:
+        raise RuntimeError(
+            "BOT_RUNTIME_PROFILE=live requires explicit env vars for live controls: "
+            + ", ".join(missing)
+        )
+
+    if not getattr(config, "LIVE_TRADING_ENABLED", False):
+        raise RuntimeError(
+            "BOT_RUNTIME_PROFILE=live resolved LIVE_TRADING_ENABLED=false. "
+            "Set LIVE_TRADING_ENABLED=true explicitly or switch profiles."
+        )
+
+    if not getattr(config, "LIVE_PREFLIGHT_REQUIRED", False):
+        raise RuntimeError(
+            "BOT_RUNTIME_PROFILE=live requires LIVE_PREFLIGHT_REQUIRED=true."
+        )
+
+    if not getattr(config, "LIVE_ACTIVATION_GUARD_ENABLED", False):
+        raise RuntimeError(
+            "BOT_RUNTIME_PROFILE=live requires LIVE_ACTIVATION_GUARD_ENABLED=true."
+        )
+
+    logger.info("Runtime profile controls validated for live deployment.")
 
 
 def validate_operational_controls(logger: logging.Logger) -> None:

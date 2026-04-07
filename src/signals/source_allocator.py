@@ -14,6 +14,7 @@ import logging
 from typing import Dict, List, Optional, Tuple
 
 import config
+from src.core.time_utils import utc_now
 from src.data import database as db
 from src.signals.signal_schema import build_source_key
 
@@ -208,7 +209,7 @@ class SourceBudgetAllocator:
         if not self.enabled:
             return
 
-        now = datetime.utcnow()
+        now = utc_now()
         if (
             not force
             and self._last_refresh_at

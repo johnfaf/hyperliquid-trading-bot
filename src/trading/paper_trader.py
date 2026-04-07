@@ -21,6 +21,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import config
 from src.data import database as db
 from src.data import hyperliquid_client as hl
+from src.core.time_utils import utc_now, utc_now_iso, utc_now_naive
 from src.signals.signal_schema import (
     TradeSignal,
     SignalSide,
@@ -303,8 +304,8 @@ class PaperTrader:
                             "req": {
                                 "coin": coin,
                                 "interval": "1h",
-                                "startTime": int((datetime.utcnow().timestamp() - 100 * 3600) * 1000),
-                                "endTime": int(datetime.utcnow().timestamp() * 1000),
+                    "startTime": int((utc_now().timestamp() - 100 * 3600) * 1000),
+                    "endTime": int(utc_now().timestamp() * 1000),
                             }
                         }
                         resp = requests.post("https://api.hyperliquid.xyz/info",
@@ -1174,7 +1175,7 @@ class PaperTrader:
                     ),
                 ),
                 "reason": signal.get("reason", ""),
-                "opened_at": datetime.utcnow().isoformat(),
+                "opened_at": utc_now_iso(),
                 "trader_address": signal.get("trader_address", ""),
                 "agent_id": signal.get("agent_id", ""),
                 "agent_name": signal.get("agent_name", ""),
@@ -1415,7 +1416,7 @@ class PaperTrader:
                     pnl=pnl,
                     return_pct=return_pct,
                     opened_at=trade.get("opened_at", ""),
-                    closed_at=datetime.utcnow().isoformat(),
+            closed_at=utc_now_iso(),
                     confidence=trade_meta.get("confidence", 0),
                     source=source_name,
                     regime=trade_meta.get("regime", ""),
@@ -1444,7 +1445,7 @@ class PaperTrader:
             "exit_price": slipped_exit,
             "metadata": trade_meta,
             "opened_at": trade.get("opened_at", ""),
-            "closed_at": datetime.utcnow().isoformat(),
+                        "closed_at": utc_now_iso(),
         }
         self._closed_events.append(closed_event)
         return closed_event
@@ -1546,7 +1547,7 @@ class PaperTrader:
             # Time-based exit: close positions using the per-trade limit when
             # present, otherwise fall back to 24 hours.
             # HIGH-FIX HIGH-7: strip any timezone offset before parsing so that
-            # naive datetime.utcnow() comparisons never raise TypeError when
+        # UTC-naive comparisons stay consistent with the legacy stored timestamps.
             # opened_at was stored with a +00:00 suffix by a timezone-aware path.
             if not should_close and trade.get("opened_at"):
                 try:
@@ -1558,7 +1559,7 @@ class PaperTrader:
                     elif "+" in opened_str:
                         opened_str = opened_str.split("+")[0]
                     opened = datetime.fromisoformat(opened_str)
-                    age_hours = (datetime.utcnow() - opened).total_seconds() / 3600
+                    age_hours = (utc_now_naive() - opened).total_seconds() / 3600
                     if age_hours > time_limit_hours:
                         should_close = True
                         close_reason = "time_exit"
