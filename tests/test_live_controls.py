@@ -10,9 +10,11 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 
 import config
+import src.analysis.capital_ramp as capital_ramp_module
 import main
 import src.analysis.daily_research_loop as daily_research_module
 import src.analysis.shadow_certification as shadow_certification_module
+from src.analysis.capital_ramp import CapitalRampManager
 from src.analysis.daily_research_loop import DailyResearchLoop
 from src.analysis.shadow_certification import build_shadow_certification_report
 from src.analysis.experiment_discipline import build_experiment_benchmark_pack
@@ -94,6 +96,15 @@ def _load_daily_research_script():
 def _load_shadow_certification_script():
     script_path = os.path.join(os.getcwd(), "scripts", "run_shadow_certification.py")
     spec = importlib.util.spec_from_file_location("test_run_shadow_certification", script_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_capital_ramp_script():
+    script_path = os.path.join(os.getcwd(), "scripts", "run_capital_ramp.py")
+    spec = importlib.util.spec_from_file_location("test_run_capital_ramp", script_path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -431,6 +442,58 @@ def test_run_reporting_executes_shadow_certification_on_daily_cadence(monkeypatc
     assert runs[0]["shadow_tracker"] is container.shadow_tracker
     assert runs[0]["live_trader"] is container.live_trader
     assert any("ShadowCertification: failed" in entry for entry in infos)
+
+
+def test_run_reporting_executes_capital_ramp_on_daily_cadence(monkeypatch):
+    infos = []
+
+    class FakeCapitalRamp:
+        def run(self, **kwargs):
+            assert kwargs["cycle_count"] == 24
+            assert kwargs["force"] is True
+            return {
+                "status": "promoted",
+                "applied_stage": "trial",
+                "approved_stage": "scaled",
+                "recommended_stage": "trial",
+                "limits": {
+                    "effective_max_order_usd": 22.0,
+                    "source_cap_multiplier": 0.6,
+                },
+            }
+
+    container = type(
+        "Container",
+        (),
+        {
+            "reporter": None,
+            "paper_trader": None,
+            "shadow_tracker": None,
+            "cross_venue_hedger": None,
+            "scorer": None,
+            "adaptive_learning": None,
+            "capital_ramp": FakeCapitalRamp(),
+        },
+    )()
+
+    monkeypatch.setattr(config, "TRADING_CYCLE_INTERVAL", 3600)
+    monkeypatch.setattr(config, "DAILY_RESEARCH_LOOP_ENABLED", False)
+    monkeypatch.setattr(config, "SHADOW_CERTIFICATION_ENABLED", False)
+    monkeypatch.setattr(config, "CAPITAL_RAMP_ENABLED", True)
+    monkeypatch.setattr("src.core.cycles.reporting_cycle._log_module_stats", lambda container: None)
+    monkeypatch.setattr("src.core.cycles.reporting_cycle.backup_to_json", lambda: None)
+    monkeypatch.setattr(
+        "src.core.cycles.reporting_cycle.build_runtime_incident_report",
+        lambda **kwargs: {"summary": {}, "incidents": []},
+    )
+    monkeypatch.setattr(
+        "src.core.cycles.reporting_cycle.logger.info",
+        lambda msg, *args: infos.append(msg % args if args else msg),
+    )
+
+    run_reporting(container, cycle_count=24, health_registry=None)
+
+    assert any("CapitalRamp: promoted" in entry for entry in infos)
 
 
 def test_live_trader_coerces_execution_dict_and_uses_live_firewall_state(monkeypatch):
@@ -1096,6 +1159,76 @@ def test_run_shadow_certification_script_returns_nonzero_until_certified(monkeyp
     with open(output_path, "r", encoding="utf-8") as handle:
         report = json.load(handle)
     assert report["run_id"] == "shadow-25"
+
+
+def test_run_capital_ramp_script_returns_zero_when_deployable(monkeypatch, capsys, tmp_path):
+    script = _load_capital_ramp_script()
+    output_path = tmp_path / "capital_ramp.json"
+
+    monkeypatch.setattr(script.db, "init_db", lambda: None)
+    monkeypatch.setattr(script, "build_capital_ramp_config", lambda cfg: {"enabled": True})
+    monkeypatch.setattr(script, "CapitalGovernor", lambda cfg: object())
+
+    class FakeCapitalRamp:
+        def __init__(self, cfg, capital_governor=None):
+            self.cfg = cfg
+            self.capital_governor = capital_governor
+
+        def run(self, cycle_count=None, force=False):
+            assert force is True
+            return {
+                "run_id": "capital-ramp-26",
+                "status": "promoted",
+                "applied_stage": "trial",
+                "approved_stage": "scaled",
+                "recommended_stage": "trial",
+                "deployable": True,
+                "limits": {"effective_max_order_usd": 22.0},
+            }
+
+    monkeypatch.setattr(script, "CapitalRampManager", FakeCapitalRamp)
+
+    rc = script.main(["--force", "--output", str(output_path)])
+    captured = capsys.readouterr()
+
+    assert rc == 0
+    assert "Applied stage: trial" in captured.out
+    with open(output_path, "r", encoding="utf-8") as handle:
+        report = json.load(handle)
+    assert report["run_id"] == "capital-ramp-26"
+
+
+def test_live_trader_applies_capital_ramp_runtime_order_cap(monkeypatch):
+    class FakeFirewall:
+        def validate(self, signal, **kwargs):
+            return True, "ok"
+
+    class FakeCapitalRamp:
+        def get_runtime_limits(self):
+            return {
+                "enabled": True,
+                "effective_stage": "trial",
+                "approved_stage": "scaled",
+                "effective_max_order_usd": 22.0,
+                "order_cap_multiplier": 0.55,
+                "source_cap_multiplier": 0.60,
+            }
+
+    monkeypatch.setattr(LiveTrader, "_load_credentials", _missing_live_credentials, raising=False)
+    monkeypatch.setattr(LiveTrader, "_load_asset_index_map", lambda self: None, raising=False)
+
+    trader = LiveTrader(
+        firewall=FakeFirewall(),
+        dry_run=False,
+        max_order_usd=40.0,
+        capital_ramp=FakeCapitalRamp(),
+    )
+
+    stats = trader.get_stats()
+
+    assert stats["configured_max_order_usd"] == 40.0
+    assert stats["max_order_usd"] == 22.0
+    assert stats["capital_ramp"]["effective_stage"] == "trial"
 
 
 def test_post_order_routes_exchange_requests_through_api_manager(monkeypatch):
@@ -4785,6 +4918,74 @@ def test_portfolio_sizer_blocks_when_same_side_book_is_full():
     assert "headroom" in decision.block_reason
 
 
+def test_capital_ramp_manager_promotes_one_stage_when_checks_clear(monkeypatch):
+    saved_runs = []
+    saved_states = []
+    monkeypatch.setattr(capital_ramp_module.db, "get_capital_ramp_state", lambda: {"applied_stage": "bootstrap"})
+    monkeypatch.setattr(capital_ramp_module.db, "get_latest_capital_ramp_run", lambda: {})
+    monkeypatch.setattr(capital_ramp_module.db, "get_latest_shadow_certification_run", lambda: {"certified": True})
+    monkeypatch.setattr(capital_ramp_module.db, "get_latest_daily_research_run", lambda: {"recommendation": "hold"})
+    monkeypatch.setattr(
+        capital_ramp_module.db,
+        "get_capital_governor_summary",
+        lambda **kwargs: {
+            "paper_current_drawdown_pct": 0.04,
+            "live_current_drawdown_pct": 0.03,
+            "live_snapshot_count": 24,
+            "degraded_source_ratio": 0.12,
+        },
+    )
+    monkeypatch.setattr(
+        capital_ramp_module.db,
+        "get_execution_quality_summary",
+        lambda **kwargs: {
+            "avg_realized_slippage_bps": 1.2,
+            "avg_expected_slippage_bps": 0.8,
+        },
+    )
+    monkeypatch.setattr(
+        capital_ramp_module.db,
+        "get_runtime_divergence_summary",
+        lambda **kwargs: {"realized_pnl_gap_ratio": 0.08},
+    )
+    monkeypatch.setattr(
+        capital_ramp_module.db,
+        "save_capital_ramp_run",
+        lambda payload: saved_runs.append(payload) or "capital-ramp-test",
+    )
+    monkeypatch.setattr(
+        capital_ramp_module.db,
+        "save_capital_ramp_state",
+        lambda payload: saved_states.append(payload),
+    )
+
+    manager = CapitalRampManager(
+        {
+            "enabled": True,
+            "default_stage": "bootstrap",
+            "approved_stage": "scaled",
+            "live_min_order_usd": 11.0,
+            "base_max_order_usd": 40.0,
+            "stages": {
+                "bootstrap": {"order_cap_multiplier": 0.35, "source_cap_multiplier": 0.40},
+                "trial": {"order_cap_multiplier": 0.55, "source_cap_multiplier": 0.60},
+                "scaled": {"order_cap_multiplier": 0.80, "source_cap_multiplier": 0.80},
+                "full": {"order_cap_multiplier": 1.0, "source_cap_multiplier": 1.0},
+            },
+        }
+    )
+
+    result = manager.run(force=True)
+
+    assert result["run_id"] == "capital-ramp-test"
+    assert result["status"] == "promoted"
+    assert result["applied_stage"] == "trial"
+    assert result["approved_stage"] == "scaled"
+    assert result["limits"]["effective_max_order_usd"] == 22.0
+    assert saved_runs and saved_states
+    assert saved_states[-1]["applied_stage"] == "trial"
+
+
 def test_source_budget_allocator_blocks_blocked_source(monkeypatch):
     monkeypatch.setattr(
         "src.signals.source_allocator.db.get_source_trade_outcome_summary",
@@ -4899,6 +5100,63 @@ def test_source_budget_allocator_reduces_position_when_headroom_is_limited(monke
     assert 0 < decision.position_pct <= 0.03
     assert signal.position_pct == decision.position_pct
     assert "source_budget_scaled" in decision.reasons
+
+
+def test_source_budget_allocator_applies_capital_ramp_source_cap(monkeypatch):
+    monkeypatch.setattr("src.signals.source_allocator.db.get_source_trade_outcome_summary", lambda **kwargs: [])
+    monkeypatch.setattr("src.signals.source_allocator.db.get_source_attribution_summary", lambda **kwargs: [])
+
+    class FakeAdaptive:
+        def get_source_profile(self, source_key="", source=""):
+            return {
+                "source_key": source_key or source,
+                "source": source or "strategy",
+                "status": "active",
+                "health_score": 0.82,
+                "weight_multiplier": 1.0,
+                "confidence_multiplier": 1.0,
+            }
+
+    class FakeCapitalRamp:
+        def get_runtime_limits(self):
+            return {
+                "effective_stage": "trial",
+                "order_cap_multiplier": 0.55,
+                "source_cap_multiplier": 0.50,
+            }
+
+    allocator = SourceBudgetAllocator(
+        {
+            "enabled": True,
+            "active_cap_pct": 0.30,
+            "capital_ramp_enabled": True,
+        },
+        adaptive_learning=FakeAdaptive(),
+        capital_ramp=FakeCapitalRamp(),
+    )
+    signal = TradeSignal(
+        coin="BTC",
+        side=SignalSide.LONG,
+        confidence=0.84,
+        source=SignalSource.STRATEGY,
+        reason="capital ramp source cap",
+        position_pct=0.18,
+        leverage=2.0,
+        risk=RiskParams(),
+    )
+
+    decision = allocator.evaluate(
+        signal,
+        signal={"source": "strategy", "source_key": "strategy:btc"},
+        open_positions=[],
+        account_balance=10_000.0,
+    )
+
+    assert decision.blocked is False
+    assert decision.capital_ramp_stage == "trial"
+    assert decision.source_cap_pct == 0.15
+    assert decision.position_pct <= 0.15
+    assert "capital_ramp_scaled" in decision.reasons
 
 
 def test_paper_trader_syncs_adjusted_trade_signal_into_execution_payload():

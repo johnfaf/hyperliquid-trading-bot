@@ -492,6 +492,20 @@ def init_db():
         );
         CREATE INDEX IF NOT EXISTS idx_shadow_certification_runs_timestamp
             ON shadow_certification_runs(timestamp);
+
+        CREATE TABLE IF NOT EXISTS capital_ramp_runs (
+            run_id TEXT PRIMARY KEY,
+            timestamp TEXT NOT NULL,
+            cycle_count INTEGER,
+            status TEXT DEFAULT 'warming_up',
+            applied_stage TEXT DEFAULT 'bootstrap',
+            approved_stage TEXT DEFAULT 'bootstrap',
+            recommended_stage TEXT DEFAULT 'bootstrap',
+            deployable INTEGER DEFAULT 0,
+            metadata TEXT DEFAULT '{}'
+        );
+        CREATE INDEX IF NOT EXISTS idx_capital_ramp_runs_timestamp
+            ON capital_ramp_runs(timestamp);
         """)
 
 
@@ -2301,6 +2315,39 @@ def get_daily_research_last_known_good() -> dict:
         return {}
 
 
+def save_capital_ramp_state(payload: dict) -> None:
+    value = json.dumps(payload or {}, sort_keys=True, default=str)
+    with get_connection() as conn:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO bot_state (key, value)
+            VALUES ('capital_ramp_state', ?)
+            """,
+            (value,),
+        )
+
+
+def get_capital_ramp_state() -> dict:
+    try:
+        with get_connection() as conn:
+            row = conn.execute(
+                """
+                SELECT value FROM bot_state
+                WHERE key = 'capital_ramp_state'
+                LIMIT 1
+                """
+            ).fetchone()
+    except sqlite3.OperationalError:
+        return {}
+
+    if not row:
+        return {}
+    try:
+        return json.loads(row["value"] or "{}")
+    except Exception:
+        return {}
+
+
 def save_shadow_certification_run(payload: dict) -> str:
     timestamp = _normalize_live_timestamp(payload.get("timestamp"))
     status = str(payload.get("status", "warming_up") or "warming_up").strip().lower()
@@ -2374,6 +2421,97 @@ def get_recent_shadow_certification_runs(limit: int = 10) -> list:
     for row in rows:
         payload = dict(row)
         payload["certified"] = bool(payload.get("certified", 0))
+        try:
+            payload["metadata"] = json.loads(payload.get("metadata") or "{}")
+        except Exception:
+            payload["metadata"] = {}
+        results.append(payload)
+    return results
+
+
+def save_capital_ramp_run(payload: dict) -> str:
+    timestamp = _normalize_live_timestamp(payload.get("timestamp"))
+    status = str(payload.get("status", "warming_up") or "warming_up").strip().lower()
+    applied_stage = str(payload.get("applied_stage", "bootstrap") or "bootstrap").strip().lower()
+    approved_stage = str(payload.get("approved_stage", "bootstrap") or "bootstrap").strip().lower()
+    recommended_stage = str(
+        payload.get("recommended_stage", applied_stage or "bootstrap") or applied_stage or "bootstrap"
+    ).strip().lower()
+    deployable = 1 if bool(payload.get("deployable", False)) else 0
+    cycle_count = payload.get("cycle_count")
+    default_key = f"{timestamp}:{status}:{applied_stage}:{approved_stage}:{recommended_stage}:{deployable}"
+    run_id = str(
+        payload.get("run_id")
+        or f"capital-ramp:{hashlib.sha256(default_key.encode()).hexdigest()[:16]}"
+    )
+    metadata = payload.get("metadata", {}) or {}
+
+    with get_connection() as conn:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO capital_ramp_runs
+            (run_id, timestamp, cycle_count, status, applied_stage, approved_stage,
+             recommended_stage, deployable, metadata)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                run_id,
+                timestamp,
+                int(cycle_count or 0) if cycle_count is not None else None,
+                status,
+                applied_stage,
+                approved_stage,
+                recommended_stage,
+                deployable,
+                json.dumps(metadata, sort_keys=True, default=str),
+            ),
+        )
+    return run_id
+
+
+def get_latest_capital_ramp_run() -> dict:
+    try:
+        with get_connection() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM capital_ramp_runs
+                ORDER BY timestamp DESC, run_id DESC
+                LIMIT 1
+                """
+            ).fetchone()
+    except sqlite3.OperationalError:
+        return {}
+
+    if not row:
+        return {}
+
+    payload = dict(row)
+    payload["deployable"] = bool(payload.get("deployable", 0))
+    try:
+        payload["metadata"] = json.loads(payload.get("metadata") or "{}")
+    except Exception:
+        payload["metadata"] = {}
+    return payload
+
+
+def get_recent_capital_ramp_runs(limit: int = 10) -> list:
+    try:
+        with get_connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM capital_ramp_runs
+                ORDER BY timestamp DESC, run_id DESC
+                LIMIT ?
+                """,
+                (int(limit),),
+            ).fetchall()
+    except sqlite3.OperationalError:
+        return []
+
+    results = []
+    for row in rows:
+        payload = dict(row)
+        payload["deployable"] = bool(payload.get("deployable", 0))
         try:
             payload["metadata"] = json.loads(payload.get("metadata") or "{}")
         except Exception:

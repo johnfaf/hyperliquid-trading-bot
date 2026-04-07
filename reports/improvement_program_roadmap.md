@@ -180,6 +180,13 @@ This branch is the staged upgrade path for making the bot more measurable, more 
 - Track paper-vs-live divergence, source degradation, slippage drift, readiness interruptions, and blocked-entry reasons in one persisted report.
 - Emit a clear certified / warming-up / failed outcome so the shadow run can become a formal gate before capital ramp decisions.
 
+## Phase 26: Controlled Capital Ramp
+
+- Status: shipped on `codex/live-ledger-foundation`
+- Add a staged capital-ramp controller so live order caps and source caps move in explicit steps instead of jumping from bootstrap to full size.
+- Require shadow certification, benchmark-clear daily research, drawdown limits, execution-quality limits, and source-health limits before promoting to the next stage.
+- Persist capital-ramp runs plus applied-stage state, expose them in reporting and dashboard metrics, and provide an operator script for manual review.
+
 ## Branch Operating Rule
 
 Each phase should be landed in a reviewable commit with tests before moving to the next phase.

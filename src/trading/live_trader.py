@@ -357,7 +357,8 @@ class LiveTrader:
     def __init__(self, firewall: DecisionFirewall, dry_run: bool = True,
                  max_daily_loss: float = 500, max_position_size: float = 1000,
                  max_order_usd: Optional[float] = None,
-                 regime_forecaster: Optional[object] = None):
+                 regime_forecaster: Optional[object] = None,
+                 capital_ramp: Optional[object] = None):
         """
         Initialize live trader.
 
@@ -409,6 +410,9 @@ class LiveTrader:
                 self.min_order_usd,
             )
             self.max_order_usd = self.min_order_usd
+        self.configured_max_order_usd = float(self.max_order_usd)
+        self.capital_ramp = capital_ramp
+        self._capital_ramp_runtime_limits: Dict[str, Any] = {}
         self.regime_forecaster = regime_forecaster
         self.status_reason = "dry_run_requested" if dry_run else "initializing"
 
@@ -545,6 +549,24 @@ class LiveTrader:
         # Reconcile positions on startup
         if not self.dry_run and self.signer:
             self.reconcile_positions()
+
+    def attach_capital_ramp(self, capital_ramp: Optional[object]) -> None:
+        self.capital_ramp = capital_ramp
+
+    def _refresh_capital_ramp_limits(self) -> Dict[str, Any]:
+        limits = {}
+        if self.capital_ramp:
+            try:
+                limits = self.capital_ramp.get_runtime_limits() or {}
+            except Exception as exc:
+                logger.debug("capital ramp refresh error: %s", exc)
+                limits = {}
+        effective_max_order_usd = float(
+            limits.get("effective_max_order_usd", self.configured_max_order_usd) or self.configured_max_order_usd
+        )
+        self.max_order_usd = max(self.min_order_usd, effective_max_order_usd)
+        self._capital_ramp_runtime_limits = dict(limits or {})
+        return dict(self._capital_ramp_runtime_limits)
 
     def _load_credentials(self):
         """
@@ -2272,6 +2294,7 @@ class LiveTrader:
         Returns:
             Order result dict
         """
+        self._refresh_capital_ramp_limits()
         side = self._normalize_order_side(side)
 
         # Kill switch and daily loss only block NEW positions (not closes).
@@ -2584,6 +2607,7 @@ class LiveTrader:
         Returns:
             Order result dict
         """
+        self._refresh_capital_ramp_limits()
         side = self._normalize_order_side(side)
         requested_size = float(size)
 
@@ -3030,6 +3054,7 @@ class LiveTrader:
             Same signal (possibly with shrunken size), or None if the cap
             would require a zero-sized order.
         """
+        self._refresh_capital_ramp_limits()
         if self.max_order_usd is None or self.max_order_usd <= 0:
             return signal
 
@@ -3115,6 +3140,7 @@ class LiveTrader:
         Returns:
             Execution result dict or None if rejected
         """
+        self._refresh_capital_ramp_limits()
         raw_signal = signal
         source_metadata = self._extract_signal_metadata(raw_signal)
         signal = self._coerce_signal(raw_signal)
@@ -3579,6 +3605,7 @@ class LiveTrader:
             Stats dict with orders, fills, PnL, kill switch status
         """
         self._check_daily_reset()
+        capital_ramp_limits = self._refresh_capital_ramp_limits()
         runtime_profile = getattr(config, "get_runtime_profile_summary", lambda: {})() or {}
 
         return {
@@ -3596,6 +3623,7 @@ class LiveTrader:
             "orders_today": self.orders_today,
             "fills_today": self.fills_today,
             "max_position_size": self.max_position_size,
+            "configured_max_order_usd": self.configured_max_order_usd,
             "max_order_usd": self.max_order_usd,
             "wallet_balance": dict(self._last_balance_snapshot),
             "asset_indices_loaded": len(self.asset_index_map),
@@ -3606,5 +3634,6 @@ class LiveTrader:
             "runtime_profile": runtime_profile.get("profile", getattr(config, "RUNTIME_PROFILE", "paper")),
             "runtime_effective_execution_mode": runtime_profile.get("effective_execution_mode", "paper"),
             "runtime_override_controls": list(runtime_profile.get("override_controls", []) or []),
+            "capital_ramp": capital_ramp_limits,
             "timestamp": utc_now_iso()
         }

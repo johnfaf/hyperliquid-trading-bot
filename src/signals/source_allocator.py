@@ -42,6 +42,9 @@ class SourceBudgetDecision:
     divergence_multiplier: float = 1.0
     capital_status: str = ""
     capital_multiplier: float = 1.0
+    capital_ramp_stage: str = ""
+    capital_ramp_order_multiplier: float = 1.0
+    capital_ramp_source_cap_multiplier: float = 1.0
     blocked: bool = False
     block_reason: str = ""
     reasons: List[str] = field(default_factory=list)
@@ -59,6 +62,7 @@ class SourceBudgetAllocator:
         adaptive_learning=None,
         divergence_controller=None,
         capital_governor=None,
+        capital_ramp=None,
     ):
         cfg = cfg or {}
         self.enabled = bool(cfg.get("enabled", True))
@@ -83,10 +87,12 @@ class SourceBudgetAllocator:
         self.block_on_status = bool(cfg.get("block_on_status", True))
         self.divergence_enabled = bool(cfg.get("divergence_enabled", divergence_controller is not None))
         self.capital_governor_enabled = bool(cfg.get("capital_governor_enabled", capital_governor is not None))
+        self.capital_ramp_enabled = bool(cfg.get("capital_ramp_enabled", capital_ramp is not None))
         self.promotion_ladder_enabled = bool(cfg.get("promotion_ladder_enabled", True))
         self.adaptive_learning = adaptive_learning
         self.divergence_controller = divergence_controller
         self.capital_governor = capital_governor
+        self.capital_ramp = capital_ramp
 
         self._last_refresh_at: Optional[datetime] = None
         self._outcome_by_key: Dict[str, Dict] = {}
@@ -119,6 +125,7 @@ class SourceBudgetAllocator:
             "divergence_scaled": 0,
             "capital_blocked": 0,
             "capital_scaled": 0,
+            "capital_ramp_scaled": 0,
             "promotion_blocked": 0,
             "promotion_scaled": 0,
             "last_decision": None,
@@ -390,6 +397,15 @@ class SourceBudgetAllocator:
             logger.debug("source allocator capital governor error: %s", exc)
             return {}
 
+    def _get_capital_ramp_limits(self) -> Dict:
+        if not self.capital_ramp_enabled or not self.capital_ramp:
+            return {}
+        try:
+            return self.capital_ramp.get_runtime_limits() or {}
+        except Exception as exc:
+            logger.debug("source allocator capital ramp error: %s", exc)
+            return {}
+
     def _status_defaults(self, status: str) -> Tuple[float, float]:
         normalized = str(status or "warming_up").strip().lower() or "warming_up"
         multipliers = {
@@ -572,6 +588,22 @@ class SourceBudgetAllocator:
                 reasons.append("capital_governor_scaled")
         if capital:
             reasons.extend([reason for reason in capital.get("reasons", []) or [] if reason])
+        capital_ramp = self._get_capital_ramp_limits()
+        capital_ramp_stage = str(capital_ramp.get("effective_stage", "") or "")
+        capital_ramp_order_multiplier = self._safe_float(
+            capital_ramp.get("order_cap_multiplier"),
+            1.0,
+        )
+        capital_ramp_source_cap_multiplier = self._safe_float(
+            capital_ramp.get("source_cap_multiplier"),
+            1.0,
+        )
+        if capital_ramp:
+            source_cap_pct *= max(0.0, capital_ramp_source_cap_multiplier)
+            source_headroom_pct = max(0.0, source_cap_pct - source_exposure_pct)
+            adjusted_position_pct = min(adjusted_position_pct, source_headroom_pct)
+            if capital_ramp_source_cap_multiplier < 0.9999:
+                reasons.append("capital_ramp_scaled")
 
         blocked = False
         block_reason = ""
@@ -628,6 +660,9 @@ class SourceBudgetAllocator:
             divergence_multiplier=round(divergence_multiplier, 6),
             capital_status=capital_status,
             capital_multiplier=round(capital_multiplier, 6),
+            capital_ramp_stage=capital_ramp_stage,
+            capital_ramp_order_multiplier=round(capital_ramp_order_multiplier, 6),
+            capital_ramp_source_cap_multiplier=round(capital_ramp_source_cap_multiplier, 6),
             blocked=blocked,
             block_reason=block_reason,
             reasons=reasons,
@@ -648,6 +683,8 @@ class SourceBudgetAllocator:
                 self.stats["promotion_scaled"] += 1
             if capital_status in {"caution", "risk_off"}:
                 self.stats["capital_scaled"] += 1
+            if capital_ramp_stage:
+                self.stats["capital_ramp_scaled"] += 1
             if divergence_status == "caution":
                 self.stats["divergence_scaled"] += 1
         status_counts = self.stats.setdefault("status_counts", {})
@@ -750,6 +787,11 @@ class SourceBudgetAllocator:
             "capital_governor": (
                 self.capital_governor.get_dashboard_payload()
                 if self.capital_governor_enabled and self.capital_governor
+                else {}
+            ),
+            "capital_ramp": (
+                self.capital_ramp.get_dashboard_payload(limit=limit)
+                if self.capital_ramp_enabled and self.capital_ramp
                 else {}
             ),
             "profiles": profiles[:limit],

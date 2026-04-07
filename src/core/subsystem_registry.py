@@ -42,6 +42,7 @@ FULL_PROFILE = FUNDABLE_CORE | {
     "llm_filter", "signal_processor", "arena_incubator", "decision_engine",
     "alpha_arena", "adaptive_learning", "execution_policy", "position_monitor", "dashboard", "telegram",
     "source_allocator", "divergence_controller", "capital_governor",
+    "capital_ramp",
     "cross_venue_hedger", "shadow_tracker", "adaptive_bot_detector",
     "regime_strategy_filter", "exchange_aggregator",
 }
@@ -86,6 +87,7 @@ class SubsystemContainer:
     source_allocator: Any = None
     divergence_controller: Any = None
     capital_governor: Any = None
+    capital_ramp: Any = None
     llm_filter: Any = None
     signal_processor: Any = None
     arena_incubator: Any = None
@@ -417,6 +419,19 @@ def build_subsystems(
             except Exception as exc:
                 logger.debug("capital governor startup evaluation error: %s", exc)
 
+    if "capital_ramp" in profile:
+        from src.analysis.capital_ramp import CapitalRampManager, build_capital_ramp_config
+
+        c.capital_ramp = _safe_init(
+            "capital_ramp",
+            lambda: CapitalRampManager(
+                build_capital_ramp_config(config),
+                capital_governor=c.capital_governor,
+            ),
+            health,
+            affects_trading=False,
+        )
+
     if "source_allocator" in profile:
         from src.signals.source_allocator import SourceBudgetAllocator
 
@@ -446,11 +461,13 @@ def build_subsystems(
                     "block_on_status": config.SOURCE_BUDGET_BLOCK_ON_STATUS,
                     "divergence_enabled": config.RUNTIME_DIVERGENCE_CONTROL_ENABLED,
                     "capital_governor_enabled": config.SOURCE_BUDGET_CAPITAL_GOVERNOR_ENABLED,
+                    "capital_ramp_enabled": config.SOURCE_BUDGET_CAPITAL_RAMP_ENABLED,
                     "promotion_ladder_enabled": config.SOURCE_BUDGET_PROMOTION_LADDER_ENABLED,
                 },
                 adaptive_learning=c.adaptive_learning,
                 divergence_controller=c.divergence_controller,
                 capital_governor=c.capital_governor,
+                capital_ramp=c.capital_ramp,
             ),
             health,
             affects_trading=False,
@@ -635,6 +652,7 @@ def build_subsystems(
                 max_daily_loss=float(getattr(config, "LIVE_MAX_DAILY_LOSS_USD", 500)),
                 max_order_usd=float(getattr(config, "LIVE_MAX_ORDER_USD", 3.0)),
                 regime_forecaster=c.predictive_forecaster,
+                capital_ramp=c.capital_ramp,
             ),
             health,
             affects_trading=bool(getattr(config, "LIVE_TRADING_ENABLED", False)),
@@ -753,6 +771,7 @@ def build_subsystems(
                 source_allocator=c.source_allocator,
                 divergence_controller=c.divergence_controller,
                 capital_governor=c.capital_governor,
+                capital_ramp=c.capital_ramp,
             )
             if c.live_trader:
                 set_live_trader(c.live_trader)

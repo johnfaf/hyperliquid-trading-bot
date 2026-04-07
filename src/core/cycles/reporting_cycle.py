@@ -343,6 +343,29 @@ def run_reporting(container, cycle_count: int, health_registry=None) -> None:
     except Exception as exc:
         logger.debug("  Shadow certification error: %s", exc)
 
+    try:
+        if (
+            getattr(container, "capital_ramp", None)
+            and getattr(config, "CAPITAL_RAMP_ENABLED", True)
+            and cycle_count % cycles_per_day == 0
+        ):
+            capital_ramp = container.capital_ramp.run(
+                cycle_count=cycle_count,
+                force=True,
+            )
+            limits = capital_ramp.get("limits", {}) or {}
+            logger.info(
+                "  CapitalRamp: %s (stage=%s, approved=%s, next=%s, max_order=$%.2f, source_cap=%.0f%%)",
+                capital_ramp.get("status", "warming_up"),
+                capital_ramp.get("applied_stage", "bootstrap"),
+                capital_ramp.get("approved_stage", "bootstrap"),
+                capital_ramp.get("recommended_stage", "bootstrap"),
+                float(limits.get("effective_max_order_usd", 0.0) or 0.0),
+                float(limits.get("source_cap_multiplier", 0.0) or 0.0) * 100.0,
+            )
+    except Exception as exc:
+        logger.debug("  Capital ramp error: %s", exc)
+
     # ── HTML report (daily) ──
     try:
         if report_exporter and cycle_count % cycles_per_day == 0:

@@ -180,6 +180,11 @@ def _rescale_size_for_live(trade: Dict, trader) -> Optional[Dict]:
     After rescaling, the final notional is clamped to trader.max_order_usd
     (if set) so nothing above the bootstrap cap ever hits the exchange.
     """
+    if hasattr(trader, "_refresh_capital_ramp_limits"):
+        try:
+            trader._refresh_capital_ramp_limits()
+        except Exception:
+            pass
     paper_account = db.get_paper_account()
     paper_balance = float((paper_account or {}).get("balance", 0) or 0)
     live_balance = trader.get_account_value()
