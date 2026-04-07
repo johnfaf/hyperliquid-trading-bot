@@ -89,6 +89,13 @@ This branch is the staged upgrade path for making the bot more measurable, more 
 - Adjust raw candidate confidence using the observed calibration curve for the source when enough history exists.
 - Block sources that remain materially miscalibrated after enough samples, and reward candidates whose confidence has proven reliable.
 
+## Phase 13: Trade Memory Decision Feedback
+
+- Status: shipped on `codex/live-ledger-foundation`
+- Use similar historical setups directly inside the main decision engine instead of only at paper-execution time.
+- Reward candidates whose nearest historical setup cluster has strong realized outcomes after enough samples.
+- Block candidates whose similar setup cluster is explicitly rated `avoid`, so repeated bad patterns are filtered before execution.
+
 ## Branch Operating Rule
 
 Each phase should be landed in a reviewable commit with tests before moving to the next phase.

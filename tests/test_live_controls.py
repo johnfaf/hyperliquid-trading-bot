@@ -2424,7 +2424,7 @@ def test_decision_engine_blocks_poorly_calibrated_source():
         "parameters": {"coins": ["BTC"], "direction": "long"},
         "metadata": {"source": "options_flow", "source_key": "options_flow:BTC"},
     }
-    breakdown = engine._compute_composite_score(
+    engine._compute_composite_score(
         dict(candidate),
         regime_data={"overall_regime": "trending_up"},
         open_coins=set(),
@@ -2560,6 +2560,193 @@ def test_decision_engine_prefers_better_calibrated_source():
     assert selected[0]["name"] == "better_calibrated"
     assert strong_breakdown["calibration"] > weak_breakdown["calibration"]
     assert strong_breakdown["calibrated_confidence"] > weak_breakdown["calibrated_confidence"]
+    assert strong_breakdown["total"] > weak_breakdown["total"]
+
+
+def test_decision_engine_blocks_memory_avoid_setups():
+    class FakeTradeMemory:
+        def find_similar(self, features, coin=None, strategy_type=None, side=None, top_k=10, min_similarity=0.5):
+            assert coin == "BTC"
+            assert strategy_type == "options_momentum"
+            assert side == "long"
+            assert features["overall_score"] == 0.81
+            return {
+                "similar_trades": [{"trade_id": "a1"}, {"trade_id": "a2"}, {"trade_id": "a3"}],
+                "total_found": 4,
+                "win_rate": 0.25,
+                "avg_pnl": -5.8,
+                "avg_return": -0.041,
+                "recommendation": "avoid",
+                "reason": "Similar setups mostly lost money",
+                "similarity_scores": [0.93, 0.88, 0.84, 0.79],
+            }
+
+    engine = DecisionEngine(
+        {
+            "w_memory": 0.60,
+            "min_decision_score": 0.0,
+            "min_signal_confidence": 0.35,
+            "min_source_weight": 0.2,
+            "min_expected_value_pct": -1.0,
+            "execution_quality_enabled": False,
+            "adaptive_learning_enabled": False,
+            "context_performance_enabled": False,
+            "confluence_enabled": False,
+            "calibration_enabled": False,
+            "trade_memory": FakeTradeMemory(),
+            "memory_enabled": True,
+            "memory_min_trades": 3,
+            "memory_block_on_avoid": True,
+        }
+    )
+
+    candidate = {
+        "name": "avoid_setup",
+        "source": "options_flow",
+        "source_key": "options_flow:BTC",
+        "strategy_type": "options_momentum",
+        "current_score": 0.81,
+        "confidence": 0.78,
+        "source_accuracy": 0.72,
+        "entry_price": 100.0,
+        "stop_loss": 97.0,
+        "take_profit": 108.0,
+        "features": {"overall_score": 0.81, "trend_strength": 0.74, "volatility": 0.02},
+        "parameters": {"coins": ["BTC"], "direction": "long"},
+        "metadata": {"source": "options_flow", "source_key": "options_flow:BTC"},
+    }
+    breakdown = engine._compute_composite_score(
+        dict(candidate),
+        regime_data={"overall_regime": "trending_up"},
+        open_coins=set(),
+        kelly_stats=None,
+    )
+
+    selected = engine.decide(
+        [candidate],
+        regime_data={"overall_regime": "trending_up"},
+        open_positions=[],
+        kelly_stats={},
+    )
+
+    assert selected == []
+    assert candidate["_trade_memory"]["blocked"] is True
+    assert candidate["_trade_memory"]["recommendation"] == "avoid"
+    assert breakdown["memory"] < 0.4
+    assert "memory_avoid" in engine._decision_blockers(candidate)
+    assert engine.get_stats()["total_memory_blocks"] >= 1
+
+
+def test_decision_engine_prefers_candidates_with_stronger_trade_memory():
+    class FakeTradeMemory:
+        def find_similar(self, features, coin=None, strategy_type=None, side=None, top_k=10, min_similarity=0.5):
+            if coin == "BTC":
+                return {
+                    "similar_trades": [{"trade_id": "btc-1"}, {"trade_id": "btc-2"}],
+                    "total_found": 6,
+                    "win_rate": 0.83,
+                    "avg_pnl": 7.2,
+                    "avg_return": 0.062,
+                    "recommendation": "proceed",
+                    "reason": "Historically strong setup cluster",
+                    "similarity_scores": [0.92, 0.89, 0.86, 0.84, 0.82, 0.81],
+                }
+            return {
+                "similar_trades": [{"trade_id": "eth-1"}, {"trade_id": "eth-2"}],
+                "total_found": 5,
+                "win_rate": 0.40,
+                "avg_pnl": -0.4,
+                "avg_return": -0.006,
+                "recommendation": "caution",
+                "reason": "Mixed results for similar setups",
+                "similarity_scores": [0.90, 0.86, 0.82, 0.79, 0.76],
+            }
+
+    engine = DecisionEngine(
+        {
+            "w_score": 0.05,
+            "w_regime": 0.0,
+            "w_diversity": 0.0,
+            "w_freshness": 0.0,
+            "w_consensus": 0.0,
+            "w_confidence": 0.03,
+            "w_source_quality": 0.03,
+            "w_confirmation": 0.0,
+            "w_expected_value": 0.05,
+            "w_context": 0.0,
+            "w_confluence": 0.0,
+            "w_calibration": 0.0,
+            "w_memory": 0.84,
+            "min_decision_score": 0.0,
+            "min_signal_confidence": 0.35,
+            "min_source_weight": 0.2,
+            "min_expected_value_pct": -1.0,
+            "execution_quality_enabled": False,
+            "adaptive_learning_enabled": False,
+            "context_performance_enabled": False,
+            "confluence_enabled": False,
+            "calibration_enabled": False,
+            "trade_memory": FakeTradeMemory(),
+            "memory_enabled": True,
+            "memory_min_trades": 3,
+            "memory_block_on_avoid": True,
+        }
+    )
+
+    stronger_memory = {
+        "name": "stronger_memory",
+        "source": "options_flow",
+        "source_key": "options_flow:BTC",
+        "strategy_type": "options_momentum",
+        "current_score": 0.74,
+        "confidence": 0.70,
+        "source_accuracy": 0.66,
+        "entry_price": 100.0,
+        "stop_loss": 97.0,
+        "take_profit": 108.0,
+        "features": {"overall_score": 0.74, "trend_strength": 0.81, "volatility": 0.018},
+        "parameters": {"coins": ["BTC"], "direction": "long"},
+        "metadata": {"source": "options_flow", "source_key": "options_flow:BTC"},
+    }
+    weaker_memory = {
+        "name": "weaker_memory",
+        "source": "strategy",
+        "source_key": "strategy:trend_following:ETH",
+        "strategy_type": "trend_following",
+        "current_score": 0.81,
+        "confidence": 0.70,
+        "source_accuracy": 0.66,
+        "entry_price": 100.0,
+        "stop_loss": 97.0,
+        "take_profit": 108.0,
+        "features": {"overall_score": 0.81, "trend_strength": 0.58, "volatility": 0.021},
+        "parameters": {"coins": ["ETH"], "direction": "long"},
+        "metadata": {"source": "strategy", "source_key": "strategy:trend_following:ETH"},
+    }
+
+    strong_breakdown = engine._compute_composite_score(
+        dict(stronger_memory),
+        regime_data={"overall_regime": "trending_up"},
+        open_coins=set(),
+        kelly_stats=None,
+    )
+    weak_breakdown = engine._compute_composite_score(
+        dict(weaker_memory),
+        regime_data={"overall_regime": "trending_up"},
+        open_coins=set(),
+        kelly_stats=None,
+    )
+    selected = engine.decide(
+        [weaker_memory, stronger_memory],
+        regime_data={"overall_regime": "trending_up"},
+        open_positions=[],
+        kelly_stats={},
+    )
+
+    assert selected
+    assert selected[0]["name"] == "stronger_memory"
+    assert selected[0]["_trade_memory"]["recommendation"] == "proceed"
+    assert strong_breakdown["memory"] > weak_breakdown["memory"]
     assert strong_breakdown["total"] > weak_breakdown["total"]
 
 

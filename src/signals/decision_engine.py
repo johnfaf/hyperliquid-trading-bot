@@ -54,6 +54,7 @@ class DecisionEngine:
         self.w_confluence = cfg.get("w_confluence", 0.10)          # Cross-source same-coin agreement
         self.w_context = cfg.get("w_context", 0.08)                # Source x coin x side x regime fitness
         self.w_calibration = cfg.get("w_calibration", 0.06)        # Confidence honesty / ECE quality
+        self.w_memory = cfg.get("w_memory", 0.07)                  # Similar historical setup fitness
 
         # Minimum composite score to even consider executing
         self.min_decision_score = cfg.get("min_decision_score", 0.34)
@@ -90,6 +91,14 @@ class DecisionEngine:
         self.calibration_min_records = int(cfg.get("calibration_min_records", 20))
         self.calibration_target_ece = float(cfg.get("calibration_target_ece", 0.05))
         self.calibration_max_ece = float(cfg.get("calibration_max_ece", 0.20))
+        self.trade_memory = cfg.get("trade_memory")
+        self.memory_enabled = bool(
+            cfg.get("memory_enabled", self.trade_memory is not None)
+        )
+        self.memory_min_trades = int(cfg.get("memory_min_trades", 3))
+        self.memory_min_similarity = float(cfg.get("memory_min_similarity", 0.55))
+        self.memory_top_k = int(cfg.get("memory_top_k", 8))
+        self.memory_block_on_avoid = bool(cfg.get("memory_block_on_avoid", True))
 
         # Max trades to execute per cycle (independent of position slots)
         self.max_trades_per_cycle = cfg.get("max_trades_per_cycle", 2)
@@ -130,6 +139,7 @@ class DecisionEngine:
         self._context_profile_cache: Dict[Tuple, Dict] = {}
         self._calibration_profile_cache: Dict[Tuple, Dict] = {}
         self._calibration_stats_snapshot: Optional[Dict[str, Dict]] = None
+        self._memory_profile_cache: Dict[Tuple, Dict] = {}
 
         # Stats
         self.stats = {
@@ -141,6 +151,7 @@ class DecisionEngine:
             "total_source_conflict_blocks": 0,
             "total_context_blocks": 0,
             "total_calibration_blocks": 0,
+            "total_memory_blocks": 0,
         }
 
     def decide(self, strategies: List[Dict],
@@ -165,6 +176,7 @@ class DecisionEngine:
         self._context_profile_cache = {}
         self._calibration_profile_cache = {}
         self._calibration_stats_snapshot = None
+        self._memory_profile_cache = {}
         open_positions = open_positions or []
         open_coins = {t["coin"] for t in open_positions}
         available_slots = max(0, 8 - len(open_positions))
@@ -279,6 +291,9 @@ class DecisionEngine:
         )
         self.stats["total_calibration_blocks"] += sum(
             1 for item in disqualified if "calibration_poor" in item.get("_decision_blockers", [])
+        )
+        self.stats["total_memory_blocks"] += sum(
+            1 for item in disqualified if "memory_avoid" in item.get("_decision_blockers", [])
         )
         if executions:
             self.stats["total_executions"] += len(executions)
@@ -660,6 +675,19 @@ class DecisionEngine:
         strategy["_metadata_for_decision"] = calibration_feedback["metadata"]
         strategy["_calibration"] = calibration_feedback["profile"]
         calibration_score = float(calibration_feedback["calibration_score"] or 0.5)
+        memory_feedback = self._apply_trade_memory_feedback(
+            strategy,
+            confidence,
+            source_quality,
+            target_coin=target_coin,
+            direction=direction,
+            strategy_type=strategy_type,
+        )
+        confidence = memory_feedback["confidence"]
+        source_quality = memory_feedback["source_quality"]
+        strategy["_metadata_for_decision"] = memory_feedback["metadata"]
+        strategy["_trade_memory"] = memory_feedback["profile"]
+        memory_score = float(memory_feedback["memory_score"] or 0.5)
         adaptive_feedback = self._apply_adaptive_learning_feedback(strategy, confidence, source_quality)
         confidence = adaptive_feedback["confidence"]
         source_quality = adaptive_feedback["source_quality"]
@@ -713,6 +741,7 @@ class DecisionEngine:
             (confluence_score, self.w_confluence),
             (context_score, self.w_context),
             (calibration_score, self.w_calibration),
+            (memory_score, self.w_memory),
         ]
         weight_total = sum(weight for _, weight in components if weight > 0)
         total = (
@@ -740,6 +769,7 @@ class DecisionEngine:
             "confluence": round(confluence_score, 3),
             "context": round(context_score, 3),
             "calibration": round(calibration_score, 3),
+            "memory": round(memory_score, 3),
             "confluence_support": round(float(confluence_feedback.get("support_score", 0.0) or 0.0), 4),
             "confluence_conflict": round(float(confluence_feedback.get("conflict_score", 0.0) or 0.0), 4),
             "confluence_support_sources": list(confluence_feedback.get("supporting_sources", [])),
@@ -774,6 +804,28 @@ class DecisionEngine:
             "calibration_used_global": bool(
                 calibration_feedback["profile"].get("used_global", False)
             ),
+            "memory_total_found": int(memory_feedback["profile"].get("total_found", 0) or 0),
+            "memory_win_rate": round(
+                float(memory_feedback["profile"].get("win_rate", 0.0) or 0.0),
+                4,
+            ),
+            "memory_avg_return": round(
+                float(memory_feedback["profile"].get("avg_return", 0.0) or 0.0),
+                4,
+            ),
+            "memory_avg_pnl": round(
+                float(memory_feedback["profile"].get("avg_pnl", 0.0) or 0.0),
+                4,
+            ),
+            "memory_avg_similarity": round(
+                float(memory_feedback["profile"].get("avg_similarity", 0.0) or 0.0),
+                4,
+            ),
+            "memory_recommendation": str(
+                memory_feedback["profile"].get("recommendation", "unknown") or "unknown"
+            ),
+            "memory_reason": str(memory_feedback["profile"].get("reason", "") or ""),
+            "memory_blocked": bool(memory_feedback["profile"].get("blocked", False)),
             "calibrated_confidence": round(confidence, 4),
             "win_probability": round(expected_value["win_probability"], 3),
             "reward_risk_ratio": round(expected_value["reward_risk_ratio"], 3),
@@ -874,6 +926,10 @@ class DecisionEngine:
         calibration_profile = strategy.get("_calibration", {}) or {}
         if self.calibration_enabled and bool(calibration_profile.get("blocked", False)):
             blockers.append("calibration_poor")
+
+        memory_profile = strategy.get("_trade_memory", {}) or {}
+        if self.memory_enabled and bool(memory_profile.get("blocked", False)):
+            blockers.append("memory_avoid")
 
         confluence = strategy.get("_source_confluence", {}) or {}
         conflict_score = float(confluence.get("conflict_score", 0.0) or 0.0)
@@ -1141,6 +1197,193 @@ class DecisionEngine:
             "confidence": adjusted_confidence,
             "source_quality": self._clamp(source_quality * quality_multiplier, 0.0, 1.0),
             "calibration_score": calibration_score,
+            "profile": enriched_profile,
+            "blocked": blocked,
+        }
+
+    def _extract_trade_memory_features(self, strategy: Dict) -> Dict:
+        metadata = self._get_metadata(strategy)
+        features: Dict = {}
+        for payload in (strategy.get("features"), metadata.get("features")):
+            if isinstance(payload, dict):
+                features.update(payload)
+
+        for key, value in metadata.items():
+            if key not in features and isinstance(value, (int, float)):
+                features[key] = value
+
+        raw_score = strategy.get("current_score")
+        if "overall_score" not in features and isinstance(raw_score, (int, float)):
+            features["overall_score"] = float(raw_score)
+        return features
+
+    def _lookup_trade_memory_profile(
+        self,
+        strategy: Dict,
+        *,
+        target_coin: str,
+        direction: str,
+        strategy_type: str,
+    ) -> Dict:
+        if not self.memory_enabled or not self.trade_memory:
+            return {}
+
+        features = self._extract_trade_memory_features(strategy)
+        if not features:
+            return {}
+
+        try:
+            feature_signature = json.dumps(features, sort_keys=True, default=str)
+        except (TypeError, ValueError):
+            feature_signature = str(features)
+
+        cache_key = (
+            str(target_coin or "").strip().upper(),
+            str(direction or "").strip().lower(),
+            str(strategy_type or "").strip().lower(),
+            round(float(self.memory_min_similarity or 0.0), 4),
+            int(self.memory_top_k),
+            feature_signature,
+        )
+        if cache_key in self._memory_profile_cache:
+            return self._memory_profile_cache[cache_key]
+
+        try:
+            result = self.trade_memory.find_similar(
+                features=features,
+                coin=str(target_coin or "").strip().upper() or None,
+                strategy_type=str(strategy_type or "").strip() or None,
+                side=str(direction or "").strip().lower() or None,
+                top_k=self.memory_top_k,
+                min_similarity=self.memory_min_similarity,
+            )
+        except Exception as exc:
+            logger.debug("trade memory lookup error: %s", exc)
+            self._memory_profile_cache[cache_key] = {}
+            return {}
+
+        def _extract_value(name: str, default):
+            if isinstance(result, dict):
+                return result.get(name, default)
+            return getattr(result, name, default)
+
+        similarity_scores = list(_extract_value("similarity_scores", []) or [])
+        avg_similarity = (
+            sum(float(score or 0.0) for score in similarity_scores) / len(similarity_scores)
+            if similarity_scores
+            else 0.0
+        )
+        profile = {
+            "features": features,
+            "similar_trades": list(_extract_value("similar_trades", []) or []),
+            "total_found": int(_extract_value("total_found", 0) or 0),
+            "win_rate": float(_extract_value("win_rate", 0.0) or 0.0),
+            "avg_pnl": float(_extract_value("avg_pnl", 0.0) or 0.0),
+            "avg_return": float(_extract_value("avg_return", 0.0) or 0.0),
+            "recommendation": str(_extract_value("recommendation", "proceed") or "proceed").strip().lower(),
+            "reason": str(_extract_value("reason", "") or ""),
+            "similarity_scores": similarity_scores,
+            "avg_similarity": round(avg_similarity, 4),
+        }
+        self._memory_profile_cache[cache_key] = profile
+        return profile
+
+    def _apply_trade_memory_feedback(
+        self,
+        strategy: Dict,
+        confidence: float,
+        source_quality: float,
+        *,
+        target_coin: str,
+        direction: str,
+        strategy_type: str,
+    ) -> Dict:
+        metadata = dict(self._get_metadata(strategy))
+        if not self.memory_enabled or not self.trade_memory:
+            return {
+                "metadata": metadata,
+                "confidence": confidence,
+                "source_quality": source_quality,
+                "memory_score": 0.5,
+                "profile": {},
+                "blocked": False,
+            }
+
+        profile = self._lookup_trade_memory_profile(
+            strategy,
+            target_coin=target_coin,
+            direction=direction,
+            strategy_type=strategy_type,
+        )
+        if not profile:
+            return {
+                "metadata": metadata,
+                "confidence": confidence,
+                "source_quality": source_quality,
+                "memory_score": 0.5,
+                "profile": {},
+                "blocked": False,
+            }
+
+        total_found = int(profile.get("total_found", 0) or 0)
+        win_rate = self._clamp(float(profile.get("win_rate", 0.0) or 0.0), 0.0, 1.0)
+        avg_return = float(profile.get("avg_return", 0.0) or 0.0)
+        avg_pnl = float(profile.get("avg_pnl", 0.0) or 0.0)
+        avg_similarity = self._clamp(float(profile.get("avg_similarity", 0.0) or 0.0), 0.0, 1.0)
+        recommendation = str(profile.get("recommendation", "proceed") or "proceed").strip().lower()
+        blocked = False
+        memory_score = 0.5
+        quality_multiplier = 1.0
+        confidence_multiplier = 1.0
+
+        if total_found >= self.memory_min_trades:
+            return_component = self._clamp(
+                0.5 + max(-0.4, min(0.4, avg_return / max(self.context_performance_return_scale, 1e-8))),
+                0.0,
+                1.0,
+            )
+            recommendation_floor = {
+                "proceed": 0.72,
+                "caution": 0.42,
+                "avoid": 0.10,
+            }.get(recommendation, 0.5)
+            memory_score = self._clamp(
+                (recommendation_floor * 0.45)
+                + (win_rate * 0.25)
+                + (return_component * 0.20)
+                + (avg_similarity * 0.10),
+                0.0,
+                1.0,
+            )
+            quality_multiplier = self._clamp(0.65 + (memory_score * 0.55), 0.40, 1.16)
+            confidence_multiplier = self._clamp(0.72 + (memory_score * 0.38), 0.50, 1.12)
+            if recommendation == "proceed" and avg_return > 0 and win_rate >= 0.55:
+                quality_multiplier = self._clamp(quality_multiplier + 0.04, 0.40, 1.18)
+                confidence_multiplier = self._clamp(confidence_multiplier + 0.02, 0.50, 1.14)
+            elif recommendation == "avoid":
+                quality_multiplier = self._clamp(quality_multiplier - 0.08, 0.35, 1.16)
+                confidence_multiplier = self._clamp(confidence_multiplier - 0.05, 0.45, 1.12)
+                blocked = self.memory_block_on_avoid
+
+        enriched_profile = dict(profile)
+        enriched_profile["memory_score"] = round(memory_score, 4)
+        enriched_profile["blocked"] = blocked
+
+        metadata["memory_total_found"] = total_found
+        metadata["memory_recommendation"] = recommendation
+        metadata["memory_reason"] = profile.get("reason", "")
+        metadata["memory_avg_similarity"] = round(avg_similarity, 4)
+        metadata["memory_win_rate"] = round(win_rate, 4)
+        metadata["memory_avg_return"] = round(avg_return, 4)
+        metadata["memory_avg_pnl"] = round(avg_pnl, 4)
+        metadata["memory_score"] = round(memory_score, 4)
+        metadata["memory_blocked"] = blocked
+
+        return {
+            "metadata": metadata,
+            "confidence": self._clamp(confidence * confidence_multiplier, 0.0, 1.0),
+            "source_quality": self._clamp(source_quality * quality_multiplier, 0.0, 1.0),
+            "memory_score": memory_score,
             "profile": enriched_profile,
             "blocked": blocked,
         }
@@ -1739,6 +1982,12 @@ class DecisionEngine:
             "calibration_min_records": self.calibration_min_records,
             "calibration_target_ece": self.calibration_target_ece,
             "calibration_max_ece": self.calibration_max_ece,
+            "memory_enabled": self.memory_enabled,
+            "memory_weight": self.w_memory,
+            "memory_min_trades": self.memory_min_trades,
+            "memory_min_similarity": self.memory_min_similarity,
+            "memory_top_k": self.memory_top_k,
+            "memory_block_on_avoid": self.memory_block_on_avoid,
             "execution_policy_enabled": self.execution_policy_enabled,
             "execution_policy": (
                 self.execution_policy.get_stats()
