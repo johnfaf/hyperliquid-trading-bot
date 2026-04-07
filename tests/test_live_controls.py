@@ -1,3 +1,4 @@
+import importlib.util
 import json
 import logging
 import os
@@ -59,6 +60,15 @@ def _fake_live_credentials(self):
     self.agent_wallet_address = self.signer.address
     self.public_address = "0x2222222222222222222222222222222222222222"
     self.status_reason = "credentials_loaded"
+
+
+def _load_live_preflight_script():
+    script_path = os.path.join(os.getcwd(), "scripts", "run_live_preflight.py")
+    spec = importlib.util.spec_from_file_location("test_run_live_preflight", script_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def test_shadow_mode_allows_missing_rotation_threshold_envs(monkeypatch):
@@ -473,6 +483,67 @@ def test_live_trader_preflight_blocks_unfunded_account(monkeypatch):
     assert trader.get_stats()["status_reason"].startswith("preflight:")
 
 
+def test_live_trader_preflight_blocks_when_account_state_is_unreachable(monkeypatch):
+    monkeypatch.setattr(config, "LIVE_TRADING_ENABLED", True)
+    monkeypatch.setattr(config, "LIVE_ACTIVATION_GUARD_ENABLED", False)
+
+    class FakeManager:
+        def post(self, payload, **kwargs):
+            if payload.get("type") == "meta":
+                return {"universe": [{"name": "BTC", "szDecimals": 5}]}
+            if payload.get("type") == "clearinghouseState":
+                return []
+            if payload.get("type") == "spotClearinghouseState":
+                return {"balances": [{"coin": "USDC", "total": "0"}]}
+            raise AssertionError(f"unexpected payload: {payload}")
+
+    class FakeFirewall:
+        def validate(self, signal, **kwargs):
+            return True, "ok"
+
+    monkeypatch.setattr("src.trading.live_trader.get_manager", lambda: FakeManager())
+    monkeypatch.setattr(LiveTrader, "_load_credentials", _fake_live_credentials)
+
+    trader = LiveTrader(firewall=FakeFirewall(), dry_run=False)
+    report = trader.run_preflight(force=True)
+
+    assert report["deployable"] is False
+    assert "account_state_accessible" in report["blocking_checks"]
+    assert "perps_buying_power" in report["blocking_checks"]
+    assert trader.is_deployable() is False
+
+
+def test_live_trader_preflight_blocks_when_only_spot_wallet_is_funded(monkeypatch):
+    monkeypatch.setattr(config, "LIVE_TRADING_ENABLED", True)
+    monkeypatch.setattr(config, "LIVE_ACTIVATION_GUARD_ENABLED", False)
+
+    class FakeManager:
+        def post(self, payload, **kwargs):
+            if payload.get("type") == "meta":
+                return {"universe": [{"name": "BTC", "szDecimals": 5}]}
+            if payload.get("type") == "clearinghouseState":
+                return {"marginSummary": {"accountValue": "0"}, "assetPositions": []}
+            if payload.get("type") == "spotClearinghouseState":
+                return {"balances": [{"coin": "USDC", "total": "125"}]}
+            raise AssertionError(f"unexpected payload: {payload}")
+
+    class FakeFirewall:
+        def validate(self, signal, **kwargs):
+            return True, "ok"
+
+    monkeypatch.setattr("src.trading.live_trader.get_manager", lambda: FakeManager())
+    monkeypatch.setattr(LiveTrader, "_load_credentials", _fake_live_credentials)
+
+    trader = LiveTrader(firewall=FakeFirewall(), dry_run=False)
+    report = trader.run_preflight(force=True)
+
+    assert report["deployable"] is False
+    assert report["wallet_total"] == 125.0
+    assert report["account_value"] == 0.0
+    assert "perps_buying_power" in report["blocking_checks"]
+    assert trader.is_deployable() is False
+
+
 def test_live_trader_requires_fresh_activation_approval(monkeypatch):
     class FakeManager:
         def post(self, payload, **kwargs):
@@ -504,6 +575,39 @@ def test_live_trader_requires_fresh_activation_approval(monkeypatch):
     assert "approved_at_present" in activation["blocking_checks"]
     assert readiness["deployable"] is False
     assert readiness["status_reason"].startswith("activation:")
+    assert trader.is_deployable() is False
+
+
+def test_live_trader_blocks_expired_activation_approval(monkeypatch):
+    class FakeManager:
+        def post(self, payload, **kwargs):
+            if payload.get("type") == "meta":
+                return {"universe": [{"name": "BTC", "szDecimals": 5}]}
+            if payload.get("type") == "clearinghouseState":
+                return {"marginSummary": {"accountValue": "250.0"}, "assetPositions": []}
+            if payload.get("type") == "spotClearinghouseState":
+                return {"balances": [{"coin": "USDC", "total": "50"}]}
+            return {}
+
+    class FakeFirewall:
+        def validate(self, signal, **kwargs):
+            return True, "ok"
+
+    approved_at = (datetime.now(timezone.utc) - timedelta(hours=30)).isoformat()
+    monkeypatch.setattr(config, "LIVE_TRADING_ENABLED", True)
+    monkeypatch.setattr(config, "LIVE_ACTIVATION_GUARD_ENABLED", True)
+    monkeypatch.setattr(config, "LIVE_ACTIVATION_APPROVED_AT", approved_at)
+    monkeypatch.setattr(config, "LIVE_ACTIVATION_APPROVED_BY", "ops")
+    monkeypatch.setattr(config, "LIVE_ACTIVATION_MAX_AGE_HOURS", 24.0)
+    monkeypatch.setattr("src.trading.live_trader.get_manager", lambda: FakeManager())
+    monkeypatch.setattr(LiveTrader, "_load_credentials", _fake_live_credentials)
+
+    trader = LiveTrader(firewall=FakeFirewall(), dry_run=False)
+    readiness = trader.get_live_readiness(force_preflight=True)
+
+    assert readiness["deployable"] is False
+    assert "approval_fresh" in readiness["activation_guard"]["blocking_checks"]
+    assert readiness["status_reason"].startswith("activation:approval_fresh")
     assert trader.is_deployable() is False
 
 
@@ -618,6 +722,157 @@ def test_execute_signal_blocks_when_activation_guard_is_not_ready(monkeypatch):
 
     assert result is None
     assert firewall.calls == 0
+
+
+def test_execute_signal_blocks_when_preflight_is_not_ready(monkeypatch):
+    class FakeManager:
+        def post(self, payload, **kwargs):
+            if payload.get("type") == "meta":
+                return {"universe": [{"name": "BTC", "szDecimals": 5}]}
+            if payload.get("type") == "clearinghouseState":
+                return {"marginSummary": {"accountValue": "0"}, "assetPositions": []}
+            if payload.get("type") == "spotClearinghouseState":
+                return {"balances": [{"coin": "USDC", "total": "0"}]}
+            return {}
+
+    class CountingFirewall:
+        def __init__(self):
+            self.calls = 0
+
+        def validate(self, signal, **kwargs):
+            self.calls += 1
+            return True, "ok"
+
+    monkeypatch.setattr(config, "LIVE_TRADING_ENABLED", True)
+    monkeypatch.setattr(config, "LIVE_PREFLIGHT_REQUIRED", True)
+    monkeypatch.setattr(config, "LIVE_ACTIVATION_GUARD_ENABLED", False)
+    monkeypatch.setattr("src.trading.live_trader.get_manager", lambda: FakeManager())
+    monkeypatch.setattr(LiveTrader, "_load_credentials", _fake_live_credentials)
+
+    firewall = CountingFirewall()
+    trader = LiveTrader(firewall=firewall, dry_run=False)
+    result = trader.execute_signal(
+        {
+            "coin": "BTC",
+            "side": "long",
+            "confidence": 0.8,
+            "entry_price": 100000.0,
+            "position_pct": 0.05,
+            "leverage": 2.0,
+            "size": 0.01,
+            "strategy_type": "momentum_long",
+        }
+    )
+
+    assert result is None
+    assert firewall.calls == 0
+    assert trader.get_live_readiness()["status_reason"].startswith("preflight:")
+
+
+def test_run_live_preflight_main_returns_nonzero_when_not_certified(monkeypatch, capsys, tmp_path):
+    script = _load_live_preflight_script()
+
+    class FakeTrader:
+        def __init__(self, firewall=None, dry_run=False, max_daily_loss=0.0, max_order_usd=0.0):
+            self.firewall = firewall
+            self.dry_run = dry_run
+
+        def run_preflight(self, force=False):
+            return {
+                "status": "blocked",
+                "deployable": False,
+                "warning_checks": [],
+                "blocking_checks": ["perps_buying_power"],
+            }
+
+        def evaluate_activation_guard(self):
+            return {
+                "status": "ready",
+                "deployable": True,
+                "approved_by": "ops",
+                "warning_checks": [],
+                "blocking_checks": [],
+            }
+
+        def get_live_readiness(self, force_preflight=False):
+            return {
+                "status": "blocked",
+                "status_reason": "preflight:perps_buying_power",
+                "deployable": False,
+                "blocking_checks": ["preflight:perps_buying_power"],
+            }
+
+    monkeypatch.setattr(script, "setup_logging", lambda: logging.getLogger("preflight-script"))
+    monkeypatch.setattr(script, "validate_dependencies", lambda logger: None)
+    monkeypatch.setattr(script, "init_database", lambda logger: None)
+    monkeypatch.setattr(script, "DecisionFirewall", lambda cfg: {"cfg": cfg})
+    monkeypatch.setattr(script, "LiveTrader", FakeTrader)
+    monkeypatch.setattr(script.config, "RUNTIME_PROFILE", "live")
+    monkeypatch.setattr(script.config, "LIVE_TRADING_ENABLED", True)
+
+    output_path = tmp_path / "preflight_blocked.json"
+    rc = script.main(["--output", str(output_path)])
+    captured = capsys.readouterr()
+
+    assert rc == 1
+    assert "Certification: FAIL" in captured.out
+    with open(output_path, "r", encoding="utf-8") as handle:
+        report = json.load(handle)
+    assert report["certified_for_live_entries"] is False
+    assert report["live_readiness"]["status"] == "blocked"
+
+
+def test_run_live_preflight_main_returns_zero_when_certified(monkeypatch, capsys, tmp_path):
+    script = _load_live_preflight_script()
+
+    class FakeTrader:
+        def __init__(self, firewall=None, dry_run=False, max_daily_loss=0.0, max_order_usd=0.0):
+            self.firewall = firewall
+            self.dry_run = dry_run
+
+        def run_preflight(self, force=False):
+            return {
+                "status": "ready",
+                "deployable": True,
+                "warning_checks": [],
+                "blocking_checks": [],
+            }
+
+        def evaluate_activation_guard(self):
+            return {
+                "status": "ready",
+                "deployable": True,
+                "approved_by": "ops",
+                "warning_checks": ["approval_expiring_soon"],
+                "blocking_checks": [],
+            }
+
+        def get_live_readiness(self, force_preflight=False):
+            return {
+                "status": "ready",
+                "status_reason": "ready",
+                "deployable": True,
+                "blocking_checks": [],
+            }
+
+    monkeypatch.setattr(script, "setup_logging", lambda: logging.getLogger("preflight-script"))
+    monkeypatch.setattr(script, "validate_dependencies", lambda logger: None)
+    monkeypatch.setattr(script, "init_database", lambda logger: None)
+    monkeypatch.setattr(script, "DecisionFirewall", lambda cfg: {"cfg": cfg})
+    monkeypatch.setattr(script, "LiveTrader", FakeTrader)
+    monkeypatch.setattr(script.config, "RUNTIME_PROFILE", "live")
+    monkeypatch.setattr(script.config, "LIVE_TRADING_ENABLED", True)
+
+    output_path = tmp_path / "preflight_ready.json"
+    rc = script.main(["--output", str(output_path)])
+    captured = capsys.readouterr()
+
+    assert rc == 0
+    assert "Certification: PASS" in captured.out
+    with open(output_path, "r", encoding="utf-8") as handle:
+        report = json.load(handle)
+    assert report["certified_for_live_entries"] is True
+    assert report["live_readiness"]["status"] == "ready"
 
 
 def test_post_order_routes_exchange_requests_through_api_manager(monkeypatch):
@@ -4643,6 +4898,50 @@ def test_positive_daily_pnl_does_not_trigger_kill_switch(monkeypatch):
 
     assert trader.check_daily_loss() is False
     assert trader.kill_switch_active is False
+
+
+def test_close_position_still_allows_reduce_only_exit_when_kill_switch_is_active(monkeypatch):
+    monkeypatch.setattr(LiveTrader, "_load_credentials", _fake_live_credentials)
+    monkeypatch.setattr(LiveTrader, "_load_asset_index_map", lambda self: None)
+
+    class FakeFirewall:
+        def validate(self, signal, **kwargs):
+            return True, "ok"
+
+    class FakeManager:
+        def post(self, payload, **kwargs):
+            return {}
+
+    captured = []
+
+    monkeypatch.setattr("src.trading.live_trader.get_manager", lambda: FakeManager())
+    monkeypatch.setattr(
+        LiveTrader,
+        "get_positions",
+        lambda self: [{"coin": "BTC", "size": 0.25, "szi": 0.25}],
+    )
+    monkeypatch.setattr(
+        LiveTrader,
+        "place_market_order",
+        lambda self, coin, side, size, reduce_only=False: captured.append(
+            {
+                "coin": coin,
+                "side": side,
+                "size": size,
+                "reduce_only": reduce_only,
+            }
+        ) or {"status": "success", "coin": coin, "reduce_only": reduce_only},
+    )
+
+    trader = LiveTrader(firewall=FakeFirewall(), dry_run=False)
+    trader.kill_switch_active = True
+
+    result = trader.close_position("BTC")
+
+    assert result["status"] == "success"
+    assert captured == [
+        {"coin": "BTC", "side": "sell", "size": 0.25, "reduce_only": True}
+    ]
 
 
 def test_hyperliquid_signer_zero_pads_signature_components(monkeypatch):

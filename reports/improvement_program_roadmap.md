@@ -159,6 +159,13 @@ This branch is the staged upgrade path for making the bot more measurable, more 
 - Expose runtime incidents in reporting, the dashboard, and Telegram alerting with cooldown-based deduplication so operators can see blocking states quickly without alert spam.
 - Add a concise incident summary panel on the dashboard that shows current severity, blocking count, and the top open incidents.
 
+## Phase 23: Live Integration Certification
+
+- Status: shipped on `codex/live-ledger-foundation`
+- Add certification-style coverage for live startup, blocked preflight, expired activation, and readiness-gated entry behavior so the real operator path is tested instead of only isolated helpers.
+- Make the live preflight operator script exit non-zero when live entries are not certified, and persist an explicit `certified_for_live_entries` flag in its JSON output for automation.
+- Prove that blocked live entry states still allow reduce-only protective exits so emergency flattening keeps working under kill-switch or readiness failures.
+
 ## Branch Operating Rule
 
 Each phase should be landed in a reviewable commit with tests before moving to the next phase.

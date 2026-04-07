@@ -31,7 +31,7 @@ from src.signals.decision_firewall import DecisionFirewall  # noqa: E402
 from src.trading.live_trader import LiveTrader  # noqa: E402
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run the live trading preflight.")
     parser.add_argument(
         "--runtime-profile",
@@ -44,7 +44,7 @@ def main() -> None:
         default="",
         help="Optional JSON path for the preflight report.",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     logger = setup_logging()
     validate_dependencies(logger)
@@ -71,7 +71,9 @@ def main() -> None:
         "preflight": preflight,
         "activation_guard": activation,
         "live_readiness": readiness,
+        "certified_for_live_entries": bool(readiness.get("deployable", False)),
     }
+    exit_code = 0 if report["certified_for_live_entries"] else 1
 
     if args.output:
         output_path = os.path.abspath(args.output)
@@ -90,9 +92,14 @@ def main() -> None:
     print(f"Blocking checks: {', '.join(readiness.get('blocking_checks', [])) or 'none'}")
     print(f"Preflight warnings: {', '.join(preflight.get('warning_checks', [])) or 'none'}")
     print(f"Activation warnings: {', '.join(activation.get('warning_checks', [])) or 'none'}")
+    print(
+        "Certification: "
+        + ("PASS" if report["certified_for_live_entries"] else "FAIL")
+    )
     if args.output:
         print(f"Output: {os.path.abspath(args.output)}")
+    return exit_code
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
