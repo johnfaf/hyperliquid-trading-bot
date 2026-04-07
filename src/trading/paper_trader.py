@@ -34,6 +34,7 @@ from src.signals.agent_scoring import AgentScorer
 from src.analysis.features import FeatureEngine
 from src.signals.kelly_sizing import KellySizer
 from src.signals.portfolio_sizer import PortfolioSizer
+from src.signals.source_allocator import SourceBudgetAllocator
 from src.trading.trade_memory import TradeMemory
 from src.trading.portfolio_rotation import PortfolioRotationManager
 from src.signals.calibration import CalibrationTracker
@@ -51,6 +52,7 @@ class PaperTrader:
                  feature_engine: Optional[FeatureEngine] = None,
                  kelly_sizer: Optional[KellySizer] = None,
                  portfolio_sizer: Optional[PortfolioSizer] = None,
+                 source_allocator: Optional[SourceBudgetAllocator] = None,
                  trade_memory: Optional[TradeMemory] = None,
                  calibration: Optional[CalibrationTracker] = None,
                  llm_filter: Optional[LLMFilter] = None):
@@ -59,6 +61,7 @@ class PaperTrader:
         self.feature_engine = feature_engine
         self.kelly_sizer = kelly_sizer
         self.portfolio_sizer = portfolio_sizer
+        self.source_allocator = source_allocator
         self.trade_memory = trade_memory
         self.calibration = calibration
         self.llm_filter = llm_filter
@@ -218,6 +221,30 @@ class PaperTrader:
             )
             return False
 
+        source_budget_context = None
+        if self.source_allocator:
+            try:
+                source_budget_context = self.source_allocator.apply_to_signal(
+                    trade_signal,
+                    signal=signal,
+                    open_positions=open_positions,
+                    account_balance=account_balance,
+                )
+            except Exception as exc:
+                logger.debug("Source budget error for %s %s: %s", signal.get("side"), signal.get("coin"), exc)
+
+        if source_budget_context and source_budget_context.blocked:
+            signal["source_budget"] = source_budget_context.to_dict()
+            signal["source_budget_status"] = source_budget_context.status
+            signal["source_budget_reason"] = source_budget_context.block_reason
+            logger.info(
+                "Source budget blocked %s %s: %s",
+                signal.get("side"),
+                signal.get("coin"),
+                source_budget_context.block_reason,
+            )
+            return False
+
         if not self._sync_signal_from_trade_signal(
             trade_signal,
             signal,
@@ -228,6 +255,10 @@ class PaperTrader:
         if sizing_context:
             signal["portfolio_sizing"] = sizing_context.to_dict()
             signal["cluster"] = sizing_context.cluster
+        if source_budget_context:
+            signal["source_budget"] = source_budget_context.to_dict()
+            signal["source_budget_status"] = source_budget_context.status
+            signal["source_budget_reason"] = source_budget_context.block_reason
         return True
 
     def execute_strategy_signals(self, strategies: List[Dict], exchange_agg=None,
@@ -1103,6 +1134,9 @@ class PaperTrader:
                     "position_pct": signal.get("position_pct", 0),
                     "time_limit_hours": signal.get("time_limit_hours", 24.0),
                     "portfolio_sizing": signal.get("portfolio_sizing", {}),
+                    "source_budget": signal.get("source_budget", {}),
+                    "source_budget_status": signal.get("source_budget_status", ""),
+                    "source_budget_reason": signal.get("source_budget_reason", ""),
                     "cluster": signal.get("cluster", ""),
                 },
             )
@@ -1144,6 +1178,7 @@ class PaperTrader:
                 "trader_address": signal.get("trader_address", ""),
                 "agent_id": signal.get("agent_id", ""),
                 "agent_name": signal.get("agent_name", ""),
+                "source_budget": signal.get("source_budget", {}),
                 "metadata": {
                     "strategy_type": signal.get("strategy_type", ""),
                     "confidence": signal.get("confidence", 0),
@@ -1188,6 +1223,9 @@ class PaperTrader:
                     "position_pct": signal.get("position_pct", 0),
                     "time_limit_hours": signal.get("time_limit_hours", 24.0),
                     "portfolio_sizing": signal.get("portfolio_sizing", {}),
+                    "source_budget": signal.get("source_budget", {}),
+                    "source_budget_status": signal.get("source_budget_status", ""),
+                    "source_budget_reason": signal.get("source_budget_reason", ""),
                     "cluster": signal.get("cluster", ""),
                 },
             }

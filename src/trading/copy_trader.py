@@ -22,6 +22,7 @@ from src.signals.decision_firewall import DecisionFirewall
 from src.signals.agent_scoring import AgentScorer
 from src.signals.kelly_sizing import KellySizer
 from src.signals.portfolio_sizer import PortfolioSizer
+from src.signals.source_allocator import SourceBudgetAllocator
 from src.trading.trade_memory import TradeMemory
 from src.trading.portfolio_rotation import PortfolioRotationManager
 from src.signals.calibration import CalibrationTracker
@@ -36,6 +37,7 @@ class CopyTrader:
                  agent_scorer: Optional[AgentScorer] = None,
                  kelly_sizer: Optional[KellySizer] = None,
                  portfolio_sizer: Optional[PortfolioSizer] = None,
+                 source_allocator: Optional[SourceBudgetAllocator] = None,
                  trade_memory: Optional[TradeMemory] = None,
                  calibration: Optional[CalibrationTracker] = None,
                  regime_forecaster: Optional[object] = None):
@@ -46,6 +48,7 @@ class CopyTrader:
         self.agent_scorer = agent_scorer
         self.kelly_sizer = kelly_sizer
         self.portfolio_sizer = portfolio_sizer
+        self.source_allocator = source_allocator
         self.trade_memory = trade_memory
         self.calibration = calibration
         self.regime_forecaster = regime_forecaster
@@ -299,6 +302,30 @@ class CopyTrader:
             )
             return False
 
+        source_budget_context = None
+        if self.source_allocator:
+            try:
+                source_budget_context = self.source_allocator.apply_to_signal(
+                    trade_signal,
+                    signal=signal,
+                    open_positions=open_positions,
+                    account_balance=account_balance,
+                )
+            except Exception as exc:
+                logger.debug("Copy source budget error for %s: %s", signal.get("coin"), exc)
+
+        if source_budget_context and source_budget_context.blocked:
+            signal["source_budget"] = source_budget_context.to_dict()
+            signal["source_budget_status"] = source_budget_context.status
+            signal["source_budget_reason"] = source_budget_context.block_reason
+            logger.info(
+                "  Source budget blocked copy %s %s: %s",
+                signal.get("side"),
+                signal.get("coin"),
+                source_budget_context.block_reason,
+            )
+            return False
+
         if not self._sync_signal_from_trade_signal(
             trade_signal,
             signal,
@@ -309,6 +336,10 @@ class CopyTrader:
         if sizing_context:
             signal["portfolio_sizing"] = sizing_context.to_dict()
             signal["cluster"] = sizing_context.cluster
+        if source_budget_context:
+            signal["source_budget"] = source_budget_context.to_dict()
+            signal["source_budget_status"] = source_budget_context.status
+            signal["source_budget_reason"] = source_budget_context.block_reason
         return True
 
     def execute_copy_signals(self, signals: List[Dict],
@@ -636,6 +667,7 @@ class CopyTrader:
 
         try:
             execution_role = signal.get("execution_role", config.PAPER_TRADING_DEFAULT_EXECUTION_ROLE)
+            source_key = signal.get("_source_key") or f"copy_trade:{signal.get('source_trader', 'unknown')}"
             trade_id = db.open_paper_trade(
                 strategy_id=None,
                 coin=signal["coin"],
@@ -656,6 +688,7 @@ class CopyTrader:
                     "is_golden": signal.get("is_golden", False),
                     "golden_wallet": signal.get("is_golden", False),
                     "source": "copy_trade",
+                    "source_key": source_key,
                     "execution_role": execution_role,
                     "maker_fee_bps": config.PAPER_TRADING_MAKER_FEE_BPS,
                     "taker_fee_bps": config.PAPER_TRADING_TAKER_FEE_BPS,
@@ -664,6 +697,9 @@ class CopyTrader:
                     "position_pct": position_pct,
                     "time_limit_hours": signal.get("time_limit_hours", 24.0),
                     "portfolio_sizing": signal.get("portfolio_sizing", {}),
+                    "source_budget": signal.get("source_budget", {}),
+                    "source_budget_status": signal.get("source_budget_status", ""),
+                    "source_budget_reason": signal.get("source_budget_reason", ""),
                     "cluster": signal.get("cluster", ""),
                 },
             )
@@ -687,7 +723,9 @@ class CopyTrader:
                 "confidence": signal.get("confidence", 0),
                 "trader_address": signal.get("source_trader", ""),
                 "source": "copy_trade",
+                "source_key": source_key,
                 "opened_at": datetime.utcnow().isoformat(),
+                "source_budget": signal.get("source_budget", {}),
                 "metadata": {
                     "type": signal["type"],
                     "source_trader": signal.get("source_trader", ""),
@@ -699,6 +737,7 @@ class CopyTrader:
                     "is_golden": signal.get("is_golden", False),
                     "golden_wallet": signal.get("is_golden", False),
                     "source": "copy_trade",
+                    "source_key": source_key,
                     "execution_role": execution_role,
                     "maker_fee_bps": config.PAPER_TRADING_MAKER_FEE_BPS,
                     "taker_fee_bps": config.PAPER_TRADING_TAKER_FEE_BPS,
@@ -707,6 +746,9 @@ class CopyTrader:
                     "position_pct": position_pct,
                     "time_limit_hours": signal.get("time_limit_hours", 24.0),
                     "portfolio_sizing": signal.get("portfolio_sizing", {}),
+                    "source_budget": signal.get("source_budget", {}),
+                    "source_budget_status": signal.get("source_budget_status", ""),
+                    "source_budget_reason": signal.get("source_budget_reason", ""),
                     "cluster": signal.get("cluster", ""),
                 },
             }

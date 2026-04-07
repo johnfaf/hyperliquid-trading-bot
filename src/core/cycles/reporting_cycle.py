@@ -228,6 +228,10 @@ def _log_module_stats(container):
         getattr(container, "execution_policy", None) and
         _fmt_execution_policy(container.execution_policy.get_stats())
     ))
+    _safe_stat("SourceAllocator", lambda: (
+        getattr(container, "source_allocator", None) and
+        _fmt_source_allocator(container.source_allocator.get_stats())
+    ))
     _safe_stat("MultiExchange", lambda: (
         container.multi_scanner and
         _fmt_multi(container.multi_scanner.get_stats())
@@ -282,4 +286,17 @@ def _fmt_execution_policy(stats):
         f"recs={stats.get('recommendations', 0)}, "
         f"maker_rate={stats.get('maker_route_rate', 0.0):.0%}, "
         f"market_rate={stats.get('market_route_rate', 0.0):.0%}"
+    )
+
+
+def _fmt_source_allocator(stats):
+    counts = stats.get("status_counts", {})
+    return (
+        f"enabled={stats.get('enabled', False)}, "
+        f"evals={stats.get('evaluations', 0)}, "
+        f"blocked={stats.get('blocked', 0)}, "
+        f"reduced={stats.get('size_reduced', 0)}, "
+        f"active={counts.get('active', 0)}, "
+        f"caution={counts.get('caution', 0)}, "
+        f"blocked_status={counts.get('blocked', 0)}"
     )

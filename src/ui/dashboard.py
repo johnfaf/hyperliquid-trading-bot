@@ -464,6 +464,22 @@ def _build_adaptive_learning_metrics(adaptive_learning=None) -> Dict:
     return metrics
 
 
+def _build_source_allocator_metrics(source_allocator=None) -> Dict:
+    metrics = {
+        "attribution": db.get_source_attribution_summary(limit_cycles=40, lookback_hours=24.0 * 14)[:12],
+        "outcomes": db.get_source_trade_outcome_summary(lookback_hours=24.0 * 30)[:12],
+    }
+    if source_allocator:
+        try:
+            metrics["runtime"] = source_allocator.get_dashboard_payload(limit=12)
+        except Exception as exc:
+            logger.debug("dashboard source allocator error: %s", exc)
+            metrics["runtime"] = {}
+    else:
+        metrics["runtime"] = {}
+    return metrics
+
+
 # Module-level references for V2 + V2.5 + V3 components (set by set_v2_components)
 _firewall = None
 _regime_detector = None
@@ -481,6 +497,7 @@ _multi_scanner = None
 _shadow_tracker = None
 _adaptive_learning = None
 _execution_policy = None
+_source_allocator = None
 
 # Module-level live trader reference for closing positions on exchange
 _live_trader = None
@@ -596,12 +613,12 @@ def set_v2_components(firewall=None, regime_detector=None, arena=None,
                        llm_filter=None, liquidation_strategy=None,
                        signal_processor=None, arena_incubator=None,
                        decision_engine=None, multi_scanner=None, shadow_tracker=None,
-                       adaptive_learning=None, execution_policy=None):
+                       adaptive_learning=None, execution_policy=None, source_allocator=None):
     """Set V2 + V2.5 + V3 + V4 component references for dashboard metrics."""
     global _firewall, _regime_detector, _arena  # noqa: PLW0603
     global _kelly_sizer, _portfolio_sizer, _trade_memory, _calibration, _llm_filter, _liquidation_strategy  # noqa
     global _signal_processor, _arena_incubator, _decision_engine  # noqa
-    global _multi_scanner, _shadow_tracker, _adaptive_learning, _execution_policy  # noqa
+    global _multi_scanner, _shadow_tracker, _adaptive_learning, _execution_policy, _source_allocator  # noqa
     _firewall = firewall
     _regime_detector = regime_detector
     _arena = arena
@@ -618,6 +635,7 @@ def set_v2_components(firewall=None, regime_detector=None, arena=None,
     _shadow_tracker = shadow_tracker
     _adaptive_learning = adaptive_learning
     _execution_policy = execution_policy
+    _source_allocator = source_allocator
 
 
 DASHBOARD_HTML = """<!DOCTYPE html>
@@ -1318,6 +1336,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 try:
                     if _execution_policy:
                         v25["execution_policy"] = _execution_policy.get_stats()
+                except Exception:
+                    pass
+                try:
+                    v25["source_allocator"] = _build_source_allocator_metrics(_source_allocator)
                 except Exception:
                     pass
                 if v25:

@@ -61,6 +61,13 @@ This branch is the staged upgrade path for making the bot more measurable, more 
 - Route low-urgency live entries through bounded ALO maker orders with safe market fallback.
 - Persist execution-policy metadata end to end across paper, mirror, live, reporting, and dashboard telemetry.
 
+## Phase 9: Source Budget Governance
+
+- Status: shipped on `codex/live-ledger-foundation`
+- Scale source-level capital using adaptive-learning health plus recent attribution and trade outcomes.
+- Cap warming and caution sources to smaller portfolio slices before execution, instead of only ranking them lower.
+- Block degraded sources outright and expose source-budget runtime state in reporting and the dashboard.
+
 ## Branch Operating Rule
 
 Each phase should be landed in a reviewable commit with tests before moving to the next phase.

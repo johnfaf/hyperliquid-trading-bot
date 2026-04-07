@@ -36,6 +36,7 @@ from src.signals.decision_engine import DecisionEngine
 from src.signals.decision_firewall import DecisionFirewall
 from src.signals.execution_policy import ExecutionPolicyManager
 from src.signals.portfolio_sizer import PortfolioSizer
+from src.signals.source_allocator import SourceBudgetAllocator
 from src.signals.signal_schema import RiskParams, SignalSide, SignalSource, TradeSignal, signal_from_execution_dict
 from src.trading.live_trader import (
     HyperliquidSigner,
@@ -1828,6 +1829,28 @@ def test_dashboard_adaptive_learning_metrics_include_runtime_and_snapshot(monkey
     assert metrics["recent_arena_reviews"][0]["agent_id"] == "seed_breakout"
 
 
+def test_dashboard_source_allocator_metrics_include_runtime(monkeypatch):
+    monkeypatch.setattr(
+        dashboard_ui.db,
+        "get_source_attribution_summary",
+        lambda **kwargs: [{"source_key": "strategy:mean_reversion:BTC", "selected_count": 3}],
+    )
+    monkeypatch.setattr(
+        dashboard_ui.db,
+        "get_source_trade_outcome_summary",
+        lambda **kwargs: [{"source_key": "strategy:mean_reversion:BTC", "realized_pnl": 42.0}],
+    )
+
+    class FakeAllocator:
+        def get_dashboard_payload(self, limit=12):
+            return {"profiles": [{"source_key": "strategy:mean_reversion:BTC", "status": "active"}]}
+
+    metrics = dashboard_ui._build_source_allocator_metrics(FakeAllocator())
+
+    assert metrics["runtime"]["profiles"][0]["status"] == "active"
+    assert metrics["attribution"][0]["source_key"] == "strategy:mean_reversion:BTC"
+
+
 def test_experiment_benchmark_pack_replays_profiles_and_builds_promotion_gate():
     cycles = []
     for idx in range(6):
@@ -2415,6 +2438,122 @@ def test_portfolio_sizer_blocks_when_same_side_book_is_full():
     assert "headroom" in decision.block_reason
 
 
+def test_source_budget_allocator_blocks_blocked_source(monkeypatch):
+    monkeypatch.setattr(
+        "src.signals.source_allocator.db.get_source_trade_outcome_summary",
+        lambda **kwargs: [
+            {
+                "source_key": "options_flow",
+                "source": "options_flow",
+                "closed_trades": 6,
+                "winning_trades": 1,
+                "realized_pnl": -250.0,
+                "avg_return_pct": -0.03,
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        "src.signals.source_allocator.db.get_source_attribution_summary",
+        lambda **kwargs: [
+            {
+                "source_key": "options_flow",
+                "source": "options_flow",
+                "selected_count": 8,
+                "live_rejection_rate": 0.31,
+                "live_avg_fill_ratio": 0.52,
+            }
+        ],
+    )
+
+    class FakeAdaptive:
+        def get_source_profile(self, source_key="", source=""):
+            return {
+                "source_key": source_key or source,
+                "source": source or "options_flow",
+                "status": "blocked",
+                "health_score": 0.21,
+                "weight_multiplier": 0.25,
+                "confidence_multiplier": 0.4,
+            }
+
+    allocator = SourceBudgetAllocator({"enabled": True}, adaptive_learning=FakeAdaptive())
+    signal = TradeSignal(
+        coin="BTC",
+        side=SignalSide.SHORT,
+        confidence=0.82,
+        source=SignalSource.OPTIONS_FLOW,
+        reason="blocked source budget test",
+        position_pct=0.04,
+        leverage=2.0,
+        risk=RiskParams(),
+    )
+
+    decision = allocator.evaluate(
+        signal,
+        signal={"source": "options_flow", "source_key": "options_flow", "coin": "BTC"},
+        open_positions=[],
+        account_balance=10_000.0,
+    )
+
+    assert decision.blocked is True
+    assert decision.block_reason == "adaptive_learning_blocked"
+    assert decision.status == "blocked"
+
+
+def test_source_budget_allocator_reduces_position_when_headroom_is_limited(monkeypatch):
+    monkeypatch.setattr("src.signals.source_allocator.db.get_source_trade_outcome_summary", lambda **kwargs: [])
+    monkeypatch.setattr("src.signals.source_allocator.db.get_source_attribution_summary", lambda **kwargs: [])
+
+    class FakeAdaptive:
+        def get_source_profile(self, source_key="", source=""):
+            return {
+                "source_key": source_key or source,
+                "source": source or "copy_trade",
+                "status": "caution",
+                "health_score": 0.45,
+                "weight_multiplier": 0.8,
+                "confidence_multiplier": 0.85,
+            }
+
+    allocator = SourceBudgetAllocator(
+        {
+            "enabled": True,
+            "caution_cap_pct": 0.10,
+            "caution_multiplier": 0.5,
+        },
+        adaptive_learning=FakeAdaptive(),
+    )
+    signal = TradeSignal(
+        coin="ETH",
+        side=SignalSide.LONG,
+        confidence=0.73,
+        source=SignalSource.COPY_TRADE,
+        reason="limited source headroom test",
+        position_pct=0.05,
+        leverage=2.0,
+        risk=RiskParams(),
+    )
+
+    decision = allocator.apply_to_signal(
+        signal,
+        signal={"source": "copy_trade", "source_trader": "0xabc123", "coin": "ETH"},
+        open_positions=[
+            {
+                "coin": "BTC",
+                "entry_price": 1000.0,
+                "size": 0.7,
+                "metadata": {"source": "copy_trade", "source_key": "copy_trade:0xabc123", "position_pct": 0.07},
+            }
+        ],
+        account_balance=10_000.0,
+    )
+
+    assert decision.blocked is False
+    assert 0 < decision.position_pct <= 0.03
+    assert signal.position_pct == decision.position_pct
+    assert "source_budget_scaled" in decision.reasons
+
+
 def test_paper_trader_syncs_adjusted_trade_signal_into_execution_payload():
     fake_features = types.ModuleType("src.analysis.features")
     fake_features.FeatureEngine = object
@@ -2459,6 +2598,73 @@ def test_paper_trader_syncs_adjusted_trade_signal_into_execution_payload():
     assert abs(signal["stop_loss"] - 99.0) < 1e-9
     assert abs(signal["take_profit"] - 103.0) < 1e-9
     assert signal["time_limit_hours"] == 18.0
+
+
+def test_paper_trader_applies_source_budget_metadata():
+    fake_features = types.ModuleType("src.analysis.features")
+    fake_features.FeatureEngine = object
+    sys.modules["src.analysis.features"] = fake_features
+    fake_kelly = types.ModuleType("src.signals.kelly_sizing")
+    fake_kelly.KellySizer = object
+    sys.modules["src.signals.kelly_sizing"] = fake_kelly
+    fake_trade_memory = types.ModuleType("src.trading.trade_memory")
+    fake_trade_memory.TradeMemory = object
+    sys.modules["src.trading.trade_memory"] = fake_trade_memory
+    import importlib
+
+    sys.modules.pop("src.trading.paper_trader", None)
+    PaperTrader = importlib.import_module("src.trading.paper_trader").PaperTrader
+
+    class FakeSourceAllocator:
+        def apply_to_signal(self, trade_signal, **kwargs):
+            trade_signal.position_pct = 0.012
+
+            class Decision:
+                blocked = False
+                status = "caution"
+                block_reason = ""
+
+                @staticmethod
+                def to_dict():
+                    return {
+                        "status": "caution",
+                        "position_pct": 0.012,
+                        "allocation_multiplier": 0.6,
+                    }
+
+            return Decision()
+
+    trader = PaperTrader(source_allocator=FakeSourceAllocator())
+    trade_signal = TradeSignal(
+        coin="BTC",
+        side=SignalSide.LONG,
+        confidence=0.8,
+        source=SignalSource.STRATEGY,
+        reason="source budget sync",
+        position_pct=0.02,
+        leverage=2.0,
+        risk=RiskParams(stop_loss_pct=0.01, take_profit_pct=0.03, time_limit_hours=18.0),
+    )
+    signal = {
+        "coin": "BTC",
+        "side": "long",
+        "price": 100.0,
+        "size": 8.0,
+        "leverage": 2.0,
+        "source": "strategy",
+        "source_key": "strategy:momentum:BTC",
+    }
+
+    assert trader._apply_portfolio_sizing(
+        trade_signal,
+        signal,
+        open_positions=[],
+        account_balance=10_000.0,
+        regime_data={"overall_regime": "trending_up"},
+    )
+    assert abs(signal["size"] - 1.2) < 1e-9
+    assert signal["source_budget"]["status"] == "caution"
+    assert signal["source_budget_status"] == "caution"
 
 
 def test_check_open_positions_uses_trade_specific_time_limit(monkeypatch):

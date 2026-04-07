@@ -41,6 +41,7 @@ FULL_PROFILE = FUNDABLE_CORE | {
     "liquidation_strategy", "kelly_sizer", "portfolio_sizer", "trade_memory", "calibration",
     "llm_filter", "signal_processor", "arena_incubator", "decision_engine",
     "alpha_arena", "adaptive_learning", "execution_policy", "position_monitor", "dashboard", "telegram",
+    "source_allocator",
     "cross_venue_hedger", "shadow_tracker", "adaptive_bot_detector",
     "regime_strategy_filter", "exchange_aggregator",
 }
@@ -82,6 +83,7 @@ class SubsystemContainer:
     calibration: Any = None
     adaptive_learning: Any = None
     execution_policy: Any = None
+    source_allocator: Any = None
     llm_filter: Any = None
     signal_processor: Any = None
     arena_incubator: Any = None
@@ -326,6 +328,40 @@ def build_subsystems(
             affects_trading=False,
         )
 
+    if "source_allocator" in profile:
+        from src.signals.source_allocator import SourceBudgetAllocator
+
+        c.source_allocator = _safe_init(
+            "source_allocator",
+            lambda: SourceBudgetAllocator(
+                {
+                    "enabled": config.SOURCE_BUDGET_ALLOCATOR_ENABLED,
+                    "lookback_hours": config.SOURCE_BUDGET_LOOKBACK_HOURS,
+                    "refresh_interval_seconds": config.SOURCE_BUDGET_REFRESH_INTERVAL_SECONDS,
+                    "min_position_pct": config.SOURCE_BUDGET_MIN_POSITION_PCT,
+                    "min_multiplier": config.SOURCE_BUDGET_MIN_MULTIPLIER,
+                    "max_multiplier": config.SOURCE_BUDGET_MAX_MULTIPLIER,
+                    "active_multiplier": config.SOURCE_BUDGET_ACTIVE_MULTIPLIER,
+                    "warming_multiplier": config.SOURCE_BUDGET_WARMING_MULTIPLIER,
+                    "caution_multiplier": config.SOURCE_BUDGET_CAUTION_MULTIPLIER,
+                    "blocked_multiplier": config.SOURCE_BUDGET_BLOCKED_MULTIPLIER,
+                    "active_cap_pct": config.SOURCE_BUDGET_ACTIVE_CAP_PCT,
+                    "warming_cap_pct": config.SOURCE_BUDGET_WARMING_CAP_PCT,
+                    "caution_cap_pct": config.SOURCE_BUDGET_CAUTION_CAP_PCT,
+                    "blocked_cap_pct": config.SOURCE_BUDGET_BLOCKED_CAP_PCT,
+                    "min_health_score": config.SOURCE_BUDGET_MIN_HEALTH_SCORE,
+                    "min_closed_trades": config.SOURCE_BUDGET_MIN_CLOSED_TRADES,
+                    "return_scale": config.SOURCE_BUDGET_RETURN_SCALE,
+                    "live_rejection_ceiling": config.SOURCE_BUDGET_LIVE_REJECTION_CEILING,
+                    "live_fill_floor": config.SOURCE_BUDGET_LIVE_FILL_FLOOR,
+                    "block_on_status": config.SOURCE_BUDGET_BLOCK_ON_STATUS,
+                },
+                adaptive_learning=c.adaptive_learning,
+            ),
+            health,
+            affects_trading=False,
+        )
+
     if "llm_filter" in profile:
         from src.signals.llm_filter import LLMFilter
         c.llm_filter = _safe_init("llm_filter", LLMFilter, health)
@@ -418,6 +454,7 @@ def build_subsystems(
                 agent_scorer=c.agent_scorer,
                 kelly_sizer=c.kelly_sizer,
                 portfolio_sizer=c.portfolio_sizer,
+                source_allocator=c.source_allocator,
                 trade_memory=c.trade_memory,
                 calibration=c.calibration,
                 regime_forecaster=c.predictive_forecaster,
@@ -435,6 +472,7 @@ def build_subsystems(
             feature_engine=c.feature_engine,
             kelly_sizer=c.kelly_sizer,
             portfolio_sizer=c.portfolio_sizer,
+            source_allocator=c.source_allocator,
             trade_memory=c.trade_memory,
             calibration=c.calibration,
             llm_filter=c.llm_filter,
@@ -545,6 +583,7 @@ def build_subsystems(
                 multi_scanner=c.multi_scanner,
                 shadow_tracker=c.shadow_tracker,
                 execution_policy=c.execution_policy,
+                source_allocator=c.source_allocator,
             )
             if c.live_trader:
                 set_live_trader(c.live_trader)
