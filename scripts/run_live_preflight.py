@@ -89,6 +89,7 @@ def main() -> None:
     print(f"Readiness: {readiness.get('status', 'unknown')} ({readiness.get('status_reason', 'unknown')})")
     print(f"Blocking checks: {', '.join(readiness.get('blocking_checks', [])) or 'none'}")
     print(f"Preflight warnings: {', '.join(preflight.get('warning_checks', [])) or 'none'}")
+    print(f"Activation warnings: {', '.join(activation.get('warning_checks', [])) or 'none'}")
     if args.output:
         print(f"Output: {os.path.abspath(args.output)}")
 

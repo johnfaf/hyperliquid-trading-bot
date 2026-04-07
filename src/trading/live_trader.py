@@ -503,6 +503,9 @@ class LiveTrader:
         self.activation_max_age_hours = float(
             getattr(config, "LIVE_ACTIVATION_MAX_AGE_HOURS", 24.0)
         )
+        self.activation_expiry_warning_hours = float(
+            getattr(config, "LIVE_ACTIVATION_EXPIRY_WARNING_HOURS", 4.0)
+        )
         self._activation_report: Dict[str, Any] = {
             "status": "not_run",
             "deployable": False,
@@ -512,6 +515,7 @@ class LiveTrader:
             "approved_by": self.activation_approved_by or None,
             "expires_at": None,
             "age_hours": None,
+            "hours_remaining": None,
             "blocking_checks": [],
             "warning_checks": [],
             "checks": [],
@@ -945,6 +949,7 @@ class LiveTrader:
             "approved_by": self.activation_approved_by or None,
             "expires_at": None,
             "age_hours": None,
+            "hours_remaining": None,
             "blocking_checks": [],
             "warning_checks": [],
             "checks": [],
@@ -1037,8 +1042,10 @@ class LiveTrader:
         if approved_at_dt is not None:
             age_hours = (now_utc - approved_at_dt).total_seconds() / 3600.0
             expires_at = approved_at_dt + timedelta(hours=max(self.activation_max_age_hours, 0.0))
+            hours_remaining = (expires_at - now_utc).total_seconds() / 3600.0
             report["age_hours"] = round(age_hours, 4)
             report["expires_at"] = expires_at.isoformat()
+            report["hours_remaining"] = round(hours_remaining, 4)
             _record(
                 "approval_not_future_dated",
                 age_hours >= -0.0834,
@@ -1056,6 +1063,22 @@ class LiveTrader:
                 ),
                 value={"age_hours": round(age_hours, 4)},
             )
+            warning_window_hours = max(
+                0.0,
+                min(self.activation_expiry_warning_hours, max(self.activation_max_age_hours, 0.0)),
+            )
+            if warning_window_hours > 0 and now_utc <= expires_at:
+                _record(
+                    "approval_expiring_soon",
+                    hours_remaining > warning_window_hours,
+                    (
+                        f"approval has {hours_remaining:.2f}h remaining"
+                        if hours_remaining > warning_window_hours
+                        else f"approval expires in {hours_remaining:.2f}h"
+                    ),
+                    severity="warning",
+                    value={"hours_remaining": round(hours_remaining, 4)},
+                )
 
         report["deployable"] = self._basic_deployable() and not blocking_checks
         report["status"] = "ready" if report["deployable"] else "blocked"

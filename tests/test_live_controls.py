@@ -538,6 +538,41 @@ def test_live_trader_accepts_fresh_activation_approval(monkeypatch):
     assert trader.is_deployable() is True
 
 
+def test_live_trader_warns_when_activation_is_near_expiry(monkeypatch):
+    class FakeManager:
+        def post(self, payload, **kwargs):
+            if payload.get("type") == "meta":
+                return {"universe": [{"name": "BTC", "szDecimals": 5}]}
+            if payload.get("type") == "clearinghouseState":
+                return {"marginSummary": {"accountValue": "250.0"}, "assetPositions": []}
+            if payload.get("type") == "spotClearinghouseState":
+                return {"balances": [{"coin": "USDC", "total": "50"}]}
+            return {}
+
+    class FakeFirewall:
+        def validate(self, signal, **kwargs):
+            return True, "ok"
+
+    approved_at = (datetime.now(timezone.utc) - timedelta(hours=21.5)).isoformat()
+    monkeypatch.setattr(config, "LIVE_TRADING_ENABLED", True)
+    monkeypatch.setattr(config, "LIVE_ACTIVATION_GUARD_ENABLED", True)
+    monkeypatch.setattr(config, "LIVE_ACTIVATION_APPROVED_AT", approved_at)
+    monkeypatch.setattr(config, "LIVE_ACTIVATION_APPROVED_BY", "operator-b")
+    monkeypatch.setattr(config, "LIVE_ACTIVATION_MAX_AGE_HOURS", 24.0)
+    monkeypatch.setattr(config, "LIVE_ACTIVATION_EXPIRY_WARNING_HOURS", 4.0)
+    monkeypatch.setattr("src.trading.live_trader.get_manager", lambda: FakeManager())
+    monkeypatch.setattr(LiveTrader, "_load_credentials", _fake_live_credentials)
+
+    trader = LiveTrader(firewall=FakeFirewall(), dry_run=False)
+    readiness = trader.get_live_readiness(force_preflight=True)
+    activation = readiness["activation_guard"]
+
+    assert readiness["deployable"] is True
+    assert activation["deployable"] is True
+    assert "approval_expiring_soon" in activation["warning_checks"]
+    assert activation["hours_remaining"] < 4.0
+
+
 def test_execute_signal_blocks_when_activation_guard_is_not_ready(monkeypatch):
     class FakeManager:
         def post(self, payload, **kwargs):
@@ -1116,6 +1151,8 @@ def test_dashboard_live_account_summary_stays_separate_from_paper_metrics():
                     "approved_by": "operator-a",
                     "expires_at": "2026-04-06T11:55:00+00:00",
                     "blocking_checks": [],
+                    "warning_checks": ["approval_expiring_soon"],
+                    "hours_remaining": 3.5,
                 },
                 "daily_pnl": 42.25,
                 "daily_pnl_limit": 150.0,
@@ -1159,6 +1196,8 @@ def test_dashboard_live_account_summary_stays_separate_from_paper_metrics():
     assert summary["activation_ready"] is True
     assert summary["activation_status"] == "ready"
     assert summary["activation_approved_by"] == "operator-a"
+    assert summary["activation_warning_checks"] == ["approval_expiring_soon"]
+    assert summary["activation_hours_remaining"] == 3.5
     assert summary["realized_pnl_today"] == 42.25
     assert summary["open_unrealized_pnl"] == 11.5
     assert summary["open_positions"] == 2
@@ -6162,7 +6201,14 @@ def test_dashboard_capital_governor_metrics_include_runtime(monkeypatch):
     class FakeGovernor:
         def get_dashboard_payload(self):
             return {
-                "runtime": {"status": "caution", "reasons": ["paper_drawdown_caution"]},
+                "runtime": {
+                    "status": "caution",
+                    "reasons": ["paper_drawdown_caution"],
+                    "operator_risk_off_enabled": True,
+                    "operator_risk_off_reason": "manual review",
+                    "operator_risk_off_set_by": "ops",
+                    "operator_risk_off_set_at": "2026-04-07T12:00:00+00:00",
+                },
                 "summary": {"paper_current_drawdown_pct": 0.06},
             }
 
@@ -6170,6 +6216,8 @@ def test_dashboard_capital_governor_metrics_include_runtime(monkeypatch):
 
     assert metrics["summary"]["paper_current_drawdown_pct"] == 0.06
     assert metrics["runtime"]["runtime"]["status"] == "caution"
+    assert metrics["operator_override"]["enabled"] is True
+    assert metrics["operator_override"]["reason"] == "manual review"
 
 
 def test_capital_governor_enters_risk_off_on_live_drawdown(monkeypatch):
@@ -6210,6 +6258,46 @@ def test_capital_governor_enters_risk_off_on_live_drawdown(monkeypatch):
     assert assessment["blocked"] is False
     assert assessment["multiplier"] == 0.4
     assert "live_drawdown_risk_off" in assessment["reasons"]
+
+
+def test_capital_governor_blocks_when_operator_risk_off_enabled(monkeypatch):
+    monkeypatch.setenv("OPERATOR_RISK_OFF_ENABLED", "true")
+    monkeypatch.setenv("OPERATOR_RISK_OFF_REASON", "manual review")
+    monkeypatch.setenv("OPERATOR_RISK_OFF_SET_BY", "ops")
+    monkeypatch.setenv("OPERATOR_RISK_OFF_SET_AT", "2026-04-07T12:00:00+00:00")
+    monkeypatch.setattr(
+        "src.signals.capital_governor.db.get_capital_governor_summary",
+        lambda lookback_hours=24.0 * 14: {
+            "paper_closed_trades": 10,
+            "paper_current_drawdown_pct": 0.01,
+            "paper_sharpe": 0.55,
+            "live_snapshot_count": 20,
+            "live_current_drawdown_pct": 0.01,
+            "live_sharpe": 0.40,
+            "source_profile_count": 5,
+            "degraded_source_ratio": 0.05,
+            "blocked_source_ratio": 0.0,
+        },
+    )
+
+    governor = CapitalGovernor(
+        {
+            "enabled": True,
+            "refresh_interval_seconds": 0.0,
+            "min_paper_trades": 3,
+            "min_live_snapshots": 3,
+            "min_source_profiles": 1,
+            "operator_risk_off_blocks": True,
+        }
+    )
+
+    assessment = governor.evaluate()
+
+    assert assessment["status"] == "blocked"
+    assert assessment["blocked"] is True
+    assert "operator_risk_off" in assessment["reasons"]
+    assert assessment["operator_risk_off_enabled"] is True
+    assert assessment["operator_risk_off_reason"] == "manual review"
 
 
 def test_decision_engine_blocks_candidate_when_capital_governor_blocked():
@@ -6274,6 +6362,71 @@ def test_decision_engine_blocks_candidate_when_capital_governor_blocked():
     assert candidate["_capital_governor"]["status"] == "blocked"
     assert "capital_governor_guard" in engine._decision_blockers(candidate)
     assert engine.get_stats()["total_capital_blocks"] >= 1
+
+
+def test_decision_engine_blocks_candidate_when_operator_risk_off_is_active():
+    class FakeGovernor:
+        def evaluate(self, regime_data=None):
+            return {
+                "status": "blocked",
+                "blocked": True,
+                "multiplier": 0.0,
+                "capital_score": 0.0,
+                "reasons": ["operator_risk_off"],
+                "metrics": {},
+                "divergence_status": "healthy",
+                "operator_risk_off_enabled": True,
+                "operator_risk_off_reason": "manual review",
+            }
+
+        def get_stats(self):
+            return {"global_status": "blocked"}
+
+    engine = DecisionEngine(
+        {
+            "w_capital_governor": 0.60,
+            "min_decision_score": 0.0,
+            "min_signal_confidence": 0.4,
+            "min_source_weight": 0.2,
+            "min_expected_value_pct": -1.0,
+            "execution_quality_enabled": False,
+            "adaptive_learning_enabled": False,
+            "context_performance_enabled": False,
+            "confluence_enabled": False,
+            "calibration_enabled": False,
+            "memory_enabled": False,
+            "divergence_enabled": False,
+            "capital_governor": FakeGovernor(),
+            "capital_governor_enabled": True,
+            "capital_governor_block_on_status": True,
+        }
+    )
+
+    candidate = {
+        "name": "operator_blocked",
+        "source": "strategy",
+        "source_key": "strategy:trend_following:BTC",
+        "strategy_type": "trend_following",
+        "current_score": 0.84,
+        "confidence": 0.8,
+        "source_accuracy": 0.74,
+        "entry_price": 100.0,
+        "stop_loss": 97.0,
+        "take_profit": 108.0,
+        "parameters": {"coins": ["BTC"], "direction": "long"},
+        "metadata": {"source": "strategy", "source_key": "strategy:trend_following:BTC"},
+    }
+
+    selected = engine.decide(
+        [candidate],
+        regime_data={"overall_regime": "trending_up", "overall_confidence": 0.8},
+        open_positions=[],
+        kelly_stats={},
+    )
+
+    assert selected == []
+    assert "operator_risk_off" in engine._decision_blockers(candidate)
+    assert engine.get_stats()["total_operator_blocks"] >= 1
 
 
 def test_source_budget_allocator_scales_position_when_capital_governor_is_risk_off(monkeypatch):

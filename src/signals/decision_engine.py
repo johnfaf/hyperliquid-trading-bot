@@ -171,6 +171,7 @@ class DecisionEngine:
             "total_memory_blocks": 0,
             "total_divergence_blocks": 0,
             "total_capital_blocks": 0,
+            "total_operator_blocks": 0,
         }
 
     def decide(self, strategies: List[Dict],
@@ -321,6 +322,9 @@ class DecisionEngine:
         )
         self.stats["total_capital_blocks"] += sum(
             1 for item in disqualified if "capital_governor_guard" in item.get("_decision_blockers", [])
+        )
+        self.stats["total_operator_blocks"] += sum(
+            1 for item in disqualified if "operator_risk_off" in item.get("_decision_blockers", [])
         )
         if executions:
             self.stats["total_executions"] += len(executions)
@@ -1009,7 +1013,10 @@ class DecisionEngine:
             blockers.append("divergence_guard")
 
         capital_profile = strategy.get("_capital_governor", {}) or {}
-        if self.capital_governor_enabled and bool(capital_profile.get("blocked", False)):
+        capital_reasons = list(capital_profile.get("reasons", []) or [])
+        if self.capital_governor_enabled and "operator_risk_off" in capital_reasons:
+            blockers.append("operator_risk_off")
+        elif self.capital_governor_enabled and bool(capital_profile.get("blocked", False)):
             blockers.append("capital_governor_guard")
 
         confluence = strategy.get("_source_confluence", {}) or {}

@@ -11,12 +11,15 @@ from __future__ import annotations
 
 from datetime import datetime
 import logging
+import os
 from typing import Dict, Optional
 
+import config
 from src.data import database as db
 from src.core.time_utils import utc_now
 
 logger = logging.getLogger(__name__)
+_TRUE_VALUES = {"true", "1", "yes"}
 
 
 class CapitalGovernor:
@@ -48,6 +51,7 @@ class CapitalGovernor:
         self.risk_off_blocked_source_ratio = float(cfg.get("risk_off_blocked_source_ratio", 0.30))
         self.low_regime_confidence = float(cfg.get("low_regime_confidence", 0.45))
         self.divergence_blocks = bool(cfg.get("divergence_blocks", True))
+        self.operator_risk_off_blocks = bool(cfg.get("operator_risk_off_blocks", True))
         self.divergence_controller = divergence_controller
 
         self._last_refresh_at: Optional[datetime] = None
@@ -73,6 +77,40 @@ class CapitalGovernor:
             return float(value)
         except (TypeError, ValueError):
             return default
+
+    @staticmethod
+    def _runtime_bool(name: str, default: bool = False) -> bool:
+        value = os.environ.get(name)
+        if value is None:
+            return bool(default)
+        return str(value).strip().lower() in _TRUE_VALUES
+
+    @staticmethod
+    def _runtime_text(name: str, default: str = "") -> str:
+        value = os.environ.get(name)
+        if value is None:
+            return str(default or "").strip()
+        return str(value).strip()
+
+    def _get_operator_override(self) -> Dict:
+        return {
+            "enabled": self._runtime_bool(
+                "OPERATOR_RISK_OFF_ENABLED",
+                getattr(config, "OPERATOR_RISK_OFF_ENABLED", False),
+            ),
+            "reason": self._runtime_text(
+                "OPERATOR_RISK_OFF_REASON",
+                getattr(config, "OPERATOR_RISK_OFF_REASON", ""),
+            ),
+            "set_by": self._runtime_text(
+                "OPERATOR_RISK_OFF_SET_BY",
+                getattr(config, "OPERATOR_RISK_OFF_SET_BY", ""),
+            ),
+            "set_at": self._runtime_text(
+                "OPERATOR_RISK_OFF_SET_AT",
+                getattr(config, "OPERATOR_RISK_OFF_SET_AT", ""),
+            ),
+        }
 
     @staticmethod
     def _severity_for_high(value: float, caution_threshold: float, risk_off_threshold: float, block_threshold: float) -> int:
@@ -262,6 +300,11 @@ class CapitalGovernor:
             severity = max(severity, 1)
             reasons.append("divergence_runtime_caution")
 
+        operator_override = self._get_operator_override()
+        if self.operator_risk_off_blocks and operator_override.get("enabled", False):
+            severity = max(severity, 3)
+            reasons.append("operator_risk_off")
+
         regime_name = ""
         regime_confidence = 0.0
         if isinstance(regime_data, dict):
@@ -279,6 +322,10 @@ class CapitalGovernor:
             regime_confidence=regime_confidence,
             divergence_status=divergence_status,
         )
+        result["operator_risk_off_enabled"] = bool(operator_override.get("enabled", False))
+        result["operator_risk_off_reason"] = str(operator_override.get("reason", "") or "")
+        result["operator_risk_off_set_by"] = str(operator_override.get("set_by", "") or "")
+        result["operator_risk_off_set_at"] = str(operator_override.get("set_at", "") or "")
 
         self.stats["evaluations"] += 1
         if result["status"] == "caution":
@@ -292,7 +339,10 @@ class CapitalGovernor:
         return result
 
     def get_stats(self) -> Dict:
-        self._refresh()
+        if not self._last_evaluation:
+            self.evaluate()
+        else:
+            self._refresh()
         return {
             **dict(self.stats),
             "global_status": self._last_evaluation.get("status", "warming_up"),
@@ -301,7 +351,10 @@ class CapitalGovernor:
         }
 
     def get_dashboard_payload(self) -> Dict:
-        self._refresh()
+        if not self._last_evaluation:
+            self.evaluate()
+        else:
+            self._refresh()
         return {
             **self.get_stats(),
             "runtime": dict(self._last_evaluation or {}),

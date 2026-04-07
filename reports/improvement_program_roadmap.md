@@ -145,6 +145,13 @@ This branch is the staged upgrade path for making the bot more measurable, more 
 - Add explicit `paper`, `shadow`, and `live` runtime profile controls that can be selected before config import in the main entrypoints and operator scripts.
 - Fail fast on live-profile boot when the required live-control env vars are missing, and force live preflight on any live-requested session so deployability cannot drift from safety defaults.
 
+## Phase 21: Operator Risk Controls
+
+- Status: shipped on `codex/live-ledger-foundation`
+- Add a manual global operator risk-off override that blocks new entries through the capital-governor and decision-engine path without interfering with protective exits.
+- Surface operator risk-off state clearly in capital-governor runtime payloads, startup health, reporting, and dashboard summaries instead of burying it in generic blocked-state reasons.
+- Add pre-expiry warnings for live activation approval so operators see approval staleness before live readiness hard-blocks on expiration.
+
 ## Branch Operating Rule
 
 Each phase should be landed in a reviewable commit with tests before moving to the next phase.

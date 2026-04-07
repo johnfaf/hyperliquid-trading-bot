@@ -108,7 +108,9 @@ def _build_live_account_summary(trader) -> Dict:
         "activation_approved_at": None,
         "activation_approved_by": None,
         "activation_expires_at": None,
+        "activation_hours_remaining": None,
         "activation_blocking_checks": [],
+        "activation_warning_checks": [],
         "ledger_ready": False,
         "wallet_total": None,
         "perps_margin": None,
@@ -249,7 +251,9 @@ def _build_live_account_summary(trader) -> Dict:
             "activation_approved_at": activation.get("approved_at"),
             "activation_approved_by": activation.get("approved_by"),
             "activation_expires_at": activation.get("expires_at"),
+            "activation_hours_remaining": activation.get("hours_remaining"),
             "activation_blocking_checks": list(activation.get("blocking_checks", []) or []),
+            "activation_warning_checks": list(activation.get("warning_checks", []) or []),
             "wallet_total": wallet.get("total"),
             "perps_margin": wallet.get("perps_margin"),
             "spot_usdc": wallet.get("spot_usdc"),
@@ -539,6 +543,13 @@ def _build_capital_governor_metrics(capital_governor=None) -> Dict:
             metrics["runtime"] = {}
     else:
         metrics["runtime"] = {}
+    runtime = ((metrics.get("runtime", {}) or {}).get("runtime", {}) or {})
+    metrics["operator_override"] = {
+        "enabled": bool(runtime.get("operator_risk_off_enabled", False)),
+        "reason": str(runtime.get("operator_risk_off_reason", "") or ""),
+        "set_by": str(runtime.get("operator_risk_off_set_by", "") or ""),
+        "set_at": str(runtime.get("operator_risk_off_set_at", "") or ""),
+    }
     return metrics
 
 

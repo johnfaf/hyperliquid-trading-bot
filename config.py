@@ -201,6 +201,16 @@ LIVE_ACTIVATION_APPROVED_BY = os.environ.get("LIVE_ACTIVATION_APPROVED_BY", "").
 LIVE_ACTIVATION_MAX_AGE_HOURS = float(
     os.environ.get("LIVE_ACTIVATION_MAX_AGE_HOURS", 24.0)
 )
+LIVE_ACTIVATION_EXPIRY_WARNING_HOURS = float(
+    os.environ.get("LIVE_ACTIVATION_EXPIRY_WARNING_HOURS", 4.0)
+)
+OPERATOR_RISK_OFF_ENABLED = os.environ.get(
+    "OPERATOR_RISK_OFF_ENABLED",
+    "false",
+).lower() in ("true", "1", "yes")
+OPERATOR_RISK_OFF_REASON = os.environ.get("OPERATOR_RISK_OFF_REASON", "").strip()
+OPERATOR_RISK_OFF_SET_BY = os.environ.get("OPERATOR_RISK_OFF_SET_BY", "").strip()
+OPERATOR_RISK_OFF_SET_AT = os.environ.get("OPERATOR_RISK_OFF_SET_AT", "").strip()
 HL_WALLET_MODE = os.environ.get("HL_WALLET_MODE", "agent_only").strip().lower()
 SECRET_MANAGER_PROVIDER = os.environ.get(
     "SECRET_MANAGER_PROVIDER", "none"
@@ -652,6 +662,10 @@ CAPITAL_GOVERNOR_LOW_REGIME_CONFIDENCE = float(
 )
 CAPITAL_GOVERNOR_DIVERGENCE_BLOCKS = os.environ.get(
     "CAPITAL_GOVERNOR_DIVERGENCE_BLOCKS",
+    "true",
+).lower() in ("true", "1", "yes")
+CAPITAL_GOVERNOR_OPERATOR_RISK_OFF_BLOCKS = os.environ.get(
+    "CAPITAL_GOVERNOR_OPERATOR_RISK_OFF_BLOCKS",
     "true",
 ).lower() in ("true", "1", "yes")
 DECISION_CAPITAL_GOVERNOR_ENABLED = os.environ.get(

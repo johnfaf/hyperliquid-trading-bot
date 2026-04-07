@@ -114,6 +114,13 @@ def run_reporting(container, cycle_count: int, health_registry=None) -> None:
                 float((runtime.get("metrics", {}) or {}).get("live_current_drawdown_pct", 0.0) or 0.0) * 100.0,
                 ", ".join(runtime.get("reasons", [])[:3]) or "none",
             )
+            if runtime.get("operator_risk_off_enabled", False):
+                logger.warning(
+                    "  OperatorRiskOff: active (%s by %s at %s)",
+                    runtime.get("operator_risk_off_reason") or "manual override",
+                    runtime.get("operator_risk_off_set_by") or "unknown",
+                    runtime.get("operator_risk_off_set_at") or "unset",
+                )
     except Exception as exc:
         logger.debug("  Capital governor error: %s", exc)
     try:
@@ -132,11 +139,12 @@ def run_reporting(container, cycle_count: int, health_registry=None) -> None:
                 )
             if activation:
                 logger.info(
-                    "  LiveActivation: %s (deployable=%s, approved_by=%s, blocking=%s)",
+                    "  LiveActivation: %s (deployable=%s, approved_by=%s, blocking=%s, warnings=%s)",
                     activation.get("status", "not_run"),
                     activation.get("deployable", False),
                     activation.get("approved_by") or "unset",
                     ", ".join(activation.get("blocking_checks", [])[:3]) or "none",
+                    ", ".join(activation.get("warning_checks", [])[:3]) or "none",
                 )
             if readiness:
                 logger.info(

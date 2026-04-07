@@ -396,12 +396,26 @@ def build_subsystems(
                     "risk_off_blocked_source_ratio": config.CAPITAL_GOVERNOR_RISK_OFF_BLOCKED_SOURCE_RATIO,
                     "low_regime_confidence": config.CAPITAL_GOVERNOR_LOW_REGIME_CONFIDENCE,
                     "divergence_blocks": config.CAPITAL_GOVERNOR_DIVERGENCE_BLOCKS,
+                    "operator_risk_off_blocks": config.CAPITAL_GOVERNOR_OPERATOR_RISK_OFF_BLOCKS,
                 },
                 divergence_controller=c.divergence_controller,
             ),
             health,
             affects_trading=False,
         )
+        if c.capital_governor:
+            try:
+                runtime = c.capital_governor.evaluate()
+                if runtime.get("operator_risk_off_enabled", False):
+                    health.set_status(
+                        "capital_governor",
+                        SubsystemState.DEGRADED,
+                        reason=runtime.get("operator_risk_off_reason") or "operator_risk_off_active",
+                        dependency_ready=True,
+                        startup_status="OPERATOR_RISK_OFF",
+                    )
+            except Exception as exc:
+                logger.debug("capital governor startup evaluation error: %s", exc)
 
     if "source_allocator" in profile:
         from src.signals.source_allocator import SourceBudgetAllocator
@@ -653,6 +667,18 @@ def build_subsystems(
                         dependency_ready=False,
                         startup_status="WAITING_FOR_DEPENDENCIES",
                     )
+                else:
+                    activation_warnings = list(
+                        ((readiness.get("activation_guard", {}) or {}).get("warning_checks", []) or [])
+                    )
+                    if activation_warnings:
+                        health.set_status(
+                            "live_trader",
+                            SubsystemState.DEGRADED,
+                            reason=f"activation_warning:{activation_warnings[0]}",
+                            dependency_ready=True,
+                            startup_status="READY_WITH_WARNINGS",
+                        )
 
     # ─── Cross-venue hedger ───────────────────────────────────
     if "cross_venue_hedger" in profile:
