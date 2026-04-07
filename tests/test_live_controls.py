@@ -323,6 +323,66 @@ def test_live_trader_routes_info_calls_through_api_manager(monkeypatch):
     assert manager.calls[1][1]["priority"] == Priority.HIGH
 
 
+def test_live_trader_preflight_reports_ready_when_account_is_funded(monkeypatch):
+    class FakeManager:
+        def __init__(self):
+            self.calls = []
+
+        def post(self, payload, **kwargs):
+            self.calls.append(payload.get("type"))
+            if payload.get("type") == "meta":
+                return {"universe": [{"name": "BTC", "szDecimals": 5}]}
+            if payload.get("type") == "clearinghouseState":
+                return {"marginSummary": {"accountValue": "125.0"}, "assetPositions": []}
+            if payload.get("type") == "spotClearinghouseState":
+                return {"balances": [{"coin": "USDC", "total": "0"}]}
+            raise AssertionError(f"unexpected payload: {payload}")
+
+    class FakeFirewall:
+        def validate(self, signal, **kwargs):
+            return True, "ok"
+
+    manager = FakeManager()
+    monkeypatch.setattr("src.trading.live_trader.get_manager", lambda: manager)
+    monkeypatch.setattr(LiveTrader, "_load_credentials", _fake_live_credentials)
+
+    trader = LiveTrader(firewall=FakeFirewall(), dry_run=False)
+    report = trader.run_preflight(force=True)
+
+    assert report["deployable"] is True
+    assert report["status"] == "ready"
+    assert report["blocking_checks"] == []
+    assert trader.is_deployable() is True
+    assert trader.get_stats()["preflight"]["deployable"] is True
+
+
+def test_live_trader_preflight_blocks_unfunded_account(monkeypatch):
+    class FakeManager:
+        def post(self, payload, **kwargs):
+            if payload.get("type") == "meta":
+                return {"universe": [{"name": "BTC", "szDecimals": 5}]}
+            if payload.get("type") == "clearinghouseState":
+                return {"marginSummary": {"accountValue": "0"}, "assetPositions": []}
+            if payload.get("type") == "spotClearinghouseState":
+                return {"balances": [{"coin": "USDC", "total": "0"}]}
+            raise AssertionError(f"unexpected payload: {payload}")
+
+    class FakeFirewall:
+        def validate(self, signal, **kwargs):
+            return True, "ok"
+
+    monkeypatch.setattr("src.trading.live_trader.get_manager", lambda: FakeManager())
+    monkeypatch.setattr(LiveTrader, "_load_credentials", _fake_live_credentials)
+
+    trader = LiveTrader(firewall=FakeFirewall(), dry_run=False)
+    report = trader.run_preflight(force=True)
+
+    assert report["deployable"] is False
+    assert "perps_buying_power" in report["blocking_checks"]
+    assert trader.is_deployable() is False
+    assert trader.get_stats()["status_reason"].startswith("preflight_failed:")
+
+
 def test_post_order_routes_exchange_requests_through_api_manager(monkeypatch):
     class FakeManager:
         def __init__(self):
@@ -842,6 +902,13 @@ def test_dashboard_live_account_summary_stays_separate_from_paper_metrics():
                 "deployable": True,
                 "dry_run": False,
                 "status_reason": "ready",
+                "preflight": {
+                    "deployable": True,
+                    "status": "ready",
+                    "checked_at": "2026-04-05T12:00:00",
+                    "blocking_checks": [],
+                    "warning_checks": [],
+                },
                 "daily_pnl": 42.25,
                 "daily_pnl_limit": 150.0,
                 "orders_today": 7,
@@ -879,6 +946,8 @@ def test_dashboard_live_account_summary_stays_separate_from_paper_metrics():
     assert summary["wallet_total"] == 1250.0
     assert summary["perps_margin"] == 1200.0
     assert summary["spot_usdc"] == 50.0
+    assert summary["preflight_ready"] is True
+    assert summary["preflight_status"] == "ready"
     assert summary["realized_pnl_today"] == 42.25
     assert summary["open_unrealized_pnl"] == 11.5
     assert summary["open_positions"] == 2

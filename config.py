@@ -119,6 +119,12 @@ LIVE_MIN_ORDER_USD = float(os.environ.get("LIVE_MIN_ORDER_USD", 11.0))
 LIVE_MAX_ORDER_USD = float(os.environ.get("LIVE_MAX_ORDER_USD", 12.0))
 # Daily loss limit for the live account in USD (forwarded to LiveTrader).
 LIVE_MAX_DAILY_LOSS_USD = float(os.environ.get("LIVE_MAX_DAILY_LOSS_USD", 5.0))
+LIVE_PREFLIGHT_REQUIRED = os.environ.get(
+    "LIVE_PREFLIGHT_REQUIRED", "true"
+).lower() in ("true", "1", "yes")
+LIVE_PREFLIGHT_REFRESH_SECONDS = float(
+    os.environ.get("LIVE_PREFLIGHT_REFRESH_SECONDS", 600)
+)
 HL_WALLET_MODE = os.environ.get("HL_WALLET_MODE", "agent_only").strip().lower()
 SECRET_MANAGER_PROVIDER = os.environ.get(
     "SECRET_MANAGER_PROVIDER", "none"

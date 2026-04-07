@@ -459,6 +459,20 @@ class LiveTrader:
         self._last_ledger_position_signature: Optional[str] = None
         self._last_ledger_position_ts: float = 0.0
         self._ledger_snapshot_interval_s: float = 60.0
+        self.preflight_required = bool(getattr(config, "LIVE_PREFLIGHT_REQUIRED", True))
+        self._preflight_refresh_seconds = float(
+            getattr(config, "LIVE_PREFLIGHT_REFRESH_SECONDS", 600.0)
+        )
+        self._preflight_checked_at_ts: float = 0.0
+        self._preflight_report: Dict[str, Any] = {
+            "status": "not_run",
+            "deployable": False,
+            "checked_at": None,
+            "blocking_checks": [],
+            "warning_checks": [],
+            "checks": [],
+        }
+        self._preflight_blocking_failure = False
 
         logger.info(
             f"LiveTrader initialized: dry_run={dry_run}, "
@@ -691,9 +705,182 @@ class LiveTrader:
         """Return True when the operator explicitly requested live execution."""
         return bool(self.live_requested)
 
+    def _basic_deployable(self) -> bool:
+        return bool(self.live_requested and not self.dry_run and self.signer and self.public_address)
+
+    def run_preflight(self, force: bool = False) -> Dict[str, Any]:
+        """Run a live readiness preflight and cache the result."""
+        now = time.time()
+        if (
+            not force
+            and self._preflight_checked_at_ts
+            and (now - self._preflight_checked_at_ts) < max(self._preflight_refresh_seconds, 0.0)
+        ):
+            return dict(self._preflight_report)
+
+        checks: List[Dict[str, Any]] = []
+        blocking_checks: List[str] = []
+        warning_checks: List[str] = []
+
+        def _record(name: str, passed: bool, message: str, *, severity: str = "error", value=None) -> None:
+            entry = {
+                "name": name,
+                "passed": bool(passed),
+                "severity": severity,
+                "message": message,
+            }
+            if value is not None:
+                entry["value"] = value
+            checks.append(entry)
+            if passed:
+                return
+            if severity == "warning":
+                warning_checks.append(name)
+            else:
+                blocking_checks.append(name)
+
+        _record(
+            "live_requested",
+            self.live_requested,
+            "live trading requested" if self.live_requested else "LIVE_TRADING_ENABLED=false",
+        )
+        _record(
+            "dry_run_disabled",
+            not self.dry_run,
+            "dry run disabled" if not self.dry_run else "dry_run still enabled",
+        )
+        _record(
+            "signer_loaded",
+            self.signer is not None,
+            "agent signer loaded" if self.signer is not None else "agent signer unavailable",
+        )
+        _record(
+            "trading_address_present",
+            bool(self.public_address),
+            (
+                f"trading address {self.public_address}"
+                if self.public_address
+                else "HL_PUBLIC_ADDRESS missing"
+            ),
+        )
+        _record(
+            "agent_wallet_present",
+            bool(self.agent_wallet_address),
+            (
+                f"agent wallet {self.agent_wallet_address}"
+                if self.agent_wallet_address
+                else "HL_AGENT_WALLET_ADDRESS not resolved"
+            ),
+        )
+        _record(
+            "wallets_distinct",
+            bool(
+                self.agent_wallet_address
+                and self.public_address
+                and self.agent_wallet_address != self.public_address
+            ),
+            "agent wallet differs from trading wallet"
+            if (
+                self.agent_wallet_address
+                and self.public_address
+                and self.agent_wallet_address != self.public_address
+            )
+            else "agent wallet must differ from trading wallet",
+        )
+        _record(
+            "asset_metadata_loaded",
+            bool(self.asset_index_map and self.sz_decimals_map),
+            (
+                f"{len(self.asset_index_map)} assets loaded"
+                if self.asset_index_map and self.sz_decimals_map
+                else "asset metadata unavailable"
+            ),
+            value=len(self.asset_index_map),
+        )
+
+        balance_snapshot = dict(self._last_balance_snapshot)
+        buying_power = None
+        if not blocking_checks:
+            account_state = self.get_account_state()
+            account_state_ok = isinstance(account_state, dict) and bool(account_state)
+            _record(
+                "account_state_accessible",
+                account_state_ok,
+                "account state reachable" if account_state_ok else "clearinghouseState unavailable",
+            )
+            balance_snapshot = self.snapshot_balance(log=False)
+            balance_ok = balance_snapshot.get("total") is not None
+            _record(
+                "balance_snapshot_accessible",
+                balance_ok,
+                (
+                    f"wallet total={balance_snapshot.get('total')}"
+                    if balance_ok
+                    else "wallet balance probe failed"
+                ),
+            )
+            buying_power = self.get_account_value()
+            funded = buying_power is not None and float(buying_power) > 0
+            if buying_power == 0:
+                power_message = "live account reachable but perps buying power is $0"
+            elif buying_power is None:
+                power_message = "could not determine live account buying power"
+            else:
+                power_message = f"perps buying power ${float(buying_power):.2f}"
+            _record("perps_buying_power", funded, power_message, value=buying_power)
+        else:
+            _record(
+                "account_state_accessible",
+                False,
+                "skipped due to prior blocking preflight failure",
+                severity="warning",
+            )
+            _record(
+                "balance_snapshot_accessible",
+                False,
+                "skipped due to prior blocking preflight failure",
+                severity="warning",
+            )
+            _record(
+                "perps_buying_power",
+                False,
+                "skipped due to prior blocking preflight failure",
+                severity="warning",
+            )
+
+        deployable = self._basic_deployable() and not blocking_checks
+        status = "ready" if deployable else ("blocked" if blocking_checks else "warning")
+        checked_at = datetime.utcnow().isoformat()
+        report = {
+            "status": status,
+            "deployable": deployable,
+            "checked_at": checked_at,
+            "blocking_checks": list(blocking_checks),
+            "warning_checks": list(warning_checks),
+            "checks": checks,
+            "account_value": buying_power,
+            "wallet_total": balance_snapshot.get("total"),
+        }
+        self._preflight_report = report
+        self._preflight_checked_at_ts = now
+        self._preflight_blocking_failure = bool(blocking_checks)
+
+        if self.live_requested:
+            if deployable:
+                self.status_reason = "ready"
+            elif blocking_checks:
+                self.status_reason = f"preflight_failed:{blocking_checks[0]}"
+
+        return dict(report)
+
     def is_deployable(self) -> bool:
         """Return True when the trader can actually submit live orders."""
-        return bool(self.live_requested and not self.dry_run and self.signer and self.public_address)
+        basic = self._basic_deployable()
+        if not basic:
+            return False
+        if self.preflight_required and self._preflight_report.get("checked_at") is not None:
+            return bool(self._preflight_report.get("deployable", False))
+        return basic
 
     def _coerce_signal(self, signal: Union[TradeSignal, Dict[str, Any]]) -> TradeSignal:
         """Accept either TradeSignal or execution dict for safer live mirroring."""
@@ -3124,5 +3311,7 @@ class LiveTrader:
             "max_order_usd": self.max_order_usd,
             "wallet_balance": dict(self._last_balance_snapshot),
             "asset_indices_loaded": len(self.asset_index_map),
+            "preflight_required": self.preflight_required,
+            "preflight": dict(self._preflight_report),
             "timestamp": datetime.utcnow().isoformat()
         }

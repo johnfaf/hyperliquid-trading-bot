@@ -634,14 +634,25 @@ def build_subsystems(
                     dependency_ready=False,
                     startup_status="DISABLED",
                 )
-            elif not c.live_trader.is_deployable():
-                health.set_status(
-                    "live_trader",
-                    SubsystemState.DEGRADED,
-                    reason=c.live_trader.get_stats().get("status_reason", "not deployable"),
-                    dependency_ready=False,
-                    startup_status="WAITING_FOR_DEPENDENCIES",
-                )
+            else:
+                try:
+                    c.live_trader.run_preflight(force=True)
+                except Exception as exc:
+                    logger.warning("  x live_trader preflight - %s", exc)
+                if not c.live_trader.is_deployable():
+                    live_stats = c.live_trader.get_stats()
+                    preflight = live_stats.get("preflight", {}) or {}
+                    blocking = list(preflight.get("blocking_checks", []) or [])
+                    reason = live_stats.get("status_reason", "not deployable")
+                    if blocking:
+                        reason = f"{reason} [{', '.join(blocking[:2])}]"
+                    health.set_status(
+                        "live_trader",
+                        SubsystemState.DEGRADED,
+                        reason=reason,
+                        dependency_ready=False,
+                        startup_status="WAITING_FOR_DEPENDENCIES",
+                    )
 
     # ─── Cross-venue hedger ───────────────────────────────────
     if "cross_venue_hedger" in profile:

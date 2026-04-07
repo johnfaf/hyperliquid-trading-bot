@@ -116,6 +116,20 @@ def run_reporting(container, cycle_count: int, health_registry=None) -> None:
             )
     except Exception as exc:
         logger.debug("  Capital governor error: %s", exc)
+    try:
+        if getattr(container, "live_trader", None):
+            live_stats = container.live_trader.get_stats()
+            preflight = live_stats.get("preflight", {}) or {}
+            if preflight:
+                logger.info(
+                    "  LivePreflight: %s (deployable=%s, blocking=%s, warnings=%s)",
+                    preflight.get("status", "not_run"),
+                    preflight.get("deployable", False),
+                    ", ".join(preflight.get("blocking_checks", [])[:3]) or "none",
+                    ", ".join(preflight.get("warning_checks", [])[:3]) or "none",
+                )
+    except Exception as exc:
+        logger.debug("  Live preflight error: %s", exc)
 
     # ── Shadow tracker + hedger stats ──
     try:

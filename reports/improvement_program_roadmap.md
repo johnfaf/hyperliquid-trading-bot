@@ -124,6 +124,13 @@ This branch is the staged upgrade path for making the bot more measurable, more 
 - Persist recalibration runs plus stable per-source promotion state for auditability, rollback safety, and manual inspection.
 - Add cooldown and confirmation controls so promotions/demotions are sticky, pending transitions are visible, and operators can force a recalibration run on demand.
 
+## Phase 18: Live Preflight And Deployment Readiness
+
+- Status: shipped on `codex/live-ledger-foundation`
+- Add an explicit live preflight so deployability means more than “credentials exist.”
+- Probe startup readiness for wallet wiring, exchange metadata, account reachability, and real perps buying power before treating live trading as healthy.
+- Expose preflight status through subsystem health, reporting, dashboard summaries, and a dedicated operator script.
+
 ## Branch Operating Rule
 
 Each phase should be landed in a reviewable commit with tests before moving to the next phase.

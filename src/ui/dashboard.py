@@ -98,6 +98,11 @@ def _build_live_account_summary(trader) -> Dict:
         "deployable": False,
         "dry_run": True,
         "status_reason": "unavailable",
+        "preflight_ready": False,
+        "preflight_status": "not_run",
+        "preflight_checked_at": None,
+        "preflight_blocking_checks": [],
+        "preflight_warning_checks": [],
         "ledger_ready": False,
         "wallet_total": None,
         "perps_margin": None,
@@ -165,8 +170,10 @@ def _build_live_account_summary(trader) -> Dict:
 
     summary["available"] = True
     live_stats = {}
+    preflight = {}
     try:
         live_stats = trader.get_stats() or {}
+        preflight = live_stats.get("preflight", {}) or {}
     except Exception as exc:
         logger.debug("dashboard live stats error: %s", exc)
 
@@ -224,6 +231,11 @@ def _build_live_account_summary(trader) -> Dict:
             "deployable": bool(live_stats.get("deployable", False)),
             "dry_run": bool(live_stats.get("dry_run", True)),
             "status_reason": str(live_stats.get("status_reason", "unknown") or "unknown"),
+            "preflight_ready": bool(preflight.get("deployable", False)),
+            "preflight_status": str(preflight.get("status", "not_run") or "not_run"),
+            "preflight_checked_at": preflight.get("checked_at"),
+            "preflight_blocking_checks": list(preflight.get("blocking_checks", []) or []),
+            "preflight_warning_checks": list(preflight.get("warning_checks", []) or []),
             "wallet_total": wallet.get("total"),
             "perps_margin": wallet.get("perps_margin"),
             "spot_usdc": wallet.get("spot_usdc"),
