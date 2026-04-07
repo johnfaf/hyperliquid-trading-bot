@@ -23,7 +23,7 @@ Instead: ranked execution with clear priority + decision logging.
 """
 import logging
 import json
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from datetime import datetime
 from collections import deque
 
@@ -151,6 +151,7 @@ class DecisionEngine:
         # Track decisions for audit
         self._decision_history: deque = deque(maxlen=100)
         self._cycle_count = 0
+        self._last_cycle_summary: Dict[str, Any] = {}
         self._context_profile_cache: Dict[Tuple, Dict] = {}
         self._calibration_profile_cache: Dict[Tuple, Dict] = {}
         self._calibration_stats_snapshot: Optional[Dict[str, Dict]] = None
@@ -2187,6 +2188,37 @@ class DecisionEngine:
 
         return round(long_score, 4), round(short_score, 4)
 
+    @staticmethod
+    def _summarize_sources(items: List[Dict]) -> Dict[str, int]:
+        counts: Dict[str, int] = {}
+        for item in items:
+            metadata = item.get("_metadata_for_decision", {})
+            if not isinstance(metadata, dict):
+                metadata = item.get("metadata", {}) if isinstance(item.get("metadata", {}), dict) else {}
+            source = str(item.get("source", metadata.get("source", "strategy")) or "strategy").strip().lower()
+            if not source:
+                source = "strategy"
+            counts[source] = counts.get(source, 0) + 1
+        return counts
+
+    @staticmethod
+    def _summarize_blockers(items: List[Dict]) -> Dict[str, int]:
+        counts: Dict[str, int] = {}
+        for item in items:
+            for blocker in item.get("_decision_blockers", []) or []:
+                normalized = str(blocker or "").strip()
+                if not normalized:
+                    continue
+                counts[normalized] = counts.get(normalized, 0) + 1
+        return counts
+
+    @staticmethod
+    def _format_count_summary(counts: Dict[str, int]) -> str:
+        if not counts:
+            return "none"
+        ordered = sorted(counts.items(), key=lambda pair: (-pair[1], pair[0]))
+        return ", ".join(f"{name}={value}" for name, value in ordered)
+
     def _log_decision(self, scored: List[Dict],
                       regime_data: Optional[Dict],
                       available_slots: int,
@@ -2233,13 +2265,64 @@ class DecisionEngine:
                 marker,
             )
 
+        source_counts = self._summarize_sources(scored)
+        blocker_counts = self._summarize_blockers(disqualified)
+        blocked_count = sum(1 for item in disqualified if item.get("_decision_blockers"))
+        below_threshold_count = sum(
+            1
+            for item in disqualified
+            if not item.get("_decision_blockers")
+            and float(item.get("_composite_score", 0.0) or 0.0) < self.min_decision_score
+        )
+        if not scored:
+            no_trade_reason = "no candidates"
+        elif available_slots == 0 and not executions:
+            no_trade_reason = "no slots"
+        elif blocked_count and not executions:
+            no_trade_reason = "blocked"
+        elif below_threshold_count and not executions:
+            no_trade_reason = "below threshold"
+        elif not executions:
+            no_trade_reason = "unknown"
+        else:
+            no_trade_reason = "executing"
+
+        self._last_cycle_summary = {
+            "cycle": self._cycle_count,
+            "regime": regime,
+            "available_slots": available_slots,
+            "candidate_count": len(scored),
+            "qualified_count": len(executions) + len(overflow),
+            "execution_count": len(executions),
+            "overflow_count": len(overflow),
+            "disqualified_count": len(disqualified),
+            "blocked_count": blocked_count,
+            "below_threshold_count": below_threshold_count,
+            "no_trade_reason": no_trade_reason,
+            "source_counts": source_counts,
+            "blocker_counts": blocker_counts,
+        }
+
+        logger.info(
+            "  DecisionSummary: qualified=%d blocked=%d below_threshold=%d overflow=%d sources=%s blockers=%s",
+            len(executions) + len(overflow),
+            blocked_count,
+            below_threshold_count,
+            len(overflow),
+            self._format_count_summary(source_counts),
+            self._format_count_summary(blocker_counts),
+        )
+
         if executions:
             logger.info("→ EXECUTING %d trade(s) this cycle", len(executions))
         else:
-            reason = "no candidates" if not scored else \
-                     "below threshold" if not [s for s in scored if s.get("_composite_score", 0) >= self.min_decision_score] else \
-                     "no slots" if available_slots == 0 else "unknown"
-            logger.info("→ NO TRADE this cycle (%s)", reason)
+            logger.info("→ NO TRADE this cycle (%s)", no_trade_reason)
+            logger.info(
+                "  WhyNoTrade: reason=%s sources=%s blockers=%s",
+                no_trade_reason,
+                self._format_count_summary(source_counts),
+                self._format_count_summary(blocker_counts),
+            )
 
     def get_stats(self) -> Dict:
         """Return decision engine statistics."""
@@ -2299,9 +2382,14 @@ class DecisionEngine:
             "adaptive_learning_block_on_status": self.adaptive_learning_block_on_status,
             "adaptive_learning_min_health_score": self.adaptive_learning_min_health_score,
             "last_research_cycle_id": self._last_research_cycle_id,
+            "last_cycle_summary": dict(self._last_cycle_summary),
             "recent_decisions": list(self._decision_history)[-10:],
         }
 
     def get_decision_history(self, limit: int = 20) -> List[Dict]:
         """Return recent decision history for dashboard."""
         return list(self._decision_history)[-limit:]
+
+    def get_last_cycle_summary(self) -> Dict[str, Any]:
+        """Return the most recent cycle-level decision summary."""
+        return dict(self._last_cycle_summary)

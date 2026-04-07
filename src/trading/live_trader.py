@@ -748,9 +748,13 @@ class LiveTrader:
         except Exception as e:
             logger.error(f"Failed to load asset index map: {e}")
 
-    def is_live_enabled(self) -> bool:
+    def is_live_requested(self) -> bool:
         """Return True when the operator explicitly requested live execution."""
         return bool(self.live_requested)
+
+    def is_live_enabled(self) -> bool:
+        """Return True when live execution is enabled beyond dry-run intent."""
+        return bool(self.live_requested and not self.dry_run)
 
     def _basic_deployable(self) -> bool:
         return bool(self.live_requested and not self.dry_run and self.signer and self.public_address)
@@ -3575,9 +3579,11 @@ class LiveTrader:
             Stats dict with orders, fills, PnL, kill switch status
         """
         self._check_daily_reset()
+        runtime_profile = getattr(config, "get_runtime_profile_summary", lambda: {})() or {}
 
         return {
-            "live_enabled": self.live_requested,
+            "live_requested": self.is_live_requested(),
+            "live_enabled": self.is_live_enabled(),
             "deployable": self.is_deployable(),
             "dry_run": self.dry_run,
             "signer_available": self.signer is not None,
@@ -3597,5 +3603,8 @@ class LiveTrader:
             "preflight": dict(self._preflight_report),
             "activation_guard": dict(self._activation_report),
             "live_readiness": self.get_live_readiness(),
+            "runtime_profile": runtime_profile.get("profile", getattr(config, "RUNTIME_PROFILE", "paper")),
+            "runtime_effective_execution_mode": runtime_profile.get("effective_execution_mode", "paper"),
+            "runtime_override_controls": list(runtime_profile.get("override_controls", []) or []),
             "timestamp": utc_now_iso()
         }

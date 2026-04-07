@@ -53,6 +53,7 @@ def _profile_env(name: str, default: str) -> str:
 
 def get_runtime_profile_summary() -> dict:
     controls = {}
+    override_controls = []
     for env_name in (
         "LIVE_TRADING_ENABLED",
         "LIVE_PREFLIGHT_REQUIRED",
@@ -60,16 +61,35 @@ def get_runtime_profile_summary() -> dict:
         "ROTATION_ENGINE_ENABLED",
         "ROTATION_DRY_RUN_TELEMETRY",
     ):
+        effective = _profile_env(env_name, "")
+        profile_default = str(RUNTIME_PROFILE_DEFAULTS.get(RUNTIME_PROFILE, {}).get(env_name, ""))
+        overridden = env_name in os.environ and str(os.environ.get(env_name, "")) != profile_default
+        if overridden:
+            override_controls.append(env_name)
         controls[env_name] = {
-            "effective": _profile_env(env_name, ""),
+            "effective": effective,
             "source": "env" if env_name in os.environ else f"profile:{RUNTIME_PROFILE}",
+            "profile_default": profile_default,
+            "overridden": overridden,
         }
+    live_enabled = str(controls["LIVE_TRADING_ENABLED"]["effective"]).strip().lower() in _TRUE_VALUES
+    rotation_enabled = str(controls["ROTATION_ENGINE_ENABLED"]["effective"]).strip().lower() in _TRUE_VALUES
+    rotation_dry_run = str(controls["ROTATION_DRY_RUN_TELEMETRY"]["effective"]).strip().lower() in _TRUE_VALUES
+    if live_enabled:
+        effective_execution_mode = "live"
+    elif rotation_enabled and rotation_dry_run:
+        effective_execution_mode = "shadow"
+    else:
+        effective_execution_mode = "paper"
     return {
         "profile": RUNTIME_PROFILE,
         "requested_profile": RUNTIME_PROFILE_RAW,
         "profile_valid": RUNTIME_PROFILE_VALID,
         "allowed_profiles": list(_RUNTIME_PROFILES),
         "controls": controls,
+        "override_controls": override_controls,
+        "has_env_overrides": bool(override_controls),
+        "effective_execution_mode": effective_execution_mode,
     }
 
 # ─── API Endpoints ─────────────────────────────────────────────

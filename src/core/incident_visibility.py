@@ -68,9 +68,10 @@ def _collect_live_incidents(live_trader=None) -> List[Dict[str, Any]]:
         logger.debug("runtime incident collector live_trader error: %s", exc)
         return incidents
 
+    live_requested = bool(stats.get("live_requested", stats.get("live_enabled", False)))
     live_enabled = bool(stats.get("live_enabled", False))
     kill_switch_active = bool(stats.get("kill_switch_active", False))
-    if kill_switch_active:
+    if kill_switch_active and live_enabled:
         incidents.append(
             _incident(
                 "live_kill_switch_active",
@@ -84,7 +85,7 @@ def _collect_live_incidents(live_trader=None) -> List[Dict[str, Any]]:
             )
         )
 
-    if not live_enabled:
+    if not live_requested or not live_enabled:
         return incidents
 
     preflight = stats.get("preflight", {}) or {}
@@ -125,6 +126,7 @@ def _collect_live_incidents(live_trader=None) -> List[Dict[str, Any]]:
     if activation:
         blocking_checks = list(activation.get("blocking_checks", []) or [])
         warning_checks = list(activation.get("warning_checks", []) or [])
+        activation_status = str(activation.get("status", "not_run") or "not_run")
         if not bool(activation.get("deployable", False)):
             incidents.append(
                 _incident(
@@ -133,7 +135,7 @@ def _collect_live_incidents(live_trader=None) -> List[Dict[str, Any]]:
                     f"Live activation approval is not deployable: {_join_reasons(blocking_checks)}.",
                     severity="critical",
                     source="live_trader",
-                    status=str(activation.get("status", "blocked") or "blocked"),
+                    status=activation_status,
                     blocking=True,
                     metadata={
                         "approved_by": activation.get("approved_by", ""),
@@ -143,15 +145,49 @@ def _collect_live_incidents(live_trader=None) -> List[Dict[str, Any]]:
                     },
                 )
             )
-        elif warning_checks:
+        elif "approval_expiring_soon" in warning_checks:
             incidents.append(
                 _incident(
                     "live_activation_warning",
                     "Live activation expiring soon",
+                    f"Activation approval expires soon: {_join_reasons(warning_checks)}.",
+                    severity="warning",
+                    source="live_trader",
+                    status=activation_status,
+                    blocking=False,
+                    metadata={
+                        "approved_by": activation.get("approved_by", ""),
+                        "expires_at": activation.get("expires_at", ""),
+                        "hours_remaining": activation.get("hours_remaining"),
+                        "warning_checks": warning_checks,
+                    },
+                )
+            )
+        elif "activation_guard_enabled" in warning_checks or activation_status == "disabled":
+            incidents.append(
+                _incident(
+                    "live_activation_guard_disabled",
+                    "Live activation guard disabled",
+                    "Live activation approval checks are disabled; rely on explicit runtime mode and preflight controls.",
+                    severity="warning",
+                    source="live_trader",
+                    status=activation_status,
+                    blocking=False,
+                    metadata={
+                        "approved_by": activation.get("approved_by", ""),
+                        "warning_checks": warning_checks,
+                    },
+                )
+            )
+        elif warning_checks:
+            incidents.append(
+                _incident(
+                    "live_activation_warning",
+                    "Live activation warnings",
                     f"Activation approval has warnings: {_join_reasons(warning_checks)}.",
                     severity="warning",
                     source="live_trader",
-                    status=str(activation.get("status", "warning") or "warning"),
+                    status=activation_status,
                     blocking=False,
                     metadata={
                         "approved_by": activation.get("approved_by", ""),

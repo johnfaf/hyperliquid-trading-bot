@@ -23,7 +23,11 @@ def get_live_trader(container):
 def is_live_trading_requested(container) -> bool:
     """True when the operator explicitly enabled live trading."""
     trader = get_live_trader(container)
-    return bool(trader and trader.is_live_enabled())
+    if not trader:
+        return False
+    if hasattr(trader, "is_live_requested"):
+        return bool(trader.is_live_requested())
+    return bool(trader.is_live_enabled())
 
 
 def is_live_trading_active(container) -> bool:

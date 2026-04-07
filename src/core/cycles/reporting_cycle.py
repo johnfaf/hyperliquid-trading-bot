@@ -138,6 +138,20 @@ def run_reporting(container, cycle_count: int, health_registry=None) -> None:
             preflight = live_stats.get("preflight", {}) or {}
             activation = live_stats.get("activation_guard", {}) or {}
             readiness = live_stats.get("live_readiness", {}) or {}
+            runtime_overrides = list(live_stats.get("runtime_override_controls", []) or [])
+            logger.info(
+                "  LiveMode: profile=%s effective=%s requested=%s enabled=%s dry_run=%s",
+                live_stats.get("runtime_profile", "paper"),
+                live_stats.get("runtime_effective_execution_mode", "paper"),
+                live_stats.get("live_requested", live_stats.get("live_enabled", False)),
+                live_stats.get("live_enabled", False),
+                live_stats.get("dry_run", True),
+            )
+            if runtime_overrides:
+                logger.warning(
+                    "  LiveMode overrides active: %s",
+                    ", ".join(runtime_overrides[:5]),
+                )
             if preflight:
                 logger.info(
                     "  LivePreflight: %s (deployable=%s, blocking=%s, warnings=%s)",
@@ -254,7 +268,16 @@ def run_reporting(container, cycle_count: int, health_registry=None) -> None:
     if container.scorer:
         try:
             improvement = container.scorer.generate_improvement_report()
-            logger.info("  Bot health: %s", improvement.get("health", "unknown"))
+            health = (
+                improvement.get("health")
+                or improvement.get("status")
+                or "unknown"
+            )
+            message = str(improvement.get("message", "") or "").strip()
+            if message:
+                logger.info("  Bot health: %s (%s)", health, message)
+            else:
+                logger.info("  Bot health: %s", health)
         except Exception:
             pass
 

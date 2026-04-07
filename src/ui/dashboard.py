@@ -238,10 +238,16 @@ def _build_live_account_summary(trader) -> Dict:
 
     summary.update(
         {
+            "live_requested": bool(live_stats.get("live_requested", live_stats.get("live_enabled", False))),
             "live_enabled": bool(live_stats.get("live_enabled", False)),
             "deployable": bool(live_stats.get("deployable", False)),
             "dry_run": bool(live_stats.get("dry_run", True)),
             "status_reason": str(live_stats.get("status_reason", "unknown") or "unknown"),
+            "runtime_profile": str(live_stats.get("runtime_profile", "paper") or "paper"),
+            "runtime_effective_execution_mode": str(
+                live_stats.get("runtime_effective_execution_mode", "paper") or "paper"
+            ),
+            "runtime_override_controls": list(live_stats.get("runtime_override_controls", []) or []),
             "preflight_ready": bool(preflight.get("deployable", False)),
             "preflight_status": str(preflight.get("status", "not_run") or "not_run"),
             "preflight_checked_at": preflight.get("checked_at"),

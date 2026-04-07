@@ -121,6 +121,19 @@ def _coerce_metadata(metadata):
     return {}
 
 
+def _candidate_source_label(strategy: dict) -> str:
+    metadata = _coerce_metadata(strategy.get("metadata", {}))
+    source = str(strategy.get("source", metadata.get("source", "strategy")) or "strategy").strip().lower()
+    return source or "strategy"
+
+
+def _format_count_map(counts) -> str:
+    if not counts:
+        return "none"
+    ordered = sorted(counts.items(), key=lambda item: (-int(item[1] or 0), item[0]))
+    return ", ".join(f"{name}={value}" for name, value in ordered)
+
+
 def _strategy_source_key(strategy: dict) -> str:
     metadata = _coerce_metadata(strategy.get("metadata", {}))
     source_key = str(strategy.get("source_key", "")).strip() or str(metadata.get("source_key", "")).strip()
@@ -592,6 +605,16 @@ def run_trading_cycle(container, cycle_count: int) -> None:
         # ── Phase 4: Paper Trading (regime-aware) ──
         logger.info("Phase 4: Paper Trading (regime-aware)")
         top_strategies = container.scorer.get_top_strategies() if container.scorer else []
+        pipeline_counts = {
+            "base": 0,
+            "polymarket": 0,
+            "options_flow": 0,
+            "lcrs": 0,
+            "arena": 0,
+            "copy_trade": 0,
+        }
+        pipeline_notes = []
+        base_before_regime = len(top_strategies)
 
         # Regime-aware filtering
         if regime_data and container.regime_strategy_filter:
@@ -603,18 +626,35 @@ def run_trading_cycle(container, cycle_count: int) -> None:
                         top_strategies, regime_data
                     )
             logger.info("  Post-regime filter: %d strategies active", len(top_strategies))
+            if base_before_regime and not top_strategies:
+                logger.warning(
+                    "  Regime filter removed all %d base strategies this cycle",
+                    base_before_regime,
+                )
+                pipeline_notes.append(f"regime_filtered_all={base_before_regime}")
 
         # Signal processing
+        pre_signal_count = len(top_strategies)
         if container.signal_processor:
             top_strategies = container.signal_processor.process(top_strategies, regime_data=regime_data)
             logger.info("  Post-signal-processor: %d strategies", len(top_strategies))
+            if pre_signal_count and not top_strategies:
+                logger.warning(
+                    "  Signal processor removed all %d base strategies this cycle",
+                    pre_signal_count,
+                )
+                pipeline_notes.append(f"signal_processor_filtered_all={pre_signal_count}")
+
+        pipeline_counts["base"] = len(top_strategies)
 
         # Inject Polymarket signals as synthetic strategies
         if polymarket_signals:
             injected_polymarket = 0
+            polymarket_below_threshold = 0
             for pm in polymarket_signals:
                 confidence = float(pm.get("confidence", 0.5) or 0.5)
                 if confidence < config.POLYMARKET_MIN_DECISION_CONFIDENCE:
+                    polymarket_below_threshold += 1
                     continue
                 source_key = build_source_key(
                     "polymarket",
@@ -647,14 +687,26 @@ def run_trading_cycle(container, cycle_count: int) -> None:
                 }
                 top_strategies.append(synthetic)
                 injected_polymarket += 1
+            pipeline_counts["polymarket"] = injected_polymarket
             logger.info("  Injected %d Polymarket signals", injected_polymarket)
+            if not injected_polymarket and polymarket_below_threshold:
+                pipeline_notes.append(
+                    "polymarket_below_threshold="
+                    f"{polymarket_below_threshold}/{len(polymarket_signals)}"
+                )
 
         # Inject high-conviction options flow as synthetic strategies
         if container.options_scanner:
             convictions = getattr(container.options_scanner, "top_convictions", None) or []
             injected_options = 0
+            rejected_options = 0
+            top_rejected_conviction = None
             for conv in convictions:
-                if conv.get("conviction_pct", 0) < config.OPTIONS_FLOW_INJECTION_MIN_CONVICTION:
+                conviction_pct = float(conv.get("conviction_pct", 0) or 0)
+                if conviction_pct < config.OPTIONS_FLOW_INJECTION_MIN_CONVICTION:
+                    rejected_options += 1
+                    if top_rejected_conviction is None or conviction_pct > top_rejected_conviction:
+                        top_rejected_conviction = conviction_pct
                     continue
                 direction = conv.get("direction", "bullish")
                 side = "long" if direction == "bullish" else "short"
@@ -688,8 +740,21 @@ def run_trading_cycle(container, cycle_count: int) -> None:
                 }
                 top_strategies.append(synthetic)
                 injected_options += 1
+            pipeline_counts["options_flow"] = injected_options
             if injected_options:
                 logger.info("  Injected %d options flow signals into decision engine", injected_options)
+            elif convictions:
+                threshold = float(config.OPTIONS_FLOW_INJECTION_MIN_CONVICTION)
+                logger.info(
+                    "  Options flow not injected: %d conviction candidates below %.1f%% threshold (top=%.1f%%)",
+                    rejected_options,
+                    threshold,
+                    float(top_rejected_conviction or 0.0),
+                )
+                pipeline_notes.append(
+                    "options_top_conviction="
+                    f"{float(top_rejected_conviction or 0.0):.1f}<threshold={threshold:.1f}"
+                )
 
         # Keep the shadow ledger synced to exchange truth when live mode is active.
         if is_live_trading_active(container):
@@ -716,16 +781,30 @@ def run_trading_cycle(container, cycle_count: int) -> None:
         if lcrs_candidates:
             top_strategies.extend(lcrs_candidates)
             logger.info("  Injected %d LCRS signals into decision engine", len(lcrs_candidates))
+        pipeline_counts["lcrs"] = len(lcrs_candidates)
 
         arena_candidates = _run_alpha_arena(container, regime_data)
         if arena_candidates:
             top_strategies.extend(arena_candidates)
             logger.info("  Injected %d arena champion signals into decision engine", len(arena_candidates))
+        pipeline_counts["arena"] = len(arena_candidates)
 
         copy_candidates = _build_copy_decision_candidates(container, copy_signals, regime_data)
         if copy_candidates:
             top_strategies.extend(copy_candidates)
             logger.info("  Injected %d copy-trade signals into decision engine", len(copy_candidates))
+        pipeline_counts["copy_trade"] = len(copy_candidates)
+
+        logger.info(
+            "  Candidate pipeline: total=%d (%s)",
+            len(top_strategies),
+            _format_count_map(pipeline_counts),
+        )
+        if not top_strategies:
+            logger.warning(
+                "  Candidate pipeline empty after upstream filters%s",
+                f" [{'; '.join(pipeline_notes)}]" if pipeline_notes else "",
+            )
 
         # Cross-venue signal confirmation
         _run_cross_venue_confirmation(container, top_strategies)
@@ -749,6 +828,16 @@ def run_trading_cycle(container, cycle_count: int) -> None:
                 top_strategies, regime_data=regime_data,
                 open_positions=open_trades, kelly_stats=kelly_stats,
             )
+            if not selected_strategies:
+                decision_summary = container.decision_engine.get_last_cycle_summary()
+                logger.info(
+                    "  NoTradeSummary: upstream=%s decision_sources=%s blockers=%s reason=%s%s",
+                    _format_count_map(pipeline_counts),
+                    _format_count_map(decision_summary.get("source_counts", {})),
+                    _format_count_map(decision_summary.get("blocker_counts", {})),
+                    decision_summary.get("no_trade_reason", "unknown"),
+                    f" notes={'; '.join(pipeline_notes)}" if pipeline_notes else "",
+                )
 
         # Execute only what the main decision engine selected.
         _execute_selected_decisions(container, selected_strategies, regime_data)

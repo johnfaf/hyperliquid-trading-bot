@@ -113,6 +113,8 @@ def validate_runtime_profile_controls(logger: logging.Logger) -> None:
     profile_valid = bool(summary.get("profile_valid", True))
     profile = str(getattr(config, "RUNTIME_PROFILE", "paper") or "paper").strip().lower()
     allowed = set(summary.get("allowed_profiles", []) or ("paper", "shadow", "live"))
+    effective_execution_mode = str(summary.get("effective_execution_mode", profile) or profile).strip().lower()
+    override_controls = list(summary.get("override_controls", []) or [])
     if not profile_valid:
         raise RuntimeError(
             f"Unsupported BOT_RUNTIME_PROFILE '{requested_profile}'. Expected one of: {', '.join(sorted(allowed))}."
@@ -122,7 +124,19 @@ def validate_runtime_profile_controls(logger: logging.Logger) -> None:
             f"Unsupported BOT_RUNTIME_PROFILE '{profile}'. Expected one of: {', '.join(sorted(allowed))}."
         )
 
-    logger.info("Runtime profile resolved: %s", profile)
+    if override_controls:
+        logger.warning(
+            "Runtime profile resolved: %s (effective execution mode: %s, env overrides: %s)",
+            profile,
+            effective_execution_mode,
+            ", ".join(override_controls),
+        )
+    else:
+        logger.info(
+            "Runtime profile resolved: %s (effective execution mode: %s)",
+            profile,
+            effective_execution_mode,
+        )
 
     if profile != "live":
         return

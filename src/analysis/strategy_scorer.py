@@ -6,10 +6,11 @@ profitable ones. This is the "learning" core of the bot.
 """
 import logging
 import numpy as np
-from datetime import datetime, timedelta
-from typing import List, Dict, Optional
+from datetime import datetime
+from typing import Dict, List
 
-import sys, os
+import os
+import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import config
 from src.data import database as db
@@ -335,7 +336,12 @@ class StrategyScorer:
         strategies = db.get_active_strategies()
 
         if not strategies:
-            return {"status": "no_strategies", "message": "No strategies tracked yet"}
+            return {
+                "status": "no_strategies_tracked",
+                "health": "warming_up",
+                "message": "No strategies tracked yet",
+                "total_strategies": 0,
+            }
 
         # Analyze trends for all strategies
         trends = {}

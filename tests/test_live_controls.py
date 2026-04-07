@@ -66,6 +66,13 @@ def _fake_live_credentials(self):
     self.status_reason = "credentials_loaded"
 
 
+def _missing_live_credentials(self):
+    self.signer = None
+    self.agent_wallet_address = None
+    self.public_address = None
+    self.status_reason = "missing_agent_wallet_signer"
+
+
 def _load_live_preflight_script():
     script_path = os.path.join(os.getcwd(), "scripts", "run_live_preflight.py")
     spec = importlib.util.spec_from_file_location("test_run_live_preflight", script_path)
@@ -312,6 +319,18 @@ def test_run_reporting_skips_false_positive_stale_warning(monkeypatch):
     run_reporting(container, cycle_count=1, health_registry=FakeHealth())
 
     assert warnings == []
+
+
+def test_strategy_scorer_reports_warming_up_when_no_strategies(monkeypatch):
+    from src.analysis.strategy_scorer import StrategyScorer
+
+    monkeypatch.setattr(db, "get_active_strategies", lambda: [])
+
+    report = StrategyScorer().generate_improvement_report()
+
+    assert report["status"] == "no_strategies_tracked"
+    assert report["health"] == "warming_up"
+    assert report["message"] == "No strategies tracked yet"
 
 
 def test_run_reporting_executes_daily_research_loop_on_daily_cadence(monkeypatch):
@@ -799,6 +818,24 @@ def test_live_trader_warns_when_activation_is_near_expiry(monkeypatch):
     assert activation["deployable"] is True
     assert "approval_expiring_soon" in activation["warning_checks"]
     assert activation["hours_remaining"] < 4.0
+
+
+def test_live_trader_stats_separate_live_requested_from_enabled(monkeypatch):
+    monkeypatch.setattr(config, "LIVE_TRADING_ENABLED", True)
+    monkeypatch.setattr(config, "LIVE_PREFLIGHT_REQUIRED", True)
+    monkeypatch.setattr(config, "LIVE_ACTIVATION_GUARD_ENABLED", True)
+    monkeypatch.setattr(LiveTrader, "_load_credentials", _missing_live_credentials)
+    monkeypatch.setattr(LiveTrader, "_load_asset_index_map", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "reconcile_positions", lambda self: None)
+
+    trader = LiveTrader(firewall=DecisionFirewall({"min_confidence": 0.4}), dry_run=False, max_order_usd=1_000_000)
+    stats = trader.get_stats()
+
+    assert stats["live_requested"] is True
+    assert stats["live_enabled"] is False
+    assert stats["dry_run"] is True
+    assert trader.is_live_requested() is True
+    assert trader.is_live_enabled() is False
 
 
 def test_execute_signal_blocks_when_activation_guard_is_not_ready(monkeypatch):
@@ -5017,6 +5054,116 @@ def test_run_trading_cycle_does_not_fall_through_to_standalone_options_flow(monk
     run_trading_cycle(container, 1)
 
 
+def test_run_trading_cycle_logs_pipeline_and_no_trade_diagnostics(monkeypatch):
+    infos = []
+    warnings = []
+
+    class FakeScorer:
+        def score_all_strategies(self):
+            return []
+
+        def get_top_strategies(self):
+            return [
+                {
+                    "name": "base_btc",
+                    "strategy_type": "trend_following",
+                    "current_score": 0.81,
+                    "confidence": 0.72,
+                    "parameters": {"coins": ["BTC"]},
+                    "metadata": {"source": "strategy"},
+                }
+            ]
+
+    class FakeRegimeDetector:
+        def get_market_regime(self):
+            return {"overall_regime": "ranging", "overall_confidence": 0.6}
+
+    class FakeRegimeFilter:
+        def filter(self, strategies, regime_data):
+            return []
+
+    class FakeOptionsScanner:
+        top_convictions = [
+            {
+                "ticker": "ETH",
+                "direction": "bullish",
+                "conviction_pct": 70,
+                "net_flow": 75000.0,
+                "total_prints": 2,
+            }
+        ]
+
+        def scan_flow(self):
+            return {"unusual_prints": 2, "top_convictions": 1}
+
+    class FakePaperTrader:
+        def check_open_positions(self):
+            return []
+
+    class FakeDecisionEngine:
+        def decide(self, strategies, **kwargs):
+            return []
+
+        def get_last_cycle_summary(self):
+            return {
+                "source_counts": {},
+                "blocker_counts": {},
+                "no_trade_reason": "no candidates",
+            }
+
+    container = type(
+        "Container",
+        (),
+        {
+            "live_trader": None,
+            "scorer": FakeScorer(),
+            "exchange_agg": None,
+            "options_scanner": FakeOptionsScanner(),
+            "regime_detector": FakeRegimeDetector(),
+            "regime_strategy_filter": FakeRegimeFilter(),
+            "signal_processor": None,
+            "polymarket": None,
+            "predictive_forecaster": None,
+            "cross_venue_hedger": None,
+            "liquidation_strategy": None,
+            "paper_trader": FakePaperTrader(),
+            "firewall": None,
+            "position_monitor": None,
+            "copy_trader": None,
+            "arena": None,
+            "decision_engine": FakeDecisionEngine(),
+            "kelly_sizer": None,
+            "multi_scanner": None,
+            "agent_scorer": None,
+            "calibration": None,
+            "shadow_tracker": None,
+        },
+    )()
+
+    monkeypatch.setattr("src.core.cycles.trading_cycle._run_multi_exchange_scan", lambda container: ({}, []))
+    monkeypatch.setattr("src.core.cycles.trading_cycle._run_liquidation_scan", lambda container, regime_data: [])
+    monkeypatch.setattr("src.core.cycles.trading_cycle._gather_copy_trade_signals", lambda container: [])
+    monkeypatch.setattr("src.core.cycles.trading_cycle._process_copy_trade_closures", lambda *args, **kwargs: None)
+    monkeypatch.setattr("src.core.cycles.trading_cycle._run_alpha_arena", lambda container, regime_data: [])
+    monkeypatch.setattr("src.core.cycles.trading_cycle._run_cross_venue_confirmation", lambda container, strategies: None)
+    monkeypatch.setattr("src.core.cycles.trading_cycle._apply_agent_scorer_weights", lambda container, strategies: None)
+    monkeypatch.setattr("src.core.cycles.trading_cycle._apply_calibration_adjustments", lambda container, strategies: None)
+    monkeypatch.setattr("src.core.cycles.trading_cycle._execute_selected_decisions", lambda container, selected_strategies, regime_data: None)
+    monkeypatch.setattr("src.core.cycles.trading_cycle._collect_closed_trade_events", lambda container, closed: [])
+    monkeypatch.setattr("src.core.cycles.trading_cycle._process_closed_trades", lambda container, closed: None)
+    monkeypatch.setattr("src.core.cycles.trading_cycle.get_execution_open_positions", lambda container: [])
+    monkeypatch.setattr("src.notifications.telegram_bot.is_configured", lambda: False)
+    monkeypatch.setattr("src.core.cycles.trading_cycle.logger.info", lambda msg, *args: infos.append(msg % args if args else msg))
+    monkeypatch.setattr("src.core.cycles.trading_cycle.logger.warning", lambda msg, *args: warnings.append(msg % args if args else msg))
+
+    run_trading_cycle(container, 1)
+
+    assert any("Regime filter removed all 1 base strategies" in entry for entry in warnings)
+    assert any("Options flow not injected:" in entry for entry in infos)
+    assert any("Candidate pipeline empty after upstream filters" in entry for entry in warnings)
+    assert any("NoTradeSummary:" in entry for entry in infos)
+
+
 def test_run_alpha_arena_returns_rankable_candidates(monkeypatch):
     class FakeResponse:
         status_code = 200
@@ -7132,6 +7279,38 @@ def test_runtime_incident_report_collects_blocking_states():
     assert "adaptive_source_demotions:recal-22" in keys
 
 
+def test_runtime_incident_report_labels_disabled_activation_guard_clearly():
+    class FakeLiveTrader:
+        def get_stats(self):
+            return {
+                "live_requested": True,
+                "live_enabled": True,
+                "kill_switch_active": False,
+                "preflight": {
+                    "deployable": True,
+                    "status": "ready",
+                    "blocking_checks": [],
+                    "warning_checks": [],
+                },
+                "activation_guard": {
+                    "deployable": True,
+                    "status": "disabled",
+                    "approved_by": "",
+                    "approved_at": None,
+                    "expires_at": None,
+                    "blocking_checks": [],
+                    "warning_checks": ["activation_guard_enabled"],
+                },
+                "live_readiness": {"status": "ready", "status_reason": "ready"},
+            }
+
+    report = build_runtime_incident_report(live_trader=FakeLiveTrader(), max_items=8)
+    keys = {item["key"] for item in report["incidents"]}
+
+    assert "live_activation_guard_disabled" in keys
+    assert "live_activation_warning" not in keys
+
+
 def test_dashboard_runtime_incident_metrics_include_summary():
     class FakeLiveTrader:
         def get_stats(self):
@@ -7369,6 +7548,61 @@ def test_decision_engine_blocks_candidate_when_capital_governor_blocked():
     assert candidate["_capital_governor"]["status"] == "blocked"
     assert "capital_governor_guard" in engine._decision_blockers(candidate)
     assert engine.get_stats()["total_capital_blocks"] >= 1
+
+
+def test_decision_engine_records_no_trade_summary_with_blockers(monkeypatch):
+    logs = []
+    monkeypatch.setattr(
+        "src.signals.decision_engine.logger.info",
+        lambda msg, *args: logs.append(msg % args if args else msg),
+    )
+
+    engine = DecisionEngine(
+        {
+            "min_decision_score": 0.0,
+            "min_signal_confidence": 0.90,
+            "min_source_weight": 0.2,
+            "min_expected_value_pct": -1.0,
+            "execution_quality_enabled": False,
+            "adaptive_learning_enabled": False,
+            "context_performance_enabled": False,
+            "confluence_enabled": False,
+            "calibration_enabled": False,
+            "memory_enabled": False,
+            "divergence_enabled": False,
+            "capital_governor_enabled": False,
+        }
+    )
+
+    candidate = {
+        "name": "confidence_blocked",
+        "source": "strategy",
+        "source_key": "strategy:trend_following:BTC",
+        "strategy_type": "trend_following",
+        "current_score": 0.84,
+        "confidence": 0.55,
+        "source_accuracy": 0.74,
+        "entry_price": 100.0,
+        "stop_loss": 97.0,
+        "take_profit": 108.0,
+        "parameters": {"coins": ["BTC"], "direction": "long"},
+        "metadata": {"source": "strategy", "source_key": "strategy:trend_following:BTC"},
+    }
+
+    selected = engine.decide(
+        [candidate],
+        regime_data={"overall_regime": "trending_up", "overall_confidence": 0.8},
+        open_positions=[],
+        kelly_stats={},
+    )
+
+    summary = engine.get_last_cycle_summary()
+
+    assert selected == []
+    assert summary["no_trade_reason"] == "blocked"
+    assert summary["source_counts"]["strategy"] == 1
+    assert summary["blocker_counts"]["confidence<0.90"] == 1
+    assert any("WhyNoTrade:" in entry for entry in logs)
 
 
 def test_decision_engine_blocks_candidate_when_operator_risk_off_is_active():
