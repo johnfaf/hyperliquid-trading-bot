@@ -46,6 +46,10 @@ def run_reporting(container, cycle_count: int, health_registry=None) -> None:
         from src.analysis.daily_research_loop import run_daily_research_loop
     except ImportError:
         run_daily_research_loop = None
+    try:
+        from src.analysis.shadow_certification import run_shadow_certification
+    except ImportError:
+        run_shadow_certification = None
 
     # ── Phase 6: Status ──
     logger.info("Phase 6: Status Update")
@@ -292,6 +296,29 @@ def run_reporting(container, cycle_count: int, health_registry=None) -> None:
             )
     except Exception as exc:
         logger.debug("  Daily research loop error: %s", exc)
+
+    try:
+        if (
+            run_shadow_certification
+            and getattr(config, "SHADOW_CERTIFICATION_ENABLED", True)
+            and cycle_count % cycles_per_day == 0
+        ):
+            shadow_cert = run_shadow_certification(
+                shadow_tracker=getattr(container, "shadow_tracker", None),
+                live_trader=getattr(container, "live_trader", None),
+                divergence_controller=getattr(container, "divergence_controller", None),
+                capital_governor=getattr(container, "capital_governor", None),
+                adaptive_learning=getattr(container, "adaptive_learning", None),
+            )
+            logger.info(
+                "  ShadowCertification: %s (certified=%s, shadow_trades=%d, readiness_interruptions=%d)",
+                shadow_cert.get("status", "warming_up"),
+                shadow_cert.get("certified", False),
+                int((shadow_cert.get("shadow_summary", {}) or {}).get("total_trades", 0) or 0),
+                int((shadow_cert.get("readiness_interruptions", {}) or {}).get("count", 0) or 0),
+            )
+    except Exception as exc:
+        logger.debug("  Shadow certification error: %s", exc)
 
     # ── HTML report (daily) ──
     try:

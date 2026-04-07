@@ -481,6 +481,17 @@ def init_db():
         );
         CREATE INDEX IF NOT EXISTS idx_daily_research_runs_timestamp
             ON daily_research_runs(timestamp);
+
+        CREATE TABLE IF NOT EXISTS shadow_certification_runs (
+            run_id TEXT PRIMARY KEY,
+            timestamp TEXT NOT NULL,
+            lookback_days INTEGER DEFAULT 7,
+            status TEXT DEFAULT 'warming_up',
+            certified INTEGER DEFAULT 0,
+            metadata TEXT DEFAULT '{}'
+        );
+        CREATE INDEX IF NOT EXISTS idx_shadow_certification_runs_timestamp
+            ON shadow_certification_runs(timestamp);
         """)
 
 
@@ -2288,6 +2299,87 @@ def get_daily_research_last_known_good() -> dict:
         return json.loads(row["value"] or "{}")
     except Exception:
         return {}
+
+
+def save_shadow_certification_run(payload: dict) -> str:
+    timestamp = _normalize_live_timestamp(payload.get("timestamp"))
+    status = str(payload.get("status", "warming_up") or "warming_up").strip().lower()
+    certified = 1 if bool(payload.get("certified", False)) else 0
+    lookback_days = int(payload.get("lookback_days", 7) or 7)
+    default_key = f"{timestamp}:{status}:{lookback_days}:{certified}"
+    run_id = str(
+        payload.get("run_id")
+        or f"shadow-cert:{hashlib.sha256(default_key.encode()).hexdigest()[:16]}"
+    )
+    metadata = payload.get("metadata", {}) or {}
+
+    with get_connection() as conn:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO shadow_certification_runs
+            (run_id, timestamp, lookback_days, status, certified, metadata)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                run_id,
+                timestamp,
+                lookback_days,
+                status,
+                certified,
+                json.dumps(metadata, sort_keys=True, default=str),
+            ),
+        )
+    return run_id
+
+
+def get_latest_shadow_certification_run() -> dict:
+    try:
+        with get_connection() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM shadow_certification_runs
+                ORDER BY timestamp DESC, run_id DESC
+                LIMIT 1
+                """
+            ).fetchone()
+    except sqlite3.OperationalError:
+        return {}
+
+    if not row:
+        return {}
+    payload = dict(row)
+    payload["certified"] = bool(payload.get("certified", 0))
+    try:
+        payload["metadata"] = json.loads(payload.get("metadata") or "{}")
+    except Exception:
+        payload["metadata"] = {}
+    return payload
+
+
+def get_recent_shadow_certification_runs(limit: int = 10) -> list:
+    try:
+        with get_connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM shadow_certification_runs
+                ORDER BY timestamp DESC, run_id DESC
+                LIMIT ?
+                """,
+                (int(limit),),
+            ).fetchall()
+    except sqlite3.OperationalError:
+        return []
+
+    results = []
+    for row in rows:
+        payload = dict(row)
+        payload["certified"] = bool(payload.get("certified", 0))
+        try:
+            payload["metadata"] = json.loads(payload.get("metadata") or "{}")
+        except Exception:
+            payload["metadata"] = {}
+        results.append(payload)
+    return results
 
 
 def get_runtime_divergence_summary(lookback_hours: float = 24.0) -> dict:

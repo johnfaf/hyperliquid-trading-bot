@@ -12,7 +12,9 @@ from datetime import datetime, timedelta, timezone
 import config
 import main
 import src.analysis.daily_research_loop as daily_research_module
+import src.analysis.shadow_certification as shadow_certification_module
 from src.analysis.daily_research_loop import DailyResearchLoop
+from src.analysis.shadow_certification import build_shadow_certification_report
 from src.analysis.experiment_discipline import build_experiment_benchmark_pack
 from src.core import boot
 from src.core.incident_visibility import build_runtime_incident_report
@@ -76,6 +78,15 @@ def _load_live_preflight_script():
 def _load_daily_research_script():
     script_path = os.path.join(os.getcwd(), "scripts", "run_daily_research_loop.py")
     spec = importlib.util.spec_from_file_location("test_run_daily_research_loop", script_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_shadow_certification_script():
+    script_path = os.path.join(os.getcwd(), "scripts", "run_shadow_certification.py")
+    spec = importlib.util.spec_from_file_location("test_run_shadow_certification", script_path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -351,6 +362,56 @@ def test_run_reporting_executes_daily_research_loop_on_daily_cadence(monkeypatch
     assert runs[0]["cycle_count"] == 24
     assert runs[0]["force"] is True
     assert any("DailyResearch: hold" in entry for entry in infos)
+
+
+def test_run_reporting_executes_shadow_certification_on_daily_cadence(monkeypatch):
+    runs = []
+    infos = []
+    container = type(
+        "Container",
+        (),
+        {
+            "reporter": None,
+            "paper_trader": None,
+            "shadow_tracker": object(),
+            "cross_venue_hedger": None,
+            "scorer": None,
+            "adaptive_learning": object(),
+            "live_trader": object(),
+            "divergence_controller": object(),
+            "capital_governor": object(),
+        },
+    )()
+
+    monkeypatch.setattr(config, "TRADING_CYCLE_INTERVAL", 3600)
+    monkeypatch.setattr(config, "DAILY_RESEARCH_LOOP_ENABLED", False)
+    monkeypatch.setattr(config, "SHADOW_CERTIFICATION_ENABLED", True)
+    monkeypatch.setattr("src.core.cycles.reporting_cycle._log_module_stats", lambda container: None)
+    monkeypatch.setattr("src.core.cycles.reporting_cycle.backup_to_json", lambda: None)
+    monkeypatch.setattr(
+        "src.core.cycles.reporting_cycle.build_runtime_incident_report",
+        lambda **kwargs: {"summary": {}, "incidents": []},
+    )
+    monkeypatch.setattr(
+        "src.analysis.shadow_certification.run_shadow_certification",
+        lambda **kwargs: runs.append(kwargs) or {
+            "status": "failed",
+            "certified": False,
+            "shadow_summary": {"total_trades": 12},
+            "readiness_interruptions": {"count": 1},
+        },
+    )
+    monkeypatch.setattr(
+        "src.core.cycles.reporting_cycle.logger.info",
+        lambda msg, *args: infos.append(msg % args if args else msg),
+    )
+
+    run_reporting(container, cycle_count=24, health_registry=None)
+
+    assert len(runs) == 1
+    assert runs[0]["shadow_tracker"] is container.shadow_tracker
+    assert runs[0]["live_trader"] is container.live_trader
+    assert any("ShadowCertification: failed" in entry for entry in infos)
 
 
 def test_live_trader_coerces_execution_dict_and_uses_live_firewall_state(monkeypatch):
@@ -970,6 +1031,34 @@ def test_run_daily_research_loop_script_writes_output(monkeypatch, capsys, tmp_p
     with open(output_path, "r", encoding="utf-8") as handle:
         report = json.load(handle)
     assert report["run_id"] == "daily-24"
+
+
+def test_run_shadow_certification_script_returns_nonzero_until_certified(monkeypatch, capsys, tmp_path):
+    script = _load_shadow_certification_script()
+    output_path = tmp_path / "shadow_certification.json"
+
+    monkeypatch.setattr(script.db, "init_db", lambda: None)
+    monkeypatch.setattr(script, "ShadowTracker", lambda: "shadow-tracker")
+    monkeypatch.setattr(
+        script,
+        "run_shadow_certification",
+        lambda **kwargs: {
+            "run_id": "shadow-25",
+            "status": "failed",
+            "certified": False,
+            "summary": "Shadow certification failed checks: slippage_drift_bps",
+            "blocked_entry_reasons": {"capital_governor_guard": 4},
+        },
+    )
+
+    rc = script.main(["--output", str(output_path)])
+    captured = capsys.readouterr()
+
+    assert rc == 1
+    assert "Certified: False" in captured.out
+    with open(output_path, "r", encoding="utf-8") as handle:
+        report = json.load(handle)
+    assert report["run_id"] == "shadow-25"
 
 
 def test_post_order_routes_exchange_requests_through_api_manager(monkeypatch):
@@ -1697,6 +1786,16 @@ def test_dashboard_experiment_discipline_metrics_include_report_and_shadow(monke
         "get_daily_research_last_known_good",
         lambda: {"profile_name": "challenger_execution_strict"},
     )
+    monkeypatch.setattr(
+        dashboard_ui.db,
+        "get_latest_shadow_certification_run",
+        lambda: {"run_id": "shadow-1", "status": "failed", "certified": False},
+    )
+    monkeypatch.setattr(
+        dashboard_ui.db,
+        "get_recent_shadow_certification_runs",
+        lambda limit=10: [{"run_id": "shadow-1"}, {"run_id": "shadow-0"}],
+    )
 
     class FakeShadowTracker:
         def get_attribution(self, days=7):
@@ -1711,6 +1810,8 @@ def test_dashboard_experiment_discipline_metrics_include_report_and_shadow(monke
     assert metrics["daily_research_latest"]["run_id"] == "daily-1"
     assert metrics["daily_research_recent"][0]["run_id"] == "daily-1"
     assert metrics["daily_research_last_known_good"]["profile_name"] == "challenger_execution_strict"
+    assert metrics["shadow_certification_latest"]["run_id"] == "shadow-1"
+    assert metrics["shadow_certification_recent"][0]["run_id"] == "shadow-1"
     assert metrics["shadow_attribution"]["strategy:trend"]["trades"] == 5
 
     os.remove(report_path)
@@ -1851,6 +1952,184 @@ def test_daily_research_loop_recommends_rollback_when_benchmark_regresses(monkey
         monkeypatch.setattr(db, "_DB_PATH", original_path)
         if os.path.exists(db_path):
             os.remove(db_path)
+
+
+def test_shadow_certification_report_flags_failure_when_thresholds_are_breached(monkeypatch):
+    monkeypatch.setattr(
+        shadow_certification_module.db,
+        "get_runtime_divergence_summary",
+        lambda lookback_hours=24.0 * 7: {
+            "paper_live_open_gap_ratio": 0.52,
+            "realized_pnl_gap_ratio": 0.48,
+        },
+    )
+    monkeypatch.setattr(
+        shadow_certification_module.db,
+        "get_decision_funnel_summary",
+        lambda limit_cycles=10: {
+            "blocker_mix": {"capital_governor_guard": 4, "net_ev<0.0015": 3},
+        },
+    )
+    monkeypatch.setattr(
+        shadow_certification_module.db,
+        "get_source_attribution_summary",
+        lambda limit_cycles=10, lookback_hours=24.0 * 7: [{"source_key": "options_flow:BTC", "selected_count": 4}],
+    )
+    monkeypatch.setattr(
+        shadow_certification_module.db,
+        "get_execution_quality_summary",
+        lambda lookback_hours=24.0 * 7: {
+            "avg_realized_slippage_bps": 4.5,
+            "avg_expected_slippage_bps": 1.2,
+        },
+    )
+    monkeypatch.setattr(
+        shadow_certification_module.db,
+        "get_execution_quality_by_source",
+        lambda lookback_hours=24.0 * 7, limit=10: [{"source_key": "options_flow:BTC", "rejection_rate": 0.2}],
+    )
+    monkeypatch.setattr(
+        shadow_certification_module.db,
+        "get_capital_governor_summary",
+        lambda lookback_hours=24.0 * 7: {"degraded_source_ratio": 0.42},
+    )
+    monkeypatch.setattr(
+        shadow_certification_module.db,
+        "get_latest_source_health_snapshot",
+        lambda limit=25: {
+            "snapshot": {"snapshot_id": "snap-25"},
+            "profiles": [{"source_key": "options_flow:BTC", "status": "blocked", "health_score": 0.31}],
+        },
+    )
+    monkeypatch.setattr(
+        shadow_certification_module.db,
+        "get_latest_daily_research_run",
+        lambda: {"run_id": "daily-24", "recommendation": "hold"},
+    )
+    monkeypatch.setattr(
+        shadow_certification_module.db,
+        "get_recent_shadow_certification_runs",
+        lambda limit=10: [
+            {
+                "timestamp": utc_now_iso(),
+                "metadata": {"incident_keys": ["live_preflight_blocked"]},
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        shadow_certification_module,
+        "build_runtime_incident_report",
+        lambda **kwargs: {"summary": {}, "incidents": [{"key": "live_activation_blocked"}]},
+    )
+
+    class FakeShadowTracker:
+        def get_summary(self, days=7):
+            return {"total_trades": 15, "total_pnl": 42.0}
+
+        def get_attribution(self, days=7):
+            return {"options_flow:BTC": {"trades": 8, "pnl": 22.5}}
+
+    report = build_shadow_certification_report(
+        cfg={
+            "enabled": True,
+            "lookback_days": 7,
+            "limit_cycles": 10,
+            "report_path": "",
+            "min_shadow_trades": 10,
+            "max_open_gap_ratio": 0.40,
+            "max_realized_pnl_gap_ratio": 0.45,
+            "max_slippage_drift_bps": 2.0,
+            "max_degraded_source_ratio": 0.35,
+            "max_readiness_interruption_runs": 0,
+        },
+        shadow_tracker=FakeShadowTracker(),
+    )
+
+    assert report["status"] == "failed"
+    assert report["certified"] is False
+    assert "paper_live_open_gap_ratio" in report["summary"]
+    assert report["blocked_entry_reasons"]["capital_governor_guard"] == 4
+    assert report["readiness_interruptions"]["count"] == 2
+
+
+def test_shadow_certification_report_warms_up_with_insufficient_trades(monkeypatch):
+    monkeypatch.setattr(
+        shadow_certification_module.db,
+        "get_runtime_divergence_summary",
+        lambda lookback_hours=24.0 * 7: {"paper_live_open_gap_ratio": 0.05, "realized_pnl_gap_ratio": 0.02},
+    )
+    monkeypatch.setattr(
+        shadow_certification_module.db,
+        "get_decision_funnel_summary",
+        lambda limit_cycles=10: {"blocker_mix": {}},
+    )
+    monkeypatch.setattr(
+        shadow_certification_module.db,
+        "get_source_attribution_summary",
+        lambda limit_cycles=10, lookback_hours=24.0 * 7: [],
+    )
+    monkeypatch.setattr(
+        shadow_certification_module.db,
+        "get_execution_quality_summary",
+        lambda lookback_hours=24.0 * 7: {"avg_realized_slippage_bps": 1.0, "avg_expected_slippage_bps": 1.0},
+    )
+    monkeypatch.setattr(
+        shadow_certification_module.db,
+        "get_execution_quality_by_source",
+        lambda lookback_hours=24.0 * 7, limit=10: [],
+    )
+    monkeypatch.setattr(
+        shadow_certification_module.db,
+        "get_capital_governor_summary",
+        lambda lookback_hours=24.0 * 7: {"degraded_source_ratio": 0.10},
+    )
+    monkeypatch.setattr(
+        shadow_certification_module.db,
+        "get_latest_source_health_snapshot",
+        lambda limit=25: {"snapshot": {}, "profiles": []},
+    )
+    monkeypatch.setattr(
+        shadow_certification_module.db,
+        "get_latest_daily_research_run",
+        lambda: {},
+    )
+    monkeypatch.setattr(
+        shadow_certification_module.db,
+        "get_recent_shadow_certification_runs",
+        lambda limit=10: [],
+    )
+    monkeypatch.setattr(
+        shadow_certification_module,
+        "build_runtime_incident_report",
+        lambda **kwargs: {"summary": {}, "incidents": []},
+    )
+
+    class FakeShadowTracker:
+        def get_summary(self, days=7):
+            return {"total_trades": 4, "total_pnl": 8.0}
+
+        def get_attribution(self, days=7):
+            return {}
+
+    report = build_shadow_certification_report(
+        cfg={
+            "enabled": True,
+            "lookback_days": 7,
+            "limit_cycles": 10,
+            "report_path": "",
+            "min_shadow_trades": 10,
+            "max_open_gap_ratio": 0.40,
+            "max_realized_pnl_gap_ratio": 0.45,
+            "max_slippage_drift_bps": 2.0,
+            "max_degraded_source_ratio": 0.35,
+            "max_readiness_interruption_runs": 0,
+        },
+        shadow_tracker=FakeShadowTracker(),
+    )
+
+    assert report["status"] == "warming_up"
+    assert report["certified"] is False
+    assert "warming up" in report["summary"]
 
 
 def test_live_ledger_helpers_persist_snapshots_and_deduplicate_fills(monkeypatch):

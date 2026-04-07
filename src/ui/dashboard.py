@@ -466,6 +466,8 @@ def _build_experiment_discipline_metrics(shadow_tracker=None) -> Dict:
         "daily_research_latest": db.get_latest_daily_research_run(),
         "daily_research_recent": db.get_recent_daily_research_runs(limit=10),
         "daily_research_last_known_good": db.get_daily_research_last_known_good(),
+        "shadow_certification_latest": db.get_latest_shadow_certification_run(),
+        "shadow_certification_recent": db.get_recent_shadow_certification_runs(limit=10),
     }
 
     if shadow_tracker:

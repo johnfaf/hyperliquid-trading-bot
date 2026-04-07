@@ -173,6 +173,13 @@ This branch is the staged upgrade path for making the bot more measurable, more 
 - Persist daily research runs, benchmark deltas, and the last known good parameter state for auditability and rollback safety.
 - Emit a promote, hold, or rollback recommendation so the research loop produces a review-ready daily decision.
 
+## Phase 25: Shadow Certification
+
+- Status: shipped on `codex/live-ledger-foundation`
+- Produce a repeatable shadow-certification pack over the last 7 days instead of relying on ad hoc log inspection.
+- Track paper-vs-live divergence, source degradation, slippage drift, readiness interruptions, and blocked-entry reasons in one persisted report.
+- Emit a clear certified / warming-up / failed outcome so the shadow run can become a formal gate before capital ramp decisions.
+
 ## Branch Operating Rule
 
 Each phase should be landed in a reviewable commit with tests before moving to the next phase.
