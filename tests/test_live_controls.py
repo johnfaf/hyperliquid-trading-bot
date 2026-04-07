@@ -12,6 +12,7 @@ import config
 import main
 from src.analysis.experiment_discipline import build_experiment_benchmark_pack
 from src.core import boot
+from src.core.incident_visibility import build_runtime_incident_report
 from src.core.time_utils import utc_now, utc_now_iso, utc_now_naive
 from src.core.api_manager import Priority
 from src.core.cycles.reporting_cycle import run_reporting
@@ -50,6 +51,7 @@ from src.trading.live_trader import (
 )
 from src.trading.portfolio_rotation import PortfolioRotationManager, RotationDecision
 from src.ui import dashboard as dashboard_ui
+from src.notifications import telegram_alerts
 
 
 def _fake_live_credentials(self):
@@ -6218,6 +6220,181 @@ def test_dashboard_capital_governor_metrics_include_runtime(monkeypatch):
     assert metrics["runtime"]["runtime"]["status"] == "caution"
     assert metrics["operator_override"]["enabled"] is True
     assert metrics["operator_override"]["reason"] == "manual review"
+
+
+def test_runtime_incident_report_collects_blocking_states():
+    class FakeLiveTrader:
+        def get_stats(self):
+            return {
+                "live_enabled": True,
+                "kill_switch_active": True,
+                "status_reason": "kill_switch_active",
+                "preflight": {
+                    "deployable": False,
+                    "status": "blocked",
+                    "blocking_checks": ["account_reachability"],
+                    "warning_checks": [],
+                },
+                "activation_guard": {
+                    "deployable": False,
+                    "status": "expired",
+                    "approved_by": "ops",
+                    "approved_at": "2026-04-07T00:00:00+00:00",
+                    "expires_at": "2026-04-08T00:00:00+00:00",
+                    "blocking_checks": ["approval_stale"],
+                    "warning_checks": [],
+                },
+                "live_readiness": {
+                    "status": "blocked",
+                    "status_reason": "preflight:account_reachability",
+                },
+            }
+
+    class FakeDivergence:
+        def get_dashboard_payload(self, limit=8):
+            return {
+                "tracked_sources": 4,
+                "global": {
+                    "status": "blocked",
+                    "reasons": ["global_execution_gap_block"],
+                },
+                "profiles": [{"scope_key": "options_flow:BTC", "status": "blocked"}],
+            }
+
+    class FakeGovernor:
+        def get_dashboard_payload(self):
+            return {
+                "runtime": {
+                    "status": "blocked",
+                    "reasons": ["divergence_runtime_block"],
+                    "metrics": {"live_current_drawdown_pct": 0.07},
+                }
+            }
+
+    class FakeAdaptive:
+        def get_dashboard_payload(self, limit=10):
+            return {
+                "recalibration": {
+                    "run_id": "recal-22",
+                    "demoted_count": 2,
+                    "promoted_count": 1,
+                    "transition_count": 3,
+                }
+            }
+
+    report = build_runtime_incident_report(
+        live_trader=FakeLiveTrader(),
+        divergence_controller=FakeDivergence(),
+        capital_governor=FakeGovernor(),
+        adaptive_learning=FakeAdaptive(),
+        max_items=12,
+    )
+
+    keys = {item["key"] for item in report["incidents"]}
+
+    assert report["summary"]["critical_count"] >= 4
+    assert report["summary"]["blocking_count"] >= 4
+    assert "live_kill_switch_active" in keys
+    assert "live_preflight_blocked" in keys
+    assert "live_activation_blocked" in keys
+    assert "divergence_runtime_blocked" in keys
+    assert "capital_governor_blocked" in keys
+    assert "adaptive_source_demotions:recal-22" in keys
+
+
+def test_dashboard_runtime_incident_metrics_include_summary():
+    class FakeLiveTrader:
+        def get_stats(self):
+            return {
+                "live_enabled": True,
+                "kill_switch_active": False,
+                "preflight": {
+                    "deployable": True,
+                    "status": "ready",
+                    "blocking_checks": [],
+                    "warning_checks": [],
+                },
+                "activation_guard": {
+                    "deployable": True,
+                    "status": "ready",
+                    "approved_by": "ops",
+                    "expires_at": "2026-04-08T00:00:00+00:00",
+                    "hours_remaining": 2.5,
+                    "blocking_checks": [],
+                    "warning_checks": ["approval_expiring_soon"],
+                },
+                "live_readiness": {"status": "ready", "status_reason": "ready"},
+            }
+
+    class FakeDivergence:
+        def get_dashboard_payload(self, limit=8):
+            return {
+                "tracked_sources": 3,
+                "global": {"status": "caution", "reasons": ["global_open_gap_caution"]},
+                "profiles": [{"scope_key": "polymarket:BTC", "status": "caution"}],
+            }
+
+    class FakeGovernor:
+        def get_dashboard_payload(self):
+            return {
+                "runtime": {
+                    "status": "caution",
+                    "reasons": ["paper_drawdown_caution"],
+                    "metrics": {"paper_current_drawdown_pct": 0.03},
+                }
+            }
+
+    class FakeAdaptive:
+        def get_dashboard_payload(self, limit=10):
+            return {
+                "recalibration": {
+                    "run_id": "recal-23",
+                    "demoted_count": 1,
+                    "promoted_count": 0,
+                    "transition_count": 1,
+                }
+            }
+
+    metrics = dashboard_ui._build_runtime_incident_metrics(
+        live_trader=FakeLiveTrader(),
+        divergence_controller=FakeDivergence(),
+        capital_governor=FakeGovernor(),
+        adaptive_learning=FakeAdaptive(),
+    )
+
+    assert metrics["summary"]["overall_status"] == "warning"
+    assert metrics["summary"]["total_incidents"] == 4
+    assert metrics["incidents"][0]["severity"] in {"critical", "warning"}
+    assert any(item["key"] == "live_activation_warning" for item in metrics["incidents"])
+
+
+def test_runtime_incident_telegram_alerts_are_deduplicated(monkeypatch):
+    sent_messages = []
+
+    monkeypatch.setattr(config, "RUNTIME_INCIDENT_TELEGRAM_ENABLED", True)
+    monkeypatch.setattr(config, "RUNTIME_INCIDENT_TELEGRAM_MAX_ALERTS", 3)
+    monkeypatch.setattr(config, "RUNTIME_INCIDENT_TELEGRAM_COOLDOWN_MINUTES", 60.0)
+    monkeypatch.setattr(telegram_alerts, "_RUNTIME_INCIDENT_ALERT_CACHE", {})
+    monkeypatch.setattr(telegram_alerts, "is_configured", lambda: True)
+    monkeypatch.setattr(
+        telegram_alerts,
+        "_send_message",
+        lambda text, parse_mode="HTML", disable_preview=True: sent_messages.append(text) or True,
+    )
+
+    incident = {
+        "key": "capital_governor_blocked",
+        "severity": "critical",
+        "source": "capital_governor",
+        "status": "blocked",
+        "blocking": True,
+        "title": "Capital governor blocked entries",
+        "summary": "Global capital posture is risk-off.",
+    }
+
+    assert telegram_alerts.send_runtime_incident_alerts([incident]) is True
+    assert telegram_alerts.send_runtime_incident_alerts([incident]) is False
+    assert len(sent_messages) == 1
 
 
 def test_capital_governor_enters_risk_off_on_live_drawdown(monkeypatch):

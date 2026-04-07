@@ -211,6 +211,17 @@ OPERATOR_RISK_OFF_ENABLED = os.environ.get(
 OPERATOR_RISK_OFF_REASON = os.environ.get("OPERATOR_RISK_OFF_REASON", "").strip()
 OPERATOR_RISK_OFF_SET_BY = os.environ.get("OPERATOR_RISK_OFF_SET_BY", "").strip()
 OPERATOR_RISK_OFF_SET_AT = os.environ.get("OPERATOR_RISK_OFF_SET_AT", "").strip()
+RUNTIME_INCIDENT_MAX_ITEMS = int(os.environ.get("RUNTIME_INCIDENT_MAX_ITEMS", 8))
+RUNTIME_INCIDENT_TELEGRAM_ENABLED = os.environ.get(
+    "RUNTIME_INCIDENT_TELEGRAM_ENABLED",
+    "true",
+).lower() in ("true", "1", "yes")
+RUNTIME_INCIDENT_TELEGRAM_MAX_ALERTS = int(
+    os.environ.get("RUNTIME_INCIDENT_TELEGRAM_MAX_ALERTS", 4)
+)
+RUNTIME_INCIDENT_TELEGRAM_COOLDOWN_MINUTES = float(
+    os.environ.get("RUNTIME_INCIDENT_TELEGRAM_COOLDOWN_MINUTES", 30.0)
+)
 HL_WALLET_MODE = os.environ.get("HL_WALLET_MODE", "agent_only").strip().lower()
 SECRET_MANAGER_PROVIDER = os.environ.get(
     "SECRET_MANAGER_PROVIDER", "none"

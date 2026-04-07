@@ -19,13 +19,16 @@ Functions:
 
 import logging
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List
 from collections import defaultdict
 
+import config
+from src.core.time_utils import utc_now, utc_now_iso
 from src.notifications.telegram_bot import _send_message, is_configured
 from src.data import database as db
 
 logger = logging.getLogger(__name__)
+_RUNTIME_INCIDENT_ALERT_CACHE: Dict[str, datetime] = {}
 
 
 # ─── Daily P&L Summary ────────────────────────────────────────────
@@ -95,8 +98,6 @@ def send_daily_pnl_summary() -> bool:
         # Build message
         emoji_balance = "💰"
         emoji_pnl = "💹" if daily_pnl >= 0 else "📉"
-        emoji_roi = "📈" if total_roi >= 0 else "📉"
-
         text = (
             f"{emoji_balance} <b>DAILY P&L SUMMARY</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
@@ -233,9 +234,6 @@ def send_weekly_digest() -> bool:
 
         balance = account.get("balance", 0)
         total_pnl = account.get("total_pnl", 0)
-        total_trades = account.get("total_trades", 0)
-        winning_trades = account.get("winning_trades", 0)
-
         # Get this week's trades (last 7 days)
         closed_trades = db.get_paper_trade_history(limit=1000)
         now = datetime.utcnow()
@@ -542,6 +540,44 @@ def send_top_movers_alert(movers: List[Dict]) -> bool:
     except Exception as e:
         logger.error(f"Failed to send top movers alert: {e}")
         return False
+
+
+def send_runtime_incident_alerts(incidents: List[Dict]) -> bool:
+    """Send deduplicated runtime incident alerts to Telegram."""
+    if not config.RUNTIME_INCIDENT_TELEGRAM_ENABLED or not is_configured():
+        return False
+
+    now = utc_now()
+    cooldown = timedelta(minutes=max(1.0, float(config.RUNTIME_INCIDENT_TELEGRAM_COOLDOWN_MINUTES)))
+    max_alerts = max(1, int(config.RUNTIME_INCIDENT_TELEGRAM_MAX_ALERTS))
+    sent = 0
+
+    for incident in (incidents or [])[:max_alerts]:
+        dedupe_key = str(incident.get("key", "") or incident.get("title", "")).strip()
+        if not dedupe_key:
+            continue
+
+        last_sent = _RUNTIME_INCIDENT_ALERT_CACHE.get(dedupe_key)
+        if last_sent and now - last_sent < cooldown:
+            continue
+
+        severity = str(incident.get("severity", "warning") or "warning").upper()
+        blocking = "YES" if incident.get("blocking", False) else "NO"
+        text = (
+            f"🚨 <b>RUNTIME INCIDENT</b>\n"
+            f"<b>Severity:</b> {severity}\n"
+            f"<b>Source:</b> {incident.get('source', 'runtime')}\n"
+            f"<b>Status:</b> {incident.get('status', 'unknown')}\n"
+            f"<b>Blocking:</b> {blocking}\n"
+            f"<b>Title:</b> {incident.get('title', 'Incident')}\n"
+            f"<b>Summary:</b> {incident.get('summary', 'No summary provided')}\n"
+            f"\n⏰ {utc_now_iso()}"
+        )
+        if _send_message(text):
+            _RUNTIME_INCIDENT_ALERT_CACHE[dedupe_key] = now
+            sent += 1
+
+    return sent > 0
 
 
 # ─── Testing Utilities ────────────────────────────────────────────

@@ -152,6 +152,13 @@ This branch is the staged upgrade path for making the bot more measurable, more 
 - Surface operator risk-off state clearly in capital-governor runtime payloads, startup health, reporting, and dashboard summaries instead of burying it in generic blocked-state reasons.
 - Add pre-expiry warnings for live activation approval so operators see approval staleness before live readiness hard-blocks on expiration.
 
+## Phase 22: Alerting And Incident Visibility
+
+- Status: shipped on `codex/live-ledger-foundation`
+- Add a shared runtime incident collector so live readiness, divergence, capital posture, source demotions, and kill-switch states are surfaced consistently instead of being scattered across modules.
+- Expose runtime incidents in reporting, the dashboard, and Telegram alerting with cooldown-based deduplication so operators can see blocking states quickly without alert spam.
+- Add a concise incident summary panel on the dashboard that shows current severity, blocking count, and the top open incidents.
+
 ## Branch Operating Rule
 
 Each phase should be landed in a reviewable commit with tests before moving to the next phase.

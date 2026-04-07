@@ -10,6 +10,7 @@ module focuses purely on signal generation and execution.
 import logging
 
 import config
+from src.core.incident_visibility import build_runtime_incident_report
 from src.data.database import backup_to_json
 
 logger = logging.getLogger(__name__)
@@ -154,6 +155,42 @@ def run_reporting(container, cycle_count: int, health_registry=None) -> None:
                 )
     except Exception as exc:
         logger.debug("  Live preflight error: %s", exc)
+
+    try:
+        incident_report = build_runtime_incident_report(
+            live_trader=getattr(container, "live_trader", None),
+            divergence_controller=getattr(container, "divergence_controller", None),
+            capital_governor=getattr(container, "capital_governor", None),
+            adaptive_learning=getattr(container, "adaptive_learning", None),
+            max_items=getattr(config, "RUNTIME_INCIDENT_MAX_ITEMS", 8),
+        )
+        incident_summary = incident_report.get("summary", {}) or {}
+        incident_items = incident_report.get("incidents", []) or []
+        if incident_items:
+            logger.warning(
+                "  RuntimeIncidents: %d open (%d blocking, %d critical, %d warning)",
+                incident_summary.get("total_incidents", len(incident_items)),
+                incident_summary.get("blocking_count", 0),
+                incident_summary.get("critical_count", 0),
+                incident_summary.get("warning_count", 0),
+            )
+            for incident in incident_items[:4]:
+                log_fn = logger.warning if incident.get("severity") in {"critical", "warning"} else logger.info
+                log_fn(
+                    "    - [%s] %s: %s",
+                    str(incident.get("severity", "warning")).upper(),
+                    incident.get("title", "Incident"),
+                    incident.get("summary", "No summary provided"),
+                )
+            if tg_alerts:
+                try:
+                    tg_alerts.send_runtime_incident_alerts(incident_items)
+                except Exception as exc:
+                    logger.debug("  Runtime incident alert error: %s", exc)
+        else:
+            logger.info("  RuntimeIncidents: none")
+    except Exception as exc:
+        logger.debug("  Runtime incident visibility error: %s", exc)
 
     # ── Shadow tracker + hedger stats ──
     try:

@@ -20,6 +20,7 @@ import logging
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import config
+from src.core.incident_visibility import build_runtime_incident_report
 from src.data import database as db
 
 logger = logging.getLogger(__name__)
@@ -553,6 +554,21 @@ def _build_capital_governor_metrics(capital_governor=None) -> Dict:
     return metrics
 
 
+def _build_runtime_incident_metrics(
+    live_trader=None,
+    divergence_controller=None,
+    capital_governor=None,
+    adaptive_learning=None,
+) -> Dict:
+    return build_runtime_incident_report(
+        live_trader=live_trader,
+        divergence_controller=divergence_controller,
+        capital_governor=capital_governor,
+        adaptive_learning=adaptive_learning,
+        max_items=getattr(config, "RUNTIME_INCIDENT_MAX_ITEMS", 8),
+    )
+
+
 # Module-level references for V2 + V2.5 + V3 components (set by set_v2_components)
 _firewall = None
 _regime_detector = None
@@ -774,6 +790,13 @@ canvas{width:100%!important;height:200px!important}
 </div>
 
 <div class="grid" id="stats-cards"></div>
+
+<div class="section" style="border-top:2px solid #ff4757;padding-top:16px;margin-top:24px">
+<h2 style="color:#ff4757">Runtime Incidents</h2>
+<div id="incident-summary" style="font-size:0.85em;color:#7b8ab8;margin-bottom:10px">Loading...</div>
+<table><thead><tr><th>Severity</th><th>Source</th><th>Title</th><th>Status</th><th>Summary</th></tr></thead>
+<tbody id="incident-table"></tbody></table>
+</div>
 
 <div class="flex-row">
 <div class="section">
@@ -1146,6 +1169,7 @@ async function refresh(){
     const wsStatus = ws && ws.readyState === WebSocket.OPEN ? '(live prices via WebSocket)' : '(WebSocket connecting...)';
     document.getElementById('update-time').textContent = new Date().toLocaleTimeString() + ' ' + wsStatus;
     renderCards(d);
+    renderIncidents((d.v25 || {}).incidents || {});
     renderOpenTrades(d.open_trades);
     renderStrategies(d.strategies);
     renderTraders(d.traders);
@@ -1212,6 +1236,41 @@ function renderV2(v2) {
       <div class="sub">ADX: ${r.adx} | ATR: ${(r.atr_pct*100).toFixed(1)}% | Conf: ${(r.confidence*100).toFixed(0)}%</div>
     </div>`;
   }).join('') : '<div style="color:#555;grid-column:1/-1">Regime data available after first full cycle</div>';
+}
+
+function renderIncidents(report) {
+  const summary = (report || {}).summary || {};
+  const incidents = (report || {}).incidents || [];
+  const overall = summary.overall_status || 'healthy';
+  const overallCls = overall === 'critical' ? 'red' : overall === 'warning' ? 'yellow' : 'green';
+  const summaryEl = document.getElementById('incident-summary');
+  const tableEl = document.getElementById('incident-table');
+  if(!summaryEl || !tableEl) return;
+
+  if(!incidents.length) {
+    summaryEl.innerHTML = '<span class="green">No runtime incidents open.</span>';
+    tableEl.innerHTML = '<tr><td colspan="5" style="color:#555">No runtime incidents</td></tr>';
+    return;
+  }
+
+  summaryEl.innerHTML =
+    `<span class="${overallCls}" style="font-weight:700">${String(overall).toUpperCase()}</span>` +
+    ` &middot; ${summary.total_incidents || incidents.length} open` +
+    ` &middot; ${summary.blocking_count || 0} blocking` +
+    ` &middot; ${summary.critical_count || 0} critical` +
+    ` &middot; ${summary.warning_count || 0} warning`;
+
+  tableEl.innerHTML = incidents.map(item => {
+    const sev = String(item.severity || 'warning').toUpperCase();
+    const sevCls = item.severity === 'critical' ? 'red' : item.severity === 'warning' ? 'yellow' : 'blue';
+    return `<tr>
+      <td><span class="${sevCls}" style="font-weight:700">${sev}</span></td>
+      <td><code>${item.source || 'runtime'}</code></td>
+      <td>${item.title || 'Incident'}</td>
+      <td>${String(item.status || '').toUpperCase()}</td>
+      <td>${item.summary || 'No summary available'}</td>
+    </tr>`;
+  }).join('');
 }
 
 function renderArena(arena) {
@@ -1428,6 +1487,15 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     pass
                 try:
                     v25["capital_governor"] = _build_capital_governor_metrics(_capital_governor)
+                except Exception:
+                    pass
+                try:
+                    v25["incidents"] = _build_runtime_incident_metrics(
+                        live_trader=_live_trader,
+                        divergence_controller=_divergence_controller,
+                        capital_governor=_capital_governor,
+                        adaptive_learning=_adaptive_learning,
+                    )
                 except Exception:
                     pass
                 if v25:
