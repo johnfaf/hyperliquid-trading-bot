@@ -430,6 +430,42 @@ def init_db():
             ON arena_review_events(timestamp);
         CREATE INDEX IF NOT EXISTS idx_arena_review_events_agent
             ON arena_review_events(agent_id, timestamp);
+
+        CREATE TABLE IF NOT EXISTS adaptive_recalibration_runs (
+            run_id TEXT PRIMARY KEY,
+            timestamp TEXT NOT NULL,
+            cycle_count INTEGER,
+            profile_count INTEGER DEFAULT 0,
+            transition_count INTEGER DEFAULT 0,
+            promoted_count INTEGER DEFAULT 0,
+            demoted_count INTEGER DEFAULT 0,
+            held_count INTEGER DEFAULT 0,
+            metadata TEXT DEFAULT '{}'
+        );
+        CREATE INDEX IF NOT EXISTS idx_adaptive_recalibration_runs_timestamp
+            ON adaptive_recalibration_runs(timestamp);
+
+        CREATE TABLE IF NOT EXISTS adaptive_promotion_states (
+            source_key TEXT PRIMARY KEY,
+            source TEXT,
+            applied_stage TEXT DEFAULT 'trial',
+            raw_stage TEXT DEFAULT 'trial',
+            pending_stage TEXT,
+            target_stage TEXT DEFAULT 'trial',
+            last_good_stage TEXT DEFAULT 'trial',
+            promotion_score REAL DEFAULT 0,
+            gate_passed INTEGER DEFAULT 0,
+            consecutive_promote_runs INTEGER DEFAULT 0,
+            consecutive_demote_runs INTEGER DEFAULT 0,
+            hold_count INTEGER DEFAULT 0,
+            last_transition_at TEXT,
+            cooldown_until TEXT,
+            last_recalibrated_at TEXT,
+            run_id TEXT,
+            metadata TEXT DEFAULT '{}'
+        );
+        CREATE INDEX IF NOT EXISTS idx_adaptive_promotion_states_stage
+            ON adaptive_promotion_states(applied_stage, last_recalibrated_at);
         """)
 
 
@@ -1876,6 +1912,17 @@ def get_latest_source_health_snapshot(limit: int = 25) -> dict:
             "promotion_multiplier",
             "promotion_cap_pct",
             "promotion_reasons",
+            "raw_promotion_stage",
+            "raw_promotion_score",
+            "raw_promotion_gate_passed",
+            "raw_promotion_reasons",
+            "promotion_target_stage",
+            "promotion_pending_stage",
+            "promotion_last_good_stage",
+            "promotion_last_transition_at",
+            "promotion_cooldown_until",
+            "promotion_transition_state",
+            "promotion_confirmed_runs",
         ):
             if key in payload["metadata"] and key not in payload:
                 payload[key] = payload["metadata"][key]
@@ -1939,6 +1986,169 @@ def get_recent_arena_review_events(limit: int = 20) -> list:
             payload["metrics"] = {}
         events.append(payload)
     return events
+
+
+def save_adaptive_recalibration_run(payload: dict) -> str:
+    timestamp = _normalize_live_timestamp(payload.get("timestamp"))
+    profile_count = int(payload.get("profile_count", 0) or 0)
+    default_key = f"{timestamp}:{profile_count}"
+    run_id = str(
+        payload.get("run_id")
+        or f"adaptive-recalibration:{hashlib.sha256(default_key.encode()).hexdigest()[:16]}"
+    )
+    metadata = payload.get("metadata", {}) or {}
+
+    with get_connection() as conn:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO adaptive_recalibration_runs
+            (run_id, timestamp, cycle_count, profile_count, transition_count,
+             promoted_count, demoted_count, held_count, metadata)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                run_id,
+                timestamp,
+                int(payload.get("cycle_count", 0) or 0) if payload.get("cycle_count") is not None else None,
+                profile_count,
+                int(payload.get("transition_count", 0) or 0),
+                int(payload.get("promoted_count", 0) or 0),
+                int(payload.get("demoted_count", 0) or 0),
+                int(payload.get("held_count", 0) or 0),
+                json.dumps(metadata, sort_keys=True, default=str),
+            ),
+        )
+    return run_id
+
+
+def get_latest_adaptive_recalibration_run() -> dict:
+    try:
+        with get_connection() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM adaptive_recalibration_runs
+                ORDER BY timestamp DESC, run_id DESC
+                LIMIT 1
+                """
+            ).fetchone()
+    except sqlite3.OperationalError:
+        return {}
+
+    if not row:
+        return {}
+
+    payload = dict(row)
+    try:
+        payload["metadata"] = json.loads(payload.get("metadata") or "{}")
+    except Exception:
+        payload["metadata"] = {}
+    return payload
+
+
+def get_recent_adaptive_recalibration_runs(limit: int = 10) -> list:
+    try:
+        with get_connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM adaptive_recalibration_runs
+                ORDER BY timestamp DESC, run_id DESC
+                LIMIT ?
+                """,
+                (int(limit),),
+            ).fetchall()
+    except sqlite3.OperationalError:
+        return []
+
+    results = []
+    for row in rows:
+        payload = dict(row)
+        try:
+            payload["metadata"] = json.loads(payload.get("metadata") or "{}")
+        except Exception:
+            payload["metadata"] = {}
+        results.append(payload)
+    return results
+
+
+def save_adaptive_promotion_states(states: list) -> int:
+    if not states:
+        return 0
+
+    updated = 0
+    with get_connection() as conn:
+        for state in states:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO adaptive_promotion_states
+                (source_key, source, applied_stage, raw_stage, pending_stage, target_stage,
+                 last_good_stage, promotion_score, gate_passed, consecutive_promote_runs,
+                 consecutive_demote_runs, hold_count, last_transition_at, cooldown_until,
+                 last_recalibrated_at, run_id, metadata)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(state.get("source_key", "") or "").strip(),
+                    str(state.get("source", "") or "").strip().lower() or "unknown",
+                    str(state.get("applied_stage", "trial") or "trial").strip().lower(),
+                    str(state.get("raw_stage", "trial") or "trial").strip().lower(),
+                    (
+                        str(state.get("pending_stage", "") or "").strip().lower()
+                        or None
+                    ),
+                    str(state.get("target_stage", "trial") or "trial").strip().lower(),
+                    str(state.get("last_good_stage", "trial") or "trial").strip().lower(),
+                    _safe_float(state.get("promotion_score"), 0.0),
+                    1 if bool(state.get("gate_passed", False)) else 0,
+                    int(state.get("consecutive_promote_runs", 0) or 0),
+                    int(state.get("consecutive_demote_runs", 0) or 0),
+                    int(state.get("hold_count", 0) or 0),
+                    _normalize_live_timestamp(state.get("last_transition_at")),
+                    _normalize_live_timestamp(state.get("cooldown_until")),
+                    _normalize_live_timestamp(state.get("last_recalibrated_at")),
+                    str(state.get("run_id", "") or "").strip() or None,
+                    json.dumps(state.get("metadata", {}) or {}, sort_keys=True, default=str),
+                ),
+            )
+            updated += 1
+    return updated
+
+
+def get_adaptive_promotion_states(limit: int = 0) -> list:
+    query = """
+        SELECT * FROM adaptive_promotion_states
+        ORDER BY
+            CASE applied_stage
+                WHEN 'full' THEN 4
+                WHEN 'scaled' THEN 3
+                WHEN 'trial' THEN 2
+                WHEN 'incubating' THEN 1
+                WHEN 'blocked' THEN 0
+                ELSE -1
+            END DESC,
+            promotion_score DESC,
+            source_key ASC
+    """
+    params = ()
+    if int(limit or 0) > 0:
+        query += "\nLIMIT ?"
+        params = (int(limit),)
+
+    try:
+        with get_connection() as conn:
+            rows = conn.execute(query, params).fetchall()
+    except sqlite3.OperationalError:
+        return []
+
+    results = []
+    for row in rows:
+        payload = dict(row)
+        try:
+            payload["metadata"] = json.loads(payload.get("metadata") or "{}")
+        except Exception:
+            payload["metadata"] = {}
+        payload["gate_passed"] = bool(payload.get("gate_passed", 0))
+        results.append(payload)
+    return results
 
 
 def get_runtime_divergence_summary(lookback_hours: float = 24.0) -> dict:

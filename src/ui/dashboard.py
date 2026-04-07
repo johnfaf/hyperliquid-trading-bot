@@ -452,6 +452,8 @@ def _build_adaptive_learning_metrics(adaptive_learning=None) -> Dict:
         "latest_snapshot": latest.get("snapshot"),
         "profiles": latest.get("profiles", []),
         "recent_arena_reviews": db.get_recent_arena_review_events(limit=10),
+        "recent_recalibrations": db.get_recent_adaptive_recalibration_runs(limit=10),
+        "promotion_states": db.get_adaptive_promotion_states(limit=12),
     }
     if adaptive_learning:
         try:

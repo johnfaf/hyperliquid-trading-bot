@@ -1880,6 +1880,10 @@ def test_adaptive_learning_manager_refreshes_profiles_and_reviews_arena(monkeypa
                 "full_promotion_health_floor": 0.65,
                 "full_promotion_recent_win_rate": 0.55,
                 "full_promotion_recent_return_pct": 0.001,
+                "promotion_confirm_runs": 1,
+                "demotion_confirm_runs": 1,
+                "recalibration_enabled": True,
+                "recalibration_interval_hours": 0,
                 "arena_min_trades": 5,
                 "arena_max_drawdown": 0.25,
             },
@@ -1904,8 +1908,173 @@ def test_adaptive_learning_manager_refreshes_profiles_and_reviews_arena(monkeypa
         assert arena.saved is True
         assert latest["profiles"]
         assert any(profile.get("promotion_stage") for profile in latest["profiles"])
+        assert stats["recalibration"]["executed"] is True
+        assert stats["recalibration"]["run_id"]
         assert review_events[0]["metrics"]["promotion_stage"] in {"trial", "blocked"}
         assert review_events[0]["agent_id"] == "seed_breakout"
+    finally:
+        monkeypatch.setattr(db, "_DB_PATH", original_path)
+        if os.path.exists(db_path):
+            os.remove(db_path)
+
+
+def test_adaptive_learning_recalibration_requires_confirmation_and_persists_state(monkeypatch):
+    fd, raw_path = tempfile.mkstemp(prefix="adaptive_recalibration_", suffix=".db", dir=os.getcwd())
+    os.close(fd)
+    db_path = os.path.abspath(raw_path)
+    original_path = db._DB_PATH
+    monkeypatch.setattr(db, "_DB_PATH", db_path)
+
+    class FakeScorer:
+        def get_all_scores(self):
+            return [
+                {
+                    "source_key": "options_flow:BTC",
+                    "total_signals": 24,
+                    "accuracy": 0.72,
+                    "weighted_accuracy": 0.75,
+                    "dynamic_weight": 0.88,
+                    "total_pnl": 120.0,
+                }
+            ]
+
+    baseline_good = [
+        {
+            "source_key": "options_flow:BTC",
+            "source": "options_flow",
+            "closed_trades": 18,
+            "winning_trades": 13,
+            "win_rate": 0.72,
+            "realized_pnl": 140.0,
+            "avg_return_pct": 0.018,
+        }
+    ]
+    recent_good = [
+        {
+            "source_key": "options_flow:BTC",
+            "source": "options_flow",
+            "closed_trades": 6,
+            "winning_trades": 5,
+            "win_rate": 0.83,
+            "realized_pnl": 65.0,
+            "avg_return_pct": 0.026,
+        }
+    ]
+    baseline_soft = [
+        {
+            "source_key": "options_flow:BTC",
+            "source": "options_flow",
+            "closed_trades": 18,
+            "winning_trades": 10,
+            "win_rate": 0.56,
+            "realized_pnl": 38.0,
+            "avg_return_pct": 0.004,
+        }
+    ]
+    recent_soft = [
+        {
+            "source_key": "options_flow:BTC",
+            "source": "options_flow",
+            "closed_trades": 6,
+            "winning_trades": 3,
+            "win_rate": 0.50,
+            "realized_pnl": 6.0,
+            "avg_return_pct": 0.0005,
+        }
+    ]
+    current = {
+        "baseline": baseline_good,
+        "recent": recent_good,
+    }
+
+    monkeypatch.setattr(
+        db,
+        "get_source_attribution_summary",
+        lambda **kwargs: [
+            {
+                "source_key": "options_flow:BTC",
+                "source": "options_flow",
+                "selected_count": 9,
+                "live_events": 3,
+                "live_success_rate": 1.0,
+                "live_rejection_rate": 0.0,
+            }
+        ],
+    )
+
+    def fake_outcome_summary(lookback_hours):
+        if float(lookback_hours) > 24 * 10:
+            return current["baseline"]
+        return current["recent"]
+
+    monkeypatch.setattr(db, "get_source_trade_outcome_summary", fake_outcome_summary)
+
+    try:
+        db.init_db()
+        manager = AdaptiveLearningManager(
+            {
+                "enabled": True,
+                "lookback_hours": 24 * 30,
+                "recent_lookback_hours": 24 * 3,
+                "min_closed_trades": 1,
+                "min_recent_closed_trades": 1,
+                "min_selected_candidates": 1,
+                "caution_health_floor": 0.30,
+                "promotion_health_floor": 0.55,
+                "caution_drift_threshold": 0.40,
+                "block_drift_threshold": 0.80,
+                "scaled_promotion_closed_trades": 4,
+                "scaled_promotion_recent_closed_trades": 2,
+                "scaled_promotion_health_floor": 0.45,
+                "scaled_promotion_recent_win_rate": 0.60,
+                "scaled_promotion_recent_return_pct": 0.001,
+                "full_promotion_closed_trades": 10,
+                "full_promotion_recent_closed_trades": 4,
+                "full_promotion_health_floor": 0.50,
+                "full_promotion_recent_win_rate": 0.70,
+                "full_promotion_recent_return_pct": 0.01,
+                "recalibration_enabled": True,
+                "recalibration_interval_hours": 0,
+                "promotion_confirm_runs": 2,
+                "demotion_confirm_runs": 2,
+                "transition_cooldown_hours": 0,
+                "immediate_block_demotion": False,
+            },
+            agent_scorer=FakeScorer(),
+        )
+
+        first = manager.refresh(force=True, cycle_count=10)
+        first_profile = manager.get_source_profile("options_flow:BTC")
+        assert first["recalibration"]["executed"] is True
+        assert first_profile["promotion_stage"] == "trial"
+        assert first_profile["promotion_pending_stage"] == "full"
+        assert first_profile["promotion_confirmed_runs"] == 1
+
+        second = manager.refresh(force=True, cycle_count=11)
+        second_profile = manager.get_source_profile("options_flow:BTC")
+        assert second_profile["promotion_stage"] == "full"
+        assert second["recalibration"]["promoted_count"] == 1
+
+        current["baseline"] = baseline_soft
+        current["recent"] = recent_soft
+
+        manager.refresh(force=True, cycle_count=12)
+        third_profile = manager.get_source_profile("options_flow:BTC")
+        assert third_profile["promotion_stage"] == "full"
+        assert third_profile["promotion_pending_stage"] == "trial"
+        assert third_profile["promotion_confirmed_runs"] == 1
+
+        fourth = manager.refresh(force=True, cycle_count=13)
+        fourth_profile = manager.get_source_profile("options_flow:BTC")
+        assert fourth_profile["promotion_stage"] == "trial"
+        assert fourth["recalibration"]["demoted_count"] == 1
+
+        promotion_states = db.get_adaptive_promotion_states(limit=10)
+        recalibration_runs = db.get_recent_adaptive_recalibration_runs(limit=10)
+        assert promotion_states[0]["applied_stage"] == "trial"
+        assert promotion_states[0]["target_stage"] == "trial"
+        assert recalibration_runs[0]["transition_count"] >= 1
+        assert recalibration_runs[0]["run_id"]
     finally:
         monkeypatch.setattr(db, "_DB_PATH", original_path)
         if os.path.exists(db_path):
@@ -1926,6 +2095,16 @@ def test_dashboard_adaptive_learning_metrics_include_runtime_and_snapshot(monkey
         "get_recent_arena_review_events",
         lambda limit=10: [{"agent_id": "seed_breakout", "action": "demote"}],
     )
+    monkeypatch.setattr(
+        dashboard_ui.db,
+        "get_recent_adaptive_recalibration_runs",
+        lambda limit=10: [{"run_id": "recal-1", "transition_count": 2}],
+    )
+    monkeypatch.setattr(
+        dashboard_ui.db,
+        "get_adaptive_promotion_states",
+        lambda limit=12: [{"source_key": "polymarket:BTC", "applied_stage": "full"}],
+    )
 
     class FakeAdaptive:
         def get_dashboard_payload(self, limit=12):
@@ -1937,6 +2116,8 @@ def test_dashboard_adaptive_learning_metrics_include_runtime_and_snapshot(monkey
     assert metrics["profiles"][0]["source_key"] == "polymarket:BTC"
     assert metrics["runtime"]["summary"]["sources_tracked"] == 2
     assert metrics["recent_arena_reviews"][0]["agent_id"] == "seed_breakout"
+    assert metrics["recent_recalibrations"][0]["run_id"] == "recal-1"
+    assert metrics["promotion_states"][0]["applied_stage"] == "full"
 
 
 def test_dashboard_source_allocator_metrics_include_runtime(monkeypatch):

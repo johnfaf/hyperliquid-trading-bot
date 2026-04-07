@@ -8,13 +8,96 @@ agents based on realized outcomes.
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, Optional
 
 from src.data import database as db
 from src.signals.signal_schema import build_source_key
 
 logger = logging.getLogger(__name__)
+
+_PROMOTION_STAGE_RANKS = {
+    "blocked": 0,
+    "incubating": 1,
+    "trial": 2,
+    "scaled": 3,
+    "full": 4,
+}
+
+
+def _normalize_stage(stage: str, default: str = "trial") -> str:
+    normalized = str(stage or default).strip().lower() or default
+    if normalized not in _PROMOTION_STAGE_RANKS:
+        return default
+    return normalized
+
+
+def _stage_rank(stage: str) -> int:
+    return _PROMOTION_STAGE_RANKS.get(_normalize_stage(stage), _PROMOTION_STAGE_RANKS["trial"])
+
+
+def _parse_timestamp(value) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        normalized = str(value).replace("Z", "+00:00")
+        parsed = datetime.fromisoformat(normalized)
+        return parsed.replace(tzinfo=None) if parsed.tzinfo else parsed
+    except Exception:
+        return None
+
+
+def build_adaptive_learning_config(cfg_module=None) -> Dict:
+    cfg = cfg_module
+    if cfg is None:
+        import config as cfg  # local import avoids hard config dependency at module import time
+
+    return {
+        "enabled": cfg.ADAPTIVE_LEARNING_ENABLED,
+        "lookback_hours": cfg.ADAPTIVE_LEARNING_LOOKBACK_HOURS,
+        "recent_lookback_hours": cfg.ADAPTIVE_LEARNING_RECENT_LOOKBACK_HOURS,
+        "report_limit_cycles": cfg.EXPERIMENT_REPORT_LIMIT_CYCLES,
+        "refresh_interval_cycles": cfg.ADAPTIVE_LEARNING_REFRESH_INTERVAL_CYCLES,
+        "min_closed_trades": cfg.ADAPTIVE_LEARNING_MIN_CLOSED_TRADES,
+        "min_recent_closed_trades": cfg.ADAPTIVE_LEARNING_MIN_RECENT_CLOSED_TRADES,
+        "min_selected_candidates": cfg.ADAPTIVE_LEARNING_MIN_SELECTED_CANDIDATES,
+        "caution_health_floor": cfg.ADAPTIVE_LEARNING_CAUTION_HEALTH_FLOOR,
+        "promotion_health_floor": cfg.ADAPTIVE_LEARNING_PROMOTION_HEALTH_FLOOR,
+        "caution_drift_threshold": cfg.ADAPTIVE_LEARNING_CAUTION_DRIFT_THRESHOLD,
+        "block_drift_threshold": cfg.ADAPTIVE_LEARNING_BLOCK_DRIFT_THRESHOLD,
+        "max_calibration_ece": cfg.ADAPTIVE_LEARNING_MAX_CALIBRATION_ECE,
+        "min_weight_multiplier": cfg.ADAPTIVE_LEARNING_MIN_WEIGHT_MULTIPLIER,
+        "return_scale": cfg.ADAPTIVE_LEARNING_RETURN_SCALE,
+        "scaled_promotion_closed_trades": cfg.ADAPTIVE_PROMOTION_SCALED_MIN_CLOSED_TRADES,
+        "scaled_promotion_recent_closed_trades": cfg.ADAPTIVE_PROMOTION_SCALED_MIN_RECENT_CLOSED_TRADES,
+        "scaled_promotion_health_floor": cfg.ADAPTIVE_PROMOTION_SCALED_MIN_HEALTH_SCORE,
+        "scaled_promotion_recent_win_rate": cfg.ADAPTIVE_PROMOTION_SCALED_MIN_RECENT_WIN_RATE,
+        "scaled_promotion_recent_return_pct": cfg.ADAPTIVE_PROMOTION_SCALED_MIN_RECENT_RETURN_PCT,
+        "full_promotion_closed_trades": cfg.ADAPTIVE_PROMOTION_FULL_MIN_CLOSED_TRADES,
+        "full_promotion_recent_closed_trades": cfg.ADAPTIVE_PROMOTION_FULL_MIN_RECENT_CLOSED_TRADES,
+        "full_promotion_health_floor": cfg.ADAPTIVE_PROMOTION_FULL_MIN_HEALTH_SCORE,
+        "full_promotion_recent_win_rate": cfg.ADAPTIVE_PROMOTION_FULL_MIN_RECENT_WIN_RATE,
+        "full_promotion_recent_return_pct": cfg.ADAPTIVE_PROMOTION_FULL_MIN_RECENT_RETURN_PCT,
+        "full_promotion_live_success_rate": cfg.ADAPTIVE_PROMOTION_FULL_MIN_LIVE_SUCCESS_RATE,
+        "incubating_promotion_multiplier": cfg.ADAPTIVE_PROMOTION_INCUBATING_MULTIPLIER,
+        "trial_promotion_multiplier": cfg.ADAPTIVE_PROMOTION_TRIAL_MULTIPLIER,
+        "scaled_promotion_multiplier": cfg.ADAPTIVE_PROMOTION_SCALED_MULTIPLIER,
+        "full_promotion_multiplier": cfg.ADAPTIVE_PROMOTION_FULL_MULTIPLIER,
+        "incubating_promotion_cap_pct": cfg.ADAPTIVE_PROMOTION_INCUBATING_CAP_PCT,
+        "trial_promotion_cap_pct": cfg.ADAPTIVE_PROMOTION_TRIAL_CAP_PCT,
+        "scaled_promotion_cap_pct": cfg.ADAPTIVE_PROMOTION_SCALED_CAP_PCT,
+        "full_promotion_cap_pct": cfg.ADAPTIVE_PROMOTION_FULL_CAP_PCT,
+        "arena_min_trades": cfg.ADAPTIVE_ARENA_MIN_TRADES,
+        "arena_min_win_rate": cfg.ADAPTIVE_ARENA_MIN_WIN_RATE,
+        "arena_min_sharpe": cfg.ADAPTIVE_ARENA_MIN_SHARPE,
+        "arena_max_drawdown": cfg.ADAPTIVE_ARENA_MAX_DRAWDOWN,
+        "recalibration_enabled": getattr(cfg, "ADAPTIVE_RECALIBRATION_ENABLED", True),
+        "recalibration_interval_hours": getattr(cfg, "ADAPTIVE_RECALIBRATION_INTERVAL_HOURS", 24.0),
+        "promotion_confirm_runs": getattr(cfg, "ADAPTIVE_RECALIBRATION_PROMOTION_CONFIRM_RUNS", 2),
+        "demotion_confirm_runs": getattr(cfg, "ADAPTIVE_RECALIBRATION_DEMOTION_CONFIRM_RUNS", 2),
+        "transition_cooldown_hours": getattr(cfg, "ADAPTIVE_RECALIBRATION_COOLDOWN_HOURS", 24.0),
+        "immediate_block_demotion": getattr(cfg, "ADAPTIVE_RECALIBRATION_IMMEDIATE_BLOCK_DEMOTION", True),
+    }
 
 
 def _status_value(status) -> str:
@@ -118,6 +201,22 @@ class AdaptiveLearningManager:
         self.full_promotion_cap_pct = float(
             cfg.get("full_promotion_cap_pct", 0.32)
         )
+        self.recalibration_enabled = bool(cfg.get("recalibration_enabled", True))
+        self.recalibration_interval_hours = float(
+            cfg.get("recalibration_interval_hours", 24.0)
+        )
+        self.recalibration_promotion_confirm_runs = int(
+            cfg.get("promotion_confirm_runs", 2)
+        )
+        self.recalibration_demotion_confirm_runs = int(
+            cfg.get("demotion_confirm_runs", 2)
+        )
+        self.recalibration_cooldown_hours = float(
+            cfg.get("transition_cooldown_hours", 24.0)
+        )
+        self.recalibration_immediate_block_demotion = bool(
+            cfg.get("immediate_block_demotion", True)
+        )
 
         self.arena_min_trades = int(cfg.get("arena_min_trades", 10))
         self.arena_min_win_rate = float(cfg.get("arena_min_win_rate", 0.52))
@@ -129,8 +228,11 @@ class AdaptiveLearningManager:
         self.last_snapshot_id: Optional[str] = None
         self.last_run_at: Optional[str] = None
         self.last_run_cycle: Optional[int] = None
+        self.last_recalibration_at: Optional[str] = None
+        self.last_recalibration_run_id: Optional[str] = None
         self.refresh_count = 0
         self.latest_arena_review = []
+        self.latest_recalibration: Dict = {}
 
     @staticmethod
     def _clamp(value: float, lower: float = 0.0, upper: float = 1.0) -> float:
@@ -154,6 +256,13 @@ class AdaptiveLearningManager:
 
         if (
             not force
+            and self.recalibration_enabled
+            and self._is_recalibration_due()
+        ):
+            return self.refresh(force=True, cycle_count=cycle_count)
+
+        if (
+            not force
             and cycle_count is not None
             and self.last_run_cycle is not None
             and cycle_count - self.last_run_cycle < self.refresh_interval_cycles
@@ -166,6 +275,7 @@ class AdaptiveLearningManager:
         if not self.enabled and not force:
             return self.get_stats()
 
+        now = datetime.utcnow()
         attribution_rows = db.get_source_attribution_summary(
             limit_cycles=self.report_limit_cycles,
             lookback_hours=self.lookback_hours,
@@ -173,6 +283,12 @@ class AdaptiveLearningManager:
         baseline_rows = db.get_source_trade_outcome_summary(self.lookback_hours)
         recent_rows = db.get_source_trade_outcome_summary(self.recent_lookback_hours)
         profiles = self._build_profiles(attribution_rows, baseline_rows, recent_rows)
+        profiles, recalibration = self._apply_recalibration_controls(
+            profiles,
+            now=now,
+            cycle_count=cycle_count,
+            force=force,
+        )
 
         summary = self._summarize_profiles(profiles)
         snapshot_metadata = {
@@ -180,10 +296,11 @@ class AdaptiveLearningManager:
             "lookback_hours": self.lookback_hours,
             "recent_lookback_hours": self.recent_lookback_hours,
             "cycle_count": cycle_count,
+            "recalibration": recalibration,
         }
         snapshot_id = db.save_source_health_snapshot(
             {
-                "timestamp": datetime.utcnow().isoformat(),
+                "timestamp": now.isoformat(),
                 "metadata": snapshot_metadata,
                 "profiles": list(profiles.values()),
             }
@@ -196,11 +313,19 @@ class AdaptiveLearningManager:
         self.source_profiles = profiles
         self.summary = summary
         self.last_snapshot_id = snapshot_id
-        self.last_run_at = datetime.utcnow().isoformat()
+        self.last_run_at = now.isoformat()
         self.last_run_cycle = cycle_count
         self.refresh_count += 1
         self.latest_arena_review = arena_review
+        self.latest_recalibration = recalibration
+        if recalibration.get("executed"):
+            self.last_recalibration_at = recalibration.get("timestamp")
+            self.last_recalibration_run_id = recalibration.get("run_id")
         return self.get_stats()
+
+    def run_recalibration(self, cycle_count: Optional[int] = None, *, force: bool = True) -> Dict:
+        self.refresh(force=force, cycle_count=cycle_count)
+        return dict(self.latest_recalibration or {})
 
     def _build_profiles(self, attribution_rows: list, baseline_rows: list, recent_rows: list) -> Dict[str, Dict]:
         attribution_by_key = {
@@ -638,6 +763,366 @@ class AdaptiveLearningManager:
             **defaults,
         }
 
+    def _is_recalibration_due(self, now: Optional[datetime] = None) -> bool:
+        if not self.recalibration_enabled:
+            return False
+
+        reference = _parse_timestamp(self.last_recalibration_at)
+        if reference is None:
+            latest_run = db.get_latest_adaptive_recalibration_run()
+            if latest_run:
+                self.last_recalibration_at = latest_run.get("timestamp")
+                self.last_recalibration_run_id = latest_run.get("run_id")
+                reference = _parse_timestamp(self.last_recalibration_at)
+                self.latest_recalibration = latest_run
+
+        if reference is None:
+            return True
+
+        now = now or datetime.utcnow()
+        return now - reference >= timedelta(hours=max(self.recalibration_interval_hours, 0.0))
+
+    def _resolve_recalibration_state(
+        self,
+        profile: Dict,
+        previous_state: Optional[Dict],
+        *,
+        now: datetime,
+        run_id: str,
+    ) -> Dict:
+        raw_stage = _normalize_stage(profile.get("promotion_stage", "trial"))
+        raw_score = float(profile.get("promotion_score", 0.0) or 0.0)
+        raw_gate_passed = bool(profile.get("promotion_gate_passed", False))
+        raw_reasons = list(profile.get("promotion_reasons", []) or [])
+        source_key = str(profile.get("source_key", "") or "").strip()
+        source = str(profile.get("source", "") or "").strip().lower() or "unknown"
+
+        current_stage = _normalize_stage(
+            (previous_state or {}).get("applied_stage", "trial")
+        )
+        if not previous_state and raw_stage in {"blocked", "incubating", "trial"}:
+            current_stage = raw_stage
+
+        target_stage = raw_stage
+        pending_stage = _normalize_stage(
+            (previous_state or {}).get("pending_stage", ""),
+            default="",
+        )
+        if not pending_stage:
+            pending_stage = ""
+        last_good_stage = _normalize_stage(
+            (previous_state or {}).get("last_good_stage", current_stage)
+        )
+        promote_runs = int((previous_state or {}).get("consecutive_promote_runs", 0) or 0)
+        demote_runs = int((previous_state or {}).get("consecutive_demote_runs", 0) or 0)
+        hold_count = int((previous_state or {}).get("hold_count", 0) or 0)
+        last_transition_at = (previous_state or {}).get("last_transition_at")
+        cooldown_until = (previous_state or {}).get("cooldown_until")
+        cooldown_active = False
+        cooldown_until_dt = _parse_timestamp(cooldown_until)
+        if cooldown_until_dt and now < cooldown_until_dt:
+            cooldown_active = True
+
+        action = "steady"
+        transition_state = "steady"
+        applied_stage = current_stage
+        current_rank = _stage_rank(current_stage)
+        target_rank = _stage_rank(target_stage)
+
+        if target_stage == current_stage:
+            pending_stage = ""
+            promote_runs = 0
+            demote_runs = 0
+        elif target_stage == "blocked" and self.recalibration_immediate_block_demotion:
+            applied_stage = "blocked"
+            pending_stage = ""
+            promote_runs = 0
+            demote_runs = 0
+            action = "demote" if current_stage != "blocked" else "steady"
+            transition_state = "immediate_block"
+        elif target_rank > current_rank:
+            promote_runs = promote_runs + 1 if pending_stage == target_stage else 1
+            demote_runs = 0
+            pending_stage = target_stage
+            transition_state = "pending_promotion"
+            action = "hold"
+            if not cooldown_active and promote_runs >= max(self.recalibration_promotion_confirm_runs, 1):
+                applied_stage = target_stage
+                pending_stage = ""
+                promote_runs = 0
+                action = "promote"
+                transition_state = "promoted"
+            else:
+                hold_count += 1
+                if cooldown_active:
+                    raw_reasons.append("promotion_cooldown_active")
+                else:
+                    raw_reasons.append("promotion_confirmation_pending")
+        else:
+            demote_runs = demote_runs + 1 if pending_stage == target_stage else 1
+            promote_runs = 0
+            pending_stage = target_stage
+            transition_state = "pending_demotion"
+            action = "hold"
+            if demote_runs >= max(self.recalibration_demotion_confirm_runs, 1):
+                applied_stage = target_stage
+                pending_stage = ""
+                demote_runs = 0
+                action = "demote"
+                transition_state = "demoted"
+            else:
+                hold_count += 1
+                raw_reasons.append("demotion_confirmation_pending")
+
+        if applied_stage != current_stage:
+            last_transition_at = now.isoformat()
+            cooldown_until = (
+                now + timedelta(hours=max(self.recalibration_cooldown_hours, 0.0))
+            ).isoformat()
+        elif not cooldown_active and cooldown_until_dt and now >= cooldown_until_dt:
+            cooldown_until = None
+
+        if applied_stage != "blocked":
+            last_good_stage = applied_stage
+
+        applied_defaults = self._promotion_defaults(applied_stage)
+        confirmed_runs = 0
+        if pending_stage:
+            confirmed_runs = promote_runs if _stage_rank(pending_stage) > _stage_rank(applied_stage) else demote_runs
+
+        metadata = {
+            "raw_stage": raw_stage,
+            "raw_score": round(raw_score, 4),
+            "raw_gate_passed": raw_gate_passed,
+            "raw_reasons": raw_reasons,
+            "pending_stage": pending_stage or None,
+            "transition_state": transition_state,
+            "action": action,
+            "confirmed_runs": confirmed_runs,
+            "cooldown_active": cooldown_active,
+            "current_stage": current_stage,
+        }
+
+        return {
+            "source_key": source_key,
+            "source": source,
+            "applied_stage": applied_stage,
+            "raw_stage": raw_stage,
+            "pending_stage": pending_stage or None,
+            "target_stage": target_stage,
+            "last_good_stage": last_good_stage,
+            "promotion_score": round(raw_score, 4),
+            "gate_passed": raw_gate_passed,
+            "consecutive_promote_runs": promote_runs,
+            "consecutive_demote_runs": demote_runs,
+            "hold_count": hold_count,
+            "last_transition_at": last_transition_at,
+            "cooldown_until": cooldown_until,
+            "last_recalibrated_at": now.isoformat(),
+            "run_id": run_id,
+            "metadata": metadata,
+            "defaults": applied_defaults,
+        }
+
+    def _apply_recalibration_controls(
+        self,
+        profiles: Dict[str, Dict],
+        *,
+        now: datetime,
+        cycle_count: Optional[int],
+        force: bool,
+    ) -> tuple[Dict[str, Dict], Dict]:
+        current_states = {
+            str(row.get("source_key", "") or "").strip(): row
+            for row in db.get_adaptive_promotion_states()
+            if str(row.get("source_key", "") or "").strip()
+        }
+        should_run = bool(force or self._is_recalibration_due(now))
+        run_id = None
+        run_timestamp = now.isoformat()
+        recalibration = {
+            "enabled": self.recalibration_enabled,
+            "executed": False,
+            "timestamp": self.last_recalibration_at,
+            "run_id": self.last_recalibration_run_id,
+            "profile_count": len(profiles),
+            "transition_count": 0,
+            "promoted_count": 0,
+            "demoted_count": 0,
+            "held_count": 0,
+            "pending_count": 0,
+            "cooldown_active_count": 0,
+            "reasons": [],
+        }
+
+        updated_states = []
+        if should_run and self.recalibration_enabled:
+            run_id = db.save_adaptive_recalibration_run(
+                {
+                    "timestamp": run_timestamp,
+                    "cycle_count": cycle_count,
+                    "profile_count": len(profiles),
+                    "transition_count": 0,
+                    "promoted_count": 0,
+                    "demoted_count": 0,
+                    "held_count": 0,
+                    "metadata": {"status": "pending"},
+                }
+            )
+        else:
+            latest_run = db.get_latest_adaptive_recalibration_run()
+            if latest_run:
+                recalibration["timestamp"] = latest_run.get("timestamp")
+                recalibration["run_id"] = latest_run.get("run_id")
+
+        for profile in profiles.values():
+            metadata = dict(profile.get("metadata", {}) or {})
+            raw_stage = _normalize_stage(profile.get("promotion_stage", "trial"))
+            raw_score = round(float(profile.get("promotion_score", 0.0) or 0.0), 4)
+            raw_gate_passed = bool(profile.get("promotion_gate_passed", False))
+            raw_reasons = list(profile.get("promotion_reasons", []) or [])
+            source_key = str(profile.get("source_key", "") or "").strip()
+            previous_state = current_states.get(source_key)
+
+            if should_run and self.recalibration_enabled:
+                state = self._resolve_recalibration_state(
+                    profile,
+                    previous_state,
+                    now=now,
+                    run_id=run_id or "",
+                )
+                updated_states.append(state)
+                current_states[source_key] = state
+            else:
+                state = previous_state
+
+            applied_stage = raw_stage
+            transition_state = "steady"
+            pending_stage = None
+            last_good_stage = raw_stage if raw_stage != "blocked" else "trial"
+            last_transition_at = None
+            cooldown_until = None
+            applied_defaults = self._promotion_defaults(raw_stage)
+            confirmed_runs = 0
+            runtime_reasons = list(raw_reasons)
+
+            if state:
+                applied_stage = _normalize_stage(state.get("applied_stage", raw_stage))
+                transition_state = str(
+                    (state.get("metadata", {}) or {}).get("transition_state", "steady")
+                    or "steady"
+                )
+                pending_stage = state.get("pending_stage")
+                last_good_stage = _normalize_stage(state.get("last_good_stage", last_good_stage))
+                last_transition_at = state.get("last_transition_at")
+                cooldown_until = state.get("cooldown_until")
+                applied_defaults = dict(state.get("defaults") or self._promotion_defaults(applied_stage))
+                confirmed_runs = int(
+                    (state.get("metadata", {}) or {}).get("confirmed_runs", 0) or 0
+                )
+                runtime_reasons = list(
+                    (state.get("metadata", {}) or {}).get("raw_reasons", raw_reasons)
+                )
+                if should_run and self.recalibration_enabled:
+                    action = str((state.get("metadata", {}) or {}).get("action", "steady") or "steady")
+                    recalibration["executed"] = True
+                    recalibration["timestamp"] = run_timestamp
+                    recalibration["run_id"] = run_id
+                    if action in {"promote", "demote"}:
+                        recalibration["transition_count"] += 1
+                    if action == "promote":
+                        recalibration["promoted_count"] += 1
+                    if action == "demote":
+                        recalibration["demoted_count"] += 1
+                    if action == "hold":
+                        recalibration["held_count"] += 1
+                    if pending_stage:
+                        recalibration["pending_count"] += 1
+                    cooldown_active = bool((state.get("metadata", {}) or {}).get("cooldown_active", False))
+                    if cooldown_active:
+                        recalibration["cooldown_active_count"] += 1
+
+            profile["promotion_stage"] = applied_stage
+            profile["promotion_gate_passed"] = applied_stage in {"scaled", "full"}
+            profile["promotion_score"] = round(float(state.get("promotion_score", raw_score) if state else raw_score), 4)
+            profile["promotion_multiplier"] = round(
+                float(applied_defaults.get("multiplier", 1.0) or 1.0),
+                4,
+            )
+            profile["promotion_cap_pct"] = round(
+                float(applied_defaults.get("cap_pct", 0.0) or 0.0),
+                4,
+            )
+            profile["promotion_reasons"] = runtime_reasons
+            profile["promotion_target_stage"] = raw_stage
+            profile["promotion_pending_stage"] = pending_stage
+            profile["promotion_last_good_stage"] = last_good_stage
+            profile["promotion_last_transition_at"] = last_transition_at
+            profile["promotion_cooldown_until"] = cooldown_until
+            profile["promotion_transition_state"] = transition_state
+            profile["promotion_confirmed_runs"] = confirmed_runs
+            profile["raw_promotion_stage"] = raw_stage
+            profile["raw_promotion_score"] = raw_score
+            profile["raw_promotion_gate_passed"] = raw_gate_passed
+            profile["raw_promotion_reasons"] = raw_reasons
+
+            metadata.update(
+                {
+                    "promotion_stage": applied_stage,
+                    "promotion_score": profile["promotion_score"],
+                    "promotion_gate_passed": profile["promotion_gate_passed"],
+                    "promotion_multiplier": profile["promotion_multiplier"],
+                    "promotion_cap_pct": profile["promotion_cap_pct"],
+                    "promotion_reasons": runtime_reasons,
+                    "promotion_quality_multiplier": round(
+                        float(applied_defaults.get("quality_multiplier", 1.0) or 1.0),
+                        4,
+                    ),
+                    "promotion_confidence_multiplier": round(
+                        float(applied_defaults.get("confidence_multiplier", 1.0) or 1.0),
+                        4,
+                    ),
+                    "raw_promotion_stage": raw_stage,
+                    "raw_promotion_score": raw_score,
+                    "raw_promotion_gate_passed": raw_gate_passed,
+                    "raw_promotion_reasons": raw_reasons,
+                    "promotion_target_stage": raw_stage,
+                    "promotion_pending_stage": pending_stage,
+                    "promotion_last_good_stage": last_good_stage,
+                    "promotion_last_transition_at": last_transition_at,
+                    "promotion_cooldown_until": cooldown_until,
+                    "promotion_transition_state": transition_state,
+                    "promotion_confirmed_runs": confirmed_runs,
+                }
+            )
+            profile["metadata"] = metadata
+
+        if updated_states:
+            db.save_adaptive_promotion_states(updated_states)
+            db.save_adaptive_recalibration_run(
+                {
+                    "run_id": run_id,
+                    "timestamp": run_timestamp,
+                    "cycle_count": cycle_count,
+                    "profile_count": len(profiles),
+                    "transition_count": recalibration["transition_count"],
+                    "promoted_count": recalibration["promoted_count"],
+                    "demoted_count": recalibration["demoted_count"],
+                    "held_count": recalibration["held_count"],
+                    "metadata": {
+                        "pending_count": recalibration["pending_count"],
+                        "cooldown_active_count": recalibration["cooldown_active_count"],
+                    },
+                }
+            )
+
+        if not recalibration["executed"] and not recalibration["run_id"]:
+            recalibration["reasons"].append("awaiting_initial_recalibration")
+        elif not recalibration["executed"]:
+            recalibration["reasons"].append("interval_not_due")
+
+        return profiles, recalibration
+
     def _training_label_for(
         self,
         *,
@@ -672,6 +1157,14 @@ class AdaptiveLearningManager:
             "scaled": 0,
             "full": 0,
         }
+        transition_counts = {
+            "steady": 0,
+            "pending_promotion": 0,
+            "pending_demotion": 0,
+            "promoted": 0,
+            "demoted": 0,
+            "immediate_block": 0,
+        }
         promote = 0
         freeze = 0
         for profile in profiles.values():
@@ -679,6 +1172,10 @@ class AdaptiveLearningManager:
             counts[status] = counts.get(status, 0) + 1
             promotion_stage = str(profile.get("promotion_stage", "trial") or "trial")
             promotion_counts[promotion_stage] = promotion_counts.get(promotion_stage, 0) + 1
+            transition_state = str(
+                profile.get("promotion_transition_state", "steady") or "steady"
+            )
+            transition_counts[transition_state] = transition_counts.get(transition_state, 0) + 1
             if profile.get("training_label") == "promote":
                 promote += 1
             if profile.get("training_label") == "freeze":
@@ -701,10 +1198,16 @@ class AdaptiveLearningManager:
             "sources_tracked": len(profiles),
             "status_counts": counts,
             "promotion_stage_counts": promotion_counts,
+            "promotion_transition_counts": transition_counts,
             "promote_count": promote,
             "freeze_count": freeze,
             "full_access_count": promotion_counts.get("full", 0),
             "scaled_access_count": promotion_counts.get("scaled", 0),
+            "pending_promotion_count": sum(
+                1
+                for item in profiles.values()
+                if item.get("promotion_pending_stage")
+            ),
             "top_sources": [
                 {
                     "source_key": item["source_key"],
@@ -846,11 +1349,16 @@ class AdaptiveLearningManager:
             "refresh_interval_cycles": self.refresh_interval_cycles,
             "lookback_hours": self.lookback_hours,
             "recent_lookback_hours": self.recent_lookback_hours,
+            "recalibration_enabled": self.recalibration_enabled,
+            "recalibration_interval_hours": self.recalibration_interval_hours,
             "last_run_at": self.last_run_at,
             "last_snapshot_id": self.last_snapshot_id,
+            "last_recalibration_at": self.last_recalibration_at,
+            "last_recalibration_run_id": self.last_recalibration_run_id,
             "refresh_count": self.refresh_count,
             "summary": self.summary or self._summarize_profiles(self.source_profiles),
             "arena_review": self.latest_arena_review[:10],
+            "recalibration": dict(self.latest_recalibration or {}),
         }
 
     def get_dashboard_payload(self, limit: int = 12) -> Dict:
@@ -872,4 +1380,6 @@ class AdaptiveLearningManager:
             **self.get_stats(),
             "profiles": ordered[:limit],
             "recent_arena_reviews": db.get_recent_arena_review_events(limit=10),
+            "recent_recalibrations": db.get_recent_adaptive_recalibration_runs(limit=10),
+            "promotion_states": db.get_adaptive_promotion_states(limit=limit),
         }

@@ -257,76 +257,14 @@ def build_subsystems(
         c.calibration = _safe_init("calibration", CalibrationTracker, health, affects_trading=False)
 
     if "adaptive_learning" in profile:
-        from src.signals.adaptive_learning import AdaptiveLearningManager
+        from src.signals.adaptive_learning import (
+            AdaptiveLearningManager,
+            build_adaptive_learning_config,
+        )
         c.adaptive_learning = _safe_init(
             "adaptive_learning",
             lambda: AdaptiveLearningManager(
-                {
-                    "enabled": config.ADAPTIVE_LEARNING_ENABLED,
-                    "lookback_hours": config.ADAPTIVE_LEARNING_LOOKBACK_HOURS,
-                    "recent_lookback_hours": config.ADAPTIVE_LEARNING_RECENT_LOOKBACK_HOURS,
-                    "report_limit_cycles": config.EXPERIMENT_REPORT_LIMIT_CYCLES,
-                    "refresh_interval_cycles": config.ADAPTIVE_LEARNING_REFRESH_INTERVAL_CYCLES,
-                    "min_closed_trades": config.ADAPTIVE_LEARNING_MIN_CLOSED_TRADES,
-                    "min_recent_closed_trades": config.ADAPTIVE_LEARNING_MIN_RECENT_CLOSED_TRADES,
-                    "min_selected_candidates": config.ADAPTIVE_LEARNING_MIN_SELECTED_CANDIDATES,
-                    "caution_health_floor": config.ADAPTIVE_LEARNING_CAUTION_HEALTH_FLOOR,
-                    "promotion_health_floor": config.ADAPTIVE_LEARNING_PROMOTION_HEALTH_FLOOR,
-                    "caution_drift_threshold": config.ADAPTIVE_LEARNING_CAUTION_DRIFT_THRESHOLD,
-                    "block_drift_threshold": config.ADAPTIVE_LEARNING_BLOCK_DRIFT_THRESHOLD,
-                    "max_calibration_ece": config.ADAPTIVE_LEARNING_MAX_CALIBRATION_ECE,
-                    "min_weight_multiplier": config.ADAPTIVE_LEARNING_MIN_WEIGHT_MULTIPLIER,
-                    "return_scale": config.ADAPTIVE_LEARNING_RETURN_SCALE,
-                    "scaled_promotion_closed_trades": (
-                        config.ADAPTIVE_PROMOTION_SCALED_MIN_CLOSED_TRADES
-                    ),
-                    "scaled_promotion_recent_closed_trades": (
-                        config.ADAPTIVE_PROMOTION_SCALED_MIN_RECENT_CLOSED_TRADES
-                    ),
-                    "scaled_promotion_health_floor": (
-                        config.ADAPTIVE_PROMOTION_SCALED_MIN_HEALTH_SCORE
-                    ),
-                    "scaled_promotion_recent_win_rate": (
-                        config.ADAPTIVE_PROMOTION_SCALED_MIN_RECENT_WIN_RATE
-                    ),
-                    "scaled_promotion_recent_return_pct": (
-                        config.ADAPTIVE_PROMOTION_SCALED_MIN_RECENT_RETURN_PCT
-                    ),
-                    "full_promotion_closed_trades": (
-                        config.ADAPTIVE_PROMOTION_FULL_MIN_CLOSED_TRADES
-                    ),
-                    "full_promotion_recent_closed_trades": (
-                        config.ADAPTIVE_PROMOTION_FULL_MIN_RECENT_CLOSED_TRADES
-                    ),
-                    "full_promotion_health_floor": (
-                        config.ADAPTIVE_PROMOTION_FULL_MIN_HEALTH_SCORE
-                    ),
-                    "full_promotion_recent_win_rate": (
-                        config.ADAPTIVE_PROMOTION_FULL_MIN_RECENT_WIN_RATE
-                    ),
-                    "full_promotion_recent_return_pct": (
-                        config.ADAPTIVE_PROMOTION_FULL_MIN_RECENT_RETURN_PCT
-                    ),
-                    "full_promotion_live_success_rate": (
-                        config.ADAPTIVE_PROMOTION_FULL_MIN_LIVE_SUCCESS_RATE
-                    ),
-                    "incubating_promotion_multiplier": (
-                        config.ADAPTIVE_PROMOTION_INCUBATING_MULTIPLIER
-                    ),
-                    "trial_promotion_multiplier": config.ADAPTIVE_PROMOTION_TRIAL_MULTIPLIER,
-                    "scaled_promotion_multiplier": config.ADAPTIVE_PROMOTION_SCALED_MULTIPLIER,
-                    "full_promotion_multiplier": config.ADAPTIVE_PROMOTION_FULL_MULTIPLIER,
-                    "incubating_promotion_cap_pct": (
-                        config.ADAPTIVE_PROMOTION_INCUBATING_CAP_PCT
-                    ),
-                    "trial_promotion_cap_pct": config.ADAPTIVE_PROMOTION_TRIAL_CAP_PCT,
-                    "scaled_promotion_cap_pct": config.ADAPTIVE_PROMOTION_SCALED_CAP_PCT,
-                    "full_promotion_cap_pct": config.ADAPTIVE_PROMOTION_FULL_CAP_PCT,
-                    "arena_min_trades": config.ADAPTIVE_ARENA_MIN_TRADES,
-                    "arena_min_win_rate": config.ADAPTIVE_ARENA_MIN_WIN_RATE,
-                    "arena_min_sharpe": config.ADAPTIVE_ARENA_MIN_SHARPE,
-                    "arena_max_drawdown": config.ADAPTIVE_ARENA_MAX_DRAWDOWN,
-                },
+                build_adaptive_learning_config(config),
                 agent_scorer=c.agent_scorer,
                 calibration=c.calibration,
             ),

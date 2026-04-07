@@ -65,6 +65,7 @@ def run_reporting(container, cycle_count: int, health_registry=None) -> None:
             summary = adaptive_stats.get("summary", {})
             counts = summary.get("status_counts", {})
             stages = summary.get("promotion_stage_counts", {})
+            recalibration = adaptive_stats.get("recalibration", {}) or {}
             logger.info(
                 "  AdaptiveLearning: %d sources (%d active, %d caution, %d blocked, %d warming | %d full, %d scaled, %d trial, %d incubating)",
                 summary.get("sources_tracked", 0),
@@ -77,6 +78,17 @@ def run_reporting(container, cycle_count: int, health_registry=None) -> None:
                 stages.get("trial", 0),
                 stages.get("incubating", 0),
             )
+            if recalibration:
+                logger.info(
+                    "  AdaptiveRecalibration: %s (run=%s, transitions=%d, promoted=%d, demoted=%d, pending=%d, held=%d)",
+                    "executed" if recalibration.get("executed") else "holding",
+                    recalibration.get("run_id", "n/a"),
+                    recalibration.get("transition_count", 0),
+                    recalibration.get("promoted_count", 0),
+                    recalibration.get("demoted_count", 0),
+                    recalibration.get("pending_count", 0),
+                    recalibration.get("held_count", 0),
+                )
     except Exception as exc:
         logger.debug("  Adaptive learning error: %s", exc)
     try:

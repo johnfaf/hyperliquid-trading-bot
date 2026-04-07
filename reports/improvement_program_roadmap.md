@@ -117,6 +117,13 @@ This branch is the staged upgrade path for making the bot more measurable, more 
 - Require stronger out-of-sample evidence before a source receives full budget, and taper capital automatically when a source falls back to trial or incubating status.
 - Apply the same progression discipline to Alpha Arena so champions receive more capital, probation agents are derisked, and low-evidence agents stay on incubating budgets.
 
+## Phase 17: Scheduled Recalibration And Rollback Controls
+
+- Status: shipped on `codex/live-ledger-foundation`
+- Add a scheduled recalibration layer so promotion changes require repeated evidence instead of flapping on every runtime refresh.
+- Persist recalibration runs plus stable per-source promotion state for auditability, rollback safety, and manual inspection.
+- Add cooldown and confirmation controls so promotions/demotions are sticky, pending transitions are visible, and operators can force a recalibration run on demand.
+
 ## Branch Operating Rule
 
 Each phase should be landed in a reviewable commit with tests before moving to the next phase.
