@@ -82,6 +82,13 @@ This branch is the staged upgrade path for making the bot more measurable, more 
 - Block contexts that have enough sample size and are still materially underperforming after costs.
 - Fall back from exact regime matches to mixed-regime context history when exact context is too sparse, while keeping the minimum sample gate intact.
 
+## Phase 12: Calibration-Aware Confidence Gating
+
+- Status: shipped on `codex/live-ledger-foundation`
+- Feed recorded confidence-vs-outcome calibration back into the main decision engine before adaptive/context scoring.
+- Adjust raw candidate confidence using the observed calibration curve for the source when enough history exists.
+- Block sources that remain materially miscalibrated after enough samples, and reward candidates whose confidence has proven reliable.
+
 ## Branch Operating Rule
 
 Each phase should be landed in a reviewable commit with tests before moving to the next phase.

@@ -388,6 +388,7 @@ def build_subsystems(
                     "w_expected_value": config.DECISION_W_EXPECTED_VALUE,
                     "w_confluence": config.DECISION_W_CONFLUENCE,
                     "w_context": config.DECISION_W_CONTEXT,
+                    "w_calibration": config.DECISION_W_CALIBRATION,
                     "min_decision_score": config.DECISION_MIN_SCORE,
                     "min_signal_confidence": config.DECISION_MIN_CONFIDENCE,
                     "min_source_weight": config.DECISION_MIN_SOURCE_WEIGHT,
@@ -419,6 +420,11 @@ def build_subsystems(
                     "context_performance_boost_win_rate": (
                         config.DECISION_CONTEXT_PERFORMANCE_BOOST_WIN_RATE
                     ),
+                    "calibration": c.calibration,
+                    "calibration_enabled": config.DECISION_CALIBRATION_ENABLED,
+                    "calibration_min_records": config.DECISION_CALIBRATION_MIN_RECORDS,
+                    "calibration_target_ece": config.DECISION_CALIBRATION_TARGET_ECE,
+                    "calibration_max_ece": config.DECISION_CALIBRATION_MAX_ECE,
                     "max_trades_per_cycle": config.DECISION_MAX_TRADES_PER_CYCLE,
                     "maker_fee_bps": config.DECISION_MAKER_FEE_BPS,
                     "taker_fee_bps": config.DECISION_TAKER_FEE_BPS,

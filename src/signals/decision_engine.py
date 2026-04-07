@@ -53,6 +53,7 @@ class DecisionEngine:
         self.w_expected_value = cfg.get("w_expected_value", 0.20)  # Net expectancy after costs
         self.w_confluence = cfg.get("w_confluence", 0.10)          # Cross-source same-coin agreement
         self.w_context = cfg.get("w_context", 0.08)                # Source x coin x side x regime fitness
+        self.w_calibration = cfg.get("w_calibration", 0.06)        # Confidence honesty / ECE quality
 
         # Minimum composite score to even consider executing
         self.min_decision_score = cfg.get("min_decision_score", 0.34)
@@ -82,6 +83,13 @@ class DecisionEngine:
         self.context_performance_boost_win_rate = float(
             cfg.get("context_performance_boost_win_rate", 0.60)
         )
+        self.calibration = cfg.get("calibration")
+        self.calibration_enabled = bool(
+            cfg.get("calibration_enabled", self.calibration is not None)
+        )
+        self.calibration_min_records = int(cfg.get("calibration_min_records", 20))
+        self.calibration_target_ece = float(cfg.get("calibration_target_ece", 0.05))
+        self.calibration_max_ece = float(cfg.get("calibration_max_ece", 0.20))
 
         # Max trades to execute per cycle (independent of position slots)
         self.max_trades_per_cycle = cfg.get("max_trades_per_cycle", 2)
@@ -120,6 +128,8 @@ class DecisionEngine:
         self._decision_history: deque = deque(maxlen=100)
         self._cycle_count = 0
         self._context_profile_cache: Dict[Tuple, Dict] = {}
+        self._calibration_profile_cache: Dict[Tuple, Dict] = {}
+        self._calibration_stats_snapshot: Optional[Dict[str, Dict]] = None
 
         # Stats
         self.stats = {
@@ -130,6 +140,7 @@ class DecisionEngine:
             "total_filtered": 0,
             "total_source_conflict_blocks": 0,
             "total_context_blocks": 0,
+            "total_calibration_blocks": 0,
         }
 
     def decide(self, strategies: List[Dict],
@@ -152,6 +163,8 @@ class DecisionEngine:
         """
         self._cycle_count += 1
         self._context_profile_cache = {}
+        self._calibration_profile_cache = {}
+        self._calibration_stats_snapshot = None
         open_positions = open_positions or []
         open_coins = {t["coin"] for t in open_positions}
         available_slots = max(0, 8 - len(open_positions))
@@ -263,6 +276,9 @@ class DecisionEngine:
         )
         self.stats["total_context_blocks"] += sum(
             1 for item in disqualified if "context_underperforming" in item.get("_decision_blockers", [])
+        )
+        self.stats["total_calibration_blocks"] += sum(
+            1 for item in disqualified if "calibration_poor" in item.get("_decision_blockers", [])
         )
         if executions:
             self.stats["total_executions"] += len(executions)
@@ -638,6 +654,12 @@ class DecisionEngine:
         source_quality = execution_quality["source_quality"]
         strategy["_metadata_for_decision"] = execution_quality["metadata"]
         strategy["_execution_quality"] = execution_quality["profile"]
+        calibration_feedback = self._apply_calibration_feedback(strategy, confidence, source_quality)
+        confidence = calibration_feedback["confidence"]
+        source_quality = calibration_feedback["source_quality"]
+        strategy["_metadata_for_decision"] = calibration_feedback["metadata"]
+        strategy["_calibration"] = calibration_feedback["profile"]
+        calibration_score = float(calibration_feedback["calibration_score"] or 0.5)
         adaptive_feedback = self._apply_adaptive_learning_feedback(strategy, confidence, source_quality)
         confidence = adaptive_feedback["confidence"]
         source_quality = adaptive_feedback["source_quality"]
@@ -690,6 +712,7 @@ class DecisionEngine:
             (expected_value["score"], self.w_expected_value),
             (confluence_score, self.w_confluence),
             (context_score, self.w_context),
+            (calibration_score, self.w_calibration),
         ]
         weight_total = sum(weight for _, weight in components if weight > 0)
         total = (
@@ -716,6 +739,7 @@ class DecisionEngine:
             "expected_value": round(expected_value["score"], 3),
             "confluence": round(confluence_score, 3),
             "context": round(context_score, 3),
+            "calibration": round(calibration_score, 3),
             "confluence_support": round(float(confluence_feedback.get("support_score", 0.0) or 0.0), 4),
             "confluence_conflict": round(float(confluence_feedback.get("conflict_score", 0.0) or 0.0), 4),
             "confluence_support_sources": list(confluence_feedback.get("supporting_sources", [])),
@@ -734,6 +758,23 @@ class DecisionEngine:
                 4,
             ),
             "context_regime": str(context_feedback["profile"].get("regime", regime_name) or regime_name),
+            "calibration_ece": round(
+                float(calibration_feedback["profile"].get("ece", 0.0) or 0.0),
+                4,
+            ) if calibration_feedback["profile"].get("ece") is not None else None,
+            "calibration_total_records": int(
+                calibration_feedback["profile"].get("total_records", 0) or 0
+            ),
+            "calibration_quality": str(
+                calibration_feedback["profile"].get("calibration_quality", "unknown") or "unknown"
+            ),
+            "calibration_lookup_key": str(
+                calibration_feedback["profile"].get("lookup_key", "") or ""
+            ),
+            "calibration_used_global": bool(
+                calibration_feedback["profile"].get("used_global", False)
+            ),
+            "calibrated_confidence": round(confidence, 4),
             "win_probability": round(expected_value["win_probability"], 3),
             "reward_risk_ratio": round(expected_value["reward_risk_ratio"], 3),
             "gross_expectancy_pct": round(expected_value["gross_expectancy_pct"], 4),
@@ -829,6 +870,10 @@ class DecisionEngine:
         context_profile = strategy.get("_context_performance", {}) or {}
         if self.context_performance_enabled and bool(context_profile.get("blocked", False)):
             blockers.append("context_underperforming")
+
+        calibration_profile = strategy.get("_calibration", {}) or {}
+        if self.calibration_enabled and bool(calibration_profile.get("blocked", False)):
+            blockers.append("calibration_poor")
 
         confluence = strategy.get("_source_confluence", {}) or {}
         conflict_score = float(confluence.get("conflict_score", 0.0) or 0.0)
@@ -958,6 +1003,147 @@ class DecisionEngine:
         except Exception as exc:
             logger.debug("adaptive learning lookup error: %s", exc)
             return {}
+
+    def _lookup_calibration_profile(self, strategy: Dict) -> Dict:
+        if not self.calibration_enabled or not self.calibration:
+            return {}
+
+        metadata = self._get_metadata(strategy)
+        source_key = str(
+            strategy.get("source_key", metadata.get("source_key", ""))
+            or ""
+        ).strip()
+        source = str(
+            strategy.get("source", metadata.get("source", "strategy"))
+            or "strategy"
+        ).strip().lower()
+        cache_key = (source_key, source)
+        if cache_key in self._calibration_profile_cache:
+            return self._calibration_profile_cache[cache_key]
+
+        if self._calibration_stats_snapshot is None:
+            try:
+                self._calibration_stats_snapshot = self.calibration.get_all_stats() or {}
+            except Exception as exc:
+                logger.debug("calibration stats lookup error: %s", exc)
+                self._calibration_stats_snapshot = {}
+
+        stats_map = self._calibration_stats_snapshot or {}
+        profile: Dict = {}
+        for lookup_key in [source_key, source, "global"]:
+            if lookup_key and lookup_key in stats_map:
+                profile = dict(stats_map[lookup_key])
+                profile["lookup_key"] = lookup_key
+                profile["used_global"] = lookup_key == "global"
+                break
+
+        if not profile:
+            for lookup_key in [source_key, source, "global"]:
+                if not lookup_key:
+                    continue
+                try:
+                    ece = self.calibration.get_ece(lookup_key)
+                except Exception as exc:
+                    logger.debug("calibration ece lookup error: %s", exc)
+                    ece = None
+                if ece is None:
+                    continue
+                profile = {
+                    "lookup_key": lookup_key,
+                    "used_global": lookup_key == "global",
+                    "ece": ece,
+                    "total_records": 0,
+                    "calibration_quality": "unknown",
+                }
+                break
+
+        self._calibration_profile_cache[cache_key] = profile
+        return profile
+
+    def _apply_calibration_feedback(
+        self,
+        strategy: Dict,
+        confidence: float,
+        source_quality: float,
+    ) -> Dict:
+        metadata = dict(self._get_metadata(strategy))
+        if not self.calibration_enabled or not self.calibration:
+            return {
+                "metadata": metadata,
+                "confidence": confidence,
+                "source_quality": source_quality,
+                "calibration_score": 0.5,
+                "profile": {},
+                "blocked": False,
+            }
+
+        profile = self._lookup_calibration_profile(strategy)
+        if not profile:
+            return {
+                "metadata": metadata,
+                "confidence": confidence,
+                "source_quality": source_quality,
+                "calibration_score": 0.5,
+                "profile": {},
+                "blocked": False,
+            }
+
+        lookup_key = str(profile.get("lookup_key", "global") or "global")
+        try:
+            adjusted_confidence = self._clamp(
+                float(self.calibration.get_adjustment_factor(lookup_key, confidence) or confidence),
+                0.0,
+                1.0,
+            )
+        except Exception as exc:
+            logger.debug("calibration adjustment error: %s", exc)
+            adjusted_confidence = confidence
+
+        total_records = int(profile.get("total_records", 0) or 0)
+        ece_value = profile.get("ece")
+        ece = float(ece_value) if ece_value is not None else None
+        calibration_score = 0.5
+        blocked = False
+        quality_multiplier = 1.0
+
+        if ece is not None and total_records >= self.calibration_min_records:
+            if ece <= self.calibration_target_ece:
+                calibration_score = 1.0
+            elif ece >= self.calibration_max_ece:
+                calibration_score = 0.0
+            else:
+                spread = max(self.calibration_max_ece - self.calibration_target_ece, 1e-8)
+                calibration_score = self._clamp(
+                    1.0 - ((ece - self.calibration_target_ece) / spread),
+                    0.0,
+                    1.0,
+                )
+            blocked = ece >= self.calibration_max_ece
+            quality_multiplier = self._clamp(0.70 + (calibration_score * 0.40), 0.55, 1.10)
+
+        enriched_profile = dict(profile)
+        enriched_profile["blocked"] = blocked
+        enriched_profile["adjusted_confidence"] = round(adjusted_confidence, 4)
+        enriched_profile["calibration_score"] = round(calibration_score, 4)
+
+        metadata["raw_confidence"] = round(confidence, 4)
+        metadata["calibrated_confidence"] = round(adjusted_confidence, 4)
+        metadata["calibration_lookup_key"] = lookup_key
+        metadata["calibration_total_records"] = total_records
+        metadata["calibration_ece"] = round(ece, 4) if ece is not None else None
+        metadata["calibration_score"] = round(calibration_score, 4)
+        metadata["calibration_blocked"] = blocked
+        metadata["calibration_quality"] = enriched_profile.get("calibration_quality", "unknown")
+        metadata["calibration_used_global"] = bool(enriched_profile.get("used_global", False))
+
+        return {
+            "metadata": metadata,
+            "confidence": adjusted_confidence,
+            "source_quality": self._clamp(source_quality * quality_multiplier, 0.0, 1.0),
+            "calibration_score": calibration_score,
+            "profile": enriched_profile,
+            "blocked": blocked,
+        }
 
     def _lookup_context_performance(
         self,
@@ -1548,6 +1734,11 @@ class DecisionEngine:
             "context_performance_block_win_rate": self.context_performance_block_win_rate,
             "context_performance_block_avg_return_pct": self.context_performance_block_avg_return_pct,
             "context_performance_boost_win_rate": self.context_performance_boost_win_rate,
+            "calibration_enabled": self.calibration_enabled,
+            "calibration_weight": self.w_calibration,
+            "calibration_min_records": self.calibration_min_records,
+            "calibration_target_ece": self.calibration_target_ece,
+            "calibration_max_ece": self.calibration_max_ece,
             "execution_policy_enabled": self.execution_policy_enabled,
             "execution_policy": (
                 self.execution_policy.get_stats()

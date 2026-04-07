@@ -2224,13 +2224,6 @@ def test_decision_engine_blocks_underperforming_context(monkeypatch):
         "parameters": {"coins": ["BTC"], "direction": "long"},
         "metadata": {"source": "options_flow", "source_key": "options_flow:BTC"},
     }
-    breakdown = engine._compute_composite_score(
-        dict(candidate),
-        regime_data={"overall_regime": "trending_up"},
-        open_coins=set(),
-        kelly_stats=None,
-    )
-
     selected = engine.decide(
         [candidate],
         regime_data={"overall_regime": "trending_up"},
@@ -2241,7 +2234,7 @@ def test_decision_engine_blocks_underperforming_context(monkeypatch):
 
     assert selected == []
     assert candidate["_context_performance"]["blocked"] is True
-    assert breakdown["context"] < 0.5
+    assert candidate["_context_performance"]["context_score"] < 0.5
     assert "context_underperforming" in blockers
     assert engine.get_stats()["total_context_blocks"] >= 1
 
@@ -2372,6 +2365,202 @@ def test_decision_engine_prefers_candidates_with_better_recent_context(monkeypat
     assert selected[0]["name"] == "good_context"
     assert good_breakdown["context"] > weaker_breakdown["context"]
     assert good_breakdown["total"] > weaker_breakdown["total"]
+
+
+def test_decision_engine_blocks_poorly_calibrated_source():
+    class FakeCalibration:
+        def get_all_stats(self):
+            return {
+                "options_flow:BTC": {
+                    "total_records": 36,
+                    "ece": 0.26,
+                    "calibration_quality": "poor",
+                },
+                "global": {
+                    "total_records": 80,
+                    "ece": 0.09,
+                    "calibration_quality": "good",
+                },
+            }
+
+        def get_adjustment_factor(self, source_key, predicted_confidence):
+            if source_key == "options_flow:BTC":
+                return 0.46
+            return predicted_confidence
+
+        def get_ece(self, source_key="global"):
+            return self.get_all_stats().get(source_key, {}).get("ece")
+
+    engine = DecisionEngine(
+        {
+            "w_calibration": 0.60,
+            "min_decision_score": 0.0,
+            "min_signal_confidence": 0.4,
+            "min_source_weight": 0.2,
+            "min_expected_value_pct": -1.0,
+            "execution_quality_enabled": False,
+            "adaptive_learning_enabled": False,
+            "context_performance_enabled": False,
+            "confluence_enabled": False,
+            "calibration": FakeCalibration(),
+            "calibration_enabled": True,
+            "calibration_min_records": 20,
+            "calibration_target_ece": 0.05,
+            "calibration_max_ece": 0.20,
+        }
+    )
+
+    candidate = {
+        "name": "btc_options_flow",
+        "source": "options_flow",
+        "source_key": "options_flow:BTC",
+        "strategy_type": "options_momentum",
+        "current_score": 0.82,
+        "confidence": 0.83,
+        "source_accuracy": 0.74,
+        "entry_price": 100.0,
+        "stop_loss": 97.0,
+        "take_profit": 108.0,
+        "parameters": {"coins": ["BTC"], "direction": "long"},
+        "metadata": {"source": "options_flow", "source_key": "options_flow:BTC"},
+    }
+    breakdown = engine._compute_composite_score(
+        dict(candidate),
+        regime_data={"overall_regime": "trending_up"},
+        open_coins=set(),
+        kelly_stats=None,
+    )
+
+    selected = engine.decide(
+        [candidate],
+        regime_data={"overall_regime": "trending_up"},
+        open_positions=[],
+        kelly_stats={},
+    )
+
+    assert selected == []
+    assert candidate["_calibration"]["blocked"] is True
+    assert candidate["_decision_confidence"] == 0.46
+    assert candidate["_calibration"]["calibration_score"] == 0.0
+    assert candidate["_calibration"]["calibration_quality"] == "poor"
+    assert "calibration_poor" in engine._decision_blockers(candidate)
+    assert engine.get_stats()["total_calibration_blocks"] >= 1
+
+
+def test_decision_engine_prefers_better_calibrated_source():
+    class FakeCalibration:
+        def get_all_stats(self):
+            return {
+                "options_flow:BTC": {
+                    "total_records": 32,
+                    "ece": 0.17,
+                    "calibration_quality": "fair",
+                },
+                "strategy:trend_following:ETH": {
+                    "total_records": 32,
+                    "ece": 0.03,
+                    "calibration_quality": "excellent",
+                },
+                "global": {
+                    "total_records": 100,
+                    "ece": 0.07,
+                    "calibration_quality": "good",
+                },
+            }
+
+        def get_adjustment_factor(self, source_key, predicted_confidence):
+            if source_key == "options_flow:BTC":
+                return 0.54
+            if source_key == "strategy:trend_following:ETH":
+                return 0.72
+            return predicted_confidence
+
+        def get_ece(self, source_key="global"):
+            return self.get_all_stats().get(source_key, {}).get("ece")
+
+    engine = DecisionEngine(
+        {
+            "w_score": 0.08,
+            "w_regime": 0.0,
+            "w_diversity": 0.0,
+            "w_freshness": 0.0,
+            "w_consensus": 0.0,
+            "w_confidence": 0.05,
+            "w_source_quality": 0.05,
+            "w_confirmation": 0.0,
+            "w_expected_value": 0.05,
+            "w_context": 0.0,
+            "w_confluence": 0.0,
+            "w_calibration": 0.77,
+            "min_decision_score": 0.0,
+            "min_signal_confidence": 0.4,
+            "min_source_weight": 0.2,
+            "min_expected_value_pct": -1.0,
+            "execution_quality_enabled": False,
+            "adaptive_learning_enabled": False,
+            "context_performance_enabled": False,
+            "confluence_enabled": False,
+            "calibration": FakeCalibration(),
+            "calibration_enabled": True,
+            "calibration_min_records": 20,
+            "calibration_target_ece": 0.05,
+            "calibration_max_ece": 0.22,
+        }
+    )
+
+    weaker_calibrated = {
+        "name": "weaker_calibrated",
+        "source": "options_flow",
+        "source_key": "options_flow:BTC",
+        "strategy_type": "options_momentum",
+        "current_score": 0.83,
+        "confidence": 0.72,
+        "source_accuracy": 0.70,
+        "entry_price": 100.0,
+        "stop_loss": 97.0,
+        "take_profit": 108.0,
+        "parameters": {"coins": ["BTC"], "direction": "long"},
+        "metadata": {"source": "options_flow", "source_key": "options_flow:BTC"},
+    }
+    better_calibrated = {
+        "name": "better_calibrated",
+        "source": "strategy",
+        "source_key": "strategy:trend_following:ETH",
+        "strategy_type": "trend_following",
+        "current_score": 0.78,
+        "confidence": 0.72,
+        "source_accuracy": 0.70,
+        "entry_price": 100.0,
+        "stop_loss": 97.0,
+        "take_profit": 108.0,
+        "parameters": {"coins": ["ETH"], "direction": "long"},
+        "metadata": {"source": "strategy", "source_key": "strategy:trend_following:ETH"},
+    }
+
+    weak_breakdown = engine._compute_composite_score(
+        dict(weaker_calibrated),
+        regime_data={"overall_regime": "trending_up"},
+        open_coins=set(),
+        kelly_stats=None,
+    )
+    strong_breakdown = engine._compute_composite_score(
+        dict(better_calibrated),
+        regime_data={"overall_regime": "trending_up"},
+        open_coins=set(),
+        kelly_stats=None,
+    )
+    selected = engine.decide(
+        [weaker_calibrated, better_calibrated],
+        regime_data={"overall_regime": "trending_up"},
+        open_positions=[],
+        kelly_stats={},
+    )
+
+    assert selected
+    assert selected[0]["name"] == "better_calibrated"
+    assert strong_breakdown["calibration"] > weak_breakdown["calibration"]
+    assert strong_breakdown["calibrated_confidence"] > weak_breakdown["calibrated_confidence"]
+    assert strong_breakdown["total"] > weak_breakdown["total"]
 
 
 def test_decision_engine_prefers_higher_net_expectancy_over_raw_score():
