@@ -44,6 +44,18 @@ def get_execution_open_positions(container) -> List[Dict]:
     return db.get_open_paper_trades()
 
 
+def get_shadow_open_positions(container) -> List[Dict]:
+    """
+    Return the paper/shadow book used for research-side decision capacity.
+
+    Paper trading is expected to keep learning alongside live trading, so
+    decision-engine slot capacity for shadow entries must not be consumed by
+    unrelated live exchange positions.
+    """
+    _ = container
+    return db.get_open_paper_trades()
+
+
 def get_execution_account_balance(container) -> Optional[float]:
     """Use live account value when available, otherwise fall back to paper balance."""
     trader = get_live_trader(container)
@@ -359,6 +371,21 @@ def mirror_executed_trades_to_live(
     if is_live_trading_active(container):
         for trade in executed:
             try:
+                trade_meta = {}
+                if isinstance(trade, dict):
+                    raw_meta = trade.get("metadata", {})
+                    if isinstance(raw_meta, dict):
+                        trade_meta = raw_meta
+                if trade_meta.get("live_mirror_allowed") is False or trade_meta.get("shadow_only"):
+                    logger.info(
+                        "%s skipped for %s %s: shadow-only decision (%s)",
+                        success_label,
+                        trade.get("coin", "?") if isinstance(trade, dict) else "?",
+                        trade.get("side", "?") if isinstance(trade, dict) else "?",
+                        str(trade_meta.get("shadow_only_reason", "live-grade blockers active") or "live-grade blockers active"),
+                    )
+                    continue
+
                 # Rescale size from paper balance to live balance
                 scaled_trade = _rescale_size_for_live(trade, trader) if isinstance(trade, dict) else trade
                 if scaled_trade is None:

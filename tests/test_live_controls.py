@@ -3504,6 +3504,86 @@ def test_decision_engine_prefers_fully_promoted_source():
     assert eth["_metadata_for_decision"]["promotion_stage"] == "incubating"
 
 
+def test_decision_engine_marks_warming_candidates_shadow_only_when_live_blockers_remain():
+    class FakeAdaptive:
+        def get_source_profile(self, source_key="", source=""):
+            return {
+                "status": "warming_up",
+                "health_score": 0.30,
+                "drift_score": 0.0,
+                "weight_multiplier": 0.45,
+                "confidence_multiplier": 0.75,
+                "training_label": "observe",
+                "recommended_action": "paper-only evidence gathering",
+                "promotion_stage": "incubating",
+                "promotion_score": 0.22,
+                "promotion_gate_passed": False,
+                "promotion_cap_pct": 0.08,
+                "metadata": {
+                    "promotion_quality_multiplier": 1.0,
+                    "promotion_confidence_multiplier": 1.0,
+                },
+            }
+
+    class FakeCalibration:
+        def get_all_stats(self):
+            return {
+                "global": {
+                    "total_records": 40,
+                    "ece": 0.28,
+                    "calibration_quality": "poor",
+                }
+            }
+
+        def get_adjustment_factor(self, lookup_key, confidence):
+            return confidence
+
+    engine = DecisionEngine(
+        {
+            "adaptive_learning": FakeAdaptive(),
+            "adaptive_learning_enabled": True,
+            "adaptive_learning_block_on_status": True,
+            "calibration": FakeCalibration(),
+            "calibration_enabled": True,
+            "min_decision_score": 0.0,
+            "min_signal_confidence": 0.58,
+            "min_source_weight": 0.35,
+            "min_expected_value_pct": -1.0,
+            "execution_quality_enabled": False,
+            "context_performance_enabled": False,
+            "confluence_enabled": False,
+            "memory_enabled": False,
+            "divergence_enabled": False,
+            "capital_governor_enabled": False,
+            "max_trades_per_cycle": 1,
+        }
+    )
+    candidate = {
+        "name": "eth_warmup",
+        "source": "options_flow",
+        "source_key": "options_flow:ETH",
+        "strategy_type": "options_momentum",
+        "current_score": 0.74,
+        "confidence": 0.72,
+        "source_accuracy": 0.62,
+        "entry_price": 100.0,
+        "stop_loss": 98.0,
+        "take_profit": 107.0,
+        "parameters": {"coins": ["ETH"], "direction": "long"},
+        "metadata": {"source": "options_flow", "source_key": "options_flow:ETH"},
+    }
+
+    selected = engine.decide([candidate], regime_data={"overall_regime": "neutral"}, open_positions=[], kelly_stats={})
+
+    assert selected
+    assert selected[0]["_shadow_only"] is True
+    assert selected[0]["metadata"]["live_mirror_allowed"] is False
+    assert "confidence<0.58" in selected[0]["_live_decision_blockers"]
+    assert "source_weight<0.35" in selected[0]["_live_decision_blockers"]
+    assert "adaptive_health<0.42" in selected[0]["_live_decision_blockers"]
+    assert selected[0]["_decision_blockers"] == []
+
+
 def test_decision_engine_rewards_cross_source_same_coin_confluence():
     engine = DecisionEngine(
         {
@@ -5162,6 +5242,103 @@ def test_run_trading_cycle_logs_pipeline_and_no_trade_diagnostics(monkeypatch):
     assert any("Options flow not injected:" in entry for entry in infos)
     assert any("Candidate pipeline empty after upstream filters" in entry for entry in warnings)
     assert any("NoTradeSummary:" in entry for entry in infos)
+
+
+def test_run_trading_cycle_uses_shadow_positions_for_decision_capacity(monkeypatch):
+    captured = {}
+
+    class FakeScorer:
+        def score_all_strategies(self):
+            return []
+
+        def get_top_strategies(self):
+            return [
+                {
+                    "name": "eth_options_shadow",
+                    "strategy_type": "options_momentum",
+                    "current_score": 0.81,
+                    "confidence": 0.72,
+                    "parameters": {"coins": ["ETH"], "direction": "long"},
+                    "metadata": {"source": "options_flow", "source_key": "options_flow:ETH"},
+                }
+            ]
+
+    class FakeRegimeDetector:
+        def get_market_regime(self):
+            return {"overall_regime": "ranging", "overall_confidence": 0.6}
+
+    class FakeOptionsScanner:
+        top_convictions = []
+
+        def scan_flow(self):
+            return {"unusual_prints": 0, "top_convictions": 0}
+
+    class FakePaperTrader:
+        def check_open_positions(self):
+            return []
+
+    class FakeDecisionEngine:
+        def decide(self, strategies, **kwargs):
+            captured["open_positions"] = kwargs["open_positions"]
+            return []
+
+        def get_last_cycle_summary(self):
+            return {"source_counts": {}, "blocker_counts": {}, "no_trade_reason": "blocked"}
+
+    container = type(
+        "Container",
+        (),
+        {
+            "live_trader": type("LiveTraderStub", (), {"dry_run": True})(),
+            "scorer": FakeScorer(),
+            "exchange_agg": None,
+            "options_scanner": FakeOptionsScanner(),
+            "regime_detector": FakeRegimeDetector(),
+            "regime_strategy_filter": None,
+            "signal_processor": None,
+            "polymarket": None,
+            "predictive_forecaster": None,
+            "cross_venue_hedger": None,
+            "liquidation_strategy": None,
+            "paper_trader": FakePaperTrader(),
+            "firewall": None,
+            "position_monitor": None,
+            "copy_trader": None,
+            "arena": None,
+            "decision_engine": FakeDecisionEngine(),
+            "kelly_sizer": None,
+            "multi_scanner": None,
+            "agent_scorer": None,
+            "calibration": None,
+            "shadow_tracker": None,
+        },
+    )()
+
+    monkeypatch.setattr("src.core.cycles.trading_cycle._run_multi_exchange_scan", lambda container: ({}, []))
+    monkeypatch.setattr("src.core.cycles.trading_cycle._run_liquidation_scan", lambda container, regime_data: [])
+    monkeypatch.setattr("src.core.cycles.trading_cycle._gather_copy_trade_signals", lambda container: [])
+    monkeypatch.setattr("src.core.cycles.trading_cycle._process_copy_trade_closures", lambda *args, **kwargs: None)
+    monkeypatch.setattr("src.core.cycles.trading_cycle._run_alpha_arena", lambda container, regime_data: [])
+    monkeypatch.setattr("src.core.cycles.trading_cycle._run_cross_venue_confirmation", lambda container, strategies: None)
+    monkeypatch.setattr("src.core.cycles.trading_cycle._apply_agent_scorer_weights", lambda container, strategies: None)
+    monkeypatch.setattr("src.core.cycles.trading_cycle._apply_calibration_adjustments", lambda container, strategies: None)
+    monkeypatch.setattr("src.core.cycles.trading_cycle._execute_selected_decisions", lambda container, selected_strategies, regime_data: None)
+    monkeypatch.setattr("src.core.cycles.trading_cycle._collect_closed_trade_events", lambda container, closed: [])
+    monkeypatch.setattr("src.core.cycles.trading_cycle._process_closed_trades", lambda container, closed: None)
+    monkeypatch.setattr("src.core.cycles.trading_cycle.is_live_trading_active", lambda container: False)
+    monkeypatch.setattr(
+        "src.core.cycles.trading_cycle.get_shadow_open_positions",
+        lambda container: [{"coin": "ETH", "side": "long"}],
+    )
+    monkeypatch.setattr(
+        "src.core.cycles.trading_cycle.get_execution_open_positions",
+        lambda container: [{"coin": "BTC", "side": "long"} for _ in range(8)],
+    )
+    monkeypatch.setattr("src.notifications.telegram_bot.is_configured", lambda: False)
+
+    run_trading_cycle(container, 1)
+
+    assert captured["open_positions"] == [{"coin": "ETH", "side": "long"}]
 
 
 def test_run_alpha_arena_returns_rankable_candidates(monkeypatch):
@@ -6942,6 +7119,49 @@ def test_mirror_executed_trades_to_live_preserves_execution_metadata(monkeypatch
     assert bypass_firewall is True
     assert isinstance(payload, dict)
     assert payload["metadata"]["upstream_metadata"]["execution_route"] == "maker_limit"
+
+
+def test_mirror_executed_trades_to_live_skips_shadow_only_entries(monkeypatch):
+    captured = []
+
+    class FakeTrader:
+        def is_live_enabled(self):
+            return True
+
+        def is_deployable(self):
+            return True
+
+        def execute_signal(self, payload, bypass_firewall=False):
+            captured.append((payload, bypass_firewall))
+            return {"status": "success"}
+
+    container = types.SimpleNamespace(live_trader=FakeTrader())
+    trade = {
+        "coin": "ETH",
+        "side": "long",
+        "confidence": 0.61,
+        "size": 0.1,
+        "entry_price": 2000.0,
+        "metadata": {
+            "shadow_only": True,
+            "live_mirror_allowed": False,
+            "shadow_only_reason": "confidence<0.58, source_weight<0.35",
+        },
+    }
+
+    monkeypatch.setattr(
+        "src.core.live_execution._rescale_size_for_live",
+        lambda trade, trader: (_ for _ in ()).throw(AssertionError("shadow-only trades must not reach live rescaling")),
+    )
+
+    mirror_executed_trades_to_live(
+        container,
+        [trade],
+        success_label="LIVE",
+        skip_label="SKIP",
+    )
+
+    assert captured == []
 
 
 def test_dashboard_divergence_control_metrics_include_runtime(monkeypatch):

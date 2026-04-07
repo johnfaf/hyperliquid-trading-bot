@@ -282,11 +282,22 @@ class DecisionEngine:
         qualified = []
         disqualified = []
         for strategy in scored:
-            blockers = self._decision_blockers(strategy)
+            live_blockers = self._decision_blockers(strategy)
+            blockers = self._decision_blockers(strategy, allow_shadow_warmup=True)
+            strategy["_live_decision_blockers"] = live_blockers
             strategy["_decision_blockers"] = blockers
             if blockers or strategy["_composite_score"] < self.min_decision_score:
                 disqualified.append(strategy)
             else:
+                shadow_only = bool(live_blockers)
+                metadata = dict(self._get_metadata(strategy))
+                metadata["live_mirror_allowed"] = not shadow_only
+                metadata["shadow_only"] = shadow_only
+                metadata["shadow_only_reason"] = ", ".join(live_blockers) if shadow_only else ""
+                metadata["live_decision_blockers"] = list(live_blockers)
+                strategy["_shadow_only"] = shadow_only
+                strategy["_metadata_for_decision"] = metadata
+                strategy["metadata"] = metadata
                 qualified.append(strategy)
 
         # ─── Limit by cycle trade cap AND available slots ─
@@ -953,7 +964,7 @@ class DecisionEngine:
             ),
         }
 
-    def _decision_blockers(self, strategy: Dict) -> List[str]:
+    def _decision_blockers(self, strategy: Dict, *, allow_shadow_warmup: bool = False) -> List[str]:
         """Hard floors that keep low-quality candidates out before execution."""
         blockers: List[str] = []
         confidence = float(
@@ -966,10 +977,16 @@ class DecisionEngine:
             )
             or 0.5
         )
+        adaptive_profile = strategy.get("_adaptive_learning", {}) or {}
+        adaptive_status = str(adaptive_profile.get("status", "") or "").strip().lower()
+        promotion_stage = str(adaptive_profile.get("promotion_stage", "") or "").strip().lower()
+        shadow_training_candidate = allow_shadow_warmup and (
+            adaptive_status == "warming_up" or promotion_stage == "incubating"
+        )
 
-        if confidence < self.min_signal_confidence:
+        if confidence < self.min_signal_confidence and not shadow_training_candidate:
             blockers.append(f"confidence<{self.min_signal_confidence:.2f}")
-        if source_quality < self.min_source_weight:
+        if source_quality < self.min_source_weight and not shadow_training_candidate:
             blockers.append(f"source_weight<{self.min_source_weight:.2f}")
         breakdown = strategy.get("_score_breakdown", {})
         net_expectancy_pct = float(
@@ -982,8 +999,6 @@ class DecisionEngine:
         if net_expectancy_pct < self.min_expected_value_pct:
             blockers.append(f"net_ev<{self.min_expected_value_pct:.4f}")
 
-        adaptive_profile = strategy.get("_adaptive_learning", {}) or {}
-        adaptive_status = str(adaptive_profile.get("status", "") or "").strip().lower()
         adaptive_health_score = float(adaptive_profile.get("health_score", 1.0) or 1.0)
         if (
             self.adaptive_learning_enabled
@@ -994,6 +1009,7 @@ class DecisionEngine:
         elif (
             self.adaptive_learning_enabled
             and adaptive_health_score < self.adaptive_learning_min_health_score
+            and not shadow_training_candidate
         ):
             blockers.append(f"adaptive_health<{self.adaptive_learning_min_health_score:.2f}")
 
@@ -1002,7 +1018,12 @@ class DecisionEngine:
             blockers.append("context_underperforming")
 
         calibration_profile = strategy.get("_calibration", {}) or {}
-        if self.calibration_enabled and bool(calibration_profile.get("blocked", False)):
+        if (
+            self.calibration_enabled
+            and bool(calibration_profile.get("blocked", False))
+            and not bool(calibration_profile.get("used_global", False))
+            and not shadow_training_candidate
+        ):
             blockers.append("calibration_poor")
 
         memory_profile = strategy.get("_trade_memory", {}) or {}

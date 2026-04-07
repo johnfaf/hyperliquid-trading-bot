@@ -14,6 +14,7 @@ from src.data import database as db
 from src.core.time_utils import utc_now
 from src.core.live_execution import (
     get_execution_open_positions,
+    get_shadow_open_positions,
     is_live_trading_active,
     mirror_executed_trades_to_live,
     sync_shadow_book_to_live,
@@ -815,7 +816,7 @@ def run_trading_cycle(container, cycle_count: int) -> None:
         _apply_calibration_adjustments(container, top_strategies)
 
         # Decision engine
-        open_trades = get_execution_open_positions(container)
+        open_trades = get_shadow_open_positions(container)
         kelly_stats = None
         if container.kelly_sizer:
             try:
