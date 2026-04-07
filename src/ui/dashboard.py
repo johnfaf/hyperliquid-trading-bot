@@ -480,6 +480,23 @@ def _build_source_allocator_metrics(source_allocator=None) -> Dict:
     return metrics
 
 
+def _build_divergence_control_metrics(divergence_controller=None) -> Dict:
+    metrics = {
+        "summary": db.get_runtime_divergence_summary(
+            lookback_hours=getattr(config, "EXPERIMENT_DIVERGENCE_LOOKBACK_HOURS", 24)
+        ),
+    }
+    if divergence_controller:
+        try:
+            metrics["runtime"] = divergence_controller.get_dashboard_payload(limit=12)
+        except Exception as exc:
+            logger.debug("dashboard divergence controller error: %s", exc)
+            metrics["runtime"] = {}
+    else:
+        metrics["runtime"] = {}
+    return metrics
+
+
 # Module-level references for V2 + V2.5 + V3 components (set by set_v2_components)
 _firewall = None
 _regime_detector = None
@@ -498,6 +515,7 @@ _shadow_tracker = None
 _adaptive_learning = None
 _execution_policy = None
 _source_allocator = None
+_divergence_controller = None
 
 # Module-level live trader reference for closing positions on exchange
 _live_trader = None
@@ -613,12 +631,14 @@ def set_v2_components(firewall=None, regime_detector=None, arena=None,
                        llm_filter=None, liquidation_strategy=None,
                        signal_processor=None, arena_incubator=None,
                        decision_engine=None, multi_scanner=None, shadow_tracker=None,
-                       adaptive_learning=None, execution_policy=None, source_allocator=None):
+                       adaptive_learning=None, execution_policy=None, source_allocator=None,
+                       divergence_controller=None):
     """Set V2 + V2.5 + V3 + V4 component references for dashboard metrics."""
     global _firewall, _regime_detector, _arena  # noqa: PLW0603
     global _kelly_sizer, _portfolio_sizer, _trade_memory, _calibration, _llm_filter, _liquidation_strategy  # noqa
     global _signal_processor, _arena_incubator, _decision_engine  # noqa
     global _multi_scanner, _shadow_tracker, _adaptive_learning, _execution_policy, _source_allocator  # noqa
+    global _divergence_controller  # noqa: PLW0603
     _firewall = firewall
     _regime_detector = regime_detector
     _arena = arena
@@ -636,6 +656,7 @@ def set_v2_components(firewall=None, regime_detector=None, arena=None,
     _adaptive_learning = adaptive_learning
     _execution_policy = execution_policy
     _source_allocator = source_allocator
+    _divergence_controller = divergence_controller
 
 
 DASHBOARD_HTML = """<!DOCTYPE html>
@@ -1340,6 +1361,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     pass
                 try:
                     v25["source_allocator"] = _build_source_allocator_metrics(_source_allocator)
+                except Exception:
+                    pass
+                try:
+                    v25["divergence_control"] = _build_divergence_control_metrics(_divergence_controller)
                 except Exception:
                     pass
                 if v25:

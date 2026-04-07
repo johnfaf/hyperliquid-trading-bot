@@ -1973,9 +1973,23 @@ def get_runtime_divergence_summary(lookback_hours: float = 24.0) -> dict:
     live_execution_total = int(live_execution.get("total_events", 0) or 0)
     live_success_count = int(live_execution.get("success_count", 0) or 0)
     live_rejection_count = int(live_execution.get("rejection_count", 0) or 0)
+    live_rejection_rate = round(
+        live_rejection_count / max(1, live_execution_total),
+        4,
+    ) if live_execution_total > 0 else 0.0
+    live_success_rate = round(
+        live_success_count / max(1, live_execution_total),
+        4,
+    ) if live_execution_total > 0 else 0.0
+
+    paper_account = get_paper_account() or {}
+    paper_total_pnl = _safe_float(paper_account.get("total_pnl"), 0.0)
+    live_fill_summary = get_live_fill_summary()
+    live_realized_pnl = _safe_float(live_fill_summary.get("realized_pnl"), 0.0)
 
     paper_live_gap = paper_open_count - live_open_positions
     shadow_live_gap = shadow_selected_count - live_execution_total
+    realized_pnl_gap = round(paper_total_pnl - live_realized_pnl, 2)
 
     return {
         "lookback_hours": float(lookback_hours or 0.0),
@@ -1987,6 +2001,15 @@ def get_runtime_divergence_summary(lookback_hours: float = 24.0) -> dict:
         "live_execution_total": live_execution_total,
         "live_success_count": live_success_count,
         "live_rejection_count": live_rejection_count,
+        "live_success_rate": live_success_rate,
+        "live_rejection_rate": live_rejection_rate,
+        "paper_total_pnl": round(paper_total_pnl, 2),
+        "live_realized_pnl": round(live_realized_pnl, 2),
+        "paper_live_realized_pnl_gap": realized_pnl_gap,
+        "paper_live_realized_pnl_gap_ratio": round(
+            abs(realized_pnl_gap) / max(1.0, abs(paper_total_pnl), abs(live_realized_pnl)),
+            4,
+        ),
         "paper_live_open_gap": paper_live_gap,
         "paper_live_open_gap_ratio": round(
             abs(paper_live_gap) / max(1, max(paper_open_count, live_open_positions)),

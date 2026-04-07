@@ -34,6 +34,8 @@ class SourceBudgetDecision:
     health_score: float
     weight_multiplier: float
     confidence_multiplier: float
+    divergence_status: str = ""
+    divergence_multiplier: float = 1.0
     blocked: bool = False
     block_reason: str = ""
     reasons: List[str] = field(default_factory=list)
@@ -45,7 +47,7 @@ class SourceBudgetDecision:
 class SourceBudgetAllocator:
     """Govern source budgets using adaptive health, outcomes, and live quality."""
 
-    def __init__(self, cfg: Optional[Dict] = None, adaptive_learning=None):
+    def __init__(self, cfg: Optional[Dict] = None, adaptive_learning=None, divergence_controller=None):
         cfg = cfg or {}
         self.enabled = bool(cfg.get("enabled", True))
         self.lookback_hours = float(cfg.get("lookback_hours", 24 * 30))
@@ -67,7 +69,9 @@ class SourceBudgetAllocator:
         self.live_rejection_ceiling = float(cfg.get("live_rejection_ceiling", 0.25))
         self.live_fill_floor = float(cfg.get("live_fill_floor", 0.60))
         self.block_on_status = bool(cfg.get("block_on_status", True))
+        self.divergence_enabled = bool(cfg.get("divergence_enabled", divergence_controller is not None))
         self.adaptive_learning = adaptive_learning
+        self.divergence_controller = divergence_controller
 
         self._last_refresh_at: Optional[datetime] = None
         self._outcome_by_key: Dict[str, Dict] = {}
@@ -89,6 +93,8 @@ class SourceBudgetAllocator:
                 "caution": 0,
                 "blocked": 0,
             },
+            "divergence_blocked": 0,
+            "divergence_scaled": 0,
             "last_decision": None,
         }
 
@@ -305,6 +311,15 @@ class SourceBudgetAllocator:
             logger.debug("source allocator profile error for %s: %s", source_key or source, exc)
             return {}
 
+    def _get_divergence_assessment(self, source_key: str, source: str) -> Dict:
+        if not self.divergence_enabled or not self.divergence_controller:
+            return {}
+        try:
+            return self.divergence_controller.evaluate(source_key=source_key, source=source) or {}
+        except Exception as exc:
+            logger.debug("source allocator divergence error for %s: %s", source_key or source, exc)
+            return {}
+
     def _status_defaults(self, status: str) -> Tuple[float, float]:
         normalized = str(status or "warming_up").strip().lower() or "warming_up"
         multipliers = {
@@ -455,11 +470,24 @@ class SourceBudgetAllocator:
         )
         source_headroom_pct = max(0.0, source_cap_pct - source_exposure_pct)
         adjusted_position_pct = min(original_position_pct * allocation_multiplier, source_headroom_pct)
+        divergence = self._get_divergence_assessment(source_key, source)
+        divergence_status = str(divergence.get("status", "") or "")
+        divergence_multiplier = self._safe_float(divergence.get("multiplier"), 1.0)
+        if divergence and not bool(divergence.get("blocked", False)):
+            adjusted_position_pct *= divergence_multiplier
+            allocation_multiplier *= divergence_multiplier
+            if divergence_status == "caution":
+                reasons.append("divergence_caution_scaled")
+        if divergence:
+            reasons.extend([reason for reason in divergence.get("reasons", []) or [] if reason])
 
         blocked = False
         block_reason = ""
 
-        if status == "blocked" and self.block_on_status:
+        if divergence and bool(divergence.get("blocked", False)):
+            blocked = True
+            block_reason = "divergence_control_blocked"
+        elif status == "blocked" and self.block_on_status:
             blocked = True
             block_reason = "adaptive_learning_blocked"
             reasons.append("blocked_status")
@@ -495,6 +523,8 @@ class SourceBudgetAllocator:
             health_score=round(health_score, 6),
             weight_multiplier=round(weight_multiplier, 6),
             confidence_multiplier=round(confidence_multiplier, 6),
+            divergence_status=divergence_status,
+            divergence_multiplier=round(divergence_multiplier, 6),
             blocked=blocked,
             block_reason=block_reason,
             reasons=reasons,
@@ -503,8 +533,12 @@ class SourceBudgetAllocator:
         self.stats["evaluations"] += 1
         if blocked:
             self.stats["blocked"] += 1
+            if block_reason == "divergence_control_blocked":
+                self.stats["divergence_blocked"] += 1
         if decision.position_pct < decision.original_position_pct:
             self.stats["size_reduced"] += 1
+            if divergence_status == "caution":
+                self.stats["divergence_scaled"] += 1
         status_counts = self.stats.setdefault("status_counts", {})
         status_counts[status] = status_counts.get(status, 0) + 1
         self.stats["last_decision"] = decision.to_dict()
@@ -583,5 +617,10 @@ class SourceBudgetAllocator:
         )
         return {
             **self.get_stats(),
+            "divergence": (
+                self.divergence_controller.get_dashboard_payload(limit=limit)
+                if self.divergence_enabled and self.divergence_controller
+                else {}
+            ),
             "profiles": profiles[:limit],
         }

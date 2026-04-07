@@ -96,6 +96,13 @@ This branch is the staged upgrade path for making the bot more measurable, more 
 - Reward candidates whose nearest historical setup cluster has strong realized outcomes after enough samples.
 - Block candidates whose similar setup cluster is explicitly rated `avoid`, so repeated bad patterns are filtered before execution.
 
+## Phase 14: Live-vs-Paper Divergence Control
+
+- Status: shipped on `codex/live-ledger-foundation`
+- Promote passive divergence reporting into a runtime control layer instead of leaving it as reporting-only telemetry.
+- Block or taper new entries when paper, shadow, and live drift exceeds configured thresholds globally or by source.
+- Expose divergence runtime state in the decision engine, source allocator, reporting cycle, and dashboard.
+
 ## Branch Operating Rule
 
 Each phase should be landed in a reviewable commit with tests before moving to the next phase.

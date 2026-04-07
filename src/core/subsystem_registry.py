@@ -41,7 +41,7 @@ FULL_PROFILE = FUNDABLE_CORE | {
     "liquidation_strategy", "kelly_sizer", "portfolio_sizer", "trade_memory", "calibration",
     "llm_filter", "signal_processor", "arena_incubator", "decision_engine",
     "alpha_arena", "adaptive_learning", "execution_policy", "position_monitor", "dashboard", "telegram",
-    "source_allocator",
+    "source_allocator", "divergence_controller",
     "cross_venue_hedger", "shadow_tracker", "adaptive_bot_detector",
     "regime_strategy_filter", "exchange_aggregator",
 }
@@ -84,6 +84,7 @@ class SubsystemContainer:
     adaptive_learning: Any = None
     execution_policy: Any = None
     source_allocator: Any = None
+    divergence_controller: Any = None
     llm_filter: Any = None
     signal_processor: Any = None
     arena_incubator: Any = None
@@ -328,6 +329,58 @@ def build_subsystems(
             affects_trading=False,
         )
 
+    if "divergence_controller" in profile:
+        from src.signals.divergence_controller import DivergenceController
+
+        c.divergence_controller = _safe_init(
+            "divergence_controller",
+            lambda: DivergenceController(
+                {
+                    "enabled": config.RUNTIME_DIVERGENCE_CONTROL_ENABLED,
+                    "live_trading_enabled": config.LIVE_TRADING_ENABLED,
+                    "lookback_hours": config.EXPERIMENT_DIVERGENCE_LOOKBACK_HOURS,
+                    "refresh_interval_seconds": config.RUNTIME_DIVERGENCE_REFRESH_INTERVAL_SECONDS,
+                    "min_live_events": config.RUNTIME_DIVERGENCE_MIN_LIVE_EVENTS,
+                    "source_min_selected": config.RUNTIME_DIVERGENCE_SOURCE_MIN_SELECTED,
+                    "caution_multiplier": config.RUNTIME_DIVERGENCE_CAUTION_MULTIPLIER,
+                    "blocked_multiplier": config.RUNTIME_DIVERGENCE_BLOCKED_MULTIPLIER,
+                    "block_on_status": config.RUNTIME_DIVERGENCE_BLOCK_ON_STATUS,
+                    "global_caution_open_gap_ratio": config.RUNTIME_DIVERGENCE_GLOBAL_CAUTION_OPEN_GAP_RATIO,
+                    "global_block_open_gap_ratio": config.RUNTIME_DIVERGENCE_GLOBAL_BLOCK_OPEN_GAP_RATIO,
+                    "global_caution_execution_gap_ratio": (
+                        config.RUNTIME_DIVERGENCE_GLOBAL_CAUTION_EXECUTION_GAP_RATIO
+                    ),
+                    "global_block_execution_gap_ratio": (
+                        config.RUNTIME_DIVERGENCE_GLOBAL_BLOCK_EXECUTION_GAP_RATIO
+                    ),
+                    "global_caution_pnl_gap_ratio": config.RUNTIME_DIVERGENCE_GLOBAL_CAUTION_PNL_GAP_RATIO,
+                    "global_block_pnl_gap_ratio": config.RUNTIME_DIVERGENCE_GLOBAL_BLOCK_PNL_GAP_RATIO,
+                    "global_caution_rejection_rate": (
+                        config.RUNTIME_DIVERGENCE_GLOBAL_CAUTION_REJECTION_RATE
+                    ),
+                    "global_block_rejection_rate": (
+                        config.RUNTIME_DIVERGENCE_GLOBAL_BLOCK_REJECTION_RATE
+                    ),
+                    "source_caution_execution_gap_ratio": (
+                        config.RUNTIME_DIVERGENCE_SOURCE_CAUTION_EXECUTION_GAP_RATIO
+                    ),
+                    "source_block_execution_gap_ratio": (
+                        config.RUNTIME_DIVERGENCE_SOURCE_BLOCK_EXECUTION_GAP_RATIO
+                    ),
+                    "source_caution_rejection_rate": (
+                        config.RUNTIME_DIVERGENCE_SOURCE_CAUTION_REJECTION_RATE
+                    ),
+                    "source_block_rejection_rate": (
+                        config.RUNTIME_DIVERGENCE_SOURCE_BLOCK_REJECTION_RATE
+                    ),
+                    "source_caution_fill_ratio": config.RUNTIME_DIVERGENCE_SOURCE_CAUTION_FILL_RATIO,
+                    "source_block_fill_ratio": config.RUNTIME_DIVERGENCE_SOURCE_BLOCK_FILL_RATIO,
+                }
+            ),
+            health,
+            affects_trading=False,
+        )
+
     if "source_allocator" in profile:
         from src.signals.source_allocator import SourceBudgetAllocator
 
@@ -355,8 +408,10 @@ def build_subsystems(
                     "live_rejection_ceiling": config.SOURCE_BUDGET_LIVE_REJECTION_CEILING,
                     "live_fill_floor": config.SOURCE_BUDGET_LIVE_FILL_FLOOR,
                     "block_on_status": config.SOURCE_BUDGET_BLOCK_ON_STATUS,
+                    "divergence_enabled": config.RUNTIME_DIVERGENCE_CONTROL_ENABLED,
                 },
                 adaptive_learning=c.adaptive_learning,
+                divergence_controller=c.divergence_controller,
             ),
             health,
             affects_trading=False,
@@ -390,6 +445,7 @@ def build_subsystems(
                     "w_context": config.DECISION_W_CONTEXT,
                     "w_calibration": config.DECISION_W_CALIBRATION,
                     "w_memory": config.DECISION_W_MEMORY,
+                    "w_divergence": config.DECISION_W_DIVERGENCE,
                     "min_decision_score": config.DECISION_MIN_SCORE,
                     "min_signal_confidence": config.DECISION_MIN_CONFIDENCE,
                     "min_source_weight": config.DECISION_MIN_SOURCE_WEIGHT,
@@ -432,6 +488,9 @@ def build_subsystems(
                     "memory_min_similarity": config.DECISION_MEMORY_MIN_SIMILARITY,
                     "memory_top_k": config.DECISION_MEMORY_TOP_K,
                     "memory_block_on_avoid": config.DECISION_MEMORY_BLOCK_ON_AVOID,
+                    "divergence_controller": c.divergence_controller,
+                    "divergence_enabled": config.DECISION_DIVERGENCE_ENABLED,
+                    "divergence_block_on_status": config.DECISION_DIVERGENCE_BLOCK_ON_STATUS,
                     "max_trades_per_cycle": config.DECISION_MAX_TRADES_PER_CYCLE,
                     "maker_fee_bps": config.DECISION_MAKER_FEE_BPS,
                     "taker_fee_bps": config.DECISION_TAKER_FEE_BPS,
@@ -626,6 +685,7 @@ def build_subsystems(
                 shadow_tracker=c.shadow_tracker,
                 execution_policy=c.execution_policy,
                 source_allocator=c.source_allocator,
+                divergence_controller=c.divergence_controller,
             )
             if c.live_trader:
                 set_live_trader(c.live_trader)
@@ -673,6 +733,7 @@ _FIELD_TO_HEALTH_NAME: dict = {
     "trade_memory":           "trade_memory",
     "calibration":            "calibration",
     "execution_policy":       "execution_policy",
+    "divergence_controller":  "divergence_controller",
     "llm_filter":             "llm_filter",
     "signal_processor":       "signal_processor",
     "arena_incubator":        "arena_incubator",

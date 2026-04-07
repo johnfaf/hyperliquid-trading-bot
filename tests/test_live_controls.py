@@ -34,6 +34,7 @@ from src.data import database as db
 from src.signals.adaptive_learning import AdaptiveLearningManager
 from src.signals.decision_engine import DecisionEngine
 from src.signals.decision_firewall import DecisionFirewall
+from src.signals.divergence_controller import DivergenceController
 from src.signals.execution_policy import ExecutionPolicyManager
 from src.signals.portfolio_sizer import PortfolioSizer
 from src.signals.source_allocator import SourceBudgetAllocator
@@ -5353,3 +5354,188 @@ def test_mirror_executed_trades_to_live_preserves_execution_metadata(monkeypatch
     assert bypass_firewall is True
     assert isinstance(payload, dict)
     assert payload["metadata"]["upstream_metadata"]["execution_route"] == "maker_limit"
+
+
+def test_dashboard_divergence_control_metrics_include_runtime(monkeypatch):
+    monkeypatch.setattr(
+        dashboard_ui.db,
+        "get_runtime_divergence_summary",
+        lambda lookback_hours=24: {
+            "paper_live_open_gap_ratio": 0.42,
+            "shadow_live_execution_gap_ratio": 0.18,
+        },
+    )
+
+    class FakeController:
+        def get_dashboard_payload(self, limit=12):
+            return {
+                "global": {"status": "caution", "reasons": ["global_open_gap_caution"]},
+                "profiles": [{"scope_key": "options_flow:BTC", "status": "blocked"}],
+            }
+
+    metrics = dashboard_ui._build_divergence_control_metrics(FakeController())
+
+    assert metrics["summary"]["paper_live_open_gap_ratio"] == 0.42
+    assert metrics["runtime"]["global"]["status"] == "caution"
+    assert metrics["runtime"]["profiles"][0]["scope_key"] == "options_flow:BTC"
+
+
+def test_divergence_controller_blocks_on_large_runtime_gap(monkeypatch):
+    monkeypatch.setattr(
+        "src.signals.divergence_controller.db.get_runtime_divergence_summary",
+        lambda lookback_hours=24: {
+            "shadow_selected_count": 10,
+            "paper_open_count": 6,
+            "live_open_positions": 1,
+            "live_execution_total": 2,
+            "paper_live_open_gap_ratio": 0.83,
+            "shadow_live_execution_gap_ratio": 0.8,
+            "paper_live_realized_pnl_gap_ratio": 0.55,
+            "live_rejection_rate": 0.31,
+        },
+    )
+    monkeypatch.setattr(
+        "src.signals.divergence_controller.db.get_source_attribution_summary",
+        lambda **kwargs: [
+            {
+                "source_key": "options_flow:BTC",
+                "source": "options_flow",
+                "selected_count": 5,
+                "live_events": 1,
+                "paper_closed_count": 4,
+                "live_rejection_rate": 0.12,
+                "live_avg_fill_ratio": 0.82,
+            }
+        ],
+    )
+
+    controller = DivergenceController(
+        {
+            "enabled": True,
+            "live_trading_enabled": True,
+            "refresh_interval_seconds": 0.0,
+            "min_live_events": 2,
+            "source_min_selected": 2,
+        }
+    )
+    assessment = controller.evaluate(source_key="options_flow:BTC", source="options_flow")
+
+    assert assessment["status"] == "blocked"
+    assert assessment["blocked"] is True
+    assert any(
+        reason in assessment["reasons"]
+        for reason in (
+            "global_open_gap_block",
+            "global_execution_gap_block",
+            "global_realized_pnl_gap_block",
+            "global_live_rejection_block",
+        )
+    )
+
+
+def test_decision_engine_blocks_candidate_when_divergence_controller_blocked():
+    class FakeController:
+        def evaluate(self, source_key="", source="", strategy=None):
+            return {
+                "status": "blocked",
+                "blocked": True,
+                "multiplier": 0.0,
+                "divergence_score": 0.0,
+                "reasons": ["global_execution_gap_block"],
+                "global": {"status": "blocked", "reasons": ["global_execution_gap_block"]},
+                "source_profile": {"status": "healthy", "reasons": []},
+            }
+
+    engine = DecisionEngine(
+        {
+            "w_divergence": 0.60,
+            "min_decision_score": 0.0,
+            "min_signal_confidence": 0.4,
+            "min_source_weight": 0.2,
+            "min_expected_value_pct": -1.0,
+            "execution_quality_enabled": False,
+            "adaptive_learning_enabled": False,
+            "context_performance_enabled": False,
+            "confluence_enabled": False,
+            "calibration_enabled": False,
+            "memory_enabled": False,
+            "divergence_controller": FakeController(),
+            "divergence_enabled": True,
+            "divergence_block_on_status": True,
+        }
+    )
+
+    candidate = {
+        "name": "divergence_blocked",
+        "source": "options_flow",
+        "source_key": "options_flow:BTC",
+        "strategy_type": "options_momentum",
+        "current_score": 0.82,
+        "confidence": 0.79,
+        "source_accuracy": 0.71,
+        "entry_price": 100.0,
+        "stop_loss": 97.0,
+        "take_profit": 108.0,
+        "parameters": {"coins": ["BTC"], "direction": "long"},
+        "metadata": {"source": "options_flow", "source_key": "options_flow:BTC"},
+    }
+
+    selected = engine.decide(
+        [candidate],
+        regime_data={"overall_regime": "trending_up"},
+        open_positions=[],
+        kelly_stats={},
+    )
+
+    assert selected == []
+    assert candidate["_divergence_control"]["status"] == "blocked"
+    assert "divergence_guard" in engine._decision_blockers(candidate)
+    assert engine.get_stats()["total_divergence_blocks"] >= 1
+
+
+def test_source_budget_allocator_scales_position_when_divergence_is_caution(monkeypatch):
+    monkeypatch.setattr("src.signals.source_allocator.db.get_source_trade_outcome_summary", lambda **kwargs: [])
+    monkeypatch.setattr("src.signals.source_allocator.db.get_source_attribution_summary", lambda **kwargs: [])
+
+    class FakeController:
+        def evaluate(self, source_key="", source=""):
+            return {
+                "status": "caution",
+                "blocked": False,
+                "multiplier": 0.5,
+                "divergence_score": 0.35,
+                "reasons": ["global_execution_gap_caution"],
+                "global": {"status": "caution"},
+                "source_profile": {"status": "healthy"},
+            }
+
+        def get_dashboard_payload(self, limit=12):
+            return {"global": {"status": "caution"}}
+
+    allocator = SourceBudgetAllocator(
+        {"enabled": True, "divergence_enabled": True},
+        adaptive_learning=None,
+        divergence_controller=FakeController(),
+    )
+    signal = TradeSignal(
+        coin="BTC",
+        side=SignalSide.LONG,
+        confidence=0.8,
+        source=SignalSource.OPTIONS_FLOW,
+        reason="divergence caution scale test",
+        position_pct=0.10,
+        leverage=2.0,
+        risk=RiskParams(),
+    )
+
+    decision = allocator.evaluate(
+        signal,
+        signal={"source": "options_flow", "source_key": "options_flow:BTC", "coin": "BTC"},
+        open_positions=[],
+        account_balance=10_000.0,
+    )
+
+    assert decision.blocked is False
+    assert decision.position_pct < decision.original_position_pct
+    assert decision.divergence_status == "caution"
+    assert decision.divergence_multiplier == 0.5

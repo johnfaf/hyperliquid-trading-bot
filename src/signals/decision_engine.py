@@ -55,6 +55,7 @@ class DecisionEngine:
         self.w_context = cfg.get("w_context", 0.08)                # Source x coin x side x regime fitness
         self.w_calibration = cfg.get("w_calibration", 0.06)        # Confidence honesty / ECE quality
         self.w_memory = cfg.get("w_memory", 0.07)                  # Similar historical setup fitness
+        self.w_divergence = cfg.get("w_divergence", 0.08)          # Paper/shadow/live alignment quality
 
         # Minimum composite score to even consider executing
         self.min_decision_score = cfg.get("min_decision_score", 0.34)
@@ -99,6 +100,11 @@ class DecisionEngine:
         self.memory_min_similarity = float(cfg.get("memory_min_similarity", 0.55))
         self.memory_top_k = int(cfg.get("memory_top_k", 8))
         self.memory_block_on_avoid = bool(cfg.get("memory_block_on_avoid", True))
+        self.divergence_controller = cfg.get("divergence_controller")
+        self.divergence_enabled = bool(
+            cfg.get("divergence_enabled", self.divergence_controller is not None)
+        )
+        self.divergence_block_on_status = bool(cfg.get("divergence_block_on_status", True))
 
         # Max trades to execute per cycle (independent of position slots)
         self.max_trades_per_cycle = cfg.get("max_trades_per_cycle", 2)
@@ -140,6 +146,7 @@ class DecisionEngine:
         self._calibration_profile_cache: Dict[Tuple, Dict] = {}
         self._calibration_stats_snapshot: Optional[Dict[str, Dict]] = None
         self._memory_profile_cache: Dict[Tuple, Dict] = {}
+        self._divergence_profile_cache: Dict[Tuple, Dict] = {}
 
         # Stats
         self.stats = {
@@ -152,6 +159,7 @@ class DecisionEngine:
             "total_context_blocks": 0,
             "total_calibration_blocks": 0,
             "total_memory_blocks": 0,
+            "total_divergence_blocks": 0,
         }
 
     def decide(self, strategies: List[Dict],
@@ -177,6 +185,7 @@ class DecisionEngine:
         self._calibration_profile_cache = {}
         self._calibration_stats_snapshot = None
         self._memory_profile_cache = {}
+        self._divergence_profile_cache = {}
         open_positions = open_positions or []
         open_coins = {t["coin"] for t in open_positions}
         available_slots = max(0, 8 - len(open_positions))
@@ -294,6 +303,9 @@ class DecisionEngine:
         )
         self.stats["total_memory_blocks"] += sum(
             1 for item in disqualified if "memory_avoid" in item.get("_decision_blockers", [])
+        )
+        self.stats["total_divergence_blocks"] += sum(
+            1 for item in disqualified if "divergence_guard" in item.get("_decision_blockers", [])
         )
         if executions:
             self.stats["total_executions"] += len(executions)
@@ -669,6 +681,12 @@ class DecisionEngine:
         source_quality = execution_quality["source_quality"]
         strategy["_metadata_for_decision"] = execution_quality["metadata"]
         strategy["_execution_quality"] = execution_quality["profile"]
+        divergence_feedback = self._apply_divergence_feedback(strategy, confidence, source_quality)
+        confidence = divergence_feedback["confidence"]
+        source_quality = divergence_feedback["source_quality"]
+        strategy["_metadata_for_decision"] = divergence_feedback["metadata"]
+        strategy["_divergence_control"] = divergence_feedback["profile"]
+        divergence_score = float(divergence_feedback["divergence_score"] or 0.5)
         calibration_feedback = self._apply_calibration_feedback(strategy, confidence, source_quality)
         confidence = calibration_feedback["confidence"]
         source_quality = calibration_feedback["source_quality"]
@@ -742,6 +760,7 @@ class DecisionEngine:
             (context_score, self.w_context),
             (calibration_score, self.w_calibration),
             (memory_score, self.w_memory),
+            (divergence_score, self.w_divergence),
         ]
         weight_total = sum(weight for _, weight in components if weight > 0)
         total = (
@@ -770,6 +789,7 @@ class DecisionEngine:
             "context": round(context_score, 3),
             "calibration": round(calibration_score, 3),
             "memory": round(memory_score, 3),
+            "divergence": round(divergence_score, 3),
             "confluence_support": round(float(confluence_feedback.get("support_score", 0.0) or 0.0), 4),
             "confluence_conflict": round(float(confluence_feedback.get("conflict_score", 0.0) or 0.0), 4),
             "confluence_support_sources": list(confluence_feedback.get("supporting_sources", [])),
@@ -826,6 +846,22 @@ class DecisionEngine:
             ),
             "memory_reason": str(memory_feedback["profile"].get("reason", "") or ""),
             "memory_blocked": bool(memory_feedback["profile"].get("blocked", False)),
+            "divergence_status": str(
+                divergence_feedback["profile"].get("status", "unknown") or "unknown"
+            ),
+            "divergence_multiplier": round(
+                float(divergence_feedback["profile"].get("multiplier", 1.0) or 1.0),
+                4,
+            ),
+            "divergence_reason_count": len(divergence_feedback["profile"].get("reasons", []) or []),
+            "divergence_global_status": str(
+                (divergence_feedback["profile"].get("global", {}) or {}).get("status", "unknown") or "unknown"
+            ),
+            "divergence_source_status": str(
+                (divergence_feedback["profile"].get("source_profile", {}) or {}).get("status", "unknown")
+                or "unknown"
+            ),
+            "divergence_blocked": bool(divergence_feedback["profile"].get("blocked", False)),
             "calibrated_confidence": round(confidence, 4),
             "win_probability": round(expected_value["win_probability"], 3),
             "reward_risk_ratio": round(expected_value["reward_risk_ratio"], 3),
@@ -930,6 +966,10 @@ class DecisionEngine:
         memory_profile = strategy.get("_trade_memory", {}) or {}
         if self.memory_enabled and bool(memory_profile.get("blocked", False)):
             blockers.append("memory_avoid")
+
+        divergence_profile = strategy.get("_divergence_control", {}) or {}
+        if self.divergence_enabled and bool(divergence_profile.get("blocked", False)):
+            blockers.append("divergence_guard")
 
         confluence = strategy.get("_source_confluence", {}) or {}
         conflict_score = float(confluence.get("conflict_score", 0.0) or 0.0)
@@ -1042,6 +1082,96 @@ class DecisionEngine:
             "source_quality": self._clamp(source_quality * quality_multiplier, 0.0, 1.0),
             "profile": profile,
             "penalty_bps": penalty_bps,
+        }
+
+    def _lookup_divergence_profile(self, strategy: Dict) -> Dict:
+        if not self.divergence_enabled or not self.divergence_controller:
+            return {}
+
+        metadata = self._get_metadata(strategy)
+        source_key = str(
+            strategy.get("source_key", metadata.get("source_key", "")) or ""
+        ).strip()
+        source = str(
+            strategy.get("source", metadata.get("source", "strategy")) or "strategy"
+        ).strip().lower()
+        cache_key = (source_key, source)
+        if cache_key in self._divergence_profile_cache:
+            return self._divergence_profile_cache[cache_key]
+
+        try:
+            profile = self.divergence_controller.evaluate(
+                source_key=source_key,
+                source=source,
+            ) or {}
+        except Exception as exc:
+            logger.debug("divergence controller lookup error: %s", exc)
+            profile = {}
+
+        self._divergence_profile_cache[cache_key] = profile
+        return profile
+
+    def _apply_divergence_feedback(
+        self,
+        strategy: Dict,
+        confidence: float,
+        source_quality: float,
+    ) -> Dict:
+        metadata = dict(self._get_metadata(strategy))
+        if not self.divergence_enabled or not self.divergence_controller:
+            return {
+                "metadata": metadata,
+                "confidence": confidence,
+                "source_quality": source_quality,
+                "divergence_score": 0.5,
+                "profile": {},
+                "blocked": False,
+            }
+
+        profile = self._lookup_divergence_profile(strategy)
+        if not profile:
+            return {
+                "metadata": metadata,
+                "confidence": confidence,
+                "source_quality": source_quality,
+                "divergence_score": 0.5,
+                "profile": {},
+                "blocked": False,
+            }
+
+        status = str(profile.get("status", "warming_up") or "warming_up").strip().lower()
+        multiplier = self._clamp(float(profile.get("multiplier", 1.0) or 1.0), 0.0, 1.0)
+        divergence_score = float(profile.get("divergence_score", 0.5) or 0.5)
+        blocked = bool(profile.get("blocked", False)) and self.divergence_block_on_status
+
+        confidence_multiplier = 1.0
+        source_quality_multiplier = 1.0
+        if status == "caution":
+            confidence_multiplier = self._clamp(0.75 + (multiplier * 0.25), 0.55, 0.95)
+            source_quality_multiplier = self._clamp(0.65 + (multiplier * 0.35), 0.45, 0.95)
+        elif status == "blocked":
+            confidence_multiplier = self._clamp(0.40 + (multiplier * 0.20), 0.20, 0.60)
+            source_quality_multiplier = self._clamp(0.35 + (multiplier * 0.20), 0.15, 0.55)
+
+        metadata["divergence_status"] = status
+        metadata["divergence_multiplier"] = round(multiplier, 4)
+        metadata["divergence_reasons"] = list(profile.get("reasons", []) or [])
+        metadata["divergence_global_status"] = str(
+            (profile.get("global", {}) or {}).get("status", "unknown") or "unknown"
+        )
+        metadata["divergence_source_status"] = str(
+            (profile.get("source_profile", {}) or {}).get("status", "unknown") or "unknown"
+        )
+        metadata["divergence_blocked"] = blocked
+        metadata["divergence_score"] = round(divergence_score, 4)
+
+        return {
+            "metadata": metadata,
+            "confidence": self._clamp(confidence * confidence_multiplier, 0.0, 1.0),
+            "source_quality": self._clamp(source_quality * source_quality_multiplier, 0.0, 1.0),
+            "divergence_score": divergence_score,
+            "profile": profile,
+            "blocked": blocked,
         }
 
     def _lookup_adaptive_profile(self, strategy: Dict) -> Dict:
@@ -1982,6 +2112,9 @@ class DecisionEngine:
             "calibration_min_records": self.calibration_min_records,
             "calibration_target_ece": self.calibration_target_ece,
             "calibration_max_ece": self.calibration_max_ece,
+            "divergence_enabled": self.divergence_enabled,
+            "divergence_weight": self.w_divergence,
+            "divergence_block_on_status": self.divergence_block_on_status,
             "memory_enabled": self.memory_enabled,
             "memory_weight": self.w_memory,
             "memory_min_trades": self.memory_min_trades,

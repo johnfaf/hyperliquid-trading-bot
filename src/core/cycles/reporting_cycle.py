@@ -74,6 +74,18 @@ def run_reporting(container, cycle_count: int, health_registry=None) -> None:
             )
     except Exception as exc:
         logger.debug("  Adaptive learning error: %s", exc)
+    try:
+        if getattr(container, "divergence_controller", None):
+            divergence_stats = container.divergence_controller.get_dashboard_payload(limit=5)
+            global_profile = divergence_stats.get("global", {}) or {}
+            logger.info(
+                "  DivergenceControl: %s (tracked=%d, reasons=%s)",
+                global_profile.get("status", "unknown"),
+                divergence_stats.get("tracked_sources", 0),
+                ", ".join(global_profile.get("reasons", [])[:3]) or "none",
+            )
+    except Exception as exc:
+        logger.debug("  Divergence control error: %s", exc)
 
     # ── Shadow tracker + hedger stats ──
     try:
@@ -232,6 +244,10 @@ def _log_module_stats(container):
         getattr(container, "source_allocator", None) and
         _fmt_source_allocator(container.source_allocator.get_stats())
     ))
+    _safe_stat("Divergence", lambda: (
+        getattr(container, "divergence_controller", None) and
+        _fmt_divergence(container.divergence_controller.get_stats())
+    ))
     _safe_stat("MultiExchange", lambda: (
         container.multi_scanner and
         _fmt_multi(container.multi_scanner.get_stats())
@@ -299,4 +315,14 @@ def _fmt_source_allocator(stats):
         f"active={counts.get('active', 0)}, "
         f"caution={counts.get('caution', 0)}, "
         f"blocked_status={counts.get('blocked', 0)}"
+    )
+
+
+def _fmt_divergence(stats):
+    return (
+        f"enabled={stats.get('enabled', False)}, "
+        f"evals={stats.get('evaluations', 0)}, "
+        f"blocked={stats.get('blocked', 0)}, "
+        f"caution={stats.get('caution', 0)}, "
+        f"global={stats.get('global_status', 'unknown')}"
     )
