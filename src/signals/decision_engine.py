@@ -56,6 +56,7 @@ class DecisionEngine:
         self.w_calibration = cfg.get("w_calibration", 0.06)        # Confidence honesty / ECE quality
         self.w_memory = cfg.get("w_memory", 0.07)                  # Similar historical setup fitness
         self.w_divergence = cfg.get("w_divergence", 0.08)          # Paper/shadow/live alignment quality
+        self.w_capital_governor = cfg.get("w_capital_governor", 0.08)  # Global capital posture quality
 
         # Minimum composite score to even consider executing
         self.min_decision_score = cfg.get("min_decision_score", 0.34)
@@ -105,6 +106,13 @@ class DecisionEngine:
             cfg.get("divergence_enabled", self.divergence_controller is not None)
         )
         self.divergence_block_on_status = bool(cfg.get("divergence_block_on_status", True))
+        self.capital_governor = cfg.get("capital_governor")
+        self.capital_governor_enabled = bool(
+            cfg.get("capital_governor_enabled", self.capital_governor is not None)
+        )
+        self.capital_governor_block_on_status = bool(
+            cfg.get("capital_governor_block_on_status", True)
+        )
 
         # Max trades to execute per cycle (independent of position slots)
         self.max_trades_per_cycle = cfg.get("max_trades_per_cycle", 2)
@@ -147,6 +155,7 @@ class DecisionEngine:
         self._calibration_stats_snapshot: Optional[Dict[str, Dict]] = None
         self._memory_profile_cache: Dict[Tuple, Dict] = {}
         self._divergence_profile_cache: Dict[Tuple, Dict] = {}
+        self._capital_governor_profile_cache: Dict[Tuple, Dict] = {}
 
         # Stats
         self.stats = {
@@ -160,6 +169,7 @@ class DecisionEngine:
             "total_calibration_blocks": 0,
             "total_memory_blocks": 0,
             "total_divergence_blocks": 0,
+            "total_capital_blocks": 0,
         }
 
     def decide(self, strategies: List[Dict],
@@ -186,6 +196,7 @@ class DecisionEngine:
         self._calibration_stats_snapshot = None
         self._memory_profile_cache = {}
         self._divergence_profile_cache = {}
+        self._capital_governor_profile_cache = {}
         open_positions = open_positions or []
         open_coins = {t["coin"] for t in open_positions}
         available_slots = max(0, 8 - len(open_positions))
@@ -306,6 +317,9 @@ class DecisionEngine:
         )
         self.stats["total_divergence_blocks"] += sum(
             1 for item in disqualified if "divergence_guard" in item.get("_decision_blockers", [])
+        )
+        self.stats["total_capital_blocks"] += sum(
+            1 for item in disqualified if "capital_governor_guard" in item.get("_decision_blockers", [])
         )
         if executions:
             self.stats["total_executions"] += len(executions)
@@ -687,6 +701,17 @@ class DecisionEngine:
         strategy["_metadata_for_decision"] = divergence_feedback["metadata"]
         strategy["_divergence_control"] = divergence_feedback["profile"]
         divergence_score = float(divergence_feedback["divergence_score"] or 0.5)
+        capital_feedback = self._apply_capital_governor_feedback(
+            strategy,
+            confidence,
+            source_quality,
+            regime_data=regime_data,
+        )
+        confidence = capital_feedback["confidence"]
+        source_quality = capital_feedback["source_quality"]
+        strategy["_metadata_for_decision"] = capital_feedback["metadata"]
+        strategy["_capital_governor"] = capital_feedback["profile"]
+        capital_governor_score = float(capital_feedback["capital_score"] or 0.5)
         calibration_feedback = self._apply_calibration_feedback(strategy, confidence, source_quality)
         confidence = calibration_feedback["confidence"]
         source_quality = calibration_feedback["source_quality"]
@@ -761,6 +786,7 @@ class DecisionEngine:
             (calibration_score, self.w_calibration),
             (memory_score, self.w_memory),
             (divergence_score, self.w_divergence),
+            (capital_governor_score, self.w_capital_governor),
         ]
         weight_total = sum(weight for _, weight in components if weight > 0)
         total = (
@@ -790,6 +816,7 @@ class DecisionEngine:
             "calibration": round(calibration_score, 3),
             "memory": round(memory_score, 3),
             "divergence": round(divergence_score, 3),
+            "capital_governor": round(capital_governor_score, 3),
             "confluence_support": round(float(confluence_feedback.get("support_score", 0.0) or 0.0), 4),
             "confluence_conflict": round(float(confluence_feedback.get("conflict_score", 0.0) or 0.0), 4),
             "confluence_support_sources": list(confluence_feedback.get("supporting_sources", [])),
@@ -862,6 +889,15 @@ class DecisionEngine:
                 or "unknown"
             ),
             "divergence_blocked": bool(divergence_feedback["profile"].get("blocked", False)),
+            "capital_governor_status": str(
+                capital_feedback["profile"].get("status", "unknown") or "unknown"
+            ),
+            "capital_governor_multiplier": round(
+                float(capital_feedback["profile"].get("multiplier", 1.0) or 1.0),
+                4,
+            ),
+            "capital_governor_reason_count": len(capital_feedback["profile"].get("reasons", []) or []),
+            "capital_governor_blocked": bool(capital_feedback["profile"].get("blocked", False)),
             "calibrated_confidence": round(confidence, 4),
             "win_probability": round(expected_value["win_probability"], 3),
             "reward_risk_ratio": round(expected_value["reward_risk_ratio"], 3),
@@ -970,6 +1006,10 @@ class DecisionEngine:
         divergence_profile = strategy.get("_divergence_control", {}) or {}
         if self.divergence_enabled and bool(divergence_profile.get("blocked", False)):
             blockers.append("divergence_guard")
+
+        capital_profile = strategy.get("_capital_governor", {}) or {}
+        if self.capital_governor_enabled and bool(capital_profile.get("blocked", False)):
+            blockers.append("capital_governor_guard")
 
         confluence = strategy.get("_source_confluence", {}) or {}
         conflict_score = float(confluence.get("conflict_score", 0.0) or 0.0)
@@ -1170,6 +1210,96 @@ class DecisionEngine:
             "confidence": self._clamp(confidence * confidence_multiplier, 0.0, 1.0),
             "source_quality": self._clamp(source_quality * source_quality_multiplier, 0.0, 1.0),
             "divergence_score": divergence_score,
+            "profile": profile,
+            "blocked": blocked,
+        }
+
+    def _lookup_capital_governor_profile(self, regime_data: Optional[Dict] = None) -> Dict:
+        if not self.capital_governor_enabled or not self.capital_governor:
+            return {}
+
+        regime_name = ""
+        regime_confidence = 0.0
+        if isinstance(regime_data, dict):
+            regime_name = str(regime_data.get("overall_regime", "") or "")
+            regime_confidence = float(regime_data.get("overall_confidence", 0.0) or 0.0)
+        cache_key = (regime_name, round(regime_confidence, 4))
+        if cache_key in self._capital_governor_profile_cache:
+            return self._capital_governor_profile_cache[cache_key]
+
+        try:
+            profile = self.capital_governor.evaluate(regime_data=regime_data) or {}
+        except Exception as exc:
+            logger.debug("capital governor lookup error: %s", exc)
+            profile = {}
+
+        self._capital_governor_profile_cache[cache_key] = profile
+        return profile
+
+    def _apply_capital_governor_feedback(
+        self,
+        strategy: Dict,
+        confidence: float,
+        source_quality: float,
+        *,
+        regime_data: Optional[Dict] = None,
+    ) -> Dict:
+        metadata = dict(self._get_metadata(strategy))
+        if not self.capital_governor_enabled or not self.capital_governor:
+            return {
+                "metadata": metadata,
+                "confidence": confidence,
+                "source_quality": source_quality,
+                "capital_score": 0.5,
+                "profile": {},
+                "blocked": False,
+            }
+
+        profile = self._lookup_capital_governor_profile(regime_data=regime_data)
+        if not profile:
+            return {
+                "metadata": metadata,
+                "confidence": confidence,
+                "source_quality": source_quality,
+                "capital_score": 0.5,
+                "profile": {},
+                "blocked": False,
+            }
+
+        status = str(profile.get("status", "warming_up") or "warming_up").strip().lower()
+        multiplier = self._clamp(float(profile.get("multiplier", 1.0) or 1.0), 0.0, 1.0)
+        capital_score = float(profile.get("capital_score", 0.5) or 0.5)
+        blocked = bool(profile.get("blocked", False)) and self.capital_governor_block_on_status
+
+        confidence_multiplier = 1.0
+        source_quality_multiplier = 1.0
+        if status == "caution":
+            confidence_multiplier = self._clamp(0.80 + (multiplier * 0.20), 0.60, 0.95)
+            source_quality_multiplier = self._clamp(0.72 + (multiplier * 0.28), 0.50, 0.96)
+        elif status == "risk_off":
+            confidence_multiplier = self._clamp(0.58 + (multiplier * 0.18), 0.35, 0.82)
+            source_quality_multiplier = self._clamp(0.50 + (multiplier * 0.20), 0.25, 0.78)
+        elif status == "blocked":
+            confidence_multiplier = self._clamp(0.35 + (multiplier * 0.15), 0.15, 0.55)
+            source_quality_multiplier = self._clamp(0.25 + (multiplier * 0.15), 0.10, 0.45)
+
+        metadata["capital_governor_status"] = status
+        metadata["capital_governor_multiplier"] = round(multiplier, 4)
+        metadata["capital_governor_reasons"] = list(profile.get("reasons", []) or [])
+        metadata["capital_governor_blocked"] = blocked
+        metadata["capital_governor_score"] = round(capital_score, 4)
+        metadata["capital_governor_divergence_status"] = str(profile.get("divergence_status", "unknown") or "unknown")
+        metadata["capital_governor_regime_name"] = str(profile.get("regime_name", "") or "")
+        metadata["capital_governor_regime_confidence"] = round(
+            float(profile.get("regime_confidence", 0.0) or 0.0),
+            4,
+        )
+
+        return {
+            "metadata": metadata,
+            "confidence": self._clamp(confidence * confidence_multiplier, 0.0, 1.0),
+            "source_quality": self._clamp(source_quality * source_quality_multiplier, 0.0, 1.0),
+            "capital_score": capital_score,
             "profile": profile,
             "blocked": blocked,
         }
@@ -2115,6 +2245,14 @@ class DecisionEngine:
             "divergence_enabled": self.divergence_enabled,
             "divergence_weight": self.w_divergence,
             "divergence_block_on_status": self.divergence_block_on_status,
+            "capital_governor_enabled": self.capital_governor_enabled,
+            "capital_governor_weight": self.w_capital_governor,
+            "capital_governor_block_on_status": self.capital_governor_block_on_status,
+            "capital_governor": (
+                self.capital_governor.get_stats()
+                if self.capital_governor_enabled and self.capital_governor
+                else {}
+            ),
             "memory_enabled": self.memory_enabled,
             "memory_weight": self.w_memory,
             "memory_min_trades": self.memory_min_trades,

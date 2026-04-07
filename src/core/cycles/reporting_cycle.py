@@ -86,6 +86,19 @@ def run_reporting(container, cycle_count: int, health_registry=None) -> None:
             )
     except Exception as exc:
         logger.debug("  Divergence control error: %s", exc)
+    try:
+        if getattr(container, "capital_governor", None):
+            capital_stats = container.capital_governor.get_dashboard_payload()
+            runtime = capital_stats.get("runtime", {}) or {}
+            logger.info(
+                "  CapitalGovernor: %s (paper_dd=%.2f%%, live_dd=%.2f%%, reasons=%s)",
+                runtime.get("status", "unknown"),
+                float((runtime.get("metrics", {}) or {}).get("paper_current_drawdown_pct", 0.0) or 0.0) * 100.0,
+                float((runtime.get("metrics", {}) or {}).get("live_current_drawdown_pct", 0.0) or 0.0) * 100.0,
+                ", ".join(runtime.get("reasons", [])[:3]) or "none",
+            )
+    except Exception as exc:
+        logger.debug("  Capital governor error: %s", exc)
 
     # ── Shadow tracker + hedger stats ──
     try:
@@ -248,6 +261,10 @@ def _log_module_stats(container):
         getattr(container, "divergence_controller", None) and
         _fmt_divergence(container.divergence_controller.get_stats())
     ))
+    _safe_stat("CapitalGovernor", lambda: (
+        getattr(container, "capital_governor", None) and
+        _fmt_capital_governor(container.capital_governor.get_stats())
+    ))
     _safe_stat("MultiExchange", lambda: (
         container.multi_scanner and
         _fmt_multi(container.multi_scanner.get_stats())
@@ -324,5 +341,16 @@ def _fmt_divergence(stats):
         f"evals={stats.get('evaluations', 0)}, "
         f"blocked={stats.get('blocked', 0)}, "
         f"caution={stats.get('caution', 0)}, "
+        f"global={stats.get('global_status', 'unknown')}"
+    )
+
+
+def _fmt_capital_governor(stats):
+    return (
+        f"enabled={stats.get('enabled', False)}, "
+        f"evals={stats.get('evaluations', 0)}, "
+        f"caution={stats.get('caution', 0)}, "
+        f"risk_off={stats.get('risk_off', 0)}, "
+        f"blocked={stats.get('blocked', 0)}, "
         f"global={stats.get('global_status', 'unknown')}"
     )

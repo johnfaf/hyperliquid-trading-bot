@@ -103,6 +103,13 @@ This branch is the staged upgrade path for making the bot more measurable, more 
 - Block or taper new entries when paper, shadow, and live drift exceeds configured thresholds globally or by source.
 - Expose divergence runtime state in the decision engine, source allocator, reporting cycle, and dashboard.
 
+## Phase 15: Adaptive Capital Governor
+
+- Status: shipped on `codex/live-ledger-foundation`
+- Convert recent paper and live portfolio quality into a global risk budget instead of treating every cycle as full-risk by default.
+- Taper or block new entries when drawdown, rolling return quality, source-health degradation, or runtime divergence indicate the system should derisk.
+- Expose the capital posture in source allocation, decision ranking, reporting, and the dashboard so risk-off states are visible instead of silent.
+
 ## Branch Operating Rule
 
 Each phase should be landed in a reviewable commit with tests before moving to the next phase.

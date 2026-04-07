@@ -41,7 +41,7 @@ FULL_PROFILE = FUNDABLE_CORE | {
     "liquidation_strategy", "kelly_sizer", "portfolio_sizer", "trade_memory", "calibration",
     "llm_filter", "signal_processor", "arena_incubator", "decision_engine",
     "alpha_arena", "adaptive_learning", "execution_policy", "position_monitor", "dashboard", "telegram",
-    "source_allocator", "divergence_controller",
+    "source_allocator", "divergence_controller", "capital_governor",
     "cross_venue_hedger", "shadow_tracker", "adaptive_bot_detector",
     "regime_strategy_filter", "exchange_aggregator",
 }
@@ -85,6 +85,7 @@ class SubsystemContainer:
     execution_policy: Any = None
     source_allocator: Any = None
     divergence_controller: Any = None
+    capital_governor: Any = None
     llm_filter: Any = None
     signal_processor: Any = None
     arena_incubator: Any = None
@@ -381,6 +382,44 @@ def build_subsystems(
             affects_trading=False,
         )
 
+    if "capital_governor" in profile:
+        from src.signals.capital_governor import CapitalGovernor
+
+        c.capital_governor = _safe_init(
+            "capital_governor",
+            lambda: CapitalGovernor(
+                {
+                    "enabled": config.CAPITAL_GOVERNOR_ENABLED,
+                    "lookback_hours": config.CAPITAL_GOVERNOR_LOOKBACK_HOURS,
+                    "refresh_interval_seconds": config.CAPITAL_GOVERNOR_REFRESH_INTERVAL_SECONDS,
+                    "min_paper_trades": config.CAPITAL_GOVERNOR_MIN_PAPER_TRADES,
+                    "min_live_snapshots": config.CAPITAL_GOVERNOR_MIN_LIVE_SNAPSHOTS,
+                    "min_source_profiles": config.CAPITAL_GOVERNOR_MIN_SOURCE_PROFILES,
+                    "caution_multiplier": config.CAPITAL_GOVERNOR_CAUTION_MULTIPLIER,
+                    "risk_off_multiplier": config.CAPITAL_GOVERNOR_RISK_OFF_MULTIPLIER,
+                    "blocked_multiplier": config.CAPITAL_GOVERNOR_BLOCKED_MULTIPLIER,
+                    "block_on_risk_off": config.CAPITAL_GOVERNOR_BLOCK_ON_RISK_OFF,
+                    "caution_paper_drawdown_pct": config.CAPITAL_GOVERNOR_CAUTION_PAPER_DRAWDOWN_PCT,
+                    "risk_off_paper_drawdown_pct": config.CAPITAL_GOVERNOR_RISK_OFF_PAPER_DRAWDOWN_PCT,
+                    "block_paper_drawdown_pct": config.CAPITAL_GOVERNOR_BLOCK_PAPER_DRAWDOWN_PCT,
+                    "caution_live_drawdown_pct": config.CAPITAL_GOVERNOR_CAUTION_LIVE_DRAWDOWN_PCT,
+                    "risk_off_live_drawdown_pct": config.CAPITAL_GOVERNOR_RISK_OFF_LIVE_DRAWDOWN_PCT,
+                    "block_live_drawdown_pct": config.CAPITAL_GOVERNOR_BLOCK_LIVE_DRAWDOWN_PCT,
+                    "caution_paper_sharpe": config.CAPITAL_GOVERNOR_CAUTION_PAPER_SHARPE,
+                    "risk_off_paper_sharpe": config.CAPITAL_GOVERNOR_RISK_OFF_PAPER_SHARPE,
+                    "caution_live_sharpe": config.CAPITAL_GOVERNOR_CAUTION_LIVE_SHARPE,
+                    "risk_off_live_sharpe": config.CAPITAL_GOVERNOR_RISK_OFF_LIVE_SHARPE,
+                    "caution_degraded_source_ratio": config.CAPITAL_GOVERNOR_CAUTION_DEGRADED_SOURCE_RATIO,
+                    "risk_off_blocked_source_ratio": config.CAPITAL_GOVERNOR_RISK_OFF_BLOCKED_SOURCE_RATIO,
+                    "low_regime_confidence": config.CAPITAL_GOVERNOR_LOW_REGIME_CONFIDENCE,
+                    "divergence_blocks": config.CAPITAL_GOVERNOR_DIVERGENCE_BLOCKS,
+                },
+                divergence_controller=c.divergence_controller,
+            ),
+            health,
+            affects_trading=False,
+        )
+
     if "source_allocator" in profile:
         from src.signals.source_allocator import SourceBudgetAllocator
 
@@ -409,9 +448,11 @@ def build_subsystems(
                     "live_fill_floor": config.SOURCE_BUDGET_LIVE_FILL_FLOOR,
                     "block_on_status": config.SOURCE_BUDGET_BLOCK_ON_STATUS,
                     "divergence_enabled": config.RUNTIME_DIVERGENCE_CONTROL_ENABLED,
+                    "capital_governor_enabled": config.SOURCE_BUDGET_CAPITAL_GOVERNOR_ENABLED,
                 },
                 adaptive_learning=c.adaptive_learning,
                 divergence_controller=c.divergence_controller,
+                capital_governor=c.capital_governor,
             ),
             health,
             affects_trading=False,
@@ -446,6 +487,7 @@ def build_subsystems(
                     "w_calibration": config.DECISION_W_CALIBRATION,
                     "w_memory": config.DECISION_W_MEMORY,
                     "w_divergence": config.DECISION_W_DIVERGENCE,
+                    "w_capital_governor": config.DECISION_W_CAPITAL_GOVERNOR,
                     "min_decision_score": config.DECISION_MIN_SCORE,
                     "min_signal_confidence": config.DECISION_MIN_CONFIDENCE,
                     "min_source_weight": config.DECISION_MIN_SOURCE_WEIGHT,
@@ -491,6 +533,9 @@ def build_subsystems(
                     "divergence_controller": c.divergence_controller,
                     "divergence_enabled": config.DECISION_DIVERGENCE_ENABLED,
                     "divergence_block_on_status": config.DECISION_DIVERGENCE_BLOCK_ON_STATUS,
+                    "capital_governor": c.capital_governor,
+                    "capital_governor_enabled": config.DECISION_CAPITAL_GOVERNOR_ENABLED,
+                    "capital_governor_block_on_status": config.DECISION_CAPITAL_GOVERNOR_BLOCK_ON_STATUS,
                     "max_trades_per_cycle": config.DECISION_MAX_TRADES_PER_CYCLE,
                     "maker_fee_bps": config.DECISION_MAKER_FEE_BPS,
                     "taker_fee_bps": config.DECISION_TAKER_FEE_BPS,
@@ -686,6 +731,7 @@ def build_subsystems(
                 execution_policy=c.execution_policy,
                 source_allocator=c.source_allocator,
                 divergence_controller=c.divergence_controller,
+                capital_governor=c.capital_governor,
             )
             if c.live_trader:
                 set_live_trader(c.live_trader)
@@ -734,6 +780,7 @@ _FIELD_TO_HEALTH_NAME: dict = {
     "calibration":            "calibration",
     "execution_policy":       "execution_policy",
     "divergence_controller":  "divergence_controller",
+    "capital_governor":       "capital_governor",
     "llm_filter":             "llm_filter",
     "signal_processor":       "signal_processor",
     "arena_incubator":        "arena_incubator",

@@ -32,6 +32,7 @@ from src.core.live_execution import (
 )
 from src.data import database as db
 from src.signals.adaptive_learning import AdaptiveLearningManager
+from src.signals.capital_governor import CapitalGovernor
 from src.signals.decision_engine import DecisionEngine
 from src.signals.decision_firewall import DecisionFirewall
 from src.signals.divergence_controller import DivergenceController
@@ -5539,3 +5540,176 @@ def test_source_budget_allocator_scales_position_when_divergence_is_caution(monk
     assert decision.position_pct < decision.original_position_pct
     assert decision.divergence_status == "caution"
     assert decision.divergence_multiplier == 0.5
+
+
+def test_dashboard_capital_governor_metrics_include_runtime(monkeypatch):
+    monkeypatch.setattr(
+        dashboard_ui.db,
+        "get_capital_governor_summary",
+        lambda lookback_hours=24.0 * 14, health_limit=200: {
+            "paper_current_drawdown_pct": 0.06,
+            "live_current_drawdown_pct": 0.02,
+        },
+    )
+
+    class FakeGovernor:
+        def get_dashboard_payload(self):
+            return {
+                "runtime": {"status": "caution", "reasons": ["paper_drawdown_caution"]},
+                "summary": {"paper_current_drawdown_pct": 0.06},
+            }
+
+    metrics = dashboard_ui._build_capital_governor_metrics(FakeGovernor())
+
+    assert metrics["summary"]["paper_current_drawdown_pct"] == 0.06
+    assert metrics["runtime"]["runtime"]["status"] == "caution"
+
+
+def test_capital_governor_enters_risk_off_on_live_drawdown(monkeypatch):
+    monkeypatch.setattr(
+        "src.signals.capital_governor.db.get_capital_governor_summary",
+        lambda lookback_hours=24.0 * 14: {
+            "paper_closed_trades": 8,
+            "paper_current_drawdown_pct": 0.06,
+            "paper_sharpe": 0.12,
+            "live_snapshot_count": 16,
+            "live_current_drawdown_pct": 0.11,
+            "live_sharpe": -0.31,
+            "source_profile_count": 5,
+            "degraded_source_ratio": 0.20,
+            "blocked_source_ratio": 0.10,
+        },
+    )
+
+    class FakeDivergence:
+        def get_stats(self):
+            return {"global_status": "healthy"}
+
+    governor = CapitalGovernor(
+        {
+            "enabled": True,
+            "refresh_interval_seconds": 0.0,
+            "min_paper_trades": 3,
+            "min_live_snapshots": 3,
+            "min_source_profiles": 2,
+        },
+        divergence_controller=FakeDivergence(),
+    )
+    assessment = governor.evaluate(
+        regime_data={"overall_regime": "choppy", "overall_confidence": 0.41}
+    )
+
+    assert assessment["status"] == "risk_off"
+    assert assessment["blocked"] is False
+    assert assessment["multiplier"] == 0.4
+    assert "live_drawdown_risk_off" in assessment["reasons"]
+
+
+def test_decision_engine_blocks_candidate_when_capital_governor_blocked():
+    class FakeGovernor:
+        def evaluate(self, regime_data=None):
+            return {
+                "status": "blocked",
+                "blocked": True,
+                "multiplier": 0.0,
+                "capital_score": 0.0,
+                "reasons": ["live_drawdown_block"],
+                "metrics": {"live_current_drawdown_pct": 0.22},
+                "divergence_status": "healthy",
+            }
+
+        def get_stats(self):
+            return {"global_status": "blocked"}
+
+    engine = DecisionEngine(
+        {
+            "w_capital_governor": 0.60,
+            "min_decision_score": 0.0,
+            "min_signal_confidence": 0.4,
+            "min_source_weight": 0.2,
+            "min_expected_value_pct": -1.0,
+            "execution_quality_enabled": False,
+            "adaptive_learning_enabled": False,
+            "context_performance_enabled": False,
+            "confluence_enabled": False,
+            "calibration_enabled": False,
+            "memory_enabled": False,
+            "divergence_enabled": False,
+            "capital_governor": FakeGovernor(),
+            "capital_governor_enabled": True,
+            "capital_governor_block_on_status": True,
+        }
+    )
+
+    candidate = {
+        "name": "capital_blocked",
+        "source": "strategy",
+        "source_key": "strategy:trend_following:BTC",
+        "strategy_type": "trend_following",
+        "current_score": 0.84,
+        "confidence": 0.8,
+        "source_accuracy": 0.74,
+        "entry_price": 100.0,
+        "stop_loss": 97.0,
+        "take_profit": 108.0,
+        "parameters": {"coins": ["BTC"], "direction": "long"},
+        "metadata": {"source": "strategy", "source_key": "strategy:trend_following:BTC"},
+    }
+
+    selected = engine.decide(
+        [candidate],
+        regime_data={"overall_regime": "trending_up", "overall_confidence": 0.8},
+        open_positions=[],
+        kelly_stats={},
+    )
+
+    assert selected == []
+    assert candidate["_capital_governor"]["status"] == "blocked"
+    assert "capital_governor_guard" in engine._decision_blockers(candidate)
+    assert engine.get_stats()["total_capital_blocks"] >= 1
+
+
+def test_source_budget_allocator_scales_position_when_capital_governor_is_risk_off(monkeypatch):
+    monkeypatch.setattr("src.signals.source_allocator.db.get_source_trade_outcome_summary", lambda **kwargs: [])
+    monkeypatch.setattr("src.signals.source_allocator.db.get_source_attribution_summary", lambda **kwargs: [])
+
+    class FakeGovernor:
+        def evaluate(self):
+            return {
+                "status": "risk_off",
+                "blocked": False,
+                "multiplier": 0.4,
+                "capital_score": 0.25,
+                "reasons": ["live_drawdown_risk_off"],
+            }
+
+        def get_dashboard_payload(self):
+            return {"runtime": {"status": "risk_off"}}
+
+    allocator = SourceBudgetAllocator(
+        {"enabled": True, "capital_governor_enabled": True},
+        adaptive_learning=None,
+        capital_governor=FakeGovernor(),
+    )
+    signal = TradeSignal(
+        coin="ETH",
+        side=SignalSide.SHORT,
+        confidence=0.77,
+        source=SignalSource.OPTIONS_FLOW,
+        reason="capital risk off test",
+        position_pct=0.10,
+        leverage=2.0,
+        risk=RiskParams(),
+    )
+
+    decision = allocator.evaluate(
+        signal,
+        signal={"source": "options_flow", "source_key": "options_flow:ETH", "coin": "ETH"},
+        open_positions=[],
+        account_balance=10_000.0,
+    )
+
+    assert decision.blocked is False
+    assert decision.position_pct < decision.original_position_pct
+    assert decision.capital_status == "risk_off"
+    assert decision.capital_multiplier == 0.4

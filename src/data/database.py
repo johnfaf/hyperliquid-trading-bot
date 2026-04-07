@@ -2025,6 +2025,194 @@ def get_runtime_divergence_summary(lookback_hours: float = 24.0) -> dict:
 
 # ─── Research Logs ─────────────────────────────────────────────
 
+def _compute_drawdown_metrics(values: list) -> dict:
+    clean_values = [_safe_float(value, 0.0) for value in values or [] if _safe_float(value, 0.0) > 0]
+    if not clean_values:
+        return {
+            "peak_value": 0.0,
+            "current_value": 0.0,
+            "current_drawdown_pct": 0.0,
+            "max_drawdown_pct": 0.0,
+        }
+
+    peak_value = clean_values[0]
+    max_drawdown_pct = 0.0
+    for value in clean_values:
+        peak_value = max(peak_value, value)
+        if peak_value > 0:
+            max_drawdown_pct = max(max_drawdown_pct, (peak_value - value) / peak_value)
+
+    current_value = clean_values[-1]
+    current_drawdown_pct = ((peak_value - current_value) / peak_value) if peak_value > 0 else 0.0
+    return {
+        "peak_value": round(peak_value, 4),
+        "current_value": round(current_value, 4),
+        "current_drawdown_pct": round(max(0.0, current_drawdown_pct), 4),
+        "max_drawdown_pct": round(max(0.0, max_drawdown_pct), 4),
+    }
+
+
+def _compute_return_stats(returns: list) -> dict:
+    clean_returns = [float(value) for value in returns or [] if value is not None]
+    if not clean_returns:
+        return {
+            "avg_return_pct": 0.0,
+            "sharpe": 0.0,
+            "volatility_pct": 0.0,
+        }
+
+    avg_return = sum(clean_returns) / len(clean_returns)
+    if len(clean_returns) < 2:
+        volatility = 0.0
+    else:
+        variance = sum((value - avg_return) ** 2 for value in clean_returns) / (len(clean_returns) - 1)
+        volatility = variance ** 0.5
+
+    sharpe = 0.0
+    if volatility > 1e-12:
+        sharpe = (avg_return / volatility) * (len(clean_returns) ** 0.5)
+
+    return {
+        "avg_return_pct": round(avg_return, 6),
+        "sharpe": round(sharpe, 4),
+        "volatility_pct": round(volatility, 6),
+    }
+
+
+def get_capital_governor_summary(lookback_hours: float = 24.0 * 14, health_limit: int = 200) -> dict:
+    cutoff = None
+    if lookback_hours and float(lookback_hours) > 0:
+        cutoff = datetime.utcnow() - timedelta(hours=float(lookback_hours))
+
+    paper_account = get_paper_account() or {}
+    paper_balance = _safe_float(paper_account.get("balance"), 0.0)
+    paper_total_pnl = _safe_float(paper_account.get("total_pnl"), 0.0)
+    inferred_initial_balance = paper_balance - paper_total_pnl
+    if inferred_initial_balance <= 0:
+        inferred_initial_balance = _safe_float(
+            getattr(config, "PAPER_TRADING_INITIAL_BALANCE", 10_000),
+            10_000.0,
+        )
+
+    try:
+        with get_connection() as conn:
+            paper_rows = conn.execute(
+                """
+                SELECT pnl, closed_at
+                FROM paper_trades
+                WHERE status = 'closed'
+                ORDER BY COALESCE(closed_at, opened_at) ASC
+                """
+            ).fetchall()
+    except sqlite3.OperationalError:
+        paper_rows = []
+
+    paper_returns = []
+    paper_closed_count = 0
+    paper_winning_trades = 0
+    equity_value = inferred_initial_balance
+    paper_equity_curve = [inferred_initial_balance]
+    for row in paper_rows:
+        closed_at = _parse_iso_timestamp(row["closed_at"])
+        if cutoff and closed_at and closed_at < cutoff:
+            continue
+        pnl = _safe_float(row["pnl"], 0.0)
+        denominator = max(abs(equity_value), 1.0)
+        paper_returns.append(pnl / denominator)
+        paper_closed_count += 1
+        if pnl > 0:
+            paper_winning_trades += 1
+        equity_value += pnl
+        paper_equity_curve.append(equity_value)
+
+    if paper_balance > 0:
+        paper_equity_curve.append(paper_balance)
+
+    paper_drawdown = _compute_drawdown_metrics(paper_equity_curve)
+    paper_return_stats = _compute_return_stats(paper_returns)
+
+    live_snapshots = get_recent_live_equity_snapshots(
+        limit=max(72, int(max(float(lookback_hours or 0.0), 1.0) * 12) + 24)
+    )
+    filtered_live_snapshots = []
+    for snapshot in live_snapshots:
+        snapshot_ts = _parse_iso_timestamp(snapshot.get("timestamp"))
+        if cutoff and snapshot_ts and snapshot_ts < cutoff:
+            continue
+        filtered_live_snapshots.append(snapshot)
+
+    live_totals = [
+        _safe_float(snapshot.get("total"), 0.0)
+        for snapshot in filtered_live_snapshots
+        if _safe_float(snapshot.get("total"), 0.0) > 0
+    ]
+    live_returns = []
+    for previous, current in zip(live_totals, live_totals[1:]):
+        if previous > 0 and current > 0:
+            live_returns.append((current - previous) / previous)
+
+    live_drawdown = _compute_drawdown_metrics(live_totals)
+    live_return_stats = _compute_return_stats(live_returns)
+    latest_live_snapshot = filtered_live_snapshots[-1] if filtered_live_snapshots else None
+
+    source_snapshot = get_latest_source_health_snapshot(limit=health_limit)
+    profiles = list(source_snapshot.get("profiles", []) or [])
+    status_counts = {"active": 0, "warming_up": 0, "caution": 0, "blocked": 0}
+    avg_health_score = 0.0
+    for profile in profiles:
+        status = str(profile.get("status", "warming_up") or "warming_up").strip().lower() or "warming_up"
+        status_counts[status] = status_counts.get(status, 0) + 1
+        avg_health_score += _safe_float(profile.get("health_score"), 0.0)
+    if profiles:
+        avg_health_score /= len(profiles)
+
+    total_profiles = len(profiles)
+    degraded_source_ratio = (
+        (status_counts.get("caution", 0) + status_counts.get("blocked", 0)) / max(total_profiles, 1)
+        if total_profiles > 0
+        else 0.0
+    )
+    blocked_source_ratio = (
+        status_counts.get("blocked", 0) / max(total_profiles, 1)
+        if total_profiles > 0
+        else 0.0
+    )
+
+    return {
+        "lookback_hours": float(lookback_hours or 0.0),
+        "paper_balance": round(paper_balance, 2),
+        "paper_total_pnl": round(paper_total_pnl, 2),
+        "paper_initial_balance": round(inferred_initial_balance, 2),
+        "paper_closed_trades": paper_closed_count,
+        "paper_win_rate": (
+            round(paper_winning_trades / max(paper_closed_count, 1), 4)
+            if paper_closed_count > 0
+            else 0.0
+        ),
+        "paper_avg_return_pct": paper_return_stats["avg_return_pct"],
+        "paper_sharpe": paper_return_stats["sharpe"],
+        "paper_volatility_pct": paper_return_stats["volatility_pct"],
+        "paper_peak_balance": paper_drawdown["peak_value"],
+        "paper_current_drawdown_pct": paper_drawdown["current_drawdown_pct"],
+        "paper_max_drawdown_pct": paper_drawdown["max_drawdown_pct"],
+        "live_snapshot_count": len(live_totals),
+        "live_current_total": live_drawdown["current_value"],
+        "live_peak_total": live_drawdown["peak_value"],
+        "live_avg_return_pct": live_return_stats["avg_return_pct"],
+        "live_sharpe": live_return_stats["sharpe"],
+        "live_volatility_pct": live_return_stats["volatility_pct"],
+        "live_current_drawdown_pct": live_drawdown["current_drawdown_pct"],
+        "live_max_drawdown_pct": live_drawdown["max_drawdown_pct"],
+        "live_latest_timestamp": latest_live_snapshot.get("timestamp") if latest_live_snapshot else None,
+        "source_profile_count": total_profiles,
+        "source_status_counts": status_counts,
+        "avg_source_health_score": round(avg_health_score, 4),
+        "degraded_source_ratio": round(degraded_source_ratio, 4),
+        "blocked_source_ratio": round(blocked_source_ratio, 4),
+        "source_snapshot_id": (source_snapshot.get("snapshot") or {}).get("snapshot_id"),
+    }
+
+
 def log_research_cycle(cycle_type, summary, details=None,
                        traders_analyzed=0, strategies_found=0, strategies_updated=0):
     now = datetime.utcnow().isoformat()
