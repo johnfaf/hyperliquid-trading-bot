@@ -125,6 +125,14 @@ LIVE_PREFLIGHT_REQUIRED = os.environ.get(
 LIVE_PREFLIGHT_REFRESH_SECONDS = float(
     os.environ.get("LIVE_PREFLIGHT_REFRESH_SECONDS", 600)
 )
+LIVE_ACTIVATION_GUARD_ENABLED = os.environ.get(
+    "LIVE_ACTIVATION_GUARD_ENABLED", "true"
+).lower() in ("true", "1", "yes")
+LIVE_ACTIVATION_APPROVED_AT = os.environ.get("LIVE_ACTIVATION_APPROVED_AT", "").strip()
+LIVE_ACTIVATION_APPROVED_BY = os.environ.get("LIVE_ACTIVATION_APPROVED_BY", "").strip()
+LIVE_ACTIVATION_MAX_AGE_HOURS = float(
+    os.environ.get("LIVE_ACTIVATION_MAX_AGE_HOURS", 24.0)
+)
 HL_WALLET_MODE = os.environ.get("HL_WALLET_MODE", "agent_only").strip().lower()
 SECRET_MANAGER_PROVIDER = os.environ.get(
     "SECRET_MANAGER_PROVIDER", "none"

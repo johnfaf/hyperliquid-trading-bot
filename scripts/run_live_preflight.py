@@ -43,7 +43,14 @@ def main() -> None:
         max_daily_loss=float(getattr(config, "LIVE_MAX_DAILY_LOSS_USD", 500)),
         max_order_usd=float(getattr(config, "LIVE_MAX_ORDER_USD", 12.0)),
     )
-    report = trader.run_preflight(force=True)
+    preflight = trader.run_preflight(force=True)
+    activation = trader.evaluate_activation_guard()
+    readiness = trader.get_live_readiness(force_preflight=False)
+    report = {
+        "preflight": preflight,
+        "activation_guard": activation,
+        "live_readiness": readiness,
+    }
 
     if args.output:
         output_path = os.path.abspath(args.output)
@@ -52,10 +59,14 @@ def main() -> None:
             json.dump(report, handle, indent=2, sort_keys=True)
 
     print("Live preflight complete")
-    print(f"Status: {report.get('status', 'unknown')}")
-    print(f"Deployable: {report.get('deployable', False)}")
-    print(f"Blocking checks: {', '.join(report.get('blocking_checks', [])) or 'none'}")
-    print(f"Warning checks: {', '.join(report.get('warning_checks', [])) or 'none'}")
+    print(f"Preflight: {preflight.get('status', 'unknown')} (deployable={preflight.get('deployable', False)})")
+    print(
+        f"Activation: {activation.get('status', 'unknown')} "
+        f"(deployable={activation.get('deployable', False)}, approved_by={activation.get('approved_by') or 'unset'})"
+    )
+    print(f"Readiness: {readiness.get('status', 'unknown')} ({readiness.get('status_reason', 'unknown')})")
+    print(f"Blocking checks: {', '.join(readiness.get('blocking_checks', [])) or 'none'}")
+    print(f"Preflight warnings: {', '.join(preflight.get('warning_checks', [])) or 'none'}")
     if args.output:
         print(f"Output: {os.path.abspath(args.output)}")
 

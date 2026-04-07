@@ -26,7 +26,7 @@ import os
 import time
 import json
 import hashlib
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple, Union
 from enum import Enum
@@ -459,7 +459,10 @@ class LiveTrader:
         self._last_ledger_position_signature: Optional[str] = None
         self._last_ledger_position_ts: float = 0.0
         self._ledger_snapshot_interval_s: float = 60.0
-        self.preflight_required = bool(getattr(config, "LIVE_PREFLIGHT_REQUIRED", True))
+        self.preflight_required = bool(
+            getattr(config, "LIVE_PREFLIGHT_REQUIRED", True)
+            and getattr(config, "LIVE_TRADING_ENABLED", self.live_requested)
+        )
         self._preflight_refresh_seconds = float(
             getattr(config, "LIVE_PREFLIGHT_REFRESH_SECONDS", 600.0)
         )
@@ -473,6 +476,32 @@ class LiveTrader:
             "checks": [],
         }
         self._preflight_blocking_failure = False
+        self.activation_guard_enabled = bool(
+            getattr(config, "LIVE_ACTIVATION_GUARD_ENABLED", True)
+            and getattr(config, "LIVE_TRADING_ENABLED", self.live_requested)
+        )
+        self.activation_approved_at = str(
+            getattr(config, "LIVE_ACTIVATION_APPROVED_AT", "") or ""
+        ).strip()
+        self.activation_approved_by = str(
+            getattr(config, "LIVE_ACTIVATION_APPROVED_BY", "") or ""
+        ).strip()
+        self.activation_max_age_hours = float(
+            getattr(config, "LIVE_ACTIVATION_MAX_AGE_HOURS", 24.0)
+        )
+        self._activation_report: Dict[str, Any] = {
+            "status": "not_run",
+            "deployable": False,
+            "checked_at": None,
+            "guard_enabled": self.activation_guard_enabled,
+            "approved_at": self.activation_approved_at or None,
+            "approved_by": self.activation_approved_by or None,
+            "expires_at": None,
+            "age_hours": None,
+            "blocking_checks": [],
+            "warning_checks": [],
+            "checks": [],
+        }
 
         logger.info(
             f"LiveTrader initialized: dry_run={dry_run}, "
@@ -708,6 +737,23 @@ class LiveTrader:
     def _basic_deployable(self) -> bool:
         return bool(self.live_requested and not self.dry_run and self.signer and self.public_address)
 
+    @staticmethod
+    def _parse_utc_timestamp(value: str) -> Optional[datetime]:
+        if not value:
+            return None
+        normalized = str(value).strip()
+        if not normalized:
+            return None
+        if normalized.endswith("Z"):
+            normalized = normalized[:-1] + "+00:00"
+        try:
+            parsed = datetime.fromisoformat(normalized)
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+
     def run_preflight(self, force: bool = False) -> Dict[str, Any]:
         """Run a live readiness preflight and cache the result."""
         now = time.time()
@@ -873,14 +919,204 @@ class LiveTrader:
 
         return dict(report)
 
+    def evaluate_activation_guard(self) -> Dict[str, Any]:
+        """Validate the explicit operator acknowledgement required for live mode."""
+        checked_at = datetime.utcnow().isoformat()
+        report: Dict[str, Any] = {
+            "status": "not_requested",
+            "deployable": False,
+            "checked_at": checked_at,
+            "guard_enabled": self.activation_guard_enabled,
+            "approved_at": self.activation_approved_at or None,
+            "approved_by": self.activation_approved_by or None,
+            "expires_at": None,
+            "age_hours": None,
+            "blocking_checks": [],
+            "warning_checks": [],
+            "checks": [],
+        }
+        checks: List[Dict[str, Any]] = report["checks"]
+        blocking_checks: List[str] = report["blocking_checks"]
+        warning_checks: List[str] = report["warning_checks"]
+
+        def _record(name: str, passed: bool, message: str, *, severity: str = "error", value=None) -> None:
+            entry = {
+                "name": name,
+                "passed": bool(passed),
+                "severity": severity,
+                "message": message,
+            }
+            if value is not None:
+                entry["value"] = value
+            checks.append(entry)
+            if passed:
+                return
+            if severity == "warning":
+                warning_checks.append(name)
+            else:
+                blocking_checks.append(name)
+
+        if not self.live_requested:
+            report["status"] = "not_requested"
+            _record(
+                "live_requested",
+                False,
+                "LIVE_TRADING_ENABLED=false",
+                severity="warning",
+            )
+            self._activation_report = report
+            return dict(report)
+
+        if self.dry_run:
+            report["status"] = "dry_run"
+            _record(
+                "dry_run_disabled",
+                False,
+                "dry_run still enabled",
+                severity="warning",
+            )
+            self._activation_report = report
+            return dict(report)
+
+        if not self.activation_guard_enabled:
+            report["status"] = "disabled"
+            report["deployable"] = True
+            _record(
+                "activation_guard_enabled",
+                False,
+                "live activation guard explicitly disabled",
+                severity="warning",
+            )
+            self._activation_report = report
+            return dict(report)
+
+        _record(
+            "approved_at_present",
+            bool(self.activation_approved_at),
+            (
+                f"approval timestamp {self.activation_approved_at}"
+                if self.activation_approved_at
+                else "LIVE_ACTIVATION_APPROVED_AT missing"
+            ),
+        )
+        approved_at_dt = self._parse_utc_timestamp(self.activation_approved_at)
+        _record(
+            "approved_at_valid",
+            approved_at_dt is not None,
+            (
+                f"parsed approval timestamp {approved_at_dt.isoformat()}"
+                if approved_at_dt is not None
+                else "LIVE_ACTIVATION_APPROVED_AT must be ISO-8601"
+            ),
+        )
+        _record(
+            "approved_by_present",
+            bool(self.activation_approved_by),
+            (
+                f"approved by {self.activation_approved_by}"
+                if self.activation_approved_by
+                else "LIVE_ACTIVATION_APPROVED_BY missing"
+            ),
+        )
+
+        now_utc = datetime.now(timezone.utc)
+        if approved_at_dt is not None:
+            age_hours = (now_utc - approved_at_dt).total_seconds() / 3600.0
+            expires_at = approved_at_dt + timedelta(hours=max(self.activation_max_age_hours, 0.0))
+            report["age_hours"] = round(age_hours, 4)
+            report["expires_at"] = expires_at.isoformat()
+            _record(
+                "approval_not_future_dated",
+                age_hours >= -0.0834,
+                "approval timestamp is current"
+                if age_hours >= -0.0834
+                else "approval timestamp is more than 5 minutes in the future",
+            )
+            _record(
+                "approval_fresh",
+                now_utc <= expires_at,
+                (
+                    f"approval valid until {expires_at.isoformat()}"
+                    if now_utc <= expires_at
+                    else f"approval expired at {expires_at.isoformat()}"
+                ),
+                value={"age_hours": round(age_hours, 4)},
+            )
+
+        report["deployable"] = self._basic_deployable() and not blocking_checks
+        report["status"] = "ready" if report["deployable"] else "blocked"
+        self._activation_report = report
+        return dict(report)
+
+    def get_live_readiness(self, force_preflight: bool = False) -> Dict[str, Any]:
+        """Return the combined live readiness state used for health and execution."""
+        preflight = dict(self._preflight_report)
+        if self.preflight_required and self.live_requested and not self.dry_run:
+            preflight = self.run_preflight(force=force_preflight)
+
+        activation = self.evaluate_activation_guard()
+        basic = self._basic_deployable()
+
+        blocking_checks: List[str] = []
+        if self.preflight_required and not preflight.get("deployable", False):
+            preflight_blockers = list(preflight.get("blocking_checks", []) or [])
+            if preflight_blockers:
+                blocking_checks.extend([f"preflight:{name}" for name in preflight_blockers])
+            elif self.live_requested and not self.dry_run:
+                blocking_checks.append("preflight:unknown")
+
+        if self.activation_guard_enabled and self.live_requested and not self.dry_run:
+            activation_blockers = list(activation.get("blocking_checks", []) or [])
+            if activation_blockers:
+                blocking_checks.extend([f"activation:{name}" for name in activation_blockers])
+
+        deployable = basic
+        if self.preflight_required:
+            deployable = deployable and bool(preflight.get("deployable", False))
+        if self.activation_guard_enabled and self.live_requested and not self.dry_run:
+            deployable = deployable and bool(activation.get("deployable", False))
+
+        if not self.live_requested:
+            status = "disabled"
+            status_reason = "live_not_requested"
+        elif self.dry_run:
+            status = "disabled"
+            status_reason = self.status_reason if self.status_reason != "ready" else "dry_run_forced"
+        elif deployable:
+            status = "ready"
+            status_reason = "ready"
+        elif blocking_checks:
+            status = "blocked"
+            status_reason = blocking_checks[0]
+        else:
+            status = "blocked"
+            status_reason = self.status_reason or "not_deployable"
+
+        if self.live_requested:
+            self.status_reason = status_reason
+
+        return {
+            "status": status,
+            "status_reason": status_reason,
+            "deployable": deployable,
+            "preflight_required": self.preflight_required,
+            "activation_guard_enabled": self.activation_guard_enabled,
+            "blocking_checks": blocking_checks,
+            "preflight": dict(preflight),
+            "activation_guard": dict(activation),
+        }
+
     def is_deployable(self) -> bool:
         """Return True when the trader can actually submit live orders."""
-        basic = self._basic_deployable()
-        if not basic:
-            return False
-        if self.preflight_required and self._preflight_report.get("checked_at") is not None:
-            return bool(self._preflight_report.get("deployable", False))
-        return basic
+        readiness = self.get_live_readiness(
+            force_preflight=bool(
+                self.preflight_required
+                and self.live_requested
+                and not self.dry_run
+                and self._preflight_report.get("checked_at") is None
+            )
+        )
+        return bool(readiness.get("deployable", False))
 
     def _coerce_signal(self, signal: Union[TradeSignal, Dict[str, Any]]) -> TradeSignal:
         """Accept either TradeSignal or execution dict for safer live mirroring."""
@@ -2842,6 +3078,15 @@ class LiveTrader:
         source_metadata = self._extract_signal_metadata(raw_signal)
         signal = self._coerce_signal(raw_signal)
 
+        if self.live_requested and not self.dry_run:
+            readiness = self.get_live_readiness()
+            if not readiness.get("deployable", False):
+                logger.warning(
+                    "Live readiness blocked - rejecting signal (%s)",
+                    readiness.get("status_reason", "not_deployable"),
+                )
+                return None
+
         if not bypass_firewall:
             live_positions = self.get_firewall_positions() if self.is_deployable() else None
             live_account_value = self.get_account_value() if self.is_deployable() else None
@@ -3313,5 +3558,7 @@ class LiveTrader:
             "asset_indices_loaded": len(self.asset_index_map),
             "preflight_required": self.preflight_required,
             "preflight": dict(self._preflight_report),
+            "activation_guard": dict(self._activation_report),
+            "live_readiness": self.get_live_readiness(),
             "timestamp": datetime.utcnow().isoformat()
         }

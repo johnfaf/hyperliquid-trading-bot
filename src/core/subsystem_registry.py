@@ -639,11 +639,11 @@ def build_subsystems(
                     c.live_trader.run_preflight(force=True)
                 except Exception as exc:
                     logger.warning("  x live_trader preflight - %s", exc)
-                if not c.live_trader.is_deployable():
+                readiness = c.live_trader.get_live_readiness(force_preflight=True)
+                if not readiness.get("deployable", False):
                     live_stats = c.live_trader.get_stats()
-                    preflight = live_stats.get("preflight", {}) or {}
-                    blocking = list(preflight.get("blocking_checks", []) or [])
-                    reason = live_stats.get("status_reason", "not deployable")
+                    blocking = list(readiness.get("blocking_checks", []) or [])
+                    reason = readiness.get("status_reason") or live_stats.get("status_reason", "not deployable")
                     if blocking:
                         reason = f"{reason} [{', '.join(blocking[:2])}]"
                     health.set_status(

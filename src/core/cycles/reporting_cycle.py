@@ -120,6 +120,8 @@ def run_reporting(container, cycle_count: int, health_registry=None) -> None:
         if getattr(container, "live_trader", None):
             live_stats = container.live_trader.get_stats()
             preflight = live_stats.get("preflight", {}) or {}
+            activation = live_stats.get("activation_guard", {}) or {}
+            readiness = live_stats.get("live_readiness", {}) or {}
             if preflight:
                 logger.info(
                     "  LivePreflight: %s (deployable=%s, blocking=%s, warnings=%s)",
@@ -127,6 +129,20 @@ def run_reporting(container, cycle_count: int, health_registry=None) -> None:
                     preflight.get("deployable", False),
                     ", ".join(preflight.get("blocking_checks", [])[:3]) or "none",
                     ", ".join(preflight.get("warning_checks", [])[:3]) or "none",
+                )
+            if activation:
+                logger.info(
+                    "  LiveActivation: %s (deployable=%s, approved_by=%s, blocking=%s)",
+                    activation.get("status", "not_run"),
+                    activation.get("deployable", False),
+                    activation.get("approved_by") or "unset",
+                    ", ".join(activation.get("blocking_checks", [])[:3]) or "none",
+                )
+            if readiness:
+                logger.info(
+                    "  LiveReadiness: %s (%s)",
+                    readiness.get("status", "unknown"),
+                    readiness.get("status_reason", "unknown"),
                 )
     except Exception as exc:
         logger.debug("  Live preflight error: %s", exc)

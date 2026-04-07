@@ -131,6 +131,13 @@ This branch is the staged upgrade path for making the bot more measurable, more 
 - Probe startup readiness for wallet wiring, exchange metadata, account reachability, and real perps buying power before treating live trading as healthy.
 - Expose preflight status through subsystem health, reporting, dashboard summaries, and a dedicated operator script.
 
+## Phase 19: Live Activation Guard And Runtime Enforcement
+
+- Status: shipped on `codex/live-ledger-foundation`
+- Require an explicit, fresh operator acknowledgement before new live entries are considered deployable.
+- Enforce combined live readiness inside the execution path so failed preflight or missing activation state blocks new orders instead of only degrading health.
+- Surface activation readiness through subsystem health, reporting, dashboard summaries, and the live preflight operator script.
+
 ## Branch Operating Rule
 
 Each phase should be landed in a reviewable commit with tests before moving to the next phase.

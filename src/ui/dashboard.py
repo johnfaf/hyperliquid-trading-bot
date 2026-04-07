@@ -103,6 +103,12 @@ def _build_live_account_summary(trader) -> Dict:
         "preflight_checked_at": None,
         "preflight_blocking_checks": [],
         "preflight_warning_checks": [],
+        "activation_ready": False,
+        "activation_status": "not_run",
+        "activation_approved_at": None,
+        "activation_approved_by": None,
+        "activation_expires_at": None,
+        "activation_blocking_checks": [],
         "ledger_ready": False,
         "wallet_total": None,
         "perps_margin": None,
@@ -171,9 +177,11 @@ def _build_live_account_summary(trader) -> Dict:
     summary["available"] = True
     live_stats = {}
     preflight = {}
+    activation = {}
     try:
         live_stats = trader.get_stats() or {}
         preflight = live_stats.get("preflight", {}) or {}
+        activation = live_stats.get("activation_guard", {}) or {}
     except Exception as exc:
         logger.debug("dashboard live stats error: %s", exc)
 
@@ -236,6 +244,12 @@ def _build_live_account_summary(trader) -> Dict:
             "preflight_checked_at": preflight.get("checked_at"),
             "preflight_blocking_checks": list(preflight.get("blocking_checks", []) or []),
             "preflight_warning_checks": list(preflight.get("warning_checks", []) or []),
+            "activation_ready": bool(activation.get("deployable", False)),
+            "activation_status": str(activation.get("status", "not_run") or "not_run"),
+            "activation_approved_at": activation.get("approved_at"),
+            "activation_approved_by": activation.get("approved_by"),
+            "activation_expires_at": activation.get("expires_at"),
+            "activation_blocking_checks": list(activation.get("blocking_checks", []) or []),
             "wallet_total": wallet.get("total"),
             "perps_margin": wallet.get("perps_margin"),
             "spot_usdc": wallet.get("spot_usdc"),
