@@ -187,6 +187,13 @@ This branch is the staged upgrade path for making the bot more measurable, more 
 - Require shadow certification, benchmark-clear daily research, drawdown limits, execution-quality limits, and source-health limits before promoting to the next stage.
 - Persist capital-ramp runs plus applied-stage state, expose them in reporting and dashboard metrics, and provide an operator script for manual review.
 
+## Phase 27: Merge Readiness And Final Go/No-Go Packaging
+
+- Status: shipped on `codex/live-ledger-foundation`
+- Add a merge-readiness package that pulls together daily research, shadow certification, capital-ramp status, live certification, git state, and the stable regression suite into one operator-facing go/hold/no-go review.
+- Persist merge-readiness runs for auditability, expose the latest and recent package on the dashboard, and provide a dedicated operator script for final branch review.
+- Keep the final package strict on demand, so operators can run a fresh benchmark pack, regression suite, and live preflight before deciding whether the branch is ready to merge.
+
 ## Branch Operating Rule
 
 Each phase should be landed in a reviewable commit with tests before moving to the next phase.

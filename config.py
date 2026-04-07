@@ -838,6 +838,57 @@ CAPITAL_RAMP_REPORT_PATH = os.environ.get(
     "CAPITAL_RAMP_REPORT_PATH",
     "reports/capital_ramp_report.json",
 )
+MERGE_READINESS_ENABLED = os.environ.get(
+    "MERGE_READINESS_ENABLED",
+    "true",
+).lower() in ("true", "1", "yes")
+MERGE_READINESS_INTERVAL_HOURS = float(
+    os.environ.get("MERGE_READINESS_INTERVAL_HOURS", 24.0)
+)
+MERGE_READINESS_REQUIRE_DAILY_RESEARCH_CLEAR = os.environ.get(
+    "MERGE_READINESS_REQUIRE_DAILY_RESEARCH_CLEAR",
+    "true",
+).lower() in ("true", "1", "yes")
+MERGE_READINESS_REQUIRE_SHADOW_CERTIFIED = os.environ.get(
+    "MERGE_READINESS_REQUIRE_SHADOW_CERTIFIED",
+    "true",
+).lower() in ("true", "1", "yes")
+MERGE_READINESS_REQUIRE_CAPITAL_RAMP_DEPLOYABLE = os.environ.get(
+    "MERGE_READINESS_REQUIRE_CAPITAL_RAMP_DEPLOYABLE",
+    "true",
+).lower() in ("true", "1", "yes")
+MERGE_READINESS_REQUIRE_BENCHMARK_CLEAR = os.environ.get(
+    "MERGE_READINESS_REQUIRE_BENCHMARK_CLEAR",
+    "true",
+).lower() in ("true", "1", "yes")
+MERGE_READINESS_REQUIRE_LIVE_CERTIFIED = os.environ.get(
+    "MERGE_READINESS_REQUIRE_LIVE_CERTIFIED",
+    "true",
+).lower() in ("true", "1", "yes")
+MERGE_READINESS_REQUIRE_REGRESSION_SUITE = os.environ.get(
+    "MERGE_READINESS_REQUIRE_REGRESSION_SUITE",
+    "false",
+).lower() in ("true", "1", "yes")
+MERGE_READINESS_REQUIRE_CLEAN_WORKTREE = os.environ.get(
+    "MERGE_READINESS_REQUIRE_CLEAN_WORKTREE",
+    "false",
+).lower() in ("true", "1", "yes")
+MERGE_READINESS_BENCHMARK_LIMIT_CYCLES = int(
+    os.environ.get(
+        "MERGE_READINESS_BENCHMARK_LIMIT_CYCLES",
+        DAILY_RESEARCH_LOOP_BENCHMARK_LIMIT_CYCLES,
+    )
+)
+MERGE_READINESS_BENCHMARK_OOS_RATIO = float(
+    os.environ.get(
+        "MERGE_READINESS_BENCHMARK_OOS_RATIO",
+        DAILY_RESEARCH_LOOP_OOS_RATIO,
+    )
+)
+MERGE_READINESS_REPORT_PATH = os.environ.get(
+    "MERGE_READINESS_REPORT_PATH",
+    "reports/merge_readiness_report.json",
+)
 ADAPTIVE_LEARNING_ENABLED = os.environ.get(
     "ADAPTIVE_LEARNING_ENABLED",
     "true",

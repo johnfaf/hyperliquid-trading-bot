@@ -11,11 +11,13 @@ from datetime import datetime, timedelta, timezone
 
 import config
 import src.analysis.capital_ramp as capital_ramp_module
+import src.analysis.merge_readiness as merge_readiness_module
 import main
 import src.analysis.daily_research_loop as daily_research_module
 import src.analysis.shadow_certification as shadow_certification_module
 from src.analysis.capital_ramp import CapitalRampManager
 from src.analysis.daily_research_loop import DailyResearchLoop
+from src.analysis.merge_readiness import MergeReadinessManager
 from src.analysis.shadow_certification import build_shadow_certification_report
 from src.analysis.experiment_discipline import build_experiment_benchmark_pack
 from src.core import boot
@@ -105,6 +107,15 @@ def _load_shadow_certification_script():
 def _load_capital_ramp_script():
     script_path = os.path.join(os.getcwd(), "scripts", "run_capital_ramp.py")
     spec = importlib.util.spec_from_file_location("test_run_capital_ramp", script_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_merge_readiness_script():
+    script_path = os.path.join(os.getcwd(), "scripts", "run_merge_readiness.py")
+    spec = importlib.util.spec_from_file_location("test_run_merge_readiness", script_path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -1198,6 +1209,48 @@ def test_run_capital_ramp_script_returns_zero_when_deployable(monkeypatch, capsy
     assert report["run_id"] == "capital-ramp-26"
 
 
+def test_run_merge_readiness_script_returns_zero_when_go(monkeypatch, capsys, tmp_path):
+    script = _load_merge_readiness_script()
+    output_path = tmp_path / "merge_readiness.json"
+
+    monkeypatch.setattr(script.db, "init_db", lambda: None)
+    monkeypatch.setattr(
+        script,
+        "build_merge_readiness_config",
+        lambda cfg: {"enabled": True, "report_path": ""},
+    )
+
+    class FakeManager:
+        def __init__(self, cfg):
+            self.cfg = cfg
+
+        def run(self, **kwargs):
+            assert kwargs["strict"] is True
+            assert kwargs["run_regression_suite"] is True
+            assert kwargs["run_benchmark_pack"] is True
+            assert kwargs["force_live_preflight"] is True
+            return {
+                "run_id": "merge-ready-27",
+                "status": "go",
+                "deployable_for_merge": True,
+                "summary": "Merge readiness clear for merge.",
+                "git": {"branch": "codex/live-ledger-foundation", "short_commit": "abc1234"},
+                "metadata": {"failed_required_checks": []},
+            }
+
+    monkeypatch.setattr(script, "MergeReadinessManager", FakeManager)
+
+    rc = script.main(["--force", "--output", str(output_path)])
+    captured = capsys.readouterr()
+
+    assert rc == 0
+    assert "Merge readiness review complete" in captured.out
+    assert "Deployable for merge: True" in captured.out
+    with open(output_path, "r", encoding="utf-8") as handle:
+        report = json.load(handle)
+    assert report["run_id"] == "merge-ready-27"
+
+
 def test_live_trader_applies_capital_ramp_runtime_order_cap(monkeypatch):
     class FakeFirewall:
         def validate(self, signal, **kwargs):
@@ -1897,7 +1950,7 @@ def test_dashboard_live_account_summary_includes_ledger_metrics(monkeypatch):
     assert summary["last_equity_timestamp"] == "2026-04-05T12:00:00"
 
 
-def test_dashboard_experiment_discipline_metrics_include_report_and_shadow(monkeypatch):
+def test_dashboard_experiment_discipline_metrics_include_report_shadow_and_merge(monkeypatch):
     fd, raw_path = tempfile.mkstemp(prefix="experiment_report_", suffix=".json", dir=os.getcwd())
     os.close(fd)
     report_path = os.path.abspath(raw_path)
@@ -1966,6 +2019,16 @@ def test_dashboard_experiment_discipline_metrics_include_report_and_shadow(monke
         "get_recent_shadow_certification_runs",
         lambda limit=10: [{"run_id": "shadow-1"}, {"run_id": "shadow-0"}],
     )
+    monkeypatch.setattr(
+        dashboard_ui.db,
+        "get_latest_merge_readiness_run",
+        lambda: {"run_id": "merge-1", "status": "go", "deployable_for_merge": True},
+    )
+    monkeypatch.setattr(
+        dashboard_ui.db,
+        "get_recent_merge_readiness_runs",
+        lambda limit=10: [{"run_id": "merge-1"}, {"run_id": "merge-0"}],
+    )
 
     class FakeShadowTracker:
         def get_attribution(self, days=7):
@@ -1982,6 +2045,8 @@ def test_dashboard_experiment_discipline_metrics_include_report_and_shadow(monke
     assert metrics["daily_research_last_known_good"]["profile_name"] == "challenger_execution_strict"
     assert metrics["shadow_certification_latest"]["run_id"] == "shadow-1"
     assert metrics["shadow_certification_recent"][0]["run_id"] == "shadow-1"
+    assert metrics["merge_readiness_latest"]["run_id"] == "merge-1"
+    assert metrics["merge_readiness_recent"][0]["run_id"] == "merge-1"
     assert metrics["shadow_attribution"]["strategy:trend"]["trades"] == 5
 
     os.remove(report_path)
@@ -4984,6 +5049,258 @@ def test_capital_ramp_manager_promotes_one_stage_when_checks_clear(monkeypatch):
     assert result["limits"]["effective_max_order_usd"] == 22.0
     assert saved_runs and saved_states
     assert saved_states[-1]["applied_stage"] == "trial"
+
+
+def test_merge_readiness_db_helpers_round_trip(monkeypatch):
+    fd, raw_path = tempfile.mkstemp(prefix="merge_readiness_", suffix=".db", dir=os.getcwd())
+    os.close(fd)
+    db_path = os.path.abspath(raw_path)
+    original_path = db._DB_PATH
+    monkeypatch.setattr(db, "_DB_PATH", db_path)
+
+    try:
+        db.init_db()
+        run_id = db.save_merge_readiness_run(
+            {
+                "timestamp": "2026-04-07T12:00:00+00:00",
+                "cycle_count": 27,
+                "status": "go",
+                "deployable_for_merge": True,
+                "branch_name": "codex/live-ledger-foundation",
+                "commit_hash": "abcdef123456",
+                "metadata": {
+                    "summary": "Merge readiness clear for merge.",
+                    "strict": True,
+                },
+            }
+        )
+
+        latest = db.get_latest_merge_readiness_run()
+        recent = db.get_recent_merge_readiness_runs(limit=5)
+
+        assert run_id.startswith("merge-readiness:")
+        assert latest["status"] == "go"
+        assert latest["deployable_for_merge"] is True
+        assert latest["summary"] == "Merge readiness clear for merge."
+        assert latest["strict"] is True
+        assert recent[0]["run_id"] == run_id
+    finally:
+        monkeypatch.setattr(db, "_DB_PATH", original_path)
+        if os.path.exists(db_path):
+            os.remove(db_path)
+
+
+def test_merge_readiness_manager_returns_go_when_all_required_checks_clear(monkeypatch):
+    saved_runs = []
+    monkeypatch.setattr(merge_readiness_module.db, "get_latest_merge_readiness_run", lambda: {})
+    monkeypatch.setattr(
+        merge_readiness_module.db,
+        "get_latest_daily_research_run",
+        lambda: {
+            "run_id": "daily-1",
+            "recommendation": "hold",
+            "winner_profile": "baseline_current",
+            "metadata": {
+                "benchmark": {
+                    "promotion_gate": {
+                        "baseline": "baseline_current",
+                        "winner": "baseline_current",
+                        "approved_profiles": [],
+                    },
+                    "profiles": {
+                        "baseline_current": {
+                            "out_of_sample": {
+                                "avg_selected_ev_pct": 0.014,
+                                "avg_selected_execution_cost_pct": 0.0021,
+                                "no_trade_rate": 0.31,
+                            },
+                            "promotion": {
+                                "ev_delta_pct": 0.0,
+                                "execution_cost_delta_pct": 0.0,
+                                "no_trade_delta": 0.0,
+                            },
+                        }
+                    },
+                }
+            },
+        },
+    )
+    monkeypatch.setattr(
+        merge_readiness_module.db,
+        "get_latest_shadow_certification_run",
+        lambda: {"run_id": "shadow-1", "status": "certified", "certified": True},
+    )
+    monkeypatch.setattr(
+        merge_readiness_module.db,
+        "get_latest_capital_ramp_run",
+        lambda: {
+            "run_id": "ramp-1",
+            "status": "holding",
+            "applied_stage": "trial",
+            "approved_stage": "scaled",
+            "deployable": True,
+        },
+    )
+    monkeypatch.setattr(
+        merge_readiness_module.db,
+        "save_merge_readiness_run",
+        lambda payload: saved_runs.append(payload) or "merge-27",
+    )
+    monkeypatch.setattr(
+        merge_readiness_module,
+        "_get_git_summary",
+        lambda: {
+            "branch": "codex/live-ledger-foundation",
+            "commit": "abcdef1234567890",
+            "short_commit": "abcdef1",
+            "dirty": False,
+        },
+    )
+    monkeypatch.setattr(
+        MergeReadinessManager,
+        "_collect_live_readiness",
+        lambda self, **kwargs: {
+            "preflight": {"status": "ready", "deployable": True},
+            "activation_guard": {"status": "ready", "deployable": True},
+            "live_readiness": {"status": "ready", "deployable": True, "status_reason": "ready"},
+            "certified_for_live_entries": True,
+        },
+    )
+    monkeypatch.setattr(
+        MergeReadinessManager,
+        "_collect_regression_suite",
+        lambda self, **kwargs: {
+            "executed": True,
+            "passed": True,
+            "summary": "191 passed",
+        },
+    )
+
+    manager = MergeReadinessManager(
+        {
+            "enabled": True,
+            "interval_hours": 24.0,
+            "require_daily_research_clear": True,
+            "require_shadow_certified": True,
+            "require_capital_ramp_deployable": True,
+            "require_benchmark_clear": True,
+            "require_live_certified": True,
+            "require_regression_suite": True,
+            "require_clean_worktree": False,
+            "benchmark_limit_cycles": 60,
+            "benchmark_oos_ratio": 0.30,
+            "report_path": "",
+        }
+    )
+    report = manager.run(
+        cycle_count=27,
+        force=True,
+        strict=True,
+        run_regression_suite=True,
+        run_benchmark_pack=False,
+        force_live_preflight=True,
+    )
+
+    assert report["run_id"] == "merge-27"
+    assert report["status"] == "go"
+    assert report["deployable_for_merge"] is True
+    assert report["benchmark"]["clear"] is True
+    assert saved_runs[0]["status"] == "go"
+
+
+def test_merge_readiness_manager_returns_no_go_when_live_certification_fails(monkeypatch):
+    monkeypatch.setattr(merge_readiness_module.db, "get_latest_merge_readiness_run", lambda: {})
+    monkeypatch.setattr(
+        merge_readiness_module.db,
+        "get_latest_daily_research_run",
+        lambda: {
+            "run_id": "daily-1",
+            "recommendation": "hold",
+            "metadata": {
+                "benchmark": {
+                    "promotion_gate": {
+                        "baseline": "baseline_current",
+                        "winner": "baseline_current",
+                        "approved_profiles": [],
+                    },
+                    "profiles": {
+                        "baseline_current": {
+                            "out_of_sample": {},
+                            "promotion": {},
+                        }
+                    },
+                }
+            },
+        },
+    )
+    monkeypatch.setattr(
+        merge_readiness_module.db,
+        "get_latest_shadow_certification_run",
+        lambda: {"run_id": "shadow-1", "status": "certified", "certified": True},
+    )
+    monkeypatch.setattr(
+        merge_readiness_module.db,
+        "get_latest_capital_ramp_run",
+        lambda: {"run_id": "ramp-1", "status": "holding", "deployable": True},
+    )
+    monkeypatch.setattr(
+        merge_readiness_module.db,
+        "save_merge_readiness_run",
+        lambda payload: "merge-blocked",
+    )
+    monkeypatch.setattr(
+        merge_readiness_module,
+        "_get_git_summary",
+        lambda: {
+            "branch": "codex/live-ledger-foundation",
+            "commit": "abcdef1234567890",
+            "short_commit": "abcdef1",
+            "dirty": False,
+        },
+    )
+    monkeypatch.setattr(
+        MergeReadinessManager,
+        "_collect_live_readiness",
+        lambda self, **kwargs: {
+            "preflight": {"status": "blocked", "deployable": False},
+            "activation_guard": {"status": "ready", "deployable": True},
+            "live_readiness": {
+                "status": "blocked",
+                "deployable": False,
+                "status_reason": "preflight_blocked",
+            },
+            "certified_for_live_entries": False,
+        },
+    )
+
+    manager = MergeReadinessManager(
+        {
+            "enabled": True,
+            "interval_hours": 24.0,
+            "require_daily_research_clear": True,
+            "require_shadow_certified": True,
+            "require_capital_ramp_deployable": True,
+            "require_benchmark_clear": True,
+            "require_live_certified": True,
+            "require_regression_suite": False,
+            "require_clean_worktree": False,
+            "benchmark_limit_cycles": 60,
+            "benchmark_oos_ratio": 0.30,
+            "report_path": "",
+        }
+    )
+    report = manager.run(
+        cycle_count=27,
+        force=True,
+        strict=True,
+        run_regression_suite=False,
+        run_benchmark_pack=False,
+        force_live_preflight=True,
+    )
+
+    assert report["status"] == "no_go"
+    assert report["deployable_for_merge"] is False
+    assert "live_certified" in report["metadata"]["failed_required_checks"]
 
 
 def test_source_budget_allocator_blocks_blocked_source(monkeypatch):
