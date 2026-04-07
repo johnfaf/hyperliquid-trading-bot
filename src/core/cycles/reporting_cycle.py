@@ -42,6 +42,10 @@ def run_reporting(container, cycle_count: int, health_registry=None) -> None:
         from src.data.hyperliquid_client import get_api_stats
     except ImportError:
         get_api_stats = None
+    try:
+        from src.analysis.daily_research_loop import run_daily_research_loop
+    except ImportError:
+        run_daily_research_loop = None
 
     # ── Phase 6: Status ──
     logger.info("Phase 6: Status Update")
@@ -264,6 +268,30 @@ def run_reporting(container, cycle_count: int, health_registry=None) -> None:
             logger.info("  Sent weekly Telegram digest")
     except Exception as exc:
         logger.debug("  Enhanced alerts error: %s", exc)
+
+    try:
+        if (
+            run_daily_research_loop
+            and getattr(config, "DAILY_RESEARCH_LOOP_ENABLED", True)
+            and cycle_count % cycles_per_day == 0
+        ):
+            daily_research = run_daily_research_loop(
+                adaptive_learning=getattr(container, "adaptive_learning", None),
+                cycle_count=cycle_count,
+                force=True,
+            )
+            recommendation = daily_research.get("recommendation", {}) or {}
+            benchmark = daily_research.get("benchmark", {}) or {}
+            gate = (benchmark.get("promotion_gate", {}) or {})
+            logger.info(
+                "  DailyResearch: %s (winner=%s, approved=%d, summary=%s)",
+                recommendation.get("action", "hold"),
+                gate.get("winner", "baseline_current"),
+                len(gate.get("approved_profiles", []) or []),
+                recommendation.get("summary", "n/a"),
+            )
+    except Exception as exc:
+        logger.debug("  Daily research loop error: %s", exc)
 
     # ── HTML report (daily) ──
     try:

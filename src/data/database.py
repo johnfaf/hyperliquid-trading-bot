@@ -467,6 +467,20 @@ def init_db():
         );
         CREATE INDEX IF NOT EXISTS idx_adaptive_promotion_states_stage
             ON adaptive_promotion_states(applied_stage, last_recalibrated_at);
+
+        CREATE TABLE IF NOT EXISTS daily_research_runs (
+            run_id TEXT PRIMARY KEY,
+            timestamp TEXT NOT NULL,
+            cycle_count INTEGER,
+            status TEXT DEFAULT 'executed',
+            recommendation TEXT DEFAULT 'hold',
+            winner_profile TEXT DEFAULT 'baseline_current',
+            approved_profile_count INTEGER DEFAULT 0,
+            recalibration_run_id TEXT,
+            metadata TEXT DEFAULT '{}'
+        );
+        CREATE INDEX IF NOT EXISTS idx_daily_research_runs_timestamp
+            ON daily_research_runs(timestamp);
         """)
 
 
@@ -2150,6 +2164,130 @@ def get_adaptive_promotion_states(limit: int = 0) -> list:
         payload["gate_passed"] = bool(payload.get("gate_passed", 0))
         results.append(payload)
     return results
+
+
+def save_daily_research_run(payload: dict) -> str:
+    timestamp = _normalize_live_timestamp(payload.get("timestamp"))
+    status = str(payload.get("status", "executed") or "executed").strip().lower()
+    recommendation = str(payload.get("recommendation", "hold") or "hold").strip().lower()
+    winner_profile = str(
+        payload.get("winner_profile")
+        or ((payload.get("benchmark") or {}).get("promotion_gate", {}) or {}).get("winner")
+        or "baseline_current"
+    ).strip()
+    approved_profile_count = int(payload.get("approved_profile_count", 0) or 0)
+    cycle_count = payload.get("cycle_count")
+    recalibration_run_id = str(payload.get("recalibration_run_id", "") or "").strip() or None
+    default_key = f"{timestamp}:{winner_profile}:{recommendation}:{approved_profile_count}"
+    run_id = str(
+        payload.get("run_id")
+        or f"daily-research:{hashlib.sha256(default_key.encode()).hexdigest()[:16]}"
+    )
+    metadata = payload.get("metadata", {}) or {}
+
+    with get_connection() as conn:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO daily_research_runs
+            (run_id, timestamp, cycle_count, status, recommendation, winner_profile,
+             approved_profile_count, recalibration_run_id, metadata)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                run_id,
+                timestamp,
+                int(cycle_count or 0) if cycle_count is not None else None,
+                status,
+                recommendation,
+                winner_profile or "baseline_current",
+                approved_profile_count,
+                recalibration_run_id,
+                json.dumps(metadata, sort_keys=True, default=str),
+            ),
+        )
+    return run_id
+
+
+def get_latest_daily_research_run() -> dict:
+    try:
+        with get_connection() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM daily_research_runs
+                ORDER BY timestamp DESC, run_id DESC
+                LIMIT 1
+                """
+            ).fetchone()
+    except sqlite3.OperationalError:
+        return {}
+
+    if not row:
+        return {}
+
+    payload = dict(row)
+    try:
+        payload["metadata"] = json.loads(payload.get("metadata") or "{}")
+    except Exception:
+        payload["metadata"] = {}
+    return payload
+
+
+def get_recent_daily_research_runs(limit: int = 10) -> list:
+    try:
+        with get_connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM daily_research_runs
+                ORDER BY timestamp DESC, run_id DESC
+                LIMIT ?
+                """,
+                (int(limit),),
+            ).fetchall()
+    except sqlite3.OperationalError:
+        return []
+
+    results = []
+    for row in rows:
+        payload = dict(row)
+        try:
+            payload["metadata"] = json.loads(payload.get("metadata") or "{}")
+        except Exception:
+            payload["metadata"] = {}
+        results.append(payload)
+    return results
+
+
+def save_daily_research_last_known_good(payload: dict) -> None:
+    value = json.dumps(payload or {}, sort_keys=True, default=str)
+    with get_connection() as conn:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO bot_state (key, value)
+            VALUES ('daily_research_last_known_good', ?)
+            """,
+            (value,),
+        )
+
+
+def get_daily_research_last_known_good() -> dict:
+    try:
+        with get_connection() as conn:
+            row = conn.execute(
+                """
+                SELECT value FROM bot_state
+                WHERE key = 'daily_research_last_known_good'
+                LIMIT 1
+                """
+            ).fetchone()
+    except sqlite3.OperationalError:
+        return {}
+
+    if not row:
+        return {}
+    try:
+        return json.loads(row["value"] or "{}")
+    except Exception:
+        return {}
 
 
 def get_runtime_divergence_summary(lookback_hours: float = 24.0) -> dict:

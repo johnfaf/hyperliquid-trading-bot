@@ -691,6 +691,29 @@ EXPERIMENT_BENCHMARK_REPORT_PATH = os.environ.get(
     "EXPERIMENT_BENCHMARK_REPORT_PATH",
     "reports/experiment_benchmark_pack.json",
 )
+DAILY_RESEARCH_LOOP_ENABLED = os.environ.get(
+    "DAILY_RESEARCH_LOOP_ENABLED",
+    "true",
+).lower() in ("true", "1", "yes")
+DAILY_RESEARCH_LOOP_INTERVAL_HOURS = float(
+    os.environ.get("DAILY_RESEARCH_LOOP_INTERVAL_HOURS", 24.0)
+)
+DAILY_RESEARCH_LOOP_BENCHMARK_LIMIT_CYCLES = int(
+    os.environ.get(
+        "DAILY_RESEARCH_LOOP_BENCHMARK_LIMIT_CYCLES",
+        EXPERIMENT_REPORT_LIMIT_CYCLES,
+    )
+)
+DAILY_RESEARCH_LOOP_OOS_RATIO = float(
+    os.environ.get("DAILY_RESEARCH_LOOP_OOS_RATIO", EXPERIMENT_OOS_RATIO)
+)
+DAILY_RESEARCH_LOOP_ROLLBACK_EV_TOLERANCE_PCT = float(
+    os.environ.get("DAILY_RESEARCH_LOOP_ROLLBACK_EV_TOLERANCE_PCT", 0.0005)
+)
+DAILY_RESEARCH_REPORT_PATH = os.environ.get(
+    "DAILY_RESEARCH_REPORT_PATH",
+    "reports/daily_research_loop.json",
+)
 ADAPTIVE_LEARNING_ENABLED = os.environ.get(
     "ADAPTIVE_LEARNING_ENABLED",
     "true",

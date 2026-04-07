@@ -11,6 +11,8 @@ from datetime import datetime, timedelta, timezone
 
 import config
 import main
+import src.analysis.daily_research_loop as daily_research_module
+from src.analysis.daily_research_loop import DailyResearchLoop
 from src.analysis.experiment_discipline import build_experiment_benchmark_pack
 from src.core import boot
 from src.core.incident_visibility import build_runtime_incident_report
@@ -65,6 +67,15 @@ def _fake_live_credentials(self):
 def _load_live_preflight_script():
     script_path = os.path.join(os.getcwd(), "scripts", "run_live_preflight.py")
     spec = importlib.util.spec_from_file_location("test_run_live_preflight", script_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_daily_research_script():
+    script_path = os.path.join(os.getcwd(), "scripts", "run_daily_research_loop.py")
+    spec = importlib.util.spec_from_file_location("test_run_daily_research_loop", script_path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -290,6 +301,56 @@ def test_run_reporting_skips_false_positive_stale_warning(monkeypatch):
     run_reporting(container, cycle_count=1, health_registry=FakeHealth())
 
     assert warnings == []
+
+
+def test_run_reporting_executes_daily_research_loop_on_daily_cadence(monkeypatch):
+    runs = []
+    infos = []
+    container = type(
+        "Container",
+        (),
+        {
+            "reporter": None,
+            "paper_trader": None,
+            "shadow_tracker": None,
+            "cross_venue_hedger": None,
+            "scorer": None,
+            "adaptive_learning": object(),
+        },
+    )()
+
+    monkeypatch.setattr(config, "TRADING_CYCLE_INTERVAL", 3600)
+    monkeypatch.setattr(config, "DAILY_RESEARCH_LOOP_ENABLED", True)
+    monkeypatch.setattr("src.core.cycles.reporting_cycle._log_module_stats", lambda container: None)
+    monkeypatch.setattr("src.core.cycles.reporting_cycle.backup_to_json", lambda: None)
+    monkeypatch.setattr(
+        "src.core.cycles.reporting_cycle.build_runtime_incident_report",
+        lambda **kwargs: {"summary": {}, "incidents": []},
+    )
+    monkeypatch.setattr(
+        "src.analysis.daily_research_loop.run_daily_research_loop",
+        lambda **kwargs: runs.append(kwargs) or {
+            "recommendation": {"action": "hold", "summary": "Daily review held baseline."},
+            "benchmark": {
+                "promotion_gate": {
+                    "winner": "baseline_current",
+                    "approved_profiles": [],
+                }
+            },
+        },
+    )
+    monkeypatch.setattr(
+        "src.core.cycles.reporting_cycle.logger.info",
+        lambda msg, *args: infos.append(msg % args if args else msg),
+    )
+
+    run_reporting(container, cycle_count=24, health_registry=None)
+
+    assert len(runs) == 1
+    assert runs[0]["adaptive_learning"] is container.adaptive_learning
+    assert runs[0]["cycle_count"] == 24
+    assert runs[0]["force"] is True
+    assert any("DailyResearch: hold" in entry for entry in infos)
 
 
 def test_live_trader_coerces_execution_dict_and_uses_live_firewall_state(monkeypatch):
@@ -873,6 +934,42 @@ def test_run_live_preflight_main_returns_zero_when_certified(monkeypatch, capsys
         report = json.load(handle)
     assert report["certified_for_live_entries"] is True
     assert report["live_readiness"]["status"] == "ready"
+
+
+def test_run_daily_research_loop_script_writes_output(monkeypatch, capsys, tmp_path):
+    script = _load_daily_research_script()
+    output_path = tmp_path / "daily_research.json"
+
+    monkeypatch.setattr(script.db, "init_db", lambda: None)
+    monkeypatch.setattr(script, "build_adaptive_learning_config", lambda cfg: {"enabled": True})
+    monkeypatch.setattr(script, "AgentScorer", lambda: object())
+    monkeypatch.setattr(script, "CalibrationTracker", lambda: object())
+    monkeypatch.setattr(script, "AdaptiveLearningManager", lambda *args, **kwargs: "adaptive-manager")
+    monkeypatch.setattr(
+        script,
+        "run_daily_research_loop",
+        lambda **kwargs: {
+            "run_id": "daily-24",
+            "status": "executed",
+            "recommendation": {"action": "promote", "rollback_target_profile": "baseline_current"},
+            "benchmark": {
+                "promotion_gate": {
+                    "winner": "challenger_execution_strict",
+                    "approved_profiles": ["challenger_execution_strict"],
+                }
+            },
+        },
+    )
+
+    rc = script.main(["--force", "--output", str(output_path)])
+    captured = capsys.readouterr()
+
+    assert rc == 0
+    assert "Recommendation: promote" in captured.out
+    assert "Winner: challenger_execution_strict" in captured.out
+    with open(output_path, "r", encoding="utf-8") as handle:
+        report = json.load(handle)
+    assert report["run_id"] == "daily-24"
 
 
 def test_post_order_routes_exchange_requests_through_api_manager(monkeypatch):
@@ -1585,6 +1682,21 @@ def test_dashboard_experiment_discipline_metrics_include_report_and_shadow(monke
         "get_runtime_divergence_summary",
         lambda lookback_hours=24: {"paper_live_open_gap": 1},
     )
+    monkeypatch.setattr(
+        dashboard_ui.db,
+        "get_latest_daily_research_run",
+        lambda: {"run_id": "daily-1", "recommendation": "promote", "winner_profile": "challenger_execution_strict"},
+    )
+    monkeypatch.setattr(
+        dashboard_ui.db,
+        "get_recent_daily_research_runs",
+        lambda limit=10: [{"run_id": "daily-1"}, {"run_id": "daily-0"}],
+    )
+    monkeypatch.setattr(
+        dashboard_ui.db,
+        "get_daily_research_last_known_good",
+        lambda: {"profile_name": "challenger_execution_strict"},
+    )
 
     class FakeShadowTracker:
         def get_attribution(self, days=7):
@@ -1596,9 +1708,149 @@ def test_dashboard_experiment_discipline_metrics_include_report_and_shadow(monke
     assert metrics["source_attribution"][0]["source_key"] == "strategy:trend"
     assert metrics["divergence"]["paper_live_open_gap"] == 1
     assert metrics["benchmark_pack"]["promotion_gate"]["winner"] == "challenger_execution_strict"
+    assert metrics["daily_research_latest"]["run_id"] == "daily-1"
+    assert metrics["daily_research_recent"][0]["run_id"] == "daily-1"
+    assert metrics["daily_research_last_known_good"]["profile_name"] == "challenger_execution_strict"
     assert metrics["shadow_attribution"]["strategy:trend"]["trades"] == 5
 
     os.remove(report_path)
+
+
+def test_daily_research_loop_persists_runs_and_last_known_good(monkeypatch):
+    fd, raw_path = tempfile.mkstemp(prefix="daily_research_", suffix=".db", dir=os.getcwd())
+    os.close(fd)
+    db_path = os.path.abspath(raw_path)
+    original_path = db._DB_PATH
+    monkeypatch.setattr(db, "_DB_PATH", db_path)
+
+    benchmark = {
+        "promotion_gate": {
+            "baseline": "baseline_current",
+            "approved_profiles": ["challenger_execution_strict"],
+            "winner": "challenger_execution_strict",
+        },
+        "profiles": {
+            "baseline_current": {
+                "out_of_sample": {"avg_selected_ev_pct": 0.011, "avg_selected_execution_cost_pct": 0.0025, "no_trade_rate": 0.40},
+                "promotion": {"approved": True, "ev_delta_pct": 0.0, "execution_cost_delta_pct": 0.0, "no_trade_delta": 0.0},
+                "overrides": {},
+            },
+            "challenger_execution_strict": {
+                "out_of_sample": {"avg_selected_ev_pct": 0.016, "avg_selected_execution_cost_pct": 0.0018, "no_trade_rate": 0.35},
+                "promotion": {"approved": True, "ev_delta_pct": 0.004, "execution_cost_delta_pct": -0.0007, "no_trade_delta": -0.05},
+                "overrides": {"min_decision_score": 0.41},
+            },
+        },
+    }
+
+    class FakeAdaptive:
+        def run_recalibration(self, cycle_count=None, force=False):
+            return {"executed": True, "run_id": "recal-24"}
+
+    monkeypatch.setattr(
+        daily_research_module,
+        "run_experiment_benchmark_pack",
+        lambda limit_cycles, out_of_sample_ratio: benchmark,
+    )
+
+    try:
+        db.init_db()
+        loop = DailyResearchLoop(
+            {
+                "enabled": True,
+                "interval_hours": 24.0,
+                "benchmark_limit_cycles": 60,
+                "out_of_sample_ratio": 0.30,
+                "benchmark_report_path": "",
+                "report_path": "",
+                "rollback_ev_tolerance_pct": 0.0005,
+            },
+            adaptive_learning=FakeAdaptive(),
+        )
+        report = loop.run(cycle_count=96, force=True)
+        latest = db.get_latest_daily_research_run()
+        recent = db.get_recent_daily_research_runs(limit=10)
+        last_known_good = db.get_daily_research_last_known_good()
+
+        assert report["recommendation"]["action"] == "promote"
+        assert latest["recommendation"] == "promote"
+        assert latest["winner_profile"] == "challenger_execution_strict"
+        assert latest["metadata"]["delta"]["winner_ev_delta_pct"] == 0.004
+        assert recent[0]["run_id"] == latest["run_id"]
+        assert last_known_good["profile_name"] == "challenger_execution_strict"
+        assert last_known_good["overrides"]["min_decision_score"] == 0.41
+    finally:
+        monkeypatch.setattr(db, "_DB_PATH", original_path)
+        if os.path.exists(db_path):
+            os.remove(db_path)
+
+
+def test_daily_research_loop_recommends_rollback_when_benchmark_regresses(monkeypatch):
+    fd, raw_path = tempfile.mkstemp(prefix="daily_research_rollback_", suffix=".db", dir=os.getcwd())
+    os.close(fd)
+    db_path = os.path.abspath(raw_path)
+    original_path = db._DB_PATH
+    monkeypatch.setattr(db, "_DB_PATH", db_path)
+
+    benchmark = {
+        "promotion_gate": {
+            "baseline": "baseline_current",
+            "approved_profiles": [],
+            "winner": "challenger_regressed",
+        },
+        "profiles": {
+            "baseline_current": {
+                "out_of_sample": {"avg_selected_ev_pct": 0.012, "avg_selected_execution_cost_pct": 0.0023, "no_trade_rate": 0.38},
+                "promotion": {"approved": True, "ev_delta_pct": 0.0, "execution_cost_delta_pct": 0.0, "no_trade_delta": 0.0},
+                "overrides": {},
+            },
+            "challenger_regressed": {
+                "out_of_sample": {"avg_selected_ev_pct": 0.008, "avg_selected_execution_cost_pct": 0.0029, "no_trade_rate": 0.43},
+                "promotion": {"approved": False, "ev_delta_pct": -0.0035, "execution_cost_delta_pct": 0.0006, "no_trade_delta": 0.05},
+                "overrides": {"min_decision_score": 0.37},
+            },
+        },
+    }
+
+    monkeypatch.setattr(
+        daily_research_module,
+        "run_experiment_benchmark_pack",
+        lambda limit_cycles, out_of_sample_ratio: benchmark,
+    )
+
+    try:
+        db.init_db()
+        db.save_daily_research_last_known_good(
+            {
+                "profile_name": "challenger_execution_strict",
+                "overrides": {"min_decision_score": 0.41},
+                "saved_at": "2026-04-06T00:00:00+00:00",
+                "reason": "previous_promotion",
+            }
+        )
+        loop = DailyResearchLoop(
+            {
+                "enabled": True,
+                "interval_hours": 24.0,
+                "benchmark_limit_cycles": 60,
+                "out_of_sample_ratio": 0.30,
+                "benchmark_report_path": "",
+                "report_path": "",
+                "rollback_ev_tolerance_pct": 0.0005,
+            }
+        )
+        report = loop.run(cycle_count=97, force=True)
+        latest = db.get_latest_daily_research_run()
+        last_known_good = db.get_daily_research_last_known_good()
+
+        assert report["recommendation"]["action"] == "rollback"
+        assert report["recommendation"]["rollback_target_profile"] == "challenger_execution_strict"
+        assert latest["recommendation"] == "rollback"
+        assert last_known_good["profile_name"] == "challenger_execution_strict"
+    finally:
+        monkeypatch.setattr(db, "_DB_PATH", original_path)
+        if os.path.exists(db_path):
+            os.remove(db_path)
 
 
 def test_live_ledger_helpers_persist_snapshots_and_deduplicate_fills(monkeypatch):

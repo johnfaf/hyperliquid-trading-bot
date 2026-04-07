@@ -166,6 +166,13 @@ This branch is the staged upgrade path for making the bot more measurable, more 
 - Make the live preflight operator script exit non-zero when live entries are not certified, and persist an explicit `certified_for_live_entries` flag in its JSON output for automation.
 - Prove that blocked live entry states still allow reduce-only protective exits so emergency flattening keeps working under kill-switch or readiness failures.
 
+## Phase 24: Automated Daily Research Loop
+
+- Status: shipped on `codex/live-ledger-foundation`
+- Run adaptive recalibration and the experiment benchmark pack on a daily cadence instead of relying on manual scripts.
+- Persist daily research runs, benchmark deltas, and the last known good parameter state for auditability and rollback safety.
+- Emit a promote, hold, or rollback recommendation so the research loop produces a review-ready daily decision.
+
 ## Branch Operating Rule
 
 Each phase should be landed in a reviewable commit with tests before moving to the next phase.

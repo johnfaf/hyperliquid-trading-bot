@@ -463,6 +463,9 @@ def _build_experiment_discipline_metrics(shadow_tracker=None) -> Dict:
             lookback_hours=getattr(config, "EXPERIMENT_DIVERGENCE_LOOKBACK_HOURS", 24)
         ),
         "benchmark_pack": _load_experiment_benchmark_summary(),
+        "daily_research_latest": db.get_latest_daily_research_run(),
+        "daily_research_recent": db.get_recent_daily_research_runs(limit=10),
+        "daily_research_last_known_good": db.get_daily_research_last_known_good(),
     }
 
     if shadow_tracker:
