@@ -131,7 +131,10 @@ class DivergenceController:
             status = "caution"
             multiplier = self.caution_multiplier
             score = 0.35
-        elif reasons and "insufficient_live_history" in reasons:
+        elif reasons and (
+            "insufficient_live_history" in reasons
+            or "insufficient_paper_history" in reasons
+        ):
             status = "warming_up"
             multiplier = 1.0
             score = 0.5
@@ -166,6 +169,8 @@ class DivergenceController:
         shadow_selected_count = int(summary.get("shadow_selected_count", 0) or 0)
         live_execution_total = int(summary.get("live_execution_total", 0) or 0)
         paper_open_count = int(summary.get("paper_open_count", 0) or 0)
+        paper_recent_open_count = int(summary.get("paper_recent_open_count", 0) or 0)
+        paper_recent_closed_count = int(summary.get("paper_recent_closed_count", 0) or 0)
         live_open_positions = int(summary.get("live_open_positions", 0) or 0)
         activity = max(
             shadow_selected_count,
@@ -178,6 +183,22 @@ class DivergenceController:
         severity = 0
         if activity < self.min_live_events:
             reasons.append("insufficient_live_history")
+            return self._build_assessment(
+                scope="global",
+                scope_key="global",
+                severity=0,
+                reasons=reasons,
+                metrics=summary,
+            )
+
+        # Shadow selections are not real paper trades. After a paper reset we
+        # can still have live/shadow history in the DB, and counting that as
+        # paper activity creates a deadlock where gap ratios block paper from
+        # ever warming up again. Require real paper exposure or recent paper
+        # closes before treating live-vs-paper divergence as meaningful.
+        paper_activity = max(paper_open_count, paper_recent_open_count) + paper_recent_closed_count
+        if paper_activity < self.min_live_events:
+            reasons.append("insufficient_paper_history")
             return self._build_assessment(
                 scope="global",
                 scope_key="global",

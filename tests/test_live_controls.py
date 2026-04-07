@@ -5921,6 +5921,44 @@ def test_divergence_controller_blocks_on_large_runtime_gap(monkeypatch):
     )
 
 
+def test_divergence_controller_warms_up_when_only_shadow_history_exists(monkeypatch):
+    monkeypatch.setattr(
+        "src.signals.divergence_controller.db.get_runtime_divergence_summary",
+        lambda lookback_hours=24: {
+            "shadow_selected_count": 12,
+            "paper_open_count": 0,
+            "paper_recent_open_count": 0,
+            "paper_recent_closed_count": 0,
+            "live_open_positions": 6,
+            "live_execution_total": 8,
+            "paper_live_open_gap_ratio": 1.0,
+            "shadow_live_execution_gap_ratio": 0.33,
+            "paper_live_realized_pnl_gap_ratio": 0.88,
+            "live_rejection_rate": 0.02,
+        },
+    )
+    monkeypatch.setattr(
+        "src.signals.divergence_controller.db.get_source_attribution_summary",
+        lambda **kwargs: [],
+    )
+
+    controller = DivergenceController(
+        {
+            "enabled": True,
+            "live_trading_enabled": True,
+            "refresh_interval_seconds": 0.0,
+            "min_live_events": 3,
+            "source_min_selected": 2,
+        }
+    )
+    assessment = controller.evaluate(source_key="options_flow:BTC", source="options_flow")
+
+    assert assessment["status"] == "warming_up"
+    assert assessment["blocked"] is False
+    assert "insufficient_paper_history" in assessment["reasons"]
+    assert "global_open_gap_block" not in assessment["reasons"]
+
+
 def test_decision_engine_blocks_candidate_when_divergence_controller_blocked():
     class FakeController:
         def evaluate(self, source_key="", source="", strategy=None):
