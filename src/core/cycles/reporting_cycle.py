@@ -64,13 +64,18 @@ def run_reporting(container, cycle_count: int, health_registry=None) -> None:
             adaptive_stats = container.adaptive_learning.run_cycle(cycle_count=cycle_count)
             summary = adaptive_stats.get("summary", {})
             counts = summary.get("status_counts", {})
+            stages = summary.get("promotion_stage_counts", {})
             logger.info(
-                "  AdaptiveLearning: %d sources (%d active, %d caution, %d blocked, %d warming)",
+                "  AdaptiveLearning: %d sources (%d active, %d caution, %d blocked, %d warming | %d full, %d scaled, %d trial, %d incubating)",
                 summary.get("sources_tracked", 0),
                 counts.get("active", 0),
                 counts.get("caution", 0),
                 counts.get("blocked", 0),
                 counts.get("warming_up", 0),
+                stages.get("full", 0),
+                stages.get("scaled", 0),
+                stages.get("trial", 0),
+                stages.get("incubating", 0),
             )
     except Exception as exc:
         logger.debug("  Adaptive learning error: %s", exc)
@@ -305,11 +310,14 @@ def _fmt_multi(stats):
 def _fmt_adaptive(stats):
     summary = stats.get("summary", {})
     counts = summary.get("status_counts", {})
+    stages = summary.get("promotion_stage_counts", {})
     return (
         f"sources={summary.get('sources_tracked', 0)}, "
         f"active={counts.get('active', 0)}, "
         f"caution={counts.get('caution', 0)}, "
-        f"blocked={counts.get('blocked', 0)}"
+        f"blocked={counts.get('blocked', 0)}, "
+        f"full={stages.get('full', 0)}, "
+        f"scaled={stages.get('scaled', 0)}"
     )
 
 
@@ -324,6 +332,7 @@ def _fmt_execution_policy(stats):
 
 def _fmt_source_allocator(stats):
     counts = stats.get("status_counts", {})
+    stages = stats.get("promotion_stage_counts", {})
     return (
         f"enabled={stats.get('enabled', False)}, "
         f"evals={stats.get('evaluations', 0)}, "
@@ -331,7 +340,9 @@ def _fmt_source_allocator(stats):
         f"reduced={stats.get('size_reduced', 0)}, "
         f"active={counts.get('active', 0)}, "
         f"caution={counts.get('caution', 0)}, "
-        f"blocked_status={counts.get('blocked', 0)}"
+        f"blocked_status={counts.get('blocked', 0)}, "
+        f"full={stages.get('full', 0)}, "
+        f"scaled={stages.get('scaled', 0)}"
     )
 
 

@@ -110,6 +110,13 @@ This branch is the staged upgrade path for making the bot more measurable, more 
 - Taper or block new entries when drawdown, rolling return quality, source-health degradation, or runtime divergence indicate the system should derisk.
 - Expose the capital posture in source allocation, decision ranking, reporting, and the dashboard so risk-off states are visible instead of silent.
 
+## Phase 16: Promotion Ladder And Capital Progression
+
+- Status: shipped on `codex/live-ledger-foundation`
+- Add a promotion ladder for signal sources so incubation, trial, scaled, and full access are explicit instead of implied by a coarse health flag.
+- Require stronger out-of-sample evidence before a source receives full budget, and taper capital automatically when a source falls back to trial or incubating status.
+- Apply the same progression discipline to Alpha Arena so champions receive more capital, probation agents are derisked, and low-evidence agents stay on incubating budgets.
+
 ## Branch Operating Rule
 
 Each phase should be landed in a reviewable commit with tests before moving to the next phase.

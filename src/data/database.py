@@ -1869,6 +1869,16 @@ def get_latest_source_health_snapshot(limit: int = 25) -> dict:
             payload["metadata"] = json.loads(payload.get("metadata") or "{}")
         except Exception:
             payload["metadata"] = {}
+        for key in (
+            "promotion_stage",
+            "promotion_score",
+            "promotion_gate_passed",
+            "promotion_multiplier",
+            "promotion_cap_pct",
+            "promotion_reasons",
+        ):
+            if key in payload["metadata"] and key not in payload:
+                payload[key] = payload["metadata"][key]
         profiles.append(payload)
 
     return {

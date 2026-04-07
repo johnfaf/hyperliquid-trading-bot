@@ -32,6 +32,7 @@ from src.core.live_execution import (
 )
 from src.data import database as db
 from src.signals.adaptive_learning import AdaptiveLearningManager
+from src.signals.alpha_arena import AgentStatus, ArenaAgent, CapitalAllocator
 from src.signals.capital_governor import CapitalGovernor
 from src.signals.decision_engine import DecisionEngine
 from src.signals.decision_firewall import DecisionFirewall
@@ -1870,6 +1871,15 @@ def test_adaptive_learning_manager_refreshes_profiles_and_reviews_arena(monkeypa
                 "promotion_health_floor": 0.68,
                 "caution_drift_threshold": 0.12,
                 "block_drift_threshold": 0.25,
+                "scaled_promotion_closed_trades": 2,
+                "scaled_promotion_recent_closed_trades": 1,
+                "scaled_promotion_health_floor": 0.55,
+                "scaled_promotion_recent_win_rate": 0.50,
+                "full_promotion_closed_trades": 4,
+                "full_promotion_recent_closed_trades": 1,
+                "full_promotion_health_floor": 0.65,
+                "full_promotion_recent_win_rate": 0.55,
+                "full_promotion_recent_return_pct": 0.001,
                 "arena_min_trades": 5,
                 "arena_max_drawdown": 0.25,
             },
@@ -1887,10 +1897,14 @@ def test_adaptive_learning_manager_refreshes_profiles_and_reviews_arena(monkeypa
         assert stats["summary"]["sources_tracked"] >= 2
         assert poly["status"] == "active"
         assert poly["training_label"] == "promote"
+        assert poly["promotion_stage"] == "full"
+        assert stats["summary"]["promotion_stage_counts"]["full"] >= 1
         assert arena_profile["status"] in {"caution", "blocked"}
         assert arena.agents["seed_breakout"].status == "probation"
         assert arena.saved is True
         assert latest["profiles"]
+        assert any(profile.get("promotion_stage") for profile in latest["profiles"])
+        assert review_events[0]["metrics"]["promotion_stage"] in {"trial", "blocked"}
         assert review_events[0]["agent_id"] == "seed_breakout"
     finally:
         monkeypatch.setattr(db, "_DB_PATH", original_path)
@@ -2069,6 +2083,100 @@ def test_decision_engine_blocks_source_when_adaptive_profile_is_blocked():
     assert candidate["_adaptive_learning"]["status"] == "blocked"
     assert candidate["_decision_confidence"] < 0.82
     assert "adaptive_blocked" in blockers
+
+
+def test_decision_engine_prefers_fully_promoted_source():
+    class FakeAdaptive:
+        def get_source_profile(self, source_key="", source=""):
+            if source_key == "options_flow:BTC":
+                return {
+                    "status": "active",
+                    "health_score": 0.84,
+                    "drift_score": 0.05,
+                    "weight_multiplier": 1.02,
+                    "confidence_multiplier": 1.01,
+                    "training_label": "promote",
+                    "recommended_action": "full capital access approved",
+                    "promotion_stage": "full",
+                    "promotion_score": 0.88,
+                    "promotion_gate_passed": True,
+                    "promotion_cap_pct": 0.32,
+                    "metadata": {
+                        "promotion_quality_multiplier": 1.08,
+                        "promotion_confidence_multiplier": 1.04,
+                    },
+                }
+            return {
+                "status": "active",
+                "health_score": 0.63,
+                "drift_score": 0.08,
+                "weight_multiplier": 0.96,
+                "confidence_multiplier": 0.97,
+                "training_label": "incubate",
+                "recommended_action": "collect more evidence before promoting",
+                "promotion_stage": "incubating",
+                "promotion_score": 0.44,
+                "promotion_gate_passed": False,
+                "promotion_cap_pct": 0.08,
+                "metadata": {
+                    "promotion_quality_multiplier": 0.82,
+                    "promotion_confidence_multiplier": 0.90,
+                },
+            }
+
+    engine = DecisionEngine(
+        {
+            "adaptive_learning": FakeAdaptive(),
+            "adaptive_learning_enabled": True,
+            "min_decision_score": 0.0,
+            "min_signal_confidence": 0.4,
+            "min_source_weight": 0.2,
+            "min_expected_value_pct": -1.0,
+            "max_trades_per_cycle": 1,
+            "execution_quality_enabled": False,
+            "context_performance_enabled": False,
+            "confluence_enabled": False,
+            "calibration_enabled": False,
+            "memory_enabled": False,
+            "divergence_enabled": False,
+            "capital_governor_enabled": False,
+        }
+    )
+    btc = {
+        "name": "btc_promoted",
+        "source": "options_flow",
+        "source_key": "options_flow:BTC",
+        "strategy_type": "options_momentum",
+        "current_score": 0.74,
+        "confidence": 0.72,
+        "source_accuracy": 0.70,
+        "entry_price": 100.0,
+        "stop_loss": 97.0,
+        "take_profit": 107.0,
+        "parameters": {"coins": ["BTC"], "direction": "long"},
+        "metadata": {"source": "options_flow", "source_key": "options_flow:BTC"},
+    }
+    eth = {
+        "name": "eth_incubating",
+        "source": "options_flow",
+        "source_key": "options_flow:ETH",
+        "strategy_type": "options_momentum",
+        "current_score": 0.74,
+        "confidence": 0.72,
+        "source_accuracy": 0.70,
+        "entry_price": 100.0,
+        "stop_loss": 97.0,
+        "take_profit": 107.0,
+        "parameters": {"coins": ["ETH"], "direction": "long"},
+        "metadata": {"source": "options_flow", "source_key": "options_flow:ETH"},
+    }
+
+    selected = engine.decide([eth, btc], regime_data={"overall_regime": "neutral"}, open_positions=[], kelly_stats={})
+
+    assert selected
+    assert selected[0]["name"] == "btc_promoted"
+    assert btc["_metadata_for_decision"]["promotion_stage"] == "full"
+    assert eth["_metadata_for_decision"]["promotion_stage"] == "incubating"
 
 
 def test_decision_engine_rewards_cross_source_same_coin_confluence():
@@ -5713,3 +5821,93 @@ def test_source_budget_allocator_scales_position_when_capital_governor_is_risk_o
     assert decision.position_pct < decision.original_position_pct
     assert decision.capital_status == "risk_off"
     assert decision.capital_multiplier == 0.4
+
+
+def test_source_budget_allocator_respects_promotion_ladder_caps(monkeypatch):
+    monkeypatch.setattr("src.signals.source_allocator.db.get_source_trade_outcome_summary", lambda **kwargs: [])
+    monkeypatch.setattr("src.signals.source_allocator.db.get_source_attribution_summary", lambda **kwargs: [])
+
+    class FakeAdaptive:
+        def get_source_profile(self, source_key="", source=""):
+            return {
+                "status": "active",
+                "health_score": 0.66,
+                "weight_multiplier": 0.98,
+                "confidence_multiplier": 0.97,
+                "promotion_stage": "incubating",
+                "promotion_multiplier": 0.55,
+                "promotion_cap_pct": 0.08,
+                "promotion_reasons": ["insufficient_closed_trades"],
+                "metadata": {
+                    "promotion_stage": "incubating",
+                    "promotion_multiplier": 0.55,
+                    "promotion_cap_pct": 0.08,
+                    "promotion_reasons": ["insufficient_closed_trades"],
+                },
+            }
+
+    allocator = SourceBudgetAllocator(
+        {"enabled": True, "promotion_ladder_enabled": True},
+        adaptive_learning=FakeAdaptive(),
+    )
+    signal = TradeSignal(
+        coin="BTC",
+        side=SignalSide.LONG,
+        confidence=0.79,
+        source=SignalSource.OPTIONS_FLOW,
+        reason="promotion ladder cap test",
+        position_pct=0.20,
+        leverage=2.0,
+        risk=RiskParams(),
+    )
+
+    decision = allocator.evaluate(
+        signal,
+        signal={"source": "options_flow", "source_key": "options_flow:BTC", "coin": "BTC"},
+        open_positions=[],
+        account_balance=10_000.0,
+    )
+
+    assert decision.blocked is False
+    assert decision.promotion_stage == "incubating"
+    assert decision.promotion_cap_pct == 0.08
+    assert decision.position_pct <= 0.08
+    assert "promotion_ladder_scaled" in decision.reasons
+
+
+def test_arena_capital_allocator_weights_by_status():
+    allocator = CapitalAllocator(total_pool=90_000.0)
+    champion = ArenaAgent(
+        agent_id="champion",
+        name="Champion",
+        strategy_type="momentum_long",
+        status=AgentStatus.CHAMPION,
+        total_trades=20,
+    )
+    active = ArenaAgent(
+        agent_id="active",
+        name="Active",
+        strategy_type="trend_following",
+        status=AgentStatus.ACTIVE,
+        total_trades=12,
+    )
+    incubating = ArenaAgent(
+        agent_id="incubating",
+        name="Incubating",
+        strategy_type="mean_reversion",
+        status=AgentStatus.ACTIVE,
+        total_trades=1,
+    )
+    probation = ArenaAgent(
+        agent_id="probation",
+        name="Probation",
+        strategy_type="contrarian",
+        status=AgentStatus.PROBATION,
+        total_trades=14,
+    )
+
+    allocations = allocator.reallocate([champion, active, incubating, probation])
+
+    assert round(sum(allocations.values()), 2) == 90_000.0
+    assert allocations["champion"] > allocations["active"] > allocations["probation"]
+    assert allocations["active"] > allocations["incubating"]

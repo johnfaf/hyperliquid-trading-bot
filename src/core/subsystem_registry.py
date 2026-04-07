@@ -277,6 +277,51 @@ def build_subsystems(
                     "max_calibration_ece": config.ADAPTIVE_LEARNING_MAX_CALIBRATION_ECE,
                     "min_weight_multiplier": config.ADAPTIVE_LEARNING_MIN_WEIGHT_MULTIPLIER,
                     "return_scale": config.ADAPTIVE_LEARNING_RETURN_SCALE,
+                    "scaled_promotion_closed_trades": (
+                        config.ADAPTIVE_PROMOTION_SCALED_MIN_CLOSED_TRADES
+                    ),
+                    "scaled_promotion_recent_closed_trades": (
+                        config.ADAPTIVE_PROMOTION_SCALED_MIN_RECENT_CLOSED_TRADES
+                    ),
+                    "scaled_promotion_health_floor": (
+                        config.ADAPTIVE_PROMOTION_SCALED_MIN_HEALTH_SCORE
+                    ),
+                    "scaled_promotion_recent_win_rate": (
+                        config.ADAPTIVE_PROMOTION_SCALED_MIN_RECENT_WIN_RATE
+                    ),
+                    "scaled_promotion_recent_return_pct": (
+                        config.ADAPTIVE_PROMOTION_SCALED_MIN_RECENT_RETURN_PCT
+                    ),
+                    "full_promotion_closed_trades": (
+                        config.ADAPTIVE_PROMOTION_FULL_MIN_CLOSED_TRADES
+                    ),
+                    "full_promotion_recent_closed_trades": (
+                        config.ADAPTIVE_PROMOTION_FULL_MIN_RECENT_CLOSED_TRADES
+                    ),
+                    "full_promotion_health_floor": (
+                        config.ADAPTIVE_PROMOTION_FULL_MIN_HEALTH_SCORE
+                    ),
+                    "full_promotion_recent_win_rate": (
+                        config.ADAPTIVE_PROMOTION_FULL_MIN_RECENT_WIN_RATE
+                    ),
+                    "full_promotion_recent_return_pct": (
+                        config.ADAPTIVE_PROMOTION_FULL_MIN_RECENT_RETURN_PCT
+                    ),
+                    "full_promotion_live_success_rate": (
+                        config.ADAPTIVE_PROMOTION_FULL_MIN_LIVE_SUCCESS_RATE
+                    ),
+                    "incubating_promotion_multiplier": (
+                        config.ADAPTIVE_PROMOTION_INCUBATING_MULTIPLIER
+                    ),
+                    "trial_promotion_multiplier": config.ADAPTIVE_PROMOTION_TRIAL_MULTIPLIER,
+                    "scaled_promotion_multiplier": config.ADAPTIVE_PROMOTION_SCALED_MULTIPLIER,
+                    "full_promotion_multiplier": config.ADAPTIVE_PROMOTION_FULL_MULTIPLIER,
+                    "incubating_promotion_cap_pct": (
+                        config.ADAPTIVE_PROMOTION_INCUBATING_CAP_PCT
+                    ),
+                    "trial_promotion_cap_pct": config.ADAPTIVE_PROMOTION_TRIAL_CAP_PCT,
+                    "scaled_promotion_cap_pct": config.ADAPTIVE_PROMOTION_SCALED_CAP_PCT,
+                    "full_promotion_cap_pct": config.ADAPTIVE_PROMOTION_FULL_CAP_PCT,
                     "arena_min_trades": config.ADAPTIVE_ARENA_MIN_TRADES,
                     "arena_min_win_rate": config.ADAPTIVE_ARENA_MIN_WIN_RATE,
                     "arena_min_sharpe": config.ADAPTIVE_ARENA_MIN_SHARPE,
@@ -449,6 +494,7 @@ def build_subsystems(
                     "block_on_status": config.SOURCE_BUDGET_BLOCK_ON_STATUS,
                     "divergence_enabled": config.RUNTIME_DIVERGENCE_CONTROL_ENABLED,
                     "capital_governor_enabled": config.SOURCE_BUDGET_CAPITAL_GOVERNOR_ENABLED,
+                    "promotion_ladder_enabled": config.SOURCE_BUDGET_PROMOTION_LADDER_ENABLED,
                 },
                 adaptive_learning=c.adaptive_learning,
                 divergence_controller=c.divergence_controller,

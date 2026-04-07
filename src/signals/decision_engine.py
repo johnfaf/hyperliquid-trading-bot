@@ -1925,6 +1925,16 @@ class DecisionEngine:
 
         weight_multiplier = float(profile.get("weight_multiplier", 1.0) or 1.0)
         confidence_multiplier = float(profile.get("confidence_multiplier", 1.0) or 1.0)
+        promotion_stage = str(profile.get("promotion_stage", "trial") or "trial")
+        profile_metadata = profile.get("metadata", {})
+        if not isinstance(profile_metadata, dict):
+            profile_metadata = {}
+        promotion_quality_multiplier = float(
+            profile_metadata.get("promotion_quality_multiplier", 1.0) or 1.0
+        )
+        promotion_confidence_multiplier = float(
+            profile_metadata.get("promotion_confidence_multiplier", 1.0) or 1.0
+        )
         metadata["adaptive_status"] = profile.get("status", "active")
         metadata["adaptive_health_score"] = round(
             float(profile.get("health_score", 0.0) or 0.0),
@@ -1936,14 +1946,26 @@ class DecisionEngine:
         )
         metadata["adaptive_training_label"] = profile.get("training_label", "monitor")
         metadata["adaptive_recommended_action"] = profile.get("recommended_action", "monitor")
+        metadata["promotion_stage"] = promotion_stage
+        metadata["promotion_score"] = round(float(profile.get("promotion_score", 0.0) or 0.0), 4)
+        metadata["promotion_gate_passed"] = bool(profile.get("promotion_gate_passed", False))
+        metadata["promotion_cap_pct"] = round(float(profile.get("promotion_cap_pct", 0.0) or 0.0), 4)
 
         return {
             "metadata": metadata,
-            "confidence": self._clamp(confidence * confidence_multiplier, 0.0, 1.0),
-            "source_quality": self._clamp(source_quality * weight_multiplier, 0.0, 1.0),
+            "confidence": self._clamp(
+                confidence * confidence_multiplier * promotion_confidence_multiplier,
+                0.0,
+                1.0,
+            ),
+            "source_quality": self._clamp(
+                source_quality * weight_multiplier * promotion_quality_multiplier,
+                0.0,
+                1.0,
+            ),
             "profile": profile,
-            "weight_multiplier": weight_multiplier,
-            "confidence_multiplier": confidence_multiplier,
+            "weight_multiplier": weight_multiplier * promotion_quality_multiplier,
+            "confidence_multiplier": confidence_multiplier * promotion_confidence_multiplier,
         }
 
     def _extract_risk_geometry(self, strategy: Dict, direction: str) -> Dict[str, float]:

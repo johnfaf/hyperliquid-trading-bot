@@ -61,6 +61,63 @@ class AdaptiveLearningManager:
         self.min_weight_multiplier = float(cfg.get("min_weight_multiplier", 0.12))
         self.return_scale = float(cfg.get("return_scale", 0.04))
         self.base_reference_confidence = float(cfg.get("base_reference_confidence", 0.70))
+        self.scaled_promotion_closed_trades = int(
+            cfg.get("scaled_promotion_closed_trades", 8)
+        )
+        self.scaled_promotion_recent_closed_trades = int(
+            cfg.get("scaled_promotion_recent_closed_trades", 2)
+        )
+        self.scaled_promotion_health_floor = float(
+            cfg.get("scaled_promotion_health_floor", 0.58)
+        )
+        self.scaled_promotion_recent_win_rate = float(
+            cfg.get("scaled_promotion_recent_win_rate", 0.52)
+        )
+        self.scaled_promotion_recent_return_pct = float(
+            cfg.get("scaled_promotion_recent_return_pct", 0.0)
+        )
+        self.full_promotion_closed_trades = int(
+            cfg.get("full_promotion_closed_trades", 16)
+        )
+        self.full_promotion_recent_closed_trades = int(
+            cfg.get("full_promotion_recent_closed_trades", 5)
+        )
+        self.full_promotion_health_floor = float(
+            cfg.get("full_promotion_health_floor", max(self.promotion_health_floor, 0.72))
+        )
+        self.full_promotion_recent_win_rate = float(
+            cfg.get("full_promotion_recent_win_rate", 0.56)
+        )
+        self.full_promotion_recent_return_pct = float(
+            cfg.get("full_promotion_recent_return_pct", 0.003)
+        )
+        self.full_promotion_live_success_rate = float(
+            cfg.get("full_promotion_live_success_rate", 0.55)
+        )
+        self.incubating_promotion_multiplier = float(
+            cfg.get("incubating_promotion_multiplier", 0.55)
+        )
+        self.trial_promotion_multiplier = float(
+            cfg.get("trial_promotion_multiplier", 0.75)
+        )
+        self.scaled_promotion_multiplier = float(
+            cfg.get("scaled_promotion_multiplier", 0.95)
+        )
+        self.full_promotion_multiplier = float(
+            cfg.get("full_promotion_multiplier", 1.10)
+        )
+        self.incubating_promotion_cap_pct = float(
+            cfg.get("incubating_promotion_cap_pct", 0.08)
+        )
+        self.trial_promotion_cap_pct = float(
+            cfg.get("trial_promotion_cap_pct", 0.14)
+        )
+        self.scaled_promotion_cap_pct = float(
+            cfg.get("scaled_promotion_cap_pct", 0.22)
+        )
+        self.full_promotion_cap_pct = float(
+            cfg.get("full_promotion_cap_pct", 0.32)
+        )
 
         self.arena_min_trades = int(cfg.get("arena_min_trades", 10))
         self.arena_min_win_rate = float(cfg.get("arena_min_win_rate", 0.52))
@@ -227,6 +284,7 @@ class AdaptiveLearningManager:
             avg_return_pct = float(baseline.get("avg_return_pct", 0.0) or 0.0)
             recent_avg_return_pct = float(recent.get("avg_return_pct", avg_return_pct) or 0.0)
             realized_pnl = float(baseline.get("realized_pnl", 0.0) or 0.0)
+            live_events = int(attr.get("live_events", 0) or 0)
             live_success_rate = float(attr.get("live_success_rate", 0.0) or 0.0)
             live_rejection_rate = float(attr.get("live_rejection_rate", 0.0) or 0.0)
 
@@ -273,6 +331,19 @@ class AdaptiveLearningManager:
                 calibration_ece=calibration_ece,
                 live_rejection_rate=live_rejection_rate,
             )
+            promotion = self._classify_promotion_stage(
+                status=status,
+                health_score=health_score,
+                drift_score=drift_score,
+                calibration_ece=calibration_ece,
+                sample_size=sample_size,
+                recent_sample_size=recent_closed_trades,
+                selection_count=selection_count,
+                recent_win_rate=recent_win_rate,
+                recent_avg_return_pct=recent_avg_return_pct,
+                live_success_rate=live_success_rate,
+                live_events=live_events,
+            )
             status_multiplier = {
                 "active": 1.0,
                 "warming_up": 0.95,
@@ -286,17 +357,23 @@ class AdaptiveLearningManager:
                 "blocked": 0.60,
             }.get(status, 1.0)
             weight_multiplier = self._clamp(
-                (0.70 + health_score * 0.60) * status_multiplier,
+                (0.70 + health_score * 0.60)
+                * status_multiplier
+                * float(promotion.get("quality_multiplier", 1.0) or 1.0),
                 self.min_weight_multiplier,
                 1.25,
             )
             confidence_multiplier = self._clamp(
-                confidence_multiplier * (0.90 + health_score * 0.20) * confidence_status_multiplier,
+                confidence_multiplier
+                * (0.90 + health_score * 0.20)
+                * confidence_status_multiplier
+                * float(promotion.get("confidence_multiplier", 1.0) or 1.0),
                 0.45,
                 1.15,
             )
             training_label, recommended_action = self._training_label_for(
                 status=status,
+                promotion_stage=promotion.get("stage", "trial"),
                 health_score=health_score,
                 drift_score=drift_score,
                 sample_size=sample_size,
@@ -325,15 +402,35 @@ class AdaptiveLearningManager:
                 "drift_score": round(drift_score, 4),
                 "live_success_rate": round(live_success_rate, 4),
                 "live_rejection_rate": round(live_rejection_rate, 4),
+                "promotion_stage": str(promotion.get("stage", "trial") or "trial"),
+                "promotion_score": round(float(promotion.get("score", 0.0) or 0.0), 4),
+                "promotion_gate_passed": bool(promotion.get("gate_passed", False)),
+                "promotion_multiplier": round(float(promotion.get("multiplier", 1.0) or 1.0), 4),
+                "promotion_cap_pct": round(float(promotion.get("cap_pct", 0.0) or 0.0), 4),
+                "promotion_reasons": list(promotion.get("reasons", []) or []),
                 "metadata": {
                     "dynamic_weight": round(dynamic_weight, 4),
                     "weighted_accuracy": round(weighted_accuracy, 4),
                     "selection_share": round(selection_count / max(total_selected, 1), 4),
                     "paper_open_count": int(attr.get("paper_open_count", 0) or 0),
                     "paper_closed_count": int(attr.get("paper_closed_count", 0) or 0),
-                    "live_events": int(attr.get("live_events", 0) or 0),
+                    "live_events": live_events,
                     "avg_composite_score": float(attr.get("avg_composite_score", 0.0) or 0.0),
                     "avg_expected_value_pct": float(attr.get("avg_expected_value_pct", 0.0) or 0.0),
+                    "promotion_stage": str(promotion.get("stage", "trial") or "trial"),
+                    "promotion_score": round(float(promotion.get("score", 0.0) or 0.0), 4),
+                    "promotion_gate_passed": bool(promotion.get("gate_passed", False)),
+                    "promotion_multiplier": round(float(promotion.get("multiplier", 1.0) or 1.0), 4),
+                    "promotion_cap_pct": round(float(promotion.get("cap_pct", 0.0) or 0.0), 4),
+                    "promotion_quality_multiplier": round(
+                        float(promotion.get("quality_multiplier", 1.0) or 1.0),
+                        4,
+                    ),
+                    "promotion_confidence_multiplier": round(
+                        float(promotion.get("confidence_multiplier", 1.0) or 1.0),
+                        4,
+                    ),
+                    "promotion_reasons": list(promotion.get("reasons", []) or []),
                 },
             }
         return profiles
@@ -410,16 +507,154 @@ class AdaptiveLearningManager:
             return "caution"
         return "active"
 
+    def _promotion_defaults(self, stage: str) -> Dict:
+        normalized = str(stage or "trial").strip().lower() or "trial"
+        stage_map = {
+            "blocked": {
+                "multiplier": 0.0,
+                "cap_pct": 0.0,
+                "quality_multiplier": 0.55,
+                "confidence_multiplier": 0.70,
+            },
+            "incubating": {
+                "multiplier": self.incubating_promotion_multiplier,
+                "cap_pct": self.incubating_promotion_cap_pct,
+                "quality_multiplier": 0.82,
+                "confidence_multiplier": 0.90,
+            },
+            "trial": {
+                "multiplier": self.trial_promotion_multiplier,
+                "cap_pct": self.trial_promotion_cap_pct,
+                "quality_multiplier": 0.92,
+                "confidence_multiplier": 0.96,
+            },
+            "scaled": {
+                "multiplier": self.scaled_promotion_multiplier,
+                "cap_pct": self.scaled_promotion_cap_pct,
+                "quality_multiplier": 1.02,
+                "confidence_multiplier": 1.01,
+            },
+            "full": {
+                "multiplier": self.full_promotion_multiplier,
+                "cap_pct": self.full_promotion_cap_pct,
+                "quality_multiplier": 1.08,
+                "confidence_multiplier": 1.04,
+            },
+        }
+        return stage_map.get(normalized, stage_map["trial"])
+
+    def _classify_promotion_stage(
+        self,
+        *,
+        status: str,
+        health_score: float,
+        drift_score: float,
+        calibration_ece,
+        sample_size: int,
+        recent_sample_size: int,
+        selection_count: int,
+        recent_win_rate: float,
+        recent_avg_return_pct: float,
+        live_success_rate: float,
+        live_events: int,
+    ) -> Dict:
+        reasons = []
+        if status == "blocked":
+            reasons.append("source_blocked")
+        if sample_size < self.min_closed_trades:
+            reasons.append("insufficient_closed_trades")
+        if selection_count < self.min_selected_candidates:
+            reasons.append("insufficient_selected_candidates")
+        if recent_sample_size < self.min_recent_closed_trades:
+            reasons.append("insufficient_recent_closed_trades")
+        if health_score < self.caution_health_floor:
+            reasons.append("health_below_caution_floor")
+        if drift_score >= self.caution_drift_threshold:
+            reasons.append("drift_above_caution_threshold")
+        if calibration_ece is not None and float(calibration_ece) > self.max_calibration_ece:
+            reasons.append("calibration_above_ceiling")
+
+        scaled_gate = (
+            status == "active"
+            and sample_size >= self.scaled_promotion_closed_trades
+            and recent_sample_size >= self.scaled_promotion_recent_closed_trades
+            and health_score >= self.scaled_promotion_health_floor
+            and recent_win_rate >= self.scaled_promotion_recent_win_rate
+            and recent_avg_return_pct >= self.scaled_promotion_recent_return_pct
+            and drift_score < self.caution_drift_threshold
+        )
+        full_gate = (
+            scaled_gate
+            and sample_size >= self.full_promotion_closed_trades
+            and recent_sample_size >= self.full_promotion_recent_closed_trades
+            and health_score >= self.full_promotion_health_floor
+            and recent_win_rate >= self.full_promotion_recent_win_rate
+            and recent_avg_return_pct >= self.full_promotion_recent_return_pct
+            and (live_events <= 0 or live_success_rate >= self.full_promotion_live_success_rate)
+        )
+
+        stage = "trial"
+        gate_passed = False
+        if status == "blocked":
+            stage = "blocked"
+        elif sample_size < self.min_closed_trades or selection_count < self.min_selected_candidates:
+            stage = "incubating"
+        elif full_gate:
+            stage = "full"
+            gate_passed = True
+        elif scaled_gate:
+            stage = "scaled"
+            gate_passed = True
+        else:
+            stage = "trial"
+
+        promotion_score = self._clamp(
+            0.30 * health_score
+            + 0.18 * self._clamp(recent_win_rate, 0.0, 1.0)
+            + 0.16 * self._clamp(0.5 + (recent_avg_return_pct / max(self.return_scale, 1e-8)), 0.0, 1.0)
+            + 0.14 * self._clamp(sample_size / max(self.full_promotion_closed_trades, 1), 0.0, 1.0)
+            + 0.12 * self._clamp(recent_sample_size / max(self.full_promotion_recent_closed_trades, 1), 0.0, 1.0)
+            + 0.10 * self._clamp(live_success_rate if live_events > 0 else 0.5, 0.0, 1.0)
+            - 0.18 * self._clamp(drift_score, 0.0, 1.0),
+            0.0,
+            1.0,
+        )
+
+        defaults = self._promotion_defaults(stage)
+        if stage == "full":
+            reasons = ["promotion_full_access"]
+        elif stage == "scaled":
+            reasons = ["promotion_scaled_access"]
+        elif stage == "trial" and not reasons:
+            reasons = ["collect_more_out_of_sample_evidence"]
+        elif stage == "incubating" and not reasons:
+            reasons = ["collect_initial_evidence"]
+
+        return {
+            "stage": stage,
+            "gate_passed": gate_passed,
+            "score": round(promotion_score, 4),
+            "reasons": reasons,
+            **defaults,
+        }
+
     def _training_label_for(
         self,
         *,
         status: str,
+        promotion_stage: str,
         health_score: float,
         drift_score: float,
         sample_size: int,
     ):
         if status == "blocked":
             return "freeze", "disable source until retrained"
+        if promotion_stage == "full":
+            return "promote", "full capital access approved"
+        if promotion_stage == "scaled":
+            return "promote", "scaled capital access approved"
+        if promotion_stage == "trial":
+            return "monitor", "keep limited capital until out-of-sample improves"
         if status == "caution":
             return "monitor", "reduce allocation and monitor drift"
         if sample_size >= self.min_closed_trades and health_score >= self.promotion_health_floor and drift_score < self.caution_drift_threshold:
@@ -430,11 +665,20 @@ class AdaptiveLearningManager:
 
     def _summarize_profiles(self, profiles: Dict[str, Dict]) -> Dict:
         counts = {"active": 0, "warming_up": 0, "caution": 0, "blocked": 0}
+        promotion_counts = {
+            "blocked": 0,
+            "incubating": 0,
+            "trial": 0,
+            "scaled": 0,
+            "full": 0,
+        }
         promote = 0
         freeze = 0
         for profile in profiles.values():
             status = str(profile.get("status", "warming_up") or "warming_up")
             counts[status] = counts.get(status, 0) + 1
+            promotion_stage = str(profile.get("promotion_stage", "trial") or "trial")
+            promotion_counts[promotion_stage] = promotion_counts.get(promotion_stage, 0) + 1
             if profile.get("training_label") == "promote":
                 promote += 1
             if profile.get("training_label") == "freeze":
@@ -456,13 +700,17 @@ class AdaptiveLearningManager:
         return {
             "sources_tracked": len(profiles),
             "status_counts": counts,
+            "promotion_stage_counts": promotion_counts,
             "promote_count": promote,
             "freeze_count": freeze,
+            "full_access_count": promotion_counts.get("full", 0),
+            "scaled_access_count": promotion_counts.get("scaled", 0),
             "top_sources": [
                 {
                     "source_key": item["source_key"],
                     "health_score": item["health_score"],
                     "status": item["status"],
+                    "promotion_stage": item.get("promotion_stage", "trial"),
                 }
                 for item in top_profiles
             ],
@@ -471,6 +719,7 @@ class AdaptiveLearningManager:
                     "source_key": item["source_key"],
                     "drift_score": item["drift_score"],
                     "status": item["status"],
+                    "promotion_stage": item.get("promotion_stage", "trial"),
                 }
                 for item in constrained
             ],
@@ -495,32 +744,49 @@ class AdaptiveLearningManager:
             profile = profiles.get(source_key, {})
             health_score = float(profile.get("health_score", 0.5) or 0.5)
             drift_score = float(profile.get("drift_score", 0.0) or 0.0)
+            promotion_stage = str(profile.get("promotion_stage", "trial") or "trial")
             new_status = previous_status
             action = ""
             reason = ""
 
             if (
-                drift_score >= self.block_drift_threshold
+                promotion_stage == "blocked"
+                or drift_score >= self.block_drift_threshold
                 or float(agent.max_drawdown or 0.0) >= self.arena_max_drawdown
-                or (int(agent.total_trades or 0) >= self.arena_min_trades and float(agent.sharpe_ratio or 0.0) < -0.10)
+                or (
+                    int(agent.total_trades or 0) >= self.arena_min_trades
+                    and float(agent.sharpe_ratio or 0.0) < -0.10
+                )
             ):
                 new_status = _coerce_status(previous_status, "probation")
                 action = "demote" if previous_status_value == "champion" else "flag"
                 reason = "arena health degraded"
             elif (
-                health_score >= self.promotion_health_floor
+                promotion_stage == "full"
+                and health_score >= self.promotion_health_floor
                 and float(agent.win_rate or 0.0) >= self.arena_min_win_rate
                 and float(agent.sharpe_ratio or 0.0) >= self.arena_min_sharpe
             ):
                 new_status = _coerce_status(previous_status, "champion")
                 action = "promote" if previous_status_value != "champion" else ""
                 reason = "arena health approved"
+            elif (
+                promotion_stage == "scaled"
+                and previous_status_value in {"incubating", "probation", "champion"}
+                and health_score >= self.caution_health_floor
+                and drift_score < self.caution_drift_threshold
+            ):
+                new_status = _coerce_status(previous_status, "active")
+                action = "restore" if previous_status_value == "probation" else "graduate"
+                reason = "arena scaled access approved"
             elif previous_status_value == "probation" and health_score >= self.caution_health_floor and drift_score < self.caution_drift_threshold:
                 new_status = _coerce_status(previous_status, "active")
                 action = "restore"
                 reason = "arena health recovered"
             elif previous_status_value == "champion" and (
-                health_score < self.caution_health_floor or drift_score >= self.caution_drift_threshold
+                promotion_stage not in {"scaled", "full"}
+                or health_score < self.caution_health_floor
+                or drift_score >= self.caution_drift_threshold
             ):
                 new_status = _coerce_status(previous_status, "active")
                 action = "derisk"
@@ -541,6 +807,8 @@ class AdaptiveLearningManager:
                         "metrics": {
                             "health_score": round(health_score, 4),
                             "drift_score": round(drift_score, 4),
+                            "promotion_stage": promotion_stage,
+                            "promotion_score": round(float(profile.get("promotion_score", 0.0) or 0.0), 4),
                             "win_rate": round(float(agent.win_rate or 0.0), 4),
                             "sharpe_ratio": round(float(agent.sharpe_ratio or 0.0), 4),
                             "max_drawdown": round(float(agent.max_drawdown or 0.0), 4),

@@ -34,6 +34,9 @@ class SourceBudgetDecision:
     health_score: float
     weight_multiplier: float
     confidence_multiplier: float
+    promotion_stage: str = ""
+    promotion_multiplier: float = 1.0
+    promotion_cap_pct: float = 0.0
     divergence_status: str = ""
     divergence_multiplier: float = 1.0
     capital_status: str = ""
@@ -79,6 +82,7 @@ class SourceBudgetAllocator:
         self.block_on_status = bool(cfg.get("block_on_status", True))
         self.divergence_enabled = bool(cfg.get("divergence_enabled", divergence_controller is not None))
         self.capital_governor_enabled = bool(cfg.get("capital_governor_enabled", capital_governor is not None))
+        self.promotion_ladder_enabled = bool(cfg.get("promotion_ladder_enabled", True))
         self.adaptive_learning = adaptive_learning
         self.divergence_controller = divergence_controller
         self.capital_governor = capital_governor
@@ -103,10 +107,19 @@ class SourceBudgetAllocator:
                 "caution": 0,
                 "blocked": 0,
             },
+            "promotion_stage_counts": {
+                "blocked": 0,
+                "incubating": 0,
+                "trial": 0,
+                "scaled": 0,
+                "full": 0,
+            },
             "divergence_blocked": 0,
             "divergence_scaled": 0,
             "capital_blocked": 0,
             "capital_scaled": 0,
+            "promotion_blocked": 0,
+            "promotion_scaled": 0,
             "last_decision": None,
         }
 
@@ -323,6 +336,41 @@ class SourceBudgetAllocator:
             logger.debug("source allocator profile error for %s: %s", source_key or source, exc)
             return {}
 
+    def _get_promotion_assessment(self, profile: Dict) -> Dict:
+        if not self.promotion_ladder_enabled or not profile:
+            return {}
+        metadata = self._coerce_metadata(profile.get("metadata", {}))
+        explicit_keys = {
+            "promotion_stage",
+            "promotion_multiplier",
+            "promotion_cap_pct",
+            "promotion_reasons",
+        }
+        if not any(key in profile or key in metadata for key in explicit_keys):
+            return {}
+        stage = str(
+            profile.get("promotion_stage", metadata.get("promotion_stage", "trial")) or "trial"
+        ).strip().lower() or "trial"
+        multiplier = self._safe_float(
+            profile.get("promotion_multiplier", metadata.get("promotion_multiplier", 1.0)),
+            1.0,
+        )
+        cap_pct = self._safe_float(
+            profile.get("promotion_cap_pct", metadata.get("promotion_cap_pct", 0.0)),
+            0.0,
+        )
+        reasons = list(
+            profile.get("promotion_reasons", metadata.get("promotion_reasons", [])) or []
+        )
+        blocked = stage == "blocked" or multiplier <= 0 or cap_pct <= 0
+        return {
+            "stage": stage,
+            "multiplier": multiplier,
+            "cap_pct": cap_pct,
+            "blocked": blocked,
+            "reasons": reasons,
+        }
+
     def _get_divergence_assessment(self, source_key: str, source: str) -> Dict:
         if not self.divergence_enabled or not self.divergence_controller:
             return {}
@@ -479,10 +527,22 @@ class SourceBudgetAllocator:
         health_score = self._safe_float(profile.get("health_score"), 0.50 if not profile else 0.0)
         weight_multiplier = self._safe_float(profile.get("weight_multiplier"), 1.0)
         confidence_multiplier = self._safe_float(profile.get("confidence_multiplier"), 1.0)
+        promotion = self._get_promotion_assessment(profile)
+        promotion_stage = str(promotion.get("stage", "") or "")
+        promotion_multiplier = self._safe_float(promotion.get("multiplier"), 1.0)
+        promotion_cap_pct = self._safe_float(promotion.get("cap_pct"), 0.0)
         _, source_cap_pct = self._status_defaults(status)
+        if promotion and promotion_cap_pct > 0:
+            source_cap_pct = min(source_cap_pct, promotion_cap_pct)
         outcome = self._outcome_by_key.get(source_key) or self._outcome_by_source.get(source, {})
         attribution = self._attribution_by_key.get(source_key) or self._attribution_by_source.get(source, {})
         allocation_multiplier = self._estimate_allocation_multiplier(profile, outcome, attribution, reasons)
+        if promotion and not bool(promotion.get("blocked", False)):
+            allocation_multiplier *= promotion_multiplier
+            if promotion_stage in {"incubating", "trial", "scaled"}:
+                reasons.append("promotion_ladder_scaled")
+        if promotion:
+            reasons.extend([reason for reason in promotion.get("reasons", []) or [] if reason])
         source_exposure_pct = self._source_exposure_pct(
             open_positions or [],
             source_key=source_key,
@@ -515,7 +575,10 @@ class SourceBudgetAllocator:
         blocked = False
         block_reason = ""
 
-        if capital and bool(capital.get("blocked", False)):
+        if promotion and bool(promotion.get("blocked", False)):
+            blocked = True
+            block_reason = "promotion_ladder_blocked"
+        elif capital and bool(capital.get("blocked", False)):
             blocked = True
             block_reason = "capital_governor_blocked"
         elif divergence and bool(divergence.get("blocked", False)):
@@ -557,6 +620,9 @@ class SourceBudgetAllocator:
             health_score=round(health_score, 6),
             weight_multiplier=round(weight_multiplier, 6),
             confidence_multiplier=round(confidence_multiplier, 6),
+            promotion_stage=promotion_stage,
+            promotion_multiplier=round(promotion_multiplier, 6),
+            promotion_cap_pct=round(promotion_cap_pct, 6),
             divergence_status=divergence_status,
             divergence_multiplier=round(divergence_multiplier, 6),
             capital_status=capital_status,
@@ -569,18 +635,25 @@ class SourceBudgetAllocator:
         self.stats["evaluations"] += 1
         if blocked:
             self.stats["blocked"] += 1
-            if block_reason == "capital_governor_blocked":
+            if block_reason == "promotion_ladder_blocked":
+                self.stats["promotion_blocked"] += 1
+            elif block_reason == "capital_governor_blocked":
                 self.stats["capital_blocked"] += 1
             elif block_reason == "divergence_control_blocked":
                 self.stats["divergence_blocked"] += 1
         if decision.position_pct < decision.original_position_pct:
             self.stats["size_reduced"] += 1
+            if promotion_stage in {"incubating", "trial", "scaled"}:
+                self.stats["promotion_scaled"] += 1
             if capital_status in {"caution", "risk_off"}:
                 self.stats["capital_scaled"] += 1
             if divergence_status == "caution":
                 self.stats["divergence_scaled"] += 1
         status_counts = self.stats.setdefault("status_counts", {})
         status_counts[status] = status_counts.get(status, 0) + 1
+        stage_counts = self.stats.setdefault("promotion_stage_counts", {})
+        normalized_stage = promotion_stage or "trial"
+        stage_counts[normalized_stage] = stage_counts.get(normalized_stage, 0) + 1
         self.stats["last_decision"] = decision.to_dict()
         return decision
 
@@ -629,22 +702,33 @@ class SourceBudgetAllocator:
             outcome = self._outcome_by_key.get(source_key, {})
             attribution = self._attribution_by_key.get(source_key, {})
             estimated_multiplier = self._estimate_allocation_multiplier(profile, outcome, attribution, reasons)
+            promotion = self._get_promotion_assessment(profile)
             status = str(profile.get("status", "warming_up") or "warming_up").strip().lower() or "warming_up"
             _, cap_pct = self._status_defaults(status)
+            if promotion and self._safe_float(promotion.get("cap_pct"), 0.0) > 0:
+                cap_pct = min(cap_pct, self._safe_float(promotion.get("cap_pct"), cap_pct))
             profiles.append(
                 {
                     "source_key": source_key,
                     "source": source or "unknown",
                     "status": status,
                     "health_score": round(self._safe_float(profile.get("health_score"), 0.0), 4),
-                    "allocation_multiplier": round(estimated_multiplier, 4),
+                    "allocation_multiplier": round(
+                        estimated_multiplier * self._safe_float(promotion.get("multiplier"), 1.0),
+                        4,
+                    ),
                     "source_cap_pct": round(cap_pct, 4),
+                    "promotion_stage": str(promotion.get("stage", "") or ""),
+                    "promotion_multiplier": round(
+                        self._safe_float(promotion.get("multiplier"), 1.0),
+                        4,
+                    ),
                     "closed_trades": int(outcome.get("closed_trades", 0) or 0),
                     "realized_pnl": round(self._safe_float(outcome.get("realized_pnl"), 0.0), 2),
                     "avg_return_pct": round(self._safe_float(outcome.get("avg_return_pct"), 0.0), 4),
                     "live_rejection_rate": round(self._safe_float(attribution.get("live_rejection_rate"), 0.0), 4),
                     "live_avg_fill_ratio": round(self._safe_float(attribution.get("live_avg_fill_ratio"), 0.0), 4),
-                    "reasons": reasons,
+                    "reasons": reasons + list(promotion.get("reasons", []) or []),
                 }
             )
 

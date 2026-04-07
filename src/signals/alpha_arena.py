@@ -18,25 +18,22 @@ Plus:
                     (walk-forward, no future data leakage)
 """
 import logging
-import math
 import json
-import time
 import copy
 import random
-import hashlib
 import sqlite3
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Dict, List, Optional, Tuple, Any
-from collections import defaultdict
 from dataclasses import dataclass, field, asdict
 from enum import Enum
 
 import numpy as np
 
-import sys, os
+import os
+import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import config
-from src.signals.signal_schema import TradeSignal, SignalSide, SignalSource, SignalStrength
+from src.signals.signal_schema import TradeSignal
 
 logger = logging.getLogger(__name__)
 
@@ -237,15 +234,23 @@ class TournamentEngine:
 
 class CapitalAllocator:
     """
-    Equal capital allocation for the 9 fixed arena agents.
-    Each agent receives an equal share of the total pool ($10,000 each).
-    No fitness-based weighting — agents compete on pure performance.
+    Status-aware capital allocation for the fixed arena agents.
+    Champions earn larger slices, probation agents are derisked, and agents
+    without enough trade history stay on an incubating budget until they prove
+    themselves.
     """
 
     BASE_CAPITAL = 10_000.0   # Each of 9 agents gets equal share
     TOTAL_POOL = 90_000.0     # Total virtual capital: 9 agents × $10,000 each
-    MAX_SINGLE_AGENT = 0.25   # No single agent gets more than 25% of pool (not used with equal allocation)
-    MIN_ALLOCATION = 10_000.0 # Minimum capital for any active agent (not used with equal allocation)
+    MAX_SINGLE_AGENT = 0.25   # Soft ceiling kept for future use
+    MIN_ALLOCATION = 5_000.0
+    STATUS_WEIGHTS = {
+        AgentStatus.CHAMPION: config.ARENA_CAPITAL_CHAMPION_WEIGHT,
+        AgentStatus.ACTIVE: config.ARENA_CAPITAL_ACTIVE_WEIGHT,
+        AgentStatus.INCUBATING: config.ARENA_CAPITAL_INCUBATING_WEIGHT,
+        AgentStatus.PROBATION: config.ARENA_CAPITAL_PROBATION_WEIGHT,
+    }
+    MIN_TRACK_RECORD_TRADES = config.ARENA_CAPITAL_MIN_TRACK_RECORD_TRADES
 
     def __init__(self, total_pool: float = None):
         if total_pool:
@@ -253,8 +258,7 @@ class CapitalAllocator:
 
     def reallocate(self, agents: List[ArenaAgent]) -> Dict[str, float]:
         """
-        Allocate equal capital to all 9 agents.
-        No fitness-based weighting, no status multipliers — pure equality.
+        Allocate capital by status, normalized back to the shared pool.
         Returns dict of agent_id → new_capital.
         """
         active = [a for a in agents if a.status not in (AgentStatus.ELIMINATED,)]
@@ -262,16 +266,40 @@ class CapitalAllocator:
         if not active:
             return {}
 
-        # Equal allocation: each of the 9 agents gets the same capital
-        per_agent = round(self.TOTAL_POOL / len(active), 2)
+        weighted_agents = []
+        for agent in active:
+            effective_status = agent.status
+            if (
+                int(agent.total_trades or 0) < self.MIN_TRACK_RECORD_TRADES
+                and effective_status not in (AgentStatus.CHAMPION, AgentStatus.PROBATION)
+            ):
+                effective_status = AgentStatus.INCUBATING
+            weight = float(self.STATUS_WEIGHTS.get(effective_status, 1.0) or 1.0)
+            weighted_agents.append((agent, max(weight, 0.05), effective_status))
+
+        total_weight = sum(weight for _, weight, _ in weighted_agents) or 1.0
         allocations = {}
 
-        for agent in active:
-            agent.capital_allocated = per_agent
-            allocations[agent.agent_id] = per_agent
+        for agent, weight, effective_status in weighted_agents:
+            allocation = round(self.TOTAL_POOL * (weight / total_weight), 2)
+            agent.capital_allocated = allocation
+            allocations[agent.agent_id] = allocation
+            logger.debug(
+                "Arena capital: %s status=%s effective=%s capital=%.2f",
+                agent.name,
+                agent.status.value,
+                effective_status.value,
+                allocation,
+            )
 
-        logger.info(f"Capital allocation (equal): {len(allocations)} agents, "
-                   f"${per_agent:,.2f} each (total ${self.TOTAL_POOL:,.0f})")
+        logger.info(
+            "Capital allocation (weighted): %d agents, champions=%d, probation=%d, incubating=%d, total $%s",
+            len(allocations),
+            sum(1 for agent, _, status in weighted_agents if status == AgentStatus.CHAMPION),
+            sum(1 for agent, _, status in weighted_agents if status == AgentStatus.PROBATION),
+            sum(1 for agent, _, status in weighted_agents if status == AgentStatus.INCUBATING),
+            f"{self.TOTAL_POOL:,.0f}",
+        )
 
         return allocations
 
@@ -457,7 +485,6 @@ class ConsensusEngine:
 
         # Feature-based adjustments
         if features and isinstance(features, dict):
-            rsi = features.get("rsi", 50)
             score = features.get("overall_score", 0)
 
             # Strong feature alignment boosts confidence
@@ -715,9 +742,6 @@ class Backtester:
 
             if test_start >= n:
                 break
-
-            # Agent only sees data up to test_start for "training"
-            visible_history = historical_candles[:test_start]
 
             # Simulate trading on test period, bar by bar
             for bar_idx in range(test_start, test_end):
@@ -1248,12 +1272,12 @@ class AlphaArena:
         # Tournament
         if self.cycle_count % self.TOURNAMENT_INTERVAL == 0:
             agents_list = list(self.agents.values())
-            rnd = self.tournament.run_round(agents_list)
+            self.tournament.run_round(agents_list)
 
         # Spawning disabled — all 9 seed agents remain fixed
         # (SPAWN_INTERVAL = 0 prevents this block from ever executing)
 
-        # Reallocate capital (equal allocation to all 9 agents)
+        # Reallocate capital using status-aware ladder weights
         active = [a for a in self.agents.values()
                  if a.status != AgentStatus.ELIMINATED]
         self.allocator.reallocate(active)
