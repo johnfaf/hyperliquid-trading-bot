@@ -112,6 +112,17 @@ class CapitalGovernor:
             ),
         }
 
+    def _runtime_live_enabled(self) -> bool:
+        profile = self._runtime_text(
+            "BOT_RUNTIME_PROFILE",
+            getattr(config, "RUNTIME_PROFILE", "paper"),
+        ).lower() or "paper"
+        live_enabled = self._runtime_bool(
+            "LIVE_TRADING_ENABLED",
+            getattr(config, "LIVE_TRADING_ENABLED", False),
+        )
+        return profile == "live" or live_enabled
+
     @staticmethod
     def _severity_for_high(value: float, caution_threshold: float, risk_off_threshold: float, block_threshold: float) -> int:
         if value >= block_threshold:
@@ -210,6 +221,12 @@ class CapitalGovernor:
             return result
 
         summary = dict(self._summary or {})
+        runtime_live_enabled = self._runtime_live_enabled()
+        if not runtime_live_enabled:
+            summary["live_snapshot_count"] = 0
+            summary["live_current_drawdown_pct"] = 0.0
+            summary["live_sharpe"] = 0.0
+            summary["live_metrics_ignored"] = True
         paper_closed_trades = int(summary.get("paper_closed_trades", 0) or 0)
         live_snapshot_count = int(summary.get("live_snapshot_count", 0) or 0)
         source_profile_count = int(summary.get("source_profile_count", 0) or 0)
@@ -347,7 +364,7 @@ class CapitalGovernor:
             **dict(self.stats),
             "global_status": self._last_evaluation.get("status", "warming_up"),
             "global_reasons": list(self._last_evaluation.get("reasons", []) or []),
-            "summary": dict(self._summary),
+            "summary": dict((self._last_evaluation or {}).get("metrics", self._summary) or {}),
         }
 
     def get_dashboard_payload(self) -> Dict:

@@ -114,6 +114,7 @@ class DecisionEngine:
         self.capital_governor_block_on_status = bool(
             cfg.get("capital_governor_block_on_status", True)
         )
+        self.max_position_slots = int(cfg.get("max_position_slots", 8))
 
         # Max trades to execute per cycle (independent of position slots)
         self.max_trades_per_cycle = cfg.get("max_trades_per_cycle", 2)
@@ -202,7 +203,7 @@ class DecisionEngine:
         self._capital_governor_profile_cache = {}
         open_positions = open_positions or []
         open_coins = {t["coin"] for t in open_positions}
-        available_slots = max(0, 8 - len(open_positions))
+        available_slots = max(0, self.max_position_slots - len(open_positions))
 
         self.stats["total_candidates"] += len(strategies)
 
@@ -2263,7 +2264,7 @@ class DecisionEngine:
             bias_str = "LONG" if long_score > short_score else "SHORT" if short_score > long_score else "NEUTRAL"
 
         logger.info("DECISION #%d | regime=%s slots=%d/%d candidates=%d bias=%s",
-                    self._cycle_count, regime, available_slots, 5, len(scored), bias_str or "N/A")
+                    self._cycle_count, regime, available_slots, self.max_position_slots, len(scored), bias_str or "N/A")
 
         # Log only top 5 candidates on one line each
         for i, s in enumerate(scored[:5]):

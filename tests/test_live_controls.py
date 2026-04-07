@@ -7627,6 +7627,10 @@ def test_runtime_incident_telegram_alerts_are_deduplicated(monkeypatch):
 
 
 def test_capital_governor_enters_risk_off_on_live_drawdown(monkeypatch):
+    monkeypatch.setenv("BOT_RUNTIME_PROFILE", "live")
+    monkeypatch.setenv("LIVE_TRADING_ENABLED", "true")
+    monkeypatch.setattr(config, "RUNTIME_PROFILE", "live")
+    monkeypatch.setattr(config, "LIVE_TRADING_ENABLED", True)
     monkeypatch.setattr(
         "src.signals.capital_governor.db.get_capital_governor_summary",
         lambda lookback_hours=24.0 * 14: {
@@ -7664,6 +7668,51 @@ def test_capital_governor_enters_risk_off_on_live_drawdown(monkeypatch):
     assert assessment["blocked"] is False
     assert assessment["multiplier"] == 0.4
     assert "live_drawdown_risk_off" in assessment["reasons"]
+
+
+def test_capital_governor_ignores_live_metrics_in_paper_runtime(monkeypatch):
+    monkeypatch.setenv("BOT_RUNTIME_PROFILE", "paper")
+    monkeypatch.setenv("LIVE_TRADING_ENABLED", "false")
+    monkeypatch.setattr(config, "RUNTIME_PROFILE", "paper")
+    monkeypatch.setattr(config, "LIVE_TRADING_ENABLED", False)
+    monkeypatch.setattr(
+        "src.signals.capital_governor.db.get_capital_governor_summary",
+        lambda lookback_hours=24.0 * 14: {
+            "paper_closed_trades": 8,
+            "paper_current_drawdown_pct": 0.02,
+            "paper_sharpe": 0.35,
+            "live_snapshot_count": 16,
+            "live_current_drawdown_pct": 0.11,
+            "live_sharpe": -0.31,
+            "source_profile_count": 5,
+            "degraded_source_ratio": 0.20,
+            "blocked_source_ratio": 0.10,
+        },
+    )
+
+    class FakeDivergence:
+        def get_stats(self):
+            return {"global_status": "healthy"}
+
+    governor = CapitalGovernor(
+        {
+            "enabled": True,
+            "refresh_interval_seconds": 0.0,
+            "min_paper_trades": 3,
+            "min_live_snapshots": 3,
+            "min_source_profiles": 2,
+        },
+        divergence_controller=FakeDivergence(),
+    )
+    assessment = governor.evaluate(
+        regime_data={"overall_regime": "ranging", "overall_confidence": 0.61}
+    )
+
+    assert assessment["status"] == "healthy"
+    assert "live_drawdown_risk_off" not in assessment["reasons"]
+    assert assessment["metrics"]["live_snapshot_count"] == 0
+    assert assessment["metrics"]["live_current_drawdown_pct"] == 0.0
+    assert governor.get_stats()["summary"]["live_snapshot_count"] == 0
 
 
 def test_capital_governor_blocks_when_operator_risk_off_enabled(monkeypatch):
@@ -7823,6 +7872,56 @@ def test_decision_engine_records_no_trade_summary_with_blockers(monkeypatch):
     assert summary["source_counts"]["strategy"] == 1
     assert summary["blocker_counts"]["confidence<0.90"] == 1
     assert any("WhyNoTrade:" in entry for entry in logs)
+
+
+def test_decision_engine_logs_actual_slot_capacity(monkeypatch):
+    logs = []
+    monkeypatch.setattr(
+        "src.signals.decision_engine.logger.info",
+        lambda msg, *args: logs.append(msg % args if args else msg),
+    )
+
+    engine = DecisionEngine(
+        {
+            "min_decision_score": 0.0,
+            "min_signal_confidence": 0.4,
+            "min_source_weight": 0.2,
+            "min_expected_value_pct": -1.0,
+            "execution_quality_enabled": False,
+            "adaptive_learning_enabled": False,
+            "context_performance_enabled": False,
+            "confluence_enabled": False,
+            "calibration_enabled": False,
+            "memory_enabled": False,
+            "divergence_enabled": False,
+            "capital_governor_enabled": False,
+            "max_position_slots": 8,
+        }
+    )
+
+    candidate = {
+        "name": "slot_logging",
+        "source": "strategy",
+        "source_key": "strategy:trend_following:BTC",
+        "strategy_type": "trend_following",
+        "current_score": 0.84,
+        "confidence": 0.8,
+        "source_accuracy": 0.74,
+        "entry_price": 100.0,
+        "stop_loss": 97.0,
+        "take_profit": 108.0,
+        "parameters": {"coins": ["BTC"], "direction": "long"},
+        "metadata": {"source": "strategy", "source_key": "strategy:trend_following:BTC"},
+    }
+
+    engine.decide(
+        [candidate],
+        regime_data={"overall_regime": "trending_up", "overall_confidence": 0.8},
+        open_positions=[],
+        kelly_stats={},
+    )
+
+    assert any("slots=8/8" in entry for entry in logs)
 
 
 def test_decision_engine_blocks_candidate_when_operator_risk_off_is_active():
