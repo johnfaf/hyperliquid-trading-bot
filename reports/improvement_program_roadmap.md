@@ -68,6 +68,13 @@ This branch is the staged upgrade path for making the bot more measurable, more 
 - Cap warming and caution sources to smaller portfolio slices before execution, instead of only ranking them lower.
 - Block degraded sources outright and expose source-budget runtime state in reporting and the dashboard.
 
+## Phase 10: Cross-Source Confluence And Conflict Gating
+
+- Status: shipped on `codex/live-ledger-foundation`
+- Build per-cycle same-coin confluence maps across the actual candidate set before final ranking.
+- Reward candidates that have distinct-source agreement on the same coin and side.
+- Penalize or block candidates when strong same-coin source conflict exists across the candidate set.
+
 ## Branch Operating Rule
 
 Each phase should be landed in a reviewable commit with tests before moving to the next phase.

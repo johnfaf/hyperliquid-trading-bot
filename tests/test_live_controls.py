@@ -1115,7 +1115,7 @@ def test_live_trader_persists_live_ledger_snapshots(monkeypatch):
             if request_type == "userFills":
                 return [
                     {
-                        "time": 1_775_437_200_000,
+                        "time": int(datetime.utcnow().timestamp() * 1000),
                         "coin": "BTC",
                         "dir": "Open Long",
                         "sz": "0.1",
@@ -1975,6 +1975,97 @@ def test_decision_engine_blocks_source_when_adaptive_profile_is_blocked():
     assert "adaptive_blocked" in blockers
 
 
+def test_decision_engine_rewards_cross_source_same_coin_confluence():
+    engine = DecisionEngine(
+        {
+            "w_score": 0.10,
+            "w_regime": 0.05,
+            "w_diversity": 0.05,
+            "w_freshness": 0.0,
+            "w_consensus": 0.0,
+            "w_confidence": 0.05,
+            "w_source_quality": 0.05,
+            "w_confirmation": 0.0,
+            "w_expected_value": 0.10,
+            "w_confluence": 0.60,
+            "confluence_enabled": True,
+            "confluence_full_weight": 0.8,
+            "min_decision_score": 0.0,
+            "min_signal_confidence": 0.4,
+            "min_source_weight": 0.2,
+            "min_expected_value_pct": 0.0,
+            "max_trades_per_cycle": 1,
+        }
+    )
+
+    isolated = {
+        "name": "isolated_sol",
+        "source": "strategy",
+        "source_key": "strategy:mean_reversion:SOL",
+        "strategy_type": "mean_reversion",
+        "current_score": 0.72,
+        "confidence": 0.64,
+        "source_accuracy": 0.62,
+        "entry_price": 100.0,
+        "stop_loss": 97.0,
+        "take_profit": 107.0,
+        "parameters": {"coins": ["SOL"], "direction": "long"},
+        "metadata": {"source": "strategy", "source_key": "strategy:mean_reversion:SOL"},
+    }
+    btc_strategy = {
+        "name": "btc_strategy",
+        "source": "strategy",
+        "source_key": "strategy:trend_following:BTC",
+        "strategy_type": "trend_following",
+        "current_score": 0.68,
+        "confidence": 0.67,
+        "source_accuracy": 0.64,
+        "entry_price": 100.0,
+        "stop_loss": 97.0,
+        "take_profit": 107.0,
+        "parameters": {"coins": ["BTC"], "direction": "long"},
+        "metadata": {"source": "strategy", "source_key": "strategy:trend_following:BTC"},
+    }
+    btc_options = {
+        "name": "btc_options",
+        "source": "options_flow",
+        "source_key": "options_flow:BTC",
+        "strategy_type": "options_momentum",
+        "current_score": 0.67,
+        "confidence": 0.76,
+        "source_accuracy": 0.75,
+        "entry_price": 100.0,
+        "stop_loss": 97.0,
+        "take_profit": 107.0,
+        "parameters": {"coins": ["BTC"], "direction": "long"},
+        "metadata": {"source": "options_flow", "source_key": "options_flow:BTC"},
+    }
+    confluence_map = engine._build_source_confluence_map(
+        [isolated, btc_strategy, btc_options],
+        {"overall_regime": "neutral"},
+    )
+    isolated_breakdown = engine._compute_composite_score(
+        dict(isolated),
+        regime_data={"overall_regime": "neutral"},
+        open_coins=set(),
+        kelly_stats={},
+        confluence_map=confluence_map,
+    )
+
+    selected = engine.decide(
+        [isolated, btc_strategy, btc_options],
+        regime_data={"overall_regime": "neutral"},
+        open_positions=[],
+        kelly_stats={},
+    )
+
+    assert selected
+    assert selected[0]["name"] == "btc_strategy"
+    assert selected[0]["_score_breakdown"]["confluence"] > isolated_breakdown["confluence"]
+    assert selected[0]["_source_confluence"]["support_source_count"] == 1
+    assert selected[0]["_source_confluence"]["conflict_source_count"] == 0
+
+
 def test_decision_engine_prefers_higher_net_expectancy_over_raw_score():
     engine = DecisionEngine(
         {
@@ -2036,6 +2127,63 @@ def test_decision_engine_prefers_higher_net_expectancy_over_raw_score():
     assert selected[0]["name"] == "good_ev"
     assert good_breakdown["net_expectancy_pct"] > bad_breakdown["net_expectancy_pct"]
     assert good_breakdown["expected_value"] > bad_breakdown["expected_value"]
+
+
+def test_decision_engine_blocks_strong_same_coin_source_conflict():
+    engine = DecisionEngine(
+        {
+            "confluence_enabled": True,
+            "w_confluence": 0.40,
+            "confluence_full_weight": 0.75,
+            "confluence_conflict_block_threshold": 0.60,
+            "confluence_conflict_floor": 0.35,
+            "min_decision_score": 0.0,
+            "min_signal_confidence": 0.4,
+            "min_source_weight": 0.2,
+            "min_expected_value_pct": 0.0,
+        }
+    )
+
+    long_candidate = {
+        "name": "btc_long_strategy",
+        "source": "strategy",
+        "source_key": "strategy:trend_following:BTC",
+        "strategy_type": "trend_following",
+        "current_score": 0.80,
+        "confidence": 0.82,
+        "source_accuracy": 0.76,
+        "entry_price": 100.0,
+        "stop_loss": 97.0,
+        "take_profit": 107.0,
+        "parameters": {"coins": ["BTC"], "direction": "long"},
+        "metadata": {"source": "strategy", "source_key": "strategy:trend_following:BTC"},
+    }
+    short_candidate = {
+        "name": "btc_short_poly",
+        "source": "polymarket",
+        "source_key": "polymarket:BTC",
+        "strategy_type": "event_driven",
+        "current_score": 0.79,
+        "confidence": 0.84,
+        "source_accuracy": 0.79,
+        "entry_price": 100.0,
+        "stop_loss": 103.0,
+        "take_profit": 93.0,
+        "parameters": {"coins": ["BTC"], "direction": "short"},
+        "metadata": {"source": "polymarket", "source_key": "polymarket:BTC"},
+    }
+
+    selected = engine.decide(
+        [long_candidate, short_candidate],
+        regime_data={"overall_regime": "neutral"},
+        open_positions=[],
+        kelly_stats={},
+    )
+
+    assert selected == []
+    assert "source_conflict" in engine._decision_blockers(long_candidate)
+    assert "source_conflict" in engine._decision_blockers(short_candidate)
+    assert engine.get_stats()["total_source_conflict_blocks"] >= 2
 
 
 def test_decision_engine_blocks_negative_expected_value_candidates():

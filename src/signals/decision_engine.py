@@ -51,12 +51,21 @@ class DecisionEngine:
         self.w_source_quality = cfg.get("w_source_quality", 0.10)  # Agent-scorer / accuracy quality
         self.w_confirmation = cfg.get("w_confirmation", 0.05)      # External confirmations
         self.w_expected_value = cfg.get("w_expected_value", 0.20)  # Net expectancy after costs
+        self.w_confluence = cfg.get("w_confluence", 0.10)          # Cross-source same-coin agreement
 
         # Minimum composite score to even consider executing
         self.min_decision_score = cfg.get("min_decision_score", 0.34)
         self.min_signal_confidence = cfg.get("min_signal_confidence", 0.58)
         self.min_source_weight = cfg.get("min_source_weight", 0.35)
         self.min_expected_value_pct = cfg.get("min_expected_value_pct", 0.0015)
+        self.confluence_enabled = bool(cfg.get("confluence_enabled", True))
+        self.confluence_baseline = float(cfg.get("confluence_baseline", 0.30))
+        self.confluence_full_weight = float(cfg.get("confluence_full_weight", 1.50))
+        self.confluence_target_support_sources = int(cfg.get("confluence_target_support_sources", 2))
+        self.confluence_conflict_block_threshold = float(
+            cfg.get("confluence_conflict_block_threshold", 0.65)
+        )
+        self.confluence_conflict_floor = float(cfg.get("confluence_conflict_floor", 0.35))
 
         # Max trades to execute per cycle (independent of position slots)
         self.max_trades_per_cycle = cfg.get("max_trades_per_cycle", 2)
@@ -102,6 +111,7 @@ class DecisionEngine:
             "total_no_trade": 0,
             "total_candidates": 0,
             "total_filtered": 0,
+            "total_source_conflict_blocks": 0,
         }
 
     def decide(self, strategies: List[Dict],
@@ -187,9 +197,10 @@ class DecisionEngine:
 
         # ─── Score each strategy ─────────────────────────
         scored = []
+        confluence_map = self._build_source_confluence_map(strategies, regime_data)
         for s in strategies:
             composite = self._compute_composite_score(
-                s, regime_data, open_coins, kelly_stats
+                s, regime_data, open_coins, kelly_stats, confluence_map=confluence_map
             )
             scored.append({
                 **s,
@@ -228,6 +239,9 @@ class DecisionEngine:
         # ─── Update stats ────────────────────────────────
         self.stats["total_decisions"] += 1
         self.stats["total_filtered"] += len(disqualified)
+        self.stats["total_source_conflict_blocks"] += sum(
+            1 for item in disqualified if "source_conflict" in item.get("_decision_blockers", [])
+        )
         if executions:
             self.stats["total_executions"] += len(executions)
         else:
@@ -248,7 +262,11 @@ class DecisionEngine:
                 {"coin": e.get("_decision_coin", "?"),
                  "side": e.get("_decision_side", "?"),
                  "composite": e["_composite_score"],
-                 "net_expectancy_pct": round(float(e.get("_expected_value_pct", 0.0) or 0.0), 4)}
+                 "net_expectancy_pct": round(float(e.get("_expected_value_pct", 0.0) or 0.0), 4),
+                 "confluence_score": round(
+                     float((e.get("_source_confluence", {}) or {}).get("confluence_score", 0.0) or 0.0),
+                     4,
+                 )}
                 for e in executions
             ],
         })
@@ -382,21 +400,166 @@ class DecisionEngine:
         # Round-trip through JSON so datetimes/enums become stable strings.
         return json.loads(json.dumps(payload, default=str))
 
-    def _compute_composite_score(self, strategy: Dict,
-                                  regime_data: Optional[Dict],
-                                  open_coins: set,
-                                  kelly_stats: Optional[Dict]) -> Dict:
-        """
-        Compute a composite ranking score from multiple factors.
-        Returns breakdown dict with individual component scores + total.
-        """
+    def _resolve_candidate_context(self, strategy: Dict, regime_data: Optional[Dict]) -> Dict:
         import json
 
         strategy_type = strategy.get("strategy_type", strategy.get("type", ""))
         raw_score = strategy.get("current_score", 0)
         confidence = min(max(float(strategy.get("confidence", raw_score) or raw_score), 0.0), 1.0)
 
+        params = strategy.get("parameters", {})
+        if isinstance(params, str):
+            try:
+                params = json.loads(params)
+            except (json.JSONDecodeError, TypeError):
+                params = {}
+        params = dict(params or {})
+
+        coins = params.get("coins", params.get("coins_traded", []))
+        if isinstance(coins, str):
+            coins = [coins]
+        target_coin = str(coins[0] if coins else "unknown").strip().upper() or "UNKNOWN"
+
+        long_types = {"momentum_long"}
+        short_types = {"momentum_short", "contrarian"}
+
+        overall_regime = (regime_data or {}).get("overall_regime", "unknown")
+        regime_conf = float((regime_data or {}).get("overall_confidence", 0.0) or 0.0)
+        if overall_regime == "trending_down" and regime_conf >= 0.6:
+            regime_default = "short"
+        elif overall_regime == "trending_up" and regime_conf >= 0.6:
+            regime_default = "long"
+        else:
+            regime_default = params.get("direction", "long")
+
+        if strategy_type in long_types:
+            direction = "long"
+        elif strategy_type in short_types:
+            direction = "short"
+        else:
+            direction = params.get("direction") or regime_default
+
+        metadata = strategy.get("metadata", {})
+        if not isinstance(metadata, dict):
+            metadata = {}
+        source = str(
+            strategy.get("source", metadata.get("source", "strategy")) or "strategy"
+        ).strip().lower()
+        source_key = str(
+            strategy.get("source_key", metadata.get("source_key", "")) or ""
+        ).strip()
+
+        return {
+            "strategy_type": strategy_type,
+            "confidence": confidence,
+            "params": params,
+            "target_coin": target_coin,
+            "direction": direction,
+            "source": source,
+            "source_key": source_key,
+            "metadata": metadata,
+        }
+
+    def _build_source_confluence_map(
+        self,
+        strategies: List[Dict],
+        regime_data: Optional[Dict],
+    ) -> Dict[int, Dict]:
+        default = {
+            "confluence_score": round(self.confluence_baseline, 4),
+            "support_score": 0.0,
+            "conflict_score": 0.0,
+            "supporting_sources": [],
+            "conflicting_sources": [],
+            "same_coin_candidates": 0,
+            "support_source_count": 0,
+            "conflict_source_count": 0,
+        }
+        if not self.confluence_enabled:
+            return {id(strategy): dict(default) for strategy in strategies}
+
+        rows = []
+        for strategy in strategies:
+            context = self._resolve_candidate_context(strategy, regime_data)
+            source_quality = min(
+                max(
+                    float(
+                        strategy.get("agent_scorer_weight", strategy.get("source_accuracy", 0.5)) or 0.5
+                    ),
+                    0.0,
+                ),
+                1.0,
+            )
+            rows.append(
+                {
+                    "id": id(strategy),
+                    "coin": context["target_coin"],
+                    "side": context["direction"],
+                    "source_bucket": context["source_key"] or context["source"] or "unknown",
+                    "display_source": context["source_key"] or context["source"] or "unknown",
+                    "weight": self._clamp((context["confidence"] * 0.60) + (source_quality * 0.40), 0.05, 1.0),
+                }
+            )
+
+        full_weight = max(self.confluence_full_weight, 1e-6)
+        target_support_sources = max(self.confluence_target_support_sources, 1)
+        confluence_map: Dict[int, Dict] = {}
+        for row in rows:
+            support_by_source: Dict[str, float] = {}
+            conflict_by_source: Dict[str, float] = {}
+            same_coin_candidates = 0
+            for other in rows:
+                if other["id"] == row["id"] or other["coin"] != row["coin"]:
+                    continue
+                same_coin_candidates += 1
+                bucket = support_by_source if other["side"] == row["side"] else conflict_by_source
+                bucket[other["source_bucket"]] = max(
+                    bucket.get(other["source_bucket"], 0.0),
+                    other["weight"],
+                )
+
+            support_score = self._clamp(sum(support_by_source.values()) / full_weight, 0.0, 1.0)
+            conflict_score = self._clamp(sum(conflict_by_source.values()) / full_weight, 0.0, 1.0)
+            support_diversity = self._clamp(len(support_by_source) / target_support_sources, 0.0, 1.0)
+            confluence_score = self._clamp(
+                self.confluence_baseline
+                + (support_score * 0.45)
+                + (support_diversity * 0.20)
+                - (conflict_score * 0.60),
+                0.0,
+                1.0,
+            )
+
+            confluence_map[row["id"]] = {
+                "confluence_score": round(confluence_score, 4),
+                "support_score": round(support_score, 4),
+                "conflict_score": round(conflict_score, 4),
+                "supporting_sources": sorted(support_by_source.keys()),
+                "conflicting_sources": sorted(conflict_by_source.keys()),
+                "same_coin_candidates": same_coin_candidates,
+                "support_source_count": len(support_by_source),
+                "conflict_source_count": len(conflict_by_source),
+            }
+
+        return confluence_map
+
+    def _compute_composite_score(self, strategy: Dict,
+                                  regime_data: Optional[Dict],
+                                  open_coins: set,
+                                  kelly_stats: Optional[Dict],
+                                  confluence_map: Optional[Dict[int, Dict]] = None) -> Dict:
+        """
+        Compute a composite ranking score from multiple factors.
+        Returns breakdown dict with individual component scores + total.
+        """
+        context = self._resolve_candidate_context(strategy, regime_data)
+        strategy_type = context["strategy_type"]
+        confidence = context["confidence"]
+        target_coin = context["target_coin"]
+        direction = context["direction"]
+
         # 1. Base score (normalized 0-1)
+        raw_score = strategy.get("current_score", 0)
         base = min(raw_score, 1.0)
 
         # 2. Regime alignment
@@ -414,46 +577,8 @@ class DecisionEngine:
                 regime_alignment = 0.55
 
         # 3. Diversification bonus — prefer coins we DON'T already have
-        params = strategy.get("parameters", "{}")
-        if isinstance(params, str):
-            try:
-                params = json.loads(params)
-            except (json.JSONDecodeError, TypeError):
-                params = {}
-        coins = params.get("coins", params.get("coins_traded", []))
-        if isinstance(coins, str):
-            coins = [coins]
-        target_coin = coins[0] if coins else "unknown"
-
         # Store for logging
         strategy["_decision_coin"] = target_coin
-
-        # Infer direction — regime-aware for all non-explicitly-directional types
-        # Only momentum_long/short are unconditionally directional.
-        # breakout, trend_following, swing_trading follow the dominant trend direction
-        # (downside breakout = short in trending_down; upside breakout = long in trending_up).
-        long_types  = {"momentum_long"}
-        short_types = {"momentum_short", "contrarian"}
-
-        # Derive regime direction bias (default for all non-explicit strategies)
-        overall_regime = (regime_data or {}).get("overall_regime", "unknown")
-        regime_conf    = (regime_data or {}).get("overall_confidence", 0.0)
-        if overall_regime == "trending_down" and regime_conf >= 0.6:
-            regime_default = "short"
-        elif overall_regime == "trending_up" and regime_conf >= 0.6:
-            regime_default = "long"
-        else:
-            regime_default = params.get("direction", "long")
-
-        if strategy_type in long_types:
-            direction = "long"
-        elif strategy_type in short_types:
-            direction = "short"
-        else:
-            # breakout, trend_following, swing_trading, concentrated_bet,
-            # mean_reversion, scalping, funding_arb, delta_neutral, etc.
-            # — follow the regime when confident, else use stored param
-            direction = params.get("direction") or regime_default
         strategy["_decision_side"] = direction
 
         diversity_bonus = 1.0 if target_coin not in open_coins else 0.0
@@ -501,6 +626,9 @@ class DecisionEngine:
         strategy["metadata"] = dict(strategy["_metadata_for_decision"])
         strategy["_decision_confidence"] = confidence
         strategy["_decision_source_quality"] = source_quality
+        confluence_feedback = (confluence_map or {}).get(id(strategy), {})
+        confluence_score = float(confluence_feedback.get("confluence_score", self.confluence_baseline) or 0.0)
+        strategy["_source_confluence"] = confluence_feedback
         confirmation = self._confirmation_score(strategy)
         expected_value = self._expected_value_score(
             strategy,
@@ -524,6 +652,7 @@ class DecisionEngine:
             (source_quality, self.w_source_quality),
             (confirmation, self.w_confirmation),
             (expected_value["score"], self.w_expected_value),
+            (confluence_score, self.w_confluence),
         ]
         weight_total = sum(weight for _, weight in components if weight > 0)
         total = (
@@ -548,6 +677,11 @@ class DecisionEngine:
             "source_quality": round(source_quality, 3),
             "confirmation": round(confirmation, 3),
             "expected_value": round(expected_value["score"], 3),
+            "confluence": round(confluence_score, 3),
+            "confluence_support": round(float(confluence_feedback.get("support_score", 0.0) or 0.0), 4),
+            "confluence_conflict": round(float(confluence_feedback.get("conflict_score", 0.0) or 0.0), 4),
+            "confluence_support_sources": list(confluence_feedback.get("supporting_sources", [])),
+            "confluence_conflict_sources": list(confluence_feedback.get("conflicting_sources", [])),
             "win_probability": round(expected_value["win_probability"], 3),
             "reward_risk_ratio": round(expected_value["reward_risk_ratio"], 3),
             "gross_expectancy_pct": round(expected_value["gross_expectancy_pct"], 4),
@@ -639,6 +773,16 @@ class DecisionEngine:
             and adaptive_health_score < self.adaptive_learning_min_health_score
         ):
             blockers.append(f"adaptive_health<{self.adaptive_learning_min_health_score:.2f}")
+
+        confluence = strategy.get("_source_confluence", {}) or {}
+        conflict_score = float(confluence.get("conflict_score", 0.0) or 0.0)
+        confluence_score = float(confluence.get("confluence_score", self.confluence_baseline) or 0.0)
+        if (
+            self.confluence_enabled
+            and conflict_score >= self.confluence_conflict_block_threshold
+            and confluence_score <= self.confluence_conflict_floor
+        ):
+            blockers.append("source_conflict")
 
         return blockers
 
@@ -1083,15 +1227,17 @@ class DecisionEngine:
             composite = s.get("_composite_score", 0)
             expected_value_pct = float(s.get("_expected_value_pct", 0.0) or 0.0) * 100.0
             execution_cost_pct = float(s.get("_execution_cost_pct", 0.0) or 0.0) * 100.0
+            confluence_score = float((s.get("_source_confluence", {}) or {}).get("confluence_score", 0.0) or 0.0)
             marker = " ← EXEC" if s in executions else ""
             logger.info(
-                "  #%d %s %s composite=%.4f ev=%+.2f%% cost=%.2f%%%s",
+                "  #%d %s %s composite=%.4f ev=%+.2f%% cost=%.2f%% cx=%.2f%s",
                 i + 1,
                 side.upper(),
                 coin,
                 composite,
                 expected_value_pct,
                 execution_cost_pct,
+                confluence_score,
                 marker,
             )
 
@@ -1116,6 +1262,11 @@ class DecisionEngine:
             "execution_quality_enabled": self.execution_quality_enabled,
             "execution_quality_lookback_hours": self.execution_quality_lookback_hours,
             "execution_quality_min_events": self.execution_quality_min_events,
+            "confluence_enabled": self.confluence_enabled,
+            "confluence_weight": self.w_confluence,
+            "confluence_baseline": self.confluence_baseline,
+            "confluence_conflict_block_threshold": self.confluence_conflict_block_threshold,
+            "confluence_conflict_floor": self.confluence_conflict_floor,
             "execution_policy_enabled": self.execution_policy_enabled,
             "execution_policy": (
                 self.execution_policy.get_stats()

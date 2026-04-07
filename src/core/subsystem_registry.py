@@ -386,10 +386,21 @@ def build_subsystems(
                     "w_source_quality": config.DECISION_W_SOURCE_QUALITY,
                     "w_confirmation": config.DECISION_W_CONFIRMATION,
                     "w_expected_value": config.DECISION_W_EXPECTED_VALUE,
+                    "w_confluence": config.DECISION_W_CONFLUENCE,
                     "min_decision_score": config.DECISION_MIN_SCORE,
                     "min_signal_confidence": config.DECISION_MIN_CONFIDENCE,
                     "min_source_weight": config.DECISION_MIN_SOURCE_WEIGHT,
                     "min_expected_value_pct": config.DECISION_MIN_EXPECTED_VALUE_PCT,
+                    "confluence_enabled": config.DECISION_CONFLUENCE_ENABLED,
+                    "confluence_baseline": config.DECISION_CONFLUENCE_BASELINE,
+                    "confluence_full_weight": config.DECISION_CONFLUENCE_FULL_WEIGHT,
+                    "confluence_target_support_sources": (
+                        config.DECISION_CONFLUENCE_TARGET_SUPPORT_SOURCES
+                    ),
+                    "confluence_conflict_block_threshold": (
+                        config.DECISION_CONFLUENCE_CONFLICT_BLOCK_THRESHOLD
+                    ),
+                    "confluence_conflict_floor": config.DECISION_CONFLUENCE_CONFLICT_FLOOR,
                     "max_trades_per_cycle": config.DECISION_MAX_TRADES_PER_CYCLE,
                     "maker_fee_bps": config.DECISION_MAKER_FEE_BPS,
                     "taker_fee_bps": config.DECISION_TAKER_FEE_BPS,

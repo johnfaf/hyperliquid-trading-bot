@@ -217,7 +217,7 @@ def _log_module_stats(container):
     ))
     _safe_stat("DecisionEngine", lambda: (
         container.decision_engine and
-        _fmt("decisions={total_decisions}, executions={total_executions}",
+        _fmt("decisions={total_decisions}, executions={total_executions}, conflict_blocks={total_source_conflict_blocks}",
              container.decision_engine.get_stats())
     ))
     _safe_stat("AdaptiveLearning", lambda: (
