@@ -52,6 +52,7 @@ class DecisionEngine:
         self.w_confirmation = cfg.get("w_confirmation", 0.05)      # External confirmations
         self.w_expected_value = cfg.get("w_expected_value", 0.20)  # Net expectancy after costs
         self.w_confluence = cfg.get("w_confluence", 0.10)          # Cross-source same-coin agreement
+        self.w_context = cfg.get("w_context", 0.08)                # Source x coin x side x regime fitness
 
         # Minimum composite score to even consider executing
         self.min_decision_score = cfg.get("min_decision_score", 0.34)
@@ -66,6 +67,21 @@ class DecisionEngine:
             cfg.get("confluence_conflict_block_threshold", 0.65)
         )
         self.confluence_conflict_floor = float(cfg.get("confluence_conflict_floor", 0.35))
+        self.context_performance_enabled = bool(cfg.get("context_performance_enabled", True))
+        self.context_performance_lookback_hours = float(
+            cfg.get("context_performance_lookback_hours", 24.0 * 30)
+        )
+        self.context_performance_min_trades = int(cfg.get("context_performance_min_trades", 3))
+        self.context_performance_return_scale = float(cfg.get("context_performance_return_scale", 0.03))
+        self.context_performance_block_win_rate = float(
+            cfg.get("context_performance_block_win_rate", 0.30)
+        )
+        self.context_performance_block_avg_return_pct = float(
+            cfg.get("context_performance_block_avg_return_pct", -0.015)
+        )
+        self.context_performance_boost_win_rate = float(
+            cfg.get("context_performance_boost_win_rate", 0.60)
+        )
 
         # Max trades to execute per cycle (independent of position slots)
         self.max_trades_per_cycle = cfg.get("max_trades_per_cycle", 2)
@@ -103,6 +119,7 @@ class DecisionEngine:
         # Track decisions for audit
         self._decision_history: deque = deque(maxlen=100)
         self._cycle_count = 0
+        self._context_profile_cache: Dict[Tuple, Dict] = {}
 
         # Stats
         self.stats = {
@@ -112,6 +129,7 @@ class DecisionEngine:
             "total_candidates": 0,
             "total_filtered": 0,
             "total_source_conflict_blocks": 0,
+            "total_context_blocks": 0,
         }
 
     def decide(self, strategies: List[Dict],
@@ -133,6 +151,7 @@ class DecisionEngine:
             within cycle trade limit).
         """
         self._cycle_count += 1
+        self._context_profile_cache = {}
         open_positions = open_positions or []
         open_coins = {t["coin"] for t in open_positions}
         available_slots = max(0, 8 - len(open_positions))
@@ -241,6 +260,9 @@ class DecisionEngine:
         self.stats["total_filtered"] += len(disqualified)
         self.stats["total_source_conflict_blocks"] += sum(
             1 for item in disqualified if "source_conflict" in item.get("_decision_blockers", [])
+        )
+        self.stats["total_context_blocks"] += sum(
+            1 for item in disqualified if "context_underperforming" in item.get("_decision_blockers", [])
         )
         if executions:
             self.stats["total_executions"] += len(executions)
@@ -557,6 +579,7 @@ class DecisionEngine:
         confidence = context["confidence"]
         target_coin = context["target_coin"]
         direction = context["direction"]
+        regime_name = str((regime_data or {}).get("overall_regime", "unknown") or "unknown")
 
         # 1. Base score (normalized 0-1)
         raw_score = strategy.get("current_score", 0)
@@ -620,6 +643,19 @@ class DecisionEngine:
         source_quality = adaptive_feedback["source_quality"]
         strategy["_metadata_for_decision"] = adaptive_feedback["metadata"]
         strategy["_adaptive_learning"] = adaptive_feedback["profile"]
+        context_feedback = self._apply_context_performance_feedback(
+            strategy,
+            confidence,
+            source_quality,
+            target_coin=target_coin,
+            direction=direction,
+            regime_name=regime_name,
+        )
+        confidence = context_feedback["confidence"]
+        source_quality = context_feedback["source_quality"]
+        strategy["_metadata_for_decision"] = context_feedback["metadata"]
+        strategy["_context_performance"] = context_feedback["profile"]
+        context_score = float(context_feedback["context_score"] or 0.5)
         execution_policy = self._apply_execution_policy_feedback(strategy, confidence, source_quality)
         strategy["_metadata_for_decision"] = execution_policy["metadata"]
         strategy["_execution_policy"] = execution_policy["recommendation"]
@@ -653,6 +689,7 @@ class DecisionEngine:
             (confirmation, self.w_confirmation),
             (expected_value["score"], self.w_expected_value),
             (confluence_score, self.w_confluence),
+            (context_score, self.w_context),
         ]
         weight_total = sum(weight for _, weight in components if weight > 0)
         total = (
@@ -678,10 +715,25 @@ class DecisionEngine:
             "confirmation": round(confirmation, 3),
             "expected_value": round(expected_value["score"], 3),
             "confluence": round(confluence_score, 3),
+            "context": round(context_score, 3),
             "confluence_support": round(float(confluence_feedback.get("support_score", 0.0) or 0.0), 4),
             "confluence_conflict": round(float(confluence_feedback.get("conflict_score", 0.0) or 0.0), 4),
             "confluence_support_sources": list(confluence_feedback.get("supporting_sources", [])),
             "confluence_conflict_sources": list(confluence_feedback.get("conflicting_sources", [])),
+            "context_closed_trades": int(context_feedback["profile"].get("closed_trades", 0) or 0),
+            "context_win_rate": round(
+                float(context_feedback["profile"].get("win_rate", 0.0) or 0.0),
+                4,
+            ),
+            "context_avg_return_pct": round(
+                float(context_feedback["profile"].get("avg_return_pct", 0.0) or 0.0),
+                4,
+            ),
+            "context_profit_factor": round(
+                float(context_feedback["profile"].get("profit_factor", 0.0) or 0.0),
+                4,
+            ),
+            "context_regime": str(context_feedback["profile"].get("regime", regime_name) or regime_name),
             "win_probability": round(expected_value["win_probability"], 3),
             "reward_risk_ratio": round(expected_value["reward_risk_ratio"], 3),
             "gross_expectancy_pct": round(expected_value["gross_expectancy_pct"], 4),
@@ -773,6 +825,10 @@ class DecisionEngine:
             and adaptive_health_score < self.adaptive_learning_min_health_score
         ):
             blockers.append(f"adaptive_health<{self.adaptive_learning_min_health_score:.2f}")
+
+        context_profile = strategy.get("_context_performance", {}) or {}
+        if self.context_performance_enabled and bool(context_profile.get("blocked", False)):
+            blockers.append("context_underperforming")
 
         confluence = strategy.get("_source_confluence", {}) or {}
         conflict_score = float(confluence.get("conflict_score", 0.0) or 0.0)
@@ -902,6 +958,223 @@ class DecisionEngine:
         except Exception as exc:
             logger.debug("adaptive learning lookup error: %s", exc)
             return {}
+
+    def _lookup_context_performance(
+        self,
+        strategy: Dict,
+        *,
+        target_coin: str,
+        direction: str,
+        regime_name: str,
+    ) -> Dict:
+        if not self.context_performance_enabled:
+            return {}
+
+        metadata = self._get_metadata(strategy)
+        source_key = str(strategy.get("source_key", metadata.get("source_key", "")) or "").strip()
+        source = str(strategy.get("source", metadata.get("source", "strategy")) or "strategy").strip().lower()
+        coin = str(target_coin or "").strip().upper()
+        side = str(direction or "").strip().lower()
+        regime = str(regime_name or "unknown").strip().lower() or "unknown"
+
+        cache_key = (source_key, source, coin, side, regime)
+        if cache_key in self._context_profile_cache:
+            return self._context_profile_cache[cache_key]
+
+        query_candidates = []
+        if source_key:
+            query_candidates.extend(
+                [
+                    {"source_key": source_key, "coin": coin, "side": side, "regime": regime},
+                    {"source_key": source_key, "coin": coin, "side": side, "regime": ""},
+                ]
+            )
+        if source:
+            query_candidates.extend(
+                [
+                    {"source": source, "coin": coin, "side": side, "regime": regime},
+                    {"source": source, "coin": coin, "side": side, "regime": ""},
+                ]
+            )
+
+        profile: Dict = {}
+        seen_queries = set()
+        for query in query_candidates:
+            query_signature = tuple(sorted(query.items()))
+            if query_signature in seen_queries:
+                continue
+            seen_queries.add(query_signature)
+
+            rows = db.get_context_trade_outcome_summary(
+                lookback_hours=self.context_performance_lookback_hours,
+                min_closed_trades=(
+                    self.context_performance_min_trades if query.get("regime") else 0
+                ),
+                **query,
+            )
+            if rows:
+                candidate = (
+                    dict(rows[0])
+                    if query.get("regime")
+                    else self._merge_context_profiles(rows)
+                )
+                if int(candidate.get("closed_trades", 0) or 0) >= self.context_performance_min_trades:
+                    profile = candidate
+                    break
+
+        self._context_profile_cache[cache_key] = profile
+        return profile
+
+    @staticmethod
+    def _merge_context_profiles(rows: List[Dict]) -> Dict:
+        if not rows:
+            return {}
+        if len(rows) == 1:
+            return dict(rows[0])
+
+        first = dict(rows[0])
+        merged = {
+            "context_key": "|".join(
+                [
+                    str(first.get("source_key", first.get("source", "unknown")) or "unknown"),
+                    str(first.get("coin", "UNKNOWN") or "UNKNOWN"),
+                    str(first.get("side", "unknown") or "unknown"),
+                    "mixed",
+                ]
+            ),
+            "source_key": first.get("source_key", first.get("source", "unknown")),
+            "source": first.get("source", "unknown"),
+            "coin": first.get("coin", "UNKNOWN"),
+            "side": first.get("side", "unknown"),
+            "regime": "mixed",
+            "open_trades": 0,
+            "closed_trades": 0,
+            "winning_trades": 0,
+            "losing_trades": 0,
+            "realized_pnl": 0.0,
+            "gross_profit": 0.0,
+            "gross_loss": 0.0,
+            "avg_return_pct": 0.0,
+            "last_closed_at": None,
+        }
+
+        return_total = 0.0
+        for row in rows:
+            row_dict = dict(row)
+            merged["open_trades"] += int(row_dict.get("open_trades", 0) or 0)
+            merged["closed_trades"] += int(row_dict.get("closed_trades", 0) or 0)
+            merged["winning_trades"] += int(row_dict.get("winning_trades", 0) or 0)
+            merged["losing_trades"] += int(row_dict.get("losing_trades", 0) or 0)
+            merged["realized_pnl"] += float(row_dict.get("realized_pnl", 0.0) or 0.0)
+            merged["gross_profit"] += float(row_dict.get("gross_profit", 0.0) or 0.0)
+            merged["gross_loss"] += float(row_dict.get("gross_loss", 0.0) or 0.0)
+            row_closed = int(row_dict.get("closed_trades", 0) or 0)
+            return_total += float(row_dict.get("avg_return_pct", 0.0) or 0.0) * row_closed
+            last_closed_at = row_dict.get("last_closed_at")
+            if last_closed_at and (
+                not merged["last_closed_at"] or str(last_closed_at) > str(merged["last_closed_at"])
+            ):
+                merged["last_closed_at"] = str(last_closed_at)
+
+        closed_trades = int(merged["closed_trades"] or 0)
+        merged["win_rate"] = round(
+            merged["winning_trades"] / closed_trades,
+            4,
+        ) if closed_trades else 0.0
+        merged["profit_factor"] = round(
+            merged["gross_profit"] / max(merged["gross_loss"], 1e-8),
+            4,
+        ) if merged["gross_profit"] > 0 and merged["gross_loss"] > 0 else (
+            999.0 if merged["gross_profit"] > 0 and merged["gross_loss"] == 0 else 0.0
+        )
+        merged["avg_return_pct"] = round(
+            return_total / closed_trades,
+            4,
+        ) if closed_trades else 0.0
+        merged["realized_pnl"] = round(float(merged["realized_pnl"] or 0.0), 2)
+        merged["gross_profit"] = round(float(merged["gross_profit"] or 0.0), 2)
+        merged["gross_loss"] = round(float(merged["gross_loss"] or 0.0), 2)
+        return merged
+
+    def _apply_context_performance_feedback(
+        self,
+        strategy: Dict,
+        confidence: float,
+        source_quality: float,
+        *,
+        target_coin: str,
+        direction: str,
+        regime_name: str,
+    ) -> Dict:
+        metadata = dict(self._get_metadata(strategy))
+        profile = self._lookup_context_performance(
+            strategy,
+            target_coin=target_coin,
+            direction=direction,
+            regime_name=regime_name,
+        )
+        if not profile:
+            return {
+                "metadata": metadata,
+                "confidence": confidence,
+                "source_quality": source_quality,
+                "context_score": 0.5,
+                "profile": {},
+                "blocked": False,
+            }
+
+        closed_trades = int(profile.get("closed_trades", 0) or 0)
+        win_rate = float(profile.get("win_rate", 0.0) or 0.0)
+        avg_return_pct = float(profile.get("avg_return_pct", 0.0) or 0.0)
+        realized_pnl = float(profile.get("realized_pnl", 0.0) or 0.0)
+        profit_factor = float(profile.get("profit_factor", 0.0) or 0.0)
+
+        return_component = self._clamp(
+            0.5 + max(-0.4, min(0.4, avg_return_pct / max(self.context_performance_return_scale, 1e-8))),
+            0.0,
+            1.0,
+        )
+        context_score = self._clamp(
+            (win_rate * 0.55)
+            + (return_component * 0.35)
+            + (0.10 if profit_factor >= 1.2 else 0.0),
+            0.0,
+            1.0,
+        )
+
+        blocked = (
+            closed_trades >= self.context_performance_min_trades
+            and win_rate <= self.context_performance_block_win_rate
+            and avg_return_pct <= self.context_performance_block_avg_return_pct
+        )
+
+        quality_multiplier = self._clamp(0.55 + (context_score * 0.70), 0.35, 1.15)
+        confidence_multiplier = self._clamp(0.70 + (context_score * 0.45), 0.45, 1.12)
+        if win_rate >= self.context_performance_boost_win_rate and avg_return_pct > 0:
+            quality_multiplier = self._clamp(quality_multiplier + 0.05, 0.35, 1.18)
+            confidence_multiplier = self._clamp(confidence_multiplier + 0.03, 0.45, 1.15)
+
+        enriched_profile = dict(profile)
+        enriched_profile["context_score"] = round(context_score, 4)
+        enriched_profile["blocked"] = blocked
+
+        metadata["context_closed_trades"] = closed_trades
+        metadata["context_win_rate"] = round(win_rate, 4)
+        metadata["context_avg_return_pct"] = round(avg_return_pct, 4)
+        metadata["context_realized_pnl"] = round(realized_pnl, 2)
+        metadata["context_profit_factor"] = round(profit_factor, 4)
+        metadata["context_score"] = round(context_score, 4)
+        metadata["context_blocked"] = blocked
+        metadata["context_regime"] = enriched_profile.get("regime", regime_name)
+
+        return {
+            "metadata": metadata,
+            "confidence": self._clamp(confidence * confidence_multiplier, 0.0, 1.0),
+            "source_quality": self._clamp(source_quality * quality_multiplier, 0.0, 1.0),
+            "context_score": context_score,
+            "profile": enriched_profile,
+            "blocked": blocked,
+        }
 
     def _apply_execution_policy_feedback(
         self,
@@ -1267,6 +1540,14 @@ class DecisionEngine:
             "confluence_baseline": self.confluence_baseline,
             "confluence_conflict_block_threshold": self.confluence_conflict_block_threshold,
             "confluence_conflict_floor": self.confluence_conflict_floor,
+            "context_performance_enabled": self.context_performance_enabled,
+            "context_weight": self.w_context,
+            "context_performance_lookback_hours": self.context_performance_lookback_hours,
+            "context_performance_min_trades": self.context_performance_min_trades,
+            "context_performance_return_scale": self.context_performance_return_scale,
+            "context_performance_block_win_rate": self.context_performance_block_win_rate,
+            "context_performance_block_avg_return_pct": self.context_performance_block_avg_return_pct,
+            "context_performance_boost_win_rate": self.context_performance_boost_win_rate,
             "execution_policy_enabled": self.execution_policy_enabled,
             "execution_policy": (
                 self.execution_policy.get_stats()

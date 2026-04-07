@@ -387,6 +387,7 @@ def build_subsystems(
                     "w_confirmation": config.DECISION_W_CONFIRMATION,
                     "w_expected_value": config.DECISION_W_EXPECTED_VALUE,
                     "w_confluence": config.DECISION_W_CONFLUENCE,
+                    "w_context": config.DECISION_W_CONTEXT,
                     "min_decision_score": config.DECISION_MIN_SCORE,
                     "min_signal_confidence": config.DECISION_MIN_CONFIDENCE,
                     "min_source_weight": config.DECISION_MIN_SOURCE_WEIGHT,
@@ -401,6 +402,23 @@ def build_subsystems(
                         config.DECISION_CONFLUENCE_CONFLICT_BLOCK_THRESHOLD
                     ),
                     "confluence_conflict_floor": config.DECISION_CONFLUENCE_CONFLICT_FLOOR,
+                    "context_performance_enabled": config.DECISION_CONTEXT_PERFORMANCE_ENABLED,
+                    "context_performance_lookback_hours": (
+                        config.DECISION_CONTEXT_PERFORMANCE_LOOKBACK_HOURS
+                    ),
+                    "context_performance_min_trades": config.DECISION_CONTEXT_PERFORMANCE_MIN_TRADES,
+                    "context_performance_return_scale": (
+                        config.DECISION_CONTEXT_PERFORMANCE_RETURN_SCALE
+                    ),
+                    "context_performance_block_win_rate": (
+                        config.DECISION_CONTEXT_PERFORMANCE_BLOCK_WIN_RATE
+                    ),
+                    "context_performance_block_avg_return_pct": (
+                        config.DECISION_CONTEXT_PERFORMANCE_BLOCK_AVG_RETURN_PCT
+                    ),
+                    "context_performance_boost_win_rate": (
+                        config.DECISION_CONTEXT_PERFORMANCE_BOOST_WIN_RATE
+                    ),
                     "max_trades_per_cycle": config.DECISION_MAX_TRADES_PER_CYCLE,
                     "maker_fee_bps": config.DECISION_MAKER_FEE_BPS,
                     "taker_fee_bps": config.DECISION_TAKER_FEE_BPS,

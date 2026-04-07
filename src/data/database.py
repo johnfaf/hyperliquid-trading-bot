@@ -1601,6 +1601,164 @@ def get_source_trade_outcome_summary(lookback_hours: float = 24.0 * 30) -> list:
     return results
 
 
+def get_context_trade_outcome_summary(
+    *,
+    lookback_hours: float = 24.0 * 30,
+    source_key: str = "",
+    source: str = "",
+    coin: str = "",
+    side: str = "",
+    regime: str = "",
+    min_closed_trades: int = 0,
+) -> list:
+    cutoff = None
+    if lookback_hours and float(lookback_hours) > 0:
+        cutoff = datetime.utcnow() - timedelta(hours=float(lookback_hours))
+
+    try:
+        with get_connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT coin, side, entry_price, size, pnl, status, metadata, opened_at, closed_at
+                FROM paper_trades
+                """
+            ).fetchall()
+    except sqlite3.OperationalError:
+        return []
+
+    by_context = {}
+
+    def _bucket_for(source_key_value, source_value, coin_value, side_value, regime_value):
+        context_key = "|".join(
+            [
+                str(source_key_value or source_value or "unknown").strip() or "unknown",
+                str(coin_value or "unknown").strip().upper() or "UNKNOWN",
+                str(side_value or "unknown").strip().lower() or "unknown",
+                str(regime_value or "unknown").strip().lower() or "unknown",
+            ]
+        )
+        return by_context.setdefault(
+            context_key,
+            {
+                "context_key": context_key,
+                "source_key": str(source_key_value or source_value or "unknown").strip() or "unknown",
+                "source": str(source_value or "unknown").strip().lower() or "unknown",
+                "coin": str(coin_value or "unknown").strip().upper() or "UNKNOWN",
+                "side": str(side_value or "unknown").strip().lower() or "unknown",
+                "regime": str(regime_value or "unknown").strip().lower() or "unknown",
+                "open_trades": 0,
+                "closed_trades": 0,
+                "winning_trades": 0,
+                "losing_trades": 0,
+                "realized_pnl": 0.0,
+                "gross_profit": 0.0,
+                "gross_loss": 0.0,
+                "avg_return_pct": 0.0,
+                "_return_total": 0.0,
+                "last_closed_at": None,
+            },
+        )
+
+    for row in rows:
+        metadata = {}
+        try:
+            metadata = json.loads(row["metadata"] or "{}")
+        except Exception:
+            metadata = {}
+
+        source_key_value = str(metadata.get("source_key", "") or "").strip()
+        source_value = str(metadata.get("source", metadata.get("signal_source", "")) or "").strip().lower()
+        coin_value = str(row["coin"] or metadata.get("coin", "") or "").strip().upper()
+        side_value = str(row["side"] or metadata.get("side", "") or "").strip().lower()
+        regime_value = str(metadata.get("regime", metadata.get("overall_regime", "")) or "").strip().lower()
+        bucket = _bucket_for(source_key_value, source_value, coin_value, side_value, regime_value)
+
+        status = str(row["status"] or "").lower()
+        opened_at = _parse_iso_timestamp(row["opened_at"])
+        closed_at = _parse_iso_timestamp(row["closed_at"])
+
+        if status == "open":
+            if cutoff is None or (opened_at and opened_at >= cutoff):
+                bucket["open_trades"] += 1
+            continue
+
+        if status != "closed":
+            continue
+        if cutoff is not None and (closed_at is None or closed_at < cutoff):
+            continue
+
+        pnl = _safe_float(row["pnl"], 0.0)
+        entry_price = _safe_float(row["entry_price"], 0.0)
+        size = abs(_safe_float(row["size"], 0.0))
+        notional = max(entry_price * max(size, 1e-8), 1e-8)
+        return_pct = pnl / notional if notional > 0 else 0.0
+
+        bucket["closed_trades"] += 1
+        bucket["realized_pnl"] += pnl
+        bucket["_return_total"] += return_pct
+        if pnl > 0:
+            bucket["winning_trades"] += 1
+            bucket["gross_profit"] += pnl
+        elif pnl < 0:
+            bucket["losing_trades"] += 1
+            bucket["gross_loss"] += abs(pnl)
+        if closed_at:
+            last_closed = bucket.get("last_closed_at")
+            if not last_closed or str(closed_at.isoformat()) > str(last_closed):
+                bucket["last_closed_at"] = closed_at.isoformat()
+
+    normalized_filters = {
+        "source_key": str(source_key or "").strip(),
+        "source": str(source or "").strip().lower(),
+        "coin": str(coin or "").strip().upper(),
+        "side": str(side or "").strip().lower(),
+        "regime": str(regime or "").strip().lower(),
+    }
+
+    results = []
+    for bucket in by_context.values():
+        closed_trades = int(bucket["closed_trades"] or 0)
+        bucket["win_rate"] = round(
+            bucket["winning_trades"] / closed_trades,
+            4,
+        ) if closed_trades else 0.0
+        bucket["profit_factor"] = round(
+            bucket["gross_profit"] / max(bucket["gross_loss"], 1e-8),
+            4,
+        ) if bucket["gross_profit"] > 0 and bucket["gross_loss"] > 0 else (
+            999.0 if bucket["gross_profit"] > 0 and bucket["gross_loss"] == 0 else 0.0
+        )
+        bucket["avg_return_pct"] = round(
+            bucket["_return_total"] / closed_trades,
+            4,
+        ) if closed_trades else 0.0
+        bucket["realized_pnl"] = round(bucket["realized_pnl"], 2)
+        bucket.pop("_return_total", None)
+
+        if min_closed_trades and closed_trades < int(min_closed_trades):
+            continue
+        if normalized_filters["source_key"] and bucket["source_key"] != normalized_filters["source_key"]:
+            continue
+        if normalized_filters["source"] and bucket["source"] != normalized_filters["source"]:
+            continue
+        if normalized_filters["coin"] and bucket["coin"] != normalized_filters["coin"]:
+            continue
+        if normalized_filters["side"] and bucket["side"] != normalized_filters["side"]:
+            continue
+        if normalized_filters["regime"] and bucket["regime"] != normalized_filters["regime"]:
+            continue
+        results.append(bucket)
+
+    results.sort(
+        key=lambda item: (
+            -item["closed_trades"],
+            -item["realized_pnl"],
+            item["context_key"],
+        )
+    )
+    return results
+
+
 def save_source_health_snapshot(snapshot: dict) -> str:
     timestamp = _normalize_live_timestamp(snapshot.get("timestamp"))
     profiles = snapshot.get("profiles", []) or []

@@ -1573,6 +1573,100 @@ def test_source_trade_outcome_summary_and_health_snapshot_round_trip(monkeypatch
             os.remove(db_path)
 
 
+def test_context_trade_outcome_summary_groups_by_coin_side_and_regime(monkeypatch):
+    fd, raw_path = tempfile.mkstemp(prefix="context_outcomes_", suffix=".db", dir=os.getcwd())
+    os.close(fd)
+    db_path = os.path.abspath(raw_path)
+    original_path = db._DB_PATH
+    monkeypatch.setattr(db, "_DB_PATH", db_path)
+
+    try:
+        db.init_db()
+        trades = [
+            {
+                "coin": "BTC",
+                "side": "long",
+                "entry_price": 100.0,
+                "exit_price": 106.0,
+                "pnl": 6.0,
+                "metadata": {
+                    "source": "options_flow",
+                    "source_key": "options_flow:BTC",
+                    "regime": "trending_up",
+                },
+            },
+            {
+                "coin": "BTC",
+                "side": "long",
+                "entry_price": 100.0,
+                "exit_price": 104.0,
+                "pnl": 4.0,
+                "metadata": {
+                    "source": "options_flow",
+                    "source_key": "options_flow:BTC",
+                    "regime": "trending_up",
+                },
+            },
+            {
+                "coin": "BTC",
+                "side": "long",
+                "entry_price": 100.0,
+                "exit_price": 97.0,
+                "pnl": -3.0,
+                "metadata": {
+                    "source": "options_flow",
+                    "source_key": "options_flow:BTC",
+                    "regime": "ranging",
+                },
+            },
+        ]
+
+        closed_ids = []
+        for item in trades:
+            trade_id = db.open_paper_trade(
+                strategy_id=1,
+                coin=item["coin"],
+                side=item["side"],
+                entry_price=item["entry_price"],
+                size=1.0,
+                metadata=item["metadata"],
+            )
+            db.close_paper_trade(trade_id, exit_price=item["exit_price"], pnl=item["pnl"])
+            closed_ids.append(trade_id)
+
+        with db.get_connection() as conn:
+            for trade_id in closed_ids:
+                conn.execute(
+                    "UPDATE paper_trades SET closed_at = ? WHERE id = ?",
+                    (datetime.utcnow().isoformat(), trade_id),
+                )
+
+        trending_up_rows = db.get_context_trade_outcome_summary(
+            lookback_hours=48,
+            source_key="options_flow:BTC",
+            coin="BTC",
+            side="long",
+            regime="trending_up",
+        )
+        all_rows = db.get_context_trade_outcome_summary(
+            lookback_hours=48,
+            source_key="options_flow:BTC",
+            coin="BTC",
+            side="long",
+        )
+
+        assert len(trending_up_rows) == 1
+        assert trending_up_rows[0]["closed_trades"] == 2
+        assert trending_up_rows[0]["winning_trades"] == 2
+        assert trending_up_rows[0]["regime"] == "trending_up"
+        assert trending_up_rows[0]["avg_return_pct"] == 0.05
+        assert len(all_rows) == 2
+    finally:
+        monkeypatch.setattr(db, "_DB_PATH", original_path)
+        if os.path.exists(db_path):
+            os.remove(db_path)
+
+
 def test_adaptive_learning_manager_refreshes_profiles_and_reviews_arena(monkeypatch):
     fd, raw_path = tempfile.mkstemp(prefix="adaptive_manager_", suffix=".db", dir=os.getcwd())
     os.close(fd)
@@ -2064,6 +2158,220 @@ def test_decision_engine_rewards_cross_source_same_coin_confluence():
     assert selected[0]["_score_breakdown"]["confluence"] > isolated_breakdown["confluence"]
     assert selected[0]["_source_confluence"]["support_source_count"] == 1
     assert selected[0]["_source_confluence"]["conflict_source_count"] == 0
+
+
+def test_decision_engine_blocks_underperforming_context(monkeypatch):
+    def fake_context_trade_outcome_summary(**kwargs):
+        if (
+            kwargs.get("source_key") == "options_flow:BTC"
+            and kwargs.get("coin") == "BTC"
+            and kwargs.get("side") == "long"
+            and kwargs.get("regime") == "trending_up"
+        ):
+            return [
+                {
+                    "source_key": "options_flow:BTC",
+                    "source": "options_flow",
+                    "coin": "BTC",
+                    "side": "long",
+                    "regime": "trending_up",
+                    "closed_trades": 6,
+                    "winning_trades": 1,
+                    "losing_trades": 5,
+                    "realized_pnl": -12.0,
+                    "gross_profit": 2.0,
+                    "gross_loss": 14.0,
+                    "avg_return_pct": -0.025,
+                    "win_rate": 0.1667,
+                    "profit_factor": 0.1429,
+                    "last_closed_at": datetime.utcnow().isoformat(),
+                }
+            ]
+        return []
+
+    monkeypatch.setattr(
+        "src.signals.decision_engine.db.get_context_trade_outcome_summary",
+        fake_context_trade_outcome_summary,
+    )
+
+    engine = DecisionEngine(
+        {
+            "w_context": 0.60,
+            "min_decision_score": 0.0,
+            "min_signal_confidence": 0.4,
+            "min_source_weight": 0.2,
+            "min_expected_value_pct": -1.0,
+            "execution_quality_enabled": False,
+            "adaptive_learning_enabled": False,
+            "context_performance_enabled": True,
+            "context_performance_min_trades": 3,
+            "context_performance_block_win_rate": 0.30,
+            "context_performance_block_avg_return_pct": -0.01,
+        }
+    )
+
+    candidate = {
+        "name": "btc_options_flow",
+        "source": "options_flow",
+        "source_key": "options_flow:BTC",
+        "strategy_type": "options_momentum",
+        "current_score": 0.84,
+        "confidence": 0.78,
+        "source_accuracy": 0.74,
+        "entry_price": 100.0,
+        "stop_loss": 97.0,
+        "take_profit": 108.0,
+        "parameters": {"coins": ["BTC"], "direction": "long"},
+        "metadata": {"source": "options_flow", "source_key": "options_flow:BTC"},
+    }
+    breakdown = engine._compute_composite_score(
+        dict(candidate),
+        regime_data={"overall_regime": "trending_up"},
+        open_coins=set(),
+        kelly_stats=None,
+    )
+
+    selected = engine.decide(
+        [candidate],
+        regime_data={"overall_regime": "trending_up"},
+        open_positions=[],
+        kelly_stats={},
+    )
+    blockers = engine._decision_blockers(candidate)
+
+    assert selected == []
+    assert candidate["_context_performance"]["blocked"] is True
+    assert breakdown["context"] < 0.5
+    assert "context_underperforming" in blockers
+    assert engine.get_stats()["total_context_blocks"] >= 1
+
+
+def test_decision_engine_prefers_candidates_with_better_recent_context(monkeypatch):
+    def fake_context_trade_outcome_summary(**kwargs):
+        source_key = kwargs.get("source_key")
+        regime = kwargs.get("regime")
+        if source_key == "options_flow:BTC" and regime == "trending_up":
+            return [
+                {
+                    "source_key": "options_flow:BTC",
+                    "source": "options_flow",
+                    "coin": "BTC",
+                    "side": "long",
+                    "regime": "trending_up",
+                    "closed_trades": 8,
+                    "winning_trades": 6,
+                    "losing_trades": 2,
+                    "realized_pnl": 18.0,
+                    "gross_profit": 24.0,
+                    "gross_loss": 6.0,
+                    "avg_return_pct": 0.04,
+                    "win_rate": 0.75,
+                    "profit_factor": 4.0,
+                    "last_closed_at": datetime.utcnow().isoformat(),
+                }
+            ]
+        if source_key == "strategy:trend_following:ETH" and regime == "trending_up":
+            return [
+                {
+                    "source_key": "strategy:trend_following:ETH",
+                    "source": "strategy",
+                    "coin": "ETH",
+                    "side": "long",
+                    "regime": "trending_up",
+                    "closed_trades": 6,
+                    "winning_trades": 3,
+                    "losing_trades": 3,
+                    "realized_pnl": -1.0,
+                    "gross_profit": 9.0,
+                    "gross_loss": 10.0,
+                    "avg_return_pct": -0.002,
+                    "win_rate": 0.5,
+                    "profit_factor": 0.9,
+                    "last_closed_at": datetime.utcnow().isoformat(),
+                }
+            ]
+        return []
+
+    monkeypatch.setattr(
+        "src.signals.decision_engine.db.get_context_trade_outcome_summary",
+        fake_context_trade_outcome_summary,
+    )
+
+    engine = DecisionEngine(
+        {
+            "w_score": 0.10,
+            "w_regime": 0.0,
+            "w_diversity": 0.0,
+            "w_freshness": 0.0,
+            "w_consensus": 0.0,
+            "w_confidence": 0.05,
+            "w_source_quality": 0.05,
+            "w_confirmation": 0.0,
+            "w_expected_value": 0.05,
+            "w_confluence": 0.0,
+            "w_context": 0.75,
+            "min_decision_score": 0.0,
+            "min_signal_confidence": 0.4,
+            "min_source_weight": 0.2,
+            "min_expected_value_pct": -1.0,
+            "execution_quality_enabled": False,
+            "adaptive_learning_enabled": False,
+            "confluence_enabled": False,
+        }
+    )
+
+    good_context = {
+        "name": "good_context",
+        "source": "options_flow",
+        "source_key": "options_flow:BTC",
+        "strategy_type": "options_momentum",
+        "current_score": 0.70,
+        "confidence": 0.70,
+        "source_accuracy": 0.68,
+        "entry_price": 100.0,
+        "stop_loss": 97.0,
+        "take_profit": 108.0,
+        "parameters": {"coins": ["BTC"], "direction": "long"},
+        "metadata": {"source": "options_flow", "source_key": "options_flow:BTC"},
+    }
+    weaker_context = {
+        "name": "weaker_context",
+        "source": "strategy",
+        "source_key": "strategy:trend_following:ETH",
+        "strategy_type": "trend_following",
+        "current_score": 0.79,
+        "confidence": 0.70,
+        "source_accuracy": 0.68,
+        "entry_price": 100.0,
+        "stop_loss": 97.0,
+        "take_profit": 108.0,
+        "parameters": {"coins": ["ETH"], "direction": "long"},
+        "metadata": {"source": "strategy", "source_key": "strategy:trend_following:ETH"},
+    }
+
+    good_breakdown = engine._compute_composite_score(
+        dict(good_context),
+        regime_data={"overall_regime": "trending_up"},
+        open_coins=set(),
+        kelly_stats=None,
+    )
+    weaker_breakdown = engine._compute_composite_score(
+        dict(weaker_context),
+        regime_data={"overall_regime": "trending_up"},
+        open_coins=set(),
+        kelly_stats=None,
+    )
+    selected = engine.decide(
+        [weaker_context, good_context],
+        regime_data={"overall_regime": "trending_up"},
+        open_positions=[],
+        kelly_stats={},
+    )
+
+    assert selected
+    assert selected[0]["name"] == "good_context"
+    assert good_breakdown["context"] > weaker_breakdown["context"]
+    assert good_breakdown["total"] > weaker_breakdown["total"]
 
 
 def test_decision_engine_prefers_higher_net_expectancy_over_raw_score():

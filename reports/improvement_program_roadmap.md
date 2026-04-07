@@ -75,6 +75,13 @@ This branch is the staged upgrade path for making the bot more measurable, more 
 - Reward candidates that have distinct-source agreement on the same coin and side.
 - Penalize or block candidates when strong same-coin source conflict exists across the candidate set.
 
+## Phase 11: Context Performance Gating
+
+- Status: shipped on `codex/live-ledger-foundation`
+- Score candidates using recent realized performance in the specific `source x coin x side x regime` context, not just source-wide quality.
+- Block contexts that have enough sample size and are still materially underperforming after costs.
+- Fall back from exact regime matches to mixed-regime context history when exact context is too sparse, while keeping the minimum sample gate intact.
+
 ## Branch Operating Rule
 
 Each phase should be landed in a reviewable commit with tests before moving to the next phase.
