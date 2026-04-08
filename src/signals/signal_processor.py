@@ -285,7 +285,9 @@ class SignalProcessor:
         """
         import json
 
-        # Group by coin
+        # Group by coin (using a primary coin key only). A strategy may carry
+        # multiple coins in params, but appending the same dict to every coin
+        # bucket can duplicate survivors during conflict resolution.
         coin_signals: Dict[str, List[Dict]] = defaultdict(list)
         no_coin_signals = []  # Strategies without clear coin assignment
 
@@ -301,9 +303,9 @@ class SignalProcessor:
             if isinstance(coins, str):
                 coins = [coins]
 
-            if coins:
-                for coin in coins:
-                    coin_signals[coin].append(s)
+            primary_coin = coins[0] if coins else None
+            if primary_coin:
+                coin_signals[primary_coin].append(s)
             else:
                 no_coin_signals.append(s)
 
@@ -377,7 +379,18 @@ class SignalProcessor:
         # Add back strategies without specific coins
         resolved.extend(no_coin_signals)
 
-        return resolved
+        # Final guard: preserve order while removing duplicate object references.
+        # This catches accidental fan-out where the same strategy object appears
+        # in multiple buckets.
+        unique = []
+        seen_refs = set()
+        for s in resolved:
+            ref = id(s)
+            if ref in seen_refs:
+                continue
+            seen_refs.add(ref)
+            unique.append(s)
+        return unique
 
     # ─── Step 4: Decision Compression ───────────────────────────
 

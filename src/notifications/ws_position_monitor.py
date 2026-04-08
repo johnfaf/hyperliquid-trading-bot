@@ -77,6 +77,7 @@ class PositionMonitor:
         self._last_msg_time = 0.0
         self._gap_count = 0
         self._max_gap_ms = 0.0
+        self._last_gap_warn_time = 0.0
 
         # Mid-price cache is refreshed by a dedicated REST thread so the
         # WebSocket message handler never blocks on external HTTP calls.
@@ -95,6 +96,18 @@ class PositionMonitor:
             float(getattr(config, "POSITION_MONITOR_WATCHDOG_TIMEOUT_S", 30.0)),
         )
         self._watchdog_thread = None
+
+        # Gap warning controls. A quiet userEvents stream can naturally have
+        # multi-second idle windows; keep warnings for materially long silence.
+        default_gap_warn_s = max(15.0, self._watchdog_timeout_s * 0.5)
+        self._gap_warn_threshold_s = max(
+            5.0,
+            float(getattr(config, "POSITION_MONITOR_GAP_WARN_S", default_gap_warn_s)),
+        )
+        self._gap_warn_cooldown_s = max(
+            5.0,
+            float(getattr(config, "POSITION_MONITOR_GAP_WARN_COOLDOWN_S", 60.0)),
+        )
 
     def start(self, addresses: List[str]) -> None:
         """
@@ -193,6 +206,7 @@ class PositionMonitor:
                 "reconnect_count": self._reconnect_count,
                 "gaps_detected": self._gap_count,
                 "max_gap_ms": round(self._max_gap_ms, 0),
+                "gap_warn_threshold_s": round(self._gap_warn_threshold_s, 2),
                 "last_update": self._last_msg_time,
             }
 
@@ -275,6 +289,7 @@ class PositionMonitor:
         """
         Handle incoming WebSocket messages from userEvents subscriptions.
         """
+        gap_log = None
         with self._lock:
             self._messages_received += 1
             now = time.time()
@@ -282,12 +297,31 @@ class PositionMonitor:
             # Gap detection
             if self._last_msg_time > 0:
                 gap_ms = (now - self._last_msg_time) * 1000
-                if gap_ms > 5000:  # 5 second gap
+                if gap_ms > self._gap_warn_threshold_s * 1000:
                     self._gap_count += 1
+                    prev_max = self._max_gap_ms
                     self._max_gap_ms = max(self._max_gap_ms, gap_ms)
-                    logger.warning(f"PositionMonitor gap: {gap_ms:.0f}ms since last message "
-                                 f"(gap #{self._gap_count})")
+                    should_warn = (
+                        (now - self._last_gap_warn_time) >= self._gap_warn_cooldown_s
+                        or gap_ms > (prev_max + 1000.0)
+                    )
+                    if should_warn:
+                        self._last_gap_warn_time = now
+                        gap_log = ("warn", gap_ms, self._gap_count)
+                    else:
+                        gap_log = ("debug", gap_ms, self._gap_count)
             self._last_msg_time = now
+
+        if gap_log:
+            level, gap_ms, gap_count = gap_log
+            msg = (
+                "PositionMonitor gap: %.0fms since last message (gap #%d, warn_threshold=%.1fs)"
+                % (gap_ms, gap_count, self._gap_warn_threshold_s)
+            )
+            if level == "warn":
+                logger.warning(msg)
+            else:
+                logger.debug(msg)
 
         try:
             data = json.loads(message)
