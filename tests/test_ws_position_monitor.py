@@ -25,6 +25,29 @@ def test_watchdog_trigger_uses_transport_activity_and_cooldown():
     assert monitor._last_watchdog_reconnect_time == 241.0
 
 
+def test_watchdog_uses_last_pong_timestamp_as_activity():
+    class _FakeWs:
+        def __init__(self, last_pong_tm: float):
+            self.last_pong_tm = last_pong_tm
+
+    monitor = PositionMonitor()
+    monitor._connected = True
+    monitor._watchdog_timeout_s = 30.0
+    monitor._watchdog_reconnect_cooldown_s = 120.0
+    monitor._last_ws_activity_time = 0.0
+    monitor._last_msg_time = 0.0
+    monitor._last_watchdog_reconnect_time = 0.0
+
+    ws = _FakeWs(last_pong_tm=200.0)
+    with monitor._lock:
+        idle = monitor._consume_watchdog_trigger_locked(220.0, ws=ws)
+    assert idle is None
+
+    with monitor._lock:
+        idle = monitor._consume_watchdog_trigger_locked(241.0, ws=ws)
+    assert idle == 41.0
+
+
 def test_on_pong_updates_transport_activity(monkeypatch):
     monitor = PositionMonitor()
     monkeypatch.setattr("src.notifications.ws_position_monitor.time.time", lambda: 123.45)

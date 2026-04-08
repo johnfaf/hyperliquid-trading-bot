@@ -355,7 +355,7 @@ class PositionMonitor:
         with self._lock:
             self._last_ws_activity_time = time.time()
 
-    def _consume_watchdog_trigger_locked(self, now: float) -> Optional[float]:
+    def _consume_watchdog_trigger_locked(self, now: float, ws=None) -> Optional[float]:
         """Return idle seconds when watchdog should force reconnect, else None.
 
         Must be called with self._lock held.
@@ -363,6 +363,15 @@ class PositionMonitor:
         if not self._connected:
             return None
         last_activity = self._last_ws_activity_time or self._last_msg_time
+        # websocket-client tracks pong timestamps internally even when callback
+        # ordering means app-level on_pong hooks are delayed or skipped.
+        if ws is not None:
+            try:
+                last_pong = float(getattr(ws, "last_pong_tm", 0.0) or 0.0)
+                if last_pong > 0:
+                    last_activity = max(last_activity, last_pong)
+            except (TypeError, ValueError):
+                pass
         if last_activity <= 0:
             return None
         idle_s = now - last_activity
@@ -587,7 +596,7 @@ class PositionMonitor:
             with self._lock:
                 ws = self._ws
                 now = time.time()
-                idle_s = self._consume_watchdog_trigger_locked(now)
+                idle_s = self._consume_watchdog_trigger_locked(now, ws=ws)
             if idle_s is None:
                 continue
             logger.warning(
