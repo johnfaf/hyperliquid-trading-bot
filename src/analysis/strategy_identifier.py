@@ -4,14 +4,11 @@ Analyzes trader behavior patterns to identify and classify trading strategies.
 Detects patterns like: momentum, mean-reversion, funding arbitrage, breakout, etc.
 """
 import logging
-import numpy as np
-from datetime import datetime
-from typing import List, Dict, Optional, Tuple
-from collections import defaultdict
+from typing import List, Dict, Optional
 
-import sys, os
+import os
+import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-import config
 from src.data import database as db
 from src.data import hyperliquid_client as hl
 
@@ -34,7 +31,6 @@ def _estimate_sharpe(metrics: Dict) -> float:
     - WR=60%, PF=2.0, 500 trades → Sharpe ≈ 2.5
     - WR=45%, PF=0.8, 100 trades → Sharpe ≈ -0.5
     """
-    pnl = metrics.get("pnl", 0)
     trade_count = metrics.get("trade_count", 0)
     win_rate = metrics.get("win_rate", 0) / 100.0  # convert from pct
     profit_factor = metrics.get("profit_factor", 0)
@@ -208,6 +204,7 @@ class StrategyIdentifier:
                 "parameters": {
                     "reversion_pct": reversion_signals / total_checked,
                     "avg_leverage": pos_analysis.get("avg_leverage", 1),
+                    "coins": pos_analysis.get("coins", trade_analysis.get("coins_traded", [])),
                 },
                 "trader_address": address,
                 "metrics": {
@@ -260,6 +257,7 @@ class StrategyIdentifier:
                     "avg_leverage": avg_lev,
                     "frequency": frequency,
                     "num_positions": pos_analysis.get("num_positions", 0),
+                    "coins": pos_analysis.get("coins", trade_analysis.get("coins_traded", [])),
                 },
                 "trader_address": address,
                 "metrics": {
@@ -297,6 +295,7 @@ class StrategyIdentifier:
                 "parameters": {
                     "funding_aligned_pct": funding_aligned / len(positions),
                     "positions": [{"coin": p["coin"], "side": p["side"]} for p in positions],
+                    "coins": pos_analysis.get("coins", trade_analysis.get("coins_traded", [])),
                 },
                 "trader_address": address,
                 "metrics": {
@@ -322,6 +321,7 @@ class StrategyIdentifier:
                 "parameters": {
                     "long_pct": long_pct,
                     "num_positions": num_pos,
+                    "coins": pos_analysis.get("coins", trade_analysis.get("coins_traded", [])),
                 },
                 "trader_address": address,
                 "metrics": {
@@ -389,6 +389,7 @@ class StrategyIdentifier:
                 "parameters": {
                     "trend_alignment": trend_aligned / len(positions),
                     "avg_leverage": pos_analysis.get("avg_leverage", 1),
+                    "coins": pos_analysis.get("coins", trade_analysis.get("coins_traded", [])),
                 },
                 "trader_address": address,
                 "metrics": {
@@ -425,6 +426,7 @@ class StrategyIdentifier:
                 "confidence": confidence,
                 "parameters": {
                     "recent_entry_pct": recent_entries / len(positions),
+                    "coins": pos_analysis.get("coins", trade_analysis.get("coins_traded", [])),
                 },
                 "trader_address": address,
                 "metrics": {

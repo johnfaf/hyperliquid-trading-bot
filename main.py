@@ -111,6 +111,12 @@ class HyperliquidResearchBot:
         log_persistence_info(self.logger)
         validate_dependencies(self.logger)
         init_database(self.logger)
+        try:
+            updated = db.backfill_strategy_coins_from_name()
+            if updated:
+                self.logger.info("Backfilled coin metadata for %d strategies from DB names.", updated)
+        except Exception as exc:
+            self.logger.warning("Strategy coin backfill skipped: %s", exc)
 
         # ── Build subsystems ──
         effective_profile = profile or FULL_PROFILE
@@ -234,6 +240,23 @@ class HyperliquidResearchBot:
             return True
         return False
 
+    def _startup_recovery_last_discovery(self, restored_ts: float, now: float) -> float:
+        """
+        Keep startup non-blocking, but force a near-term recovery discovery.
+
+        Thin inventory should not wait a full starvation interval before we
+        refresh the trader pool.
+        """
+        recovery_interval = max(1, int(config.DISCOVERY_STARVATION_RECOVERY_INTERVAL))
+        startup_delay = max(0, int(config.DISCOVERY_STARTUP_RECOVERY_DELAY))
+        startup_delay = min(startup_delay, recovery_interval)
+        target_elapsed = max(0, recovery_interval - startup_delay)
+        target_ts = now - target_elapsed
+
+        if restored_ts and restored_ts > 0:
+            return min(restored_ts, target_ts)
+        return target_ts
+
     # ── Scheduling loops ──────────────────────────────────────
 
     def _run_discovery(self):
@@ -327,18 +350,18 @@ class HyperliquidResearchBot:
                 inventory["total_strategies"],
             )
             restored_ts = self._restore_last_discovery_time()
-            if restored_ts and (time.time() - restored_ts) < config.DISCOVERY_CYCLE_INTERVAL:
-                self._last_discovery = restored_ts
-                remaining_h = (config.DISCOVERY_CYCLE_INTERVAL - (time.time() - restored_ts)) / 3600
-                self.logger.info("Restored discovery timer, next in %.1fh", remaining_h)
-            else:
-                self._last_discovery = time.time()
-                self.logger.info(
-                    "DB has %d traders and %d tracked strategies — next recovery discovery check in %.1fh",
-                    trader_count,
-                    inventory["total_strategies"],
-                    config.DISCOVERY_STARVATION_RECOVERY_INTERVAL / 3600,
-                )
+            now_ts = time.time()
+            self._last_discovery = self._startup_recovery_last_discovery(restored_ts, now_ts)
+            recovery_eta_seconds = max(
+                0.0,
+                float(config.DISCOVERY_STARVATION_RECOVERY_INTERVAL) - (now_ts - self._last_discovery),
+            )
+            self.logger.info(
+                "DB has %d traders and %d tracked strategies — next recovery discovery check in %.1fm",
+                trader_count,
+                inventory["total_strategies"],
+                recovery_eta_seconds / 60.0,
+            )
         else:
             restored_ts = self._restore_last_discovery_time()
             if restored_ts and (time.time() - restored_ts) < config.DISCOVERY_CYCLE_INTERVAL:

@@ -6,6 +6,7 @@ import json
 import os
 import logging
 import hashlib
+import re
 from datetime import datetime, timedelta
 from contextlib import contextmanager
 
@@ -682,6 +683,93 @@ def get_all_strategies():
             "SELECT * FROM strategies ORDER BY current_score DESC, discovered_at DESC"
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+def backfill_strategy_coins_from_name(limit: int = 5000) -> int:
+    """
+    Backfill missing strategy coin metadata from deterministic name/description tokens.
+
+    This avoids random coin inference during decisioning for legacy strategies that
+    were saved without `parameters.coins`.
+    """
+    stopwords = {
+        "alpha", "beta", "gamma", "delta", "epsilon", "theta", "kappa",
+        "strategy", "signal", "model", "long", "short", "momentum", "reversion",
+        "mean", "swing", "scalp", "scalping", "trend", "following", "breakout",
+        "arb", "funding", "neutral", "concentrated", "bet", "copy", "trade",
+        "trader", "flow", "options", "polymarket", "arena", "champion", "unknown",
+        "legacy", "explicit", "coin", "coins", "param", "params", "profile",
+        "without", "with", "token", "tradable", "available", "custom", "pattern",
+        "name", "description", "no",
+    }
+    updated = 0
+
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, name, description, strategy_type, parameters
+            FROM strategies
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (int(limit),),
+        ).fetchall()
+
+        for row in rows:
+            params_raw = row["parameters"]
+            if isinstance(params_raw, str):
+                try:
+                    params = json.loads(params_raw)
+                except Exception:
+                    params = {}
+            elif isinstance(params_raw, dict):
+                params = dict(params_raw)
+            else:
+                params = {}
+
+            existing_coins = params.get("coins", params.get("coins_traded", []))
+            if isinstance(existing_coins, str):
+                existing_coins = [existing_coins]
+            normalized_existing = [
+                str(c).strip().upper()
+                for c in (existing_coins or [])
+                if str(c).strip() and str(c).strip().lower() != "unknown"
+            ]
+            if normalized_existing:
+                continue
+
+            text_parts = [
+                str(row["name"] or ""),
+                str(row["description"] or ""),
+                str(row["strategy_type"] or ""),
+            ]
+            tokens = re.split(r"[^A-Za-z0-9]+", " ".join(text_parts).lower())
+            inferred: list[str] = []
+            for token in reversed(tokens):
+                token = token.strip()
+                if not token or token in stopwords or token.startswith("0x"):
+                    continue
+                if not token.isalnum():
+                    continue
+                if len(token) < 2 or len(token) > 8:
+                    continue
+                coin = token.upper()
+                if coin not in inferred:
+                    inferred.append(coin)
+                if len(inferred) >= 3:
+                    break
+
+            if not inferred:
+                continue
+
+            params["coins"] = inferred
+            conn.execute(
+                "UPDATE strategies SET parameters = ? WHERE id = ?",
+                (json.dumps(params), row["id"]),
+            )
+            updated += 1
+
+    return updated
 
 
 def get_strategy(strategy_id):

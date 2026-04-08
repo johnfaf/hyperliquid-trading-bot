@@ -6990,6 +6990,112 @@ def test_startup_discovery_forced_when_no_tracked_strategies_exist():
     assert bot._should_force_startup_discovery(inventory) is True
 
 
+def test_startup_recovery_timer_accelerates_when_inventory_is_thin(monkeypatch):
+    bot = main.HyperliquidResearchBot.__new__(main.HyperliquidResearchBot)
+    monkeypatch.setattr(config, "DISCOVERY_STARVATION_RECOVERY_INTERVAL", 3600)
+    monkeypatch.setattr(config, "DISCOVERY_STARTUP_RECOVERY_DELAY", 300)
+
+    now_ts = 10_000.0
+    scheduled_ts = bot._startup_recovery_last_discovery(restored_ts=0.0, now=now_ts)
+    remaining = 3600.0 - (now_ts - scheduled_ts)
+
+    assert round(remaining) == 300
+
+
+def test_backfill_strategy_coins_from_name(monkeypatch):
+    fd, raw_path = tempfile.mkstemp(prefix="strategy_coin_backfill_", suffix=".db", dir=os.getcwd())
+    os.close(fd)
+    db_path = os.path.normpath(raw_path)
+
+    original_path = db._DB_PATH
+    monkeypatch.setattr(db, "_DB_PATH", db_path)
+
+    try:
+        db.init_db()
+        db.save_strategy("alpha_momentum_btc", "BTC momentum profile", "momentum_long", parameters={})
+        db.save_strategy("bravo_reversion_eth", "ETH mean reversion profile", "mean_reversion", parameters={})
+
+        updated = db.backfill_strategy_coins_from_name()
+        strategies = db.get_all_strategies()
+        by_name = {row["name"]: json.loads(row["parameters"]) for row in strategies}
+
+        assert updated >= 2
+        assert by_name["alpha_momentum_btc"]["coins"][0] == "BTC"
+        assert by_name["bravo_reversion_eth"]["coins"][0] == "ETH"
+    finally:
+        monkeypatch.setattr(db, "_DB_PATH", original_path)
+        if os.path.exists(db_path):
+            os.remove(db_path)
+
+
+def test_decision_engine_infers_coin_from_name_without_random_fallback():
+    engine = DecisionEngine({
+        "min_decision_score": 0.0,
+        "min_signal_confidence": 0.0,
+        "min_source_weight": 0.0,
+        "min_expected_value_pct": -1.0,
+        "max_position_slots": 8,
+        "max_trades_per_cycle": 1,
+    })
+
+    strategies = [{
+        "id": 1,
+        "name": "alpha_momentum_btc",
+        "description": "legacy strategy without explicit coin params",
+        "strategy_type": "momentum_long",
+        "current_score": 0.8,
+        "confidence": 0.8,
+        "parameters": {},
+        "metrics": {},
+        "metadata": {},
+    }]
+
+    decisions = engine.decide(
+        strategies,
+        regime_data={"overall_regime": "trending_up", "strategy_guidance": {"activate": ["momentum_long"]}},
+        open_positions=[],
+        kelly_stats={},
+    )
+
+    assert decisions
+    assert decisions[0]["parameters"]["coins"][0] == "BTC"
+
+
+def test_decision_engine_blocks_missing_coin_context_when_unresolvable():
+    engine = DecisionEngine({
+        "min_decision_score": 0.0,
+        "min_signal_confidence": 0.0,
+        "min_source_weight": 0.0,
+        "min_expected_value_pct": -1.0,
+        "max_position_slots": 8,
+        "max_trades_per_cycle": 1,
+    })
+
+    strategies = [{
+        "id": 1,
+        "name": "model_alpha_unknown",
+        "description": "no tradable coin token available",
+        "strategy_type": "custom_pattern",
+        "current_score": 0.9,
+        "confidence": 0.9,
+        "parameters": {},
+        "metrics": {},
+        "metadata": {},
+    }]
+
+    decisions = engine.decide(
+        strategies,
+        regime_data={"overall_regime": "trending_up"},
+        open_positions=[],
+        kelly_stats={},
+    )
+    summary = engine.get_last_cycle_summary()
+
+    assert decisions == []
+    assert summary["no_trade_reason"] == "blocked"
+    assert summary["blocker_counts"].get("missing_coin_context", 0) == 1
+
+
 def test_heartbeat_active_covers_recovery_subsystems():
     from src.core.subsystem_registry import heartbeat_active
 

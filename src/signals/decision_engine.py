@@ -23,6 +23,7 @@ Instead: ranked execution with clear priority + decision logging.
 """
 import logging
 import json
+import re
 from typing import Any, Dict, List, Optional, Tuple
 from datetime import datetime
 from collections import deque
@@ -176,6 +177,58 @@ class DecisionEngine:
             "total_operator_blocks": 0,
         }
 
+        self._coin_inference_stopwords = {
+            "alpha", "beta", "gamma", "delta", "epsilon", "theta", "kappa",
+            "strategy", "signal", "model", "long", "short", "momentum", "reversion",
+            "mean", "swing", "scalp", "scalping", "trend", "following", "breakout",
+            "arb", "funding", "neutral", "concentrated", "bet", "copy", "trade",
+            "trader", "flow", "options", "polymarket", "arena", "champion", "unknown",
+            "legacy", "explicit", "coin", "coins", "param", "params", "profile",
+            "without", "with", "token", "tradable", "available", "custom", "pattern",
+            "name", "description", "no",
+        }
+
+    def _normalize_coin_list(self, value: Any) -> List[str]:
+        if value is None:
+            return []
+        if isinstance(value, str):
+            candidates = [value]
+        elif isinstance(value, list):
+            candidates = value
+        else:
+            return []
+
+        normalized: List[str] = []
+        for item in candidates:
+            token = str(item).strip()
+            if not token:
+                continue
+            if token.lower() == "unknown" or token.lower().startswith("0x"):
+                continue
+            token = token.upper()
+            if token not in normalized:
+                normalized.append(token)
+        return normalized
+
+    def _infer_coin_tokens_from_text(self, *values: Any) -> List[str]:
+        text = " ".join(str(v or "") for v in values)
+        tokens = re.split(r"[^A-Za-z0-9]+", text.lower())
+        inferred: List[str] = []
+        for token in reversed(tokens):
+            token = token.strip()
+            if not token or token in self._coin_inference_stopwords:
+                continue
+            if token.startswith("0x") or not token.isalnum():
+                continue
+            if len(token) < 2 or len(token) > 8:
+                continue
+            symbol = token.upper()
+            if symbol not in inferred:
+                inferred.append(symbol)
+            if len(inferred) >= 3:
+                break
+        return inferred
+
     def decide(self, strategies: List[Dict],
                regime_data: Optional[Dict] = None,
                open_positions: Optional[List[Dict]] = None,
@@ -212,14 +265,12 @@ class DecisionEngine:
             self.stats["total_no_trade"] += 1
             return []
 
-        # Extract and validate coin field — fallback to positions if missing
-        TOP_COINS = ["BTC", "ETH", "SOL", "DOGE", "ARB", "OP", "AVAX", "MATIC",
-                     "LINK", "WLD", "SUI", "TIA", "SEI", "INJ", "NEAR"]
+        # Extract and validate coin field from deterministic strategy context.
         valid_strategies = []
+        pre_disqualified: List[Dict[str, Any]] = []
         for s in strategies:
             params = s.get("parameters", {})
             if isinstance(params, str):
-                import json
                 try:
                     params = json.loads(params)
                 except (json.JSONDecodeError, TypeError):
@@ -227,29 +278,41 @@ class DecisionEngine:
                 # Persist parsed version so downstream doesn't re-parse
                 s["parameters"] = params
 
-            coins = params.get("coins", params.get("coins_traded", []))
-            if isinstance(coins, str):
-                coins = [coins]
+            coins = self._normalize_coin_list(params.get("coins", params.get("coins_traded", [])))
 
-            # Fallback 1: extract from trader's current positions in metrics
-            if not coins or (coins and coins[0] == "unknown"):
+            # Fallback 1: extract from strategy metrics metadata.
+            if not coins:
                 metrics = s.get("metrics", {})
-                traded_coins = metrics.get("coins", metrics.get("coins_traded", []))
-                if traded_coins and isinstance(traded_coins, list):
-                    coins = traded_coins
-                    params["coins"] = coins  # Persist so _compute_composite_score sees it
+                coins = self._normalize_coin_list(metrics.get("coins", metrics.get("coins_traded", [])))
 
-            # Fallback 2: infer from strategy type — use top liquid coins
-            if not coins or (coins and coins[0] == "unknown"):
-                import random
-                strategy_type = s.get("strategy_type", s.get("type", ""))
-                # Pick a coin based on strategy: momentum → BTC/ETH, mean_reversion → alts
-                if "momentum" in strategy_type or "trend" in strategy_type:
-                    coins = [random.choice(TOP_COINS[:3])]  # BTC, ETH, SOL
-                else:
-                    coins = [random.choice(TOP_COINS[:7])]  # Top 7 liquid
-                logger.info(f"Inferred coin {coins[0]} for strategy "
-                           f"{strategy_type} (no asset in parameters)")
+            # Fallback 2: extract from source metadata used by adapters.
+            if not coins:
+                metadata = s.get("metadata", {}) or {}
+                coins = self._normalize_coin_list(
+                    metadata.get("coin", metadata.get("coins", metadata.get("ticker", "")))
+                )
+
+            # Fallback 3: deterministic inference from strategy text fields.
+            if not coins:
+                coins = self._infer_coin_tokens_from_text(
+                    s.get("name", ""),
+                    s.get("description", ""),
+                    s.get("strategy_type", s.get("type", "")),
+                )
+
+            if not coins:
+                blocked = dict(s)
+                blocked["_composite_score"] = 0.0
+                blocked["_score_breakdown"] = {}
+                blocked["_decision_blockers"] = ["missing_coin_context"]
+                blocked["_live_decision_blockers"] = ["missing_coin_context"]
+                pre_disqualified.append(blocked)
+                logger.info(
+                    "Skipping strategy %s (%s): missing coin context",
+                    s.get("name", "unknown"),
+                    s.get("strategy_type", s.get("type", "unknown")),
+                )
+                continue
 
             # Always persist resolved coins back into params
             params["coins"] = coins
@@ -259,8 +322,9 @@ class DecisionEngine:
 
         strategies = valid_strategies
         if not strategies:
-            self._log_decision([], regime_data, available_slots)
+            self._log_decision([], regime_data, available_slots, disqualified=pre_disqualified)
             self.stats["total_no_trade"] += 1
+            self.stats["total_filtered"] += len(pre_disqualified)
             return []
 
         # ─── Score each strategy ─────────────────────────
@@ -281,7 +345,7 @@ class DecisionEngine:
 
         # ─── Filter by minimum threshold ─────────────────
         qualified = []
-        disqualified = []
+        disqualified = list(pre_disqualified)
         for strategy in scored:
             live_blockers = self._decision_blockers(strategy)
             blockers = self._decision_blockers(strategy, allow_shadow_warmup=True)
@@ -2296,7 +2360,9 @@ class DecisionEngine:
             if not item.get("_decision_blockers")
             and float(item.get("_composite_score", 0.0) or 0.0) < self.min_decision_score
         )
-        if not scored:
+        if not scored and disqualified:
+            no_trade_reason = "blocked"
+        elif not scored:
             no_trade_reason = "no candidates"
         elif available_slots == 0 and not executions:
             no_trade_reason = "no slots"
