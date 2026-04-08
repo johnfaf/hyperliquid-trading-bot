@@ -75,6 +75,7 @@ class PositionMonitor:
         self._signals_emitted = 0
         self._connected = False
         self._last_msg_time = 0.0
+        self._last_ws_activity_time = 0.0
         self._gap_count = 0
         self._max_gap_ms = 0.0
         self._last_gap_warn_time = 0.0
@@ -95,6 +96,17 @@ class PositionMonitor:
             10.0,
             float(getattr(config, "POSITION_MONITOR_WATCHDOG_TIMEOUT_S", 30.0)),
         )
+        self._watchdog_reconnect_cooldown_s = max(
+            15.0,
+            float(
+                getattr(
+                    config,
+                    "POSITION_MONITOR_WATCHDOG_RECONNECT_COOLDOWN_S",
+                    120.0,
+                )
+            ),
+        )
+        self._last_watchdog_reconnect_time = 0.0
         self._watchdog_thread = None
 
         # Gap warning controls. A quiet userEvents stream can naturally have
@@ -220,6 +232,7 @@ class PositionMonitor:
                     self.WS_URL,
                     on_open=self._on_open,
                     on_message=self._on_message,
+                    on_pong=self._on_pong,
                     on_error=self._on_error,
                     on_close=self._on_close,
                 )
@@ -244,7 +257,9 @@ class PositionMonitor:
 
         with self._lock:
             self._connected = True
-            self._last_msg_time = time.time()
+            now = time.time()
+            self._last_msg_time = now
+            self._last_ws_activity_time = now
             tracked = list(self._tracked_addresses)
 
         if was_reconnect:
@@ -311,6 +326,7 @@ class PositionMonitor:
                     else:
                         gap_log = ("debug", gap_ms, self._gap_count)
             self._last_msg_time = now
+            self._last_ws_activity_time = now
 
         if gap_log:
             level, gap_ms, gap_count = gap_log
@@ -333,6 +349,29 @@ class PositionMonitor:
             pass
         except Exception as e:
             logger.debug(f"Message processing error: {e}")
+
+    def _on_pong(self, ws, message) -> None:
+        """Treat pong frames as transport activity for watchdog liveness."""
+        with self._lock:
+            self._last_ws_activity_time = time.time()
+
+    def _consume_watchdog_trigger_locked(self, now: float) -> Optional[float]:
+        """Return idle seconds when watchdog should force reconnect, else None.
+
+        Must be called with self._lock held.
+        """
+        if not self._connected:
+            return None
+        last_activity = self._last_ws_activity_time or self._last_msg_time
+        if last_activity <= 0:
+            return None
+        idle_s = now - last_activity
+        if idle_s <= self._watchdog_timeout_s:
+            return None
+        if (now - self._last_watchdog_reconnect_time) < self._watchdog_reconnect_cooldown_s:
+            return None
+        self._last_watchdog_reconnect_time = now
+        return idle_s
 
     def _on_error(self, ws, error) -> None:
         """Handle WebSocket errors."""
@@ -546,16 +585,13 @@ class PositionMonitor:
         while self._running:
             time.sleep(check_interval)
             with self._lock:
-                connected = self._connected
-                last_msg = self._last_msg_time
                 ws = self._ws
-            if not connected or last_msg <= 0:
-                continue
-            idle_s = time.time() - last_msg
-            if idle_s <= self._watchdog_timeout_s:
+                now = time.time()
+                idle_s = self._consume_watchdog_trigger_locked(now)
+            if idle_s is None:
                 continue
             logger.warning(
-                "PositionMonitor watchdog: no messages for %.1fs (> %.1fs), forcing reconnect",
+                "PositionMonitor watchdog: no WS activity for %.1fs (> %.1fs), forcing reconnect",
                 idle_s,
                 self._watchdog_timeout_s,
             )
