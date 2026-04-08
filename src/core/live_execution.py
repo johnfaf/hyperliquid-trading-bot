@@ -383,7 +383,7 @@ def mirror_executed_trades_to_live(
         if not candidates:
             return
 
-        live_balance = float(trader.get_wallet_balance() or 0.0)
+        live_balance = float(trader.get_account_value() or 0.0)
         margin_budget = live_balance * 0.95 if live_balance > 0 else 0.0
         selected = []
         used_margin = 0.0

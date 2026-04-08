@@ -792,6 +792,10 @@ class LiveTrader:
         # Both are empty/failed
         return perps_value  # 0.0 or None
 
+    def get_wallet_balance(self) -> Optional[float]:
+        """Backward-compatible alias for callers expecting wallet balance API."""
+        return self.get_account_value()
+
     def _get_spot_usdc_balance(self) -> Optional[float]:
         """Fetch USDC balance from the spot wallet."""
         if not self.public_address:

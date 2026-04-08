@@ -22,6 +22,7 @@ from src.core.health_registry import SubsystemHealthRegistry, SubsystemState
 from src.core.live_execution import (
     _rescale_size_for_live,
     get_execution_open_positions,
+    mirror_executed_trades_to_live,
     sync_shadow_book_to_live,
 )
 from src.signals.decision_firewall import DecisionFirewall
@@ -683,6 +684,50 @@ def test_execute_options_flow_live_path_executes_signal(monkeypatch):
     _execute_options_flow_trades(container, {"overall_regime": "neutral"})
 
     assert executed == [("ETH", "long", True)]
+
+
+def test_mirror_executed_trades_uses_account_value_without_wallet_alias():
+    class FakeLiveTrader:
+        def __init__(self):
+            self.executed = []
+
+        def is_live_enabled(self):
+            return True
+
+        def is_deployable(self):
+            return True
+
+        def get_account_value(self):
+            return 250.0
+
+        def execute_signal(self, signal, bypass_firewall=False):
+            self.executed.append((signal.coin, signal.side.value, bypass_firewall))
+            return {"status": "success"}
+
+    trader = FakeLiveTrader()
+    container = type("Container", (), {"live_trader": trader})()
+    executed = [
+        signal_from_execution_dict(
+            {
+                "coin": "ETH",
+                "side": "long",
+                "confidence": 0.7,
+                "entry_price": 2000.0,
+                "size": 0.01,
+                "leverage": 2,
+                "strategy_type": "mirror_test",
+            }
+        )
+    ]
+
+    mirror_executed_trades_to_live(
+        container,
+        executed,
+        success_label="LIVE",
+        skip_label="SKIP",
+    )
+
+    assert trader.executed == [("ETH", "long", True)]
 
 
 def test_execute_options_flow_paper_trade_preserves_precise_stops(monkeypatch):
