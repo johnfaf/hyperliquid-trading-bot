@@ -224,9 +224,13 @@ def init_database(logger: logging.Logger) -> None:
 
 def log_persistence_info(logger: logging.Logger) -> None:
     """Log persistence paths for Railway debugging."""
+    try:
+        uid = os.getuid()
+    except AttributeError:
+        uid = "n/a"
     logger.info(
         "[PERSISTENCE] persistent_volume=%s DB_PATH=%s HL_BOT_DB_env=%s uid=%s /data_exists=%s",
         config._HAS_PERSISTENT_VOLUME, config.DB_PATH,
         os.environ.get("HL_BOT_DB", "NOT SET"),
-        os.getuid(), os.path.isdir("/data"),
+        uid, os.path.isdir("/data"),
     )

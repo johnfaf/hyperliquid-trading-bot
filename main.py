@@ -301,6 +301,22 @@ class HyperliquidResearchBot:
 
         # ── Shutdown ──
         self.task_runner.stop_all(timeout=10)
+        try:
+            if getattr(self.container, "position_monitor", None):
+                self.container.position_monitor.stop()
+        except Exception as exc:
+            self.logger.warning("Position monitor stop failed: %s", exc)
+        try:
+            from src.data.hyperliquid_client import stop_websocket
+            stop_websocket()
+        except Exception as exc:
+            self.logger.warning("Market websocket stop failed: %s", exc)
+        try:
+            if getattr(self.container, "dashboard", None):
+                self.container.dashboard.shutdown()
+                self.container.dashboard.server_close()
+        except Exception as exc:
+            self.logger.warning("Dashboard shutdown failed: %s", exc)
         self.logger.info("Bot stopped.")
         if self.container.reporter:
             self.container.reporter.generate_daily_report()

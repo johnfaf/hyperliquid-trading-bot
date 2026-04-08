@@ -26,6 +26,7 @@ import os
 import time
 import json
 import hashlib
+import copy
 from datetime import datetime
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -246,7 +247,8 @@ class HyperliquidSigner:
 
         self.account = Account.from_key(private_key)
         self.address = self.account.address
-        logger.info(f"HyperliquidSigner initialized with address: {self.address}")
+        masked = f"{self.address[:6]}...{self.address[-4:]}" if self.address else "unknown"
+        logger.info("HyperliquidSigner initialized with address: %s", masked)
 
     @staticmethod
     def _action_hash(action: Dict, vault_address: Optional[str], nonce: int,
@@ -431,6 +433,8 @@ class LiveTrader:
 
         # State tracking
         self.daily_pnl = 0.0
+        self.daily_realized_pnl = 0.0
+        self.daily_unrealized_pnl = 0.0
         self.daily_reset_date = ""
         self.kill_switch_active = False
         self.orders_today = 0
@@ -442,7 +446,43 @@ class LiveTrader:
         # Order idempotency: prevent duplicate orders from timeout/retry
         # Maps action_hash -> (timestamp, result) for recent orders
         self._recent_order_hashes: Dict[str, Tuple[float, Dict]] = {}
-        self._ORDER_DEDUP_WINDOW = 30  # seconds to remember recent orders
+        self._ORDER_DEDUP_WINDOW = max(
+            1.0,
+            float(os.environ.get("LIVE_ORDER_DEDUP_WINDOW_S", "30")),
+        )
+
+        # Price sanity state (instance-level; class-level cache leaks across traders).
+        self._price_history: Dict[str, float] = {}  # coin -> last known good mid
+        self._price_seed_candidates: Dict[str, float] = {}  # coin -> untrusted first sample
+
+        # Fill verification defaults:
+        # - verify_fill() API remains blocking by default for backward compatibility.
+        # - execute_signal() uses a separate non-blocking default to avoid cycle stalls.
+        self._fill_verify_blocking = os.environ.get(
+            "LIVE_FILL_VERIFY_BLOCKING", "true"
+        ).strip().lower() in {"1", "true", "yes"}
+        # execute_signal uses this mode explicitly (default non-blocking).
+        self._execute_fill_verify_blocking = os.environ.get(
+            "LIVE_EXECUTE_FILL_VERIFY_BLOCKING", "false"
+        ).strip().lower() in {"1", "true", "yes"}
+        self._fill_verify_timeout_s = max(
+            0.0,
+            float(os.environ.get("LIVE_FILL_VERIFY_TIMEOUT_S", "10.0")),
+        )
+        self._fill_verify_poll_s = max(
+            0.1,
+            float(os.environ.get("LIVE_FILL_VERIFY_POLL_S", "1.0")),
+        )
+
+        # Emergency exit retries for transient API/network failures.
+        self._emergency_close_retries = max(
+            1,
+            int(os.environ.get("LIVE_EMERGENCY_CLOSE_RETRIES", "3")),
+        )
+        self._emergency_close_retry_delay_s = max(
+            0.1,
+            float(os.environ.get("LIVE_EMERGENCY_CLOSE_RETRY_DELAY_S", "1.5")),
+        )
 
         # Wallet balance tracking (last-known snapshots for dashboards/cycles).
         self._last_balance_snapshot: Dict[str, Optional[float]] = {
@@ -930,6 +970,8 @@ class LiveTrader:
         if today != self.daily_reset_date:
             self.daily_reset_date = today
             self.daily_pnl = 0.0
+            self.daily_realized_pnl = 0.0
+            self.daily_unrealized_pnl = 0.0
             self.orders_today = 0
             self.fills_today = 0
             self.kill_switch_active = False
@@ -1163,9 +1205,9 @@ class LiveTrader:
             if not isinstance(fills, list):
                 return
 
-            # Sum closed PnL from today's fills
+            # Sum realized closed PnL from today's fills.
             today = datetime.utcnow().strftime("%Y-%m-%d")
-            today_pnl = 0.0
+            today_realized = 0.0
             for fill in fills:
                 fill_time = fill.get("time", "")
                 if isinstance(fill_time, (int, float)):
@@ -1180,13 +1222,33 @@ class LiveTrader:
 
                 if fill_date == today:
                     closed_pnl = float(fill.get("closedPnl", 0))
-                    today_pnl += closed_pnl
+                    today_realized += closed_pnl
+
+            # Include current unrealized PnL so daily loss controls react to
+            # open-position drawdowns, not only realized closes.
+            unrealized = 0.0
+            try:
+                for pos in self.get_positions():
+                    unrealized += self._coerce_float(
+                        pos.get("unrealized_pnl", pos.get("unrealizedPnl", 0))
+                    )
+            except Exception as exc:
+                logger.debug("Could not include unrealized PnL in daily tracking: %s", exc)
+
+            today_pnl = today_realized + unrealized
 
             old_pnl = self.daily_pnl
+            self.daily_realized_pnl = today_realized
+            self.daily_unrealized_pnl = unrealized
             self.daily_pnl = today_pnl
 
             if abs(self.daily_pnl) > 0 and abs(self.daily_pnl - old_pnl) > 0.01:
-                logger.info(f"Daily PnL updated: ${self.daily_pnl:+,.2f}")
+                logger.info(
+                    "Daily PnL updated: total=%+.2f (realized=%+.2f, unrealized=%+.2f)",
+                    self.daily_pnl,
+                    self.daily_realized_pnl,
+                    self.daily_unrealized_pnl,
+                )
 
             # Keep the firewall on the same realized-loss snapshot instead of
             # re-adding the full day's losses on every refresh.
@@ -1218,9 +1280,6 @@ class LiveTrader:
 
         return None
 
-    # Price sanity: track recent mids to detect garbage prices
-    _price_history: Dict[str, float] = {}  # coin -> last known good mid
-
     def _validate_price(self, coin: str, price: float) -> bool:
         """
         Validate that a price is reasonable.
@@ -1229,6 +1288,8 @@ class LiveTrader:
         - Zero, negative, NaN, Infinity
         - Prices that deviate >10% from the last known good price
           (protects against corrupt API responses)
+        - First-sample baseline poisoning after restart (requires two
+          reasonably-close samples before trusting the initial baseline)
 
         Returns True if price is sane.
         """
@@ -1242,7 +1303,7 @@ class LiveTrader:
             return False
 
         last_good = self._price_history.get(coin)
-        if last_good:
+        if last_good and last_good > 0:
             deviation = abs(price - last_good) / last_good
             if deviation > 0.10:  # >10% move since last check
                 logger.error(
@@ -1251,9 +1312,45 @@ class LiveTrader:
                     f"Possible corrupt data — blocking order."
                 )
                 return False
+            self._price_history[coin] = price
+            return True
 
-        # Price is sane — update history
-        self._price_history[coin] = price
+        # No trusted baseline yet: require two close samples.
+        seed = self._price_seed_candidates.get(coin)
+        if not seed or seed <= 0:
+            self._price_seed_candidates[coin] = price
+            logger.warning(
+                "Price sanity baseline warm-up for %s: captured first sample %.6f; "
+                "waiting for confirmation sample before strict deviation checks.",
+                coin,
+                price,
+            )
+            return True
+
+        seed_deviation = abs(price - seed) / seed
+        if seed_deviation > 0.05:
+            logger.error(
+                "PRICE REJECTED during baseline warm-up: %s second sample %.6f "
+                "deviates %.1f%% from initial %.6f. Re-seeding baseline.",
+                coin,
+                price,
+                seed_deviation * 100.0,
+                seed,
+            )
+            self._price_seed_candidates[coin] = price
+            return False
+
+        # Promote the confirmed baseline.
+        confirmed = (seed + price) / 2.0
+        self._price_history[coin] = confirmed
+        self._price_seed_candidates.pop(coin, None)
+        logger.info(
+            "Price sanity baseline established for %s at %.6f (seed %.6f / %.6f).",
+            coin,
+            confirmed,
+            seed,
+            price,
+        )
         return True
 
     def _apply_market_slippage(self, mid_price: float, side: str, slippage_pct: float = 0.05) -> float:
@@ -1325,6 +1422,25 @@ class LiveTrader:
                 total += total_sz
                 found = True
         return total if found else None
+
+    @classmethod
+    def _extract_reported_fill_price(cls, result: Optional[Dict]) -> Optional[float]:
+        """Return size-weighted average fill price from an order response, if any."""
+        weighted_notional = 0.0
+        total_size = 0.0
+        for entry in cls._extract_inner_order_statuses(result):
+            filled = entry.get("filled")
+            if not isinstance(filled, dict):
+                continue
+            total_sz = cls._coerce_float(filled.get("totalSz"), 0.0)
+            avg_px = cls._coerce_float(filled.get("avgPx"), 0.0)
+            if total_sz <= 0 or avg_px <= 0:
+                continue
+            weighted_notional += total_sz * avg_px
+            total_size += total_sz
+        if total_size > 0:
+            return weighted_notional / total_size
+        return None
 
     @classmethod
     def _is_order_result_success(cls, result: Optional[Dict]) -> bool:
@@ -1686,6 +1802,9 @@ class LiveTrader:
             reported_fill_size = self._extract_reported_fill_size(result)
             if reported_fill_size is not None:
                 result["exchange_reported_fill_size"] = reported_fill_size
+            reported_fill_price = self._extract_reported_fill_price(result)
+            if reported_fill_price is not None:
+                result["exchange_reported_fill_price"] = reported_fill_price
 
         if self._is_order_result_success(result) and not self.dry_run:
             self.orders_today += 1
@@ -1693,9 +1812,14 @@ class LiveTrader:
         return result
 
     def verify_fill(self, coin: str, expected_side: str, expected_size: float,
-                    timeout: float = 10.0, poll_interval: float = 1.0) -> Optional[Dict]:
+                    timeout: float = 10.0, poll_interval: float = 1.0,
+                    blocking: Optional[bool] = None) -> Optional[Dict]:
         """
-        Poll exchange positions to verify an order actually filled.
+        Verify an order fill against exchange positions.
+
+        Non-blocking by default (single snapshot poll) to avoid stalling
+        trading-cycle threads. Set ``blocking=True`` to keep the legacy
+        poll-with-timeout behavior.
 
         Args:
             coin: Expected coin
@@ -1703,6 +1827,7 @@ class LiveTrader:
             expected_size: Expected position size change
             timeout: Max seconds to wait
             poll_interval: Seconds between polls
+            blocking: Override instance default verification mode
 
         Returns:
             Position dict if verified, None if not found after timeout
@@ -1710,50 +1835,71 @@ class LiveTrader:
         if self.dry_run:
             return {"status": "verified", "dry_run": True}
 
+        expected_side = self._normalize_order_side(expected_side)
+        blocking_mode = self._fill_verify_blocking if blocking is None else bool(blocking)
+
+        def _poll_once(attempt: int) -> Optional[Dict]:
+            positions = self.get_positions()
+            for pos in positions:
+                pos_coin = pos.get("coin", "")
+                pos_size = float(pos.get("szi", 0) or 0)
+
+                if pos_coin != coin or abs(pos_size) == 0:
+                    continue
+
+                # Verify side matches (buy → positive szi, sell → negative)
+                if expected_side == "buy" and pos_size < 0:
+                    continue
+                if expected_side == "sell" and pos_size > 0:
+                    continue
+
+                fill_size = abs(pos_size)
+                if fill_size < expected_size * 0.5:
+                    logger.warning(
+                        f"Fill partial: {coin} got {abs(pos_size):.6f} "
+                        f"vs expected {expected_size:.6f}"
+                    )
+                    continue
+
+                matched_size = min(fill_size, expected_size)
+                partial_fill = matched_size < (expected_size * 0.99)
+                position_entry_price = self._coerce_float(
+                    pos.get("entry_price", pos.get("entryPx", 0)),
+                    0.0,
+                )
+
+                logger.info(
+                    f"Fill VERIFIED: {coin} size={pos_size} "
+                    f"(expected={expected_size:.6f}, attempt {attempt})"
+                )
+                return {
+                    "status": "verified",
+                    "coin": coin,
+                    "size": matched_size,
+                    "position_size": pos_size,
+                    "partial_fill": partial_fill,
+                    "attempt": attempt,
+                    "entry_price": position_entry_price if position_entry_price > 0 else None,
+                }
+            return None
+
+        if not blocking_mode:
+            try:
+                return _poll_once(attempt=1)
+            except Exception as e:
+                logger.debug(f"Fill verification snapshot error: {e}")
+                return None
+
         deadline = time.time() + timeout
         attempt = 0
 
         while time.time() < deadline:
             attempt += 1
             try:
-                positions = self.get_positions()
-                for pos in positions:
-                    pos_coin = pos.get("coin", "")
-                    pos_size = float(pos.get("szi", 0) or 0)
-
-                    if pos_coin != coin or abs(pos_size) == 0:
-                        continue
-
-                    # Verify side matches (buy → positive szi, sell → negative)
-                    if expected_side == "buy" and pos_size < 0:
-                        continue
-                    if expected_side == "sell" and pos_size > 0:
-                        continue
-
-                    fill_size = abs(pos_size)
-                    if fill_size < expected_size * 0.5:
-                        logger.warning(
-                            f"Fill partial: {coin} got {abs(pos_size):.6f} "
-                            f"vs expected {expected_size:.6f}"
-                        )
-                        continue
-
-                    matched_size = min(fill_size, expected_size)
-                    partial_fill = matched_size < (expected_size * 0.99)
-
-                    logger.info(
-                        f"Fill VERIFIED: {coin} size={pos_size} "
-                        f"(expected={expected_size:.6f}, attempt {attempt}, "
-                        f"{time.time() - (deadline - timeout):.1f}s)"
-                    )
-                    return {
-                        "status": "verified",
-                        "coin": coin,
-                        "size": matched_size,
-                        "position_size": pos_size,
-                        "partial_fill": partial_fill,
-                        "attempt": attempt,
-                    }
+                match = _poll_once(attempt=attempt)
+                if match:
+                    match["elapsed_s"] = round(time.time() - (deadline - timeout), 2)
+                    return match
             except Exception as e:
                 logger.debug(f"Fill verification poll error: {e}")
 
@@ -1981,7 +2127,15 @@ class LiveTrader:
         }
 
         result = self._post_order(action)
-        return result.get("status") != "error"
+        ok = self._is_order_result_success(result)
+        if not ok:
+            logger.warning(
+                "Cancel rejected for %s oid=%s: %s",
+                coin,
+                order_id,
+                result,
+            )
+        return ok
 
     def cancel_all_orders(self, coin: Optional[str] = None) -> int:
         """
@@ -2003,10 +2157,19 @@ class LiveTrader:
             if coin:
                 orders = [o for o in orders if o.get("coin") == coin]
 
+            cancelled = 0
             for order in orders:
-                self.cancel_order(order.get("coin"), order.get("id"))
+                if self.cancel_order(order.get("coin"), order.get("id")):
+                    cancelled += 1
 
-            return len(orders)
+            if cancelled < len(orders):
+                logger.warning(
+                    "cancel_all_orders: confirmed %d/%d cancellations%s",
+                    cancelled,
+                    len(orders),
+                    f" for {coin}" if coin else "",
+                )
+            return cancelled
         except Exception as e:
             logger.error(f"Error cancelling orders: {e}")
             return 0
@@ -2060,9 +2223,39 @@ class LiveTrader:
             # Close all positions
             positions = self.get_positions()
             for pos in positions:
-                result = self.close_position(pos.get("coin"))
-                results.append(result)
-                logger.warning(f"Closed position on {pos.get('coin')}")
+                coin = pos.get("coin")
+                if not coin:
+                    continue
+                result = None
+                for attempt in range(1, self._emergency_close_retries + 1):
+                    result = self.close_position(coin)
+                    if self._is_order_result_success(result):
+                        logger.warning(
+                            "Closed position on %s (attempt %d/%d)",
+                            coin,
+                            attempt,
+                            self._emergency_close_retries,
+                        )
+                        break
+                    if attempt < self._emergency_close_retries:
+                        wait = self._emergency_close_retry_delay_s * attempt
+                        logger.warning(
+                            "Emergency close retry for %s in %.1fs (attempt %d/%d): %s",
+                            coin,
+                            wait,
+                            attempt,
+                            self._emergency_close_retries,
+                            result,
+                        )
+                        time.sleep(wait)
+                if result is not None:
+                    results.append(result)
+                    if not self._is_order_result_success(result):
+                        logger.error(
+                            "FAILED to close %s after %d attempts. Manual intervention required.",
+                            coin,
+                            self._emergency_close_retries,
+                        )
 
         except Exception as e:
             logger.error(f"Error in emergency close all: {e}")
@@ -2143,47 +2336,51 @@ class LiveTrader:
         if not regime_info:
             return signal
 
+        # Avoid mutating caller-owned signal objects in-place. This keeps
+        # upstream audit logs and strategy traces immutable.
+        adjusted = copy.deepcopy(signal)
+
         regime = regime_info.get("regime", "neutral")
         confidence = regime_info.get("confidence", 0.0)
 
         # CRIT-FIX CRIT-4 (continued): remove the position_pct * effective_size fallback.
         # execute_signal now guarantees signal.size > 0 before calling this method.
         # Use signal.size directly; log an error if somehow it's still unset here.
-        base_size = signal.size or 0.0
+        base_size = adjusted.size or 0.0
         if base_size <= 0:
             logger.error(
-                f"apply_regime_overlay: signal.size not set for {signal.coin} — "
+                f"apply_regime_overlay: signal.size not set for {adjusted.coin} — "
                 f"skipping size adjustment (execute_signal should have computed it first)"
             )
-            return signal
+            return adjusted
 
         # 1. CRASH regime: reduce size 60%, tighten stop loss to 3%
         if regime == "crash" and confidence > 0.4:
-            signal.size = base_size * 0.4  # 60% reduction = multiply by 0.4
-            signal.risk.stop_loss_pct = 0.03
+            adjusted.size = base_size * 0.4  # 60% reduction = multiply by 0.4
+            adjusted.risk.stop_loss_pct = 0.03
             logger.warning(
                 f"REGIME OVERLAY: crash detected (conf={confidence:.2f}), "
-                f"reducing size 60%, tightening SL to 3% for {signal.coin}"
+                f"reducing size 60%, tightening SL to 3% for {adjusted.coin}"
             )
 
         # 2. VOLATILE regime: reduce size 30%, widen stop loss to 8%
         elif regime == "volatile":
-            signal.size = base_size * 0.7  # 30% reduction = multiply by 0.7
-            signal.risk.stop_loss_pct = 0.08
+            adjusted.size = base_size * 0.7  # 30% reduction = multiply by 0.7
+            adjusted.risk.stop_loss_pct = 0.08
             logger.info(
                 f"REGIME OVERLAY: volatile detected, "
-                f"reducing size 30%, widening SL to 8% for {signal.coin}"
+                f"reducing size 30%, widening SL to 8% for {adjusted.coin}"
             )
 
         # 3. BULLISH regime: allow full size, boost by 10%
         elif regime == "bullish" and confidence > 0.6:
-            signal.size = base_size * 1.1  # 10% boost
+            adjusted.size = base_size * 1.1  # 10% boost
             logger.info(
                 f"REGIME OVERLAY: bullish confirmed (conf={confidence:.2f}), "
-                f"boosting size 10% for {signal.coin}"
+                f"boosting size 10% for {adjusted.coin}"
             )
 
-        return signal
+        return adjusted
 
     def _apply_order_usd_cap(self, signal: TradeSignal) -> Optional[TradeSignal]:
         """
@@ -2383,85 +2580,164 @@ class LiveTrader:
                 entry_result.get("exchange_reported_fill_size"),
                 0.0,
             )
+            exchange_reported_fill_price = self._coerce_float(
+                entry_result.get("exchange_reported_fill_price"),
+                0.0,
+            )
             if exchange_reported_fill_size > 0:
                 expected_fill_size = exchange_reported_fill_size
             actual_fill_size = expected_fill_size
+            verified_fill_price = 0.0
+            fill_check = None
 
             # 1b. Verify the fill actually happened before placing SL/TP
             if not self.dry_run:
-                fill_check = self.verify_fill(coin, entry_side, expected_fill_size, timeout=10.0)
+                try:
+                    fill_check = self.verify_fill(
+                        coin,
+                        entry_side,
+                        expected_fill_size,
+                        timeout=self._fill_verify_timeout_s,
+                        poll_interval=self._fill_verify_poll_s,
+                        blocking=self._execute_fill_verify_blocking,
+                    )
+                except TypeError:
+                    # Backward-compatibility for monkeypatched/tests that still
+                    # use the legacy verify_fill signature.
+                    fill_check = self.verify_fill(
+                        coin,
+                        entry_side,
+                        expected_fill_size,
+                        timeout=self._fill_verify_timeout_s,
+                        poll_interval=self._fill_verify_poll_s,
+                    )
                 if not fill_check:
-                    logger.error(
-                        f"FILL NOT VERIFIED for {coin} {side} {expected_fill_size} — "
-                        f"skipping SL/TP placement. Manual intervention required."
-                    )
-                    return {
-                        "status": "warning",
-                        "message": "order posted but fill not verified",
-                        "coin": coin,
-                        "expected_fill_size": expected_fill_size,
-                        "submitted_size": submitted_entry_size,
-                        "entry_result": entry_result,
-                    }
-                actual_fill_size = float(fill_check.get("size", expected_fill_size) or expected_fill_size)
-                if actual_fill_size <= 0:
-                    logger.error(
-                        "Fill verification returned invalid size for %s: %s",
-                        coin,
-                        fill_check,
-                    )
-                    close_result = self.close_position(coin)
-                    return {
-                        "status": "error",
-                        "message": "invalid_fill_size",
-                        "coin": coin,
-                        "entry_result": entry_result,
-                        "close_result": close_result,
-                    }
-                if fill_check.get("partial_fill"):
+                    if self._execute_fill_verify_blocking:
+                        logger.error(
+                            f"FILL NOT VERIFIED for {coin} {side} {expected_fill_size} — "
+                            f"skipping SL/TP placement. Manual intervention required."
+                        )
+                        return {
+                            "status": "warning",
+                            "message": "order posted but fill not verified",
+                            "coin": coin,
+                            "expected_fill_size": expected_fill_size,
+                            "submitted_size": submitted_entry_size,
+                            "entry_result": entry_result,
+                        }
                     logger.warning(
-                        "Partial fill accepted for %s: protecting %.6f of requested %.6f",
+                        "Fill verification pending for %s (non-blocking mode). "
+                        "Proceeding with conservative protection sizing.",
                         coin,
-                        actual_fill_size,
-                        submitted_entry_size,
                     )
+                else:
+                    actual_fill_size = float(
+                        fill_check.get("size", expected_fill_size) or expected_fill_size
+                    )
+                    verified_fill_price = self._coerce_float(fill_check.get("entry_price"), 0.0)
+                    if actual_fill_size <= 0:
+                        logger.error(
+                            "Fill verification returned invalid size for %s: %s",
+                            coin,
+                            fill_check,
+                        )
+                        close_result = self.close_position(coin)
+                        return {
+                            "status": "error",
+                            "message": "invalid_fill_size",
+                            "coin": coin,
+                            "entry_result": entry_result,
+                            "close_result": close_result,
+                        }
+                    if fill_check.get("partial_fill"):
+                        logger.warning(
+                            "Partial fill accepted for %s: protecting at least %.6f of requested %.6f",
+                            coin,
+                            actual_fill_size,
+                            submitted_entry_size,
+                        )
 
-            # 2. Calculate stop loss and take profit prices
-            mid = self._get_mid_price(coin)
-            if not mid:
-                logger.error(
-                    "Cannot place SL/TP for %s: mid price unavailable. "
-                    "Position is UNPROTECTED — closing immediately.", coin
+            # Protective sizing:
+            # - If we verified a concrete position, protect that observed size.
+            # - If verification is pending/non-blocking, protect intended size.
+            observed_position_size = 0.0
+            if fill_check:
+                observed_position_size = abs(
+                    self._coerce_float(fill_check.get("position_size"), 0.0)
                 )
-                close_result = None
-                if not self.dry_run:
-                    close_result = self.close_position(coin)
+                protective_size = max(actual_fill_size, observed_position_size)
+            else:
+                protective_size = max(expected_fill_size, submitted_entry_size)
+            if protective_size <= 0:
+                logger.error(
+                    "Cannot place protective orders for %s: computed size is invalid "
+                    "(actual=%.6f expected=%.6f submitted=%.6f)",
+                    coin,
+                    actual_fill_size,
+                    expected_fill_size,
+                    submitted_entry_size,
+                )
+                close_result = self.close_position(coin) if not self.dry_run else None
                 return {
                     "status": "error",
-                    "message": "mid_price_unavailable_for_sl_tp",
+                    "message": "invalid_protective_size",
                     "coin": coin,
                     "entry_result": entry_result,
                     "close_result": close_result,
                 }
+            if protective_size > actual_fill_size * 1.01:
+                logger.info(
+                    "Protective size for %s expanded from %.6f to %.6f to cover potential "
+                    "partial-fill remainders.",
+                    coin,
+                    actual_fill_size,
+                    protective_size,
+                )
 
-            # mid is guaranteed non-None here (early return above)
+            # 2. Calculate stop loss and take profit prices from actual fill price when available.
+            entry_anchor_price = exchange_reported_fill_price or verified_fill_price
+            if entry_anchor_price <= 0:
+                mid = self._get_mid_price(coin)
+                if not mid:
+                    logger.error(
+                        "Cannot place SL/TP for %s: neither fill price nor mid price is available. "
+                        "Position is UNPROTECTED — closing immediately.",
+                        coin,
+                    )
+                    close_result = None
+                    if not self.dry_run:
+                        close_result = self.close_position(coin)
+                    return {
+                        "status": "error",
+                        "message": "entry_price_unavailable_for_sl_tp",
+                        "coin": coin,
+                        "entry_result": entry_result,
+                        "close_result": close_result,
+                    }
+                entry_anchor_price = mid
+                logger.warning(
+                    "SL/TP for %s falling back to mid price %.6f (fill price unavailable).",
+                    coin,
+                    entry_anchor_price,
+                )
+
             if side == "buy":
-                sl_price = mid * (1 - signal.risk.stop_loss_pct)
-                tp_price = mid * (1 + signal.risk.take_profit_pct)
+                sl_price = entry_anchor_price * (1 - signal.risk.stop_loss_pct)
+                tp_price = entry_anchor_price * (1 + signal.risk.take_profit_pct)
             else:
-                sl_price = mid * (1 + signal.risk.stop_loss_pct)
-                tp_price = mid * (1 - signal.risk.take_profit_pct)
+                sl_price = entry_anchor_price * (1 + signal.risk.stop_loss_pct)
+                tp_price = entry_anchor_price * (1 - signal.risk.take_profit_pct)
 
             # 3. Place stop loss
             sl_result = self.place_trigger_order(
                 coin, "sell" if side == "buy" else "buy",
-                actual_fill_size, sl_price, tp_or_sl="sl"
+                protective_size, sl_price, tp_or_sl="sl"
             )
 
             # 4. Place take profit
             tp_result = self.place_trigger_order(
                 coin, "sell" if side == "buy" else "buy",
-                actual_fill_size, tp_price, tp_or_sl="tp"
+                protective_size, tp_price, tp_or_sl="tp"
             )
 
             if not self._is_order_result_success(sl_result) or not self._is_order_result_success(tp_result):
@@ -2492,11 +2768,17 @@ class LiveTrader:
                 "coin": coin,
                 "side": signal_side,
                 "size": actual_fill_size,
+                "protected_size": protective_size,
+                "entry_fill_price": entry_anchor_price,
                 "requested_size": requested_entry_size,
                 "submitted_size": submitted_entry_size,
                 "exchange_reported_fill_size": (
                     exchange_reported_fill_size if exchange_reported_fill_size > 0 else None
                 ),
+                "exchange_reported_fill_price": (
+                    exchange_reported_fill_price if exchange_reported_fill_price > 0 else None
+                ),
+                "fill_verified": bool(fill_check),
                 "leverage": signal.leverage,
                 "entry_result": entry_result,
                 "dry_run": self.dry_run,
@@ -2526,11 +2808,16 @@ class LiveTrader:
             "status_reason": self.status_reason,
             "kill_switch_active": self.kill_switch_active,
             "daily_pnl": round(self.daily_pnl, 2),
+            "daily_realized_pnl": round(self.daily_realized_pnl, 2),
+            "daily_unrealized_pnl": round(self.daily_unrealized_pnl, 2),
             "daily_pnl_limit": self.max_daily_loss,
             "orders_today": self.orders_today,
             "fills_today": self.fills_today,
             "max_position_size": self.max_position_size,
             "max_order_usd": self.max_order_usd,
+            "order_dedup_window_s": self._ORDER_DEDUP_WINDOW,
+            "fill_verify_blocking": self._fill_verify_blocking,
+            "execute_fill_verify_blocking": self._execute_fill_verify_blocking,
             "wallet_balance": dict(self._last_balance_snapshot),
             "asset_indices_loaded": len(self.asset_index_map),
             "timestamp": datetime.utcnow().isoformat()

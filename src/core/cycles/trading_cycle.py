@@ -10,6 +10,7 @@ Extracted from ``HyperliquidResearchBot._run_trading_cycle``.
 import logging
 from datetime import datetime
 
+import config
 from src.data import database as db
 from src.core.live_execution import (
     get_execution_open_positions,
@@ -20,6 +21,19 @@ from src.core.live_execution import (
 
 logger = logging.getLogger(__name__)
 logger.addHandler(logging.NullHandler())
+
+_OPTIONS_FLOW_MIN_CONVICTION_PCT = float(
+    getattr(config, "OPTIONS_FLOW_MIN_CONVICTION_PCT", 30.0)
+)
+_ARENA_CHAMPION_MIN_FITNESS = float(
+    getattr(config, "ARENA_CHAMPION_MIN_FITNESS", 0.15)
+)
+_ARENA_CHAMPION_MIN_TRADES = int(
+    getattr(config, "ARENA_CHAMPION_MIN_TRADES", 5)
+)
+_ARENA_CHAMPION_MIN_WIN_RATE = float(
+    getattr(config, "ARENA_CHAMPION_MIN_WIN_RATE", 0.45)
+)
 
 
 # ---------------------------------------------------------------------------
@@ -206,10 +220,10 @@ def run_trading_cycle(container, cycle_count: int) -> None:
                 )
                 if tg.is_configured() and container.options_scanner.top_convictions:
                     for conv in container.options_scanner.top_convictions[:3]:
-                        if conv.get("conviction_pct", 0) > 60:
+                        if conv.get("conviction_pct", 0) >= _OPTIONS_FLOW_MIN_CONVICTION_PCT:
                             tg.notify_strong_signal(
                                 coin=conv["ticker"],
-                                side=conv["direction"],
+                                side=str(conv.get("direction", "")).lower(),
                                 reasons=[
                                     f"Options flow: {conv.get('total_prints', 0)} unusual prints",
                                     f"Net flow: ${conv.get('net_flow', 0):,.0f}",
@@ -317,17 +331,21 @@ def run_trading_cycle(container, cycle_count: int) -> None:
             convictions = getattr(container.options_scanner, "top_convictions", None) or []
             injected_options = 0
             for conv in convictions:
-                if conv.get("conviction_pct", 0) < 70:
+                if conv.get("conviction_pct", 0) < _OPTIONS_FLOW_MIN_CONVICTION_PCT:
                     continue
-                direction = conv.get("direction", "bullish")
-                side = "long" if direction == "bullish" else "short"
+                direction = str(conv.get("direction", "")).upper()
+                side = "long" if direction == "BULLISH" else "short"
                 synthetic = {
                     "id": None,
                     "name": f"options_flow_{conv.get('ticker', 'UNK')}_{side}",
                     "strategy_type": "options_momentum",
                     "trader_address": "options_flow",
-                    "current_score": conv.get("conviction_pct", 70) / 100.0,
-                    "confidence": conv.get("conviction_pct", 70) / 100.0,
+                    "current_score": conv.get(
+                        "conviction_pct", _OPTIONS_FLOW_MIN_CONVICTION_PCT
+                    ) / 100.0,
+                    "confidence": conv.get(
+                        "conviction_pct", _OPTIONS_FLOW_MIN_CONVICTION_PCT
+                    ) / 100.0,
                     "direction": side,
                     "side": side,
                     "source": "options_flow",
@@ -747,7 +765,7 @@ def _execute_options_flow_trades(container, regime_data):
 
         convictions = getattr(container.options_scanner, "top_convictions", None) or []
         for conv in convictions:
-            if conv.get("conviction_pct", 0) < 70:
+            if conv.get("conviction_pct", 0) < _OPTIONS_FLOW_MIN_CONVICTION_PCT:
                 continue
             flow_signal = signal_from_options_flow(
                 ticker=conv["ticker"], direction=conv["direction"],
@@ -981,7 +999,10 @@ def _run_alpha_arena(container, regime_data):
             try:
                 from src.signals.signal_schema import TradeSignal, SignalSide, SignalSource, RiskParams
                 champion_signals = container.arena.get_champion_signals(
-                    current_candles=arena_candles[-100:], min_fitness=0.15, min_trades=10,
+                    current_candles=arena_candles[-100:],
+                    min_fitness=_ARENA_CHAMPION_MIN_FITNESS,
+                    min_trades=_ARENA_CHAMPION_MIN_TRADES,
+                    min_win_rate=_ARENA_CHAMPION_MIN_WIN_RATE,
                 )
                 if champion_signals:
                     logger.info("  Arena champions: %d signals", len(champion_signals))

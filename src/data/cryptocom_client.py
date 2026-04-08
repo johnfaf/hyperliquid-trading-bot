@@ -7,6 +7,7 @@ Supports spot markets (BTC_USD, ETH_USD, etc.) and perpetual futures
 (BTC_USDPERP, ETH_USDPERP, etc.).
 """
 import logging
+import os
 import time
 import requests
 from typing import Optional, Dict, List
@@ -78,7 +79,10 @@ class CryptoComClient:
         self._cache: Dict[str, tuple] = {}  # key -> (data, timestamp)
         self._cache_ttl = cache_ttl
         self._last_request_time = 0
-        self._request_interval = 0.15  # 150ms between requests for rate limiting
+        self._request_interval = float(
+            os.environ.get("CRYPTOCOM_MIN_REQUEST_INTERVAL_S", "0.2")
+        )
+        self._max_retries = int(os.environ.get("CRYPTOCOM_MAX_RETRIES", "3"))
 
     def _throttle(self):
         """Apply rate limiting between requests (150ms)."""
@@ -122,37 +126,61 @@ class CryptoComClient:
         if cached is not None:
             return cached
 
-        # Rate limit
-        self._throttle()
-
         # Make request
-        try:
-            url = f"{self.BASE_URL}/{endpoint}"
-            resp = self.session.get(url, params=params, timeout=10)
+        url = f"{self.BASE_URL}/{endpoint}"
+        for attempt in range(self._max_retries):
+            self._throttle()
+            try:
+                resp = self.session.get(url, params=params, timeout=10)
+                if resp.status_code == 200:
+                    raw = resp.json()
+                    # Crypto.com v1 wraps responses in {"id": -1, "method": "...", "code": 0, "result": {...}}
+                    # Unwrap the result if present
+                    if isinstance(raw, dict) and "result" in raw:
+                        data = raw["result"]
+                    else:
+                        data = raw
+                    self._set_cache(cache_key, data)
+                    return data
 
-            if resp.status_code == 200:
-                raw = resp.json()
-                # Crypto.com v1 wraps responses in {"id": -1, "method": "...", "code": 0, "result": {...}}
-                # Unwrap the result if present
-                if isinstance(raw, dict) and "result" in raw:
-                    data = raw["result"]
-                else:
-                    data = raw
-                self._set_cache(cache_key, data)
-                return data
-            else:
-                logger.warning(f"crypto.com API error {resp.status_code} for {endpoint}: {resp.text[:200]}")
+                if resp.status_code == 429 or resp.status_code >= 500:
+                    backoff = min(8.0, 0.5 * (2 ** attempt))
+                    logger.warning(
+                        "crypto.com API %s returned %d (attempt %d/%d); retrying in %.1fs",
+                        endpoint,
+                        resp.status_code,
+                        attempt + 1,
+                        self._max_retries,
+                        backoff,
+                    )
+                    time.sleep(backoff)
+                    continue
+
+                logger.warning(
+                    "crypto.com API error %d for %s: %s",
+                    resp.status_code,
+                    endpoint,
+                    resp.text[:200],
+                )
                 return None
-
-        except requests.exceptions.Timeout:
-            logger.error(f"Timeout requesting {endpoint}")
-            return None
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Request error for {endpoint}: {e}")
-            return None
-        except Exception as e:
-            logger.error(f"Unexpected error calling {endpoint}: {e}")
-            return None
+            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+                backoff = min(8.0, 0.5 * (2 ** attempt))
+                logger.warning(
+                    "crypto.com network error for %s (attempt %d/%d): %s; retrying in %.1fs",
+                    endpoint,
+                    attempt + 1,
+                    self._max_retries,
+                    e,
+                    backoff,
+                )
+                time.sleep(backoff)
+            except requests.exceptions.RequestException as e:
+                logger.error(f"Request error for {endpoint}: {e}")
+                return None
+            except Exception as e:
+                logger.error(f"Unexpected error calling {endpoint}: {e}")
+                return None
+        return None
 
     def get_ticker(self, coin: str, is_perp: bool = False) -> Optional[Dict]:
         """

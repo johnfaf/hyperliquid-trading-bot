@@ -2,6 +2,7 @@
 Configuration for the Hyperliquid Trading Research Bot.
 """
 import os
+import math
 
 # ─── API Endpoints ─────────────────────────────────────────────
 HYPERLIQUID_API_URL = "https://api.hyperliquid.xyz"
@@ -62,7 +63,10 @@ TIME_WINDOWS = {
 # Weight decay factor for older strategy scores (per day)
 SCORE_DECAY_RATE = 0.95
 # Minimum score to keep a strategy active
-MIN_STRATEGY_SCORE = 0.15
+MIN_STRATEGY_SCORE = 0.05
+# Keep at least top-N strategies active even when all scores are weak, to avoid
+# complete strategy starvation during cold-start or rough regimes.
+MIN_ACTIVE_STRATEGIES = int(os.environ.get("MIN_ACTIVE_STRATEGIES", 5))
 # Max active strategies in DB — prune lowest-scoring beyond this
 MAX_ACTIVE_STRATEGIES = int(os.environ.get("MAX_ACTIVE_STRATEGIES", 200))
 # Max strategies per trading cycle fed to decision engine
@@ -116,9 +120,9 @@ LIVE_MIN_ORDER_USD = float(os.environ.get("LIVE_MIN_ORDER_USD", 11.0))
 # can actually execute; set a higher value via env var as confidence grows.
 # NOTE: a value below LIVE_MIN_ORDER_USD is impossible to honor — the
 # LiveTrader will raise it to LIVE_MIN_ORDER_USD at startup with a warning.
-LIVE_MAX_ORDER_USD = float(os.environ.get("LIVE_MAX_ORDER_USD", 12.0))
+LIVE_MAX_ORDER_USD = float(os.environ.get("LIVE_MAX_ORDER_USD", 100.0))
 # Daily loss limit for the live account in USD (forwarded to LiveTrader).
-LIVE_MAX_DAILY_LOSS_USD = float(os.environ.get("LIVE_MAX_DAILY_LOSS_USD", 5.0))
+LIVE_MAX_DAILY_LOSS_USD = float(os.environ.get("LIVE_MAX_DAILY_LOSS_USD", 100.0))
 HL_WALLET_MODE = os.environ.get("HL_WALLET_MODE", "agent_only").strip().lower()
 SECRET_MANAGER_PROVIDER = os.environ.get(
     "SECRET_MANAGER_PROVIDER", "none"
@@ -220,6 +224,16 @@ ENABLE_PREDICTIVE_FORECASTER = os.environ.get("ENABLE_PREDICTIVE_FORECASTER", "t
 FORECASTER_CRASH_THRESHOLD = float(os.environ.get("FORECASTER_CRASH_THRESHOLD", -0.15))
 ARKHAM_API_KEY = os.environ.get("ARKHAM_API_KEY")  # Optional: platform.arkhamintelligence.com
 
+# Arena champion bootstrap controls.
+ARENA_CHAMPION_MIN_FITNESS = float(os.environ.get("ARENA_CHAMPION_MIN_FITNESS", 0.15))
+ARENA_CHAMPION_MIN_TRADES = int(os.environ.get("ARENA_CHAMPION_MIN_TRADES", 5))
+ARENA_CHAMPION_MIN_WIN_RATE = float(os.environ.get("ARENA_CHAMPION_MIN_WIN_RATE", 0.45))
+
+# Options-flow conviction gate (0-100).
+OPTIONS_FLOW_MIN_CONVICTION_PCT = float(
+    os.environ.get("OPTIONS_FLOW_MIN_CONVICTION_PCT", 30.0)
+)
+
 # ─── XGBoost Forecaster (optional ML upgrade) ─────────────────
 ENABLE_XGBOOST_FORECASTER = os.environ.get("ENABLE_XGBOOST_FORECASTER", "true").lower() in ("true", "1", "yes")
 XGBOOST_MODEL_PATH = "models/regime_xgboost.json"
@@ -260,3 +274,94 @@ LOG_LEVEL = "INFO"
 
 # ─── Reports ───────────────────────────────────────────────────
 REPORTS_DIR = os.path.join(os.path.dirname(__file__), "reports")
+
+
+def _warn_config(msg: str) -> None:
+    # Boot logging may not be configured yet.
+    print(f"[config] {msg}")
+
+
+def _validate_numeric_bounds(name: str, min_value: float, max_value: float, fallback):
+    value = globals().get(name, fallback)
+    if isinstance(value, bool):
+        return
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        _warn_config(f"Invalid {name}={value!r}; using fallback {fallback}.")
+        globals()[name] = fallback
+        return
+    if not math.isfinite(numeric):
+        _warn_config(f"Non-finite {name}={value!r}; using fallback {fallback}.")
+        globals()[name] = fallback
+        return
+    clamped = min(max(numeric, min_value), max_value)
+    if clamped != numeric:
+        _warn_config(
+            f"{name}={numeric} out of range [{min_value}, {max_value}] "
+            f"-> clamped to {clamped}."
+        )
+    if isinstance(fallback, int):
+        globals()[name] = int(clamped)
+    else:
+        globals()[name] = float(clamped)
+
+
+def _validate_config_bounds() -> None:
+    """Best-effort guardrails for env-configurable numeric settings."""
+    rules = [
+        ("MIN_STRATEGY_SCORE", 0.0, 1.0, 0.05),
+        ("MAX_ACTIVE_STRATEGIES", 1, 5000, 200),
+        ("MIN_ACTIVE_STRATEGIES", 1, 500, 5),
+        ("MAX_STRATEGIES_PER_CYCLE", 1, 200, 15),
+        ("PAPER_TRADING_MAX_LEVERAGE", 1.0, 25.0, 5.0),
+        ("PAPER_TRADING_STOP_LOSS_PCT", 0.001, 1.0, 0.15),
+        ("PAPER_TRADING_TAKE_PROFIT_PCT", 0.001, 3.0, 0.30),
+        ("LIVE_MIN_ORDER_USD", 10.0, 1_000_000.0, 11.0),
+        ("LIVE_MAX_ORDER_USD", 10.0, 1_000_000.0, 100.0),
+        ("LIVE_MAX_DAILY_LOSS_USD", 1.0, 10_000_000.0, 100.0),
+        ("PORTFOLIO_TARGET_POSITIONS", 1, 100, 8),
+        ("PORTFOLIO_HARD_MAX_POSITIONS", 1, 200, 10),
+        ("PORTFOLIO_RESERVED_HIGH_CONVICTION_SLOTS", 0, 50, 2),
+        ("PORTFOLIO_HIGH_CONVICTION_THRESHOLD", 0.0, 1.0, 0.78),
+        ("PORTFOLIO_REPLACEMENT_THRESHOLD", 0.0, 1.0, 0.15),
+        ("PORTFOLIO_MAX_REPLACEMENTS_PER_CYCLE", 0, 50, 1),
+        ("PORTFOLIO_MAX_REPLACEMENTS_PER_HOUR", 0, 200, 4),
+        ("PORTFOLIO_MAX_REPLACEMENTS_PER_DAY", 0, 500, 12),
+        ("PORTFOLIO_MAX_COIN_EXPOSURE_PCT", 0.0, 1.0, 0.45),
+        ("PORTFOLIO_MAX_SIDE_EXPOSURE_PCT", 0.0, 1.0, 0.65),
+        ("PORTFOLIO_MAX_CLUSTER_EXPOSURE_PCT", 0.0, 1.0, 0.55),
+        ("FIREWALL_MIN_CONFIDENCE", 0.0, 1.0, 0.45),
+        ("TRADING_CYCLE_INTERVAL", 10, 86_400, 900),
+        ("DISCOVERY_CYCLE_INTERVAL", 60, 2_592_000, 86400),
+        ("POLYMARKET_SCAN_INTERVAL", 10, 3600, 180),
+        ("OPTIONS_FLOW_SCAN_INTERVAL", 10, 3600, 120),
+        ("FORECASTER_EXTERNAL_DATA_TTL", 10, 86_400, 600),
+        ("ARENA_CHAMPION_MIN_FITNESS", 0.0, 1.0, 0.15),
+        ("ARENA_CHAMPION_MIN_TRADES", 1, 500, 5),
+        ("ARENA_CHAMPION_MIN_WIN_RATE", 0.0, 1.0, 0.45),
+        ("OPTIONS_FLOW_MIN_CONVICTION_PCT", 0.0, 100.0, 30.0),
+        ("XGBOOST_MIN_CONFIDENCE", 0.0, 1.0, 0.52),
+        ("XGBOOST_RETRAIN_INTERVAL", 60, 2_592_000, 86400),
+        ("KELLY_MULTIPLIER", 0.0, 1.0, 0.25),
+        ("MONTE_CARLO_PATHS", 100, 200_000, 5000),
+    ]
+    for name, min_value, max_value, fallback in rules:
+        _validate_numeric_bounds(name, min_value, max_value, fallback)
+
+    if LIVE_MAX_ORDER_USD < LIVE_MIN_ORDER_USD:
+        _warn_config(
+            f"LIVE_MAX_ORDER_USD ({LIVE_MAX_ORDER_USD}) is below LIVE_MIN_ORDER_USD "
+            f"({LIVE_MIN_ORDER_USD}); raising max to min."
+        )
+        globals()["LIVE_MAX_ORDER_USD"] = float(LIVE_MIN_ORDER_USD)
+
+    if PORTFOLIO_HARD_MAX_POSITIONS < PORTFOLIO_TARGET_POSITIONS:
+        _warn_config(
+            "PORTFOLIO_HARD_MAX_POSITIONS is below PORTFOLIO_TARGET_POSITIONS; "
+            "raising hard max to target."
+        )
+        globals()["PORTFOLIO_HARD_MAX_POSITIONS"] = int(PORTFOLIO_TARGET_POSITIONS)
+
+
+_validate_config_bounds()

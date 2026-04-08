@@ -4,6 +4,7 @@ SQLite database layer for persisting traders, strategies, scores, and paper trad
 import sqlite3
 import json
 import os
+import shutil
 import logging
 from datetime import datetime
 from contextlib import contextmanager
@@ -17,20 +18,39 @@ logger = logging.getLogger(__name__)
 # Resolved once at import — config.py already tested writability
 _DB_PATH = config.DB_PATH
 os.makedirs(os.path.dirname(os.path.abspath(_DB_PATH)), exist_ok=True)
+_DB_MIN_FREE_MB = max(1.0, float(os.environ.get("DB_MIN_FREE_MB", "100")))
 
 
 def get_db_path():
     return _DB_PATH
 
 
+def _assert_db_disk_space() -> None:
+    """Guard DB writes against low-disk conditions."""
+    db_dir = os.path.dirname(os.path.abspath(_DB_PATH))
+    usage = shutil.disk_usage(db_dir)
+    free_mb = usage.free / (1024 * 1024)
+    if free_mb < _DB_MIN_FREE_MB:
+        raise RuntimeError(
+            f"Insufficient disk space for DB operations: {free_mb:.1f}MB free "
+            f"(minimum {_DB_MIN_FREE_MB:.1f}MB)"
+        )
+
+
 @contextmanager
 def get_connection():
+    _assert_db_disk_space()
     conn = sqlite3.connect(get_db_path())
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=5000")
     try:
         yield conn
         conn.commit()
+    except sqlite3.OperationalError as exc:
+        logger.warning("SQLite operational error: %s", exc)
+        conn.rollback()
+        raise
     except Exception:
         conn.rollback()
         raise
@@ -701,6 +721,7 @@ def restore_from_json(filepath: str = None):
 
         # Restore golden wallets (v2 backup)
         golden_count = 0
+        golden_failures = 0
         fills_count = 0
         if data.get("golden_wallets"):
             try:
@@ -733,8 +754,14 @@ def restore_from_json(filepath: str = None):
                                 gw.get("connected_to_live", 0),
                             ))
                             golden_count += 1
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            golden_failures += 1
+                            if golden_failures <= 3:
+                                logger.warning(
+                                    "Restore golden_wallets row failed for %s: %s",
+                                    gw.get("address", "?"),
+                                    e,
+                                )
             except Exception as e:
                 print(f"Warning: could not restore golden wallets: {e}")
 
@@ -742,6 +769,7 @@ def restore_from_json(filepath: str = None):
         # Schema: wallet_address, coin, side, original_price, penalised_price,
         #         size, time_ms, delayed_time_ms, closed_pnl, penalised_pnl,
         #         fee, is_liquidation, direction
+        fills_failures = 0
         if data.get("wallet_fills"):
             try:
                 with get_connection() as conn:
@@ -770,10 +798,22 @@ def restore_from_json(filepath: str = None):
                                 fill.get("direction", ""),
                             ))
                             fills_count += 1
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            fills_failures += 1
+                            if fills_failures <= 3:
+                                logger.warning(
+                                    "Restore wallet_fills row failed for %s %s: %s",
+                                    fill.get("wallet_address", "?"),
+                                    fill.get("coin", "?"),
+                                    e,
+                                )
             except Exception as e:
                 print(f"Warning: could not restore wallet fills: {e}")
+
+        if golden_failures:
+            logger.warning("Restore golden_wallets: %d rows failed", golden_failures)
+        if fills_failures:
+            logger.warning("Restore wallet_fills: %d rows failed", fills_failures)
 
         print(f"Restored DB from backup: {len(data.get('traders', []))} traders, "
               f"{len(data.get('bot_traders', []))} bots, "

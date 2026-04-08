@@ -59,7 +59,7 @@ def get_live_golden_wallets() -> List[Dict]:
             d = dict(r)
             try:
                 d["coins_traded"] = json.loads(d.get("coins_traded", "[]"))
-            except:
+            except Exception:
                 d["coins_traded"] = []
             results.append(d)
         return results
@@ -191,7 +191,7 @@ def get_stats() -> Dict:
             "golden_wallets": golden,
             "live_connected": live,
         }
-    except:
+    except Exception:
         return {"total_evaluated": 0, "golden_wallets": 0, "live_connected": 0}
     finally:
         conn.close()

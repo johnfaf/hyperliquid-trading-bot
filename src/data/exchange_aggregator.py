@@ -36,28 +36,69 @@ SYMBOL_MAP = {
     "TIA": {"binance": "TIAUSDT", "bybit": "TIAUSDT", "kraken": None, "coinbase": "TIA-USD", "cryptocom": "TIA_USD"},
 }
 
-# Rate limiting
-_last_req = 0
-_REQ_INTERVAL = 0.15  # 150ms between requests
+# Per-exchange rate limiting for direct external REST calls.
+_EXCHANGE_REQ_INTERVAL = {
+    "binance": 0.12,
+    "bybit": 0.18,
+    "kraken": 0.35,
+    "coinbase": 0.25,
+    "cryptocom": 0.2,
+    "generic": 0.2,
+}
+_last_req_by_exchange = {name: 0.0 for name in _EXCHANGE_REQ_INTERVAL}
 
 
-def _throttle():
-    global _last_req
-    elapsed = time.time() - _last_req
-    if elapsed < _REQ_INTERVAL:
-        time.sleep(_REQ_INTERVAL - elapsed)
-    _last_req = time.time()
+def _throttle(exchange: str = "generic"):
+    interval = _EXCHANGE_REQ_INTERVAL.get(exchange, _EXCHANGE_REQ_INTERVAL["generic"])
+    last = _last_req_by_exchange.get(exchange, 0.0)
+    elapsed = time.time() - last
+    if elapsed < interval:
+        time.sleep(interval - elapsed)
+    _last_req_by_exchange[exchange] = time.time()
 
 
-def _safe_get(url: str, params: dict = None, timeout: int = 10) -> Optional[dict]:
-    """Safe GET request with error handling."""
-    _throttle()
-    try:
-        resp = requests.get(url, params=params, timeout=timeout)
-        if resp.status_code == 200:
-            return resp.json()
-    except Exception as e:
-        logger.debug(f"Request failed {url}: {e}")
+def _safe_get(
+    url: str,
+    params: dict = None,
+    timeout: int = 10,
+    exchange: str = "generic",
+    retries: int = 3,
+) -> Optional[dict]:
+    """Safe GET request with per-exchange throttling and retry/backoff."""
+    for attempt in range(retries):
+        _throttle(exchange)
+        try:
+            resp = requests.get(url, params=params, timeout=timeout)
+            if resp.status_code == 200:
+                return resp.json()
+            if resp.status_code == 429 or resp.status_code >= 500:
+                backoff = min(8.0, 0.5 * (2 ** attempt))
+                logger.warning(
+                    "%s request returned %d (attempt %d/%d); retrying in %.1fs",
+                    exchange,
+                    resp.status_code,
+                    attempt + 1,
+                    retries,
+                    backoff,
+                )
+                time.sleep(backoff)
+                continue
+            logger.debug("%s request failed %s status=%d", exchange, url, resp.status_code)
+            return None
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+            backoff = min(8.0, 0.5 * (2 ** attempt))
+            logger.warning(
+                "%s request error %s (attempt %d/%d); retrying in %.1fs",
+                exchange,
+                e,
+                attempt + 1,
+                retries,
+                backoff,
+            )
+            time.sleep(backoff)
+        except Exception as e:
+            logger.debug(f"Request failed {url}: {e}")
+            return None
     return None
 
 
@@ -65,7 +106,11 @@ def _safe_get(url: str, params: dict = None, timeout: int = 10) -> Optional[dict
 
 def _binance_ticker(symbol: str) -> Optional[Dict]:
     """Get 24h ticker from Binance."""
-    data = _safe_get("https://api.binance.com/api/v3/ticker/24hr", {"symbol": symbol})
+    data = _safe_get(
+        "https://api.binance.com/api/v3/ticker/24hr",
+        {"symbol": symbol},
+        exchange="binance",
+    )
     if data:
         return {
             "exchange": "binance",
@@ -82,7 +127,11 @@ def _binance_ticker(symbol: str) -> Optional[Dict]:
 
 def _binance_futures_oi(symbol: str) -> Optional[Dict]:
     """Get open interest from Binance Futures."""
-    data = _safe_get("https://fapi.binance.com/fapi/v1/openInterest", {"symbol": symbol})
+    data = _safe_get(
+        "https://fapi.binance.com/fapi/v1/openInterest",
+        {"symbol": symbol},
+        exchange="binance",
+    )
     if data:
         return {
             "open_interest": float(data.get("openInterest", 0)),
@@ -95,7 +144,8 @@ def _binance_long_short_ratio(symbol: str) -> Optional[Dict]:
     """Get top trader long/short ratio from Binance Futures."""
     data = _safe_get(
         "https://fapi.binance.com/futures/data/topLongShortAccountRatio",
-        {"symbol": symbol, "period": "1h", "limit": 1}
+        {"symbol": symbol, "period": "1h", "limit": 1},
+        exchange="binance",
     )
     if data and len(data) > 0:
         return {
@@ -108,7 +158,11 @@ def _binance_long_short_ratio(symbol: str) -> Optional[Dict]:
 
 def _binance_funding_rate(symbol: str) -> Optional[float]:
     """Get current funding rate from Binance Futures."""
-    data = _safe_get("https://fapi.binance.com/fapi/v1/premiumIndex", {"symbol": symbol})
+    data = _safe_get(
+        "https://fapi.binance.com/fapi/v1/premiumIndex",
+        {"symbol": symbol},
+        exchange="binance",
+    )
     if data:
         return float(data.get("lastFundingRate", 0))
     return None
@@ -118,7 +172,11 @@ def _binance_funding_rate(symbol: str) -> Optional[float]:
 
 def _bybit_ticker(symbol: str) -> Optional[Dict]:
     """Get 24h ticker from Bybit."""
-    data = _safe_get("https://api.bybit.com/v5/market/tickers", {"category": "linear", "symbol": symbol})
+    data = _safe_get(
+        "https://api.bybit.com/v5/market/tickers",
+        {"category": "linear", "symbol": symbol},
+        exchange="bybit",
+    )
     if data and data.get("result", {}).get("list"):
         t = data["result"]["list"][0]
         return {
@@ -138,7 +196,11 @@ def _bybit_ticker(symbol: str) -> Optional[Dict]:
 
 def _kraken_ticker(pair: str) -> Optional[Dict]:
     """Get ticker from Kraken."""
-    data = _safe_get("https://api.kraken.com/0/public/Ticker", {"pair": pair})
+    data = _safe_get(
+        "https://api.kraken.com/0/public/Ticker",
+        {"pair": pair},
+        exchange="kraken",
+    )
     if data and data.get("result") and len(data["result"]) > 0:
         key = list(data["result"].keys())[0]
         t = data["result"][key]
@@ -159,7 +221,10 @@ def _kraken_ticker(pair: str) -> Optional[Dict]:
 
 def _coinbase_ticker(product_id: str) -> Optional[Dict]:
     """Get ticker from Coinbase."""
-    data = _safe_get(f"https://api.exchange.coinbase.com/products/{product_id}/stats")
+    data = _safe_get(
+        f"https://api.exchange.coinbase.com/products/{product_id}/stats",
+        exchange="coinbase",
+    )
     if data:
         price = float(data.get("last", 0))
         vol = float(data.get("volume", 0))
@@ -180,7 +245,8 @@ def _cryptocom_ticker(instrument_name: str) -> Optional[Dict]:
     """Get 24h ticker from Crypto.com Exchange."""
     raw = _safe_get(
         "https://api.crypto.com/exchange/v1/public/get-tickers",
-        {"instrument_name": instrument_name}
+        {"instrument_name": instrument_name},
+        exchange="cryptocom",
     )
     if not raw:
         return None
@@ -290,6 +356,18 @@ class ExchangeAggregator:
 
         if not results:
             return None
+
+        expected = [ex for ex, symbol in symbols.items() if symbol]
+        got = {"cryptocom" if k == "crypto.com" else k for k in results.keys()}
+        if len(got) < len(expected):
+            missing = sorted(set(expected) - got)
+            if missing:
+                logger.warning(
+                    "Partial multi-exchange data for %s: got=%s missing=%s",
+                    coin,
+                    sorted(got),
+                    missing,
+                )
 
         return self._compute_aggregate(coin, results)
 

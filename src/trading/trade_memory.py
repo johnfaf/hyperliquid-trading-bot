@@ -20,6 +20,7 @@ import logging
 import json
 import math
 import sqlite3
+import threading
 import numpy as np
 from typing import Dict, List, Optional, Tuple
 from datetime import datetime
@@ -95,16 +96,47 @@ class TradeMemory:
     def __init__(self, db_path: Optional[str] = None):
         import config
         self.db_path = db_path or config.DB_PATH
+        self._local = threading.local()
         self._init_table()
         self._cache_count = 0
         self._update_cache_count()
 
         logger.info(f"TradeMemory initialized with {self._cache_count} stored trades")
 
+    def _get_conn(self, row_factory=None) -> sqlite3.Connection:
+        """
+        Return a persistent thread-local SQLite connection.
+        Avoids open/close-per-operation overhead under fast cycles.
+        """
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            conn = sqlite3.connect(self.db_path, timeout=5)
+            conn.execute("PRAGMA busy_timeout=5000")
+            self._local.conn = conn
+        conn.row_factory = row_factory
+        return conn
+
+    def close(self):
+        """Close the thread-local SQLite connection, if present."""
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            return
+        try:
+            conn.close()
+        finally:
+            self._local.conn = None
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
+
     def _init_table(self):
         """Create the trade_memory table if it doesn't exist."""
+        conn = None
         try:
-            conn = sqlite3.connect(self.db_path)
+            conn = self._get_conn()
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS trade_memory (
                     trade_id TEXT PRIMARY KEY,
@@ -135,16 +167,14 @@ class TradeMemory:
                 ON trade_memory(strategy_type)
             """)
             conn.commit()
-            conn.close()
         except Exception as e:
             logger.warning(f"Could not init trade_memory table: {e}")
 
     def _update_cache_count(self):
         try:
-            conn = sqlite3.connect(self.db_path)
+            conn = self._get_conn()
             row = conn.execute("SELECT COUNT(*) FROM trade_memory").fetchone()
             self._cache_count = row[0] if row else 0
-            conn.close()
         except Exception:
             self._cache_count = 0
 
@@ -164,8 +194,9 @@ class TradeMemory:
         # Extract feature vector for similarity search
         feature_vector = self._extract_feature_vector(features)
 
+        conn = None
         try:
-            conn = sqlite3.connect(self.db_path)
+            conn = self._get_conn()
             conn.execute("""
                 INSERT OR REPLACE INTO trade_memory
                 (trade_id, coin, side, strategy_type, entry_price, exit_price,
@@ -179,9 +210,13 @@ class TradeMemory:
                 json.dumps(features), json.dumps(feature_vector),
             ))
             conn.commit()
-            conn.close()
             self._cache_count += 1
         except Exception as e:
+            try:
+                if conn is not None:
+                    conn.rollback()
+            except Exception:
+                pass
             logger.debug(f"Could not record trade to memory: {e}")
 
     def find_similar(self, features: Dict, coin: Optional[str] = None,
@@ -214,8 +249,7 @@ class TradeMemory:
 
         # Query past trades
         try:
-            conn = sqlite3.connect(self.db_path)
-            conn.row_factory = sqlite3.Row
+            conn = self._get_conn(row_factory=sqlite3.Row)
 
             query = "SELECT * FROM trade_memory WHERE 1=1"
             params = []
@@ -231,7 +265,6 @@ class TradeMemory:
                 params.append(side)
 
             rows = conn.execute(query, params).fetchall()
-            conn.close()
         except Exception as e:
             # MED-FIX MED-8: elevate to WARNING and return "caution" instead of
             # "proceed" — a DB error here means historical loss patterns on this
@@ -328,12 +361,11 @@ class TradeMemory:
     def get_stats(self) -> Dict:
         """Get memory statistics."""
         try:
-            conn = sqlite3.connect(self.db_path)
+            conn = self._get_conn()
             total = conn.execute("SELECT COUNT(*) FROM trade_memory").fetchone()[0]
             wins = conn.execute("SELECT COUNT(*) FROM trade_memory WHERE win = 1").fetchone()[0]
             coins = conn.execute("SELECT COUNT(DISTINCT coin) FROM trade_memory").fetchone()[0]
             strategies = conn.execute("SELECT COUNT(DISTINCT strategy_type) FROM trade_memory").fetchone()[0]
-            conn.close()
             return {
                 "total_trades": total,
                 "win_rate": wins / total if total > 0 else 0,

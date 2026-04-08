@@ -115,25 +115,25 @@ class TestOptionsFlowScanner:
         assert result.get("is_unusual") is True
 
     def test_get_flow_signal_strong_conviction(self, scanner):
-        """get_flow_signal returns signal when conviction_pct > 60"""
+        """get_flow_signal returns signal when conviction_pct >= configured gate."""
         scanner.top_convictions = [{
             "ticker": "BTC",
             "direction": "BULLISH",
-            "conviction_pct": 75,
+            "conviction_pct": 45,
             "net_flow": 1_000_000,
             "total_prints": 12,
         }]
         signal = scanner.get_flow_signal("BTC")
         assert signal is not None
-        assert signal.get("confidence") == pytest.approx(0.75)
+        assert signal.get("confidence") == pytest.approx(0.45)
         assert signal.get("side") == "long"
 
     def test_get_flow_signal_weak_conviction(self, scanner):
-        """get_flow_signal returns None when conviction_pct <= 60"""
+        """get_flow_signal returns None when conviction_pct is below configured gate."""
         scanner.top_convictions = [{
             "ticker": "BTC",
             "direction": "BULLISH",
-            "conviction_pct": 45,
+            "conviction_pct": 25,
             "net_flow": 500_000,
             "total_prints": 5,
         }]

@@ -75,6 +75,7 @@ class CrossVenueHedger:
         self.binance_enabled = cfg.get("binance_enabled", True)
         self.bybit_enabled = cfg.get("bybit_enabled", False)
         self.rate_limit_ms = cfg.get("rate_limit_ms", 100)
+        self.allow_unimplemented_live = bool(cfg.get("allow_unimplemented_live", False))
 
         # API credentials (loaded from environment)
         self.binance_api_key = os.environ.get("BINANCE_API_KEY", "")
@@ -100,6 +101,15 @@ class CrossVenueHedger:
         self._last_api_call_ts = 0.0
 
         mode_str = "DRY_RUN" if self.dry_run else "LIVE"
+
+        if not self.dry_run and not self.allow_unimplemented_live and (self.binance_enabled or self.bybit_enabled):
+            logger.error(
+                "Cross-venue hedger live execution is disabled: API signing/execution "
+                "is not fully implemented. Forcing hedger to no-op live mode."
+            )
+            self.binance_enabled = False
+            self.bybit_enabled = False
+
         venues = []
         if self.binance_enabled:
             venues.append("Binance")
@@ -269,16 +279,17 @@ class CrossVenueHedger:
                 )
                 return True
 
-            # Production: Would sign and POST to endpoint here
-            # POST https://fapi.binance.com/fapi/v1/order
-            # Headers: X-MBX-APIKEY: {self.binance_api_key}
-            # Body: {order_params with signature}
-            logger.info(
-                f"Placing Binance hedge order: {side} {size} {symbol} "
-                f"(reduce-only)"
+            if not self.allow_unimplemented_live:
+                logger.error(
+                    "Binance live hedge blocked for %s: order execution path is not implemented.",
+                    coin,
+                )
+                return False
+            logger.warning(
+                "allow_unimplemented_live=True but Binance execution still unimplemented. "
+                "Returning failure to avoid false hedge accounting."
             )
-            # TODO: Implement actual signed request with signature
-            return True
+            return False
 
         except Exception as e:
             logger.error(f"Failed to place Binance hedge for {coin}: {e}")
@@ -319,16 +330,17 @@ class CrossVenueHedger:
                 )
                 return True
 
-            # Production: Would sign and POST to endpoint here
-            # POST https://api.bybit.com/v5/order/create
-            # Headers: X-BAPI-SIGN: {signature}, X-BAPI-API-KEY: {self.bybit_api_key}
-            # JSON body: {order_body}
-            logger.info(
-                f"Placing Bybit hedge order: {bybit_side} {size} {symbol} "
-                f"(reduce-only)"
+            if not self.allow_unimplemented_live:
+                logger.error(
+                    "Bybit live hedge blocked for %s: order execution path is not implemented.",
+                    coin,
+                )
+                return False
+            logger.warning(
+                "allow_unimplemented_live=True but Bybit execution still unimplemented. "
+                "Returning failure to avoid false hedge accounting."
             )
-            # TODO: Implement actual signed request with signature
-            return True
+            return False
 
         except Exception as e:
             logger.error(f"Failed to place Bybit hedge for {coin}: {e}")

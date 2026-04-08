@@ -78,6 +78,24 @@ class PositionMonitor:
         self._gap_count = 0
         self._max_gap_ms = 0.0
 
+        # Mid-price cache is refreshed by a dedicated REST thread so the
+        # WebSocket message handler never blocks on external HTTP calls.
+        self._mids_cache: Dict[str, float] = {}
+        self._mids_last_refresh = 0.0
+        self._mids_refresh_interval_s = max(
+            0.5,
+            float(getattr(config, "POSITION_MONITOR_MIDS_REFRESH_S", 1.5)),
+        )
+        self._mids_thread = None
+
+        # Watchdog: if WS stays "connected" but no messages arrive for too
+        # long, force-close so run_forever reconnects and re-subscribes.
+        self._watchdog_timeout_s = max(
+            10.0,
+            float(getattr(config, "POSITION_MONITOR_WATCHDOG_TIMEOUT_S", 30.0)),
+        )
+        self._watchdog_thread = None
+
     def start(self, addresses: List[str]) -> None:
         """
         Connect to WebSocket and subscribe to userEvents for the given addresses.
@@ -97,6 +115,10 @@ class PositionMonitor:
         self._running = True
         self._thread = threading.Thread(target=self._run_forever, daemon=True)
         self._thread.start()
+        self._mids_thread = threading.Thread(target=self._refresh_mids_loop, daemon=True)
+        self._mids_thread.start()
+        self._watchdog_thread = threading.Thread(target=self._watchdog_loop, daemon=True)
+        self._watchdog_thread.start()
         logger.info(f"PositionMonitor starting with {len(addresses)} traders")
 
     def stop(self) -> None:
@@ -208,19 +230,25 @@ class PositionMonitor:
 
         with self._lock:
             self._connected = True
+            self._last_msg_time = time.time()
+            tracked = list(self._tracked_addresses)
 
         if was_reconnect:
             logger.info("PositionMonitor RECONNECTED — clearing stale cache")
             with self._lock:
                 self._position_cache.clear()
                 self._subscribed_addresses.clear()
+            # Bootstrap fresh position state before consuming new deltas.
+            for address in tracked:
+                self._bootstrap_positions(address)
         else:
             logger.info("PositionMonitor connected")
+            for address in tracked:
+                self._bootstrap_positions(address)
 
         # Subscribe to all tracked addresses
-        with self._lock:
-            for address in list(self._tracked_addresses):
-                self._subscribe_to_address(address)
+        for address in tracked:
+            self._subscribe_to_address(address)
 
     def _subscribe_to_address(self, address: str) -> None:
         """
@@ -383,8 +411,9 @@ class PositionMonitor:
         old_coins = set(old_positions.keys())
         new_coins = set(new_positions.keys())
 
-        # Get current prices for confidence/pricing
-        mids = hl.get_all_mids() or {}
+        # Read latest prices from dedicated mids-refresh cache.
+        with self._lock:
+            mids = dict(self._mids_cache)
 
         # 1. New positions opened
         for coin in new_coins - old_coins:
@@ -454,6 +483,53 @@ class PositionMonitor:
                 })
 
         return signals
+
+    def _refresh_mids_loop(self) -> None:
+        """Refresh all-mids cache out-of-band from the WebSocket handler thread."""
+        while self._running:
+            try:
+                mids_raw = hl.get_all_mids() or {}
+                if isinstance(mids_raw, dict):
+                    mids_clean = {}
+                    for coin, px in mids_raw.items():
+                        try:
+                            price = float(px)
+                            if price > 0:
+                                mids_clean[coin] = price
+                        except (TypeError, ValueError):
+                            continue
+                    if mids_clean:
+                        with self._lock:
+                            self._mids_cache = mids_clean
+                            self._mids_last_refresh = time.time()
+            except Exception as exc:
+                logger.debug("PositionMonitor mids refresh error: %s", exc)
+            time.sleep(self._mids_refresh_interval_s)
+
+    def _watchdog_loop(self) -> None:
+        """Force reconnect if WS is silent for too long."""
+        check_interval = max(5.0, self._watchdog_timeout_s / 3.0)
+        while self._running:
+            time.sleep(check_interval)
+            with self._lock:
+                connected = self._connected
+                last_msg = self._last_msg_time
+                ws = self._ws
+            if not connected or last_msg <= 0:
+                continue
+            idle_s = time.time() - last_msg
+            if idle_s <= self._watchdog_timeout_s:
+                continue
+            logger.warning(
+                "PositionMonitor watchdog: no messages for %.1fs (> %.1fs), forcing reconnect",
+                idle_s,
+                self._watchdog_timeout_s,
+            )
+            try:
+                if ws:
+                    ws.close()
+            except Exception as exc:
+                logger.debug("PositionMonitor watchdog close error: %s", exc)
 
     # ─── Bootstrap: Initial position fetch ──────────────────────────
 

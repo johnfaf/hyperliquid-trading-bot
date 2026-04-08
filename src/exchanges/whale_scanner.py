@@ -14,6 +14,7 @@ Integration into pipeline:
   firewall validation → execution
 """
 import logging
+import threading
 from typing import Dict, List, Optional
 from datetime import datetime
 
@@ -22,9 +23,6 @@ logger = logging.getLogger(__name__)
 
 class WhaleScanner:
     """Detect and track whale trades across monitored coins."""
-
-    # Track recent whales to avoid duplicate signals within 30 seconds
-    _whale_cache: Dict[str, float] = {}  # key: f"{coin}:{side}:{notional}" -> timestamp
 
     def __init__(self, cryptocom_client=None, coins: Optional[List[str]] = None,
                  min_notional: float = 100000.0, cache_ttl: float = 30.0):
@@ -44,6 +42,8 @@ class WhaleScanner:
         self._last_scan_time = 0.0
         self._scan_count = 0
         self._whales_found = 0
+        self._whale_cache: Dict[str, float] = {}
+        self._cache_lock = threading.Lock()
 
         logger.info(
             f"WhaleScanner initialized: monitoring {self._coins} "
@@ -75,6 +75,13 @@ class WhaleScanner:
 
         whales = []
         current_time = datetime.utcnow().timestamp()
+        with self._cache_lock:
+            expired_keys = [
+                key for key, ts in self._whale_cache.items()
+                if (current_time - ts) > self._cache_ttl
+            ]
+            for key in expired_keys:
+                self._whale_cache.pop(key, None)
 
         for coin in self._coins:
             try:
@@ -91,15 +98,22 @@ class WhaleScanner:
 
                 for whale in whale_trades:
                     # Deduplicate within cache TTL
-                    cache_key = f"{whale['coin']}:{whale['side']}:{whale['notional']}"
-                    if cache_key in self._whale_cache:
-                        cache_age = current_time - self._whale_cache[cache_key]
-                        if cache_age < self._cache_ttl:
-                            # Skip duplicate within TTL
-                            continue
-
-                    # Record in cache
-                    self._whale_cache[cache_key] = current_time
+                    w_coin = whale.get("coin", coin)
+                    w_side = whale.get("side", "")
+                    w_price = float(whale.get("price", 0) or 0)
+                    w_qty = float(whale.get("qty", 0) or 0)
+                    w_ts = int(float(whale.get("timestamp", 0) or 0))
+                    # Include timestamp+price+qty fingerprint to avoid dropping
+                    # distinct trades that share coarse notional buckets.
+                    cache_key = f"{w_coin}:{w_side}:{w_ts}:{w_price:.4f}:{w_qty:.6f}"
+                    with self._cache_lock:
+                        if cache_key in self._whale_cache:
+                            cache_age = current_time - self._whale_cache[cache_key]
+                            if cache_age < self._cache_ttl:
+                                # Skip duplicate within TTL
+                                continue
+                        # Record in cache
+                        self._whale_cache[cache_key] = current_time
 
                     whales.append({
                         "coin": whale["coin"],

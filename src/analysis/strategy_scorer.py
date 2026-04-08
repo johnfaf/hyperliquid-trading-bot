@@ -206,16 +206,6 @@ class StrategyScorer:
                 # Update the strategy's current score
                 db.update_strategy_score(strategy["id"], composite)
 
-                # Deactivate strategies below threshold
-                if composite < config.MIN_STRATEGY_SCORE:
-                    logger.info(f"Deactivating low-scoring strategy {strategy['id']} "
-                              f"({strategy['name']}): score={composite:.4f}")
-                    with db.get_connection() as conn:
-                        conn.execute(
-                            "UPDATE strategies SET active = 0 WHERE id = ?",
-                            (strategy["id"],)
-                        )
-
                 results.append({
                     "strategy_id": strategy["id"],
                     "name": strategy["name"],
@@ -235,36 +225,49 @@ class StrategyScorer:
         if results:
             top = results[0]
             logger.info(f"Top strategy: {top['name']} (type={top['type']}, score={top['score']:.4f})")
-            active_count = sum(1 for r in results if r["active"])
-            logger.info(f"Active strategies: {active_count}/{len(results)}")
 
-        # Prune: if active strategies exceed MAX_ACTIVE_STRATEGIES,
-        # deactivate the lowest-scoring ones to prevent unbounded growth
-        active_results = [r for r in results if r["active"]]
-        if len(active_results) > config.MAX_ACTIVE_STRATEGIES:
-            # Keep top MAX_ACTIVE_STRATEGIES, deactivate the rest
-            to_deactivate = active_results[config.MAX_ACTIVE_STRATEGIES:]
-            for r in to_deactivate:
-                try:
-                    with db.get_connection() as conn:
-                        conn.execute(
-                            "UPDATE strategies SET active = 0 WHERE id = ?",
-                            (r["strategy_id"],)
-                        )
-                    r["active"] = False
-                except Exception as e:
-                    # MED-FIX MED-7: log rather than swallow — if DB write fails
-                    # the in-memory count diverges from the real DB active set.
-                    # Still mark inactive in-memory so the cycle count is correct
-                    # and the operator gets a visible warning to investigate.
-                    logger.error(
-                        "Prune: failed to deactivate strategy %s in DB: %s — "
-                        "in-memory marked inactive but DB row may still be active=1",
-                        r["strategy_id"], e,
+        # Keep all above-threshold strategies, but ensure at least top-N stay
+        # active during weak-score phases (prevents strategy "death spiral").
+        keep_top_n = max(1, int(getattr(config, "MIN_ACTIVE_STRATEGIES", 5)))
+        threshold = float(config.MIN_STRATEGY_SCORE)
+        desired_active_ids = {
+            r["strategy_id"] for r in results if r["score"] >= threshold
+        }
+        for r in results[:keep_top_n]:
+            desired_active_ids.add(r["strategy_id"])
+
+        # Hard cap for operational safety.
+        if len(desired_active_ids) > config.MAX_ACTIVE_STRATEGIES:
+            capped_ids = {
+                r["strategy_id"] for r in results[:config.MAX_ACTIVE_STRATEGIES]
+            }
+            desired_active_ids = capped_ids
+
+        # Persist active flags.
+        for r in results:
+            should_be_active = r["strategy_id"] in desired_active_ids
+            r["active"] = should_be_active
+            try:
+                with db.get_connection() as conn:
+                    conn.execute(
+                        "UPDATE strategies SET active = ? WHERE id = ?",
+                        (1 if should_be_active else 0, r["strategy_id"]),
                     )
-                    r["active"] = False
-            logger.info(f"Pruned {len(to_deactivate)} excess strategies "
-                       f"(keeping top {config.MAX_ACTIVE_STRATEGIES})")
+            except Exception as e:
+                logger.error(
+                    "Failed to persist active=%s for strategy %s: %s",
+                    should_be_active,
+                    r["strategy_id"],
+                    e,
+                )
+
+        logger.info(
+            "Strategy activation policy: threshold=%.3f, keep_top_n=%d, active=%d/%d",
+            threshold,
+            keep_top_n,
+            sum(1 for r in results if r["active"]),
+            len(results),
+        )
 
         # Log the scoring cycle
         active_count = sum(1 for r in results if r["active"])

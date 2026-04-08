@@ -419,8 +419,8 @@ class ArenaIncubator:
 
     def __init__(self, config: Optional[Dict] = None):
         cfg = config or {}
-        self.min_incubation_trades = cfg.get("min_incubation_trades", 20)
-        self.min_win_rate = cfg.get("min_win_rate", 0.55)
+        self.min_incubation_trades = cfg.get("min_incubation_trades", 5)
+        self.min_win_rate = cfg.get("min_win_rate", 0.45)
         self.min_profit_factor = cfg.get("min_profit_factor", 1.2)
 
         # Track incubating strategies

@@ -8,10 +8,11 @@ V3: All requests route through the centralized APIManager (token bucket +
 """
 import json
 import logging
+import math
 import os
 import re
 import sys
-from typing import Optional
+from typing import Optional, Any
 
 import requests
 
@@ -33,6 +34,21 @@ def _is_valid_eth_address(address: Optional[str]) -> bool:
     if not address or not isinstance(address, str):
         return False
     return bool(_ETH_ADDRESS_RE.match(address.strip()))
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    """Best-effort numeric coercion for externally sourced payload fields."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
 
 # ─── Internal post — now delegates to APIManager ─────────────────
@@ -65,25 +81,39 @@ def get_all_mids():
     Get mid-prices for all assets. Returns dict like {'BTC': '67432.5', ...}.
     Served from WebSocket when available (zero REST cost).
     """
-    return _post({"type": "allMids"}, priority=Priority.HIGH)
+    data = _post({"type": "allMids"}, priority=Priority.HIGH)
+    if not isinstance(data, dict):
+        logger.warning("get_all_mids: unexpected payload type %s", type(data).__name__)
+        return {}
+    sanitized = {}
+    for coin, price in data.items():
+        try:
+            parsed = float(price)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(parsed):
+            continue
+        sanitized[str(coin)] = price
+    return sanitized
 
 
 def get_asset_contexts():
     """Get detailed context for all assets (funding, open interest, etc.)."""
     data = _post({"type": "metaAndAssetCtxs"}, priority=Priority.NORMAL)
-    if data and len(data) == 2:
+    if isinstance(data, list) and len(data) == 2:
         meta, contexts = data
+        if not isinstance(meta, dict) or not isinstance(contexts, list):
+            logger.warning(
+                "get_asset_contexts: invalid payload shape meta=%s contexts=%s",
+                type(meta).__name__,
+                type(contexts).__name__,
+            )
+            return {}
         universe = meta.get("universe", [])
         result = {}
         for i, ctx in enumerate(contexts):
             if i < len(universe):
                 coin = universe[i]["name"]
-                def _safe_float(val, default=0):
-                    try:
-                        return float(val) if val is not None else default
-                    except (ValueError, TypeError):
-                        return default
-
                 result[coin] = {
                     "funding": _safe_float(ctx.get("funding")),
                     "open_interest": _safe_float(ctx.get("openInterest")),
@@ -114,32 +144,68 @@ def get_user_state(address: str):
                  priority=Priority.HIGH)
     if not data:
         return None
+    if not isinstance(data, dict):
+        logger.warning("get_user_state: unexpected payload type %s", type(data).__name__)
+        return None
 
     positions = []
-    for pos_data in data.get("assetPositions", []):
+    asset_positions = data.get("assetPositions", [])
+    if not isinstance(asset_positions, list):
+        logger.warning(
+            "get_user_state: invalid assetPositions type %s for address %s",
+            type(asset_positions).__name__,
+            address[:10],
+        )
+        return None
+
+    for pos_data in asset_positions:
+        if not isinstance(pos_data, dict):
+            continue
         pos = pos_data.get("position", pos_data)
-        szi = float(pos.get("szi", 0))
+        if not isinstance(pos, dict):
+            continue
+        szi = _safe_float(pos.get("szi", 0))
         if szi == 0:
             continue  # Skip flat/zero positions entirely — no side to assign
+        leverage = pos.get("leverage", 1)
+        if isinstance(leverage, dict):
+            leverage = _safe_float(leverage.get("value", 1), 1.0)
+        else:
+            leverage = _safe_float(leverage, 1.0)
         positions.append({
             "coin": pos.get("coin", ""),
             "side": "long" if szi > 0 else "short",
             "size": abs(szi),
-            "entry_price": float(pos.get("entryPx", 0)),
-            "leverage": float(pos.get("leverage", {}).get("value", 1)) if isinstance(pos.get("leverage"), dict) else float(pos.get("leverage", 1)),
-            "unrealized_pnl": float(pos.get("unrealizedPnl", 0)),
-            "return_on_equity": float(pos.get("returnOnEquity", 0)),
-            "margin_used": float(pos.get("marginUsed", 0)),
+            "entry_price": _safe_float(pos.get("entryPx", 0)),
+            "leverage": leverage,
+            "unrealized_pnl": _safe_float(pos.get("unrealizedPnl", 0)),
+            "return_on_equity": _safe_float(pos.get("returnOnEquity", 0)),
+            "margin_used": _safe_float(pos.get("marginUsed", 0)),
             "liquidation_price": pos.get("liquidationPx"),
         })
 
     margin_summary = data.get("marginSummary", data.get("crossMarginSummary", {}))
+    if not isinstance(margin_summary, dict):
+        logger.warning(
+            "get_user_state: invalid marginSummary type %s for address %s",
+            type(margin_summary).__name__,
+            address[:10],
+        )
+        return None
+    account_value = _safe_float(margin_summary.get("accountValue", 0))
+    if account_value < 0:
+        logger.warning(
+            "get_user_state: negative account_value %.4f for address %s; treating payload as invalid",
+            account_value,
+            address[:10],
+        )
+        return None
     return {
         "positions": positions,
-        "account_value": float(margin_summary.get("accountValue", 0)),
-        "total_margin_used": float(margin_summary.get("totalMarginUsed", 0)),
-        "total_ntl_pos": float(margin_summary.get("totalNtlPos", 0)),
-        "withdrawable": float(data.get("withdrawable", 0)),
+        "account_value": account_value,
+        "total_margin_used": max(0.0, _safe_float(margin_summary.get("totalMarginUsed", 0))),
+        "total_ntl_pos": abs(_safe_float(margin_summary.get("totalNtlPos", 0))),
+        "withdrawable": max(0.0, _safe_float(data.get("withdrawable", 0))),
     }
 
 
@@ -157,22 +223,27 @@ def get_user_fills(address: str, start_time: Optional[int] = None):
     data = _post(payload, priority=Priority.LOW)
     if not data:
         return []
+    if not isinstance(data, list):
+        logger.warning("get_user_fills: unexpected payload type %s", type(data).__name__)
+        return []
 
     fills = []
     for fill in data:
+        if not isinstance(fill, dict):
+            continue
         fills.append({
             "coin": fill.get("coin", ""),
             "side": fill.get("side", "").lower(),
-            "price": float(fill.get("px", 0)),
-            "size": float(fill.get("sz", 0)),
-            "time": fill.get("time", 0),
-            "fee": float(fill.get("fee", 0)),
+            "price": _safe_float(fill.get("px", 0)),
+            "size": _safe_float(fill.get("sz", 0)),
+            "time": _safe_int(fill.get("time", 0)),
+            "fee": _safe_float(fill.get("fee", 0)),
             "is_liquidation": fill.get("liquidation", False),
             "start_position": fill.get("startPosition", ""),
             "direction": fill.get("dir", ""),
-            "closed_pnl": float(fill.get("closedPnl", 0)),
+            "closed_pnl": _safe_float(fill.get("closedPnl", 0)),
             "hash": fill.get("hash", ""),
-            "oid": fill.get("oid", 0),
+            "oid": _safe_int(fill.get("oid", 0)),
             "crossed": fill.get("crossed", False),
         })
     return fills
@@ -300,6 +371,12 @@ def start_websocket(coins: list = None):
     """Start the WebSocket feed. Call from main.py during init."""
     mgr = get_manager()
     mgr.start_websocket(coins=coins)
+
+
+def stop_websocket():
+    """Stop the shared WebSocket feed."""
+    mgr = get_manager()
+    mgr.stop_websocket()
 
 
 def get_api_stats() -> dict:

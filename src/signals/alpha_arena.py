@@ -1317,9 +1317,13 @@ class AlphaArena:
     #  V7: Champion Signal Generation (closes Arena → Live gap)
     # ═══════════════════════════════════════════════════════════
 
-    def get_champion_signals(self, current_candles: Optional[List[Dict]] = None,
-                              min_fitness: float = 0.15,
-                              min_trades: int = 10) -> List[Dict]:
+    def get_champion_signals(
+        self,
+        current_candles: Optional[List[Dict]] = None,
+        min_fitness: float = 0.15,
+        min_trades: int = 5,
+        min_win_rate: float = 0.45,
+    ) -> List[Dict]:
         """
         Generate live trading signals from champion/top-performing agents.
 
@@ -1330,7 +1334,8 @@ class AlphaArena:
             current_candles: Recent candle data (at least 30 bars).
                              If None, no signals generated.
             min_fitness: Minimum fitness score to qualify (default 0.15)
-            min_trades: Minimum trade history to trust agent (default 10)
+            min_trades: Minimum trade history to trust agent (default 5)
+            min_win_rate: Minimum realized win rate required (default 45%)
 
         Returns:
             List of signal dicts compatible with paper_trader pipeline:
@@ -1346,6 +1351,7 @@ class AlphaArena:
             if a.status in (AgentStatus.CHAMPION, AgentStatus.ACTIVE)
             and a.fitness_score >= min_fitness
             and a.total_trades >= min_trades
+            and a.win_rate >= min_win_rate
         ]
 
         if not qualified:

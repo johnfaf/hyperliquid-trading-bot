@@ -7,6 +7,7 @@ Runs every 60s between trading cycles.
 Extracted from ``HyperliquidResearchBot._fast_cycle``.
 """
 import logging
+import time
 
 from src.core.live_execution import (
     is_live_trading_active,
@@ -37,10 +38,24 @@ def run_fast_cycle(container, cycle_count: int) -> None:
             # Refresh the cached wallet snapshot (perps + spot + total) so the
             # dashboard and logs always see fresh numbers.  snapshot_balance
             # self-rate-limits INFO logs to once every 5 min to avoid spam.
-            try:
-                container.live_trader.snapshot_balance()
-            except Exception as exc:
-                logger.debug("[fast] snapshot_balance error: %s", exc)
+            now_ts = time.time()
+            next_allowed = float(getattr(container, "_snapshot_balance_next_try_ts", 0.0) or 0.0)
+            if now_ts >= next_allowed:
+                try:
+                    container.live_trader.snapshot_balance()
+                    container._snapshot_balance_failures = 0
+                    container._snapshot_balance_next_try_ts = 0.0
+                except Exception as exc:
+                    failures = int(getattr(container, "_snapshot_balance_failures", 0) or 0) + 1
+                    backoff = min(300.0, float(2 ** min(failures, 8)))
+                    container._snapshot_balance_failures = failures
+                    container._snapshot_balance_next_try_ts = now_ts + backoff
+                    logger.warning(
+                        "[fast] snapshot_balance error (failure #%d): %s; backing off %.0fs",
+                        failures,
+                        exc,
+                        backoff,
+                    )
             container.live_trader.update_daily_pnl_from_fills()
             reconciled = sync_shadow_book_to_live(container)
             if reconciled:

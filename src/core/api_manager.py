@@ -537,6 +537,10 @@ class APIManager:
                 self.ws.subscribe_coin(coin)
         self.ws.start()
 
+    def stop_websocket(self):
+        """Stop the shared WebSocket feed."""
+        self.ws.stop()
+
     def post(
         self,
         payload: dict,

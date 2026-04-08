@@ -28,6 +28,17 @@ logger.addHandler(logging.NullHandler())
 _options_scanner = None
 
 
+def _resolve_dashboard_host() -> str:
+    """Resolve dashboard bind host with secure localhost default."""
+    explicit = os.environ.get("DASHBOARD_HOST", "").strip()
+    if explicit:
+        return explicit
+    public = os.environ.get("DASHBOARD_BIND_PUBLIC", "false").strip().lower() in {
+        "1", "true", "yes"
+    }
+    return "0.0.0.0" if public else "127.0.0.1"
+
+
 def _get_db():
     conn = sqlite3.connect(config.DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -1435,14 +1446,15 @@ def start_dashboard(port=None, options_scanner=None):
         set_options_scanner(options_scanner)
 
     port = port or int(os.environ.get("PORT", 8080))
-    server = HTTPServer(("0.0.0.0", port), DashboardHandler)
+    host = _resolve_dashboard_host()
+    server = HTTPServer((host, port), DashboardHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
-    logger.info("Dashboard running at http://0.0.0.0:%d", port)
-    logger.info("  Main dashboard:    http://0.0.0.0:%d/", port)
-    logger.info("  Options flow:      http://0.0.0.0:%d/options", port)
-    logger.info("  Backtest:          http://0.0.0.0:%d/backtest", port)
-    logger.info("  Stress test:       http://0.0.0.0:%d/stress", port)
+    logger.info("Dashboard running at http://%s:%d", host, port)
+    logger.info("  Main dashboard:    http://%s:%d/", host, port)
+    logger.info("  Options flow:      http://%s:%d/options", host, port)
+    logger.info("  Backtest:          http://%s:%d/backtest", host, port)
+    logger.info("  Stress test:       http://%s:%d/stress", host, port)
     return server
 
 
@@ -1453,6 +1465,7 @@ if __name__ == "__main__":
     from src.data.database import init_db
     init_db()
     port = int(os.environ.get("PORT", 8080))
-    print(f"Starting dashboard on port {port}...")
-    server = HTTPServer(("0.0.0.0", port), DashboardHandler)
+    host = _resolve_dashboard_host()
+    print(f"Starting dashboard on {host}:{port}...")
+    server = HTTPServer((host, port), DashboardHandler)
     server.serve_forever()

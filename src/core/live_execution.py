@@ -355,6 +355,7 @@ def mirror_executed_trades_to_live(
         return
 
     if is_live_trading_active(container):
+        candidates = []
         for trade in executed:
             try:
                 # Rescale size from paper balance to live balance
@@ -362,6 +363,52 @@ def mirror_executed_trades_to_live(
                 if scaled_trade is None:
                     continue  # blocked by rescale — already logged
                 live_signal = signal_from_execution_dict(scaled_trade) if isinstance(scaled_trade, dict) else scaled_trade
+                entry_price = float(
+                    getattr(live_signal, "entry_price", 0)
+                    or (scaled_trade.get("entry_price", scaled_trade.get("price", 0)) if isinstance(scaled_trade, dict) else 0)
+                    or 0
+                )
+                size = abs(float(getattr(live_signal, "size", 0) or 0))
+                leverage = max(1.0, float(getattr(live_signal, "leverage", 1.0) or 1.0))
+                notional = max(0.0, size * entry_price)
+                margin = notional / leverage if leverage > 0 else notional
+                candidates.append({
+                    "signal": live_signal,
+                    "notional": notional,
+                    "margin": margin,
+                })
+            except Exception as exc:
+                logger.error("%s live execution prep error: %s", success_label, exc)
+
+        if not candidates:
+            return
+
+        live_balance = float(trader.get_wallet_balance() or 0.0)
+        margin_budget = live_balance * 0.95 if live_balance > 0 else 0.0
+        selected = []
+        used_margin = 0.0
+
+        # Highest-confidence mirrors consume margin first.
+        for item in sorted(candidates, key=lambda x: float(getattr(x["signal"], "confidence", 0.0) or 0.0), reverse=True):
+            projected = used_margin + item["margin"]
+            if margin_budget > 0 and projected > margin_budget:
+                logger.warning(
+                    "%s skipped %s %s: batch margin budget exceeded "
+                    "(need $%.2f, used $%.2f, budget $%.2f)",
+                    success_label,
+                    item["signal"].coin,
+                    item["signal"].side.value,
+                    item["margin"],
+                    used_margin,
+                    margin_budget,
+                )
+                continue
+            selected.append(item)
+            used_margin = projected
+
+        for item in selected:
+            live_signal = item["signal"]
+            try:
                 # Mirror path: the paper trade has already passed the firewall
                 # (cooldown, risk checks, etc.), so bypass firewall validation
                 # here.  Otherwise the firewall's cooldown check rejects every

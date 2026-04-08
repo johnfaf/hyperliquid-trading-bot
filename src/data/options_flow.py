@@ -17,6 +17,7 @@ from typing import List, Dict, Optional, Tuple
 from collections import defaultdict
 
 import requests
+import config
 
 logger = logging.getLogger(__name__)
 
@@ -74,8 +75,23 @@ class OptionsFlowScanner:
 
         # Conviction rankings
         self.top_convictions: List[Dict] = []
+        self.min_conviction_pct = float(
+            getattr(config, "OPTIONS_FLOW_MIN_CONVICTION_PCT", 30.0)
+        )
+        self._venue_last_request = {"deribit": 0.0, "binance_options": 0.0}
+        self._venue_min_interval = {"deribit": 0.2, "binance_options": 0.2}
 
         logger.info("OptionsFlowScanner initialized")
+
+    def _throttle_venue(self, venue: str) -> None:
+        """Simple per-venue rate limiter for direct external API calls."""
+        min_interval = self._venue_min_interval.get(venue, 0.2)
+        last = self._venue_last_request.get(venue, 0.0)
+        now = time.time()
+        elapsed = now - last
+        if elapsed < min_interval:
+            time.sleep(min_interval - elapsed)
+        self._venue_last_request[venue] = time.time()
 
     # ─── Deribit API Helpers ──────────────────────────────────
 
@@ -86,6 +102,7 @@ class OptionsFlowScanner:
         max_retries = 3
         for attempt in range(max_retries):
             try:
+                self._throttle_venue("deribit")
                 url = f"{DERIBIT_BASE}/{method}"
                 resp = self.session.get(url, params=params or {}, timeout=10)
                 if resp.status_code == 200:
@@ -97,28 +114,63 @@ class OptionsFlowScanner:
                                    f"(attempt {attempt+1}/{max_retries})")
                     time.sleep(backoff)
                     continue
+                elif resp.status_code >= 500:
+                    backoff = min(10, 2 ** attempt)
+                    logger.warning(
+                        "Deribit %s returned %d (attempt %d/%d); retrying in %.1fs",
+                        method, resp.status_code, attempt + 1, max_retries, backoff,
+                    )
+                    time.sleep(backoff)
+                    continue
                 else:
                     logger.warning(f"Deribit {method} returned {resp.status_code}")
                     return None
+            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+                backoff = min(10, 2 ** attempt)
+                logger.warning(
+                    "Deribit %s network error (attempt %d/%d): %s; retrying in %.1fs",
+                    method, attempt + 1, max_retries, e, backoff,
+                )
+                time.sleep(backoff)
+                continue
             except Exception as e:
                 logger.debug(f"Deribit {method} error: {e}")
-                return None
-        logger.warning(f"Deribit {method} failed after {max_retries} retries (429)")
+                backoff = min(10, 2 ** attempt)
+                time.sleep(backoff)
+        logger.warning(f"Deribit {method} failed after {max_retries} attempts")
         return None
 
     def _binance_options_get(self, endpoint: str, params: dict = None) -> Optional[dict]:
         """Call Binance Options API."""
-        try:
-            url = f"{BINANCE_OPTIONS_BASE}{endpoint}"
-            resp = self.session.get(url, params=params or {}, timeout=10)
-            if resp.status_code == 200:
-                return resp.json()
-            else:
+        max_retries = 3
+        for attempt in range(max_retries):
+            self._throttle_venue("binance_options")
+            try:
+                url = f"{BINANCE_OPTIONS_BASE}{endpoint}"
+                resp = self.session.get(url, params=params or {}, timeout=10)
+                if resp.status_code == 200:
+                    return resp.json()
+                if resp.status_code == 429 or resp.status_code >= 500:
+                    backoff = min(10, 2 ** attempt)
+                    logger.warning(
+                        "Binance Options %s returned %d (attempt %d/%d); retrying in %.1fs",
+                        endpoint, resp.status_code, attempt + 1, max_retries, backoff,
+                    )
+                    time.sleep(backoff)
+                    continue
                 logger.debug(f"Binance Options {endpoint} returned {resp.status_code}")
                 return None
-        except Exception as e:
-            logger.debug(f"Binance Options error: {e}")
-            return None
+            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+                backoff = min(10, 2 ** attempt)
+                logger.warning(
+                    "Binance Options %s network error (attempt %d/%d): %s; retrying in %.1fs",
+                    endpoint, attempt + 1, max_retries, e, backoff,
+                )
+                time.sleep(backoff)
+            except Exception as e:
+                logger.debug(f"Binance Options error: {e}")
+                return None
+        return None
 
     # ─── Instrument Discovery ─────────────────────────────────
 
@@ -579,7 +631,10 @@ class OptionsFlowScanner:
         with self._lock:
             for conv in self.top_convictions:
                 try:
-                    if conv.get("ticker") == ticker and conv.get("conviction_pct", 0) > 60:
+                    if (
+                        conv.get("ticker") == ticker
+                        and conv.get("conviction_pct", 0) >= self.min_conviction_pct
+                    ):
                         return {
                             "ticker": ticker,
                             "side": "long" if conv.get("direction") == "BULLISH" else "short",

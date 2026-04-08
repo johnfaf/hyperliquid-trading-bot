@@ -30,6 +30,7 @@ from typing import Dict, List, Optional, Tuple
 from datetime import datetime, timedelta
 from dataclasses import dataclass, field
 from collections import defaultdict
+from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
 
@@ -170,10 +171,19 @@ class PolymarketScanner:
         # Scan configuration
         self.scan_interval_seconds = self.config.get("scan_interval_seconds", 60)
         self.max_markets_per_scan = self.config.get("max_markets_per_scan", 100)
+        self.max_retries = int(self.config.get("max_retries", 3))
 
-        # Rate limiting: max 1 req/sec
-        self.rate_limit_delay = 1.0
-        self._last_request_time = 0.0
+        # Per-host rate limiting for direct external API calls.
+        self.rate_limit_delay = float(self.config.get("rate_limit_delay", 0.35))
+        self._rate_limit_by_host = {
+            "clob.polymarket.com": float(
+                self.config.get("clob_rate_limit_delay", self.rate_limit_delay)
+            ),
+            "gamma-api.polymarket.com": float(
+                self.config.get("gamma_rate_limit_delay", self.rate_limit_delay)
+            ),
+        }
+        self._last_request_time_by_host: Dict[str, float] = {}
 
         # Cache
         self._market_cache: Dict[str, PolymarketMarket] = {}
@@ -192,32 +202,64 @@ class PolymarketScanner:
         logger.info(f"PolymarketScanner initialized with cache TTL={self.cache_ttl_minutes}min, "
                    f"rate_limit={self.rate_limit_delay}s")
 
-    def _rate_limit(self):
-        """Enforce rate limiting (max 1 req/sec to Polymarket)."""
-        elapsed = time.time() - self._last_request_time
-        if elapsed < self.rate_limit_delay:
-            time.sleep(self.rate_limit_delay - elapsed)
-        self._last_request_time = time.time()
+    def _rate_limit(self, url: str):
+        """Enforce per-host rate limiting for Polymarket endpoints."""
+        host = urlparse(url).netloc.lower()
+        delay = self._rate_limit_by_host.get(host, self.rate_limit_delay)
+        last = self._last_request_time_by_host.get(host, 0.0)
+        elapsed = time.time() - last
+        if elapsed < delay:
+            time.sleep(delay - elapsed)
+        self._last_request_time_by_host[host] = time.time()
 
     def _fetch_json(self, url: str, timeout: int = 10) -> Optional[Dict]:
-        """Fetch JSON from URL with rate limiting and error handling."""
-        self._rate_limit()
-        try:
-            response = requests.get(url, timeout=timeout)
-            response.raise_for_status()
-            return response.json()
-        except requests.exceptions.Timeout:
-            logger.warning(f"Timeout fetching {url}")
-            return None
-        except requests.exceptions.ConnectionError:
-            logger.warning(f"Connection error fetching {url}")
-            return None
-        except requests.exceptions.HTTPError as e:
-            logger.warning(f"HTTP error {e.response.status_code} fetching {url}")
-            return None
-        except Exception as e:
-            logger.error(f"Error fetching {url}: {e}")
-            return None
+        """Fetch JSON with per-host throttling and retry/backoff on transient failures."""
+        for attempt in range(self.max_retries):
+            self._rate_limit(url)
+            try:
+                response = requests.get(url, timeout=timeout)
+                if response.status_code == 429 or response.status_code >= 500:
+                    backoff = min(8.0, 0.5 * (2 ** attempt))
+                    logger.warning(
+                        "Polymarket fetch %s returned %d (attempt %d/%d); retrying in %.1fs",
+                        url,
+                        response.status_code,
+                        attempt + 1,
+                        self.max_retries,
+                        backoff,
+                    )
+                    time.sleep(backoff)
+                    continue
+                response.raise_for_status()
+                return response.json()
+            except requests.exceptions.Timeout:
+                backoff = min(8.0, 0.5 * (2 ** attempt))
+                logger.warning(
+                    "Timeout fetching %s (attempt %d/%d); retrying in %.1fs",
+                    url,
+                    attempt + 1,
+                    self.max_retries,
+                    backoff,
+                )
+                time.sleep(backoff)
+            except requests.exceptions.ConnectionError:
+                backoff = min(8.0, 0.5 * (2 ** attempt))
+                logger.warning(
+                    "Connection error fetching %s (attempt %d/%d); retrying in %.1fs",
+                    url,
+                    attempt + 1,
+                    self.max_retries,
+                    backoff,
+                )
+                time.sleep(backoff)
+            except requests.exceptions.HTTPError as e:
+                status = e.response.status_code if e.response is not None else 0
+                logger.warning(f"HTTP error {status} fetching {url}")
+                return None
+            except Exception as e:
+                logger.error(f"Error fetching {url}: {e}")
+                return None
+        return None
 
     def _fetch_raw_markets(self) -> List[Dict]:
         """

@@ -276,7 +276,7 @@ class CopyTrader:
                             trade_signal,
                             regime_data=regime_data,
                             open_positions=open_trades,
-                            ignore_position_limit=True,
+                            ignore_position_limit=False,
                             dry_run=True,
                         )
                         if not passed:

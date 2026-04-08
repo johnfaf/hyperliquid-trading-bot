@@ -41,6 +41,7 @@ class SupervisedTask:
     target: Callable
     interval_seconds: float
     max_retries: int = 5
+    auto_recover_cooldown_s: float = 300.0
     stop_event: threading.Event = field(default_factory=threading.Event)
     thread: Optional[threading.Thread] = field(default=None, repr=False)
     retry_count: int = 0
@@ -70,7 +71,8 @@ class SupervisedTaskRunner:
     # ── Registration ──────────────────────────────────────────────
 
     def register(self, name: str, target: Callable,
-                 interval_seconds: float, max_retries: int = 5) -> None:
+                 interval_seconds: float, max_retries: int = 5,
+                 auto_recover_cooldown_s: float = 300.0) -> None:
         """Register a background task.  Does NOT start it yet."""
         with self._lock:
             if name in self._tasks:
@@ -80,9 +82,15 @@ class SupervisedTaskRunner:
                 target=target,
                 interval_seconds=interval_seconds,
                 max_retries=max_retries,
+                auto_recover_cooldown_s=max(0.0, float(auto_recover_cooldown_s)),
             )
-        logger.debug("Registered supervised task: %s (interval=%ss, max_retries=%d)",
-                      name, interval_seconds, max_retries)
+        logger.debug(
+            "Registered supervised task: %s (interval=%ss, max_retries=%d, auto_recover=%ss)",
+            name,
+            interval_seconds,
+            max_retries,
+            auto_recover_cooldown_s,
+        )
 
     # ── Lifecycle ─────────────────────────────────────────────────
 
@@ -192,6 +200,7 @@ class SupervisedTaskRunner:
             "interval_seconds": task.interval_seconds,
             "retry_count": task.retry_count,
             "max_retries": task.max_retries,
+            "auto_recover_cooldown_s": task.auto_recover_cooldown_s,
             "consecutive_failures": task.consecutive_failures,
             "last_success_ts": task.last_success_ts,
             "last_error": task.last_error,
@@ -240,7 +249,7 @@ class SupervisedTaskRunner:
                 if task.retry_count >= task.max_retries:
                     task.state = "failed"
                     logger.error(
-                        "Task '%s' PERMANENTLY FAILED after %d retries — giving up",
+                        "Task '%s' reached max retries (%d).",
                         task.name, task.max_retries,
                     )
                     if self._health:
@@ -252,7 +261,35 @@ class SupervisedTaskRunner:
                             )
                         except Exception:
                             pass
-                    break  # exit the loop
+                    cooldown = max(0.0, float(task.auto_recover_cooldown_s))
+                    if cooldown <= 0:
+                        logger.error(
+                            "Task '%s' auto-recovery disabled; stopping supervised loop.",
+                            task.name,
+                        )
+                        break  # explicit permanent stop
+                    logger.error(
+                        "Task '%s' entering recovery cooldown for %.0fs before restart.",
+                        task.name,
+                        cooldown,
+                    )
+                    if task.stop_event.wait(cooldown):
+                        break
+                    task.retry_count = 0
+                    task.consecutive_failures = 0
+                    task.state = "running"
+                    if self._health:
+                        try:
+                            from src.core.health_registry import SubsystemState
+                            self._health.set_status(
+                                task.name,
+                                SubsystemState.DEGRADED,
+                                reason="auto-recovered after max retries",
+                                dependency_ready=True,
+                            )
+                        except Exception:
+                            pass
+                    continue
 
                 # Exponential back-off: 2, 4, 8, 16, 32, 60, 60, …
                 task.state = "retrying"

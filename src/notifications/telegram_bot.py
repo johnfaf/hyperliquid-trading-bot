@@ -8,44 +8,124 @@ import os
 import logging
 import requests
 import json
+import time
 from datetime import datetime
 from typing import Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
-# Configuration from environment variables
-BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
-TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
+_TELEGRAM_SUBSYSTEM = "telegram"
+_MAX_SEND_RETRIES = max(1, int(os.environ.get("TELEGRAM_SEND_RETRIES", "3")))
+_RETRY_BASE_DELAY_S = max(0.2, float(os.environ.get("TELEGRAM_SEND_RETRY_BASE_S", "0.8")))
+_failure_streak = 0
+
+
+def _load_credentials() -> tuple:
+    """Load Telegram credentials lazily from environment."""
+    token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+    api = f"https://api.telegram.org/bot{token}" if token else ""
+    return token, chat_id, api
+
+
+def _report_health(success: bool, reason: str = "") -> None:
+    """Report Telegram subsystem health to the shared registry (best effort)."""
+    try:
+        from src.core.health_registry import registry, SubsystemState
+    except Exception:
+        return
+
+    try:
+        registry.register(_TELEGRAM_SUBSYSTEM, affects_trading=False)
+        if success:
+            registry.set_status(
+                _TELEGRAM_SUBSYSTEM,
+                SubsystemState.HEALTHY,
+                reason="",
+                dependency_ready=True,
+                startup_status="READY",
+            )
+            registry.heartbeat(_TELEGRAM_SUBSYSTEM)
+            return
+        state = SubsystemState.DEGRADED if _failure_streak < 3 else SubsystemState.FAILED
+        registry.set_status(
+            _TELEGRAM_SUBSYSTEM,
+            state,
+            reason=reason[:200],
+            dependency_ready=False,
+            startup_status="ERROR",
+        )
+    except Exception:
+        return
 
 
 def is_configured() -> bool:
     """Check if Telegram credentials are set."""
-    return bool(BOT_TOKEN and CHAT_ID)
+    token, chat_id, _ = _load_credentials()
+    return bool(token and chat_id)
 
 
 def _send_message(text: str, parse_mode: str = "HTML", disable_preview: bool = True) -> bool:
     """Send a message via Telegram Bot API."""
-    if not is_configured():
+    global _failure_streak
+
+    token, chat_id, telegram_api = _load_credentials()
+    if not (token and chat_id and telegram_api):
         return False
-    try:
-        resp = requests.post(
-            f"{TELEGRAM_API}/sendMessage",
-            json={
-                "chat_id": CHAT_ID,
-                "text": text,
-                "parse_mode": parse_mode,
-                "disable_web_page_preview": disable_preview,
-            },
-            timeout=10,
-        )
-        if resp.status_code != 200:
-            logger.warning(f"Telegram send failed: {resp.status_code} {resp.text[:100]}")
-            return False
-        return True
-    except Exception as e:
-        logger.warning(f"Telegram send error: {e}")
-        return False
+
+    last_error = "unknown"
+    for attempt in range(1, _MAX_SEND_RETRIES + 1):
+        try:
+            resp = requests.post(
+                f"{telegram_api}/sendMessage",
+                json={
+                    "chat_id": chat_id,
+                    "text": text,
+                    "parse_mode": parse_mode,
+                    "disable_web_page_preview": disable_preview,
+                },
+                timeout=10,
+            )
+            if resp.status_code == 200:
+                _failure_streak = 0
+                _report_health(success=True)
+                return True
+
+            body_preview = (resp.text or "")[:120]
+            last_error = f"http_{resp.status_code}:{body_preview}"
+            transient = resp.status_code == 429 or resp.status_code >= 500
+            if transient and attempt < _MAX_SEND_RETRIES:
+                wait = _RETRY_BASE_DELAY_S * (2 ** (attempt - 1))
+                logger.warning(
+                    "Telegram send transient failure (%s) attempt %d/%d; retrying in %.1fs",
+                    resp.status_code,
+                    attempt,
+                    _MAX_SEND_RETRIES,
+                    wait,
+                )
+                time.sleep(wait)
+                continue
+
+            logger.warning("Telegram send failed: %s", last_error)
+            break
+        except Exception as e:
+            last_error = str(e)
+            if attempt < _MAX_SEND_RETRIES:
+                wait = _RETRY_BASE_DELAY_S * (2 ** (attempt - 1))
+                logger.warning(
+                    "Telegram send error attempt %d/%d; retrying in %.1fs: %s",
+                    attempt,
+                    _MAX_SEND_RETRIES,
+                    wait,
+                    e,
+                )
+                time.sleep(wait)
+                continue
+            logger.warning("Telegram send error: %s", e)
+
+    _failure_streak += 1
+    _report_health(success=False, reason=f"send_failure_streak={_failure_streak} last_error={last_error}")
+    return False
 
 
 # ─── Notification Templates ──────────────────────────────────

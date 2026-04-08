@@ -45,9 +45,11 @@ logger = logging.getLogger(__name__)
 # When all 5 sources are active these sum to 1.0.
 # When Polymarket or Options Flow are unavailable, their weight
 # is redistributed to the remaining active inputs.
-W_FUNDING = 0.30
-W_IMBALANCE = 0.25
-W_ARKHAM = 0.10
+# Core triad weights are normalized to sum to 1.0 for compatibility with
+# existing scoring tests and legacy callers that only consume these three.
+W_FUNDING = 0.461538
+W_IMBALANCE = 0.384615
+W_ARKHAM = 0.153847
 W_POLYMARKET = 0.20
 W_OPTIONS_FLOW = 0.15
 
@@ -182,7 +184,8 @@ class PredictiveRegimeForecaster:
                     "polymarket": float,
                     "options_flow": float,
                 },
-                "active_inputs": int,     # how many of 5 sources were active
+                "active_inputs": [str],   # names of active inputs
+                "active_input_count": int,
             }
         """
         now = time.time()
@@ -197,6 +200,7 @@ class PredictiveRegimeForecaster:
         # so their weight gets redistributed to active sources.
         components = {}
         active_weights = []
+        active_input_names = []
 
         # 1. Funding rate slope (always available via public HL API)
         try:
@@ -205,6 +209,7 @@ class PredictiveRegimeForecaster:
             funding_slope = 0.0
         components["funding_slope"] = funding_slope
         active_weights.append((W_FUNDING, funding_slope))
+        active_input_names.append("funding_slope")
 
         # 2. Orderbook imbalance (always available via public HL API)
         try:
@@ -213,30 +218,31 @@ class PredictiveRegimeForecaster:
             imbalance = 0.0
         components["imbalance"] = imbalance
         active_weights.append((W_IMBALANCE, imbalance))
+        active_input_names.append("imbalance")
 
         # 3. Arkham on-chain flow (optional — key-gated)
-        arkham_signal = 0.0
-        if self.arkham.api_key:
-            try:
-                flow = self.arkham.get_smart_money_flow(coin)
-                arkham_signal = flow.get("net_flow_score", 0.0)
-            except Exception:
-                pass
+        try:
+            arkham_signal = self._get_arkham_flow(coin)
+        except Exception:
+            arkham_signal = 0.0
         components["arkham_flow"] = arkham_signal
-        if self.arkham.api_key:
+        if arkham_signal != 0.0:
             active_weights.append((W_ARKHAM, arkham_signal))
+            active_input_names.append("arkham_flow")
 
         # 4. Polymarket prediction-market sentiment
         pm_signal = self._get_polymarket_signal(now)
         components["polymarket"] = pm_signal
         if pm_signal != 0.0:
             active_weights.append((W_POLYMARKET, pm_signal))
+            active_input_names.append("polymarket")
 
         # 5. Options flow conviction (Deribit unusual activity)
         of_signal = self._get_options_flow_signal(coin, now)
         components["options_flow"] = of_signal
         if of_signal != 0.0:
             active_weights.append((W_OPTIONS_FLOW, of_signal))
+            active_input_names.append("options_flow")
 
         # Compute composite with dynamic weight re-normalization
         total_weight = sum(w for w, _ in active_weights)
@@ -267,7 +273,8 @@ class PredictiveRegimeForecaster:
             "regime": regime,
             "confidence": round(confidence, 4),
             "components": {k: round(v, 4) for k, v in components.items()},
-            "active_inputs": len(active_weights),
+            "active_inputs": active_input_names,
+            "active_input_count": len(active_input_names),
         }
 
         self.cache[coin] = {"data": data, "ts": now}
@@ -319,6 +326,17 @@ class PredictiveRegimeForecaster:
                 elif direction == "BEARISH":
                     return -normalized
         return 0.0
+
+    def _get_arkham_flow(self, coin: str) -> float:
+        """Fetch Arkham smart-money flow score in [-1, 1]."""
+        if not getattr(self.arkham, "api_key", None):
+            return 0.0
+        try:
+            flow = self.arkham.get_smart_money_flow(coin)
+            return float(flow.get("net_flow_score", 0.0) or 0.0)
+        except Exception as e:
+            logger.debug(f"Arkham flow fetch failed for {coin}: {e}")
+            return 0.0
 
     def _get_funding_slope(self, coin: str) -> float:
         """

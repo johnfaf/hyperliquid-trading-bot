@@ -106,8 +106,13 @@ def _load_from_hashicorp_vault() -> str:
 
     url = f"{addr}/v1/{path}"
     headers = {"X-Vault-Token": token}
-    response = requests.get(url, headers=headers, timeout=10)
-    response.raise_for_status()
+    try:
+        response = requests.get(url, headers=headers, timeout=10)
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        raise SecretManagerError(
+            f"Vault request failed for path '{path}': {exc.__class__.__name__}"
+        ) from exc
     payload = response.json()
 
     data = payload.get("data", {})

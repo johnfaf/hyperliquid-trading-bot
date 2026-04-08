@@ -83,7 +83,8 @@ CREATE TABLE IF NOT EXISTS regime_history (
     options_flow_conviction REAL DEFAULT 0,
     regime_label INTEGER DEFAULT 1,
     confidence REAL DEFAULT 0,
-    predicted_regime TEXT DEFAULT 'neutral'
+    predicted_regime TEXT DEFAULT 'neutral',
+    label_source TEXT DEFAULT 'predicted'
 )
 """
 
@@ -197,7 +198,11 @@ class XGBoostRegimeForecaster:
                         "bullish": round(float(proba[2]), 4),
                     },
                     "components": base.get("components", {}),
-                    "active_inputs": base.get("active_inputs", 0),
+                    "active_inputs": base.get("active_inputs", []),
+                    "active_input_count": base.get(
+                        "active_input_count",
+                        len(base.get("active_inputs", []) or []),
+                    ),
                 }
 
                 self.prediction_cache[coin] = {"data": result, "ts": now}
@@ -396,7 +401,7 @@ class XGBoostRegimeForecaster:
 
         logger.info("Training XGBoost regime forecaster on %d samples...", len(y))
 
-        self.model = xgb.XGBClassifier(
+        model_kwargs = dict(
             n_estimators=180,
             max_depth=6,
             learning_rate=0.1,
@@ -410,20 +415,36 @@ class XGBoostRegimeForecaster:
             random_state=42,
             verbosity=0,
         )
+        self.model = xgb.XGBClassifier(**model_kwargs)
 
-        # Cross-validation (if enough data)
+        # Time-series walk-forward validation (if enough chronologically-labeled data)
         cv_mean = 0.0
         try:
-            from sklearn.model_selection import cross_val_score
-            n_splits = min(5, max(2, len(X) // 20))
-            cv_scores = cross_val_score(self.model, X, y, cv=n_splits, scoring="accuracy")
-            cv_mean = float(np.mean(cv_scores))
-            logger.info(
-                "XGBoost CV accuracy: %.3f (+/- %.3f)",
-                cv_mean, float(np.std(cv_scores)),
-            )
-        except Exception:
-            pass
+            from sklearn.metrics import accuracy_score
+            from sklearn.model_selection import TimeSeriesSplit
+
+            n_splits = min(5, max(2, len(X) // 50))
+            tscv = TimeSeriesSplit(n_splits=n_splits)
+            fold_scores = []
+
+            for train_idx, test_idx in tscv.split(X):
+                if len(train_idx) < 20 or len(test_idx) < 5:
+                    continue
+                fold_model = xgb.XGBClassifier(**model_kwargs)
+                fold_model.fit(X[train_idx], y[train_idx])
+                preds = fold_model.predict(X[test_idx])
+                fold_scores.append(float(accuracy_score(y[test_idx], preds)))
+
+            if fold_scores:
+                cv_mean = float(np.mean(fold_scores))
+                logger.info(
+                    "XGBoost walk-forward accuracy: %.3f (+/- %.3f, folds=%d)",
+                    cv_mean,
+                    float(np.std(fold_scores)),
+                    len(fold_scores),
+                )
+        except Exception as exc:
+            logger.debug("Walk-forward validation skipped: %s", exc)
 
         # Train on full data
         self.model.fit(X, y)
@@ -464,7 +485,9 @@ class XGBoostRegimeForecaster:
                            regime_label
                     FROM regime_history
                     WHERE timestamp > datetime('now', '-90 days')
-                    ORDER BY timestamp DESC
+                      AND regime_label IN (0, 1, 2)
+                      AND label_source = 'observed'
+                    ORDER BY timestamp ASC
                 """).fetchall()
 
             if rows:
@@ -476,7 +499,10 @@ class XGBoostRegimeForecaster:
                     [int(r[8]) for r in rows],
                     dtype=np.int32,
                 )
-                logger.info("Loaded %d rows from regime_history for training", len(y_rows))
+                logger.info(
+                    "Loaded %d observed-label rows from regime_history for training",
+                    len(y_rows),
+                )
 
                 if len(y_rows) >= self.min_samples:
                     return X_rows, y_rows
@@ -527,8 +553,8 @@ class XGBoostRegimeForecaster:
                        (coin, funding_rate, funding_slope, orderbook_imbalance,
                         arkham_flow, volatility_5m, basis_spread,
                         polymarket_sentiment, options_flow_conviction,
-                        regime_label, confidence, predicted_regime)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        regime_label, confidence, predicted_regime, label_source)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         coin,
                         features.get("funding_rate", 0),
@@ -539,9 +565,10 @@ class XGBoostRegimeForecaster:
                         features.get("basis_spread", 0),
                         features.get("polymarket_sentiment", 0),
                         features.get("options_flow_conviction", 0),
-                        REGIME_LABELS.get(regime, 1),
+                        None,  # Unknown at prediction time; do not self-label training data.
                         confidence,
                         regime,
+                        "predicted",
                     ),
                 )
         except Exception as exc:
@@ -555,6 +582,17 @@ class XGBoostRegimeForecaster:
             from src.data.database import get_connection
             with get_connection() as conn:
                 conn.execute(_REGIME_HISTORY_DDL)
+                # Backward-compatible migrations for existing deployments.
+                cols = conn.execute("PRAGMA table_info(regime_history)").fetchall()
+                col_names = {str(row["name"]) for row in cols} if cols else set()
+                if "label_source" not in col_names:
+                    conn.execute(
+                        "ALTER TABLE regime_history ADD COLUMN label_source TEXT DEFAULT 'predicted'"
+                    )
+                    conn.execute(
+                        "UPDATE regime_history SET label_source = 'predicted' "
+                        "WHERE label_source IS NULL OR label_source = ''"
+                    )
         except Exception as exc:
             logger.debug("Could not create regime_history table: %s", exc)
 

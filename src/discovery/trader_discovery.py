@@ -828,7 +828,7 @@ class TraderDiscovery:
                             passed_prescreen.append(trader)
                         else:
                             skipped_prescreen += 1
-                    except:
+                    except Exception:
                         skipped_prescreen += 1
                 else:
                     skipped_prescreen += 1
@@ -884,7 +884,7 @@ class TraderDiscovery:
                         if profile:
                             all_profiles.append(profile)
                             self.known_traders[addr] = trader
-                    except:
+                    except Exception:
                         logger.error(f"Retry also failed for {addr[:10]}")
                 else:
                     logger.error(f"Error analyzing trader {addr[:10]}: {e}")
