@@ -220,6 +220,20 @@ class HyperliquidResearchBot:
         elapsed = now - self._last_discovery if self._last_discovery else float("inf")
         return elapsed >= config.DISCOVERY_STARVATION_RECOVERY_INTERVAL
 
+    def _should_force_startup_discovery(self, inventory: dict) -> bool:
+        """
+        Only block startup on discovery when the bot has no usable inventory.
+
+        If tracked strategies already exist, let the trading cycle run first so
+        the scorer can reactivate them immediately instead of sitting behind a
+        long discovery pass.
+        """
+        if inventory.get("traders", 0) == 0:
+            return True
+        if inventory.get("total_strategies", 0) == 0 and self._strategy_pool_is_starved():
+            return True
+        return False
+
     # ── Scheduling loops ──────────────────────────────────────
 
     def _run_discovery(self):
@@ -291,18 +305,40 @@ class HyperliquidResearchBot:
         inventory = self._get_inventory_snapshot()
         trader_count = inventory["traders"]
 
-        if trader_count == 0:
-            self.logger.info("No traders in DB — running initial discovery…")
+        if self._should_force_startup_discovery(inventory):
+            if trader_count == 0:
+                self.logger.info("No traders in DB — running initial discovery…")
+            else:
+                self.logger.warning(
+                    "Strategy pool starved on startup with no tracked strategies — forcing recovery discovery "
+                    "(traders=%d, active_strategies=%d, total_strategies=%d)",
+                    inventory["traders"],
+                    inventory["active_strategies"],
+                    inventory["total_strategies"],
+                )
             self._run_discovery()
         elif self._strategy_pool_is_starved():
             self.logger.warning(
-                "Strategy pool starved on startup â€” forcing recovery discovery "
+                "Strategy pool is thin on startup, but tracked strategies exist — "
+                "allowing scoring/trading before recovery discovery "
                 "(traders=%d, active_strategies=%d, total_strategies=%d)",
                 inventory["traders"],
                 inventory["active_strategies"],
                 inventory["total_strategies"],
             )
-            self._run_discovery()
+            restored_ts = self._restore_last_discovery_time()
+            if restored_ts and (time.time() - restored_ts) < config.DISCOVERY_CYCLE_INTERVAL:
+                self._last_discovery = restored_ts
+                remaining_h = (config.DISCOVERY_CYCLE_INTERVAL - (time.time() - restored_ts)) / 3600
+                self.logger.info("Restored discovery timer, next in %.1fh", remaining_h)
+            else:
+                self._last_discovery = time.time()
+                self.logger.info(
+                    "DB has %d traders and %d tracked strategies — next recovery discovery check in %.1fh",
+                    trader_count,
+                    inventory["total_strategies"],
+                    config.DISCOVERY_STARVATION_RECOVERY_INTERVAL / 3600,
+                )
         else:
             restored_ts = self._restore_last_discovery_time()
             if restored_ts and (time.time() - restored_ts) < config.DISCOVERY_CYCLE_INTERVAL:

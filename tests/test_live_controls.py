@@ -6964,6 +6964,32 @@ def test_strategy_pool_starvation_detection_uses_active_inventory(monkeypatch):
     assert bot._should_run_recovery_discovery(1_000_000.0) is True
 
 
+def test_startup_discovery_not_forced_when_tracked_strategies_exist():
+    bot = main.HyperliquidResearchBot.__new__(main.HyperliquidResearchBot)
+    inventory = {
+        "traders": 3,
+        "active_strategies": 0,
+        "total_strategies": 5,
+    }
+
+    bot._strategy_pool_is_starved = lambda: True
+
+    assert bot._should_force_startup_discovery(inventory) is False
+
+
+def test_startup_discovery_forced_when_no_tracked_strategies_exist():
+    bot = main.HyperliquidResearchBot.__new__(main.HyperliquidResearchBot)
+    inventory = {
+        "traders": 3,
+        "active_strategies": 0,
+        "total_strategies": 0,
+    }
+
+    bot._strategy_pool_is_starved = lambda: True
+
+    assert bot._should_force_startup_discovery(inventory) is True
+
+
 def test_heartbeat_active_covers_recovery_subsystems():
     from src.core.subsystem_registry import heartbeat_active
 
