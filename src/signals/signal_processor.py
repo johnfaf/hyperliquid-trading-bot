@@ -377,7 +377,36 @@ class SignalProcessor:
         # Add back strategies without specific coins
         resolved.extend(no_coin_signals)
 
-        return resolved
+        # Final safety dedupe: multi-coin grouping can reference the same strategy
+        # more than once across coin buckets. Keep first occurrence only.
+        unique = []
+        seen = set()
+        for s in resolved:
+            key = self._strategy_key(s)
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(s)
+
+        return unique
+
+    @staticmethod
+    def _strategy_key(strategy: Dict) -> Tuple:
+        params = strategy.get("parameters", {})
+        if isinstance(params, dict):
+            coins = params.get("coins", params.get("coins_traded", []))
+        else:
+            coins = []
+        if isinstance(coins, str):
+            coins = [coins]
+        normalized_coins = tuple(sorted(str(c).upper() for c in coins if str(c).strip()))
+        return (
+            strategy.get("id"),
+            strategy.get("name", ""),
+            strategy.get("strategy_type", strategy.get("type", "")),
+            strategy.get("trader_address", ""),
+            normalized_coins,
+        )
 
     # ─── Step 4: Decision Compression ───────────────────────────
 

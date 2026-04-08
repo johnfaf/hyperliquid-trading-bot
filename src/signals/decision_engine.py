@@ -185,8 +185,32 @@ class DecisionEngine:
             "trader", "flow", "options", "polymarket", "arena", "champion", "unknown",
             "legacy", "explicit", "coin", "coins", "param", "params", "profile",
             "without", "with", "token", "tradable", "available", "custom", "pattern",
-            "name", "description", "no",
+            "name", "description", "no", "trading",
+            "on", "in", "of", "to", "for", "from", "by", "at", "as", "and",
+            "daily", "weekly", "monthly", "hourly",
+            "1m", "3m", "5m", "15m", "30m", "45m",
+            "1h", "2h", "4h", "6h", "8h", "12h",
+            "1d", "3d", "1w", "1mo",
         }
+
+    def _is_plausible_coin_symbol(self, token: str) -> bool:
+        value = str(token or "").strip()
+        if not value:
+            return False
+        lowered = value.lower()
+        if lowered in self._coin_inference_stopwords:
+            return False
+        if lowered.startswith("0x") or lowered == "unknown":
+            return False
+        if value[0].isdigit():
+            return False
+        if not value.isalnum():
+            return False
+        if len(value) < 2 or len(value) > 8:
+            return False
+        # Reject tokens that are mostly numeric/timeframe-like.
+        letters = sum(ch.isalpha() for ch in value)
+        return letters >= 2
 
     def _normalize_coin_list(self, value: Any) -> List[str]:
         if value is None:
@@ -201,9 +225,7 @@ class DecisionEngine:
         normalized: List[str] = []
         for item in candidates:
             token = str(item).strip()
-            if not token:
-                continue
-            if token.lower() == "unknown" or token.lower().startswith("0x"):
+            if not self._is_plausible_coin_symbol(token):
                 continue
             token = token.upper()
             if token not in normalized:
@@ -216,11 +238,7 @@ class DecisionEngine:
         inferred: List[str] = []
         for token in reversed(tokens):
             token = token.strip()
-            if not token or token in self._coin_inference_stopwords:
-                continue
-            if token.startswith("0x") or not token.isalnum():
-                continue
-            if len(token) < 2 or len(token) > 8:
+            if not self._is_plausible_coin_symbol(token):
                 continue
             symbol = token.upper()
             if symbol not in inferred:

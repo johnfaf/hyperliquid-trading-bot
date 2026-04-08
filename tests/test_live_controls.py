@@ -51,6 +51,7 @@ from src.signals.divergence_controller import DivergenceController
 from src.signals.execution_policy import ExecutionPolicyManager
 from src.signals.portfolio_sizer import PortfolioSizer
 from src.signals.source_allocator import SourceBudgetAllocator
+from src.signals.signal_processor import SignalProcessor
 from src.signals.signal_schema import RiskParams, SignalSide, SignalSource, TradeSignal, signal_from_execution_dict
 from src.trading.live_trader import (
     HyperliquidSigner,
@@ -7094,6 +7095,61 @@ def test_decision_engine_blocks_missing_coin_context_when_unresolvable():
     assert decisions == []
     assert summary["no_trade_reason"] == "blocked"
     assert summary["blocker_counts"].get("missing_coin_context", 0) == 1
+
+
+def test_decision_engine_rejects_timeframe_text_as_coin_context():
+    engine = DecisionEngine({
+        "min_decision_score": 0.0,
+        "min_signal_confidence": 0.0,
+        "min_source_weight": 0.0,
+        "min_expected_value_pct": -1.0,
+        "max_position_slots": 8,
+        "max_trades_per_cycle": 1,
+    })
+
+    strategies = [{
+        "id": 1,
+        "name": "mean_reversion_4h_trading",
+        "description": "legacy trading profile on hourly timeframe",
+        "strategy_type": "mean_reversion",
+        "current_score": 0.9,
+        "confidence": 0.9,
+        "parameters": {},
+        "metrics": {},
+        "metadata": {},
+    }]
+
+    decisions = engine.decide(
+        strategies,
+        regime_data={"overall_regime": "trending_up"},
+        open_positions=[],
+        kelly_stats={},
+    )
+    summary = engine.get_last_cycle_summary()
+
+    assert decisions == []
+    assert summary["blocker_counts"].get("missing_coin_context", 0) == 1
+
+
+def test_signal_processor_conflict_resolution_dedupes_multicoin_strategy():
+    processor = SignalProcessor({
+        "dedup_enabled": False,
+        "conflict_resolution": "regime_aligned",
+    })
+    strategies = [{
+        "id": 1,
+        "name": "multi_coin_long",
+        "strategy_type": "momentum_long",
+        "current_score": 0.9,
+        "parameters": {"coins": ["BTC", "ETH"]},
+    }]
+
+    resolved = processor._resolve_conflicts(
+        strategies,
+        regime_data={"overall_regime": "TRENDING_UP"},
+    )
+
+    assert len(resolved) == 1
 
 
 def test_heartbeat_active_covers_recovery_subsystems():
