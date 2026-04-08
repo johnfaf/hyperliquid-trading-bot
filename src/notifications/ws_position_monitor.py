@@ -122,7 +122,7 @@ class PositionMonitor:
 
         # Gap warning controls. A quiet userEvents stream can naturally have
         # multi-second idle windows; keep warnings for materially long silence.
-        default_gap_warn_s = max(15.0, self._watchdog_timeout_s * 0.5)
+        default_gap_warn_s = max(30.0, self._watchdog_timeout_s)
         self._gap_warn_threshold_s = max(
             5.0,
             float(getattr(config, "POSITION_MONITOR_GAP_WARN_S", default_gap_warn_s)),

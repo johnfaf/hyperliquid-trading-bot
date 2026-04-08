@@ -1,6 +1,21 @@
 from src.notifications.ws_position_monitor import PositionMonitor
 
 
+def test_default_gap_warn_threshold_is_30s_when_not_overridden(monkeypatch):
+    import src.notifications.ws_position_monitor as monitor_module
+
+    monkeypatch.delattr(monitor_module.config, "POSITION_MONITOR_GAP_WARN_S", raising=False)
+    monkeypatch.setattr(
+        monitor_module.config,
+        "POSITION_MONITOR_WATCHDOG_TIMEOUT_S",
+        30.0,
+        raising=False,
+    )
+
+    monitor = monitor_module.PositionMonitor()
+    assert monitor._gap_warn_threshold_s == 30.0
+
+
 def test_watchdog_trigger_uses_transport_activity_and_cooldown():
     monitor = PositionMonitor()
     monitor._connected = True
