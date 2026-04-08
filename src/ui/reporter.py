@@ -7,7 +7,6 @@ import logging
 import os
 import json
 from datetime import datetime
-from typing import List, Dict
 
 import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -27,7 +26,7 @@ class Reporter:
         """Generate a comprehensive daily report as markdown."""
         now = datetime.utcnow()
         report = []
-        report.append(f"# Hyperliquid Research Bot - Daily Report")
+        report.append("# Hyperliquid Research Bot - Daily Report")
         report.append(f"**Generated:** {now.strftime('%Y-%m-%d %H:%M UTC')}\n")
 
         # 1. Trader Overview
@@ -192,6 +191,7 @@ class Reporter:
         account = db.get_paper_account()
         traders = db.get_active_traders()
         strategies = db.get_active_strategies()
+        all_strategies = db.get_all_strategies()
         open_trades = db.get_open_paper_trades()
 
         lines = []
@@ -206,7 +206,7 @@ class Reporter:
             lines.append(f"  Paper PnL:     ${account['total_pnl']:,.2f}")
 
         lines.append(f"  Tracked Traders:    {len(traders)}")
-        lines.append(f"  Active Strategies:  {len(strategies)}")
+        lines.append(f"  Strategies:         {len(strategies)} active / {len(all_strategies)} tracked")
         lines.append(f"  Open Positions:     {len(open_trades)}")
 
         if strategies:

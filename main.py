@@ -188,6 +188,38 @@ class HyperliquidResearchBot:
         except Exception:
             return 0.0
 
+    def _get_inventory_snapshot(self) -> dict:
+        try:
+            trader_count = len(db.get_active_traders())
+        except Exception:
+            trader_count = 0
+        try:
+            active_strategy_count = len(db.get_active_strategies())
+        except Exception:
+            active_strategy_count = 0
+        try:
+            total_strategy_count = len(db.get_all_strategies())
+        except Exception:
+            total_strategy_count = active_strategy_count
+        return {
+            "traders": trader_count,
+            "active_strategies": active_strategy_count,
+            "total_strategies": total_strategy_count,
+        }
+
+    def _strategy_pool_is_starved(self) -> bool:
+        inventory = self._get_inventory_snapshot()
+        return (
+            inventory["traders"] < config.DISCOVERY_RECOVERY_MIN_ACTIVE_TRADERS
+            or inventory["active_strategies"] < config.DISCOVERY_RECOVERY_MIN_ACTIVE_STRATEGIES
+        )
+
+    def _should_run_recovery_discovery(self, now: float) -> bool:
+        if not self._strategy_pool_is_starved():
+            return False
+        elapsed = now - self._last_discovery if self._last_discovery else float("inf")
+        return elapsed >= config.DISCOVERY_STARVATION_RECOVERY_INTERVAL
+
     # ── Scheduling loops ──────────────────────────────────────
 
     def _run_discovery(self):
@@ -256,14 +288,20 @@ class HyperliquidResearchBot:
         sys.stdout.flush()
 
         # Initial discovery if needed
-        trader_count = 0
-        try:
-            trader_count = len(db.get_active_traders())
-        except Exception:
-            pass
+        inventory = self._get_inventory_snapshot()
+        trader_count = inventory["traders"]
 
         if trader_count == 0:
             self.logger.info("No traders in DB — running initial discovery…")
+            self._run_discovery()
+        elif self._strategy_pool_is_starved():
+            self.logger.warning(
+                "Strategy pool starved on startup â€” forcing recovery discovery "
+                "(traders=%d, active_strategies=%d, total_strategies=%d)",
+                inventory["traders"],
+                inventory["active_strategies"],
+                inventory["total_strategies"],
+            )
             self._run_discovery()
         else:
             restored_ts = self._restore_last_discovery_time()
@@ -284,6 +322,16 @@ class HyperliquidResearchBot:
             try:
                 # Tier 3: Discovery (daily)
                 if now - self._last_discovery >= config.DISCOVERY_CYCLE_INTERVAL:
+                    self._run_discovery()
+                elif self._should_run_recovery_discovery(now):
+                    inventory = self._get_inventory_snapshot()
+                    self.logger.warning(
+                        "Strategy pool still starved â€” running recovery discovery "
+                        "(traders=%d, active_strategies=%d, total_strategies=%d)",
+                        inventory["traders"],
+                        inventory["active_strategies"],
+                        inventory["total_strategies"],
+                    )
                     self._run_discovery()
 
                 # Tier 2: Trading (5 min)

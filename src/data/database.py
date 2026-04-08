@@ -619,16 +619,20 @@ def get_trader_position_history(trader_address, limit=100):
 # ─── Strategy CRUD ─────────────────────────────────────────────
 
 def save_strategy(name, description, strategy_type, parameters=None,
-                  total_pnl=0, trade_count=0, win_rate=0, sharpe_ratio=0):
-    now = utc_now_naive().isoformat()
+                  total_pnl=0, trade_count=0, win_rate=0, sharpe_ratio=0,
+                  discovered_at=None, last_scored=None, current_score=0,
+                  active=1):
+    discovered_time = discovered_at or utc_now_naive().isoformat()
     with get_connection() as conn:
         cursor = conn.execute("""
             INSERT INTO strategies
             (name, description, strategy_type, parameters, discovered_at,
-             total_pnl, trade_count, win_rate, sharpe_ratio)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+             last_scored, current_score, total_pnl, trade_count, win_rate,
+             sharpe_ratio, active)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (name, description, strategy_type, json.dumps(parameters or {}),
-              now, total_pnl, trade_count, win_rate, sharpe_ratio))
+              discovered_time, last_scored, current_score, total_pnl,
+              trade_count, win_rate, sharpe_ratio, int(bool(active))))
         return cursor.lastrowid
 
 
@@ -641,12 +645,17 @@ def save_strategies_batch(strategies_data):
             cursor = conn.execute("""
                 INSERT INTO strategies
                 (name, description, strategy_type, parameters, discovered_at,
-                 total_pnl, trade_count, win_rate, sharpe_ratio)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 last_scored, current_score, total_pnl, trade_count, win_rate,
+                 sharpe_ratio, active)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (s["name"], s["description"], s["strategy_type"],
                   json.dumps(s.get("parameters") or {}),
-                  now, s.get("total_pnl", 0), s.get("trade_count", 0),
-                  s.get("win_rate", 0), s.get("sharpe_ratio", 0)))
+                  s.get("discovered_at") or now,
+                  s.get("last_scored"),
+                  s.get("current_score", 0),
+                  s.get("total_pnl", 0), s.get("trade_count", 0),
+                  s.get("win_rate", 0), s.get("sharpe_ratio", 0),
+                  int(bool(s.get("active", 1)))))
             saved_ids.append(cursor.lastrowid)
     return saved_ids
 
@@ -663,6 +672,14 @@ def get_active_strategies():
     with get_connection() as conn:
         rows = conn.execute(
             "SELECT * FROM strategies WHERE active = 1 ORDER BY current_score DESC"
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_all_strategies():
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT * FROM strategies ORDER BY current_score DESC, discovered_at DESC"
         ).fetchall()
     return [dict(r) for r in rows]
 
@@ -2996,7 +3013,7 @@ def backup_to_json(filepath: str = None):
             "paper_account": get_paper_account(),
             "traders": get_active_traders()[:200],
             "bot_traders": [t for t in get_all_traders_including_bots() if not t.get("active", 1)],
-            "strategies": get_active_strategies()[:500],
+            "strategies": get_all_strategies()[:1000],
             "open_trades": get_open_paper_trades(),
             "closed_trades": get_paper_trade_history(limit=500),
         }
@@ -3064,10 +3081,10 @@ def restore_from_json(filepath: str = None):
     if not os.path.exists(filepath):
         return False
 
-    # Only restore if DB is empty (fresh deploy)
-    account = get_paper_account()
-    if account:
-        return False  # DB already has data
+    # Only skip restore if the DB already contains meaningful research/trading
+    # state. A bootstrap paper account row alone should not block recovery.
+    if get_active_traders() or get_all_strategies() or get_open_paper_trades():
+        return False
 
     try:
         with open(filepath, "r") as f:
@@ -3127,6 +3144,10 @@ def restore_from_json(filepath: str = None):
                 trade_count=s.get("trade_count", 0),
                 win_rate=s.get("win_rate", 0),
                 sharpe_ratio=s.get("sharpe_ratio", 0),
+                discovered_at=s.get("discovered_at"),
+                last_scored=s.get("last_scored"),
+                current_score=s.get("current_score", 0),
+                active=s.get("active", 1),
             )
 
         # Restore golden wallets (v2 backup)

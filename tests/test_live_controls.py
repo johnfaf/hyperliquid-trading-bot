@@ -347,6 +347,7 @@ def test_strategy_scorer_reports_warming_up_when_no_strategies(monkeypatch):
     from src.analysis.strategy_scorer import StrategyScorer
 
     monkeypatch.setattr(db, "get_active_strategies", lambda: [])
+    monkeypatch.setattr(db, "get_all_strategies", lambda: [])
 
     report = StrategyScorer().generate_improvement_report()
 
@@ -6817,6 +6818,174 @@ def test_discovery_time_persistence_round_trips_through_db_context(monkeypatch):
 # causes Hyperliquid to return
 # ``{"status": "ok", "response": {..., "statuses": [{"error": "Order has
 # invalid price."}]}}`` — the order never fills but looks accepted.
+
+def test_strategy_scorer_reactivates_inactive_strategies(monkeypatch):
+    from src.analysis.strategy_scorer import StrategyScorer
+
+    fd, raw_path = tempfile.mkstemp(prefix="strategy_reactivate_", suffix=".db", dir=os.getcwd())
+    os.close(fd)
+    db_path = os.path.abspath(raw_path)
+    original_path = db._DB_PATH
+    monkeypatch.setattr(db, "_DB_PATH", db_path)
+
+    try:
+        db.init_db()
+        strategy_id = db.save_strategy(
+            "reactivate_me",
+            "Recovered after restore",
+            "momentum_long",
+            trade_count=32,
+            total_pnl=4200.0,
+            win_rate=0.61,
+            current_score=0.04,
+            active=0,
+        )
+
+        monkeypatch.setattr(
+            StrategyScorer,
+            "score_strategy",
+            lambda self, strategy: {
+                "composite": 0.84,
+                "pnl_score": 0.8,
+                "win_rate_score": 0.7,
+                "sharpe_score": 0.75,
+                "consistency_score": 0.72,
+                "risk_adj_score": 0.7,
+            },
+        )
+
+        scorer = StrategyScorer()
+        results = scorer.score_all_strategies()
+
+        assert len(results) == 1
+        restored = db.get_strategy(strategy_id)
+        assert restored["active"] == 1
+        assert restored["current_score"] == 0.84
+        assert len(db.get_active_strategies()) == 1
+    finally:
+        monkeypatch.setattr(db, "_DB_PATH", original_path)
+        if os.path.exists(db_path):
+            os.remove(db_path)
+
+
+def test_backup_restore_preserves_strategy_inventory_and_state(monkeypatch):
+    fd, raw_db = tempfile.mkstemp(prefix="strategy_restore_", suffix=".db", dir=os.getcwd())
+    os.close(fd)
+    db_path = os.path.abspath(raw_db)
+    fd, raw_backup = tempfile.mkstemp(prefix="strategy_restore_", suffix=".json", dir=os.getcwd())
+    os.close(fd)
+    backup_path = os.path.abspath(raw_backup)
+    original_path = db._DB_PATH
+    monkeypatch.setattr(db, "_DB_PATH", db_path)
+
+    try:
+        db.init_db()
+        db.save_strategy(
+            "inactive_restored",
+            "Inactive but tracked",
+            "mean_reversion",
+            current_score=0.11,
+            active=0,
+            discovered_at="2026-03-01T00:00:00",
+            last_scored="2026-03-20T12:00:00",
+        )
+        db.save_strategy(
+            "active_restored",
+            "Active and scored",
+            "momentum_long",
+            current_score=0.74,
+            active=1,
+            discovered_at="2026-03-02T00:00:00",
+            last_scored="2026-03-21T12:00:00",
+        )
+
+        db.backup_to_json(backup_path)
+        os.remove(db_path)
+        db.init_db()
+
+        assert db.restore_from_json(backup_path) is True
+
+        restored = db.get_all_strategies()
+        assert len(restored) == 2
+        by_name = {row["name"]: row for row in restored}
+        assert by_name["inactive_restored"]["active"] == 0
+        assert by_name["inactive_restored"]["current_score"] == 0.11
+        assert by_name["inactive_restored"]["last_scored"] == "2026-03-20T12:00:00"
+        assert by_name["active_restored"]["active"] == 1
+        assert by_name["active_restored"]["current_score"] == 0.74
+    finally:
+        monkeypatch.setattr(db, "_DB_PATH", original_path)
+        if os.path.exists(db_path):
+            os.remove(db_path)
+        if os.path.exists(backup_path):
+            os.remove(backup_path)
+
+
+def test_strategy_improvement_report_distinguishes_inactive_inventory(monkeypatch):
+    from src.analysis.strategy_scorer import StrategyScorer
+
+    fd, raw_path = tempfile.mkstemp(prefix="strategy_report_", suffix=".db", dir=os.getcwd())
+    os.close(fd)
+    db_path = os.path.abspath(raw_path)
+    original_path = db._DB_PATH
+    monkeypatch.setattr(db, "_DB_PATH", db_path)
+
+    try:
+        db.init_db()
+        db.save_strategy(
+            "inactive_only",
+            "Tracked but inactive",
+            "momentum_long",
+            current_score=0.05,
+            active=0,
+        )
+
+        report = StrategyScorer().generate_improvement_report()
+
+        assert report["status"] == "no_active_strategies"
+        assert report["health"] == "recovery_needed"
+        assert report["total_strategies"] == 1
+        assert report["active_strategies"] == 0
+    finally:
+        monkeypatch.setattr(db, "_DB_PATH", original_path)
+        if os.path.exists(db_path):
+            os.remove(db_path)
+
+
+def test_strategy_pool_starvation_detection_uses_active_inventory(monkeypatch):
+    bot = main.HyperliquidResearchBot.__new__(main.HyperliquidResearchBot)
+    bot._last_discovery = 0
+
+    monkeypatch.setattr(main.db, "get_active_traders", lambda: [{"address": "0x1"}] * 3)
+    monkeypatch.setattr(main.db, "get_active_strategies", lambda: [])
+    monkeypatch.setattr(main.db, "get_all_strategies", lambda: [{"id": i} for i in range(200)])
+
+    assert bot._strategy_pool_is_starved() is True
+    assert bot._should_run_recovery_discovery(1_000_000.0) is True
+
+
+def test_heartbeat_active_covers_recovery_subsystems():
+    from src.core.subsystem_registry import heartbeat_active
+
+    health = SubsystemHealthRegistry()
+    for name in ("portfolio_sizer", "adaptive_learning", "source_allocator", "capital_ramp"):
+        health.register(name, affects_trading=True)
+
+    container = types.SimpleNamespace(
+        portfolio_sizer=object(),
+        adaptive_learning=object(),
+        source_allocator=object(),
+        capital_ramp=object(),
+    )
+
+    heartbeat_active(container, health)
+    stale = health.check_stale(timeout_seconds=999999)
+
+    assert stale["portfolio_sizer"] is False
+    assert stale["adaptive_learning"] is False
+    assert stale["source_allocator"] is False
+    assert stale["capital_ramp"] is False
+
 
 def test_hl_format_price_respects_five_sig_fig_limit():
     # HYPE at szDecimals=2 lets up to 4 decimals, but sig-fig cap is 5.

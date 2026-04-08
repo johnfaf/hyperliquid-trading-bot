@@ -179,13 +179,19 @@ class StrategyScorer:
 
     def score_all_strategies(self) -> List[Dict]:
         """
-        Score all active strategies and update the database.
+        Score all tracked strategies and update the database.
         This is the main "learning" loop - called periodically.
+
+        Important recovery behavior:
+        - inactive strategies are re-scored too, so the bot can recover from a
+          fully inactive strategy table after backup/restore or a bad cycle
+        - strategies are reactivated automatically once they clear the minimum
+          score threshold again
         """
-        strategies = db.get_active_strategies()
+        strategies = db.get_all_strategies()
         results = []
 
-        logger.info(f"Scoring {len(strategies)} active strategies...")
+        logger.info(f"Scoring {len(strategies)} tracked strategies...")
 
         for strategy in strategies:
             try:
@@ -207,14 +213,22 @@ class StrategyScorer:
                 # Update the strategy's current score
                 db.update_strategy_score(strategy["id"], composite)
 
-                # Deactivate strategies below threshold
-                if composite < config.MIN_STRATEGY_SCORE:
-                    logger.info(f"Deactivating low-scoring strategy {strategy['id']} "
-                              f"({strategy['name']}): score={composite:.4f}")
+                should_be_active = composite >= config.MIN_STRATEGY_SCORE
+                if bool(strategy.get("active", 1)) != bool(should_be_active):
                     with db.get_connection() as conn:
                         conn.execute(
-                            "UPDATE strategies SET active = 0 WHERE id = ?",
-                            (strategy["id"],)
+                            "UPDATE strategies SET active = ? WHERE id = ?",
+                            (1 if should_be_active else 0, strategy["id"]),
+                        )
+                    if should_be_active:
+                        logger.info(
+                            "Reactivating strategy %s (%s): score=%.4f",
+                            strategy["id"], strategy["name"], composite,
+                        )
+                    else:
+                        logger.info(
+                            "Deactivating low-scoring strategy %s (%s): score=%.4f",
+                            strategy["id"], strategy["name"], composite,
                         )
 
                 results.append({
@@ -333,14 +347,23 @@ class StrategyScorer:
         Generate a report on how the bot's strategy selection is improving over time.
         This is the key self-improvement metric.
         """
-        strategies = db.get_active_strategies()
+        all_strategies = db.get_all_strategies()
+        strategies = [s for s in all_strategies if s.get("active", 1)]
 
-        if not strategies:
+        if not all_strategies:
             return {
                 "status": "no_strategies_tracked",
                 "health": "warming_up",
                 "message": "No strategies tracked yet",
                 "total_strategies": 0,
+            }
+        if not strategies:
+            return {
+                "status": "no_active_strategies",
+                "health": "recovery_needed",
+                "message": "Tracked strategies exist but none are active",
+                "total_strategies": len(all_strategies),
+                "active_strategies": 0,
             }
 
         # Analyze trends for all strategies
@@ -359,6 +382,7 @@ class StrategyScorer:
         return {
             "timestamp": datetime.utcnow().isoformat(),
             "total_strategies": len(strategies),
+            "tracked_strategies": len(all_strategies),
             "improving": improving,
             "declining": declining,
             "stable": stable,
