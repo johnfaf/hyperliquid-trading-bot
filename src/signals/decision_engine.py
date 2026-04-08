@@ -177,6 +177,19 @@ class DecisionEngine:
             "total_operator_blocks": 0,
         }
 
+        configured_coin_universe = cfg.get("coin_universe", []) or []
+        if isinstance(configured_coin_universe, str):
+            configured_coin_universe = [
+                item.strip().upper()
+                for item in configured_coin_universe.split(",")
+                if item.strip()
+            ]
+        self._coin_universe = {
+            str(item).strip().upper()
+            for item in configured_coin_universe
+            if str(item).strip()
+        }
+
         self._coin_inference_stopwords = {
             "alpha", "beta", "gamma", "delta", "epsilon", "theta", "kappa",
             "strategy", "signal", "model", "long", "short", "momentum", "reversion",
@@ -186,6 +199,7 @@ class DecisionEngine:
             "legacy", "explicit", "coin", "coins", "param", "params", "profile",
             "without", "with", "token", "tradable", "available", "custom", "pattern",
             "name", "description", "no", "trading",
+            "trends", "bets", "stops", "spikes", "signals", "setups", "entries", "exits",
             "on", "in", "of", "to", "for", "from", "by", "at", "as", "and",
             "daily", "weekly", "monthly", "hourly",
             "1m", "3m", "5m", "15m", "30m", "45m",
@@ -210,7 +224,11 @@ class DecisionEngine:
             return False
         # Reject tokens that are mostly numeric/timeframe-like.
         letters = sum(ch.isalpha() for ch in value)
-        return letters >= 2
+        if letters < 2:
+            return False
+        if self._coin_universe and value.upper() not in self._coin_universe:
+            return False
+        return True
 
     def _normalize_coin_list(self, value: Any) -> List[str]:
         if value is None:

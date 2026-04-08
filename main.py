@@ -78,6 +78,7 @@ from src.core.cycles.trading_cycle import run_trading_cycle
 from src.core.cycles.fast_cycle import run_fast_cycle
 from src.core.cycles.reporting_cycle import run_reporting
 from src.data import database as db
+from src.data import hyperliquid_client as hl
 from src.data.database import backup_to_json
 
 from cli import (
@@ -111,8 +112,13 @@ class HyperliquidResearchBot:
         log_persistence_info(self.logger)
         validate_dependencies(self.logger)
         init_database(self.logger)
+        valid_coins = []
         try:
-            updated = db.backfill_strategy_coins_from_name()
+            valid_coins = hl.get_all_coins() or []
+        except Exception as exc:
+            self.logger.debug("Coin universe fetch for strategy backfill failed: %s", exc)
+        try:
+            updated = db.backfill_strategy_coins_from_name(valid_coins=valid_coins)
             if updated:
                 self.logger.info("Backfilled coin metadata for %d strategies from DB names.", updated)
         except Exception as exc:

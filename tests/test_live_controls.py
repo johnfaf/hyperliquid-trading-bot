@@ -7016,13 +7016,42 @@ def test_backfill_strategy_coins_from_name(monkeypatch):
         db.save_strategy("alpha_momentum_btc", "BTC momentum profile", "momentum_long", parameters={})
         db.save_strategy("bravo_reversion_eth", "ETH mean reversion profile", "mean_reversion", parameters={})
 
-        updated = db.backfill_strategy_coins_from_name()
+        updated = db.backfill_strategy_coins_from_name(valid_coins=["BTC", "ETH", "SOL", "DOGE"])
         strategies = db.get_all_strategies()
         by_name = {row["name"]: json.loads(row["parameters"]) for row in strategies}
 
         assert updated >= 2
         assert by_name["alpha_momentum_btc"]["coins"][0] == "BTC"
         assert by_name["bravo_reversion_eth"]["coins"][0] == "ETH"
+    finally:
+        monkeypatch.setattr(db, "_DB_PATH", original_path)
+        if os.path.exists(db_path):
+            os.remove(db_path)
+
+
+def test_backfill_strategy_coins_replaces_invalid_existing_tokens(monkeypatch):
+    fd, raw_path = tempfile.mkstemp(prefix="strategy_coin_sanitize_", suffix=".db", dir=os.getcwd())
+    os.close(fd)
+    db_path = os.path.normpath(raw_path)
+
+    original_path = db._DB_PATH
+    monkeypatch.setattr(db, "_DB_PATH", db_path)
+
+    try:
+        db.init_db()
+        db.save_strategy(
+            "legacy_reversion_btc",
+            "legacy strategy",
+            "mean_reversion",
+            parameters={"coins": ["TRENDS"]},
+        )
+
+        updated = db.backfill_strategy_coins_from_name(valid_coins=["BTC", "ETH"])
+        row = db.get_all_strategies()[0]
+        params = json.loads(row["parameters"])
+
+        assert updated >= 1
+        assert params.get("coins") == ["BTC"]
     finally:
         monkeypatch.setattr(db, "_DB_PATH", original_path)
         if os.path.exists(db_path):
@@ -7037,6 +7066,7 @@ def test_decision_engine_infers_coin_from_name_without_random_fallback():
         "min_expected_value_pct": -1.0,
         "max_position_slots": 8,
         "max_trades_per_cycle": 1,
+        "coin_universe": ["BTC", "ETH", "SOL", "DOGE"],
     })
 
     strategies = [{
@@ -7070,6 +7100,7 @@ def test_decision_engine_blocks_missing_coin_context_when_unresolvable():
         "min_expected_value_pct": -1.0,
         "max_position_slots": 8,
         "max_trades_per_cycle": 1,
+        "coin_universe": ["BTC", "ETH", "SOL", "DOGE"],
     })
 
     strategies = [{
@@ -7105,6 +7136,7 @@ def test_decision_engine_rejects_timeframe_text_as_coin_context():
         "min_expected_value_pct": -1.0,
         "max_position_slots": 8,
         "max_trades_per_cycle": 1,
+        "coin_universe": ["BTC", "ETH", "SOL", "DOGE"],
     })
 
     strategies = [{

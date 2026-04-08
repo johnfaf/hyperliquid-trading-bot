@@ -685,13 +685,19 @@ def get_all_strategies():
     return [dict(r) for r in rows]
 
 
-def backfill_strategy_coins_from_name(limit: int = 5000) -> int:
+def backfill_strategy_coins_from_name(limit: int = 5000, valid_coins=None) -> int:
     """
     Backfill missing strategy coin metadata from deterministic name/description tokens.
 
     This avoids random coin inference during decisioning for legacy strategies that
     were saved without `parameters.coins`.
     """
+    valid_coin_set = {
+        str(c).strip().upper()
+        for c in (valid_coins or [])
+        if str(c).strip()
+    }
+
     stopwords = {
         "alpha", "beta", "gamma", "delta", "epsilon", "theta", "kappa",
         "strategy", "signal", "model", "long", "short", "momentum", "reversion",
@@ -701,6 +707,7 @@ def backfill_strategy_coins_from_name(limit: int = 5000) -> int:
         "legacy", "explicit", "coin", "coins", "param", "params", "profile",
         "without", "with", "token", "tradable", "available", "custom", "pattern",
         "name", "description", "no", "trading",
+        "trends", "bets", "stops", "spikes", "signals", "setups", "entries", "exits",
         "on", "in", "of", "to", "for", "from", "by", "at", "as", "and",
         "daily", "weekly", "monthly", "hourly",
         "1m", "3m", "5m", "15m", "30m", "45m",
@@ -724,7 +731,11 @@ def backfill_strategy_coins_from_name(limit: int = 5000) -> int:
         if len(value) < 2 or len(value) > 8:
             return False
         letters = sum(ch.isalpha() for ch in value)
-        return letters >= 2
+        if letters < 2:
+            return False
+        if valid_coin_set and value.upper() not in valid_coin_set:
+            return False
+        return True
     updated = 0
 
     with get_connection() as conn:
@@ -753,29 +764,37 @@ def backfill_strategy_coins_from_name(limit: int = 5000) -> int:
             existing_coins = params.get("coins", params.get("coins_traded", []))
             if isinstance(existing_coins, str):
                 existing_coins = [existing_coins]
-            normalized_existing = [
-                str(c).strip().upper()
-                for c in (existing_coins or [])
-                if str(c).strip() and str(c).strip().lower() != "unknown"
-            ]
+            raw_existing = [str(c).strip().upper() for c in (existing_coins or []) if str(c).strip()]
+            normalized_existing = [c for c in raw_existing if _is_plausible_coin_symbol(c)]
             if normalized_existing:
+                if normalized_existing != raw_existing:
+                    params["coins"] = normalized_existing
+                    conn.execute(
+                        "UPDATE strategies SET parameters = ? WHERE id = ?",
+                        (json.dumps(params), row["id"]),
+                    )
+                    updated += 1
                 continue
 
+            inferred: list[str] = []
+            # Prefer strategy name tokens first, then type/description as fallback.
             text_parts = [
                 str(row["name"] or ""),
-                str(row["description"] or ""),
                 str(row["strategy_type"] or ""),
+                str(row["description"] or ""),
             ]
-            tokens = re.split(r"[^A-Za-z0-9]+", " ".join(text_parts).lower())
-            inferred: list[str] = []
-            for token in reversed(tokens):
-                token = token.strip()
-                if not _is_plausible_coin_symbol(token):
-                    continue
-                coin = token.upper()
-                if coin not in inferred:
-                    inferred.append(coin)
-                if len(inferred) >= 3:
+            for part in text_parts:
+                tokens = re.split(r"[^A-Za-z0-9]+", part.lower())
+                for token in reversed(tokens):
+                    token = token.strip()
+                    if not _is_plausible_coin_symbol(token):
+                        continue
+                    coin = token.upper()
+                    if coin not in inferred:
+                        inferred.append(coin)
+                    if len(inferred) >= 3:
+                        break
+                if inferred:
                     break
 
             if not inferred:

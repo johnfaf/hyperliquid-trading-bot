@@ -483,6 +483,13 @@ def build_subsystems(
         c.arena_incubator = _safe_init("arena_incubator", ArenaIncubator, health, affects_trading=False)
 
     if "decision_engine" in profile:
+        decision_coin_universe = []
+        try:
+            from src.data import hyperliquid_client as hl
+            decision_coin_universe = hl.get_all_coins() or []
+        except Exception:
+            decision_coin_universe = []
+
         from src.signals.decision_engine import DecisionEngine
         c.decision_engine = _safe_init(
             "decision_engine",
@@ -572,6 +579,7 @@ def build_subsystems(
                     "adaptive_learning_enabled": config.ADAPTIVE_LEARNING_ENABLED,
                     "adaptive_learning_block_on_status": config.ADAPTIVE_LEARNING_BLOCK_ON_STATUS,
                     "adaptive_learning_min_health_score": config.ADAPTIVE_LEARNING_MIN_HEALTH_SCORE,
+                    "coin_universe": decision_coin_universe,
                 }
             ),
             health,
