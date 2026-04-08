@@ -511,7 +511,7 @@ class XGBoostRegimeForecaster:
             logger.debug("Could not load training data from DB: %s", exc)
 
         # Fallback: synthetic warm-start with realistic distributions
-        logger.warning(
+        logger.info(
             "Using synthetic warm-start (%d DB rows, need %d)",
             len(y_rows) if isinstance(y_rows, np.ndarray) else 0,
             self.min_samples,

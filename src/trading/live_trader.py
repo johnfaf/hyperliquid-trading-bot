@@ -1035,7 +1035,7 @@ class LiveTrader:
                         "entry_price": entry_px,
                         "unrealized_pnl": unrealized_pnl,
                     }
-                    logger.warning(
+                    logger.info(
                         f"EXISTING POSITION found: {side.upper()} {coin} "
                         f"size={abs(size)} entry=${entry_px:,.2f} "
                         f"uPnL=${unrealized_pnl:+,.2f}"
@@ -1043,7 +1043,7 @@ class LiveTrader:
                     unprotected.append(pos)
 
             if active_coins:
-                logger.warning(
+                logger.info(
                     f"Reconciliation: {len(active_coins)} open positions found on "
                     f"exchange: {', '.join(active_coins)}. These will be tracked."
                 )
@@ -1323,7 +1323,7 @@ class LiveTrader:
         seed = self._price_seed_candidates.get(coin)
         if not seed or seed <= 0:
             self._price_seed_candidates[coin] = price
-            logger.warning(
+            logger.info(
                 "Price sanity baseline warm-up for %s: captured first sample %.6f; "
                 "waiting for confirmation sample before strict deviation checks.",
                 coin,
@@ -2629,7 +2629,7 @@ class LiveTrader:
                             "submitted_size": submitted_entry_size,
                             "entry_result": entry_result,
                         }
-                    logger.warning(
+                    logger.info(
                         "Fill verification pending for %s (non-blocking mode). "
                         "Proceeding with conservative protection sizing.",
                         coin,

@@ -106,7 +106,18 @@ class PositionMonitor:
                 )
             ),
         )
+        self._watchdog_startup_grace_s = max(
+            0.0,
+            float(
+                getattr(
+                    config,
+                    "POSITION_MONITOR_WATCHDOG_STARTUP_GRACE_S",
+                    45.0,
+                )
+            ),
+        )
         self._last_watchdog_reconnect_time = 0.0
+        self._watchdog_grace_until = 0.0
         self._watchdog_thread = None
 
         # Gap warning controls. A quiet userEvents stream can naturally have
@@ -260,6 +271,7 @@ class PositionMonitor:
             now = time.time()
             self._last_msg_time = now
             self._last_ws_activity_time = now
+            self._watchdog_grace_until = now + self._watchdog_startup_grace_s
             tracked = list(self._tracked_addresses)
 
         if was_reconnect:
@@ -361,6 +373,8 @@ class PositionMonitor:
         Must be called with self._lock held.
         """
         if not self._connected:
+            return None
+        if now < self._watchdog_grace_until:
             return None
         last_activity = self._last_ws_activity_time or self._last_msg_time
         # websocket-client tracks pong timestamps internally even when callback

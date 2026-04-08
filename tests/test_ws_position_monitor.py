@@ -48,6 +48,25 @@ def test_watchdog_uses_last_pong_timestamp_as_activity():
     assert idle == 41.0
 
 
+def test_watchdog_respects_startup_grace_window():
+    monitor = PositionMonitor()
+    monitor._connected = True
+    monitor._watchdog_timeout_s = 30.0
+    monitor._watchdog_reconnect_cooldown_s = 120.0
+    monitor._last_ws_activity_time = 100.0
+    monitor._last_msg_time = 100.0
+    monitor._last_watchdog_reconnect_time = 0.0
+    monitor._watchdog_grace_until = 145.0
+
+    with monitor._lock:
+        idle = monitor._consume_watchdog_trigger_locked(140.0)
+    assert idle is None
+
+    with monitor._lock:
+        idle = monitor._consume_watchdog_trigger_locked(146.0)
+    assert idle == 46.0
+
+
 def test_on_pong_updates_transport_activity(monkeypatch):
     monitor = PositionMonitor()
     monkeypatch.setattr("src.notifications.ws_position_monitor.time.time", lambda: 123.45)
