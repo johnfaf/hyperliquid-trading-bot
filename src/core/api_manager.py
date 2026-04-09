@@ -263,6 +263,16 @@ class HyperliquidWebSocket:
     """
 
     WS_URL = "wss://api.hyperliquid.xyz/ws"
+    _TRANSIENT_DISCONNECT_MARKERS = (
+        "connection to remote host was lost",
+        "goodbye",
+        "closed connection",
+        "connection reset",
+        "broken pipe",
+        "timed out",
+        "ping/pong timed out",
+        "no close frame",
+    )
 
     def __init__(self):
         self._ws = None
@@ -289,8 +299,23 @@ class HyperliquidWebSocket:
         # Hyperliquid doesn't use explicit sequence numbers, so we track
         # timestamps to detect if we missed data during disconnects
         self._last_msg_time: float = 0.0
+        self._last_ws_activity_time: float = 0.0
         self._gap_count: int = 0       # Number of detected gaps
         self._max_gap_ms: float = 0.0  # Largest gap seen
+        self._gap_warn_threshold_ms: float = max(
+            5000.0,
+            float(getattr(config, "WS_FEED_GAP_WARN_MS", 30000.0)),
+        )
+        self._gap_warn_cooldown_s: float = max(
+            5.0,
+            float(getattr(config, "WS_FEED_GAP_WARN_COOLDOWN_S", 60.0)),
+        )
+        self._gap_warn_startup_grace_s: float = max(
+            0.0,
+            float(getattr(config, "WS_FEED_GAP_WARN_STARTUP_GRACE_S", 45.0)),
+        )
+        self._gap_warn_grace_until: float = 0.0
+        self._last_gap_warn_time: float = 0.0
 
     def start(self):
         """Start the WebSocket connection in a background thread."""
@@ -345,12 +370,17 @@ class HyperliquidWebSocket:
                     self.WS_URL,
                     on_open=self._on_open,
                     on_message=self._on_message,
+                    on_pong=self._on_pong,
                     on_error=self._on_error,
                     on_close=self._on_close,
                 )
                 self._ws.run_forever(ping_interval=20, ping_timeout=10)
             except Exception as e:
-                logger.error(f"WebSocket error: {e}")
+                if self._running:
+                    if self._is_transient_disconnect_error(e):
+                        logger.info("WebSocket transport dropped: %s", e)
+                    else:
+                        logger.error("WebSocket loop error: %s", e)
 
             if self._running:
                 self._reconnect_count += 1
@@ -372,6 +402,10 @@ class HyperliquidWebSocket:
         was_reconnect = self._connected is False and self._reconnect_count > 0
         self._connected = True
         self._reconnect_count = 0
+        now = time.time()
+        self._last_msg_time = now
+        self._last_ws_activity_time = now
+        self._gap_warn_grace_until = now + self._gap_warn_startup_grace_s
 
         if was_reconnect:
             logger.info("WebSocket RECONNECTED — clearing stale local state")
@@ -420,15 +454,39 @@ class HyperliquidWebSocket:
         self._messages_received += 1
         now = time.time()
 
-        # Gap detection: if time since last message > 5s, we likely missed data
+        # Gap detection with cooldown + startup grace to avoid noisy false alarms.
         if self._last_msg_time > 0:
             gap_ms = (now - self._last_msg_time) * 1000
-            if gap_ms > 5000:  # 5 second gap = suspicious
+            if gap_ms > self._gap_warn_threshold_ms:
                 self._gap_count += 1
+                prev_max = self._max_gap_ms
                 self._max_gap_ms = max(self._max_gap_ms, gap_ms)
-                logger.warning(f"WebSocket gap detected: {gap_ms:.0f}ms since last message "
-                             f"(gap #{self._gap_count})")
+                in_grace = now < self._gap_warn_grace_until
+                should_warn = (
+                    not in_grace
+                    and (
+                        (now - self._last_gap_warn_time) >= self._gap_warn_cooldown_s
+                        or gap_ms > (prev_max + 1000.0)
+                    )
+                )
+                if should_warn:
+                    self._last_gap_warn_time = now
+                    logger.warning(
+                        "WebSocket gap detected: %.0fms since last message (gap #%d, warn_threshold=%.0fms)",
+                        gap_ms,
+                        self._gap_count,
+                        self._gap_warn_threshold_ms,
+                    )
+                else:
+                    logger.debug(
+                        "WebSocket gap observed: %.0fms (gap #%d, warn_threshold=%.0fms, in_grace=%s)",
+                        gap_ms,
+                        self._gap_count,
+                        self._gap_warn_threshold_ms,
+                        in_grace,
+                    )
         self._last_msg_time = now
+        self._last_ws_activity_time = now
         self.last_update = now
 
         try:
@@ -479,9 +537,24 @@ class HyperliquidWebSocket:
         except Exception as e:
             logger.debug(f"WS message parse error: {e}")
 
+    def _on_pong(self, ws, message):
+        """Treat pong frames as healthy transport activity."""
+        self._last_ws_activity_time = time.time()
+
+    @classmethod
+    def _is_transient_disconnect_error(cls, error: Any) -> bool:
+        """Classify common transport disconnects as transient/recoverable."""
+        if error is None:
+            return False
+        text = str(error).lower()
+        return any(marker in text for marker in cls._TRANSIENT_DISCONNECT_MARKERS)
+
     def _on_error(self, ws, error):
         if self._running:
-            logger.warning(f"WebSocket error: {error}")
+            if self._is_transient_disconnect_error(error):
+                logger.info("WebSocket transient disconnect: %s", error)
+            else:
+                logger.warning("WebSocket error: %s", error)
         self._connected = False
 
     def _on_close(self, ws, close_status_code=None, close_msg=None):
@@ -500,6 +573,7 @@ class HyperliquidWebSocket:
             "age_seconds": round(time.time() - self.last_update, 1) if self.last_update else None,
             "gaps_detected": self._gap_count,
             "max_gap_ms": round(self._max_gap_ms, 0),
+            "gap_warn_threshold_ms": round(self._gap_warn_threshold_ms, 0),
         }
 
 
