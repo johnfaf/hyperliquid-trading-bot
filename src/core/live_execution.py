@@ -17,6 +17,29 @@ from src.signals.signal_schema import signal_from_execution_dict
 logger = logging.getLogger(__name__)
 
 
+def _is_insufficient_margin_rejection(result) -> bool:
+    """Return True when a rejection payload indicates insufficient margin."""
+    if not isinstance(result, dict):
+        return False
+
+    reason = str(result.get("reason", "") or "").strip().lower()
+    if reason == "insufficient_margin":
+        return True
+
+    messages: List[str] = []
+    errors = result.get("errors")
+    if isinstance(errors, list):
+        messages.extend(str(item) for item in errors)
+    elif errors:
+        messages.append(str(errors))
+
+    message = result.get("message")
+    if message:
+        messages.append(str(message))
+
+    return any("insufficient margin" in msg.lower() for msg in messages)
+
+
 def get_live_trader(container):
     """Return the attached live trader, if any."""
     return getattr(container, "live_trader", None)
@@ -424,14 +447,23 @@ def mirror_executed_trades_to_live(
                         live_signal.side.value,
                     )
                 else:
-                    logger.error(
-                        "%s FAILED: %s %s %s — result: %s",
-                        success_label,
-                        live_signal.coin,
-                        live_signal.side.value,
-                        live_signal.confidence,
-                        live_result,
-                    )
+                    if _is_insufficient_margin_rejection(live_result):
+                        logger.warning(
+                            "%s skipped due to insufficient margin: %s %s -> %s",
+                            success_label,
+                            live_signal.coin,
+                            live_signal.side.value,
+                            live_result,
+                        )
+                    else:
+                        logger.error(
+                            "%s FAILED: %s %s %s — result: %s",
+                            success_label,
+                            live_signal.coin,
+                            live_signal.side.value,
+                            live_signal.confidence,
+                            live_result,
+                        )
             except Exception as exc:
                 logger.error("%s live execution error: %s", success_label, exc)
     elif trader.is_live_enabled():

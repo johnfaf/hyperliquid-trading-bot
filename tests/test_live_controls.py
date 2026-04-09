@@ -898,6 +898,62 @@ def test_mirror_executed_trades_uses_account_value_without_wallet_alias():
     assert trader.executed == [("ETH", "long", True)]
 
 
+def test_mirror_executed_trades_logs_warning_for_insufficient_margin(monkeypatch, caplog):
+    class FakeLiveTrader:
+        def __init__(self):
+            self.executed = []
+            self.max_order_usd = 25.0
+            self.min_order_usd = 11.0
+
+        def is_live_enabled(self):
+            return True
+
+        def is_deployable(self):
+            return True
+
+        def get_account_value(self):
+            return 250.0
+
+        def execute_signal(self, signal, bypass_firewall=False):
+            self.executed.append((signal.coin, signal.side.value, bypass_firewall))
+            return {
+                "status": "rejected",
+                "reason": "exchange_inner_error",
+                "errors": ["Insufficient margin to place order. asset=4"],
+            }
+
+    monkeypatch.setattr("src.core.live_execution.db.get_paper_account", lambda: {"balance": 10000.0})
+    monkeypatch.setattr("src.core.live_execution.get_all_mids", lambda: {"DYDX": "0.10403"})
+
+    trader = FakeLiveTrader()
+    container = type("Container", (), {"live_trader": trader})()
+    executed = [
+        signal_from_execution_dict(
+            {
+                "coin": "DYDX",
+                "side": "long",
+                "confidence": 0.8,
+                "entry_price": 0.10403,
+                "size": 100.0,
+                "leverage": 5,
+                "strategy_type": "mirror_test",
+            }
+        )
+    ]
+
+    with caplog.at_level(logging.WARNING):
+        mirror_executed_trades_to_live(
+            container,
+            executed,
+            success_label="LIVE COPY",
+            skip_label="SKIP",
+        )
+
+    assert trader.executed == [("DYDX", "long", True)]
+    assert "insufficient margin" in caplog.text.lower()
+    assert "live copy failed" not in caplog.text.lower()
+
+
 def test_execute_options_flow_paper_trade_preserves_precise_stops(monkeypatch):
     opened = {}
     price = 0.01234567
