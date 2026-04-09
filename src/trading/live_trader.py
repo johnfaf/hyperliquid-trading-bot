@@ -1108,7 +1108,10 @@ class LiveTrader:
             logger.warning("protect_orphaned_positions: open-orders fetch failed: %s", exc)
             open_orders = []
 
+        # Index protective orders by coin. Track order IDs for stale cleanup.
+        _MAX_PROTECTIVE_ORDERS_PER_COIN = 2  # 1 SL + 1 TP expected
         protected_coins: Dict[str, List[str]] = {}
+        protective_order_ids: Dict[str, List[int]] = {}  # coin → [oid, ...]
         for order in open_orders:
             if not isinstance(order, dict):
                 continue
@@ -1123,6 +1126,26 @@ class LiveTrader:
             # position even without an explicit reduceOnly flag.
             if reduce_only or "stop" in order_type or "take" in order_type or "trigger" in order_type:
                 protected_coins.setdefault(coin, []).append(order_type or "reduce_only")
+                oid = order.get("oid") or order.get("order_id") or order.get("id")
+                if oid is not None:
+                    protective_order_ids.setdefault(coin, []).append(int(oid))
+
+        # Clean up stale protective orders: if a coin has >2 reduce_only orders,
+        # cancel the oldest extras to prevent accumulation over position changes.
+        stale_cancelled = 0
+        for coin, oids in protective_order_ids.items():
+            if len(oids) > _MAX_PROTECTIVE_ORDERS_PER_COIN:
+                excess = sorted(oids)[:-_MAX_PROTECTIVE_ORDERS_PER_COIN]  # Keep newest 2
+                logger.warning(
+                    "Cleaning %d stale protective orders for %s (had %d, keeping %d)",
+                    len(excess), coin, len(oids), _MAX_PROTECTIVE_ORDERS_PER_COIN,
+                )
+                for oid in excess:
+                    try:
+                        if self.cancel_order(coin, oid):
+                            stale_cancelled += 1
+                    except Exception as exc:
+                        logger.debug("Failed to cancel stale order %s/%s: %s", coin, oid, exc)
 
         protected = 0
         skipped = 0
@@ -1193,10 +1216,101 @@ class LiveTrader:
             "protected": protected,
             "skipped": skipped,
             "failed": failed,
+            "stale_cancelled": stale_cancelled,
         }
-        if protected or failed:
+        if protected or failed or stale_cancelled:
             logger.warning("Orphan protection summary: %s", summary)
         return summary
+
+    _PROTECTIVE_RESIZE_DELAY_S = 30.0  # Wait for remaining fills before resizing
+
+    def _deferred_protective_resize(
+        self,
+        coin: str,
+        protect_side: str,
+        original_protective_size: float,
+        sl_price: float,
+        tp_price: float,
+        tp_or_sl_type: tuple = ("sl", "tp"),
+    ) -> None:
+        """Background task: after a delay, check actual position size and resize
+        SL/TP if they're oversized relative to the real position.
+
+        This handles the case where a market order partially fills (e.g. 140 of
+        1902 units) and we initially place SL/TP for the full requested size.
+        After the delay, if the remaining quantity never filled, we cancel and
+        re-place protective orders sized to the actual position.
+        """
+        try:
+            time.sleep(self._PROTECTIVE_RESIZE_DELAY_S)
+
+            # Check actual position size
+            positions = self.get_positions()
+            actual_size = 0.0
+            for pos in positions:
+                if pos.get("coin") == coin:
+                    actual_size = abs(self._coerce_float(pos.get("size", pos.get("szi", 0))))
+                    break
+
+            if actual_size <= 0:
+                logger.info(
+                    "Deferred resize for %s: position gone (closed or liquidated), skipping",
+                    coin,
+                )
+                return
+
+            # Only resize if the protective orders are significantly oversized (>10%)
+            if original_protective_size <= actual_size * 1.10:
+                logger.debug(
+                    "Deferred resize for %s: protective size %.4f within 10%% of actual %.4f, no action",
+                    coin, original_protective_size, actual_size,
+                )
+                return
+
+            logger.warning(
+                "PROTECTIVE RESIZE %s: actual position=%.4f but SL/TP sized at %.4f (%.0f%% over). "
+                "Cancelling and re-placing at correct size.",
+                coin, actual_size, original_protective_size,
+                (original_protective_size / actual_size - 1) * 100,
+            )
+
+            # Cancel all existing protective orders for this coin
+            try:
+                open_orders = self.get_open_orders()
+                for order in open_orders:
+                    if not isinstance(order, dict):
+                        continue
+                    if order.get("coin") != coin:
+                        continue
+                    reduce_only = bool(order.get("reduceOnly") or order.get("reduce_only"))
+                    otype = str(order.get("orderType") or order.get("type") or "").lower()
+                    if reduce_only or "stop" in otype or "take" in otype or "trigger" in otype:
+                        oid = order.get("oid") or order.get("order_id") or order.get("id")
+                        if oid is not None:
+                            self.cancel_order(coin, int(oid))
+            except Exception as exc:
+                logger.warning("Deferred resize cancel phase failed for %s: %s", coin, exc)
+                return
+
+            # Re-place SL and TP at correct actual size
+            sl_result = self.place_trigger_order(coin, protect_side, actual_size, sl_price, tp_or_sl="sl")
+            tp_result = self.place_trigger_order(coin, protect_side, actual_size, tp_price, tp_or_sl="tp")
+
+            sl_ok = self._is_order_result_success(sl_result)
+            tp_ok = self._is_order_result_success(tp_result)
+            if sl_ok and tp_ok:
+                logger.info(
+                    "Deferred resize for %s complete: SL/TP resized from %.4f to %.4f",
+                    coin, original_protective_size, actual_size,
+                )
+            else:
+                logger.error(
+                    "Deferred resize for %s FAILED: sl=%s tp=%s — position may be unprotected!",
+                    coin, sl_result, tp_result,
+                )
+
+        except Exception as exc:
+            logger.error("Deferred protective resize error for %s: %s", coin, exc)
 
     def update_daily_pnl_from_fills(self):
         """
@@ -2819,6 +2933,19 @@ class LiveTrader:
                 }
 
             logger.info(f"Placed SL @ ${sl_price:.2f}, TP @ ${tp_price:.2f}")
+
+            # Schedule deferred protective order resize if we over-protected
+            # due to pending fill verification (protective_size >> actual_fill).
+            if protective_size > actual_fill_size * 1.10 and not self.dry_run:
+                import threading as _threading
+                _protect_side = "sell" if side == "buy" else "buy"
+                _threading.Thread(
+                    target=self._deferred_protective_resize,
+                    args=(coin, _protect_side, protective_size, sl_price, tp_price),
+                    kwargs={"tp_or_sl_type": ("sl", "tp")},
+                    daemon=True,
+                    name=f"protect-resize-{coin}",
+                ).start()
 
             # Return summary
             return {

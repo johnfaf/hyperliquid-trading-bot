@@ -122,9 +122,12 @@ class PositionMonitor:
 
         # Watchdog: if WS stays "connected" but no messages arrive for too
         # long, force-close so run_forever reconnects and re-subscribes.
+        # Default raised from 30s→90s: ping/pong every 20s keeps connection
+        # alive; 30s timeout was too aggressive for quiet streams (no position
+        # changes) causing unnecessary 2-minute reconnect cycles.
         self._watchdog_timeout_s = max(
             10.0,
-            float(getattr(config, "POSITION_MONITOR_WATCHDOG_TIMEOUT_S", 30.0)),
+            float(getattr(config, "POSITION_MONITOR_WATCHDOG_TIMEOUT_S", 90.0)),
         )
         self._watchdog_reconnect_cooldown_s = max(
             15.0,
@@ -277,7 +280,7 @@ class PositionMonitor:
                     on_error=self._on_error,
                     on_close=self._on_close,
                 )
-                self._ws.run_forever(ping_interval=20, ping_timeout=10)
+                self._ws.run_forever(ping_interval=30, ping_timeout=15)
             except Exception as e:
                 if self._is_transient_ws_close_error(e):
                     logger.info("PositionMonitor transport reconnect trigger: %s", e)
@@ -341,6 +344,10 @@ class PositionMonitor:
             logger.info("PositionMonitor connected")
             for address in tracked:
                 self._bootstrap_positions(address)
+
+        # Reset reconnect counter on successful connection so backoff
+        # doesn't permanently escalate to 60s after transient failures.
+        self._reconnect_count = 0
 
         # Subscribe to all tracked addresses
         for address in tracked:

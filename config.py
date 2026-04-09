@@ -194,12 +194,14 @@ PORTFOLIO_MAX_CLUSTER_EXPOSURE_PCT = float(
     os.environ.get("PORTFOLIO_MAX_CLUSTER_EXPOSURE_PCT", 0.55)
 )
 ROTATION_ENGINE_ENABLED = os.environ.get(
-    "ROTATION_ENGINE_ENABLED", "false"
+    "ROTATION_ENGINE_ENABLED", "true"
 ).lower() in ("true", "1", "yes")
+# Dry-run telemetry: when true alongside ROTATION_ENGINE_ENABLED, rotations
+# are simulated (logged but not executed).  Default off so rotations are live.
 ROTATION_DRY_RUN_TELEMETRY = os.environ.get(
-    "ROTATION_DRY_RUN_TELEMETRY", "true"
+    "ROTATION_DRY_RUN_TELEMETRY", "false"
 ).lower() in ("true", "1", "yes")
-ROTATION_SHADOW_MODE_DAYS = int(os.environ.get("ROTATION_SHADOW_MODE_DAYS", "7"))
+ROTATION_SHADOW_MODE_DAYS = int(os.environ.get("ROTATION_SHADOW_MODE_DAYS", "0"))
 ROTATION_REQUIRE_EXPLICIT_THRESHOLDS = os.environ.get(
     "ROTATION_REQUIRE_EXPLICIT_THRESHOLDS", "true"
 ).lower() in ("true", "1", "yes")
