@@ -12,7 +12,7 @@ import logging
 import time
 import json
 import threading
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Optional, Tuple
 from collections import defaultdict
 
@@ -413,7 +413,7 @@ class OptionsFlowScanner:
             # Deribit format: 28MAR26
             from datetime import datetime
             exp_date = datetime.strptime(expiry_str, "%d%b%y")
-            days_to_expiry = (exp_date - datetime.utcnow()).days
+            days_to_expiry = (exp_date - datetime.now(timezone.utc)).days
             if days_to_expiry <= 7:
                 return "weekly"
             elif days_to_expiry <= 35:
@@ -475,7 +475,7 @@ class OptionsFlowScanner:
                     existing_ids.add(p["trade_id"])
 
             # Trim to last 24h and cap at 500
-            cutoff = int((datetime.utcnow() - timedelta(hours=24)).timestamp() * 1000)
+            cutoff = int((datetime.now(timezone.utc) - timedelta(hours=24)).timestamp() * 1000)
             self.unusual_prints = [
                 p for p in self.unusual_prints if p.get("timestamp", 0) > cutoff
             ][-500:]
@@ -494,7 +494,7 @@ class OptionsFlowScanner:
             "unusual_prints": len(all_unusual),
             "total_tracked": len(self.unusual_prints),
             "top_convictions": len(self.top_convictions),
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
         }
         logger.info(f"Flow scan complete: {len(all_unusual)} new unusual prints, "
                     f"{len(self.unusual_prints)} total tracked")
@@ -610,7 +610,7 @@ class OptionsFlowScanner:
                 })
 
             return {
-                "timestamp": datetime.utcnow().isoformat(),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
                 "convictions": self.top_convictions,
                 "heatmap": heatmap_data,
                 "flow_bars": flow_bars,

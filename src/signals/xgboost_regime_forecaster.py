@@ -56,11 +56,12 @@ except ImportError:
     HAS_CRYPTOCOM = False
 
 
-# Feature order must match training and prediction
+# Feature order must match training and prediction.
+# NOTE: arkham_flow and polymarket_sentiment were removed — they are always
+# zero (no live data source) and just added noise to the model.
 FEATURE_NAMES = [
     "funding_rate", "funding_slope", "orderbook_imbalance",
-    "arkham_flow", "volatility_5m", "basis_spread",
-    "polymarket_sentiment", "options_flow_conviction",
+    "volatility_5m", "basis_spread", "options_flow_conviction",
 ]
 
 # Label encoding: crash=0, neutral=1, bullish=2
@@ -480,8 +481,7 @@ class XGBoostRegimeForecaster:
             with get_connection() as conn:
                 rows = conn.execute("""
                     SELECT funding_rate, funding_slope, orderbook_imbalance,
-                           arkham_flow, volatility_5m, basis_spread,
-                           polymarket_sentiment, options_flow_conviction,
+                           volatility_5m, basis_spread, options_flow_conviction,
                            regime_label
                     FROM regime_history
                     WHERE timestamp > datetime('now', '-90 days')
@@ -491,12 +491,13 @@ class XGBoostRegimeForecaster:
                 """).fetchall()
 
             if rows:
+                n_features = len(FEATURE_NAMES)  # 6
                 X_rows = np.array(
-                    [[float(r[i]) for i in range(8)] for r in rows],
+                    [[float(r[i]) for i in range(n_features)] for r in rows],
                     dtype=np.float32,
                 )
                 y_rows = np.array(
-                    [int(r[8]) for r in rows],
+                    [int(r[n_features]) for r in rows],
                     dtype=np.int32,
                 )
                 logger.info(
@@ -522,16 +523,15 @@ class XGBoostRegimeForecaster:
             rng.normal(0, 0.0005, n),   # funding_rate
             rng.normal(0, 0.3, n),      # funding_slope
             rng.normal(0, 0.2, n),      # orderbook_imbalance
-            rng.normal(0, 0.15, n),     # arkham_flow
             rng.exponential(0.03, n),   # volatility_5m (always positive)
             rng.normal(0, 0.1, n),      # basis_spread
-            rng.normal(0, 0.25, n),     # polymarket_sentiment
             rng.normal(0, 0.2, n),      # options_flow_conviction
         ]).astype(np.float32)
 
         # Labels: derived from weighted composite to be internally consistent
+        # Indices: 1=funding_slope, 2=orderbook_imbalance, 5=options_flow_conviction
         composite = (X_synth[:, 1] * 0.30 + X_synth[:, 2] * 0.25 +
-                     X_synth[:, 6] * 0.20 + rng.normal(0, 0.15, n))
+                     X_synth[:, 5] * 0.20 + rng.normal(0, 0.15, n))
         y_synth = np.where(composite < -0.15, 0, np.where(composite > 0.15, 2, 1)).astype(np.int32)
 
         # If we have some DB rows, prepend them

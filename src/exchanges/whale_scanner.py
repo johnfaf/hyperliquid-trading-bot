@@ -16,7 +16,7 @@ Integration into pipeline:
 import logging
 import threading
 from typing import Dict, List, Optional
-from datetime import datetime
+from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
 
@@ -74,7 +74,7 @@ class WhaleScanner:
             return []
 
         whales = []
-        current_time = datetime.utcnow().timestamp()
+        current_time = datetime.now(timezone.utc).timestamp()
         with self._cache_lock:
             expired_keys = [
                 key for key, ts in self._whale_cache.items()

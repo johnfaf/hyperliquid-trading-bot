@@ -9,7 +9,7 @@ import json
 import logging
 import os
 import glob
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent.parent
@@ -92,7 +92,7 @@ def run_stress_test(scenarios=None, use_seed=False) -> dict:
 
     # Save reports
     os.makedirs(str(REPORTS_DIR), exist_ok=True)
-    ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
 
     json_path = str(REPORTS_DIR / f"stress_test_{ts}.json")
     with open(json_path, "w") as f:

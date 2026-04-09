@@ -25,7 +25,7 @@ import time
 import logging
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 
 from .base_adapter import BaseExchangeAdapter, NormalizedTrader, NormalizedMarketData
 from .hyperliquid_adapter import HyperliquidAdapter
@@ -38,7 +38,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class ScanResult:
     """Result of a multi-exchange scan cycle."""
-    timestamp: str = field(default_factory=lambda: datetime.utcnow().isoformat())
+    timestamp: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     cycle_duration_s: float = 0.0
 
     # Trader discovery — real counts, not request counts

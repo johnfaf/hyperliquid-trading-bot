@@ -27,7 +27,7 @@ import time
 import json
 import hashlib
 import copy
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple, Union
 from enum import Enum
@@ -859,7 +859,7 @@ class LiveTrader:
             "perps_margin": perps,
             "spot_usdc": spot,
             "total": total,
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
         }
 
         if log and (now - self._last_balance_log_ts) >= self._balance_log_interval_s:
@@ -970,7 +970,7 @@ class LiveTrader:
 
     def _check_daily_reset(self):
         """Reset daily counters at midnight UTC."""
-        today = datetime.utcnow().strftime("%Y-%m-%d")
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         if today != self.daily_reset_date:
             self.daily_reset_date = today
             self.daily_pnl = 0.0
@@ -1210,7 +1210,7 @@ class LiveTrader:
                 return
 
             # Sum realized closed PnL from today's fills.
-            today = datetime.utcnow().strftime("%Y-%m-%d")
+            today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
             today_realized = 0.0
             for fill in fills:
                 fill_time = fill.get("time", "")
@@ -1483,6 +1483,29 @@ class LiveTrader:
             return False
         return True
 
+    @classmethod
+    def _is_insufficient_margin_rejection(cls, result: Optional[Dict]) -> bool:
+        """Return True when an order rejection is caused by insufficient margin."""
+        if not isinstance(result, dict):
+            return False
+
+        reason = str(result.get("reason", "")).strip().lower()
+        if "insufficient_margin" in reason:
+            return True
+
+        messages: List[str] = []
+        errors = result.get("errors")
+        if isinstance(errors, list):
+            messages.extend(str(err) for err in errors if err is not None)
+        elif errors is not None:
+            messages.append(str(errors))
+
+        message = result.get("message")
+        if message:
+            messages.append(str(message))
+
+        return any("insufficient margin" in msg.lower() for msg in messages)
+
     def _post_order(self, action: Dict, dry_run_override: Optional[bool] = None) -> Dict:
         """
         Post an order to Hyperliquid exchange.
@@ -1603,21 +1626,29 @@ class LiveTrader:
             inner_statuses = self._extract_inner_order_statuses(result)
             if inner_statuses and any("error" in s for s in inner_statuses):
                 errors = [s["error"] for s in inner_statuses if "error" in s]
-                logger.error(
-                    "Exchange rejected order at inner level: %s (action_hash=%s)",
-                    errors, action_hash[:16],
-                )
-                # Do NOT cache inner-error rejections — the order did not
-                # execute, so retries (e.g. from the next orphan-protection
-                # sweep after the caller has fixed the price) must be
-                # allowed to reach the exchange instead of being silently
-                # swallowed by the dedup cache.
-                return {
+                rejection_payload = {
                     "status": "rejected",
                     "reason": "exchange_inner_error",
                     "errors": errors,
                     "raw_response": result,
                 }
+                if self._is_insufficient_margin_rejection(rejection_payload):
+                    logger.warning(
+                        "Exchange rejected order for insufficient margin: %s (action_hash=%s)",
+                        errors,
+                        action_hash[:16],
+                    )
+                else:
+                    logger.error(
+                        "Exchange rejected order at inner level: %s (action_hash=%s)",
+                        errors, action_hash[:16],
+                    )
+                # Do NOT cache inner-error rejections — the order did not
+                # execute, so retries (e.g. from the next orphan-protection
+                # sweep after the caller has fixed the price) must be
+                # allowed to reach the exchange instead of being silently
+                # swallowed by the dedup cache.
+                return rejection_payload
 
             # Only cache successfully accepted orders.  Rejected orders
             # are not "placed" and must remain retryable.
@@ -2306,7 +2337,7 @@ class LiveTrader:
             )
 
             orders = data.get("orders", []) if isinstance(data, dict) else data
-            return orders
+            return orders if isinstance(orders, list) else []
 
         except Exception as e:
             logger.error(f"Error getting open orders: {e}")
@@ -2572,7 +2603,15 @@ class LiveTrader:
             )
 
             if not self._is_order_result_success(entry_result):
-                logger.error(f"Failed to place entry order: {entry_result}")
+                if self._is_insufficient_margin_rejection(entry_result):
+                    logger.warning(
+                        "Skipping %s %s entry due to insufficient margin: %s",
+                        coin,
+                        signal_side,
+                        entry_result,
+                    )
+                else:
+                    logger.error(f"Failed to place entry order: {entry_result}")
                 return entry_result
 
             # Update daily PnL after every execution to keep loss tracking current
@@ -2786,7 +2825,7 @@ class LiveTrader:
                 "leverage": signal.leverage,
                 "entry_result": entry_result,
                 "dry_run": self.dry_run,
-                "timestamp": datetime.utcnow().isoformat()
+                "timestamp": datetime.now(timezone.utc).isoformat()
             }
 
         except Exception as e:
@@ -2824,5 +2863,5 @@ class LiveTrader:
             "execute_fill_verify_blocking": self._execute_fill_verify_blocking,
             "wallet_balance": dict(self._last_balance_snapshot),
             "asset_indices_loaded": len(self.asset_index_map),
-            "timestamp": datetime.utcnow().isoformat()
+            "timestamp": datetime.now(timezone.utc).isoformat()
         }

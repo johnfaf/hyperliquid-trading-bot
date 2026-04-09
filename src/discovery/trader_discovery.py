@@ -5,7 +5,7 @@ Analyzes their positions, trading patterns, and performance over time.
 """
 import logging
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Optional
 
 import sys, os
@@ -381,7 +381,7 @@ class TraderDiscovery:
             return None
 
         # Get recent fills
-        one_week_ago = int((datetime.utcnow() - timedelta(days=7)).timestamp() * 1000)
+        one_week_ago = int((datetime.now(timezone.utc) - timedelta(days=7)).timestamp() * 1000)
         fills = hl.get_user_fills(address, start_time=one_week_ago)
 
         # Analyze positions
@@ -428,7 +428,7 @@ class TraderDiscovery:
             "trade_analysis": trade_analysis,
             "total_margin_used": state["total_margin_used"],
             "num_open_positions": len([p for p in positions if p["size"] > 0]),
-            "analyzed_at": datetime.utcnow().isoformat(),
+            "analyzed_at": datetime.now(timezone.utc).isoformat(),
             "bot_score": bot_score,
         }
 
@@ -923,7 +923,7 @@ class TraderDiscovery:
                     win_rate=0, trade_count=0,
                     metadata={"status": "bot_detected",
                               "bot_score": p.get("bot_score", 0),
-                              "detected_at": datetime.utcnow().isoformat()},
+                              "detected_at": datetime.now(timezone.utc).isoformat()},
                     is_active=False,
                 )
                 bots_marked += 1
@@ -948,7 +948,7 @@ class TraderDiscovery:
             "final_pool": len(profiles),
             "total_tracked": len(self.known_traders),
             "rate_limit_hits": rate_limit_hits + rate_limit_hits_deep,
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
         }
 
         db.log_research_cycle(

@@ -90,8 +90,8 @@ PAPER_TRADING_MAX_LEVERAGE = float(os.environ.get("PAPER_TRADING_MAX_LEVERAGE", 
 #   e.g. PAPER_TRADING_STOP_LOSS_PCT=0.15 at 5x → 3% raw move before exit.
 PAPER_TRADING_STOP_LOSS_PCT = float(os.environ.get("PAPER_TRADING_STOP_LOSS_PCT", 0.15))
 PAPER_TRADING_TAKE_PROFIT_PCT = float(os.environ.get("PAPER_TRADING_TAKE_PROFIT_PCT", 0.30))
-PAPER_TRADING_MAKER_FEE_BPS = float(os.environ.get("PAPER_TRADING_MAKER_FEE_BPS", 1.5))
-PAPER_TRADING_TAKER_FEE_BPS = float(os.environ.get("PAPER_TRADING_TAKER_FEE_BPS", 4.5))
+PAPER_TRADING_MAKER_FEE_BPS = float(os.environ.get("PAPER_TRADING_MAKER_FEE_BPS", 0.2))
+PAPER_TRADING_TAKER_FEE_BPS = float(os.environ.get("PAPER_TRADING_TAKER_FEE_BPS", 2.5))
 PAPER_TRADING_DEFAULT_EXECUTION_ROLE = os.environ.get(
     "PAPER_TRADING_DEFAULT_EXECUTION_ROLE", "taker"
 ).lower()
@@ -345,6 +345,22 @@ def _validate_config_bounds() -> None:
         ("XGBOOST_RETRAIN_INTERVAL", 60, 2_592_000, 86400),
         ("KELLY_MULTIPLIER", 0.0, 1.0, 0.25),
         ("MONTE_CARLO_PATHS", 100, 200_000, 5000),
+        # Previously unvalidated float/int env vars:
+        ("PAPER_TRADING_MAKER_FEE_BPS", 0.0, 100.0, 0.2),
+        ("PAPER_TRADING_TAKER_FEE_BPS", 0.0, 100.0, 2.5),
+        ("BOT_MM_PNL_THRESHOLD", -1e6, 1e6, 0.0),
+        ("BOT_HARD_CUTOFF_TRADES", 1, 100_000, 100),
+        ("BOT_THRESHOLD", 1, 100, 3),
+        ("BOT_ELEVATED_FREQ", 1, 100_000, 50),
+        ("PORTFOLIO_CHURN_PENALTY", 0.0, 1.0, 0.02),
+        ("PORTFOLIO_MIN_HOLD_MINUTES", 0, 525_600, 60),
+        ("ROTATION_SHADOW_MODE_DAYS", 0, 365, 7),
+        ("FORECASTER_CRASH_THRESHOLD", -1.0, 0.0, -0.15),
+        ("XGBOOST_CRASH_THRESHOLD", -1.0, 0.0, -0.18),
+        ("FUNDING_NEGATIVE_THRESHOLD", -1.0, 0.0, -0.001),
+        ("FUNDING_POSITIVE_THRESHOLD", 0.0, 1.0, 0.003),
+        ("POLYMARKET_MIN_VOLUME", 0.0, 1e9, 10_000.0),
+        ("VAULT_KV_VERSION", 1, 2, 2),
     ]
     for name, min_value, max_value, fallback in rules:
         _validate_numeric_bounds(name, min_value, max_value, fallback)

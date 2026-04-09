@@ -8,7 +8,7 @@ Runs every ~5 minutes to react to market changes quickly.
 Extracted from ``HyperliquidResearchBot._run_trading_cycle``.
 """
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 
 import config
 from src.data import database as db
@@ -118,14 +118,37 @@ def _record_shadow_trade(container, closed_trade, pnl, return_pct, entry):
         logger.debug("  ShadowTracker record error: %s", exc)
 
 
-def _execute_signal_live(container, trade_signal, source_label: str):
+def _is_insufficient_margin_rejection(result) -> bool:
+    """Return True when a rejection payload indicates insufficient margin."""
+    if not isinstance(result, dict):
+        return False
+
+    reason = str(result.get("reason", "")).strip().lower()
+    if "insufficient_margin" in reason:
+        return True
+
+    errors = result.get("errors")
+    messages = []
+    if isinstance(errors, list):
+        messages.extend(str(e) for e in errors if e)
+    elif errors:
+        messages.append(str(errors))
+
+    message = result.get("message")
+    if message:
+        messages.append(str(message))
+
+    return any("insufficient margin" in msg.lower() for msg in messages)
+
+
+def _execute_signal_live(container, trade_signal, source_label: str, bypass_firewall: bool = True):
     """Execute a TradeSignal directly on the live trader and log the outcome."""
     trader = getattr(container, "live_trader", None)
     if not trader or not is_live_trading_active(container):
         return None
 
     try:
-        result = trader.execute_signal(trade_signal, bypass_firewall=True)
+        result = trader.execute_signal(trade_signal, bypass_firewall=bypass_firewall)
     except Exception as exc:
         logger.error(
             "  LIVE %s execution error for %s %s: %s",
@@ -133,6 +156,15 @@ def _execute_signal_live(container, trade_signal, source_label: str):
             trade_signal.side.value.upper(),
             trade_signal.coin,
             exc,
+        )
+        return None
+
+    if not result:
+        logger.info(
+            "  LIVE %s skipped: %s %s (no execution result)",
+            source_label,
+            trade_signal.side.value.upper(),
+            trade_signal.coin,
         )
         return None
 
@@ -145,6 +177,24 @@ def _execute_signal_live(container, trade_signal, source_label: str):
             result.get("status", "ok"),
         )
         return result
+
+    if result.get("status") == "rejected":
+        if _is_insufficient_margin_rejection(result):
+            logger.warning(
+                "  LIVE %s skipped due to insufficient margin: %s %s",
+                source_label,
+                trade_signal.side.value.upper(),
+                trade_signal.coin,
+            )
+        else:
+            logger.warning(
+                "  LIVE %s rejected: %s %s -> %s",
+                source_label,
+                trade_signal.side.value.upper(),
+                trade_signal.coin,
+                result,
+            )
+        return None
 
     logger.error(
         "  LIVE %s failed: %s %s -> %s",
@@ -528,8 +578,8 @@ def _run_liquidation_scan(container, regime_data):
                             "type": "candleSnapshot",
                             "req": {
                                 "coin": coin, "interval": "1h",
-                                "startTime": int((datetime.utcnow().timestamp() - 100 * 3600) * 1000),
-                                "endTime": int(datetime.utcnow().timestamp() * 1000),
+                                "startTime": int((datetime.now(timezone.utc).timestamp() - 100 * 3600) * 1000),
+                                "endTime": int(datetime.now(timezone.utc).timestamp() * 1000),
                             },
                         }
                         resp = requests.post("https://api.hyperliquid.xyz/info", json=payload, timeout=10)
@@ -762,6 +812,16 @@ def _execute_options_flow_trades(container, regime_data):
         from src.data import hyperliquid_client as hl_client
         mids = hl_client.get_all_mids() or {}
         options_executed = []
+        live_active = is_live_trading_active(container)
+        live_trader = getattr(container, "live_trader", None) if live_active else None
+        live_account_value = None
+        if live_active and live_trader:
+            get_account_value = getattr(live_trader, "get_account_value", None)
+            if callable(get_account_value):
+                try:
+                    live_account_value = get_account_value()
+                except Exception as exc:
+                    logger.debug("  Options flow live account check failed: %s", exc)
 
         convictions = getattr(container.options_scanner, "top_convictions", None) or []
         for conv in convictions:
@@ -779,10 +839,29 @@ def _execute_options_flow_trades(container, regime_data):
                 continue
             flow_signal.entry_price = price
 
+            if live_active and live_account_value is not None and live_account_value <= 0:
+                logger.warning(
+                    "  Skipping options flow live trade for %s: perps margin unavailable (account_value=%.2f)",
+                    conv["ticker"],
+                    live_account_value,
+                )
+                continue
+
+            if live_active and live_trader and (not flow_signal.size or flow_signal.size <= 0):
+                try:
+                    max_position_size = float(getattr(live_trader, "max_position_size", 0.0) or 0.0)
+                except (TypeError, ValueError):
+                    max_position_size = 0.0
+                if max_position_size > 0:
+                    estimated_notional = max_position_size * flow_signal.position_pct
+                    if estimated_notional > 0:
+                        flow_signal.size = estimated_notional / price
+
             if container.firewall:
                 passed, reason = container.firewall.validate(
                     flow_signal, regime_data=regime_data,
                     open_positions=get_execution_open_positions(container),
+                    account_balance=live_account_value if live_active else None,
                 )
                 if not passed:
                     logger.info("  Firewall rejected options flow %s: %s", conv["ticker"], reason)
@@ -794,8 +873,15 @@ def _execute_options_flow_trades(container, regime_data):
                     "confidence": flow_signal.confidence,
                 })
 
-            if is_live_trading_active(container):
-                live_result = _execute_signal_live(container, flow_signal, "OPTIONS FLOW")
+            if live_active:
+                # Run full live-trader firewall validation so account-based checks
+                # use live balance context instead of paper defaults.
+                live_result = _execute_signal_live(
+                    container,
+                    flow_signal,
+                    "OPTIONS FLOW",
+                    bypass_firewall=False,
+                )
                 if live_result:
                     options_executed.append(live_result)
                     if tg.is_configured():
@@ -971,8 +1057,8 @@ def _run_alpha_arena(container, regime_data):
                 "type": "candleSnapshot",
                 "req": {
                     "coin": "BTC", "interval": "1h",
-                    "startTime": int((datetime.utcnow().timestamp() - 720 * 3600) * 1000),
-                    "endTime": int(datetime.utcnow().timestamp() * 1000),
+                    "startTime": int((datetime.now(timezone.utc).timestamp() - 720 * 3600) * 1000),
+                    "endTime": int(datetime.now(timezone.utc).timestamp() * 1000),
                 },
             }
             resp = requests.post("https://api.hyperliquid.xyz/info", json=payload, timeout=15)

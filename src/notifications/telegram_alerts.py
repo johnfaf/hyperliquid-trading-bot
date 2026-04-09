@@ -18,7 +18,7 @@ Functions:
 """
 
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 from collections import defaultdict
 
@@ -65,7 +65,7 @@ def send_daily_pnl_summary() -> bool:
 
         # Get today's trades (compare to 24h ago)
         closed_trades = db.get_paper_trade_history(limit=500)
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         today_start = (now - timedelta(days=1)).isoformat()
 
         daily_trades = [
@@ -196,7 +196,7 @@ def send_trader_move_alert(
             f"<b>Trades:</b> {trade_count}\n"
         )
 
-        text += f"\n⏰ {datetime.utcnow().strftime('%H:%M:%S UTC')}"
+        text += f"\n⏰ {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}"
 
         return _send_message(text)
 
@@ -238,7 +238,7 @@ def send_weekly_digest() -> bool:
 
         # Get this week's trades (last 7 days)
         closed_trades = db.get_paper_trade_history(limit=1000)
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         week_start = (now - timedelta(days=7)).isoformat()
 
         weekly_trades = [
@@ -355,7 +355,7 @@ def send_golden_wallet_alert(
             f"Consider copying this position.\n"
         )
 
-        text += f"\n⏰ {datetime.utcnow().strftime('%H:%M:%S UTC')}"
+        text += f"\n⏰ {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}"
 
         return _send_message(text)
 
@@ -398,7 +398,7 @@ def send_portfolio_snapshot() -> bool:
                 f"━━━━━━━━━━━━━━━━━━━━\n"
                 f"<b>Balance:</b> ${balance:,.2f}\n"
                 f"<b>Status:</b> No open positions\n"
-                f"\n⏰ {datetime.utcnow().strftime('%H:%M:%S UTC')}"
+                f"\n⏰ {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}"
             )
             return _send_message(text)
 
@@ -452,7 +452,7 @@ def send_portfolio_snapshot() -> bool:
             text += "\n<b>⚠️ Risk Warnings:</b>\n"
             text += "\n".join(correlation_warnings) + "\n"
 
-        text += f"\n⏰ {datetime.utcnow().strftime('%H:%M:%S UTC')}"
+        text += f"\n⏰ {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}"
 
         return _send_message(text)
 
@@ -532,7 +532,7 @@ def send_top_movers_alert(movers: List[Dict]) -> bool:
                     f"Consider this a strong consensus signal.\n"
                 )
 
-                text += f"\n⏰ {datetime.utcnow().strftime('%H:%M:%S UTC')}"
+                text += f"\n⏰ {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}"
 
                 if _send_message(text):
                     alerts_sent += 1

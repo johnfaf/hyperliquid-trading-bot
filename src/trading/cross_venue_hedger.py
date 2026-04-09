@@ -279,18 +279,15 @@ class CrossVenueHedger:
                 )
                 return True
 
-            if not self.allow_unimplemented_live:
-                logger.error(
-                    "Binance live hedge blocked for %s: order execution path is not implemented.",
-                    coin,
-                )
-                return False
-            logger.warning(
-                "allow_unimplemented_live=True but Binance execution still unimplemented. "
-                "Returning failure to avoid false hedge accounting."
+            # Live execution is NOT implemented.  Always raise so callers
+            # can never silently believe a hedge was placed.
+            raise NotImplementedError(
+                f"Binance live hedge execution is not implemented for {coin}. "
+                "Remove this venue from config or use dry_run=True."
             )
-            return False
 
+        except NotImplementedError:
+            raise  # Never swallow this
         except Exception as e:
             logger.error(f"Failed to place Binance hedge for {coin}: {e}")
             return False
@@ -330,18 +327,15 @@ class CrossVenueHedger:
                 )
                 return True
 
-            if not self.allow_unimplemented_live:
-                logger.error(
-                    "Bybit live hedge blocked for %s: order execution path is not implemented.",
-                    coin,
-                )
-                return False
-            logger.warning(
-                "allow_unimplemented_live=True but Bybit execution still unimplemented. "
-                "Returning failure to avoid false hedge accounting."
+            # Live execution is NOT implemented.  Always raise so callers
+            # can never silently believe a hedge was placed.
+            raise NotImplementedError(
+                f"Bybit live hedge execution is not implemented for {coin}. "
+                "Remove this venue from config or use dry_run=True."
             )
-            return False
 
+        except NotImplementedError:
+            raise  # Never swallow this
         except Exception as e:
             logger.error(f"Failed to place Bybit hedge for {coin}: {e}")
             return False

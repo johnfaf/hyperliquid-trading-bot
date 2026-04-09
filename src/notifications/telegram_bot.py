@@ -9,7 +9,7 @@ import logging
 import requests
 import json
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -156,7 +156,7 @@ def notify_trade_opened(trade: Dict, source: str = "strategy"):
     elif source == "strategy":
         text += f"<b>Strategy:</b> {trade.get('strategy_type', '?')}\n"
 
-    text += f"\n⏰ {datetime.utcnow().strftime('%H:%M:%S UTC')}"
+    text += f"\n⏰ {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}"
 
     _send_message(text)
 
@@ -191,7 +191,7 @@ def notify_trade_closed(trade: Dict, exit_price: float, pnl: float, reason: str 
         f"<b>Exit:</b> ${exit_price:,.4f}\n"
         f"<b>PnL:</b> ${pnl:+,.2f}{pnl_pct}\n"
         f"<b>Reason:</b> {reason_text}\n"
-        f"\n⏰ {datetime.utcnow().strftime('%H:%M:%S UTC')}"
+        f"\n⏰ {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}"
     )
 
     _send_message(text)
@@ -234,7 +234,7 @@ def notify_market_bias(overview: Dict):
             icon = "🟢" if cb == "bullish" else "🔴" if cb == "bearish" else "⚪"
             text += f"{icon} {coin}: {chg:+.2f}% | Vol: ${vol:,.0f}\n"
 
-    text += f"\n⏰ {datetime.utcnow().strftime('%H:%M:%S UTC')}"
+    text += f"\n⏰ {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}"
 
     _send_message(text)
 
@@ -260,7 +260,7 @@ def notify_cycle_summary(summary: Dict):
     if summary.get("market_bias"):
         text += f"<b>Market Bias:</b> {summary['market_bias']}\n"
 
-    text += f"\n⏰ {datetime.utcnow().strftime('%H:%M:%S UTC')}"
+    text += f"\n⏰ {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}"
 
     _send_message(text)
 
@@ -281,7 +281,7 @@ def notify_strong_signal(coin: str, side: str, reasons: List[str], confidence: f
     for reason in reasons:
         text += f"  • {reason}\n"
 
-    text += f"\n⏰ {datetime.utcnow().strftime('%H:%M:%S UTC')}"
+    text += f"\n⏰ {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}"
 
     _send_message(text)
 
@@ -303,7 +303,7 @@ def send_startup_message():
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"Monitoring top traders, strategies, and\n"
         f"multi-exchange volume data.\n"
-        f"\n⏰ {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}"
+        f"\n⏰ {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}"
     )
     _send_message(text)
 

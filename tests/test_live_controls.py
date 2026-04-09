@@ -13,6 +13,7 @@ from src.core import boot
 from src.core.api_manager import Priority
 from src.core.cycles.reporting_cycle import run_reporting
 from src.core.cycles.trading_cycle import (
+    _execute_signal_live,
     _execute_lcrs_signals,
     _execute_options_flow_trades,
     _process_closed_trades,
@@ -26,7 +27,12 @@ from src.core.live_execution import (
     sync_shadow_book_to_live,
 )
 from src.signals.decision_firewall import DecisionFirewall
-from src.signals.signal_schema import TradeSignal, signal_from_execution_dict
+from src.signals.signal_schema import (
+    SignalSide,
+    SignalSource,
+    TradeSignal,
+    signal_from_execution_dict,
+)
 from src.trading.live_trader import (
     HyperliquidSigner,
     LiveTrader,
@@ -683,7 +689,143 @@ def test_execute_options_flow_live_path_executes_signal(monkeypatch):
 
     _execute_options_flow_trades(container, {"overall_regime": "neutral"})
 
-    assert executed == [("ETH", "long", True)]
+    assert executed == [("ETH", "long", False)]
+
+
+def test_execute_options_flow_live_path_skips_unfunded_perps(monkeypatch):
+    executed = []
+
+    class FakeLiveTrader:
+        max_position_size = 1000.0
+
+        def get_account_value(self):
+            return 0.0
+
+        def execute_signal(self, signal, bypass_firewall=False):
+            executed.append((signal.coin, signal.side.value, bypass_firewall))
+            return {"status": "success", "coin": signal.coin}
+
+    class FakeFirewall:
+        def validate(self, signal, **kwargs):
+            return True, "ok"
+
+    container = type(
+        "Container",
+        (),
+        {
+            "live_trader": FakeLiveTrader(),
+            "firewall": FakeFirewall(),
+            "agent_scorer": None,
+            "options_scanner": type(
+                "Scanner",
+                (),
+                {
+                    "top_convictions": [
+                        {
+                            "ticker": "ETH",
+                            "direction": "BULLISH",
+                            "conviction_pct": 75,
+                            "net_flow": 100000.0,
+                            "total_prints": 3,
+                        }
+                    ]
+                },
+            )(),
+        },
+    )()
+
+    monkeypatch.setattr("src.core.cycles.trading_cycle.is_live_trading_active", lambda container: True)
+    monkeypatch.setattr("src.core.cycles.trading_cycle.get_execution_open_positions", lambda container: [])
+    monkeypatch.setattr("src.data.hyperliquid_client.get_all_mids", lambda: {"ETH": "2000.0"})
+    monkeypatch.setattr("src.notifications.telegram_bot.is_configured", lambda: False)
+
+    _execute_options_flow_trades(container, {"overall_regime": "neutral"})
+
+    assert executed == []
+
+
+def test_execute_options_flow_live_precomputes_size_for_firewall(monkeypatch):
+    executed = []
+    seen = {}
+
+    class FakeLiveTrader:
+        max_position_size = 1000.0
+
+        def get_account_value(self):
+            return 20.0
+
+        def execute_signal(self, signal, bypass_firewall=False):
+            executed.append((signal.coin, signal.side.value, bypass_firewall))
+            return {"status": "success", "coin": signal.coin}
+
+    class FakeFirewall:
+        def validate(self, signal, **kwargs):
+            seen["size"] = signal.size
+            seen["account_balance"] = kwargs.get("account_balance")
+            return False, "risk_blocked"
+
+    container = type(
+        "Container",
+        (),
+        {
+            "live_trader": FakeLiveTrader(),
+            "firewall": FakeFirewall(),
+            "agent_scorer": None,
+            "options_scanner": type(
+                "Scanner",
+                (),
+                {
+                    "top_convictions": [
+                        {
+                            "ticker": "ETH",
+                            "direction": "BULLISH",
+                            "conviction_pct": 75,
+                            "net_flow": 100000.0,
+                            "total_prints": 3,
+                        }
+                    ]
+                },
+            )(),
+        },
+    )()
+
+    monkeypatch.setattr("src.core.cycles.trading_cycle.is_live_trading_active", lambda container: True)
+    monkeypatch.setattr("src.core.cycles.trading_cycle.get_execution_open_positions", lambda container: [])
+    monkeypatch.setattr("src.data.hyperliquid_client.get_all_mids", lambda: {"ETH": "2000.0"})
+    monkeypatch.setattr("src.notifications.telegram_bot.is_configured", lambda: False)
+
+    _execute_options_flow_trades(container, {"overall_regime": "neutral"})
+
+    assert executed == []
+    assert seen["account_balance"] == 20.0
+    assert abs(seen["size"] - 0.02) < 1e-12
+
+
+def test_execute_signal_live_logs_warning_for_insufficient_margin(monkeypatch, caplog):
+    class FakeLiveTrader:
+        def execute_signal(self, signal, bypass_firewall=False):
+            return {
+                "status": "rejected",
+                "reason": "exchange_inner_error",
+                "errors": ["Insufficient margin to place order. asset=0"],
+            }
+
+    container = type("Container", (), {"live_trader": FakeLiveTrader()})()
+    signal = TradeSignal(
+        coin="ETH",
+        side=SignalSide.LONG,
+        confidence=0.8,
+        source=SignalSource.STRATEGY,
+        reason="test",
+    )
+
+    monkeypatch.setattr("src.core.cycles.trading_cycle.is_live_trading_active", lambda container: True)
+
+    with caplog.at_level(logging.WARNING):
+        result = _execute_signal_live(container, signal, "OPTIONS FLOW", bypass_firewall=False)
+
+    assert result is None
+    assert "insufficient margin" in caplog.text.lower()
 
 
 def test_mirror_executed_trades_uses_account_value_without_wallet_alias():

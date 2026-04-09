@@ -412,7 +412,7 @@ def evaluate_wallet(address: str, bot_score: int = 0) -> Optional[Tuple[WalletRe
         best_coin=best_coin,
         worst_coin=worst_coin,
         avg_hold_time_hours=0,  # TODO: compute from open/close pairs
-        evaluated_at=datetime.utcnow().isoformat(),
+        evaluated_at=datetime.now(timezone.utc).isoformat(),
     )
 
     tag = "GOLDEN" if is_golden else "not golden"
@@ -693,7 +693,7 @@ def run_golden_scan(max_wallets: int = 200) -> Dict:
              for r in results],
             key=lambda x: x["pnl"], reverse=True
         )[:10],
-        "evaluated_at": datetime.utcnow().isoformat(),
+        "evaluated_at": datetime.now(timezone.utc).isoformat(),
     }
 
     logger.info(f"Golden scan complete: {golden_count}/{len(results)} wallets are golden")

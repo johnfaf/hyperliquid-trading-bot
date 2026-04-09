@@ -12,7 +12,7 @@ import sys
 import sqlite3
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict
 from urllib.parse import urlparse, parse_qs
 
@@ -27,6 +27,15 @@ logger.addHandler(logging.NullHandler())
 # Module-level options scanner reference (set by set_options_scanner)
 _options_scanner = None
 
+# ─── Dashboard Authentication ─────────────────────────────────
+# Set DASHBOARD_AUTH_TOKEN to require Bearer-token authentication on all
+# API endpoints (except /api/health which is left open for Railway probes).
+# When the token is not set, all endpoints are unauthenticated.
+_DASHBOARD_AUTH_TOKEN: str = os.environ.get("DASHBOARD_AUTH_TOKEN", "").strip()
+
+# Paths that are always open (health probes, Railway readiness checks)
+_AUTH_EXEMPT_PATHS = {"/api/health"}
+
 
 def _resolve_dashboard_host() -> str:
     """Resolve dashboard bind host with secure localhost default."""
@@ -36,6 +45,12 @@ def _resolve_dashboard_host() -> str:
     public = os.environ.get("DASHBOARD_BIND_PUBLIC", "false").strip().lower() in {
         "1", "true", "yes"
     }
+    if public and not _DASHBOARD_AUTH_TOKEN:
+        logger.warning(
+            "DASHBOARD_BIND_PUBLIC=true but DASHBOARD_AUTH_TOKEN is not set. "
+            "The dashboard will be publicly accessible WITHOUT authentication. "
+            "Set DASHBOARD_AUTH_TOKEN to secure it."
+        )
     return "0.0.0.0" if public else "127.0.0.1"
 
 
@@ -167,7 +182,7 @@ def get_dashboard_data():
         roi = ((balance / initial_balance) - 1) * 100 if initial_balance else 0
 
         return {
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
             "account": {
                 "balance": balance,
                 "total_pnl": account.get("total_pnl", 0),
@@ -929,7 +944,31 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass  # Suppress default logging
 
+    def _check_auth(self) -> bool:
+        """Return True if request is authenticated or auth is not required."""
+        if not _DASHBOARD_AUTH_TOKEN:
+            return True  # Auth not configured — allow all
+        parsed = urlparse(self.path)
+        if parsed.path in _AUTH_EXEMPT_PATHS:
+            return True  # Health probe — always open
+        # Check Authorization header: "Bearer <token>"
+        auth_header = self.headers.get("Authorization", "")
+        if auth_header.startswith("Bearer ") and auth_header[7:].strip() == _DASHBOARD_AUTH_TOKEN:
+            return True
+        # Check query parameter: ?token=<token>
+        qs = parse_qs(parsed.query)
+        if qs.get("token", [None])[0] == _DASHBOARD_AUTH_TOKEN:
+            return True
+        self.send_response(401)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("WWW-Authenticate", 'Bearer realm="dashboard"')
+        self.end_headers()
+        self.wfile.write(b'{"error": "unauthorized", "hint": "Set Authorization: Bearer <token> header"}')
+        return False
+
     def do_GET(self):
+        if not self._check_auth():
+            return
         parsed = urlparse(self.path)
 
         if parsed.path == "/" or parsed.path == "/dashboard":
@@ -1044,7 +1083,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._serve_flow_data()
 
         elif parsed.path == "/api/health":
-            self._json_response({"status": "ok", "timestamp": datetime.utcnow().isoformat()})
+            self._json_response({"status": "ok", "timestamp": datetime.now(timezone.utc).isoformat()})
 
         elif parsed.path == "/api/health_report":
             # Full structured health report for Claude monitoring

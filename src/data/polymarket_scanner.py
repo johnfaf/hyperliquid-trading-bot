@@ -27,7 +27,7 @@ import logging
 import time
 import requests
 from typing import Dict, List, Optional, Tuple
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass, field
 from collections import defaultdict
 from urllib.parse import urlparse
@@ -75,7 +75,7 @@ class PolymarketSignal:
     polymarket_probability: float = 0.0
     polymarket_volume_24h: float = 0.0
     correlation_with_hl: str = ""  # Description of correlation
-    timestamp: str = field(default_factory=lambda: datetime.utcnow().isoformat())
+    timestamp: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
     def to_dict(self) -> Dict:
         """Convert to dict for pipeline compatibility."""
@@ -394,7 +394,7 @@ class PolymarketScanner:
                     volume_24h = 0.0
                     liquidity = 0.0
 
-                last_traded = market_data.get("last_traded", datetime.utcnow().isoformat())
+                last_traded = market_data.get("last_traded", datetime.now(timezone.utc).isoformat())
 
                 # Determine category
                 category = market_data.get("category", "general")
@@ -645,7 +645,7 @@ class PolymarketScanner:
             }
         """
         self._scan_count += 1
-        self._last_scan_time = datetime.utcnow()
+        self._last_scan_time = datetime.now(timezone.utc)
 
         logger.info(f"Generating Polymarket signals (scan #{self._scan_count})...")
 
@@ -695,7 +695,7 @@ class PolymarketScanner:
                 "polymarket_market": movement.title,
                 "polymarket_probability": movement.current_probability,
                 "polymarket_volume_24h": movement.volume_move,
-                "timestamp": datetime.utcnow().isoformat(),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
             }
             raw_signals.append(signal)
 

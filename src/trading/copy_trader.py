@@ -8,7 +8,7 @@ V2: Signals routed through DecisionFirewall and tracked by AgentScorer.
 """
 import logging
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List, Dict, Optional, Set, Tuple
 
 import sys, os
@@ -69,7 +69,7 @@ class CopyTrader:
 
                 current_positions = {}
                 for pos in state["positions"]:
-                    if pos["size"] > 0:
+                    if float(pos.get("size", 0)) > 0:
                         current_positions[pos["coin"]] = pos
 
                 # Compare with cached positions to find changes
@@ -131,8 +131,8 @@ class CopyTrader:
 
         # Significantly increased positions (scaling in)
         for coin in old_coins & new_coins:
-            old_size = old_positions[coin]["size"]
-            new_size = new_positions[coin]["size"]
+            old_size = float(old_positions[coin].get("size", 0))
+            new_size = float(new_positions[coin].get("size", 0))
             if new_size > old_size * 1.5:  # 50%+ increase
                 pos = new_positions[coin]
                 price = float(mids.get(coin, pos["entry_price"]))
@@ -563,7 +563,7 @@ class CopyTrader:
                 "confidence": signal.get("confidence", 0),
                 "trader_address": signal.get("source_trader", ""),
                 "source": "copy_trade",
-                "opened_at": datetime.utcnow().isoformat(),
+                "opened_at": datetime.now(timezone.utc).isoformat(),
                 "metadata": {
                     "type": signal["type"],
                     "source_trader": signal.get("source_trader", ""),
@@ -731,7 +731,7 @@ class CopyTrader:
                     pnl=pnl,
                     return_pct=return_pct,
                     opened_at=trade.get("opened_at", ""),
-                    closed_at=datetime.utcnow().isoformat(),
+                    closed_at=datetime.now(timezone.utc).isoformat(),
                     confidence=meta.get("confidence", 0),
                     source="copy_trade",
                 )
@@ -755,7 +755,7 @@ class CopyTrader:
             "strategy_type": "copy_trade",
             "trader_address": meta.get("source_trader", ""),
             "opened_at": trade.get("opened_at", ""),
-            "closed_at": datetime.utcnow().isoformat(),
+            "closed_at": datetime.now(timezone.utc).isoformat(),
         }
         self._closed_events.append(closed_event)
         return closed_event

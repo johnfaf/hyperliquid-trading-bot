@@ -6,7 +6,7 @@ paper trading results, and self-improvement metrics.
 import logging
 import os
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List, Dict
 
 import sys
@@ -25,7 +25,7 @@ class Reporter:
 
     def generate_daily_report(self) -> str:
         """Generate a comprehensive daily report as markdown."""
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         report = []
         report.append(f"# Hyperliquid Research Bot - Daily Report")
         report.append(f"**Generated:** {now.strftime('%Y-%m-%d %H:%M UTC')}\n")
@@ -197,7 +197,7 @@ class Reporter:
         lines = []
         lines.append("=" * 60)
         lines.append("  HYPERLIQUID RESEARCH BOT - LIVE STATUS")
-        lines.append(f"  {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}")
+        lines.append(f"  {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}")
         lines.append("=" * 60)
 
         if account:

@@ -18,7 +18,7 @@ import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
-from datetime import datetime
+from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
 
@@ -42,7 +42,7 @@ class NormalizedTrader:
     is_bot: bool = False
     bot_score: int = 0              # 0-10 (0=human, 10=definite bot)
     raw_data: Dict = field(default_factory=dict)
-    discovered_at: str = field(default_factory=lambda: datetime.utcnow().isoformat())
+    discovered_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
 
 @dataclass

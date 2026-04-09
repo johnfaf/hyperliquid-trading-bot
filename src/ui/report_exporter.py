@@ -8,7 +8,7 @@ Generates exportable performance reports in HTML and CSV formats.
 import os
 import csv
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, List, Optional
 import json
 
@@ -322,7 +322,7 @@ def export_html_report(output_dir: str = None) -> str:
     html.append("  <header>")
     html.append("    <h1>📊 Hyperliquid Trading Bot</h1>")
     html.append("    <p class='timestamp'>Performance Report</p>")
-    html.append(f"    <p class='timestamp'>Generated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}</p>")
+    html.append(f"    <p class='timestamp'>Generated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}</p>")
     html.append("  </header>")
 
     # Content
@@ -585,7 +585,7 @@ def export_html_report(output_dir: str = None) -> str:
     html.append("</html>")
 
     # Write file
-    filename = f"report_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.html"
+    filename = f"report_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.html"
     filepath = os.path.join(output_dir, filename)
 
     with open(filepath, "w") as f:
@@ -608,7 +608,7 @@ def export_csv_trades(output_dir: str = None) -> str:
 
     closed_trades = db.get_paper_trade_history(limit=10000)
 
-    filename = f"trades_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.csv"
+    filename = f"trades_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.csv"
     filepath = os.path.join(output_dir, filename)
 
     with open(filepath, "w", newline="") as csvfile:
@@ -667,7 +667,7 @@ def export_csv_strategies(output_dir: str = None) -> str:
         ).fetchall()
     strategies = [dict(r) for r in rows]
 
-    filename = f"strategies_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.csv"
+    filename = f"strategies_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.csv"
     filepath = os.path.join(output_dir, filename)
 
     with open(filepath, "w", newline="") as csvfile:
@@ -709,7 +709,7 @@ def export_csv_traders(output_dir: str = None) -> str:
 
     traders = db.get_all_traders_including_bots()
 
-    filename = f"traders_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.csv"
+    filename = f"traders_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.csv"
     filepath = os.path.join(output_dir, filename)
 
     with open(filepath, "w", newline="") as csvfile:
