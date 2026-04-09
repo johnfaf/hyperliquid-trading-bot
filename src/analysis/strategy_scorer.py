@@ -6,7 +6,7 @@ profitable ones. This is the "learning" core of the bot.
 """
 import logging
 import numpy as np
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Optional
 
 import sys, os
@@ -65,7 +65,9 @@ class StrategyScorer:
         if last_scored:
             try:
                 last_dt = datetime.fromisoformat(last_scored)
-                days_since = (datetime.utcnow() - last_dt).days
+                if last_dt.tzinfo is None:
+                    last_dt = last_dt.replace(tzinfo=timezone.utc)
+                days_since = (datetime.now(timezone.utc) - last_dt).days
                 # Accelerated decay: gentle for first 7 days, aggressive after
                 if days_since <= 7:
                     decay_factor = self.decay_rate ** days_since
@@ -200,7 +202,7 @@ class StrategyScorer:
                     sharpe_score=score_breakdown["sharpe_score"],
                     consistency_score=score_breakdown["consistency_score"],
                     risk_adj_score=score_breakdown["risk_adj_score"],
-                    notes=f"Auto-scored at {datetime.utcnow().isoformat()}"
+                    notes=f"Auto-scored at {datetime.now(timezone.utc).isoformat()}"
                 )
 
                 # Update the strategy's current score
@@ -354,7 +356,7 @@ class StrategyScorer:
         avg_score = np.mean(all_scores) if all_scores else 0
 
         return {
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
             "total_strategies": len(strategies),
             "improving": improving,
             "declining": declining,

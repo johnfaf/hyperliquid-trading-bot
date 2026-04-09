@@ -29,7 +29,7 @@ import os
 import sys
 import time
 from dataclasses import dataclass, field, asdict
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
 
@@ -176,7 +176,7 @@ class StressTestEngine:
                      baseline.max_drawdown_pct, baseline.sharpe_ratio)
 
         report = StressTestReport(
-            timestamp=datetime.utcnow().isoformat(),
+            timestamp=datetime.now(timezone.utc).isoformat(),
             baseline_pnl=baseline.total_pnl,
             baseline_dd=baseline.max_drawdown_pct,
             baseline_sharpe=baseline.sharpe_ratio,
@@ -555,7 +555,7 @@ Examples:
     # Save reports
     output_dir = args.output_dir or str(ROOT / "reports")
     os.makedirs(output_dir, exist_ok=True)
-    ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
 
     if args.report in ("json", "both"):
         json_path = os.path.join(output_dir, f"stress_test_{ts}.json")

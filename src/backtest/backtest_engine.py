@@ -282,7 +282,7 @@ def run_backtest(address: str) -> Optional[BacktestResult]:
 
     result = BacktestResult(
         address=address,
-        evaluated_at=datetime.utcnow().isoformat(),
+        evaluated_at=datetime.now(timezone.utc).isoformat(),
     )
 
     # Multi-timeframe analysis

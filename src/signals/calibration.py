@@ -21,7 +21,7 @@ import json
 import sqlite3
 import math
 from typing import Dict, List, Optional, Tuple
-from datetime import datetime
+from datetime import datetime, timezone
 from collections import defaultdict
 
 logger = logging.getLogger(__name__)
@@ -145,7 +145,7 @@ class CalibrationTracker:
                 INSERT INTO calibration_records
                 (source_key, predicted_confidence, actual_win, pnl, coin, side, timestamp)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
-            """, (source_key, conf, win, pnl, coin, side, datetime.utcnow().isoformat()))
+            """, (source_key, conf, win, pnl, coin, side, datetime.now(timezone.utc).isoformat()))
             conn.commit()
             conn.close()
         except Exception as e:

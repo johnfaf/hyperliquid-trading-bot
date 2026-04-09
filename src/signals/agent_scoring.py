@@ -13,7 +13,7 @@ import logging
 import math
 import json
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 from collections import defaultdict
 from dataclasses import dataclass, asdict
@@ -144,7 +144,7 @@ class AgentScorer:
                 """, (source_key, score.total_signals, score.correct_signals,
                       score.total_pnl, score.total_return, score.accuracy, score.sharpe,
                       score.dynamic_weight, history_json,
-                      datetime.utcnow().isoformat()))
+                      datetime.now(timezone.utc).isoformat()))
         except Exception as e:
             logger.warning(f"Could not save agent score for {source_key}: {e}")
 
@@ -160,13 +160,13 @@ class AgentScorer:
 
         score = self.scores[source_key]
         score.total_signals += 1
-        score.last_updated = datetime.utcnow().isoformat()
+        score.last_updated = datetime.now(timezone.utc).isoformat()
 
         signal_id = f"{source_key}:{score.total_signals}:{int(time.time())}"
 
         self._trade_history[source_key].append({
             "signal_id": signal_id,
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
             "coin": signal_data.get("coin", ""),
             "side": signal_data.get("side", ""),
             "confidence": signal_data.get("confidence", 0),

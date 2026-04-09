@@ -67,7 +67,7 @@ class JSONFormatter(logging.Formatter):
 def setup_logging() -> logging.Logger:
     """Configure root logger with file + console handlers. Returns module logger."""
     os.makedirs(config.LOG_DIR, exist_ok=True)
-    log_file = os.path.join(config.LOG_DIR, f"bot_{datetime.utcnow().strftime('%Y%m%d')}.log")
+    log_file = os.path.join(config.LOG_DIR, f"bot_{datetime.now(timezone.utc).strftime('%Y%m%d')}.log")
 
     json_fmt = JSONFormatter()
     text_fmt = logging.Formatter(

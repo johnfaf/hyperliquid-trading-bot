@@ -6,7 +6,7 @@ import json
 import os
 import shutil
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from contextlib import contextmanager
 
 import sys
@@ -200,7 +200,7 @@ def init_db():
 
 def upsert_trader(address, total_pnl=0, roi_pct=0, account_value=0,
                   win_rate=0, trade_count=0, metadata=None, is_active=True):
-    now = datetime.utcnow().isoformat()
+    now = datetime.now(timezone.utc).isoformat()
     meta_json = json.dumps(metadata or {})
     active_int = 1 if is_active else 0
     with get_connection() as conn:
@@ -226,7 +226,7 @@ def mark_trader_inactive(address):
     """Mark a trader as inactive (e.g. detected as bot)."""
     with get_connection() as conn:
         conn.execute("UPDATE traders SET active = 0, last_updated = ? WHERE address = ?",
-                     (datetime.utcnow().isoformat(), address))
+                     (datetime.now(timezone.utc).isoformat(), address))
 
 
 def get_active_traders():
@@ -269,7 +269,7 @@ def get_all_traders_including_bots():
 
 def save_position_snapshot(trader_address, coin, side, size, entry_price,
                            leverage=1, unrealized_pnl=0, margin_used=0, metadata=None):
-    now = datetime.utcnow().isoformat()
+    now = datetime.now(timezone.utc).isoformat()
     with get_connection() as conn:
         conn.execute("""
             INSERT INTO position_snapshots
@@ -294,7 +294,7 @@ def get_trader_position_history(trader_address, limit=100):
 
 def save_strategy(name, description, strategy_type, parameters=None,
                   total_pnl=0, trade_count=0, win_rate=0, sharpe_ratio=0):
-    now = datetime.utcnow().isoformat()
+    now = datetime.now(timezone.utc).isoformat()
     with get_connection() as conn:
         cursor = conn.execute("""
             INSERT INTO strategies
@@ -308,7 +308,7 @@ def save_strategy(name, description, strategy_type, parameters=None,
 
 def save_strategies_batch(strategies_data):
     """Batch insert multiple strategies in a single transaction."""
-    now = datetime.utcnow().isoformat()
+    now = datetime.now(timezone.utc).isoformat()
     saved_ids = []
     with get_connection() as conn:
         for s in strategies_data:
@@ -326,7 +326,7 @@ def save_strategies_batch(strategies_data):
 
 
 def update_strategy_score(strategy_id, score):
-    now = datetime.utcnow().isoformat()
+    now = datetime.now(timezone.utc).isoformat()
     with get_connection() as conn:
         conn.execute("""
             UPDATE strategies SET current_score = ?, last_scored = ? WHERE id = ?
@@ -351,7 +351,7 @@ def get_strategy(strategy_id):
 
 def save_strategy_score(strategy_id, score, pnl_score=0, win_rate_score=0,
                         sharpe_score=0, consistency_score=0, risk_adj_score=0, notes=""):
-    now = datetime.utcnow().isoformat()
+    now = datetime.now(timezone.utc).isoformat()
     with get_connection() as conn:
         conn.execute("""
             INSERT INTO strategy_scores
@@ -375,7 +375,7 @@ def get_strategy_score_history(strategy_id, limit=30):
 # ─── Paper Trading ─────────────────────────────────────────────
 
 def init_paper_account(balance):
-    now = datetime.utcnow().isoformat()
+    now = datetime.now(timezone.utc).isoformat()
     with get_connection() as conn:
         conn.execute("""
             INSERT OR REPLACE INTO paper_account (id, balance, total_pnl, total_trades, winning_trades, last_updated)
@@ -390,7 +390,7 @@ def get_paper_account():
 
 
 def update_paper_account(balance, total_pnl, total_trades, winning_trades):
-    now = datetime.utcnow().isoformat()
+    now = datetime.now(timezone.utc).isoformat()
     with get_connection() as conn:
         conn.execute("""
             UPDATE paper_account
@@ -401,7 +401,7 @@ def update_paper_account(balance, total_pnl, total_trades, winning_trades):
 
 def open_paper_trade(strategy_id, coin, side, entry_price, size, leverage=1,
                      stop_loss=None, take_profit=None, metadata=None):
-    now = datetime.utcnow().isoformat()
+    now = datetime.now(timezone.utc).isoformat()
     with get_connection() as conn:
         cursor = conn.execute("""
             INSERT INTO paper_trades
@@ -438,7 +438,7 @@ def close_paper_trade(trade_id, exit_price, pnl) -> bool:
     already closed or the ID is wrong.  The caller MUST check the return value and
     skip the account PnL credit to prevent phantom double-credit.
     """
-    now = datetime.utcnow().isoformat()
+    now = datetime.now(timezone.utc).isoformat()
     with get_connection() as conn:
         cursor = conn.execute("""
             UPDATE paper_trades SET closed_at = ?, exit_price = ?, pnl = ?, status = 'closed'
@@ -491,7 +491,7 @@ def reset_paper_trades(initial_balance: float = None):
         conn.execute("""
             INSERT OR REPLACE INTO paper_account (id, balance, total_pnl, total_trades, winning_trades, last_updated)
             VALUES (1, ?, 0, 0, 0, ?)
-        """, (initial_balance, datetime.utcnow().isoformat()))
+        """, (initial_balance, datetime.now(timezone.utc).isoformat()))
 
     logger.info(f"Paper trades reset: cleared {open_count} open + {closed_count} closed trades, "
                f"balance reset to ${initial_balance:,.2f}")
@@ -506,7 +506,7 @@ def reset_paper_trades(initial_balance: float = None):
 
 def log_research_cycle(cycle_type, summary, details=None,
                        traders_analyzed=0, strategies_found=0, strategies_updated=0):
-    now = datetime.utcnow().isoformat()
+    now = datetime.now(timezone.utc).isoformat()
     with get_connection() as conn:
         conn.execute("""
             INSERT INTO research_logs
@@ -532,7 +532,7 @@ def audit_log(action: str, coin: str = None, side: str = None,
              circuit_breaker_triggered, rate_limit_hit, websocket_reconnect,
              golden_wallet_connected, bot_detected, error
     """
-    now = datetime.utcnow().isoformat()
+    now = datetime.now(timezone.utc).isoformat()
     with get_connection() as conn:
         conn.execute("""
             INSERT INTO audit_trail (timestamp, action, coin, side, price, size, pnl, source, details)
@@ -582,7 +582,7 @@ def backup_to_json(filepath: str = None):
     try:
         data = {
             "version": 2,
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
             "paper_account": get_paper_account(),
             "traders": get_active_traders()[:200],
             "bot_traders": [t for t in get_all_traders_including_bots() if not t.get("active", 1)],
@@ -750,7 +750,7 @@ def restore_from_json(filepath: str = None):
                                 gw.get("is_golden", 0),
                                 gw.get("coins_traded", ""),
                                 gw.get("best_coin", ""),
-                                gw.get("evaluated_at", datetime.utcnow().isoformat()),
+                                gw.get("evaluated_at", datetime.now(timezone.utc).isoformat()),
                                 gw.get("connected_to_live", 0),
                             ))
                             golden_count += 1

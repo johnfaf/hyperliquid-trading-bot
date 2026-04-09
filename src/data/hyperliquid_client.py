@@ -280,14 +280,17 @@ def get_leaderboard():
     on newer API versions, so we try the stats endpoint first.
     """
     # Method 1: Stats data endpoint (used by the frontend — most reliable)
+    # Note: this is a different domain from the HL info API so the bucket
+    # token was previously wasted. We still acquire a token to self-throttle
+    # the bot's overall outbound request rate.
     try:
         mgr = get_manager()
         if not mgr.bucket.acquire(priority=Priority.LOW, timeout=10):
             logger.debug("Leaderboard: couldn't acquire token for stats endpoint")
         else:
-            resp = requests.get(
+            resp = mgr.session.get(
                 "https://stats-data.hyperliquid.xyz/Mainnet/leaderboard",
-                timeout=30
+                timeout=30,
             )
             if resp.status_code == 200:
                 data = resp.json()

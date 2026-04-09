@@ -15,7 +15,7 @@ Each regime maps to which strategy types should be active vs paused.
 """
 import logging
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 from collections import defaultdict
 from dataclasses import dataclass, asdict
@@ -147,7 +147,7 @@ class RegimeDetector:
                 regime=Regime.UNKNOWN, confidence=0.0,
                 adx=0, atr_pct=0, volume_ratio=0,
                 trend_direction=0, momentum=0,
-                timestamp=datetime.utcnow().isoformat(),
+                timestamp=datetime.now(timezone.utc).isoformat(),
             )
 
         # Extract OHLCV arrays
@@ -176,7 +176,7 @@ class RegimeDetector:
             volume_ratio=round(volume_ratio, 2),
             trend_direction=round(trend_dir, 4),
             momentum=round(momentum, 4),
-            timestamp=datetime.utcnow().isoformat(),
+            timestamp=datetime.now(timezone.utc).isoformat(),
         )
 
         # Cache and log
@@ -389,8 +389,8 @@ class RegimeDetector:
                 "req": {
                     "coin": coin,
                     "interval": interval,
-                    "startTime": int((datetime.utcnow().timestamp() - count * 3600) * 1000),
-                    "endTime": int(datetime.utcnow().timestamp() * 1000),
+                    "startTime": int((datetime.now(timezone.utc).timestamp() - count * 3600) * 1000),
+                    "endTime": int(datetime.now(timezone.utc).timestamp() * 1000),
                 }
             }
             resp = requests.post("https://api.hyperliquid.xyz/info",
@@ -481,7 +481,7 @@ class RegimeDetector:
             "per_coin": {coin: state.to_dict() for coin, state in per_coin.items()},
             "regime_votes": {r.value: round(w, 2) for r, w in regime_votes.items()},
             "strategy_guidance": guidance,
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
         }
 
         logger.info(f"Market regime: {overall_regime.value} (confidence={overall_confidence:.0%})")

@@ -363,14 +363,36 @@ class CrossVenueHedger:
         close_side = "BUY" if original_side == "SELL" else "SELL"
 
         success = False
-        if venue == HedgeVenue.BINANCE.value:
-            success = self._place_binance_hedge(coin, close_side, original_size)
-        elif venue == HedgeVenue.BYBIT.value:
-            success = self._place_bybit_hedge(coin, close_side, original_size)
+        try:
+            if venue == HedgeVenue.BINANCE.value:
+                success = self._place_binance_hedge(coin, close_side, original_size)
+            elif venue == HedgeVenue.BYBIT.value:
+                success = self._place_bybit_hedge(coin, close_side, original_size)
+        except NotImplementedError:
+            logger.warning(
+                "_close_hedge(%s, %s): live execution not implemented — removing stale tracking entry",
+                coin, venue,
+            )
+            # Remove tracking regardless: if execution isn't implemented,
+            # keeping the entry would block future hedge attempts.
+            self._active_hedges.get(venue, {}).pop(coin, None)
+            return False
+        except Exception as exc:
+            logger.error("_close_hedge(%s, %s) failed: %s", coin, venue, exc)
+            return False
 
         if success:
             del self._active_hedges[venue][coin]
             logger.debug(f"Hedge closed for {coin} on {venue}")
+        else:
+            # Position may have been liquidated/closed by exchange.
+            # Remove from tracking to avoid stale entries.
+            logger.warning(
+                "_close_hedge(%s, %s): close order failed — position may have been "
+                "liquidated. Removing from tracking to prevent inconsistency.",
+                coin, venue,
+            )
+            self._active_hedges.get(venue, {}).pop(coin, None)
 
         return success
 

@@ -21,7 +21,8 @@ logger = logging.getLogger(__name__)
 # ─── Seed Addresses ────────────────────────────────────────────
 # Known profitable / high-profile Hyperliquid traders and vaults.
 # The bot will discover more over time, but these bootstrap the system.
-SEED_TRADER_ADDRESSES = [
+# Override via SEED_TRADER_ADDRESSES env var (comma-separated hex addresses).
+_DEFAULT_SEED_ADDRESSES = [
     # HLP (Hyperliquidity Provider) vault
     "0xdfc24b077bc1425ad1dea75bcb6f8158e3df2f0f",
     # Well-known active traders (sourced from public leaderboard/community)
@@ -40,6 +41,16 @@ SEED_TRADER_ADDRESSES = [
     "0xa01c6c3e0cf5a11cc92c7400e82753638c205a45",
     "0x14d460010b4d94e7c891d4e78c52c10a8f867e8f",
 ]
+
+def _load_seed_addresses() -> list:
+    env_val = os.environ.get("SEED_TRADER_ADDRESSES", "").strip()
+    if env_val:
+        addrs = [a.strip() for a in env_val.split(",") if a.strip().startswith("0x")]
+        if addrs:
+            return addrs
+    return _DEFAULT_SEED_ADDRESSES
+
+SEED_TRADER_ADDRESSES = _load_seed_addresses()
 
 
 class TraderDiscovery:

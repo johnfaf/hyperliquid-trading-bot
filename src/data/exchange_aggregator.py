@@ -8,7 +8,7 @@ import logging
 import time
 import requests
 from typing import Dict, List, Optional, Tuple
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 logger = logging.getLogger(__name__)
 
@@ -457,7 +457,7 @@ class ExchangeAggregator:
             "confidence": round(confidence, 2),
             "exchanges_reporting": exchanges_reporting,
             "exchange_data": exchange_data,
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
         }
 
     def get_market_overview(self, coins: List[str] = None) -> Dict:
@@ -481,7 +481,7 @@ class ExchangeAggregator:
             "bullish_coins": [],
             "bearish_coins": [],
             "neutral_coins": [],
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
         }
 
         bias_scores = []

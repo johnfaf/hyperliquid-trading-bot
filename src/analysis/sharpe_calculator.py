@@ -15,7 +15,7 @@ import logging
 import numpy as np
 from typing import List, Dict, Optional
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
 
@@ -47,7 +47,7 @@ class SharpeResult:
 
     def __post_init__(self):
         if self.timestamp is None:
-            self.timestamp = datetime.utcnow().isoformat()
+            self.timestamp = datetime.now(timezone.utc).isoformat()
 
 
 def _group_fills_into_roundtrips(fills: List[Dict]) -> List[Dict]:

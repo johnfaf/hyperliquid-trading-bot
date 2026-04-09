@@ -82,6 +82,12 @@ class WhaleScanner:
             ]
             for key in expired_keys:
                 self._whale_cache.pop(key, None)
+            # Hard cap: if cache still exceeds 10,000 entries, evict oldest
+            max_cache_size = 10_000
+            if len(self._whale_cache) > max_cache_size:
+                sorted_entries = sorted(self._whale_cache.items(), key=lambda x: x[1])
+                for key, _ in sorted_entries[:len(self._whale_cache) - max_cache_size]:
+                    self._whale_cache.pop(key, None)
 
         for coin in self._coins:
             try:

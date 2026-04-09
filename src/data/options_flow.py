@@ -36,7 +36,8 @@ MIN_VOL_OI_RATIO = 0.10  # 10% of OI is already noteworthy for options
 MIN_NOTIONAL = 25_000    # Lowered from 50K; options have smaller trade sizes
 
 # Supported underlyings
-TRACKED_CURRENCIES = ["BTC", "ETH", "SOL"]
+# SOL removed: Deribit has no SOL options — every scan returned 0 trades.
+TRACKED_CURRENCIES = ["BTC", "ETH"]
 
 # Cache TTLs
 INSTRUMENTS_CACHE_TTL = 300   # 5 min

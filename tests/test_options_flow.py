@@ -149,8 +149,8 @@ class TestOptionsFlowScanner:
         assert isinstance(dashboard, dict)
 
     def test_tracked_currencies(self, scanner):
-        """TRACKED_CURRENCIES is accessible on the instance and contains BTC/ETH/SOL"""
+        """TRACKED_CURRENCIES is accessible on the instance and contains BTC/ETH"""
         tracked = scanner.TRACKED_CURRENCIES
         assert "BTC" in tracked
         assert "ETH" in tracked
-        assert "SOL" in tracked
+        # SOL removed: Deribit has no SOL options — every scan returned 0 trades

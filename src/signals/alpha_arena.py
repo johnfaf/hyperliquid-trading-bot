@@ -25,7 +25,7 @@ import copy
 import random
 import hashlib
 import sqlite3
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple, Any
 from collections import defaultdict
 from dataclasses import dataclass, field, asdict
@@ -76,7 +76,7 @@ class ArenaAgent:
     # Arena metadata
     generation: int = 0                  # 0 = original, 1+ = spawned
     parent_id: str = ""                  # If spawned, who was the parent
-    created_at: str = field(default_factory=lambda: datetime.utcnow().isoformat())
+    created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     rounds_survived: int = 0
     elo_rating: float = 1000.0           # Chess-style rating
     tournament_rank: int = 0
@@ -172,7 +172,7 @@ class TournamentEngine:
         self.round_count += 1
         rnd = TournamentRound(
             round_id=self.round_count,
-            started_at=datetime.utcnow().isoformat(),
+            started_at=datetime.now(timezone.utc).isoformat(),
             agents_entered=len(agents),
         )
 
@@ -181,7 +181,7 @@ class TournamentEngine:
         active = [a for a in scoreable if a.total_trades >= 3]
 
         if len(active) < self.MIN_AGENTS:
-            rnd.ended_at = datetime.utcnow().isoformat()
+            rnd.ended_at = datetime.now(timezone.utc).isoformat()
             rnd.summary = f"Not enough active agents ({len(active)}) — skipping round"
             self.history.append(rnd)
             return rnd
@@ -220,7 +220,7 @@ class TournamentEngine:
 
         rnd.best_agent = ranked[0].name if ranked else ""
         rnd.best_fitness = ranked[0].fitness_score if ranked else 0
-        rnd.ended_at = datetime.utcnow().isoformat()
+        rnd.ended_at = datetime.now(timezone.utc).isoformat()
         rnd.summary = (f"Ranked {len(ranked)} agents. "
                       f"Champion: {rnd.best_agent} (fitness={rnd.best_fitness:.3f}). "
                       f"Promoted: {rnd.agents_promoted}, Eliminated: {rnd.agents_eliminated}")
@@ -339,7 +339,7 @@ class ConsensusEngine:
         reject_count = sum(1 for v in votes if v.vote == "reject")
 
         self.vote_history.append({
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
             "coin": signal.coin,
             "side": signal.side.value,
             "approved": approved,
@@ -1150,7 +1150,7 @@ class AlphaArena:
         """Persist all agents to DB."""
         try:
             conn = sqlite3.connect(config.DB_PATH)
-            now = datetime.utcnow().isoformat()
+            now = datetime.now(timezone.utc).isoformat()
             for agent in self.agents.values():
                 conn.execute("""
                     INSERT OR REPLACE INTO arena_agents

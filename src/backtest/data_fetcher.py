@@ -502,7 +502,7 @@ class DataFetcher:
             """INSERT INTO fetch_log (coin, timeframe, start_ms, end_ms, candle_count, source, fetched_at)
                VALUES (?, ?, ?, ?, ?, ?, ?)""",
             (coin, tf, candles[0].timestamp_ms, candles[-1].timestamp_ms,
-             len(candles), source, datetime.utcnow().isoformat())
+             len(candles), source, datetime.now(timezone.utc).isoformat())
         )
         conn.commit()
         conn.close()

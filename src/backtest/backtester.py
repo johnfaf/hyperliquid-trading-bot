@@ -256,7 +256,7 @@ class BacktestEngine:
         start_time = time.time()
 
         if experiment_id is None:
-            experiment_id = f"bt_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}_{self._rng_seed}"
+            experiment_id = f"bt_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}_{self._rng_seed}"
 
         if not fills:
             logger.warning("No fills to backtest")
@@ -635,8 +635,8 @@ class BacktestEngine:
                 wallets_used=wallets_used,
                 equity_curve=self._equity_curve,
                 equity_timestamps=self._equity_timestamps,
-                started_at=datetime.utcnow().isoformat(),
-                completed_at=datetime.utcnow().isoformat(),
+                started_at=datetime.now(timezone.utc).isoformat(),
+                completed_at=datetime.now(timezone.utc).isoformat(),
                 duration_seconds=elapsed,
             )
 
@@ -725,8 +725,8 @@ class BacktestEngine:
             daily_returns=daily_returns,
             trades=trades,
             coin_breakdown=dict(coin_breakdown),
-            started_at=datetime.utcnow().isoformat(),
-            completed_at=datetime.utcnow().isoformat(),
+            started_at=datetime.now(timezone.utc).isoformat(),
+            completed_at=datetime.now(timezone.utc).isoformat(),
             duration_seconds=elapsed,
         )
 

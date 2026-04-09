@@ -13,7 +13,7 @@ import sqlite3
 import json
 import os
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from contextlib import contextmanager
 from statistics import mean, stdev
 import math
@@ -164,8 +164,8 @@ class ShadowTracker:
                     trade_dict["size"],
                     pnl or 0,
                     pnl_pct or 0,
-                    trade_dict.get("entry_ts", datetime.utcnow().isoformat()),
-                    trade_dict.get("exit_ts", datetime.utcnow().isoformat()),
+                    trade_dict.get("entry_ts", datetime.now(timezone.utc).isoformat()),
+                    trade_dict.get("exit_ts", datetime.now(timezone.utc).isoformat()),
                     trade_dict.get("regime_at_entry"),
                     trade_dict.get("confidence", 1.0),
                     json.dumps(trade_dict.get("metadata", {}))
@@ -195,7 +195,7 @@ class ShadowTracker:
             ...
         }
         """
-        cutoff_ts = (datetime.utcnow() - timedelta(days=days)).isoformat()
+        cutoff_ts = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
 
         try:
             with self._get_connection() as conn:
@@ -259,7 +259,7 @@ class ShadowTracker:
             ...
         }
         """
-        cutoff_ts = (datetime.utcnow() - timedelta(days=days)).isoformat()
+        cutoff_ts = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
 
         try:
             with self._get_connection() as conn:
@@ -315,7 +315,7 @@ class ShadowTracker:
         Returns:
             dict: Counts of deleted records.
         """
-        cutoff_ts = (datetime.utcnow() - timedelta(days=keep_days)).isoformat()
+        cutoff_ts = (datetime.now(timezone.utc) - timedelta(days=keep_days)).isoformat()
 
         try:
             with self._get_connection() as conn:
@@ -334,7 +334,7 @@ class ShadowTracker:
                 # Delete orphaned attribution records
                 conn.execute(
                     "DELETE FROM shadow_attribution WHERE date < date(?, '-' || ? || ' days')",
-                    (datetime.utcnow().isoformat(), keep_days)
+                    (datetime.now(timezone.utc).isoformat(), keep_days)
                 )
 
             logger.info(f"Pruned {count_before} shadow trades older than {keep_days} days")
@@ -421,7 +421,7 @@ class ShadowTracker:
         """
         import csv
 
-        cutoff_ts = (datetime.utcnow() - timedelta(days=days)).isoformat()
+        cutoff_ts = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
 
         try:
             with self._get_connection() as conn:
@@ -463,8 +463,8 @@ if __name__ == "__main__":
         "entry_price": 50000.0,
         "exit_price": 51000.0,
         "size": 0.1,
-        "entry_ts": (datetime.utcnow() - timedelta(hours=2)).isoformat(),
-        "exit_ts": datetime.utcnow().isoformat(),
+        "entry_ts": (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat(),
+        "exit_ts": datetime.now(timezone.utc).isoformat(),
         "confidence": 0.85
     })
 

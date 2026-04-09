@@ -450,6 +450,8 @@ class LiveTrader:
             1.0,
             float(os.environ.get("LIVE_ORDER_DEDUP_WINDOW_S", "30")),
         )
+        self._last_hash_cleanup_ts = 0.0
+        self._HASH_CLEANUP_INTERVAL = 60.0  # periodic cleanup every 60s
 
         # Price sanity state (instance-level; class-level cache leaks across traders).
         self._price_history: Dict[str, float] = {}  # coin -> last known good mid
@@ -870,6 +872,15 @@ class LiveTrader:
                 f"{spot:.2f}" if spot is not None else "n/a",
                 f"{total:.2f}" if total is not None else "n/a",
             )
+
+        # Periodic cleanup of stale order dedup hashes (runs during idle periods
+        # when no orders trigger the at-order-time cleanup).
+        if now - self._last_hash_cleanup_ts > self._HASH_CLEANUP_INTERVAL:
+            self._last_hash_cleanup_ts = now
+            stale = [h for h, (ts, _) in self._recent_order_hashes.items()
+                     if now - ts > self._ORDER_DEDUP_WINDOW]
+            for h in stale:
+                del self._recent_order_hashes[h]
 
         return self._last_balance_snapshot
 
@@ -2230,6 +2241,9 @@ class LiveTrader:
                 return {"status": "error", "message": "No position found"}
 
             size = abs(pos.get("size", 0))
+            if size <= 0:
+                logger.warning("close_position(%s): position size is zero — may have been closed concurrently", coin)
+                return {"status": "error", "message": "Position size is zero (may have been closed by SL/TP)"}
             side = "sell" if pos.get("szi", 0) > 0 else "buy"
 
             return self.place_market_order(coin, side, size, reduce_only=True)
@@ -2568,6 +2582,8 @@ class LiveTrader:
                 )
                 return None
             position_usd = signal.position_pct * self.max_position_size
+            import copy as _copy
+            signal = _copy.deepcopy(signal)  # Avoid mutating caller's reference
             signal.size = position_usd / mid
             logger.debug(
                 f"Computed size for {coin}: ${position_usd:.2f} / ${mid:.4f} = {signal.size:.6f} coins"
