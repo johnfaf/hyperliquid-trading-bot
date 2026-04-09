@@ -421,7 +421,10 @@ class PositionMonitor:
     def _on_error(self, ws, error) -> None:
         """Handle WebSocket errors."""
         if self._running:
-            logger.warning(f"PositionMonitor WebSocket error: {error}")
+            if self._is_transient_ws_close_error(error):
+                logger.info("PositionMonitor transient WebSocket close: %s", error)
+            else:
+                logger.warning(f"PositionMonitor WebSocket error: {error}")
         with self._lock:
             self._connected = False
 

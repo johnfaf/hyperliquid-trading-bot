@@ -5,6 +5,7 @@ Tests the signal pipeline from regime detection through to trade decision,
 using mocked external APIs but real internal logic.
 """
 import pytest
+import logging
 from unittest.mock import MagicMock, patch
 
 
@@ -157,6 +158,43 @@ class TestIntegrationPipeline:
         result = _reconcile_regimes(regime_data, mock_container)
 
         assert result is regime_data  # Same object, unchanged
+
+    def test_regime_reconciliation_non_crash_disagreement_logs_info(self, mock_container, caplog):
+        """High-confidence non-crash disagreement should be informational."""
+        from src.core.cycles.trading_cycle import _reconcile_regimes
+
+        mock_container.predictive_forecaster.predict_regime.return_value = {
+            "regime": "bullish",
+            "confidence": 0.74,
+            "signal": 0.74,
+        }
+        regime_data = mock_container.regime_detector.get_market_regime()
+        regime_data["overall_regime"] = "ranging"
+        regime_data["overall_confidence"] = 0.79
+
+        with caplog.at_level(logging.INFO):
+            result = _reconcile_regimes(regime_data, mock_container)
+
+        assert result["regime_agreement"] is False
+        assert result.get("regime_override") is None
+        assert "no crash override applied" in caplog.text.lower()
+
+    def test_regime_reconciliation_crash_override_logs_warning(self, mock_container, caplog):
+        """Crash disagreement that triggers override should remain warning-level."""
+        from src.core.cycles.trading_cycle import _reconcile_regimes
+
+        mock_container.predictive_forecaster.predict_regime.return_value = {
+            "regime": "crash",
+            "confidence": 0.75,
+            "signal": -0.75,
+        }
+        regime_data = mock_container.regime_detector.get_market_regime()
+
+        with caplog.at_level(logging.WARNING):
+            result = _reconcile_regimes(regime_data, mock_container)
+
+        assert result.get("regime_override") == "forecaster_crash"
+        assert "applying crash-protective override" in caplog.text.lower()
 
     def test_signal_processor_receives_strategies(self, mock_container):
         """Signal processor receives strategies from scorer."""

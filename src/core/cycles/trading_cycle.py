@@ -75,8 +75,8 @@ _REGIME_MAP_FORECASTER_TO_DETECTOR = {
 def _reconcile_regimes(regime_data: dict, container) -> dict:
     """
     Compare regime detector (technical, 6-class) with forecaster (predictive, 3-class).
-    When they disagree with high confidence, log a warning and annotate regime_data
-    so downstream consumers can react conservatively.
+    Annotates regime_data with agreement metadata and applies conservative crash
+    overrides when predictive crash risk is high.
     """
     forecaster = container.predictive_forecaster if container else None
     if not forecaster or not regime_data:
@@ -104,13 +104,13 @@ def _reconcile_regimes(regime_data: dict, container) -> dict:
     regime_data["regime_agreement"] = agree
 
     if not agree and min(pred_conf, det_conf) >= 0.5:
-        logger.warning(
-            "  REGIME DISAGREEMENT: detector=%s (%.0f%%) vs forecaster=%s (%.0f%%) — "
-            "using conservative override",
-            det_regime, det_conf * 100, pred_regime, pred_conf * 100,
-        )
-        # Conservative policy: if forecaster says crash, override to crash-equivalent
+        # Conservative policy: if forecaster says crash, override to crash-equivalent.
         if pred_regime == "crash" and pred_conf >= 0.6:
+            logger.warning(
+                "  REGIME DISAGREEMENT: detector=%s (%.0f%%) vs forecaster=%s (%.0f%%) — "
+                "applying crash-protective override",
+                det_regime, det_conf * 100, pred_regime, pred_conf * 100,
+            )
             regime_data["overall_regime"] = "volatile"
             regime_data["regime_override"] = "forecaster_crash"
             # Suppress bullish strategy activation
@@ -118,6 +118,12 @@ def _reconcile_regimes(regime_data: dict, container) -> dict:
             guidance["pause"] = list(set(guidance.get("pause", []) + guidance.get("activate", [])))
             guidance["activate"] = []
             regime_data["strategy_guidance"] = guidance
+        else:
+            logger.info(
+                "  REGIME DISAGREEMENT: detector=%s (%.0f%%) vs forecaster=%s (%.0f%%) — "
+                "no crash override applied",
+                det_regime, det_conf * 100, pred_regime, pred_conf * 100,
+            )
     elif agree:
         logger.debug(
             "  Regime consensus: detector=%s ↔ forecaster=%s (both confident)",

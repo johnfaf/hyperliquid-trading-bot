@@ -1,3 +1,5 @@
+import logging
+
 from src.notifications.ws_position_monitor import PositionMonitor
 
 
@@ -109,3 +111,23 @@ def test_transient_ws_close_error_detection_recognizes_inactive():
 
 def test_transient_ws_close_error_detection_rejects_generic_error():
     assert not PositionMonitor._is_transient_ws_close_error("ssl cert verify failed")
+
+
+def test_on_error_logs_info_for_transient_inactive_close(caplog):
+    monitor = PositionMonitor()
+    monitor._running = True
+
+    with caplog.at_level(logging.INFO):
+        monitor._on_error(None, "fin=1 opcode=8 data=b'\\x03\\xe8Inactive' - goodbye")
+
+    assert "transient websocket close" in caplog.text.lower()
+
+
+def test_on_error_logs_warning_for_non_transient_error(caplog):
+    monitor = PositionMonitor()
+    monitor._running = True
+
+    with caplog.at_level(logging.WARNING):
+        monitor._on_error(None, "ssl cert verify failed")
+
+    assert "websocket error" in caplog.text.lower()
