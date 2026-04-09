@@ -263,15 +263,6 @@ class CrossVenueHedger:
         try:
             symbol = f"{coin}USDT"
 
-            order_params = {
-                "symbol": symbol,
-                "side": side,
-                "type": "MARKET",
-                "quantity": size,
-                "reduceOnly": True,
-                "timestamp": int(time.time() * 1000),
-            }
-
             if self.dry_run:
                 logger.info(
                     f"[DRY-RUN] Binance hedge order: {side} {size} {symbol} "
@@ -310,15 +301,6 @@ class CrossVenueHedger:
         try:
             symbol = f"{coin}USDT"
             bybit_side = "Buy" if side == "BUY" else "Sell"
-
-            order_body = {
-                "category": "linear",
-                "symbol": symbol,
-                "side": bybit_side,
-                "orderType": "Market",
-                "qty": str(size),
-                "reduceOnly": True,
-            }
 
             if self.dry_run:
                 logger.info(

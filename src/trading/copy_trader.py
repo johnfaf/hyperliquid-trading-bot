@@ -9,14 +9,15 @@ V2: Signals routed through DecisionFirewall and tracked by AgentScorer.
 import logging
 import json
 from datetime import datetime, timezone
-from typing import List, Dict, Optional, Set, Tuple
+from typing import List, Dict, Optional
 
-import sys, os
+import sys
+import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import config
 from src.data import database as db
 from src.data import hyperliquid_client as hl
-from src.signals.signal_schema import TradeSignal, SignalSide, SignalSource, RiskParams, signal_from_copy_trade
+from src.signals.signal_schema import signal_from_copy_trade
 from src.signals.decision_firewall import DecisionFirewall
 from src.signals.agent_scoring import AgentScorer
 from src.signals.kelly_sizing import KellySizer

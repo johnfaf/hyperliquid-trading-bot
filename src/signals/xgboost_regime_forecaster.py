@@ -27,7 +27,7 @@ If not installed, falls back to the weighted-signal PredictiveRegimeForecaster.
 import logging
 import os
 import time
-from typing import Dict, Optional, List
+from typing import Dict, Optional
 from pathlib import Path
 
 import numpy as np

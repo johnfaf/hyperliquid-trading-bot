@@ -21,9 +21,7 @@ import json
 import math
 import sqlite3
 import threading
-import numpy as np
 from typing import Dict, List, Optional, Tuple
-from datetime import datetime
 from dataclasses import dataclass, asdict
 
 logger = logging.getLogger(__name__)

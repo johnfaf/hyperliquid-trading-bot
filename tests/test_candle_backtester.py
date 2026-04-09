@@ -5,7 +5,7 @@ import pytest
 
 import numpy as np
 from src.backtest.candle_backtester import (
-    CandleBacktester, CandleBacktestConfig, CandleBacktestResult,
+    CandleBacktestConfig, CandleBacktestResult,
     _sma, _ema, _rsi, _atr, _bollinger, STRATEGY_MAP,
 )
 

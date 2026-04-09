@@ -16,12 +16,10 @@ import json
 import sqlite3
 import os
 import sys
-from typing import List, Dict, Optional, Set
-from datetime import datetime, timezone
+from typing import List, Dict, Optional
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import config
-from src.data import database as db
 from src.data import hyperliquid_client as hl
 
 logger = logging.getLogger("golden_bridge")

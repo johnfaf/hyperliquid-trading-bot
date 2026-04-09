@@ -87,7 +87,6 @@ class DecisionEngine:
         self._cycle_count += 1
         open_positions = open_positions or []
         open_coins = {t["coin"] for t in open_positions}
-        open_sides = {(t["coin"], t.get("side", "")): True for t in open_positions}
         available_slots = max(0, 8 - len(open_positions))
 
         self.stats["total_candidates"] += len(strategies)

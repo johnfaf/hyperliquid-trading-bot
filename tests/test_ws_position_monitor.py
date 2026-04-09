@@ -1,6 +1,9 @@
 import logging
 
-from src.notifications.ws_position_monitor import PositionMonitor
+from src.notifications.ws_position_monitor import (
+    PositionMonitor,
+    _TransientWebSocketLibraryLogFilter,
+)
 
 
 def test_default_gap_warn_threshold_is_30s_when_not_overridden(monkeypatch):
@@ -131,3 +134,28 @@ def test_on_error_logs_warning_for_non_transient_error(caplog):
         monitor._on_error(None, "ssl cert verify failed")
 
     assert "websocket error" in caplog.text.lower()
+
+
+def test_websocket_library_filter_suppresses_transient_close_frame_errors():
+    filt = _TransientWebSocketLibraryLogFilter(PositionMonitor._TRANSIENT_CLOSE_MARKERS)
+    transient = logging.LogRecord(
+        name="websocket",
+        level=logging.ERROR,
+        pathname=__file__,
+        lineno=1,
+        msg="fin=1 opcode=8 data=b'\\x03\\xe8Inactive' - goodbye",
+        args=(),
+        exc_info=None,
+    )
+    non_transient = logging.LogRecord(
+        name="websocket",
+        level=logging.ERROR,
+        pathname=__file__,
+        lineno=1,
+        msg="ssl cert verify failed",
+        args=(),
+        exc_info=None,
+    )
+
+    assert filt.filter(transient) is False
+    assert filt.filter(non_transient) is True

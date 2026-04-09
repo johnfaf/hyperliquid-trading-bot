@@ -16,9 +16,8 @@ import sqlite3
 import os
 import sys
 from datetime import datetime, timedelta, timezone
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Tuple
-from enum import Enum
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import config
@@ -103,7 +102,6 @@ def download_fills_90d(address: str) -> List[Dict]:
     consecutive_errors = 0
 
     for page in range(50):  # safety cap: 50 pages = 100k fills max
-        start_time = oldest_seen if oldest_seen else None
         # For first page, don't pass startTime to get most recent
         # For subsequent pages, use oldest seen to page backwards
         try:

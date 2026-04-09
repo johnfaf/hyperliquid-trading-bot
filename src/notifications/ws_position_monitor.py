@@ -37,6 +37,21 @@ from src.data import hyperliquid_client as hl
 logger = logging.getLogger(__name__)
 
 
+class _TransientWebSocketLibraryLogFilter(logging.Filter):
+    """Suppress websocket-client library noise for expected transient closes."""
+
+    def __init__(self, markers):
+        super().__init__()
+        self._markers = tuple(str(m).lower() for m in markers if m)
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            text = str(record.getMessage()).lower()
+        except Exception:
+            return True
+        return not any(marker in text for marker in self._markers)
+
+
 class PositionMonitor:
     """
     Monitors top traders' positions via Hyperliquid WebSocket userEvents.
@@ -57,6 +72,8 @@ class PositionMonitor:
         "ping/pong timed out",
         "no close frame",
     )
+    _websocket_filter_lock = threading.Lock()
+    _websocket_filter_installed = False
 
     def __init__(self, max_signal_queue: int = 1000):
         """
@@ -65,6 +82,8 @@ class PositionMonitor:
         Args:
             max_signal_queue: Maximum pending signals before dropping oldest
         """
+        self._install_websocket_library_filter()
+
         self._ws = None
         self._thread = None
         self._running = False
@@ -273,6 +292,20 @@ class PositionMonitor:
                 logger.info(f"PositionMonitor reconnecting in {wait:.1f}s "
                            f"(reconnect #{self._reconnect_count})")
                 time.sleep(wait)
+
+    @classmethod
+    def _install_websocket_library_filter(cls) -> None:
+        """Filter expected websocket-client close-frame noise globally once."""
+        if not HAS_WEBSOCKET:
+            return
+        with cls._websocket_filter_lock:
+            if cls._websocket_filter_installed:
+                return
+            ws_logger = logging.getLogger("websocket")
+            ws_logger.addFilter(
+                _TransientWebSocketLibraryLogFilter(cls._TRANSIENT_CLOSE_MARKERS)
+            )
+            cls._websocket_filter_installed = True
 
     @classmethod
     def _is_transient_ws_close_error(cls, error) -> bool:

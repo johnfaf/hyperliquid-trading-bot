@@ -23,7 +23,7 @@ trader/strategy data to the existing pipeline.
 """
 import time
 import logging
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 

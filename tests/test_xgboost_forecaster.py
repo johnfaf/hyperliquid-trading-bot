@@ -123,7 +123,7 @@ class TestXGBoostRegimeForecaster:
         forecaster._last_train_ts = time.time() - 100_000  # Long ago
         forecaster.model = None
 
-        with patch.object(forecaster, "train") as mock_train:
+        with patch.object(forecaster, "train"):
             forecaster.predict_regime("BTC")
             # train should NOT be called if HAS_XGBOOST is False
             # but if it is True and model is None, it should try

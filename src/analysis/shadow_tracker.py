@@ -16,8 +16,6 @@ import logging
 from datetime import datetime, timedelta, timezone
 from contextlib import contextmanager
 from statistics import mean, stdev
-import math
-import time
 
 logger = logging.getLogger(__name__)
 

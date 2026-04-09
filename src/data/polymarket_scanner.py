@@ -26,10 +26,9 @@ Polymarket API:
 import logging
 import time
 import requests
-from typing import Dict, List, Optional, Tuple
-from datetime import datetime, timedelta, timezone
+from typing import Dict, List, Optional
+from datetime import datetime, timezone
 from dataclasses import dataclass, field
-from collections import defaultdict
 from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)

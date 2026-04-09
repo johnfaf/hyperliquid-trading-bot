@@ -19,7 +19,7 @@ Functions:
 
 import logging
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List
 from collections import defaultdict
 
 from src.notifications.telegram_bot import _send_message, is_configured
@@ -95,7 +95,6 @@ def send_daily_pnl_summary() -> bool:
         # Build message
         emoji_balance = "💰"
         emoji_pnl = "💹" if daily_pnl >= 0 else "📉"
-        emoji_roi = "📈" if total_roi >= 0 else "📉"
 
         text = (
             f"{emoji_balance} <b>DAILY P&L SUMMARY</b>\n"
@@ -233,8 +232,6 @@ def send_weekly_digest() -> bool:
 
         balance = account.get("balance", 0)
         total_pnl = account.get("total_pnl", 0)
-        total_trades = account.get("total_trades", 0)
-        winning_trades = account.get("winning_trades", 0)
 
         # Get this week's trades (last 7 days)
         closed_trades = db.get_paper_trade_history(limit=1000)

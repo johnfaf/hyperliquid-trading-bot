@@ -1,7 +1,6 @@
 """
 Unit tests for DecisionFirewall.
 """
-import pytest
 
 from unittest.mock import patch, MagicMock
 

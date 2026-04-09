@@ -83,7 +83,6 @@ def _group_fills_into_roundtrips(fills: List[Dict]) -> List[Dict]:
         for fill in coin_fills_sorted:
             side = fill.get("side", "").lower()  # "buy" or "sell"
             price = fill.get("price", 0)
-            original_price = fill.get("original_price", price)
             size = abs(fill.get("size", 0))
             time_ms = fill.get("time_ms", 0)
             closed_pnl = fill.get("closed_pnl", 0)

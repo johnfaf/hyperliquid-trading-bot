@@ -31,21 +31,17 @@ import time
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional
 
 # ─── Path setup ────────────────────────────────────────────────
 ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(ROOT))
 
-import config
 from src.backtest.backtester import (
     BacktestConfig, BacktestEngine, BacktestResult, BacktestFill,
-    load_fills_from_db, init_experiments_table, save_experiment,
 )
 from src.backtest.stress_scenarios import (
     StressScenarioSuite, apply_scenario,
-    FlashCrashConfig, FundingSqueezeConfig, LiquidityDrainConfig,
-    CascadeLiquidationConfig, BlackSwanConfig,
 )
 
 logger = logging.getLogger("stress_test")
@@ -334,7 +330,6 @@ def generate_html_report(report: StressTestReport, output_path: str):
     """Generate an interactive HTML stress test report."""
     scenarios_html = ""
     for s in report.scenarios:
-        status_class = "pass" if s.survived else "fail"
         status_text = "SURVIVED" if s.survived else ("BLOWN" if s.blown else "DAMAGED")
         status_emoji = "&#9989;" if s.survived else "&#10060;"
 
@@ -612,7 +607,6 @@ def _print_summary(report: StressTestReport):
 
     for s in report.scenarios:
         verdict = "SURVIVED" if s.survived else ("BLOWN" if s.blown else "DAMAGED")
-        v_color = verdict
         print(f"  {s.scenario_name:<26} ${s.total_pnl:>+8,.0f} "
               f"{s.max_drawdown_pct:>7.1f}% {s.liquidations:>5} "
               f"{s.severity_score:>6.0f}/100 {verdict:>10}")

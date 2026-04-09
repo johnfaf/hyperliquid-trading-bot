@@ -72,7 +72,6 @@ def run_stress_test(scenarios=None, use_seed=False) -> dict:
     sys.path.insert(0, str(ROOT))
 
     from src.backtest.stress_test import StressTestEngine, _load_fills_from_db, generate_html_report
-    from src.backtest.stress_scenarios import StressScenarioSuite
 
     # Load fills
     fills_raw = []

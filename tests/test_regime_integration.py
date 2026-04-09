@@ -1,5 +1,5 @@
 import pytest
-from unittest.mock import Mock, patch, MagicMock
+from unittest.mock import patch
 from datetime import datetime, timedelta
 from src.signals.predictive_regime_forecaster import PredictiveRegimeForecaster
 

@@ -10,10 +10,9 @@ Data sources:
 """
 import logging
 import time
-import json
 import threading
 from datetime import datetime, timedelta, timezone
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional
 from collections import defaultdict
 
 import requests

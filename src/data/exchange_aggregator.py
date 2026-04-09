@@ -8,7 +8,7 @@ import logging
 import time
 import requests
 from typing import Dict, List, Optional, Tuple
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
 

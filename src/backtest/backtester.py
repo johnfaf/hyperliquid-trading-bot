@@ -30,7 +30,7 @@ import os
 import sys
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
-from typing import List, Dict, Optional, Tuple, Any
+from typing import List, Dict, Optional
 from collections import defaultdict
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -1194,7 +1194,7 @@ Examples:
 
         coin_data = json.loads(exp["coin_breakdown"]) if isinstance(exp["coin_breakdown"], str) else exp["coin_breakdown"]
         if coin_data:
-            print(f"\nCoin Breakdown:")
+            print("\nCoin Breakdown:")
             print(f"  {'Coin':<10} {'Trades':>7} {'WR%':>6} {'PnL':>12}")
             for coin, data in sorted(coin_data.items(), key=lambda x: x[1].get("pnl", 0), reverse=True):
                 wr = data.get("win_rate", 0)
@@ -1254,7 +1254,7 @@ Examples:
             init_experiments_table()
             for r in results[:10]:
                 save_experiment(r, notes=f"sweep: {args.notes}" if args.notes else "parameter sweep")
-            print(f"\nSaved top 10 experiments to DB")
+            print("\nSaved top 10 experiments to DB")
 
     else:
         # Single run
@@ -1281,7 +1281,7 @@ Examples:
         print(f"Duration:             {result.duration_seconds:.1f}s")
 
         if result.coin_breakdown:
-            print(f"\nCoin Breakdown:")
+            print("\nCoin Breakdown:")
             print(f"  {'Coin':<10} {'Trades':>7} {'WR%':>6} {'PnL':>12}")
             for coin, data in sorted(result.coin_breakdown.items(),
                                       key=lambda x: x[1]["pnl"], reverse=True)[:15]:

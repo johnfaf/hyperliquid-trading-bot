@@ -3,7 +3,7 @@ Unit tests for Kelly Criterion position sizing.
 """
 import pytest
 
-from src.signals.kelly_sizing import KellySizer, SizingResult
+from src.signals.kelly_sizing import KellySizer
 
 
 def test_kelly_no_edge():

@@ -7,10 +7,9 @@ Uses Telegram Bot API directly — no extra packages needed.
 import os
 import logging
 import requests
-import json
 import time
 from datetime import datetime, timezone
-from typing import Dict, List, Optional
+from typing import Dict, List
 
 logger = logging.getLogger(__name__)
 

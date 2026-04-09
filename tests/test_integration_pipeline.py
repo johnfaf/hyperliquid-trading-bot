@@ -6,7 +6,7 @@ using mocked external APIs but real internal logic.
 """
 import pytest
 import logging
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 
 class TestIntegrationPipeline:

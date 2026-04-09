@@ -13,13 +13,12 @@ import logging
 import math
 import json
 import time
-from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Optional, Tuple
+from datetime import datetime, timezone
+from typing import Dict, List
 from collections import defaultdict
 from dataclasses import dataclass, asdict
 
 from src.data import database as db
-from src.signals.signal_schema import SignalSource
 
 logger = logging.getLogger(__name__)
 
@@ -126,8 +125,6 @@ class AgentScorer:
     def _save_score(self, source_key: str):
         """Persist a single source's score to DB."""
         try:
-            import sqlite3
-            import config
             score = self.scores.get(source_key)
             if not score:
                 return

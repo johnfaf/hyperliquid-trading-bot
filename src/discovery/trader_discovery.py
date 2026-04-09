@@ -8,7 +8,8 @@ import time
 from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Optional
 
-import sys, os
+import sys
+import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import config
 from src.data import hyperliquid_client as hl

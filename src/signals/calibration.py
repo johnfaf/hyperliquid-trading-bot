@@ -17,10 +17,8 @@ This module:
   4. Provides adjustment factors to correct miscalibrated confidence
 """
 import logging
-import json
 import sqlite3
-import math
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 from datetime import datetime, timezone
 from collections import defaultdict
 

@@ -28,8 +28,8 @@ import time
 import sqlite3
 import logging
 import requests
-from datetime import datetime, timezone, timedelta
-from typing import List, Dict, Optional, Tuple
+from datetime import datetime, timezone
+from typing import List, Dict
 from dataclasses import dataclass, asdict
 
 logger = logging.getLogger("data_fetcher")
@@ -439,7 +439,7 @@ class DataFetcher:
                     timeframe=timeframe,
                 )
                 candles.append(candle)
-            except (ValueError, TypeError) as e:
+            except (ValueError, TypeError):
                 continue
 
         candles.sort(key=lambda x: x.timestamp_ms)

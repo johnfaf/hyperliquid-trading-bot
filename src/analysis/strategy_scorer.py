@@ -6,10 +6,11 @@ profitable ones. This is the "learning" core of the bot.
 """
 import logging
 import numpy as np
-from datetime import datetime, timedelta, timezone
-from typing import List, Dict, Optional
+from datetime import datetime, timezone
+from typing import List, Dict
 
-import sys, os
+import sys
+import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import config
 from src.data import database as db

@@ -7,7 +7,6 @@ import logging
 import os
 import json
 from datetime import datetime, timezone
-from typing import List, Dict
 
 import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -27,7 +26,7 @@ class Reporter:
         """Generate a comprehensive daily report as markdown."""
         now = datetime.now(timezone.utc)
         report = []
-        report.append(f"# Hyperliquid Research Bot - Daily Report")
+        report.append("# Hyperliquid Research Bot - Daily Report")
         report.append(f"**Generated:** {now.strftime('%Y-%m-%d %H:%M UTC')}\n")
 
         # 1. Trader Overview

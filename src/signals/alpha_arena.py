@@ -18,25 +18,22 @@ Plus:
                     (walk-forward, no future data leakage)
 """
 import logging
-import math
 import json
-import time
 import copy
 import random
-import hashlib
 import sqlite3
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple, Any
-from collections import defaultdict
 from dataclasses import dataclass, field, asdict
 from enum import Enum
 
 import numpy as np
 
-import sys, os
+import sys
+import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import config
-from src.signals.signal_schema import TradeSignal, SignalSide, SignalSource, SignalStrength
+from src.signals.signal_schema import TradeSignal
 
 logger = logging.getLogger(__name__)
 
@@ -457,7 +454,6 @@ class ConsensusEngine:
 
         # Feature-based adjustments
         if features and isinstance(features, dict):
-            rsi = features.get("rsi", 50)
             score = features.get("overall_score", 0)
 
             # Strong feature alignment boosts confidence
@@ -715,9 +711,6 @@ class Backtester:
 
             if test_start >= n:
                 break
-
-            # Agent only sees data up to test_start for "training"
-            visible_history = historical_candles[:test_start]
 
             # Simulate trading on test period, bar by bar
             for bar_idx in range(test_start, test_end):
@@ -1248,7 +1241,7 @@ class AlphaArena:
         # Tournament
         if self.cycle_count % self.TOURNAMENT_INTERVAL == 0:
             agents_list = list(self.agents.values())
-            rnd = self.tournament.run_round(agents_list)
+            self.tournament.run_round(agents_list)
 
         # Spawning disabled — all 9 seed agents remain fixed
         # (SPAWN_INTERVAL = 0 prevents this block from ever executing)

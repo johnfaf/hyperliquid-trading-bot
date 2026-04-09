@@ -14,7 +14,6 @@ import re
 import sys
 from typing import Optional, Any
 
-import requests
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from src.core.api_manager import get_manager, Priority  # noqa: E402

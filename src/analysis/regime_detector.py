@@ -23,7 +23,8 @@ from enum import Enum
 
 import numpy as np
 
-import sys, os
+import sys
+import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from src.data import hyperliquid_client as hl
 from src.data.exchange_aggregator import ExchangeAggregator
