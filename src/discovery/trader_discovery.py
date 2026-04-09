@@ -302,14 +302,14 @@ class TraderDiscovery:
         seen_addrs = set()
 
         try:
-            import requests
-            # Get coins with highest open interest
-            resp = requests.post("https://api.hyperliquid.xyz/info",
-                                 json={"type": "metaAndAssetCtxs"}, timeout=10)
-            if resp.status_code != 200:
+            from src.core.api_manager import get_manager, Priority
+            # Get coins with highest open interest via API manager
+            data = get_manager().post(
+                payload={"type": "metaAndAssetCtxs"},
+                priority=Priority.NORMAL, timeout=10,
+            )
+            if data is None:
                 return []
-
-            data = resp.json()
             if not isinstance(data, list) or len(data) < 2:
                 return []
 

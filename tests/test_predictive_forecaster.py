@@ -1,10 +1,8 @@
 """
 Unit tests for Predictive Regime Forecaster.
 """
-import pytest
-import sys
 import os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+import pytest
 
 from unittest.mock import patch, MagicMock
 from src.signals.predictive_regime_forecaster import (

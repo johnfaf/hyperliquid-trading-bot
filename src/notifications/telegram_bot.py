@@ -18,6 +18,9 @@ _TELEGRAM_SUBSYSTEM = "telegram"
 _MAX_SEND_RETRIES = max(1, int(os.environ.get("TELEGRAM_SEND_RETRIES", "3")))
 _RETRY_BASE_DELAY_S = max(0.2, float(os.environ.get("TELEGRAM_SEND_RETRY_BASE_S", "0.8")))
 _failure_streak = 0
+_MAX_FAILURE_STREAK = 100  # Cap to prevent unbounded growth
+_last_failure_ts: float = 0.0  # Auto-reset streak after extended silence
+_FAILURE_RESET_WINDOW_S = 300.0  # 5 minutes without sends → reset streak
 
 
 def _load_credentials() -> tuple:
@@ -67,7 +70,7 @@ def is_configured() -> bool:
 
 def _send_message(text: str, parse_mode: str = "HTML", disable_preview: bool = True) -> bool:
     """Send a message via Telegram Bot API."""
-    global _failure_streak
+    global _failure_streak, _last_failure_ts
 
     token, chat_id, telegram_api = _load_credentials()
     if not (token and chat_id and telegram_api):
@@ -123,7 +126,12 @@ def _send_message(text: str, parse_mode: str = "HTML", disable_preview: bool = T
                 continue
             logger.warning("Telegram send error: %s", e)
 
-    _failure_streak += 1
+    # Cap streak and record timestamp for time-based decay
+    now = time.time()
+    if _last_failure_ts > 0 and (now - _last_failure_ts) > _FAILURE_RESET_WINDOW_S:
+        _failure_streak = 0  # Reset after prolonged silence
+    _failure_streak = min(_failure_streak + 1, _MAX_FAILURE_STREAK)
+    _last_failure_ts = now  # noqa: F841 – used on next call
     _report_health(success=False, reason=f"send_failure_streak={_failure_streak} last_error={last_error}")
     return False
 

@@ -382,8 +382,8 @@ class RegimeDetector:
         Falls back to computing from recent trades if candle endpoint unavailable.
         """
         try:
-            # Try Hyperliquid candle snapshot endpoint
-            import requests
+            # Try Hyperliquid candle snapshot endpoint via API manager
+            from src.core.api_manager import get_manager, Priority
             payload = {
                 "type": "candleSnapshot",
                 "req": {
@@ -393,23 +393,20 @@ class RegimeDetector:
                     "endTime": int(datetime.now(timezone.utc).timestamp() * 1000),
                 }
             }
-            resp = requests.post("https://api.hyperliquid.xyz/info",
-                                 json=payload, timeout=10)
-            if resp.status_code == 200:
-                data = resp.json()
-                if isinstance(data, list) and data:
-                    candles = []
-                    for c in data:
-                        # Hyperliquid candle format: {t, T, s, o, c, h, l, v, n}
-                        candles.append({
-                            "timestamp": c.get("t", 0),
-                            "open": float(c.get("o", 0)),
-                            "high": float(c.get("h", 0)),
-                            "low": float(c.get("l", 0)),
-                            "close": float(c.get("c", 0)),
-                            "volume": float(c.get("v", 0)),
-                        })
-                    return candles
+            data = get_manager().post(payload=payload, priority=Priority.NORMAL, timeout=10)
+            if isinstance(data, list) and data:
+                candles = []
+                for c in data:
+                    # Hyperliquid candle format: {t, T, s, o, c, h, l, v, n}
+                    candles.append({
+                        "timestamp": c.get("t", 0),
+                        "open": float(c.get("o", 0)),
+                        "high": float(c.get("h", 0)),
+                        "low": float(c.get("l", 0)),
+                        "close": float(c.get("c", 0)),
+                        "volume": float(c.get("v", 0)),
+                    })
+                return candles
 
         except Exception as e:
             logger.debug(f"Candle fetch for {coin}: {e}")

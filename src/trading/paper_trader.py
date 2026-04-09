@@ -131,7 +131,7 @@ class PaperTrader:
                 for coin in set(["BTC", "ETH", "SOL"]):
                     try:
                         # Fetch candles for feature computation
-                        import requests
+                        from src.core.api_manager import get_manager, Priority
                         payload = {
                             "type": "candleSnapshot",
                             "req": {
@@ -141,18 +141,15 @@ class PaperTrader:
                                 "endTime": int(datetime.now(timezone.utc).timestamp() * 1000),
                             }
                         }
-                        resp = requests.post("https://api.hyperliquid.xyz/info",
-                                             json=payload, timeout=10)
-                        if resp.status_code == 200:
-                            raw = resp.json()
-                            if isinstance(raw, list) and len(raw) >= 20:
-                                candles = [{"open": float(c.get("o", 0)), "high": float(c.get("h", 0)),
-                                            "low": float(c.get("l", 0)), "close": float(c.get("c", 0)),
-                                            "volume": float(c.get("v", 0))} for c in raw]
-                                features = self.feature_engine.compute(coin, candles)
-                                coin_features[coin] = features
-                                logger.debug(f"Features {coin}: score={features.overall_score:+.2f}, "
-                                           f"rsi={features.rsi:.0f}, vol={features.volatility:.3f}")
+                        raw = get_manager().post(payload=payload, priority=Priority.NORMAL, timeout=10)
+                        if isinstance(raw, list) and len(raw) >= 20:
+                            candles = [{"open": float(c.get("o", 0)), "high": float(c.get("h", 0)),
+                                        "low": float(c.get("l", 0)), "close": float(c.get("c", 0)),
+                                        "volume": float(c.get("v", 0))} for c in raw]
+                            features = self.feature_engine.compute(coin, candles)
+                            coin_features[coin] = features
+                            logger.debug(f"Features {coin}: score={features.overall_score:+.2f}, "
+                                       f"rsi={features.rsi:.0f}, vol={features.volatility:.3f}")
                     except Exception as e:
                         logger.debug(f"Feature computation for {coin}: {e}")
             except Exception as e:

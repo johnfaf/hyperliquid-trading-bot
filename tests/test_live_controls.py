@@ -970,7 +970,18 @@ def test_run_alpha_arena_live_path_executes_signal(monkeypatch):
     )()
 
     monkeypatch.setattr("src.core.cycles.trading_cycle.is_live_trading_active", lambda container: True)
-    monkeypatch.setattr("requests.post", lambda *args, **kwargs: FakeResponse())
+
+    # Mock the API manager to return candle data (arena now uses get_manager().post)
+    fake_candles = [
+        {"o": "1.0", "h": "1.1", "l": "0.9", "c": "1.0", "v": "10"}
+        for _ in range(60)
+    ]
+
+    class FakeManager:
+        def post(self, **kwargs):
+            return fake_candles
+
+    monkeypatch.setattr("src.core.api_manager.get_manager", lambda: FakeManager())
 
     _run_alpha_arena(container, {"overall_regime": "neutral"})
 
@@ -1027,7 +1038,18 @@ def test_run_alpha_arena_paper_trade_preserves_precise_stops(monkeypatch):
         "src.core.cycles.trading_cycle.db.open_paper_trade",
         lambda **kwargs: opened.update(kwargs) or 1,
     )
-    monkeypatch.setattr("requests.post", lambda *args, **kwargs: FakeResponse())
+
+    # Mock API manager (arena now uses get_manager().post instead of requests.post)
+    fake_candles = [
+        {"o": str(price), "h": str(price * 1.1), "l": str(price * 0.9),
+         "c": str(price), "v": "10"} for _ in range(60)
+    ]
+
+    class FakeManager:
+        def post(self, **kwargs):
+            return fake_candles
+
+    monkeypatch.setattr("src.core.api_manager.get_manager", lambda: FakeManager())
 
     _run_alpha_arena(container, {"overall_regime": "neutral"})
 

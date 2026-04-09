@@ -65,6 +65,68 @@ def _inject_forecaster_signals(container, regime_data):
         logger.debug("  Forecaster polymarket injection error: %s", exc)
 
 
+_REGIME_MAP_FORECASTER_TO_DETECTOR = {
+    "crash": {"trending_down", "volatile"},
+    "bullish": {"trending_up"},
+    "neutral": {"ranging", "unknown", "low_liquidity"},
+}
+
+
+def _reconcile_regimes(regime_data: dict, container) -> dict:
+    """
+    Compare regime detector (technical, 6-class) with forecaster (predictive, 3-class).
+    When they disagree with high confidence, log a warning and annotate regime_data
+    so downstream consumers can react conservatively.
+    """
+    forecaster = container.predictive_forecaster if container else None
+    if not forecaster or not regime_data:
+        return regime_data
+
+    try:
+        pred = forecaster.predict_regime("BTC")
+    except Exception:
+        return regime_data
+
+    if not pred or not isinstance(pred, dict):
+        return regime_data
+
+    pred_regime = pred.get("regime", "neutral")           # crash / neutral / bullish
+    pred_conf = float(pred.get("confidence", 0))
+    det_regime = regime_data.get("overall_regime", "unknown")  # trending_up / trending_down / ranging / volatile / ...
+    det_conf = float(regime_data.get("overall_confidence", 0))
+
+    # Check compatibility
+    compatible_detector_classes = _REGIME_MAP_FORECASTER_TO_DETECTOR.get(pred_regime, set())
+    agree = det_regime in compatible_detector_classes
+
+    regime_data["forecaster_regime"] = pred_regime
+    regime_data["forecaster_confidence"] = pred_conf
+    regime_data["regime_agreement"] = agree
+
+    if not agree and min(pred_conf, det_conf) >= 0.5:
+        logger.warning(
+            "  REGIME DISAGREEMENT: detector=%s (%.0f%%) vs forecaster=%s (%.0f%%) — "
+            "using conservative override",
+            det_regime, det_conf * 100, pred_regime, pred_conf * 100,
+        )
+        # Conservative policy: if forecaster says crash, override to crash-equivalent
+        if pred_regime == "crash" and pred_conf >= 0.6:
+            regime_data["overall_regime"] = "volatile"
+            regime_data["regime_override"] = "forecaster_crash"
+            # Suppress bullish strategy activation
+            guidance = regime_data.get("strategy_guidance", {})
+            guidance["pause"] = list(set(guidance.get("pause", []) + guidance.get("activate", [])))
+            guidance["activate"] = []
+            regime_data["strategy_guidance"] = guidance
+    elif agree:
+        logger.debug(
+            "  Regime consensus: detector=%s ↔ forecaster=%s (both confident)",
+            det_regime, pred_regime,
+        )
+
+    return regime_data
+
+
 def _run_hedger(container, regime_data):
     """Cross-venue hedging — auto-hedge on crash regime."""
     hedger = container.cross_venue_hedger
@@ -316,8 +378,9 @@ def run_trading_cycle(container, cycle_count: int) -> None:
             except Exception as exc:
                 logger.warning("  Polymarket scan error: %s", exc)
 
-        # Inject into forecaster
+        # Inject into forecaster and reconcile detector vs forecaster
         _inject_forecaster_signals(container, regime_data)
+        regime_data = _reconcile_regimes(regime_data, container)
 
         # Cross-venue hedging
         _run_hedger(container, regime_data)
@@ -538,7 +601,7 @@ def _run_liquidation_scan(container, regime_data):
     logger.info("Phase 3f: Liquidation Strategy Scan")
     try:
         from src.data import hyperliquid_client as hl_client
-        import requests
+        from src.core.api_manager import get_manager, Priority
         mids = hl_client.get_all_mids() or {}
         coins = ["BTC", "ETH", "SOL", "DOGE", "AVAX", "LINK", "ARB",
                  "OP", "SUI", "APT", "INJ", "SEI"]
@@ -556,18 +619,16 @@ def _run_liquidation_scan(container, regime_data):
 
                 # Funding rate
                 try:
-                    meta_resp = requests.post(
-                        "https://api.hyperliquid.xyz/info",
-                        json={"type": "metaAndAssetCtxs"}, timeout=10,
+                    meta_data = get_manager().post(
+                        payload={"type": "metaAndAssetCtxs"},
+                        priority=Priority.NORMAL, timeout=10,
                     )
-                    if meta_resp.status_code == 200:
-                        meta_data = meta_resp.json()
-                        if isinstance(meta_data, list) and len(meta_data) > 1:
-                            for asset_ctx in meta_data[1]:
-                                if isinstance(asset_ctx, dict) and asset_ctx.get("coin") == coin:
-                                    lcrs_features["funding_rate"] = float(asset_ctx.get("funding", 0))
-                                    lcrs_features["oi_change"] = float(asset_ctx.get("openInterest", 0)) * 0.01
-                                    break
+                    if isinstance(meta_data, list) and len(meta_data) > 1:
+                        for asset_ctx in meta_data[1]:
+                            if isinstance(asset_ctx, dict) and asset_ctx.get("coin") == coin:
+                                lcrs_features["funding_rate"] = float(asset_ctx.get("funding", 0))
+                                lcrs_features["oi_change"] = float(asset_ctx.get("openInterest", 0)) * 0.01
+                                break
                 except Exception:
                     pass
 
@@ -582,27 +643,25 @@ def _run_liquidation_scan(container, regime_data):
                                 "endTime": int(datetime.now(timezone.utc).timestamp() * 1000),
                             },
                         }
-                        resp = requests.post("https://api.hyperliquid.xyz/info", json=payload, timeout=10)
-                        if resp.status_code == 200:
-                            raw = resp.json()
-                            if isinstance(raw, list) and len(raw) >= 20:
-                                candles = [
-                                    {"open": float(c.get("o", 0)), "high": float(c.get("h", 0)),
-                                     "low": float(c.get("l", 0)), "close": float(c.get("c", 0)),
-                                     "volume": float(c.get("v", 0))} for c in raw
-                                ]
-                                feat = container.feature_engine.compute(coin, candles)
-                                lcrs_features.setdefault("rsi", feat.rsi)
-                                lcrs_features.setdefault("momentum_score", feat.momentum_score)
-                                lcrs_features.setdefault("trend_strength", feat.trend_strength)
-                                lcrs_features.setdefault("volatility", feat.volatility)
-                                lcrs_features.setdefault("volume_ratio", feat.volume_ratio)
-                                lcrs_features.setdefault("overall_score", feat.overall_score)
-                                lcrs_features.setdefault("bollinger_position", feat.bollinger_position)
-                                if len(candles) >= 8:
-                                    lcrs_features["price_change"] = (
-                                        (candles[-1]["close"] - candles[-8]["close"]) / candles[-8]["close"]
-                                    )
+                        raw = get_manager().post(payload=payload, priority=Priority.NORMAL, timeout=10)
+                        if isinstance(raw, list) and len(raw) >= 20:
+                            candles = [
+                                {"open": float(c.get("o", 0)), "high": float(c.get("h", 0)),
+                                 "low": float(c.get("l", 0)), "close": float(c.get("c", 0)),
+                                 "volume": float(c.get("v", 0))} for c in raw
+                            ]
+                            feat = container.feature_engine.compute(coin, candles)
+                            lcrs_features.setdefault("rsi", feat.rsi)
+                            lcrs_features.setdefault("momentum_score", feat.momentum_score)
+                            lcrs_features.setdefault("trend_strength", feat.trend_strength)
+                            lcrs_features.setdefault("volatility", feat.volatility)
+                            lcrs_features.setdefault("volume_ratio", feat.volume_ratio)
+                            lcrs_features.setdefault("overall_score", feat.overall_score)
+                            lcrs_features.setdefault("bollinger_position", feat.bollinger_position)
+                            if len(candles) >= 8:
+                                lcrs_features["price_change"] = (
+                                    (candles[-1]["close"] - candles[-8]["close"]) / candles[-8]["close"]
+                                )
                     except Exception:
                         pass
 
@@ -1050,7 +1109,7 @@ def _run_alpha_arena(container, regime_data):
         return
     logger.info("Phase 5: Alpha Arena")
     try:
-        import requests
+        from src.core.api_manager import get_manager, Priority
         arena_candles = None
         try:
             payload = {
@@ -1061,15 +1120,13 @@ def _run_alpha_arena(container, regime_data):
                     "endTime": int(datetime.now(timezone.utc).timestamp() * 1000),
                 },
             }
-            resp = requests.post("https://api.hyperliquid.xyz/info", json=payload, timeout=15)
-            if resp.status_code == 200:
-                raw = resp.json()
-                if isinstance(raw, list) and len(raw) >= 50:
-                    arena_candles = [
-                        {"open": float(c.get("o", 0)), "high": float(c.get("h", 0)),
-                         "low": float(c.get("l", 0)), "close": float(c.get("c", 0)),
-                         "volume": float(c.get("v", 0))} for c in raw
-                    ]
+            raw = get_manager().post(payload=payload, priority=Priority.LOW, timeout=15)
+            if isinstance(raw, list) and len(raw) >= 50:
+                arena_candles = [
+                    {"open": float(c.get("o", 0)), "high": float(c.get("h", 0)),
+                     "low": float(c.get("l", 0)), "close": float(c.get("c", 0)),
+                     "volume": float(c.get("v", 0))} for c in raw
+                ]
         except Exception:
             pass
 

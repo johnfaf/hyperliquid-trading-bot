@@ -2,9 +2,6 @@
 Unit tests for Kelly Criterion position sizing.
 """
 import pytest
-import sys
-import os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from src.signals.kelly_sizing import KellySizer, SizingResult
 
