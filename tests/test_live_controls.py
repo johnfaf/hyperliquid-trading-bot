@@ -76,6 +76,32 @@ def test_shadow_mode_allows_missing_rotation_threshold_envs(monkeypatch):
     boot.validate_operational_controls(logger)
 
 
+def test_default_rotation_controls_allow_built_in_thresholds(monkeypatch):
+    logger = logging.getLogger("test-live-default-thresholds")
+    monkeypatch.setattr(config, "ROTATION_ENGINE_ENABLED", True)
+    monkeypatch.setattr(config, "ROTATION_REQUIRE_EXPLICIT_THRESHOLDS", False)
+    monkeypatch.setattr(config, "ROTATION_DRY_RUN_TELEMETRY", False)
+
+    required = [
+        "PORTFOLIO_REPLACEMENT_THRESHOLD",
+        "PORTFOLIO_MAX_REPLACEMENTS_PER_CYCLE",
+        "PORTFOLIO_MAX_REPLACEMENTS_PER_HOUR",
+        "PORTFOLIO_MAX_REPLACEMENTS_PER_DAY",
+        "PORTFOLIO_FORCED_EXIT_COOLDOWN_MINUTES",
+        "PORTFOLIO_ROUND_TRIP_BLOCK_MINUTES",
+        "PORTFOLIO_MAX_COIN_EXPOSURE_PCT",
+        "PORTFOLIO_MAX_SIDE_EXPOSURE_PCT",
+        "PORTFOLIO_MAX_CLUSTER_EXPOSURE_PCT",
+        "PORTFOLIO_TRANSACTION_COST_WEIGHT",
+        "PORTFOLIO_CHURN_PENALTY",
+        "PORTFOLIO_EXPECTED_SLIPPAGE_BPS",
+    ]
+    for env_name in required:
+        monkeypatch.delenv(env_name, raising=False)
+
+    boot.validate_operational_controls(logger)
+
+
 def test_live_mode_still_requires_explicit_rotation_threshold_envs(monkeypatch):
     logger = logging.getLogger("test-live-thresholds")
     monkeypatch.setattr(config, "ROTATION_ENGINE_ENABLED", True)

@@ -203,7 +203,7 @@ ROTATION_DRY_RUN_TELEMETRY = os.environ.get(
 ).lower() in ("true", "1", "yes")
 ROTATION_SHADOW_MODE_DAYS = int(os.environ.get("ROTATION_SHADOW_MODE_DAYS", "0"))
 ROTATION_REQUIRE_EXPLICIT_THRESHOLDS = os.environ.get(
-    "ROTATION_REQUIRE_EXPLICIT_THRESHOLDS", "true"
+    "ROTATION_REQUIRE_EXPLICIT_THRESHOLDS", "false"
 ).lower() in ("true", "1", "yes")
 
 # ─── Decision Firewall ─────────────────────────────────────────

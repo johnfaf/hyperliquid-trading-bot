@@ -106,13 +106,17 @@ def validate_dependencies(logger: logging.Logger) -> None:
 
 def validate_operational_controls(logger: logging.Logger) -> None:
     """
-    Enforce explicit rotation thresholds before enabling rotation engine.
-    This prevents accidental live-ish operation on hidden defaults.
+    Validate rotation-engine operational controls at boot.
+
+    Built-in portfolio rotation defaults are now deliberate and validated in
+    config, so explicit env-only thresholds are optional by default.  Teams
+    that want stricter deployment discipline can still force env-provided
+    thresholds via ROTATION_REQUIRE_EXPLICIT_THRESHOLDS=true.
     """
     if not getattr(config, "ROTATION_ENGINE_ENABLED", False):
         return
     if not getattr(config, "ROTATION_REQUIRE_EXPLICIT_THRESHOLDS", True):
-        logger.warning("Rotation engine enabled without explicit-threshold enforcement.")
+        logger.info("Rotation engine enabled with built-in threshold defaults.")
         return
 
     required_envs = [
