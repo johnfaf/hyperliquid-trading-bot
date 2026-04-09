@@ -46,6 +46,17 @@ class PositionMonitor:
     """
 
     WS_URL = "wss://api.hyperliquid.xyz/ws"
+    _TRANSIENT_CLOSE_MARKERS = (
+        "inactive",
+        "goodbye",
+        "connection to remote host was lost",
+        "closed connection",
+        "connection reset",
+        "broken pipe",
+        "timed out",
+        "ping/pong timed out",
+        "no close frame",
+    )
 
     def __init__(self, max_signal_queue: int = 1000):
         """
@@ -249,7 +260,10 @@ class PositionMonitor:
                 )
                 self._ws.run_forever(ping_interval=20, ping_timeout=10)
             except Exception as e:
-                logger.error(f"WebSocket error: {e}")
+                if self._is_transient_ws_close_error(e):
+                    logger.info("PositionMonitor transport reconnect trigger: %s", e)
+                else:
+                    logger.error(f"WebSocket error: {e}")
 
             if self._running:
                 self._reconnect_count += 1
@@ -259,6 +273,14 @@ class PositionMonitor:
                 logger.info(f"PositionMonitor reconnecting in {wait:.1f}s "
                            f"(reconnect #{self._reconnect_count})")
                 time.sleep(wait)
+
+    @classmethod
+    def _is_transient_ws_close_error(cls, error) -> bool:
+        """Return True when a websocket close/error string is expected/transient."""
+        text = str(error or "").lower()
+        if not text:
+            return False
+        return any(marker in text for marker in cls._TRANSIENT_CLOSE_MARKERS)
 
     def _on_open(self, ws) -> None:
         """

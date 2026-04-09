@@ -99,3 +99,13 @@ def test_on_message_updates_transport_activity_on_non_json_frame(monkeypatch):
 
     assert monitor._last_msg_time == 130.0
     assert monitor._last_ws_activity_time == 130.0
+
+
+def test_transient_ws_close_error_detection_recognizes_inactive():
+    assert PositionMonitor._is_transient_ws_close_error(
+        "fin=1 opcode=8 data=b'\\x03\\xe8Inactive' - goodbye"
+    )
+
+
+def test_transient_ws_close_error_detection_rejects_generic_error():
+    assert not PositionMonitor._is_transient_ws_close_error("ssl cert verify failed")

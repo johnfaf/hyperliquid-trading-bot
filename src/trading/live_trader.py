@@ -1226,7 +1226,6 @@ class LiveTrader:
             for fill in fills:
                 fill_time = fill.get("time", "")
                 if isinstance(fill_time, (int, float)):
-                    from datetime import timezone
                     fill_date = datetime.fromtimestamp(
                         fill_time / 1000, tz=timezone.utc
                     ).strftime("%Y-%m-%d")
