@@ -153,10 +153,22 @@ python scripts/seed_and_replay.py              # Seed sample data + backtest
 python scripts/seed_and_replay.py --seed-only  # Just populate DB
 python scripts/seed_and_replay.py --sweep      # Seed + parameter sweep
 python scripts/diagnose_rejections.py          # Debug signal rejections
+python scripts/replay_decision_cycle.py        # Replay recent approve/reject outcomes
 python scripts/run_crash_monte_carlo.py        # Crash stress test
 python scripts/run_rotation_shadow_mode.py     # 7-day rotation shadow mode
 ```
 
+
+## Live Safety Hardening
+
+Recent live-readiness hardening adds explicit guardrails and observability:
+
+- **Canary controls:** optional caps on order size and daily signal count before full rollout.
+- **Per-source/day throttles:** firewall approvals and live entries can be capped by source.
+- **External kill switch:** live entries can be blocked instantly by env flag or a watched file.
+- **Runtime health snapshot:** dashboard/API exposes subsystem health, stale heartbeats, firewall rejection summary, and live kill-switch state.
+- **Rotation telemetry depth:** replacement decisions now capture candidate/incumbent scores, reasons, and post-close outcomes.
+- **Decision replay harness:** `scripts/replay_decision_cycle.py` summarizes approval/rejection reasons and execution attribution by source/regime.
 ## Signal Pipeline
 
 Signals flow through 6 layers before execution. Each layer can reject:
@@ -241,6 +253,11 @@ DISCOVERY_CYCLE_INTERVAL = 86400     # 24h  (env: DISCOVERY_CYCLE_INTERVAL)
 | `ENABLE_PREDICTIVE_FORECASTER` | `true` | Enable regime forecaster |
 | `ENABLE_XGBOOST_FORECASTER` | `true` | Enable ML regime model |
 | `LIVE_TRADING_ENABLED` | `false` | Explicitly enable real order submission; otherwise the live trader stays disabled/dry-run |
+| `LIVE_CANARY_MODE` | `false` | Enable live canary rollout guardrails |
+| `LIVE_CANARY_MAX_ORDER_USD` | `25` | Max order notional when canary mode is enabled |
+| `LIVE_CANARY_MAX_SIGNALS_PER_DAY` | `25` | Daily live entry cap when canary mode is enabled |
+| `LIVE_MAX_ORDERS_PER_SOURCE_PER_DAY` | `0` | Per-source daily live entry cap (`0` disables cap) |
+| `LIVE_EXTERNAL_KILL_SWITCH_FILE` | _(none)_ | Optional file path; truthy/non-empty file activates kill switch |
 | `HL_WALLET_MODE` | `agent_only` | Wallet mode; only agent-wallet signing is permitted |
 | `HL_PUBLIC_ADDRESS` | _(none)_ | Trading account address (master/vault) |
 | `HL_AGENT_PRIVATE_KEY` | _(none)_ | Agent wallet private key (only for `SECRET_MANAGER_PROVIDER=none`) |
@@ -254,6 +271,10 @@ DISCOVERY_CYCLE_INTERVAL = 86400     # 24h  (env: DISCOVERY_CYCLE_INTERVAL)
 | `ROTATION_ENGINE_ENABLED` | `false` | Enable rotation decision engine |
 | `ROTATION_DRY_RUN_TELEMETRY` | `true` | Shadow mode: simulate replacements and log telemetry only |
 | `ROTATION_SHADOW_MODE_DAYS` | `7` | Planned shadow window length for operations logging |
+| `FIREWALL_MAX_SIGNALS_PER_SOURCE_PER_DAY` | `0` | Per-source daily firewall pass cap (`0` disables cap) |
+| `FIREWALL_CANARY_MODE` | `false` | Enable firewall canary constraints |
+| `FIREWALL_CANARY_MAX_POSITIONS` | `2` | Max open positions enforced when firewall canary mode is on |
+| `POLYMARKET_MAX_MARKETS_PER_SCAN` | `100` | Hard cap of ranked markets processed each scan |
 | `ARKHAM_API_KEY` | _(none)_ | Optional: Arkham Intelligence API key |
 | `LOG_FORMAT` | `json` | Log format: `json` (production) or `text` (local) |
 
