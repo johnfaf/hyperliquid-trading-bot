@@ -169,7 +169,7 @@ class PolymarketScanner:
 
         # Scan configuration
         self.scan_interval_seconds = self.config.get("scan_interval_seconds", 60)
-        self.max_markets_per_scan = self.config.get("max_markets_per_scan", 100)
+        self.max_markets_per_scan = max(1, int(self.config.get("max_markets_per_scan", 100)))
         self.max_retries = int(self.config.get("max_retries", 3))
 
         # Per-host rate limiting for direct external API calls.
@@ -275,7 +275,8 @@ class PolymarketScanner:
         try:
             next_cursor = ""
             pages_fetched = 0
-            max_pages = 3  # Cap at 300 markets to stay within rate limits
+            # Fetch slightly more than the final cap so we can rank/filter.
+            max_pages = max(1, min(10, (self.max_markets_per_scan + 99) // 100 + 1))
 
             while pages_fetched < max_pages:
                 url = f"{self.CLOB_API}/markets?limit=100&active=true"
@@ -422,16 +423,40 @@ class PolymarketScanner:
                 logger.debug(f"Error parsing market: {e}")
                 continue
 
-        self._markets_tracked = len(enriched)
-        self._crypto_markets_found = crypto_count
+        # Filter low-liquidity noise before caching/processing.
+        filtered = [
+            market
+            for market in enriched
+            if market.volume_24h >= self.min_volume_threshold
+            and market.liquidity >= self.min_liquidity_threshold
+        ]
+        filtered.sort(
+            key=lambda market: (market.volume_24h, market.liquidity),
+            reverse=True,
+        )
+        capped = filtered[: self.max_markets_per_scan]
 
-        logger.info(f"Scanned {len(enriched)} total markets, "
-                   f"found {crypto_count} crypto-related markets")
+        self._markets_tracked = len(capped)
+        self._crypto_markets_found = sum(
+            1 for market in capped if self._is_crypto_market(market.title, market.description, market.category)
+        )
 
-        # Cache markets
-        self._market_cache = {m.market_id: m for m in enriched}
+        logger.info(
+            "Scanned %d raw markets, parsed %d, liquidity-filtered %d, capped to %d "
+            "(crypto in cap=%d, min_volume=$%.0f, min_liquidity=$%.0f)",
+            len(raw_markets),
+            len(enriched),
+            len(filtered),
+            len(capped),
+            self._crypto_markets_found,
+            self.min_volume_threshold,
+            self.min_liquidity_threshold,
+        )
 
-        return enriched
+        # Cache only markets that survive liquidity and top-N filters.
+        self._market_cache = {market.market_id: market for market in capped}
+
+        return capped
 
     def _is_crypto_market(self, title: str, description: str, category: str) -> bool:
         """Check if market is crypto-related."""

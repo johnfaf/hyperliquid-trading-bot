@@ -433,8 +433,11 @@ class PaperTrader:
             trade_signal = candidate["trade_signal"]
             sig = candidate["signal"]
             victim = None
+            closed_victim_event = None
             candidate_open_positions = open_trades
             decision_reason = ""
+            decision_candidate_score = None
+            decision_incumbent_score = None
             forced_victim_id = sig.get("existing_strategy_trade_id")
 
             if forced_victim_id is not None:
@@ -468,6 +471,8 @@ class PaperTrader:
                     regime_data=regime_data,
                     replacements_used=replacements_used,
                 )
+                decision_candidate_score = decision.candidate_score
+                decision_incumbent_score = decision.incumbent_score
                 shadow_bypass_open = (
                     shadow_mode
                     and self.rotation_manager.should_bypass_reject_in_shadow_mode(
@@ -581,6 +586,7 @@ class PaperTrader:
                     )
                     _drop_counts["rotation_victim_close_failed"] = _drop_counts.get("rotation_victim_close_failed", 0) + 1
                     continue
+                closed_victim_event = closed_victim
                 # Remove closed victim from working position list immediately so
                 # subsequent firewall checks in this batch don't double-count it.
                 open_trades = [t for t in open_trades if t.get("id") != victim.get("id")]
@@ -599,6 +605,11 @@ class PaperTrader:
                         replaced_trade=victim,
                         new_coin=sig.get("coin", ""),
                         new_side=sig.get("side", ""),
+                        candidate_score=decision_candidate_score,
+                        incumbent_score=decision_incumbent_score,
+                        reason=decision_reason,
+                        new_trade_id=trade.get("id"),
+                        closed_trade_event=closed_victim_event,
                     )
                     logger.info(
                         "Rotation replaced %s with %s (%s)",
@@ -1116,6 +1127,11 @@ class PaperTrader:
             "opened_at": trade.get("opened_at", ""),
             "closed_at": datetime.now(timezone.utc).isoformat(),
         }
+        try:
+            if self.rotation_manager:
+                self.rotation_manager.record_trade_close(closed_event)
+        except Exception:
+            pass
         self._closed_events.append(closed_event)
         return closed_event
 

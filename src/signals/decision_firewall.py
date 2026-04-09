@@ -17,11 +17,11 @@ Flow: Signal Source → TradeSignal → DecisionFirewall → Execution
 import logging
 import threading
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import List, Dict, Optional, Tuple
 from collections import defaultdict
 
-from src.signals.signal_schema import TradeSignal, SignalStrength
+from src.signals.signal_schema import TradeSignal
 from src.data import database as db
 
 # Optional: predictive regime forecaster for dynamic de-risking
@@ -56,10 +56,17 @@ class DecisionFirewall:
         # strategy DB has 50+ scored strategies with >10 trades each.
         self.min_confidence = cfg.get("min_confidence", 0.15)
         self.min_source_accuracy = cfg.get("min_source_accuracy", 0.0)  # 0 = no filter
+        self.max_signals_per_source_per_day = int(
+            cfg.get("max_signals_per_source_per_day", 0)
+        )
+        self.canary_mode = bool(cfg.get("canary_mode", False))
+        self.canary_max_positions = max(1, int(cfg.get("canary_max_positions", 2)))
         # Lowered from 300 → 60: 5-minute cooldown was blocking re-entries
         # during paper trading when signals fire frequently on the same coin.
         self.cooldown_seconds = cfg.get("cooldown_seconds", 60)
         self.daily_loss_limit_pct = cfg.get("daily_loss_limit_pct", 0.03)
+        if self.canary_mode:
+            self.max_positions = min(self.max_positions, self.canary_max_positions)
 
         # Portfolio-level aggregate exposure limit
         # With 2000 traders scanned and golden wallets auto-connected,
@@ -103,6 +110,7 @@ class DecisionFirewall:
         self._recent_trades: Dict[str, float] = {}  # coin -> last trade timestamp
         self._daily_losses: float = 0.0
         self._daily_reset_date: str = ""
+        self._source_signal_counts: Dict[str, int] = defaultdict(int)
 
         # Stats
         self.stats = {
@@ -115,6 +123,7 @@ class DecisionFirewall:
             "rejected_conflict": 0,
             "rejected_cooldown": 0,
             "rejected_accuracy": 0,
+            "rejected_source_cap": 0,
             "rejected_drawdown": 0,
             "rejected_exposure": 0,
             "rejected_funding": 0,
@@ -123,8 +132,22 @@ class DecisionFirewall:
             "audit_log_failures": 0,
         }
 
-        logger.info(f"DecisionFirewall initialized: max_risk={self.max_risk_per_trade:.0%}/trade, "
-                    f"max_positions={self.max_positions}, min_confidence={self.min_confidence:.0%}")
+        logger.info(
+            "DecisionFirewall initialized: max_risk=%s/trade, max_positions=%d, "
+            "min_confidence=%s, canary_mode=%s",
+            f"{self.max_risk_per_trade:.0%}",
+            self.max_positions,
+            f"{self.min_confidence:.0%}",
+            self.canary_mode,
+        )
+
+    @staticmethod
+    def _source_key(signal: TradeSignal) -> str:
+        source = getattr(signal, "source", None)
+        if hasattr(source, "value"):
+            source = source.value
+        key = str(source or "unknown").strip().lower()
+        return key or "unknown"
 
     def validate(self, signal: TradeSignal, regime_data: Optional[Dict] = None,
                  open_positions: Optional[List[Dict]] = None,
@@ -182,6 +205,18 @@ class DecisionFirewall:
         if signal.confidence < self.min_confidence:
             return _reject("rejected_confidence",
                           f"Low confidence {signal.confidence:.0%} < {self.min_confidence:.0%}")
+
+        # 2b. Per-source/day throughput cap (approved signals).
+        self._check_daily_reset()
+        source_key = self._source_key(signal)
+        if self.max_signals_per_source_per_day > 0:
+            used = self._source_signal_counts.get(source_key, 0)
+            if used >= self.max_signals_per_source_per_day:
+                return _reject(
+                    "rejected_source_cap",
+                    f"Source/day cap hit for {source_key} "
+                    f"({used}/{self.max_signals_per_source_per_day})",
+                )
 
         # 3. Leverage check
         if signal.leverage > self.max_leverage:
@@ -320,6 +355,8 @@ class DecisionFirewall:
         if not dry_run:
             self.stats["passed"] += 1
             self._recent_trades[signal.coin] = now
+            if self.max_signals_per_source_per_day > 0:
+                self._source_signal_counts[source_key] += 1
 
             # Audit trail: record approval
             try:
@@ -424,6 +461,7 @@ class DecisionFirewall:
         if today != self._daily_reset_date:
             self._daily_reset_date = today
             self._daily_losses = 0.0
+            self._source_signal_counts.clear()
 
     def get_stats(self) -> Dict:
         """Return firewall statistics."""
@@ -436,4 +474,7 @@ class DecisionFirewall:
                 [(k, v) for k, v in self.stats.items() if k.startswith("rejected_")],
                 key=lambda x: x[1], default=("none", 0)
             )[0],
+            "canary_mode": self.canary_mode,
+            "max_signals_per_source_per_day": int(self.max_signals_per_source_per_day),
+            "source_signal_counts": dict(self._source_signal_counts),
         }

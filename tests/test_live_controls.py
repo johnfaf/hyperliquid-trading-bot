@@ -2390,3 +2390,148 @@ def test_load_asset_index_map_captures_sz_decimals(monkeypatch):
     assert trader.sz_decimals_map["BTC"] == 5
     assert trader.sz_decimals_map["ETH"] == 4
     assert trader.sz_decimals_map["HYPE"] == 2
+
+
+def test_live_trader_external_kill_switch_env_blocks_entries(monkeypatch):
+    class FakeFirewall:
+        def validate(self, signal, **kwargs):
+            return True, "ok"
+
+    monkeypatch.setenv("LIVE_EXTERNAL_KILL_SWITCH", "1")
+    monkeypatch.setattr(LiveTrader, "_load_credentials", _fake_live_credentials)
+    monkeypatch.setattr(LiveTrader, "_load_asset_index_map", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "reconcile_positions", lambda self: None)
+
+    trader = LiveTrader(firewall=FakeFirewall(), dry_run=False, max_order_usd=1_000_000)
+    result = trader.execute_signal(
+        {
+            "coin": "ETH",
+            "side": "long",
+            "confidence": 0.8,
+            "entry_price": 2000.0,
+            "position_pct": 0.05,
+            "leverage": 2,
+            "size": 0.1,
+            "source": "copy_trade",
+        },
+        bypass_firewall=True,
+    )
+
+    assert result is None
+    stats = trader.get_stats()
+    assert stats["kill_switch_active"] is True
+    assert stats["kill_switch_reason"] == "env:LIVE_EXTERNAL_KILL_SWITCH"
+
+
+def test_live_trader_source_day_cap_blocks_second_entry(monkeypatch):
+    class FakeFirewall:
+        def validate(self, signal, **kwargs):
+            return True, "ok"
+
+    monkeypatch.delenv("LIVE_EXTERNAL_KILL_SWITCH", raising=False)
+    monkeypatch.setattr(config, "LIVE_MAX_ORDERS_PER_SOURCE_PER_DAY", 1)
+    monkeypatch.setattr(config, "LIVE_CANARY_MODE", False)
+    monkeypatch.setattr(LiveTrader, "_load_credentials", _fake_live_credentials)
+    monkeypatch.setattr(LiveTrader, "_load_asset_index_map", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "reconcile_positions", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "get_firewall_positions", lambda self: [])
+    monkeypatch.setattr(LiveTrader, "get_account_value", lambda self: 2500.0)
+    monkeypatch.setattr(LiveTrader, "place_market_order", lambda self, *args, **kwargs: {"status": "success"})
+    monkeypatch.setattr(LiveTrader, "update_daily_pnl_from_fills", lambda self: None)
+    monkeypatch.setattr(
+        LiveTrader,
+        "verify_fill",
+        lambda self, *args, **kwargs: {"status": "verified", "size": 0.1},
+    )
+    monkeypatch.setattr(LiveTrader, "_get_mid_price", lambda self, coin: 2000.0)
+    monkeypatch.setattr(LiveTrader, "place_trigger_order", lambda self, *args, **kwargs: {"status": "success"})
+
+    trader = LiveTrader(firewall=FakeFirewall(), dry_run=False, max_order_usd=1_000_000)
+    first = trader.execute_signal(
+        {
+            "coin": "ETH",
+            "side": "long",
+            "confidence": 0.8,
+            "entry_price": 2000.0,
+            "position_pct": 0.05,
+            "leverage": 2,
+            "size": 0.1,
+            "source": "copy_trade",
+        }
+    )
+    second = trader.execute_signal(
+        {
+            "coin": "BTC",
+            "side": "long",
+            "confidence": 0.8,
+            "entry_price": 60000.0,
+            "position_pct": 0.05,
+            "leverage": 2,
+            "size": 0.003,
+            "source": "copy_trade",
+        }
+    )
+
+    assert first is not None and first["status"] == "success"
+    assert second is None
+    stats = trader.get_stats()
+    assert stats["source_orders_today"]["copy_trade"] == 1
+    assert stats["max_orders_per_source_per_day"] == 1
+
+
+def test_live_trader_canary_signal_cap_blocks_after_limit(monkeypatch):
+    class FakeFirewall:
+        def validate(self, signal, **kwargs):
+            return True, "ok"
+
+    monkeypatch.delenv("LIVE_EXTERNAL_KILL_SWITCH", raising=False)
+    monkeypatch.setattr(config, "LIVE_CANARY_MODE", True)
+    monkeypatch.setattr(config, "LIVE_CANARY_MAX_SIGNALS_PER_DAY", 1)
+    monkeypatch.setattr(config, "LIVE_CANARY_MAX_ORDER_USD", 25.0)
+    monkeypatch.setattr(config, "LIVE_MAX_ORDERS_PER_SOURCE_PER_DAY", 0)
+    monkeypatch.setattr(LiveTrader, "_load_credentials", _fake_live_credentials)
+    monkeypatch.setattr(LiveTrader, "_load_asset_index_map", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "reconcile_positions", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "get_firewall_positions", lambda self: [])
+    monkeypatch.setattr(LiveTrader, "get_account_value", lambda self: 2500.0)
+    monkeypatch.setattr(LiveTrader, "place_market_order", lambda self, *args, **kwargs: {"status": "success"})
+    monkeypatch.setattr(LiveTrader, "update_daily_pnl_from_fills", lambda self: None)
+    monkeypatch.setattr(
+        LiveTrader,
+        "verify_fill",
+        lambda self, *args, **kwargs: {"status": "verified", "size": 0.01},
+    )
+    monkeypatch.setattr(LiveTrader, "_get_mid_price", lambda self, coin: 2000.0)
+    monkeypatch.setattr(LiveTrader, "place_trigger_order", lambda self, *args, **kwargs: {"status": "success"})
+
+    trader = LiveTrader(firewall=FakeFirewall(), dry_run=False, max_order_usd=1_000_000)
+    first = trader.execute_signal(
+        {
+            "coin": "ETH",
+            "side": "long",
+            "confidence": 0.8,
+            "entry_price": 2000.0,
+            "position_pct": 0.05,
+            "leverage": 2,
+            "size": 0.1,
+            "source": "copy_trade",
+        }
+    )
+    second = trader.execute_signal(
+        {
+            "coin": "BTC",
+            "side": "long",
+            "confidence": 0.8,
+            "entry_price": 60000.0,
+            "position_pct": 0.05,
+            "leverage": 2,
+            "size": 0.003,
+            "source": "golden_wallet",
+        }
+    )
+
+    assert first is not None and first["status"] == "success"
+    assert second is None
+    stats = trader.get_stats()
+    assert stats["canary_mode"] is True
+    assert stats["total_entry_signals_today"] == 1

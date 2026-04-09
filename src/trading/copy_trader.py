@@ -472,6 +472,11 @@ class CopyTrader:
                         replaced_trade=victim,
                         new_coin=signal.get("coin", ""),
                         new_side=signal.get("side", ""),
+                        candidate_score=decision.candidate_score,
+                        incumbent_score=decision.incumbent_score,
+                        reason=decision.reason,
+                        new_trade_id=trade.get("id"),
+                        closed_trade_event=closed_trade,
                     )
                     logger.info(
                         "  Rotation replaced %s with copy %s (%s)",
@@ -770,6 +775,11 @@ class CopyTrader:
             "opened_at": trade.get("opened_at", ""),
             "closed_at": datetime.now(timezone.utc).isoformat(),
         }
+        try:
+            if self.rotation_manager:
+                self.rotation_manager.record_trade_close(closed_event)
+        except Exception:
+            pass
         self._closed_events.append(closed_event)
         return closed_event
 

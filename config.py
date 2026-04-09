@@ -135,6 +135,15 @@ LIVE_MIN_ORDER_USD = float(os.environ.get("LIVE_MIN_ORDER_USD", 11.0))
 LIVE_MAX_ORDER_USD = float(os.environ.get("LIVE_MAX_ORDER_USD", 100.0))
 # Daily loss limit for the live account in USD (forwarded to LiveTrader).
 LIVE_MAX_DAILY_LOSS_USD = float(os.environ.get("LIVE_MAX_DAILY_LOSS_USD", 100.0))
+LIVE_CANARY_MODE = os.environ.get(
+    "LIVE_CANARY_MODE", "false"
+).lower() in ("true", "1", "yes")
+LIVE_CANARY_MAX_ORDER_USD = float(os.environ.get("LIVE_CANARY_MAX_ORDER_USD", 25.0))
+LIVE_CANARY_MAX_SIGNALS_PER_DAY = int(os.environ.get("LIVE_CANARY_MAX_SIGNALS_PER_DAY", 25))
+LIVE_MAX_ORDERS_PER_SOURCE_PER_DAY = int(
+    os.environ.get("LIVE_MAX_ORDERS_PER_SOURCE_PER_DAY", 0)
+)
+LIVE_EXTERNAL_KILL_SWITCH_FILE = os.environ.get("LIVE_EXTERNAL_KILL_SWITCH_FILE", "").strip()
 HL_WALLET_MODE = os.environ.get("HL_WALLET_MODE", "agent_only").strip().lower()
 SECRET_MANAGER_PROVIDER = os.environ.get(
     "SECRET_MANAGER_PROVIDER", "none"
@@ -211,6 +220,15 @@ ROTATION_REQUIRE_EXPLICIT_THRESHOLDS = os.environ.get(
 # 0.15 (15%) is far too permissive — nearly any signal passes.
 # Raise to 0.45+ to ensure only well-confirmed signals are traded.
 FIREWALL_MIN_CONFIDENCE = float(os.environ.get("FIREWALL_MIN_CONFIDENCE", 0.45))
+FIREWALL_MAX_SIGNALS_PER_SOURCE_PER_DAY = int(
+    os.environ.get("FIREWALL_MAX_SIGNALS_PER_SOURCE_PER_DAY", 0)
+)
+FIREWALL_CANARY_MODE = os.environ.get(
+    "FIREWALL_CANARY_MODE", "false"
+).lower() in ("true", "1", "yes")
+FIREWALL_CANARY_MAX_POSITIONS = int(
+    os.environ.get("FIREWALL_CANARY_MAX_POSITIONS", 2)
+)
 
 # ─── Scheduling ────────────────────────────────────────────────
 # 3-tier scheduling:
@@ -269,6 +287,9 @@ FUNDING_POSITIVE_THRESHOLD = float(os.environ.get("FUNDING_POSITIVE_THRESHOLD", 
 POLYMARKET_ENABLED = os.environ.get("POLYMARKET_ENABLED", "true").lower() in ("true", "1", "yes")
 POLYMARKET_SCAN_INTERVAL = int(os.environ.get("POLYMARKET_SCAN_INTERVAL", 180))  # 3 minutes
 POLYMARKET_MIN_VOLUME = float(os.environ.get("POLYMARKET_MIN_VOLUME", 10000))    # $10k min volume
+POLYMARKET_MAX_MARKETS_PER_SCAN = int(
+    os.environ.get("POLYMARKET_MAX_MARKETS_PER_SCAN", 100)
+)
 
 # ─── Options Flow Integration ───────────────────────────────
 OPTIONS_FLOW_ENABLED = os.environ.get("OPTIONS_FLOW_ENABLED", "true").lower() in ("true", "1", "yes")
@@ -346,9 +367,12 @@ def _validate_config_bounds() -> None:
         ("PORTFOLIO_MAX_SIDE_EXPOSURE_PCT", 0.0, 1.0, 0.65),
         ("PORTFOLIO_MAX_CLUSTER_EXPOSURE_PCT", 0.0, 1.0, 0.55),
         ("FIREWALL_MIN_CONFIDENCE", 0.0, 1.0, 0.45),
+        ("FIREWALL_MAX_SIGNALS_PER_SOURCE_PER_DAY", 0, 100_000, 0),
+        ("FIREWALL_CANARY_MAX_POSITIONS", 1, 100, 2),
         ("TRADING_CYCLE_INTERVAL", 10, 86_400, 900),
         ("DISCOVERY_CYCLE_INTERVAL", 60, 2_592_000, 86400),
         ("POLYMARKET_SCAN_INTERVAL", 10, 3600, 180),
+        ("POLYMARKET_MAX_MARKETS_PER_SCAN", 10, 10_000, 100),
         ("OPTIONS_FLOW_SCAN_INTERVAL", 10, 3600, 120),
         ("FORECASTER_EXTERNAL_DATA_TTL", 10, 86_400, 600),
         ("ARENA_CHAMPION_MIN_FITNESS", 0.0, 1.0, 0.15),
@@ -374,6 +398,9 @@ def _validate_config_bounds() -> None:
         ("FUNDING_NEGATIVE_THRESHOLD", -1.0, 0.0, -0.001),
         ("FUNDING_POSITIVE_THRESHOLD", 0.0, 1.0, 0.003),
         ("POLYMARKET_MIN_VOLUME", 0.0, 1e9, 10_000.0),
+        ("LIVE_CANARY_MAX_ORDER_USD", 10.0, 1_000_000.0, 25.0),
+        ("LIVE_CANARY_MAX_SIGNALS_PER_DAY", 1, 100_000, 25),
+        ("LIVE_MAX_ORDERS_PER_SOURCE_PER_DAY", 0, 100_000, 0),
         ("VAULT_KV_VERSION", 1, 2, 2),
     ]
     for name, min_value, max_value, fallback in rules:

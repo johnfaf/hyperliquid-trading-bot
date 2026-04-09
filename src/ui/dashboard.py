@@ -259,6 +259,7 @@ _signal_processor = None
 _arena_incubator = None
 _decision_engine = None
 _multi_scanner = None
+_health_registry = None
 
 # Module-level live trader reference for closing positions on exchange
 _live_trader = None
@@ -373,12 +374,13 @@ def set_v2_components(firewall=None, regime_detector=None, arena=None,
                        kelly_sizer=None, trade_memory=None, calibration=None,
                        llm_filter=None, liquidation_strategy=None,
                        signal_processor=None, arena_incubator=None,
-                       decision_engine=None, multi_scanner=None):
+                       decision_engine=None, multi_scanner=None,
+                       health_registry=None):
     """Set V2 + V2.5 + V3 + V4 component references for dashboard metrics."""
     global _firewall, _regime_detector, _arena  # noqa: PLW0603
     global _kelly_sizer, _trade_memory, _calibration, _llm_filter, _liquidation_strategy  # noqa
     global _signal_processor, _arena_incubator, _decision_engine  # noqa
-    global _multi_scanner  # noqa
+    global _multi_scanner, _health_registry  # noqa
     _firewall = firewall
     _regime_detector = regime_detector
     _arena = arena
@@ -391,6 +393,99 @@ def set_v2_components(firewall=None, regime_detector=None, arena=None,
     _arena_incubator = arena_incubator
     _decision_engine = decision_engine
     _multi_scanner = multi_scanner
+    _health_registry = health_registry
+
+
+def _build_runtime_health_snapshot() -> Dict:
+    """Build a compact runtime health payload for dashboard/API consumers."""
+    now = datetime.now(timezone.utc)
+    snapshot: Dict[str, object] = {
+        "timestamp": now.isoformat(),
+        "overall": "unknown",
+        "all_trading_safe": None,
+        "subsystem_counts": {},
+        "stale_subsystems": [],
+        "at_risk_subsystems": [],
+        "subsystems": {},
+    }
+    stale_timeout_s = max(
+        30,
+        int(os.environ.get("DASHBOARD_HEALTH_STALE_SECONDS", "600")),
+    )
+
+    try:
+        if _health_registry:
+            statuses = _health_registry.get_all()
+            state_counts: Dict[str, int] = {}
+            stale_names = []
+            at_risk = []
+            subsystem_map = {}
+            for name, status in statuses.items():
+                state = status.state.value
+                state_counts[state] = state_counts.get(state, 0) + 1
+
+                heartbeat_age_s = None
+                if status.last_heartbeat:
+                    heartbeat_age_s = (now - status.last_heartbeat).total_seconds()
+                    if heartbeat_age_s > stale_timeout_s:
+                        stale_names.append(name)
+
+                if state in {"FAILED", "DEGRADED"}:
+                    at_risk.append(name)
+
+                subsystem_map[name] = {
+                    "state": state,
+                    "reason": status.reason,
+                    "dependency_ready": bool(status.dependency_ready),
+                    "affects_trading": bool(status.affects_trading),
+                    "heartbeat_age_s": round(heartbeat_age_s, 1)
+                    if heartbeat_age_s is not None
+                    else None,
+                }
+
+            all_safe = bool(_health_registry.is_all_trading_safe())
+            overall = "ok" if all_safe and not at_risk else "at_risk"
+            snapshot.update(
+                {
+                    "overall": overall,
+                    "all_trading_safe": all_safe,
+                    "subsystem_counts": state_counts,
+                    "stale_subsystems": stale_names,
+                    "at_risk_subsystems": at_risk,
+                    "subsystems": subsystem_map,
+                }
+            )
+    except Exception as exc:
+        snapshot["error"] = f"health_registry_unavailable: {exc}"
+
+    try:
+        if _firewall:
+            fw = _firewall.get_stats()
+            snapshot["firewall"] = {
+                "total_signals": int(fw.get("total_signals", 0) or 0),
+                "passed": int(fw.get("passed", 0) or 0),
+                "top_rejection_reason": fw.get("top_rejection_reason", "none"),
+                "daily_losses": float(fw.get("daily_losses", 0.0) or 0.0),
+            }
+    except Exception:
+        pass
+
+    try:
+        if _live_trader:
+            stats = _live_trader.get_stats()
+            snapshot["live_trader"] = {
+                "kill_switch_active": bool(stats.get("kill_switch_active", False)),
+                "kill_switch_reason": stats.get("kill_switch_reason"),
+                "canary_mode": bool(stats.get("canary_mode", False)),
+                "max_order_usd": stats.get("max_order_usd"),
+                "daily_pnl": stats.get("daily_pnl"),
+                "daily_pnl_limit": stats.get("daily_pnl_limit"),
+                "entry_signals_today": stats.get("total_entry_signals_today"),
+            }
+    except Exception:
+        pass
+
+    return snapshot
 
 
 DASHBOARD_HTML = """<!DOCTYPE html>
@@ -528,6 +623,12 @@ canvas{width:100%!important;height:200px!important}
 
 <h2>Per-Coin Regime</h2>
 <div id="regime-grid" class="grid"></div>
+</div>
+
+<div class="section" style="border-top:2px solid #38bdf8;padding-top:16px;margin-top:24px">
+<h2 style="color:#38bdf8">Runtime Health</h2>
+<div class="grid" id="runtime-cards"></div>
+<div id="runtime-health-detail" style="font-size:0.85em;color:#7b8ab8;margin-top:10px">Loading runtime health…</div>
 </div>
 
 <div class="section" style="border-top:2px solid #ff6b35;padding-top:16px;margin-top:24px">
@@ -819,6 +920,7 @@ async function refresh(){
     renderTypeChart(d.type_distribution);
     renderLogs(d.research_logs);
     if(d.v2) renderV2(d.v2);
+    if(d.runtime_health) renderRuntimeHealth(d.runtime_health);
     if(d.v2 && d.v2.arena) renderArena(d.v2.arena);
   } catch(e) {
     console.error('Refresh error:', e);
@@ -876,6 +978,38 @@ function renderV2(v2) {
       <div class="sub">ADX: ${r.adx} | ATR: ${(r.atr_pct*100).toFixed(1)}% | Conf: ${(r.confidence*100).toFixed(0)}%</div>
     </div>`;
   }).join('') : '<div style="color:#555;grid-column:1/-1">Regime data available after first full cycle</div>';
+}
+
+function renderRuntimeHealth(runtime) {
+  const counts = runtime.subsystem_counts || {};
+  const staleCount = (runtime.stale_subsystems || []).length;
+  const atRiskCount = (runtime.at_risk_subsystems || []).length;
+  const live = runtime.live_trader || {};
+  const fw = runtime.firewall || {};
+
+  const cards = [
+    {label:'Overall', value:(runtime.overall || 'unknown').toUpperCase(), cls: runtime.overall === 'ok' ? 'green' : 'red'},
+    {label:'Trading Safe', value: runtime.all_trading_safe === true ? 'YES' : runtime.all_trading_safe === false ? 'NO' : 'N/A', cls: runtime.all_trading_safe ? 'green' : 'yellow'},
+    {label:'At-Risk Subsystems', value: atRiskCount, cls: atRiskCount > 0 ? 'red' : 'green'},
+    {label:'Stale Heartbeats', value: staleCount, cls: staleCount > 0 ? 'yellow' : 'green'},
+    {label:'Failed', value: counts.FAILED || 0, cls: (counts.FAILED || 0) > 0 ? 'red' : 'green'},
+    {label:'Degraded', value: counts.DEGRADED || 0, cls: (counts.DEGRADED || 0) > 0 ? 'yellow' : 'green'},
+    {label:'Firewall Rejections', value: Math.max((fw.total_signals || 0) - (fw.passed || 0), 0), cls:'yellow'},
+    {label:'Kill Switch', value: live.kill_switch_active ? 'ON' : 'OFF', cls: live.kill_switch_active ? 'red' : 'green'},
+  ];
+  document.getElementById('runtime-cards').innerHTML = cards.map(c=>`
+    <div class="card"><div class="label">${c.label}</div>
+    <div class="value ${c.cls||''}">${c.value}</div></div>`).join('');
+
+  const atRiskList = (runtime.at_risk_subsystems || []).slice(0, 8).join(', ') || 'none';
+  const staleList = (runtime.stale_subsystems || []).slice(0, 8).join(', ') || 'none';
+  const killReason = live.kill_switch_reason ? `<span class="red">${live.kill_switch_reason}</span>` : 'none';
+  const topReject = fw.top_rejection_reason || 'none';
+  document.getElementById('runtime-health-detail').innerHTML =
+    `<div>At-risk: <strong>${atRiskList}</strong></div>` +
+    `<div>Stale: <strong>${staleList}</strong></div>` +
+    `<div>Firewall top reject: <strong>${topReject}</strong></div>` +
+    `<div>Kill-switch reason: ${killReason}</div>`;
 }
 
 function renderArena(arena) {
@@ -1086,6 +1220,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 if v25:
                     data["v25"] = v25
 
+                data["runtime_health"] = _build_runtime_health_snapshot()
                 self._json_response(data)
             except Exception as e:
                 self._json_response({"error": str(e)}, code=500)

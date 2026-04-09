@@ -12,7 +12,7 @@ import json
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import config
 
@@ -158,7 +158,10 @@ class PortfolioRotationManager:
             "replacement_count": 0,
             "estimated_churn_cost": 0.0,
             "rejection_reasons": {},
+            "replacement_events": [],
         }
+        self._replacement_outcome_by_trade_id: Dict[int, Dict[str, Any]] = {}
+        self._replacement_event_cap = 200
         self._cluster_map = {
             "majors": {"BTC", "ETH"},
             "l1": {"SOL", "AVAX", "APT", "SUI", "INJ", "SEI"},
@@ -375,6 +378,12 @@ class PortfolioRotationManager:
         replaced_trade: Dict,
         new_coin: str,
         new_side: str,
+        *,
+        candidate_score: Optional[float] = None,
+        incumbent_score: Optional[float] = None,
+        reason: str = "",
+        new_trade_id: Optional[int] = None,
+        closed_trade_event: Optional[Dict] = None,
     ) -> None:
         """Track replacement event for hourly/day caps and cooldown guardrails."""
         now = datetime.now(timezone.utc)
@@ -397,7 +406,64 @@ class PortfolioRotationManager:
         self._telemetry["replacement_count"] += 1
         churn_cost = self._replacement_threshold_with_costs(replaced_trade, type("S", (), {"coin": new_coin, "side": new_side})())
         self._telemetry["estimated_churn_cost"] += float(max(churn_cost, 0.0))
+
+        event: Dict[str, Any] = {
+            "timestamp": now.isoformat(),
+            "replaced_trade_id": replaced_trade.get("id"),
+            "replaced_coin": coin,
+            "replaced_side": side,
+            "new_coin": str(new_coin or "").upper(),
+            "new_side": self._side_value(new_side),
+            "reason": str(reason or ""),
+            "candidate_score": float(candidate_score) if candidate_score is not None else None,
+            "incumbent_score": float(incumbent_score) if incumbent_score is not None else None,
+            "estimated_churn_cost": round(float(max(churn_cost, 0.0)), 6),
+            "new_trade_id": int(new_trade_id) if new_trade_id is not None else None,
+            "victim_realized_pnl": None,
+        }
+        if closed_trade_event:
+            event["victim_realized_pnl"] = float(closed_trade_event.get("pnl", 0.0) or 0.0)
+            event["victim_closed_at"] = closed_trade_event.get("closed_at")
+        self._telemetry["replacement_events"].append(event)
+        if new_trade_id is not None:
+            self._replacement_outcome_by_trade_id[int(new_trade_id)] = event
+        self._trim_replacement_events()
         self._cleanup_guardrail_state(now)
+
+    def record_trade_close(self, closed_trade: Dict) -> None:
+        """
+        Attach realized outcomes to prior replacement events once the replacement
+        trade eventually closes.
+        """
+        try:
+            trade_id = int(closed_trade.get("trade_id"))
+        except (TypeError, ValueError):
+            return
+        event = self._replacement_outcome_by_trade_id.pop(trade_id, None)
+        if not event:
+            return
+
+        pnl = float(closed_trade.get("pnl", 0.0) or 0.0)
+        event["replacement_realized_pnl"] = pnl
+        event["replacement_closed_at"] = closed_trade.get("closed_at")
+        event["replacement_outcome"] = "win" if pnl > 0 else "loss" if pnl < 0 else "flat"
+
+        opened_at = closed_trade.get("opened_at")
+        closed_at = closed_trade.get("closed_at")
+        hold_minutes = None
+        try:
+            if opened_at and closed_at:
+                opened_ts = datetime.fromisoformat(str(opened_at).replace("Z", "+00:00"))
+                closed_ts = datetime.fromisoformat(str(closed_at).replace("Z", "+00:00"))
+                if opened_ts.tzinfo is None:
+                    opened_ts = opened_ts.replace(tzinfo=timezone.utc)
+                if closed_ts.tzinfo is None:
+                    closed_ts = closed_ts.replace(tzinfo=timezone.utc)
+                hold_minutes = max((closed_ts - opened_ts).total_seconds() / 60.0, 0.0)
+        except Exception:
+            hold_minutes = None
+        if hold_minutes is not None:
+            event["replacement_hold_minutes"] = round(float(hold_minutes), 2)
 
     def record_dry_run_replacement_skip(
         self,
@@ -429,6 +495,10 @@ class PortfolioRotationManager:
 
     def get_stats(self) -> Dict:
         """Expose rotation telemetry for dashboards and reports."""
+        events = list(self._telemetry["replacement_events"])
+        completed = [event for event in events if event.get("replacement_outcome")]
+        wins = sum(1 for event in completed if event.get("replacement_outcome") == "win")
+        win_rate = (wins / len(completed)) if completed else 0.0
         return {
             "decisions": int(self._telemetry["decisions"]),
             "open": int(self._telemetry["open"]),
@@ -439,6 +509,9 @@ class PortfolioRotationManager:
             "rejection_reasons": dict(self._telemetry["rejection_reasons"]),
             "replacements_last_hour": self._count_recent_replacements(hours=1),
             "replacements_last_day": self._count_recent_replacements(hours=24),
+            "replacement_outcomes_recorded": len(completed),
+            "replacement_outcome_win_rate": round(float(win_rate), 4),
+            "replacement_events": events[-20:],
         }
 
     def is_high_conviction(self, score: float) -> bool:
@@ -699,6 +772,21 @@ class PortfolioRotationManager:
             reasons = self._telemetry["rejection_reasons"]
             key = str(decision.reason or "unknown_reject")
             reasons[key] = reasons.get(key, 0) + 1
+
+    def _trim_replacement_events(self) -> None:
+        events = self._telemetry["replacement_events"]
+        if len(events) <= self._replacement_event_cap:
+            return
+        keep = events[-self._replacement_event_cap :]
+        keep_ids = {id(event) for event in keep}
+        self._telemetry["replacement_events"] = keep
+        stale_trade_ids = [
+            trade_id
+            for trade_id, event in self._replacement_outcome_by_trade_id.items()
+            if id(event) not in keep_ids
+        ]
+        for trade_id in stale_trade_ids:
+            self._replacement_outcome_by_trade_id.pop(trade_id, None)
 
     def _count_recent_replacements(self, hours: int) -> int:
         if hours <= 0:

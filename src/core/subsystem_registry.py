@@ -197,6 +197,11 @@ def build_subsystems(
         lambda: DecisionFirewall({
             "forecaster": c.predictive_forecaster,
             "min_confidence": getattr(_fw_cfg, "FIREWALL_MIN_CONFIDENCE", 0.45),
+            "max_signals_per_source_per_day": getattr(
+                _fw_cfg, "FIREWALL_MAX_SIGNALS_PER_SOURCE_PER_DAY", 0
+            ),
+            "canary_mode": bool(getattr(_fw_cfg, "FIREWALL_CANARY_MODE", False)),
+            "canary_max_positions": int(getattr(_fw_cfg, "FIREWALL_CANARY_MAX_POSITIONS", 2)),
         }),
         health,
     )
@@ -248,7 +253,18 @@ def build_subsystems(
     # ─── Polymarket ───────────────────────────────────────────
     if "polymarket" in profile:
         from src.data.polymarket_scanner import PolymarketScanner
-        c.polymarket = _safe_init("polymarket", PolymarketScanner, health)
+        c.polymarket = _safe_init(
+            "polymarket",
+            lambda: PolymarketScanner(
+                config={
+                    "min_volume_threshold": float(getattr(config, "POLYMARKET_MIN_VOLUME", 10_000.0)),
+                    "max_markets_per_scan": int(
+                        getattr(config, "POLYMARKET_MAX_MARKETS_PER_SCAN", 100)
+                    ),
+                }
+            ),
+            health,
+        )
 
     # ─── Multi-exchange ───────────────────────────────────────
     if "multi_scanner" in profile:
@@ -390,6 +406,7 @@ def build_subsystems(
                 arena_incubator=c.arena_incubator,
                 decision_engine=c.decision_engine,
                 multi_scanner=c.multi_scanner,
+                health_registry=health,
             )
             if c.live_trader:
                 set_live_trader(c.live_trader)

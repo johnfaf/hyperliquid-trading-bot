@@ -27,6 +27,7 @@ import time
 import json
 import hashlib
 import copy
+from collections import defaultdict
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -409,6 +410,36 @@ class LiveTrader:
                 self.min_order_usd,
             )
             self.max_order_usd = self.min_order_usd
+
+        # Canary rollout guardrails for live deployment.
+        self.canary_mode = bool(getattr(config, "LIVE_CANARY_MODE", False))
+        self.canary_max_order_usd = float(
+            getattr(config, "LIVE_CANARY_MAX_ORDER_USD", self.max_order_usd)
+        )
+        self.canary_max_signals_per_day = int(
+            getattr(config, "LIVE_CANARY_MAX_SIGNALS_PER_DAY", 25)
+        )
+        if self.canary_mode and self.canary_max_order_usd > 0:
+            self.max_order_usd = max(
+                self.min_order_usd,
+                min(self.max_order_usd, self.canary_max_order_usd),
+            )
+            logger.warning(
+                "LIVE_CANARY_MODE enabled: max_order_usd tightened to $%.2f",
+                self.max_order_usd,
+            )
+
+        # Optional per-source/day entry cap (0 disables this guardrail).
+        self.max_orders_per_source_per_day = int(
+            getattr(config, "LIVE_MAX_ORDERS_PER_SOURCE_PER_DAY", 0)
+        )
+
+        # Optional external kill-switch controls.
+        self.external_kill_switch_file = str(
+            getattr(config, "LIVE_EXTERNAL_KILL_SWITCH_FILE", "")
+        ).strip()
+        self.external_kill_switch_env = "LIVE_EXTERNAL_KILL_SWITCH"
+        self._kill_switch_reason: str = ""
         self.regime_forecaster = regime_forecaster
         self.status_reason = "dry_run_requested" if dry_run else "initializing"
 
@@ -439,6 +470,7 @@ class LiveTrader:
         self.kill_switch_active = False
         self.orders_today = 0
         self.fills_today = 0
+        self._source_orders_today: Dict[str, int] = defaultdict(int)
 
         # Track realized PnL from closed positions for daily loss enforcement
         self._last_known_positions: Dict[str, Dict] = {}  # coin -> position snapshot
@@ -979,6 +1011,51 @@ class LiveTrader:
             logger.warning(f"Asset index not found for {coin}")
         return idx
 
+    @staticmethod
+    def _signal_source_key(signal: TradeSignal) -> str:
+        source = getattr(signal, "source", None)
+        if hasattr(source, "value"):
+            source = source.value
+        key = str(source or "unknown").strip().lower()
+        return key or "unknown"
+
+    def _refresh_external_kill_switch(self) -> bool:
+        """
+        External kill-switch hook.
+
+        Triggers when either:
+          - env LIVE_EXTERNAL_KILL_SWITCH is truthy (1/true/on/yes)
+          - LIVE_EXTERNAL_KILL_SWITCH_FILE exists and is non-empty/truthy
+        """
+        reason = ""
+
+        env_val = os.environ.get(self.external_kill_switch_env, "").strip().lower()
+        if env_val in {"1", "true", "yes", "on"}:
+            reason = f"env:{self.external_kill_switch_env}"
+
+        if not reason and self.external_kill_switch_file:
+            try:
+                if os.path.exists(self.external_kill_switch_file):
+                    with open(self.external_kill_switch_file, "r", encoding="utf-8") as handle:
+                        content = handle.read().strip().lower()
+                    if not content or content in {"1", "true", "yes", "on", "kill"}:
+                        reason = f"file:{self.external_kill_switch_file}"
+            except Exception as exc:
+                logger.warning(
+                    "Failed to evaluate external kill switch file %s: %s",
+                    self.external_kill_switch_file,
+                    exc,
+                )
+
+        if reason:
+            if not self.kill_switch_active or self._kill_switch_reason != reason:
+                logger.critical("External kill switch ACTIVATED (%s)", reason)
+            self.kill_switch_active = True
+            self._kill_switch_reason = reason
+            self.status_reason = "external_kill_switch"
+            return True
+        return False
+
     def _check_daily_reset(self):
         """Reset daily counters at midnight UTC."""
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -989,8 +1066,12 @@ class LiveTrader:
             self.daily_unrealized_pnl = 0.0
             self.orders_today = 0
             self.fills_today = 0
+            self._source_orders_today.clear()
             self.kill_switch_active = False
+            self._kill_switch_reason = ""
             logger.info("Daily counters reset")
+            # Keep external kill-switch state sticky across day boundaries.
+            self._refresh_external_kill_switch()
 
     def check_daily_loss(self) -> bool:
         """
@@ -1000,6 +1081,8 @@ class LiveTrader:
             True if loss > limit (triggers kill switch)
         """
         self._check_daily_reset()
+        if self._refresh_external_kill_switch():
+            return True
 
         if self.daily_pnl < -self.max_daily_loss:
             logger.warning(f"⚠️  Daily loss limit exceeded: ${abs(self.daily_pnl):.2f} > ${self.max_daily_loss:.2f}")
@@ -1810,6 +1893,7 @@ class LiveTrader:
             Order result dict
         """
         side = self._normalize_order_side(side)
+        self._refresh_external_kill_switch()
 
         # Kill switch and daily loss only block NEW positions (not closes).
         # reduce_only orders MUST always go through so the bot can exit
@@ -2086,6 +2170,7 @@ class LiveTrader:
             Order result dict
         """
         side = self._normalize_order_side(side)
+        self._refresh_external_kill_switch()
 
         # Kill switch and position size limit only block NEW positions.
         # reduce_only orders MUST go through so the bot can exit positions.
@@ -2647,6 +2732,10 @@ class LiveTrader:
             Execution result dict or None if rejected
         """
         signal = self._coerce_signal(signal)
+        source_key = self._signal_source_key(signal)
+
+        # External kill-switch takes precedence over any other gate.
+        self._refresh_external_kill_switch()
 
         if not bypass_firewall:
             live_positions = self.get_firewall_positions() if self.is_deployable() else None
@@ -2676,6 +2765,30 @@ class LiveTrader:
         if self.check_daily_loss():
             logger.warning("Daily loss limit exceeded - rejecting signal")
             return None
+
+        # Canary/source caps apply to NEW live entries only.
+        total_signals_today = sum(self._source_orders_today.values())
+        if self.canary_mode and self.canary_max_signals_per_day > 0:
+            if total_signals_today >= self.canary_max_signals_per_day:
+                logger.warning(
+                    "Canary signal cap reached (%d/%d) - rejecting %s (source=%s)",
+                    total_signals_today,
+                    self.canary_max_signals_per_day,
+                    signal.coin,
+                    source_key,
+                )
+                return None
+        if self.max_orders_per_source_per_day > 0:
+            used = self._source_orders_today.get(source_key, 0)
+            if used >= self.max_orders_per_source_per_day:
+                logger.warning(
+                    "Source/day cap reached for %s (%d/%d) - rejecting %s",
+                    source_key,
+                    used,
+                    self.max_orders_per_source_per_day,
+                    signal.coin,
+                )
+                return None
 
         # CRIT-FIX CRIT-4: resolve canonical coin quantity BEFORE the regime overlay
         # so the overlay can apply a correct proportional multiplier.  The original
@@ -2948,6 +3061,8 @@ class LiveTrader:
                 ).start()
 
             # Return summary
+            if self._is_order_result_success(entry_result) and not self.dry_run:
+                self._source_orders_today[source_key] += 1
             return {
                 "status": "success",
                 "coin": coin,
@@ -2992,12 +3107,20 @@ class LiveTrader:
             "public_address": self.public_address,
             "status_reason": self.status_reason,
             "kill_switch_active": self.kill_switch_active,
+            "kill_switch_reason": self._kill_switch_reason or None,
             "daily_pnl": round(self.daily_pnl, 2),
             "daily_realized_pnl": round(self.daily_realized_pnl, 2),
             "daily_unrealized_pnl": round(self.daily_unrealized_pnl, 2),
             "daily_pnl_limit": self.max_daily_loss,
             "orders_today": self.orders_today,
             "fills_today": self.fills_today,
+            "source_orders_today": dict(self._source_orders_today),
+            "total_entry_signals_today": int(sum(self._source_orders_today.values())),
+            "max_orders_per_source_per_day": self.max_orders_per_source_per_day,
+            "canary_mode": self.canary_mode,
+            "canary_max_order_usd": self.canary_max_order_usd,
+            "canary_max_signals_per_day": self.canary_max_signals_per_day,
+            "external_kill_switch_file": self.external_kill_switch_file or None,
             "max_position_size": self.max_position_size,
             "max_order_usd": self.max_order_usd,
             "order_dedup_window_s": self._ORDER_DEDUP_WINDOW,

@@ -176,3 +176,61 @@ def test_firewall_stats(mock_db):
     assert stats["total_signals"] == 2
     assert stats["passed"] == 1
     assert stats["rejected_confidence"] == 1
+
+
+@patch("src.signals.decision_firewall.db")
+def test_firewall_enforces_per_source_day_cap(mock_db):
+    """Approved signals per source should stop at configured daily cap."""
+    mock_db.get_open_paper_trades.return_value = []
+    mock_db.get_paper_account.return_value = {"balance": 10000}
+    mock_db.audit_log = MagicMock()
+
+    from src.signals.decision_firewall import DecisionFirewall
+
+    fw = DecisionFirewall(
+        {
+            "max_signals_per_source_per_day": 1,
+            "enable_predictive_derisk": False,
+            "funding_risk_enabled": False,
+        }
+    )
+    first = MockSignal(coin="BTC", confidence=0.6)
+    first.source = "copy_trade"
+    second = MockSignal(coin="ETH", confidence=0.6)
+    second.source = "copy_trade"
+
+    passed1, _ = fw.validate(first)
+    passed2, reason2 = fw.validate(second)
+
+    assert passed1 is True
+    assert passed2 is False
+    assert "source/day cap" in reason2.lower()
+    stats = fw.get_stats()
+    assert stats["rejected_source_cap"] == 1
+    assert stats["source_signal_counts"]["copy_trade"] == 1
+
+
+@patch("src.signals.decision_firewall.db")
+def test_firewall_canary_mode_tightens_position_limit(mock_db):
+    """Canary mode should force max_positions down to canary max."""
+    mock_db.get_open_paper_trades.return_value = [
+        {"coin": "ETH", "side": "long", "size": 1, "entry_price": 3000, "leverage": 1},
+        {"coin": "SOL", "side": "long", "size": 1, "entry_price": 100, "leverage": 1},
+    ]
+    mock_db.get_paper_account.return_value = {"balance": 10000}
+    mock_db.audit_log = MagicMock()
+
+    from src.signals.decision_firewall import DecisionFirewall
+
+    fw = DecisionFirewall(
+        {
+            "max_positions": 8,
+            "canary_mode": True,
+            "canary_max_positions": 2,
+            "enable_predictive_derisk": False,
+            "funding_risk_enabled": False,
+        }
+    )
+    passed, reason = fw.validate(MockSignal(coin="BTC", confidence=0.8))
+    assert passed is False
+    assert "max positions" in reason.lower()

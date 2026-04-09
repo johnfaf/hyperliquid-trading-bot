@@ -120,3 +120,41 @@ def test_rotation_guardrail_caps_replacements_per_hour():
     decision = manager.decide(MockSignal(confidence=0.95), [victim, _open_trade(2, confidence=0.5, minutes_ago=200)])
     assert decision.action == "reject"
     assert "cap hit" in decision.reason
+
+
+def test_rotation_tracks_replacement_outcomes():
+    manager = PortfolioRotationManager({})
+    victim = _open_trade(7, confidence=0.2, minutes_ago=240, coin="ARB", side="short")
+    now = datetime.now(timezone.utc)
+    opened_at = (now - timedelta(minutes=25)).isoformat()
+    closed_at = now.isoformat()
+
+    manager.register_replacement(
+        victim,
+        new_coin="ETH",
+        new_side="long",
+        candidate_score=0.83,
+        incumbent_score=0.27,
+        reason="higher_edge",
+        new_trade_id=777,
+        closed_trade_event={"pnl": -3.5, "closed_at": closed_at},
+    )
+    manager.record_trade_close(
+        {
+            "trade_id": 777,
+            "pnl": 5.25,
+            "opened_at": opened_at,
+            "closed_at": closed_at,
+        }
+    )
+
+    stats = manager.get_stats()
+    assert stats["replacement_outcomes_recorded"] == 1
+    assert abs(stats["replacement_outcome_win_rate"] - 1.0) < 1e-9
+    assert stats["replacement_events"], "replacement_events should include recent event telemetry"
+    event = stats["replacement_events"][-1]
+    assert event["reason"] == "higher_edge"
+    assert abs(event["candidate_score"] - 0.83) < 1e-9
+    assert abs(event["incumbent_score"] - 0.27) < 1e-9
+    assert abs(event["victim_realized_pnl"] - (-3.5)) < 1e-9
+    assert event["replacement_outcome"] == "win"
