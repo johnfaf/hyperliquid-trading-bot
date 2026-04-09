@@ -27,6 +27,10 @@ from src.signals.calibration import CalibrationTracker
 
 logger = logging.getLogger(__name__)
 
+_CRASH_COPY_CONFIDENCE_MULTIPLIER = 0.60
+_NEUTRAL_COPY_CONFIDENCE_MULTIPLIER = 0.70
+_BULLISH_COPY_CONFIDENCE_MULTIPLIER = 1.20
+
 
 class CopyTrader:
     """Monitors top traders and mirrors their position changes."""
@@ -198,22 +202,26 @@ class CopyTrader:
 
         # Apply regime multiplier to confidence
         if regime == "crash":
-            # Copy much less aggressively during crashes (30% of normal confidence)
-            adjusted_confidence = original_confidence * 0.3
+            # Keep copy trading de-risked during crashes without locking out
+            # genuinely strong candidates before the firewall/rotation layers.
+            adjusted_confidence = original_confidence * _CRASH_COPY_CONFIDENCE_MULTIPLIER
             logger.info(
                 f"REGIME WEIGHT: crash detected for {coin}, "
                 f"reducing copy confidence {original_confidence:.2f} → {adjusted_confidence:.2f}"
             )
         elif regime == "neutral":
-            # Slightly reduce during neutral regimes (70% of normal confidence)
-            adjusted_confidence = original_confidence * 0.7
+            # Slightly reduce during neutral regimes.
+            adjusted_confidence = original_confidence * _NEUTRAL_COPY_CONFIDENCE_MULTIPLIER
             logger.debug(
                 f"REGIME WEIGHT: neutral regime for {coin}, "
                 f"reducing copy confidence {original_confidence:.2f} → {adjusted_confidence:.2f}"
             )
         elif regime == "bullish":
-            # Increase aggressiveness during bullish regimes (120% of normal, capped at 1.0)
-            adjusted_confidence = min(original_confidence * 1.2, 1.0)
+            # Increase aggressiveness during bullish regimes, capped at 1.0.
+            adjusted_confidence = min(
+                original_confidence * _BULLISH_COPY_CONFIDENCE_MULTIPLIER,
+                1.0,
+            )
             if adjusted_confidence > original_confidence:
                 logger.info(
                     f"REGIME WEIGHT: bullish detected for {coin}, "
@@ -273,11 +281,15 @@ class CopyTrader:
                             weight = self.agent_scorer.get_weight(source_key)
                             trade_signal.confidence = trade_signal.confidence * 0.6 + weight * 0.4
 
+                        # Rotation needs to see candidates even when the book is
+                        # full.  Pre-screen only signal-level checks here; final
+                        # execution-time validation still runs against the real
+                        # post-rotation portfolio state.
                         passed, reason = self.firewall.validate(
                             trade_signal,
                             regime_data=regime_data,
-                            open_positions=open_trades,
-                            ignore_position_limit=False,
+                            open_positions=[],
+                            ignore_position_limit=True,
                             dry_run=True,
                         )
                         if not passed:

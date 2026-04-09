@@ -162,12 +162,7 @@ class PaperTrader:
                         "llm_filter": 0, "other_error": 0}
         for strategy in strategies:
             try:
-                # Check if we already have a position from this strategy
                 existing = [t for t in open_trades if t["strategy_id"] == strategy.get("id")]
-                if existing:
-                    _drop_counts["existing_position"] += 1
-                    logger.info(f"Skipping {strategy.get('name', '?')} — already have open position")
-                    continue
 
                 # Generate signal from strategy
                 signal = self._generate_signal(strategy, mids, regime_data=regime_data)
@@ -175,6 +170,25 @@ class PaperTrader:
                     _drop_counts["no_signal"] += 1
                     logger.info(f"No signal generated for {strategy.get('name', '?')}")
                     continue
+
+                if existing:
+                    matching_trade = next(
+                        (
+                            trade for trade in existing
+                            if trade.get("coin") == signal["coin"]
+                            and trade.get("side") == signal["side"]
+                        ),
+                        None,
+                    )
+                    if matching_trade:
+                        _drop_counts["existing_position"] += 1
+                        logger.info(
+                            "Skipping %s — already have matching open position",
+                            strategy.get("name", "?"),
+                        )
+                        continue
+
+                    signal["existing_strategy_trade_id"] = existing[0].get("id")
 
                 # Enrich with feature engine data
                 coin = signal["coin"]
@@ -288,17 +302,15 @@ class PaperTrader:
             try:
                 # Use firewall if available, else fall back to legacy risk checks
                 if self.firewall:
-                    # HIGH-FIX HIGH-6/HIGH-9: do NOT bypass position limits in the
-                    # dry-run pre-screen.  The original ignore_position_limit=True
-                    # meant signals that should be blocked (8 positions open) sailed
-                    # through pre-screening and then passed the real execution validate
-                    # call too (same flag was propagated), so the limit was never
-                    # enforced end-to-end.  Use the same constraints for both passes.
+                    # Rotation-aware pre-screen: only validate signal-level checks
+                    # here so full books can still produce rotation candidates.
+                    # Execution-time validation below runs again against the real
+                    # post-rotation portfolio state before any trade is opened.
                     passed, reason = self.firewall.validate(
                         trade_signal,
                         regime_data=regime_data,
-                        open_positions=open_trades,
-                        ignore_position_limit=False,
+                        open_positions=[],
+                        ignore_position_limit=True,
                         dry_run=True,
                     )
                     if not passed:
@@ -420,80 +432,109 @@ class PaperTrader:
         ):
             trade_signal = candidate["trade_signal"]
             sig = candidate["signal"]
-            decision = self.rotation_manager.decide(
-                trade_signal,
-                open_trades,
-                regime_data=regime_data,
-                replacements_used=replacements_used,
-            )
             victim = None
             candidate_open_positions = open_trades
-            shadow_bypass_open = (
-                shadow_mode
-                and self.rotation_manager.should_bypass_reject_in_shadow_mode(
-                    decision,
-                    len(open_trades),
-                )
-            )
+            decision_reason = ""
+            forced_victim_id = sig.get("existing_strategy_trade_id")
 
-            if decision.action == "reject" and not shadow_bypass_open:
-                logger.info(
-                    "Rotation skipped %s %s: %s",
-                    sig["side"].upper(),
-                    sig["coin"],
-                    decision.reason,
-                )
-                continue
-            if shadow_bypass_open:
-                logger.info(
-                    "Rotation shadow mode: bypassing rotation reject for %s %s (%s)",
-                    sig["side"].upper(),
-                    sig["coin"],
-                    decision.reason,
-                )
-
-            if decision.action == "replace":
-                if not rotation_enabled:
-                    if rotation_dry_run:
-                        self.rotation_manager.record_dry_run_replacement_skip(
-                            decision, reason_key="dry_run_rotation_disabled"
-                        )
-                        logger.info(
-                            "Rotation dry-run: would replace %s with %s (%s)",
-                            decision.replacement_trade_id,
-                            sig["coin"],
-                            decision.reason,
-                        )
+            if forced_victim_id is not None:
+                if replacements_used >= self.rotation_manager.max_replacements_per_cycle:
                     logger.info(
-                        "Rotation disabled by config; skipped replacement for %s %s",
+                        "Strategy refresh skipped %s %s: replacement budget exhausted (%s/%s)",
                         sig["side"].upper(),
                         sig["coin"],
+                        replacements_used,
+                        self.rotation_manager.max_replacements_per_cycle,
                     )
                     continue
-                if rotation_dry_run:
-                    self.rotation_manager.record_dry_run_replacement_skip(
-                        decision, reason_key="dry_run_shadow_mode"
+                victim = next(
+                    (trade for trade in open_trades if trade.get("id") == forced_victim_id),
+                    None,
+                )
+                if not victim:
+                    logger.info("Strategy refresh skipped %s: incumbent not found", sig["coin"])
+                    continue
+                candidate_open_positions = [
+                    trade for trade in open_trades if trade.get("id") != victim.get("id")
+                ]
+                decision_reason = (
+                    f"strategy refresh: replace {victim.get('coin')} "
+                    f"with {sig['coin']}"
+                )
+            else:
+                decision = self.rotation_manager.decide(
+                    trade_signal,
+                    open_trades,
+                    regime_data=regime_data,
+                    replacements_used=replacements_used,
+                )
+                shadow_bypass_open = (
+                    shadow_mode
+                    and self.rotation_manager.should_bypass_reject_in_shadow_mode(
+                        decision,
+                        len(open_trades),
                     )
+                )
+
+                if decision.action == "reject" and not shadow_bypass_open:
                     logger.info(
-                        "Rotation shadow mode: simulated replacement of %s with %s (%s)",
-                        decision.replacement_trade_id,
+                        "Rotation skipped %s %s: %s",
+                        sig["side"].upper(),
                         sig["coin"],
                         decision.reason,
                     )
                     continue
+                if shadow_bypass_open:
+                    logger.info(
+                        "Rotation shadow mode: bypassing rotation reject for %s %s (%s)",
+                        sig["side"].upper(),
+                        sig["coin"],
+                        decision.reason,
+                    )
 
-            if decision.action == "replace":
-                victim = next(
-                    (trade for trade in open_trades if trade.get("id") == decision.replacement_trade_id),
-                    None,
-                )
-                if not victim:
-                    logger.info("Rotation skipped %s: incumbent not found", sig["coin"])
-                    continue
+                if decision.action == "replace":
+                    if not rotation_enabled:
+                        if rotation_dry_run:
+                            self.rotation_manager.record_dry_run_replacement_skip(
+                                decision, reason_key="dry_run_rotation_disabled"
+                            )
+                            logger.info(
+                                "Rotation dry-run: would replace %s with %s (%s)",
+                                decision.replacement_trade_id,
+                                sig["coin"],
+                                decision.reason,
+                            )
+                        logger.info(
+                            "Rotation disabled by config; skipped replacement for %s %s",
+                            sig["side"].upper(),
+                            sig["coin"],
+                        )
+                        continue
+                    if rotation_dry_run:
+                        self.rotation_manager.record_dry_run_replacement_skip(
+                            decision, reason_key="dry_run_shadow_mode"
+                        )
+                        logger.info(
+                            "Rotation shadow mode: simulated replacement of %s with %s (%s)",
+                            decision.replacement_trade_id,
+                            sig["coin"],
+                            decision.reason,
+                        )
+                        continue
 
-                candidate_open_positions = [
-                    trade for trade in open_trades if trade.get("id") != victim.get("id")
-                ]
+                if decision.action == "replace":
+                    victim = next(
+                        (trade for trade in open_trades if trade.get("id") == decision.replacement_trade_id),
+                        None,
+                    )
+                    if not victim:
+                        logger.info("Rotation skipped %s: incumbent not found", sig["coin"])
+                        continue
+
+                    candidate_open_positions = [
+                        trade for trade in open_trades if trade.get("id") != victim.get("id")
+                    ]
+                decision_reason = decision.reason
 
             if self.firewall:
                 passed, reason = self.firewall.validate(
@@ -563,7 +604,7 @@ class PaperTrader:
                         "Rotation replaced %s with %s (%s)",
                         victim.get("coin"),
                         sig["coin"],
-                        decision.reason,
+                        decision_reason,
                     )
 
         if executed:
