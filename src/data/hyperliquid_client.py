@@ -13,6 +13,7 @@ import os
 import re
 import sys
 from typing import Optional, Any
+import requests
 
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -287,7 +288,7 @@ def get_leaderboard():
         if not mgr.bucket.acquire(priority=Priority.LOW, timeout=10):
             logger.debug("Leaderboard: couldn't acquire token for stats endpoint")
         else:
-            resp = mgr.session.get(
+            resp = requests.get(
                 "https://stats-data.hyperliquid.xyz/Mainnet/leaderboard",
                 timeout=30,
             )

@@ -1,4 +1,5 @@
 import pytest
+import time
 from unittest.mock import patch, MagicMock
 
 from src.signals.xgboost_regime_forecaster import (
@@ -44,7 +45,8 @@ class TestXGBoostRegimeForecaster:
     def test_predict_regime_fallback(self, forecaster):
         """Without XGBoost model, predict_regime falls back to weighted-signal."""
         forecaster.model = None
-        result = forecaster.predict_regime("BTC")
+        with patch("src.signals.xgboost_regime_forecaster.HAS_XGBOOST", False):
+            result = forecaster.predict_regime("BTC")
         assert result is not None
         assert isinstance(result, dict)
         assert "regime" in result
@@ -62,6 +64,7 @@ class TestXGBoostRegimeForecaster:
         # Simulate model predicting bullish with 70% confidence
         mock_model.predict_proba.return_value = np.array([[0.1, 0.2, 0.7]])
         forecaster.model = mock_model
+        forecaster._last_train_ts = time.time()
 
         # Mock the feature extraction
         features = {f: 0.5 for f in FEATURE_NAMES}
@@ -87,6 +90,7 @@ class TestXGBoostRegimeForecaster:
         mock_model = MagicMock()
         mock_model.predict_proba.return_value = np.array([[0.8, 0.15, 0.05]])
         forecaster.model = mock_model
+        forecaster._last_train_ts = time.time()
 
         features = {f: 0.0 for f in FEATURE_NAMES}
         with patch.object(forecaster, "_extract_features", return_value=features):

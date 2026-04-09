@@ -19,6 +19,11 @@ from urllib.parse import urlparse, parse_qs
 import logging
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+try:
+    from dotenv import load_dotenv
+    load_dotenv(override=False)
+except ImportError:
+    pass
 import config
 
 logger = logging.getLogger(__name__)
@@ -944,6 +949,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass  # Suppress default logging
 
+    def _send_no_cache_headers(self):
+        self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+        self.send_header("Pragma", "no-cache")
+        self.send_header("Expires", "0")
+
     def _check_auth(self) -> bool:
         """Return True if request is authenticated or auth is not required."""
         if not _DASHBOARD_AUTH_TOKEN:
@@ -962,6 +972,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.send_response(401)
         self.send_header("Content-Type", "application/json")
         self.send_header("WWW-Authenticate", 'Bearer realm="dashboard"')
+        self._send_no_cache_headers()
         self.end_headers()
         self.wfile.write(b'{"error": "unauthorized", "hint": "Set Authorization: Bearer <token> header"}')
         return False
@@ -974,6 +985,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if parsed.path == "/" or parsed.path == "/dashboard":
             self.send_response(200)
             self.send_header("Content-Type", "text/html")
+            self._send_no_cache_headers()
             self.end_headers()
             self.wfile.write(DASHBOARD_HTML.encode())
 
@@ -1213,6 +1225,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             from src.ui.stress_dashboard import STRESS_HTML
             self.send_response(200)
             self.send_header("Content-Type", "text/html")
+            self._send_no_cache_headers()
             self.end_headers()
             self.wfile.write(STRESS_HTML.encode())
         except Exception as e:
@@ -1366,6 +1379,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Access-Control-Allow-Origin", "*")
+        self._send_no_cache_headers()
         self.end_headers()
         self.wfile.write(json.dumps(data, default=_safe_json).encode())
 
@@ -1376,6 +1390,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             html = _get_dashboard_html()
             self.send_response(200)
             self.send_header("Content-Type", "text/html")
+            self._send_no_cache_headers()
             self.end_headers()
             self.wfile.write(html.encode())
         except Exception as e:
@@ -1413,6 +1428,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             from src.ui.backtest_dashboard import BACKTEST_HTML
             self.send_response(200)
             self.send_header("Content-Type", "text/html")
+            self._send_no_cache_headers()
             self.end_headers()
             self.wfile.write(BACKTEST_HTML.encode())
         except Exception as e:
@@ -1502,6 +1518,10 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
     from src.data.database import init_db
+    logger.warning(
+        "Standalone dashboard mode only shows persisted DB state. "
+        "Run main.py to attach live subsystem metrics."
+    )
     init_db()
     port = int(os.environ.get("PORT", 8080))
     host = _resolve_dashboard_host()

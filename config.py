@@ -13,21 +13,33 @@ HYPERLIQUID_EXCHANGE_URL = f"{HYPERLIQUID_API_URL}/exchange"
 # Priority: HL_BOT_DB env var > /data/ volume > local ./data/
 # On Railway: set HL_BOT_DB=/data/bot.db in Variables tab, or the code
 # auto-detects the /data volume if it exists and is writable.
+def _can_use_persistent_volume() -> bool:
+    """Return True when Railway-style /data persistence is actually available."""
+    if os.name == "nt":
+        return False
+
+    data_dir = "/data"
+    if not os.path.isdir(data_dir):
+        return False
+
+    try:
+        probe = os.path.join(data_dir, ".write_test")
+        with open(probe, "w", encoding="utf-8") as f:
+            f.write("ok")
+        os.remove(probe)
+        return True
+    except OSError:
+        return False
+
+
 def _resolve_db_path() -> str:
     # 1. Explicit env var always wins
     env_db = os.environ.get("HL_BOT_DB")
     if env_db:
         return env_db
-    # 2. Check if /data exists AND is writable (Railway persistent volume)
-    try:
-        os.makedirs("/data", exist_ok=True)
-        probe = "/data/.write_test"
-        with open(probe, "w") as f:
-            f.write("ok")
-        os.remove(probe)
+    # 2. Use Railway-style persistent volume only on supported platforms.
+    if _can_use_persistent_volume():
         return "/data/bot.db"
-    except OSError:
-        pass
     # 3. Fallback to local ./data/
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "bot.db")
 

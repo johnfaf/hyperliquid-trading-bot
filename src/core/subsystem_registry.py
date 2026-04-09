@@ -113,7 +113,7 @@ def _safe_init(name: str, factory, health: SubsystemHealthRegistry,
             startup_status="READY",
         )
         health.heartbeat(name)
-        logger.info("  ✓ %s", name)
+        logger.info("  OK %s", name)
         return instance
     except Exception as exc:
         health.set_status(
@@ -123,7 +123,7 @@ def _safe_init(name: str, factory, health: SubsystemHealthRegistry,
             dependency_ready=False,
             startup_status="FAILED",
         )
-        logger.warning("  ✗ %s — %s", name, exc)
+        logger.warning("  FAIL %s - %s", name, exc)
         return None
 
 
@@ -363,15 +363,15 @@ def build_subsystems(
                     health,
                 )
         except Exception as exc:
-            logger.warning("  ✗ position_monitor — %s", exc)
+            logger.warning("  FAIL position_monitor - %s", exc)
 
     # ─── WebSocket feed ───────────────────────────────────────
     try:
         from src.data.hyperliquid_client import start_websocket
         start_websocket(coins=["BTC", "ETH", "SOL", "DOGE", "ARB", "OP"])
-        logger.info("  ✓ websocket_feed")
+        logger.info("  OK websocket_feed")
     except Exception as exc:
-        logger.warning("  ✗ websocket_feed — %s (REST fallback active)", exc)
+        logger.warning("  FAIL websocket_feed - %s (REST fallback active)", exc)
 
     # ─── Dashboard ────────────────────────────────────────────
     if "dashboard" in profile:
@@ -394,20 +394,20 @@ def build_subsystems(
             if c.live_trader:
                 set_live_trader(c.live_trader)
             c.dashboard = start_dashboard(options_scanner=c.options_scanner)
-            logger.info("  ✓ dashboard")
+            logger.info("  OK dashboard")
         except Exception as exc:
-            logger.warning("  ✗ dashboard — %s", exc)
+            logger.warning("  FAIL dashboard - %s", exc)
 
     # ─── Telegram ─────────────────────────────────────────────
     try:
         from src.notifications import telegram_bot as tg
         if tg.is_configured():
             tg.send_startup_message()
-            logger.info("  ✓ telegram")
+            logger.info("  OK telegram")
         else:
-            logger.info("  — telegram (not configured)")
+            logger.info("  SKIP telegram (not configured)")
     except Exception as exc:
-        logger.debug("  ✗ telegram — %s", exc)
+        logger.debug("  FAIL telegram - %s", exc)
 
     logger.info("Subsystem build complete.")
     return c

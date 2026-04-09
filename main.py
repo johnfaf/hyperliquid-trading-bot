@@ -27,9 +27,9 @@ import time
 # Force unbuffered stdout/stderr for Docker/Railway log visibility
 # Belt-and-suspenders: also set via PYTHONUNBUFFERED=1 in Dockerfile
 if hasattr(sys.stdout, 'reconfigure'):
-    sys.stdout.reconfigure(line_buffering=True)
+    sys.stdout.reconfigure(line_buffering=True, encoding="utf-8", errors="backslashreplace")
 if hasattr(sys.stderr, 'reconfigure'):
-    sys.stderr.reconfigure(line_buffering=True)
+    sys.stderr.reconfigure(line_buffering=True, encoding="utf-8", errors="backslashreplace")
 
 sys.path.insert(0, os.path.dirname(__file__))
 

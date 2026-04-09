@@ -87,10 +87,16 @@ def run_discovery(container) -> None:
         try:
             from src.discovery.golden_wallet import run_golden_scan
             golden_summary = run_golden_scan(max_wallets=200)
+            golden_count = int(
+                golden_summary.get("golden_count", golden_summary.get("golden", 0)) or 0
+            )
+            total_evaluated = int(
+                golden_summary.get("total_evaluated", golden_summary.get("scanned", 0)) or 0
+            )
             logger.info(
                 "  Golden scan: %d golden wallets out of %d evaluated",
-                golden_summary.get("golden_count", 0),
-                golden_summary.get("total_evaluated", 0),
+                golden_count,
+                total_evaluated,
             )
         except Exception as exc:
             logger.warning("Golden wallet scan failed: %s", exc)

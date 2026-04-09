@@ -188,7 +188,7 @@ def validate_or_fail(features: Optional[List[str]] = None,
         logger.critical(msg)
         raise RuntimeError(msg)
 
-    logger.info("Dependency validation passed — all enabled features have their packages.")
+    logger.info("Dependency validation passed - all enabled features have their packages.")
 
 
 def get_boot_report(config_module=None) -> str:
@@ -197,16 +197,16 @@ def get_boot_report(config_module=None) -> str:
 
     Example output::
 
-        ┌─ Dependency Boot Report ────────────────────┐
-        │ ✓ core              READY                   │
-        │ ✓ polymarket        READY                   │
-        │ ✗ ml_regime         MISSING xgboost, sklearn│
-        │ — dashboard         DISABLED                │
-        └─────────────────────────────────────────────┘
+        +-- Dependency Boot Report -------------------------+
+        | OK   core                   READY                 |
+        | OK   polymarket             READY                 |
+        | FAIL ml_regime              MISSING xgboost       |
+        | SKIP dashboard              DISABLED              |
+        +---------------------------------------------------+
     """
     report = validate_all(config_module)
 
-    lines = ["", "┌─ Dependency Boot Report ─────────────────────────┐"]
+    lines = ["", "+-- Dependency Boot Report -------------------------+"]
 
     for feature, info in sorted(report.items()):
         enabled = info["enabled"]
@@ -214,17 +214,17 @@ def get_boot_report(config_module=None) -> str:
         missing = info["missing"]
 
         if not enabled:
-            icon = "—"
+            icon = "SKIP"
             status = "DISABLED"
         elif available:
-            icon = "✓"
+            icon = "OK"
             status = "READY"
         else:
-            icon = "✗"
+            icon = "FAIL"
             status = f"MISSING {', '.join(missing)}"
 
-        line = f"│ {icon} {feature:<22s} {status:<25s} │"
+        line = f"| {icon:<4s} {feature:<22s} {status:<21s} |"
         lines.append(line)
 
-    lines.append("└───────────────────────────────────────────────────┘")
+    lines.append("+---------------------------------------------------+")
     return "\n".join(lines)
