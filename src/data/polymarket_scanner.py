@@ -23,6 +23,7 @@ Polymarket API:
   - Gamma API: https://gamma-api.polymarket.com (enriched data)
 """
 
+import json
 import logging
 import time
 import requests
@@ -271,60 +272,78 @@ class PolymarketScanner:
         """
         Fetch raw market dicts from Polymarket, handling pagination.
 
-        The CLOB API returns paginated results:
-          GET /markets?next_cursor=...  → {"limit":100, "count":N, "next_cursor":"...", "data":[...]}
-
-        Falls back to Gamma API if CLOB returns nothing.
+        Gamma is the preferred source for market discovery because it exposes
+        indexed volume/liquidity and uses `limit` + `offset` pagination.
+        Falls back to the CLOB listing endpoint if Gamma returns nothing.
         """
         raw_markets = []
 
-        # --- Primary: CLOB paginated endpoint ---
+        # --- Primary: Gamma paginated endpoint ---
         try:
-            next_cursor = ""
+            offset = 0
             pages_fetched = 0
-            # Fetch slightly more than the final cap so we can rank/filter.
             max_pages = max(1, min(10, (self.max_markets_per_scan + 99) // 100 + 1))
 
             while pages_fetched < max_pages:
-                url = f"{self.CLOB_API}/markets?limit=100&active=true"
-                if next_cursor:
-                    url += f"&next_cursor={next_cursor}"
-
+                url = (
+                    f"{self.GAMMA_API}/markets?limit=100&offset={offset}"
+                    "&active=true&closed=false&order=volume&ascending=false"
+                )
                 resp = self._fetch_json(url)
                 if not resp:
                     break
 
-                # Paginated dict: {"data": [...], "next_cursor": "...", "count": N}
-                if isinstance(resp, dict):
+                if isinstance(resp, list):
+                    page_data = resp
+                elif isinstance(resp, dict):
                     page_data = resp.get("data", resp.get("markets", []))
-                    raw_markets.extend(page_data)
-                    next_cursor = resp.get("next_cursor", "")
-                    pages_fetched += 1
-                    if not next_cursor or next_cursor == "LTE=":  # "LTE=" = end of pages
-                        break
-                elif isinstance(resp, list):
-                    raw_markets.extend(resp)
-                    break
                 else:
                     break
 
-        except Exception as e:
-            logger.debug(f"CLOB markets fetch error: {e}")
+                if not page_data:
+                    break
 
-        # --- Fallback: Gamma API (simpler, non-paginated) ---
+                raw_markets.extend(page_data)
+                pages_fetched += 1
+                if len(page_data) < 100:
+                    break
+                offset += 100
+
+        except Exception as e:
+            logger.debug(f"Gamma markets fetch error: {e}")
+
+        # --- Fallback: CLOB paginated endpoint ---
         if not raw_markets:
             try:
-                gamma_url = f"{self.GAMMA_API}/markets?limit=100&active=true&closed=false"
-                resp = self._fetch_json(gamma_url)
-                if isinstance(resp, list):
-                    raw_markets = resp
-                elif isinstance(resp, dict):
-                    raw_markets = resp.get("markets", resp.get("data", []))
+                next_cursor = ""
+                pages_fetched = 0
+                max_pages = max(1, min(10, (self.max_markets_per_scan + 99) // 100 + 1))
+
+                while pages_fetched < max_pages:
+                    url = f"{self.CLOB_API}/markets?limit=100&active=true"
+                    if next_cursor:
+                        url += f"&next_cursor={next_cursor}"
+
+                    resp = self._fetch_json(url)
+                    if not resp:
+                        break
+
+                    if isinstance(resp, dict):
+                        page_data = resp.get("data", resp.get("markets", []))
+                        raw_markets.extend(page_data)
+                        next_cursor = resp.get("next_cursor", "")
+                        pages_fetched += 1
+                        if not next_cursor or next_cursor == "LTE=":
+                            break
+                    elif isinstance(resp, list):
+                        raw_markets.extend(resp)
+                        break
+                    else:
+                        break
             except Exception as e:
-                logger.debug(f"Gamma markets fetch error: {e}")
+                logger.debug(f"CLOB markets fetch error: {e}")
 
         return raw_markets
-
     def scan_markets(self, force_refresh: bool = False) -> List[PolymarketMarket]:
         """
         Fetch active markets from Polymarket.
@@ -381,7 +400,18 @@ class PolymarketScanner:
 
                 # Get outcomes and current prices
                 outcomes = market_data.get("outcomes", [])
+                if isinstance(outcomes, str):
+                    try:
+                        outcomes = json.loads(outcomes)
+                    except json.JSONDecodeError:
+                        outcomes = [outcomes] if outcomes else []
+
                 tokens = market_data.get("tokens", [])
+                if isinstance(tokens, str):
+                    try:
+                        tokens = json.loads(tokens)
+                    except json.JSONDecodeError:
+                        tokens = []
 
                 # Extract current prices from tokens
                 prices = []
@@ -395,20 +425,56 @@ class PolymarketScanner:
                     else:
                         prices.append(0.0)
 
-                # Get volume and liquidity — field names differ between CLOB and Gamma API
+                if not prices:
+                    outcome_prices = (
+                        market_data.get("outcomePrices")
+                        or market_data.get("outcome_prices")
+                        or []
+                    )
+                    if isinstance(outcome_prices, str):
+                        try:
+                            outcome_prices = json.loads(outcome_prices)
+                        except json.JSONDecodeError:
+                            outcome_prices = []
+                    if isinstance(outcome_prices, list):
+                        for price in outcome_prices:
+                            try:
+                                prices.append(float(price))
+                            except (ValueError, TypeError):
+                                prices.append(0.0)
+
+                if not token_ids:
+                    clob_token_ids = (
+                        market_data.get("clobTokenIds")
+                        or market_data.get("clob_token_ids")
+                        or []
+                    )
+                    if isinstance(clob_token_ids, str):
+                        try:
+                            clob_token_ids = json.loads(clob_token_ids)
+                        except json.JSONDecodeError:
+                            clob_token_ids = []
+                    if isinstance(clob_token_ids, list):
+                        token_ids = [str(token_id) for token_id in clob_token_ids if token_id]
+
+                # Get volume and liquidity ? field names differ between CLOB and Gamma API
                 volume_24h = (
                     market_data.get("volume_24hr")
                     or market_data.get("volume_24h")
+                    or market_data.get("volume24hr")
+                    or market_data.get("volume24hrClob")
+                    or market_data.get("volumeClob")
+                    or market_data.get("volumeNum")
                     or market_data.get("volume")
                     or 0
                 )
                 liquidity = (
                     market_data.get("liquidity")
                     or market_data.get("liquidityNum")
+                    or market_data.get("liquidityClob")
                     or market_data.get("total_liquidity")
                     or 0
                 )
-
                 try:
                     volume_24h = float(volume_24h)
                     liquidity = float(liquidity)

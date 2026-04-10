@@ -19,6 +19,20 @@ def _raw_market(mid: str, title: str, volume: float, liquidity: float):
     }
 
 
+def _gamma_market(mid: str, title: str, volume: str, liquidity: str):
+    return {
+        "conditionId": mid,
+        "question": title,
+        "description": "",
+        "outcomes": '["Yes","No"]',
+        "outcomePrices": '["0.61","0.39"]',
+        "clobTokenIds": f'["{mid}-yes","{mid}-no"]',
+        "volumeNum": volume,
+        "liquidityNum": liquidity,
+        "category": "crypto",
+    }
+
+
 def test_scan_markets_filters_and_caps_top_markets(monkeypatch):
     scanner = PolymarketScanner(
         config={
@@ -53,7 +67,10 @@ def test_fetch_raw_markets_page_budget_scales_with_market_cap(monkeypatch):
 
     def _fake_fetch_json(_url: str):
         calls["n"] += 1
-        return {"data": [{"condition_id": f"m{calls['n']}"}], "next_cursor": "NEXT"}
+        return [
+            {"condition_id": f"m{calls['n']}-{i}"}
+            for i in range(100)
+        ]
 
     monkeypatch.setattr(scanner, "_fetch_json", _fake_fetch_json)
     scanner._fetch_raw_markets()
@@ -63,6 +80,32 @@ def test_fetch_raw_markets_page_budget_scales_with_market_cap(monkeypatch):
     calls["n"] = 0
     scanner._fetch_raw_markets()
     assert calls["n"] == 4  # (250 + 99) // 100 + 1
+
+
+def test_scan_markets_parses_gamma_market_string_fields(monkeypatch):
+    scanner = PolymarketScanner(
+        config={
+            "min_volume_threshold": 1000.0,
+            "min_liquidity_threshold": 500.0,
+            "max_markets_per_scan": 5,
+        }
+    )
+    monkeypatch.setattr(
+        scanner,
+        "_fetch_raw_markets",
+        lambda: [_gamma_market("m1", "Will Bitcoin close above 120k?", "12000.5", "7500.25")],
+    )
+
+    markets = scanner.scan_markets()
+
+    assert len(markets) == 1
+    market = markets[0]
+    assert market.market_id == "m1"
+    assert market.token_id == "m1-yes"
+    assert market.current_prices == [0.61, 0.39]
+    assert market.outcomes == ["Yes", "No"]
+    assert market.volume_24h == 12000.5
+    assert market.liquidity == 7500.25
 
 
 def test_get_market_sentiment_reuses_recent_empty_scan_without_refetch(monkeypatch):
