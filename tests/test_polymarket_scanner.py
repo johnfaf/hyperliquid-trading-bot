@@ -1,3 +1,5 @@
+import logging
+
 from src.data.polymarket_scanner import PolymarketScanner
 
 
@@ -61,3 +63,52 @@ def test_fetch_raw_markets_page_budget_scales_with_market_cap(monkeypatch):
     calls["n"] = 0
     scanner._fetch_raw_markets()
     assert calls["n"] == 4  # (250 + 99) // 100 + 1
+
+
+def test_get_market_sentiment_reuses_recent_empty_scan_without_refetch(monkeypatch):
+    scanner = PolymarketScanner(
+        config={
+            "min_volume_threshold": 10_000.0,
+            "min_liquidity_threshold": 5_000.0,
+            "scan_interval_seconds": 180,
+        }
+    )
+    calls = {"n": 0}
+
+    def _fake_fetch():
+        calls["n"] += 1
+        return [
+            _raw_market("m1", "Will Bitcoin close above 120k?", 4000.0, 3000.0),
+        ]
+
+    monkeypatch.setattr(scanner, "_fetch_raw_markets", _fake_fetch)
+
+    markets = scanner.scan_markets()
+    sentiment = scanner.get_market_sentiment()
+
+    assert markets == []
+    assert calls["n"] == 1
+    assert sentiment["sentiment"] == "neutral"
+    assert sentiment["markets_analyzed"] == 0
+
+
+def test_generate_signals_logs_info_when_markets_filtered_out(monkeypatch, caplog):
+    scanner = PolymarketScanner(
+        config={
+            "min_volume_threshold": 10_000.0,
+            "min_liquidity_threshold": 5_000.0,
+            "scan_interval_seconds": 180,
+        }
+    )
+    monkeypatch.setattr(
+        scanner,
+        "_fetch_raw_markets",
+        lambda: [_raw_market("m1", "Will Bitcoin close above 120k?", 4000.0, 3000.0)],
+    )
+
+    with caplog.at_level(logging.INFO):
+        signals = scanner.generate_signals()
+
+    assert signals == []
+    assert "No Polymarket markets passed filters" in caplog.text
+    assert "No markets found in scan" not in caplog.text

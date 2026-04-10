@@ -193,10 +193,17 @@ class PolymarketScanner:
         # Statistics
         self._scan_count = 0
         self._last_scan_time: Optional[datetime] = None
+        self._last_scan_attempt_ts: float = 0.0
+        self._last_raw_market_count = 0
+        self._last_filtered_market_count = 0
         self._signals_generated = 0
         self._markets_tracked = 0
         self._crypto_markets_found = 0
         self._movements_detected = 0
+        self._scan_cache_window_s = max(
+            30.0,
+            min(float(self.cache_ttl_minutes) * 60.0, float(self.scan_interval_seconds)),
+        )
 
         logger.info(f"PolymarketScanner initialized with cache TTL={self.cache_ttl_minutes}min, "
                    f"rate_limit={self.rate_limit_delay}s")
@@ -318,7 +325,7 @@ class PolymarketScanner:
 
         return raw_markets
 
-    def scan_markets(self) -> List[PolymarketMarket]:
+    def scan_markets(self, force_refresh: bool = False) -> List[PolymarketMarket]:
         """
         Fetch active markets from Polymarket.
         Filter for crypto-related markets and major macro markets.
@@ -328,10 +335,25 @@ class PolymarketScanner:
         """
         logger.debug("Scanning Polymarket markets...")
 
+        now = time.time()
+        if (
+            not force_refresh
+            and self._last_scan_attempt_ts
+            and (now - self._last_scan_attempt_ts) < self._scan_cache_window_s
+        ):
+            return list(self._market_cache.values())
+
+        self._last_scan_attempt_ts = now
+        self._last_scan_time = datetime.now(timezone.utc)
         raw_markets = self._fetch_raw_markets()
+        self._last_raw_market_count = len(raw_markets)
 
         if not raw_markets:
             logger.warning("Failed to fetch markets from Polymarket")
+            self._last_filtered_market_count = 0
+            self._markets_tracked = 0
+            self._crypto_markets_found = 0
+            self._market_cache = {}
             return []
 
         enriched = []
@@ -435,6 +457,7 @@ class PolymarketScanner:
             reverse=True,
         )
         capped = filtered[: self.max_markets_per_scan]
+        self._last_filtered_market_count = len(filtered)
 
         self._markets_tracked = len(capped)
         self._crypto_markets_found = sum(
@@ -669,14 +692,21 @@ class PolymarketScanner:
             }
         """
         self._scan_count += 1
-        self._last_scan_time = datetime.now(timezone.utc)
-
         logger.info(f"Generating Polymarket signals (scan #{self._scan_count})...")
 
         # Step 1: Scan markets
         markets = self.scan_markets()
         if not markets:
-            logger.warning("No markets found in scan")
+            if self._last_raw_market_count > 0:
+                logger.info(
+                    "No Polymarket markets passed filters "
+                    "(raw=%d, min_volume=$%.0f, min_liquidity=$%.0f)",
+                    self._last_raw_market_count,
+                    self.min_volume_threshold,
+                    self.min_liquidity_threshold,
+                )
+            else:
+                logger.info("No Polymarket markets available from upstream scan")
             return []
 
         # Step 2: Detect odds movements
@@ -744,7 +774,13 @@ class PolymarketScanner:
                 "bearish_probability": float,
             }
         """
-        if not self._market_cache:
+        if (
+            not self._market_cache
+            and (
+                not self._last_scan_attempt_ts
+                or (time.time() - self._last_scan_attempt_ts) >= self._scan_cache_window_s
+            )
+        ):
             self.scan_markets()
 
         # Find crypto-relevant markets with price data
