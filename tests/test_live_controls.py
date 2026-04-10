@@ -954,6 +954,58 @@ def test_mirror_executed_trades_logs_warning_for_insufficient_margin(monkeypatch
     assert "live copy failed" not in caplog.text.lower()
 
 
+def test_mirror_executed_trades_logs_warning_for_guardrail_skip(monkeypatch, caplog):
+    class FakeLiveTrader:
+        def __init__(self):
+            self.executed = []
+            self.max_order_usd = 25.0
+            self.min_order_usd = 11.0
+
+        def is_live_enabled(self):
+            return True
+
+        def is_deployable(self):
+            return True
+
+        def get_account_value(self):
+            return 250.0
+
+        def execute_signal(self, signal, bypass_firewall=False):
+            self.executed.append((signal.coin, signal.side.value, bypass_firewall))
+            return None  # guardrail skip path (e.g., source/day cap hit)
+
+    monkeypatch.setattr("src.core.live_execution.db.get_paper_account", lambda: {"balance": 10000.0})
+    monkeypatch.setattr("src.core.live_execution.get_all_mids", lambda: {"PAXG": "4734.45"})
+
+    trader = FakeLiveTrader()
+    container = type("Container", (), {"live_trader": trader})()
+    executed = [
+        signal_from_execution_dict(
+            {
+                "coin": "PAXG",
+                "side": "long",
+                "confidence": 0.63,
+                "entry_price": 4734.45,
+                "size": 0.04,
+                "leverage": 5,
+                "strategy_type": "mirror_test",
+            }
+        )
+    ]
+
+    with caplog.at_level(logging.WARNING):
+        mirror_executed_trades_to_live(
+            container,
+            executed,
+            success_label="LIVE COPY",
+            skip_label="SKIP",
+        )
+
+    assert trader.executed == [("PAXG", "long", True)]
+    assert "blocked by live guardrails" in caplog.text.lower()
+    assert "live copy failed" not in caplog.text.lower()
+
+
 def test_execute_options_flow_paper_trade_preserves_precise_stops(monkeypatch):
     opened = {}
     price = 0.01234567

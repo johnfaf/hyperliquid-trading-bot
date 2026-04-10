@@ -447,7 +447,14 @@ def mirror_executed_trades_to_live(
                         live_signal.side.value,
                     )
                 else:
-                    if _is_insufficient_margin_rejection(live_result):
+                    if live_result is None:
+                        logger.warning(
+                            "%s skipped: %s %s blocked by live guardrails (no execution result)",
+                            success_label,
+                            live_signal.coin,
+                            live_signal.side.value,
+                        )
+                    elif _is_insufficient_margin_rejection(live_result):
                         logger.warning(
                             "%s skipped due to insufficient margin: %s %s -> %s",
                             success_label,
