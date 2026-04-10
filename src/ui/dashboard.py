@@ -33,13 +33,31 @@ logger.addHandler(logging.NullHandler())
 _options_scanner = None
 
 # ─── Dashboard Authentication ─────────────────────────────────
-# Set DASHBOARD_AUTH_TOKEN to require Bearer-token authentication on all
-# API endpoints (except /api/health which is left open for Railway probes).
-# When the token is not set, all endpoints are unauthenticated.
-_DASHBOARD_AUTH_TOKEN: str = os.environ.get("DASHBOARD_AUTH_TOKEN", "").strip()
-
 # Paths that are always open (health probes, Railway readiness checks)
 _AUTH_EXEMPT_PATHS = {"/api/health"}
+
+
+def _dashboard_auth_token() -> str:
+    """Read the dashboard auth token lazily so env changes apply immediately."""
+    return os.environ.get("DASHBOARD_AUTH_TOKEN", "").strip()
+
+
+def _truthy_env(name: str, default: str = "false") -> bool:
+    return os.environ.get(name, default).strip().lower() in {"1", "true", "yes"}
+
+
+def _is_hosted_dashboard_environment() -> bool:
+    """Detect hosted runtimes that need a public bind host."""
+    return any(
+        os.environ.get(name, "").strip()
+        for name in (
+            "RAILWAY_PUBLIC_DOMAIN",
+            "RAILWAY_STATIC_URL",
+            "RENDER_EXTERNAL_URL",
+            "FLY_APP_NAME",
+            "K_SERVICE",
+        )
+    )
 
 
 def _resolve_dashboard_host() -> str:
@@ -47,16 +65,44 @@ def _resolve_dashboard_host() -> str:
     explicit = os.environ.get("DASHBOARD_HOST", "").strip()
     if explicit:
         return explicit
-    public = os.environ.get("DASHBOARD_BIND_PUBLIC", "false").strip().lower() in {
-        "1", "true", "yes"
-    }
-    if public and not _DASHBOARD_AUTH_TOKEN:
+    public = _truthy_env("DASHBOARD_BIND_PUBLIC")
+    if not public and _is_hosted_dashboard_environment():
+        public = True
+    if public and not _dashboard_auth_token():
         logger.warning(
-            "DASHBOARD_BIND_PUBLIC=true but DASHBOARD_AUTH_TOKEN is not set. "
+            "Dashboard is binding publicly but DASHBOARD_AUTH_TOKEN is not set. "
             "The dashboard will be publicly accessible WITHOUT authentication. "
             "Set DASHBOARD_AUTH_TOKEN to secure it."
         )
     return "0.0.0.0" if public else "127.0.0.1"
+
+
+def _resolve_dashboard_base_url(host: str, port: int) -> str:
+    """Return the best URL to present to the operator for dashboard access."""
+    explicit = os.environ.get("DASHBOARD_PUBLIC_URL", "").strip().rstrip("/")
+    if explicit:
+        return explicit
+
+    railway_domain = os.environ.get("RAILWAY_PUBLIC_DOMAIN", "").strip()
+    if railway_domain:
+        return f"https://{railway_domain}"
+
+    railway_static = os.environ.get("RAILWAY_STATIC_URL", "").strip().rstrip("/")
+    if railway_static:
+        return railway_static
+
+    render_external = os.environ.get("RENDER_EXTERNAL_URL", "").strip().rstrip("/")
+    if render_external:
+        return render_external
+
+    fly_app = os.environ.get("FLY_APP_NAME", "").strip()
+    if fly_app:
+        return f"https://{fly_app}.fly.dev"
+
+    if host == "0.0.0.0" and not _is_hosted_dashboard_environment():
+        return f"http://127.0.0.1:{port}"
+
+    return f"http://{host}:{port}"
 
 
 def _get_db():
@@ -1102,18 +1148,19 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def _check_auth(self) -> bool:
         """Return True if request is authenticated or auth is not required."""
-        if not _DASHBOARD_AUTH_TOKEN:
-            return True  # Auth not configured — allow all
+        auth_token = _dashboard_auth_token()
+        if not auth_token:
+            return True  # Auth not configured ? allow all
         parsed = urlparse(self.path)
         if parsed.path in _AUTH_EXEMPT_PATHS:
-            return True  # Health probe — always open
+            return True  # Health probe ? always open
         # Check Authorization header: "Bearer <token>"
         auth_header = self.headers.get("Authorization", "")
-        if auth_header.startswith("Bearer ") and auth_header[7:].strip() == _DASHBOARD_AUTH_TOKEN:
+        if auth_header.startswith("Bearer ") and auth_header[7:].strip() == auth_token:
             return True
         # Check query parameter: ?token=<token>
         qs = parse_qs(parsed.query)
-        if qs.get("token", [None])[0] == _DASHBOARD_AUTH_TOKEN:
+        if qs.get("token", [None])[0] == auth_token:
             return True
         self.send_response(401)
         self.send_header("Content-Type", "application/json")
@@ -1122,7 +1169,6 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(b'{"error": "unauthorized", "hint": "Set Authorization: Bearer <token> header"}')
         return False
-
     def do_GET(self):
         if not self._check_auth():
             return
@@ -1647,16 +1693,19 @@ def start_dashboard(port=None, options_scanner=None):
     if options_scanner:
         set_options_scanner(options_scanner)
 
+
     port = port or int(os.environ.get("PORT", 8080))
     host = _resolve_dashboard_host()
+    base_url = _resolve_dashboard_base_url(host, port)
     server = HTTPServer((host, port), DashboardHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
-    logger.info("Dashboard running at http://%s:%d", host, port)
-    logger.info("  Main dashboard:    http://%s:%d/", host, port)
-    logger.info("  Options flow:      http://%s:%d/options", host, port)
-    logger.info("  Backtest:          http://%s:%d/backtest", host, port)
-    logger.info("  Stress test:       http://%s:%d/stress", host, port)
+    logger.info("Dashboard bind address: http://%s:%d", host, port)
+    logger.info("Dashboard running at %s", base_url)
+    logger.info("  Main dashboard:    %s/", base_url)
+    logger.info("  Options flow:      %s/options", base_url)
+    logger.info("  Backtest:          %s/backtest", base_url)
+    logger.info("  Stress test:       %s/stress", base_url)
     return server
 
 
@@ -1672,6 +1721,8 @@ if __name__ == "__main__":
     init_db()
     port = int(os.environ.get("PORT", 8080))
     host = _resolve_dashboard_host()
+    base_url = _resolve_dashboard_base_url(host, port)
     print(f"Starting dashboard on {host}:{port}...")
+    print(f"Dashboard URL: {base_url}/")
     server = HTTPServer((host, port), DashboardHandler)
     server.serve_forever()

@@ -63,3 +63,46 @@ def test_build_runtime_health_snapshot_includes_subsystems_and_safety(monkeypatc
     assert snapshot["firewall"]["top_rejection_reason"] == "rejected_confidence"
     assert snapshot["live_trader"]["kill_switch_active"] is True
     assert snapshot["live_trader"]["source_orders_today"] == {"copy_trade:0xabc": 1}
+
+
+def test_dashboard_host_defaults_to_localhost_when_not_hosted(monkeypatch):
+    for name in (
+        "DASHBOARD_HOST",
+        "DASHBOARD_BIND_PUBLIC",
+        "DASHBOARD_PUBLIC_URL",
+        "DASHBOARD_AUTH_TOKEN",
+        "RAILWAY_PUBLIC_DOMAIN",
+        "RAILWAY_STATIC_URL",
+        "RENDER_EXTERNAL_URL",
+        "FLY_APP_NAME",
+        "K_SERVICE",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    assert dashboard._resolve_dashboard_host() == "127.0.0.1"
+    assert dashboard._resolve_dashboard_base_url("127.0.0.1", 8080) == "http://127.0.0.1:8080"
+
+
+def test_dashboard_host_auto_binds_publicly_on_railway(monkeypatch):
+    for name in (
+        "DASHBOARD_HOST",
+        "DASHBOARD_BIND_PUBLIC",
+        "DASHBOARD_PUBLIC_URL",
+        "DASHBOARD_AUTH_TOKEN",
+        "RAILWAY_STATIC_URL",
+        "RENDER_EXTERNAL_URL",
+        "FLY_APP_NAME",
+        "K_SERVICE",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("RAILWAY_PUBLIC_DOMAIN", "bot.up.railway.app")
+
+    assert dashboard._resolve_dashboard_host() == "0.0.0.0"
+    assert dashboard._resolve_dashboard_base_url("0.0.0.0", 8080) == "https://bot.up.railway.app"
+
+
+def test_dashboard_public_url_override_wins(monkeypatch):
+    monkeypatch.setenv("DASHBOARD_PUBLIC_URL", "https://dash.example.com/")
+    monkeypatch.setenv("RAILWAY_PUBLIC_DOMAIN", "bot.up.railway.app")
+
+    assert dashboard._resolve_dashboard_base_url("0.0.0.0", 8080) == "https://dash.example.com"
