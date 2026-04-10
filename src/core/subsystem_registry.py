@@ -258,6 +258,9 @@ def build_subsystems(
             lambda: PolymarketScanner(
                 config={
                     "min_volume_threshold": float(getattr(config, "POLYMARKET_MIN_VOLUME", 10_000.0)),
+                    "min_liquidity_threshold": float(
+                        getattr(config, "POLYMARKET_MIN_LIQUIDITY", 1_000.0)
+                    ),
                     "max_markets_per_scan": int(
                         getattr(config, "POLYMARKET_MAX_MARKETS_PER_SCAN", 100)
                     ),

@@ -78,7 +78,7 @@ def test_get_market_sentiment_reuses_recent_empty_scan_without_refetch(monkeypat
     def _fake_fetch():
         calls["n"] += 1
         return [
-            _raw_market("m1", "Will Bitcoin close above 120k?", 4000.0, 3000.0),
+            _raw_market("m1", "Will Bitcoin close above 120k?", 0.0, 0.0),
         ]
 
     monkeypatch.setattr(scanner, "_fetch_raw_markets", _fake_fetch)
@@ -103,7 +103,7 @@ def test_generate_signals_logs_info_when_markets_filtered_out(monkeypatch, caplo
     monkeypatch.setattr(
         scanner,
         "_fetch_raw_markets",
-        lambda: [_raw_market("m1", "Will Bitcoin close above 120k?", 4000.0, 3000.0)],
+        lambda: [_raw_market("m1", "Will Bitcoin close above 120k?", 0.0, 0.0)],
     )
 
     with caplog.at_level(logging.INFO):
@@ -112,3 +112,30 @@ def test_generate_signals_logs_info_when_markets_filtered_out(monkeypatch, caplo
     assert signals == []
     assert "No Polymarket markets passed filters" in caplog.text
     assert "No markets found in scan" not in caplog.text
+
+
+def test_scan_markets_falls_back_to_active_crypto_markets_when_strict_filters_zero_out(monkeypatch, caplog):
+    scanner = PolymarketScanner(
+        config={
+            "min_volume_threshold": 10_000.0,
+            "min_liquidity_threshold": 5_000.0,
+            "max_markets_per_scan": 2,
+        }
+    )
+    monkeypatch.setattr(
+        scanner,
+        "_fetch_raw_markets",
+        lambda: [
+            _raw_market("m1", "Will Bitcoin close above 120k?", 4000.0, 3000.0),
+            _raw_market("m2", "Will Ethereum ETF be approved?", 2500.0, 500.0),
+            _raw_market("m3", "Will Solana hit new ATH?", 1500.0, 250.0),
+        ],
+    )
+
+    with caplog.at_level(logging.INFO):
+        markets = scanner.scan_markets()
+
+    assert [market.market_id for market in markets] == ["m1", "m2"]
+    assert scanner._last_filtered_market_count == 0
+    assert scanner._markets_tracked == 2
+    assert "falling back to 2 active crypto markets" in caplog.text

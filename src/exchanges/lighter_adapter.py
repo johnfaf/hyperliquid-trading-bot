@@ -30,7 +30,6 @@ import time
 import logging
 import requests
 from typing import Dict, List, Optional
-from datetime import datetime, timedelta
 from enum import Enum
 
 from .base_adapter import (
@@ -260,7 +259,6 @@ class LighterAdapter(BaseExchangeAdapter):
             # If symbol still empty, try to construct from quote/base fields
             if not symbol:
                 base = m.get("base", m.get("baseAsset", ""))
-                quote = m.get("quote", m.get("quoteAsset", ""))
                 if base:
                     symbol = base
 
@@ -536,37 +534,74 @@ class LighterAdapter(BaseExchangeAdapter):
     # ─── Required: Market Data ─────────────────────────────
 
     def get_market_data(self, coins: Optional[List[str]] = None) -> List[NormalizedMarketData]:
-        """Fetch market data from orderBookDetails for each market."""
+        """Fetch market data from the bulk orderBookDetails snapshot."""
         if self.state == VenueState.DOWN:
             return []
 
         self._ensure_markets_loaded()
+        details = self._get("/orderBookDetails", quiet=True)
+        if not details:
+            return []
+
+        detail_rows = []
+        if isinstance(details, dict):
+            for key in ("order_book_details", "orderBookDetails", "data"):
+                rows = details.get(key)
+                if isinstance(rows, list):
+                    detail_rows.extend(item for item in rows if isinstance(item, dict))
+            spot_rows = details.get("spot_order_book_details")
+            if isinstance(spot_rows, list):
+                detail_rows.extend(item for item in spot_rows if isinstance(item, dict))
+        elif isinstance(details, list):
+            detail_rows = [item for item in details if isinstance(item, dict)]
+
+        if not detail_rows:
+            return []
+
+        detail_by_market_id: Dict[str, Dict] = {}
+        for row in detail_rows:
+            market_id = str(
+                row.get("market_id")
+                or row.get("order_book_index")
+                or row.get("order_book_id")
+                or row.get("id")
+                or ""
+            )
+            if market_id:
+                detail_by_market_id[market_id] = row
 
         results = []
         for market_id, coin in self._symbol_map.items():
             if coins and coin not in coins:
                 continue
 
-            details = self._get("/orderBookDetails",
-                               params={"order_book_id": market_id},
-                               quiet=True)
-            if not details:
+            row = detail_by_market_id.get(str(market_id))
+            if not row:
                 continue
 
-            # Parse orderbook details — try various field name conventions
-            mid = float(details.get("mid_price", 0) or details.get("midPrice", 0) or 0)
-            funding = float(details.get("funding_rate", 0) or
-                           details.get("fundingRate", 0) or 0)
-            oi = float(details.get("open_interest", 0) or
-                      details.get("openInterest", 0) or 0)
-            vol = float(details.get("volume_24h", 0) or
-                       details.get("volume24h", 0) or 0)
-            best_bid = float(details.get("best_bid", 0) or
-                            details.get("bestBid", 0) or 0)
-            best_ask = float(details.get("best_ask", 0) or
-                            details.get("bestAsk", 0) or 0)
+            mid = float(
+                row.get("mid_price", 0)
+                or row.get("midPrice", 0)
+                or row.get("mark_price", 0)
+                or row.get("markPrice", 0)
+                or row.get("index_price", 0)
+                or row.get("indexPrice", 0)
+                or row.get("last_trade_price", 0)
+                or row.get("lastTradePrice", 0)
+                or 0
+            )
+            funding = float(row.get("funding_rate", 0) or row.get("fundingRate", 0) or 0)
+            oi = float(row.get("open_interest", 0) or row.get("openInterest", 0) or 0)
+            vol = float(
+                row.get("daily_quote_token_volume", 0)
+                or row.get("volume_24h", 0)
+                or row.get("volume24h", 0)
+                or row.get("volume", 0)
+                or 0
+            )
+            best_bid = float(row.get("best_bid", 0) or row.get("bestBid", 0) or 0)
+            best_ask = float(row.get("best_ask", 0) or row.get("bestAsk", 0) or 0)
 
-            # Calculate spread in basis points
             spread_bps = 0.0
             if best_bid > 0 and best_ask > 0 and mid > 0:
                 spread_bps = (best_ask - best_bid) / mid * 10000
@@ -578,10 +613,18 @@ class LighterAdapter(BaseExchangeAdapter):
                 funding_rate=funding,
                 open_interest=oi,
                 volume_24h=vol,
-                mark_price=float(details.get("mark_price", 0) or
-                                details.get("markPrice", mid) or mid),
-                index_price=float(details.get("index_price", 0) or
-                                 details.get("indexPrice", 0) or 0),
+                mark_price=float(
+                    row.get("mark_price", 0)
+                    or row.get("markPrice", 0)
+                    or row.get("last_trade_price", 0)
+                    or mid
+                ),
+                index_price=float(
+                    row.get("index_price", 0)
+                    or row.get("indexPrice", 0)
+                    or row.get("last_trade_price", 0)
+                    or mid
+                ),
                 best_bid=best_bid,
                 best_ask=best_ask,
                 spread_bps=spread_bps,

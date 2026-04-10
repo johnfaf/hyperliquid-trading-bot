@@ -160,7 +160,7 @@ class PolymarketScanner:
         # Cache configuration
         self.cache_ttl_minutes = self.config.get("cache_ttl_minutes", 5)
         self.min_volume_threshold = self.config.get("min_volume_threshold", 10000)  # $10k
-        self.min_liquidity_threshold = self.config.get("min_liquidity_threshold", 5000)  # $5k
+        self.min_liquidity_threshold = self.config.get("min_liquidity_threshold", 1000)  # $1k
 
         # Detection thresholds
         self.odds_movement_threshold_1h = self.config.get("odds_movement_1h", 0.005)  # 0.5% (for 3-min scans)
@@ -445,10 +445,16 @@ class PolymarketScanner:
                 logger.debug(f"Error parsing market: {e}")
                 continue
 
-        # Filter low-liquidity noise before caching/processing.
-        filtered = [
+        # Prefer crypto-relevant markets and only fall back to relaxed filtering
+        # when strict thresholds would otherwise leave the forecaster blind.
+        crypto_markets = [
             market
             for market in enriched
+            if self._is_crypto_market(market.title, market.description, market.category)
+        ]
+        filtered = [
+            market
+            for market in crypto_markets
             if market.volume_24h >= self.min_volume_threshold
             and market.liquidity >= self.min_liquidity_threshold
         ]
@@ -457,23 +463,44 @@ class PolymarketScanner:
             reverse=True,
         )
         capped = filtered[: self.max_markets_per_scan]
+        fallback_used = False
+        if not capped and crypto_markets:
+            fallback_used = True
+            relaxed = [
+                market
+                for market in crypto_markets
+                if market.volume_24h > 0 or market.liquidity > 0
+            ]
+            relaxed.sort(
+                key=lambda market: (market.volume_24h, market.liquidity),
+                reverse=True,
+            )
+            capped = relaxed[: self.max_markets_per_scan]
+            if capped:
+                logger.info(
+                    "Polymarket strict filters produced 0 markets; falling back to %d active crypto markets "
+                    "(strict min_volume=$%.0f, min_liquidity=$%.0f)",
+                    len(capped),
+                    self.min_volume_threshold,
+                    self.min_liquidity_threshold,
+                )
         self._last_filtered_market_count = len(filtered)
 
         self._markets_tracked = len(capped)
-        self._crypto_markets_found = sum(
-            1 for market in capped if self._is_crypto_market(market.title, market.description, market.category)
-        )
+        self._crypto_markets_found = len(capped)
 
         logger.info(
             "Scanned %d raw markets, parsed %d, liquidity-filtered %d, capped to %d "
-            "(crypto in cap=%d, min_volume=$%.0f, min_liquidity=$%.0f)",
+            "(crypto parsed=%d, crypto in cap=%d, min_volume=$%.0f, min_liquidity=$%.0f, fallback=%s)",
             len(raw_markets),
             len(enriched),
             len(filtered),
             len(capped),
+            len(crypto_markets),
             self._crypto_markets_found,
             self.min_volume_threshold,
             self.min_liquidity_threshold,
+            fallback_used,
         )
 
         # Cache only markets that survive liquidity and top-N filters.

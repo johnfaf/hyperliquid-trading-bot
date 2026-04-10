@@ -287,6 +287,9 @@ FUNDING_POSITIVE_THRESHOLD = float(os.environ.get("FUNDING_POSITIVE_THRESHOLD", 
 POLYMARKET_ENABLED = os.environ.get("POLYMARKET_ENABLED", "true").lower() in ("true", "1", "yes")
 POLYMARKET_SCAN_INTERVAL = int(os.environ.get("POLYMARKET_SCAN_INTERVAL", 180))  # 3 minutes
 POLYMARKET_MIN_VOLUME = float(os.environ.get("POLYMARKET_MIN_VOLUME", 10000))    # $10k min volume
+POLYMARKET_MIN_LIQUIDITY = float(
+    os.environ.get("POLYMARKET_MIN_LIQUIDITY", 1000)
+)  # $1k min liquidity
 POLYMARKET_MAX_MARKETS_PER_SCAN = int(
     os.environ.get("POLYMARKET_MAX_MARKETS_PER_SCAN", 100)
 )
@@ -398,6 +401,7 @@ def _validate_config_bounds() -> None:
         ("FUNDING_NEGATIVE_THRESHOLD", -1.0, 0.0, -0.001),
         ("FUNDING_POSITIVE_THRESHOLD", 0.0, 1.0, 0.003),
         ("POLYMARKET_MIN_VOLUME", 0.0, 1e9, 10_000.0),
+        ("POLYMARKET_MIN_LIQUIDITY", 0.0, 1e9, 1_000.0),
         ("LIVE_CANARY_MAX_ORDER_USD", 10.0, 1_000_000.0, 25.0),
         ("LIVE_CANARY_MAX_SIGNALS_PER_DAY", 1, 100_000, 25),
         ("LIVE_MAX_ORDERS_PER_SOURCE_PER_DAY", 0, 100_000, 0),
