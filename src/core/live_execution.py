@@ -411,8 +411,9 @@ def mirror_executed_trades_to_live(
         selected = []
         used_margin = 0.0
 
-        # Highest-confidence mirrors consume margin first.
-        for item in sorted(candidates, key=lambda x: float(getattr(x["signal"], "confidence", 0.0) or 0.0), reverse=True):
+        # Keep the paper execution order to maximize live-vs-paper parity when
+        # margin/canary caps force us to drop some mirrors.
+        for item in candidates:
             projected = used_margin + item["margin"]
             if margin_budget > 0 and projected > margin_budget:
                 logger.warning(

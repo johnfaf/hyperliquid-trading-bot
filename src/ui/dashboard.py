@@ -481,6 +481,8 @@ def _build_runtime_health_snapshot() -> Dict:
                 "daily_pnl": stats.get("daily_pnl"),
                 "daily_pnl_limit": stats.get("daily_pnl_limit"),
                 "entry_signals_today": stats.get("total_entry_signals_today"),
+                "max_orders_per_source_per_day": stats.get("max_orders_per_source_per_day"),
+                "source_orders_today": stats.get("source_orders_today", {}),
             }
     except Exception:
         pass
@@ -1005,11 +1007,21 @@ function renderRuntimeHealth(runtime) {
   const staleList = (runtime.stale_subsystems || []).slice(0, 8).join(', ') || 'none';
   const killReason = live.kill_switch_reason ? `<span class="red">${live.kill_switch_reason}</span>` : 'none';
   const topReject = fw.top_rejection_reason || 'none';
+  const sourceUsage = live.source_orders_today || {};
+  const sourceCap = Number(live.max_orders_per_source_per_day || 0);
+  const sourceUsageSummary = Object.keys(sourceUsage).length
+    ? Object.entries(sourceUsage)
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 5)
+        .map(([key, used]) => sourceCap > 0 ? `${key}: ${used}/${sourceCap}` : `${key}: ${used}`)
+        .join(', ')
+    : 'none';
   document.getElementById('runtime-health-detail').innerHTML =
     `<div>At-risk: <strong>${atRiskList}</strong></div>` +
     `<div>Stale: <strong>${staleList}</strong></div>` +
     `<div>Firewall top reject: <strong>${topReject}</strong></div>` +
-    `<div>Kill-switch reason: ${killReason}</div>`;
+    `<div>Kill-switch reason: ${killReason}</div>` +
+    `<div>Live source usage: <strong>${sourceUsageSummary}</strong></div>`;
 }
 
 function renderArena(arena) {

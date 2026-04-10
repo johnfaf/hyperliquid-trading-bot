@@ -1016,8 +1016,17 @@ class LiveTrader:
         source = getattr(signal, "source", None)
         if hasattr(source, "value"):
             source = source.value
-        key = str(source or "unknown").strip().lower()
-        return key or "unknown"
+        key = str(source or "unknown").strip().lower() or "unknown"
+
+        # Copy-trade throughput caps should apply per copied trader, not as one
+        # global "copy_trade" bucket. Otherwise one early fill can starve all
+        # remaining copy signals for the day and create side skew.
+        if key == "copy_trade":
+            trader_address = str(getattr(signal, "trader_address", "") or "").strip().lower()
+            if trader_address:
+                return f"{key}:{trader_address}"
+
+        return key
 
     def _refresh_external_kill_switch(self) -> bool:
         """

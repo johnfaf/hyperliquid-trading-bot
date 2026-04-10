@@ -24,6 +24,8 @@ class _FakeLiveTrader:
             "daily_pnl": -7.5,
             "daily_pnl_limit": 100.0,
             "total_entry_signals_today": 3,
+            "max_orders_per_source_per_day": 2,
+            "source_orders_today": {"copy_trade:0xabc": 1},
         }
 
 
@@ -60,3 +62,4 @@ def test_build_runtime_health_snapshot_includes_subsystems_and_safety(monkeypatc
     assert "live_trader" in snapshot["stale_subsystems"]
     assert snapshot["firewall"]["top_rejection_reason"] == "rejected_confidence"
     assert snapshot["live_trader"]["kill_switch_active"] is True
+    assert snapshot["live_trader"]["source_orders_today"] == {"copy_trade:0xabc": 1}

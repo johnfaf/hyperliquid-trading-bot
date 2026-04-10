@@ -1006,6 +1006,65 @@ def test_mirror_executed_trades_logs_warning_for_guardrail_skip(monkeypatch, cap
     assert "live copy failed" not in caplog.text.lower()
 
 
+def test_mirror_executed_trades_preserves_paper_execution_order(monkeypatch):
+    class FakeLiveTrader:
+        def __init__(self):
+            self.executed = []
+
+        def is_live_enabled(self):
+            return True
+
+        def is_deployable(self):
+            return True
+
+        def get_account_value(self):
+            return 100.0
+
+        def execute_signal(self, signal, bypass_firewall=False):
+            self.executed.append((signal.coin, signal.side.value, bypass_firewall))
+            return {"status": "success"}
+
+    # Keep candidate sizes as supplied so the margin-budget selection is deterministic.
+    monkeypatch.setattr("src.core.live_execution._rescale_size_for_live", lambda trade, trader: trade)
+
+    trader = FakeLiveTrader()
+    container = type("Container", (), {"live_trader": trader})()
+    executed = [
+        signal_from_execution_dict(
+            {
+                "coin": "ETH",
+                "side": "long",
+                "confidence": 0.20,
+                "entry_price": 100.0,
+                "size": 0.60,   # margin $60 at 1x
+                "leverage": 1,
+                "strategy_type": "mirror_test",
+            }
+        ),
+        signal_from_execution_dict(
+            {
+                "coin": "BTC",
+                "side": "short",
+                "confidence": 0.95,
+                "entry_price": 100.0,
+                "size": 0.50,   # margin $50 at 1x
+                "leverage": 1,
+                "strategy_type": "mirror_test",
+            }
+        ),
+    ]
+
+    mirror_executed_trades_to_live(
+        container,
+        executed,
+        success_label="LIVE COPY",
+        skip_label="SKIP",
+    )
+
+    # Margin budget is $95 (95% of $100), so only the first paper trade should mirror.
+    assert trader.executed == [("ETH", "long", True)]
+
+
 def test_execute_options_flow_paper_trade_preserves_precise_stops(monkeypatch):
     opened = {}
     price = 0.01234567
@@ -2585,6 +2644,65 @@ def test_live_trader_source_day_cap_blocks_second_entry(monkeypatch):
     stats = trader.get_stats()
     assert stats["source_orders_today"]["copy_trade"] == 1
     assert stats["max_orders_per_source_per_day"] == 1
+
+
+def test_live_trader_source_day_cap_scopes_copy_trades_per_trader(monkeypatch):
+    class FakeFirewall:
+        def validate(self, signal, **kwargs):
+            return True, "ok"
+
+    monkeypatch.delenv("LIVE_EXTERNAL_KILL_SWITCH", raising=False)
+    monkeypatch.setattr(config, "LIVE_MAX_ORDERS_PER_SOURCE_PER_DAY", 1)
+    monkeypatch.setattr(config, "LIVE_CANARY_MODE", False)
+    monkeypatch.setattr(LiveTrader, "_load_credentials", _fake_live_credentials)
+    monkeypatch.setattr(LiveTrader, "_load_asset_index_map", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "reconcile_positions", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "get_firewall_positions", lambda self: [])
+    monkeypatch.setattr(LiveTrader, "get_account_value", lambda self: 2500.0)
+    monkeypatch.setattr(LiveTrader, "place_market_order", lambda self, *args, **kwargs: {"status": "success"})
+    monkeypatch.setattr(LiveTrader, "update_daily_pnl_from_fills", lambda self: None)
+    monkeypatch.setattr(
+        LiveTrader,
+        "verify_fill",
+        lambda self, *args, **kwargs: {"status": "verified", "size": 0.1},
+    )
+    monkeypatch.setattr(LiveTrader, "_get_mid_price", lambda self, coin: 2000.0 if coin == "ETH" else 60000.0)
+    monkeypatch.setattr(LiveTrader, "place_trigger_order", lambda self, *args, **kwargs: {"status": "success"})
+
+    trader = LiveTrader(firewall=FakeFirewall(), dry_run=False, max_order_usd=1_000_000)
+    first = trader.execute_signal(
+        {
+            "coin": "ETH",
+            "side": "long",
+            "confidence": 0.8,
+            "entry_price": 2000.0,
+            "position_pct": 0.05,
+            "leverage": 2,
+            "size": 0.1,
+            "source": "copy_trade",
+            "trader_address": "0xAAA",
+        }
+    )
+    second = trader.execute_signal(
+        {
+            "coin": "BTC",
+            "side": "long",
+            "confidence": 0.8,
+            "entry_price": 60000.0,
+            "position_pct": 0.05,
+            "leverage": 2,
+            "size": 0.003,
+            "source": "copy_trade",
+            "trader_address": "0xBBB",
+        }
+    )
+
+    assert first is not None and first["status"] == "success"
+    assert second is not None and second["status"] == "success"
+    stats = trader.get_stats()
+    assert stats["source_orders_today"]["copy_trade:0xaaa"] == 1
+    assert stats["source_orders_today"]["copy_trade:0xbbb"] == 1
+    assert stats["total_entry_signals_today"] == 2
 
 
 def test_live_trader_canary_signal_cap_blocks_after_limit(monkeypatch):
