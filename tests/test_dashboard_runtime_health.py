@@ -1,3 +1,4 @@
+import pytest
 from datetime import datetime, timedelta, timezone
 
 from src.core.health_registry import SubsystemHealthRegistry, SubsystemState
@@ -106,3 +107,19 @@ def test_dashboard_public_url_override_wins(monkeypatch):
     monkeypatch.setenv("RAILWAY_PUBLIC_DOMAIN", "bot.up.railway.app")
 
     assert dashboard._resolve_dashboard_base_url("0.0.0.0", 8080) == "https://dash.example.com"
+
+
+def test_hosted_public_dashboard_requires_auth_token(monkeypatch):
+    monkeypatch.setenv("RAILWAY_PUBLIC_DOMAIN", "bot.up.railway.app")
+    monkeypatch.delenv("DASHBOARD_AUTH_TOKEN", raising=False)
+
+    with pytest.raises(RuntimeError, match="DASHBOARD_AUTH_TOKEN"):
+        dashboard._validate_dashboard_auth_configuration("0.0.0.0")
+
+
+def test_local_public_dashboard_can_warn_without_auth_token(monkeypatch):
+    for name in ("RAILWAY_PUBLIC_DOMAIN", "RAILWAY_STATIC_URL", "RENDER_EXTERNAL_URL", "FLY_APP_NAME", "K_SERVICE"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.delenv("DASHBOARD_AUTH_TOKEN", raising=False)
+
+    dashboard._validate_dashboard_auth_configuration("0.0.0.0")

@@ -45,6 +45,7 @@ TRADING_CYCLE_INTERVAL=300         # 5 min (lower for more frequent trading)
 DISCOVERY_CYCLE_INTERVAL=86400     # 24h
 LOG_FORMAT=json                     # structured logs for Railway log viewer
 LIVE_TRADING_ENABLED=false          # leave false until live preflight is complete
+DASHBOARD_AUTH_TOKEN=replace-me     # required for Railway dashboard access
 
 # Rotation shadow mode (recommended before live replacement execution)
 ROTATION_ENGINE_ENABLED=true
@@ -136,6 +137,14 @@ The backup includes: traders, golden wallets, wallet fills, strategies, strategy
 ## 5. Health Check
 
 The Dockerfile configures a health check that pings `http://localhost:8080/api/health` every 30 seconds. Railway marks the service unhealthy after 3 consecutive failures.
+
+The dashboard itself requires `DASHBOARD_AUTH_TOKEN` on Railway. Open it with:
+
+```
+https://<your-railway-domain>/?token=<DASHBOARD_AUTH_TOKEN>
+```
+
+After the first successful request, the browser receives a same-origin auth cookie so the dashboard pages and API actions continue working normally. The health probe remains open on `/api/health`.
 
 Check the Logs tab for:
 

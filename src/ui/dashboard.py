@@ -11,6 +11,7 @@ import os
 import sys
 import sqlite3
 import threading
+from http.cookies import SimpleCookie
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime, timezone
 from typing import Dict
@@ -35,6 +36,7 @@ _options_scanner = None
 # ─── Dashboard Authentication ─────────────────────────────────
 # Paths that are always open (health probes, Railway readiness checks)
 _AUTH_EXEMPT_PATHS = {"/api/health"}
+_AUTH_COOKIE_NAME = "dashboard_auth"
 
 
 def _dashboard_auth_token() -> str:
@@ -68,12 +70,6 @@ def _resolve_dashboard_host() -> str:
     public = _truthy_env("DASHBOARD_BIND_PUBLIC")
     if not public and _is_hosted_dashboard_environment():
         public = True
-    if public and not _dashboard_auth_token():
-        logger.warning(
-            "Dashboard is binding publicly but DASHBOARD_AUTH_TOKEN is not set. "
-            "The dashboard will be publicly accessible WITHOUT authentication. "
-            "Set DASHBOARD_AUTH_TOKEN to secure it."
-        )
     return "0.0.0.0" if public else "127.0.0.1"
 
 
@@ -103,6 +99,24 @@ def _resolve_dashboard_base_url(host: str, port: int) -> str:
         return f"http://127.0.0.1:{port}"
 
     return f"http://{host}:{port}"
+
+
+def _validate_dashboard_auth_configuration(host: str) -> None:
+    """Require auth when the dashboard is publicly exposed from a hosted runtime."""
+    if host != "0.0.0.0":
+        return
+    if _dashboard_auth_token():
+        return
+    if _is_hosted_dashboard_environment():
+        raise RuntimeError(
+            "DASHBOARD_AUTH_TOKEN is required for hosted public dashboard access. "
+            "Set it in Railway Variables, then open the dashboard with ?token=<value>."
+        )
+    logger.warning(
+        "Dashboard is binding publicly but DASHBOARD_AUTH_TOKEN is not set. "
+        "The dashboard will be publicly accessible WITHOUT authentication. "
+        "Set DASHBOARD_AUTH_TOKEN to secure it."
+    )
 
 
 def _get_db():
@@ -1145,22 +1159,45 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
         self.send_header("Pragma", "no-cache")
         self.send_header("Expires", "0")
+        pending_auth_cookie = getattr(self, "_pending_auth_cookie", "")
+        if pending_auth_cookie:
+            secure_attr = "; Secure" if _is_hosted_dashboard_environment() else ""
+            self.send_header(
+                "Set-Cookie",
+                f"{_AUTH_COOKIE_NAME}={pending_auth_cookie}; Path=/; HttpOnly; SameSite=Lax{secure_attr}",
+            )
+
+    def _cookie_auth_token(self) -> str:
+        """Return the dashboard auth token from the Cookie header if present."""
+        cookie_header = self.headers.get("Cookie", "")
+        if not cookie_header:
+            return ""
+        try:
+            cookie = SimpleCookie()
+            cookie.load(cookie_header)
+            morsel = cookie.get(_AUTH_COOKIE_NAME)
+            return morsel.value if morsel else ""
+        except Exception:
+            return ""
 
     def _check_auth(self) -> bool:
         """Return True if request is authenticated or auth is not required."""
         auth_token = _dashboard_auth_token()
         if not auth_token:
-            return True  # Auth not configured ? allow all
+            return True  # Auth not configured - allow all
         parsed = urlparse(self.path)
         if parsed.path in _AUTH_EXEMPT_PATHS:
-            return True  # Health probe ? always open
+            return True  # Health probe - always open
         # Check Authorization header: "Bearer <token>"
         auth_header = self.headers.get("Authorization", "")
         if auth_header.startswith("Bearer ") and auth_header[7:].strip() == auth_token:
             return True
+        if self._cookie_auth_token() == auth_token:
+            return True
         # Check query parameter: ?token=<token>
         qs = parse_qs(parsed.query)
         if qs.get("token", [None])[0] == auth_token:
+            self._pending_auth_cookie = auth_token
             return True
         self.send_response(401)
         self.send_header("Content-Type", "application/json")
@@ -1169,6 +1206,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(b'{"error": "unauthorized", "hint": "Set Authorization: Bearer <token> header"}')
         return False
+
     def do_GET(self):
         if not self._check_auth():
             return
@@ -1329,6 +1367,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.end_headers()
 
     def do_POST(self):
+        if not self._check_auth():
+            return
         parsed = urlparse(self.path)
         if parsed.path == "/api/order":
             self._handle_order()
@@ -1693,9 +1733,9 @@ def start_dashboard(port=None, options_scanner=None):
     if options_scanner:
         set_options_scanner(options_scanner)
 
-
     port = port or int(os.environ.get("PORT", 8080))
     host = _resolve_dashboard_host()
+    _validate_dashboard_auth_configuration(host)
     base_url = _resolve_dashboard_base_url(host, port)
     server = HTTPServer((host, port), DashboardHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -1721,6 +1761,7 @@ if __name__ == "__main__":
     init_db()
     port = int(os.environ.get("PORT", 8080))
     host = _resolve_dashboard_host()
+    _validate_dashboard_auth_configuration(host)
     base_url = _resolve_dashboard_base_url(host, port)
     print(f"Starting dashboard on {host}:{port}...")
     print(f"Dashboard URL: {base_url}/")
