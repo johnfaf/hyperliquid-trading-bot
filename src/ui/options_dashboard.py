@@ -37,24 +37,28 @@ def _get_dashboard_html() -> str:
   --amber: #b9771f;
   --red: #b54d3f;
   --green: #207f59;
-  --shadow: 0 10px 30px rgba(40,31,20,.05);
+  --shadow: 0 14px 34px rgba(40,31,20,.04);
 }
 * { margin: 0; padding: 0; box-sizing: border-box; }
 body {
   min-height: 100vh;
-  background: linear-gradient(180deg, #f8f4ec 0%, var(--bg) 100%);
+  background:
+    radial-gradient(circle at top, rgba(31,111,95,.06), transparent 32%),
+    linear-gradient(180deg, #fbf8f1 0%, var(--bg) 100%);
   color: var(--ink);
   font-family: 'IBM Plex Sans', sans-serif;
-  padding: 24px 18px 34px;
+  padding: 28px 18px 38px;
 }
 a { color: inherit; }
-.shell { max-width: 1500px; margin: 0 auto; }
+.shell { max-width: 1420px; margin: 0 auto; }
 .topbar {
   display: flex;
   justify-content: space-between;
   align-items: flex-start;
   gap: 18px;
-  margin-bottom: 18px;
+  margin-bottom: 22px;
+  padding-bottom: 18px;
+  border-bottom: 1px solid rgba(227,216,199,.9);
 }
 .eyebrow {
   font-size: .74rem;
@@ -66,14 +70,14 @@ a { color: inherit; }
 h1 {
   margin: 8px 0 10px;
   font-family: 'Fraunces', serif;
-  font-size: clamp(1.9rem, 2.8vw, 3rem);
+  font-size: clamp(2rem, 3vw, 3.2rem);
   line-height: .98;
 }
-.subtitle { max-width: 64ch; color: var(--muted); line-height: 1.55; font-size: .94rem; }
+.subtitle { max-width: 62ch; color: var(--muted); line-height: 1.6; font-size: .94rem; }
 .header-actions { display: flex; flex-wrap: wrap; gap: 10px; justify-content: flex-end; }
 .pill {
   display: inline-flex; align-items: center; gap: 8px; padding: 9px 12px;
-  border-radius: 999px; border: 1px solid var(--line); background: var(--panel); text-decoration: none;
+  border-radius: 999px; border: 1px solid var(--line); background: rgba(255,255,255,.72); text-decoration: none;
   font-size: .82rem; font-weight: 600;
 }
 .live-dot {
@@ -85,10 +89,10 @@ h1 {
 .workspace,
 .tape-stack { display: grid; gap: 18px; align-content: start; }
 .panel {
-  background: var(--panel); border: 1px solid var(--line); border-radius: 20px; padding: 18px; box-shadow: var(--shadow);
+  background: linear-gradient(180deg,#fffdf9 0%,#fcf8f1 100%); border: 1px solid var(--line); border-radius: 22px; padding: 18px; box-shadow: var(--shadow);
 }
 .panel-head { display: flex; justify-content: space-between; align-items: flex-end; gap: 10px; margin-bottom: 12px; }
-.panel-title { font-family: 'Fraunces', serif; font-size: 1.22rem; line-height: 1.08; }
+.panel-title { font-family: 'Fraunces', serif; font-size: 1.28rem; line-height: 1.08; }
 .panel-copy { color: var(--muted); font-size: .86rem; line-height: 1.5; }
 .metric-row {
   display: flex; justify-content: space-between; align-items: center; gap: 10px; padding: 10px 0;
@@ -120,10 +124,10 @@ h1 {
   display: flex; align-items: center; font-size: .8rem; color: var(--ink); padding: 8px; font-weight: 700;
 }
 .heatmap-cell {
-  min-height: 50px; border-radius: 14px; padding: 10px; display: flex; align-items: center; justify-content: center;
+  min-height: 54px; border-radius: 14px; padding: 10px; display: flex; align-items: center; justify-content: center;
   text-align: center; font-size: .76rem; font-weight: 700; border: 1px solid rgba(227,216,199,.75);
 }
-.flow-chart-container { height: 320px; }
+.flow-chart-container { height: 334px; }
 .tape-header,
 .tape-row {
   display: grid; grid-template-columns: 58px 46px 96px 72px 70px 64px 82px 72px; gap: 8px; align-items: center;
@@ -422,6 +426,7 @@ function renderFlowChart(flowBars) {
   const labels = flowBars.map(f => f.ticker);
   const values = flowBars.map(f => f.net_flow);
   const colors = values.map(v => v >= 0 ? '#1f6f5f' : '#b54d3f');
+  const borders = values.map(v => v >= 0 ? '#17584b' : '#943b30');
 
   if (flowChart) flowChart.destroy();
   flowChart = new Chart(ctx, {
@@ -432,8 +437,10 @@ function renderFlowChart(flowBars) {
         label: 'Net Flow',
         data: values,
         backgroundColor: colors,
-        borderWidth: 0,
+        borderColor: borders,
+        borderWidth: 1,
         borderRadius: 8,
+        barThickness: 18,
       }]
     },
     options: {
