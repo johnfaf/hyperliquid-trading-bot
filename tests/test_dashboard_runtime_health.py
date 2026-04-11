@@ -126,11 +126,13 @@ def test_local_public_dashboard_can_warn_without_auth_token(monkeypatch):
     dashboard._validate_dashboard_auth_configuration("0.0.0.0")
 
 
-def _make_dashboard_handler(path="/", headers=None):
+def _make_dashboard_handler(path="/", headers=None, command="GET"):
     handler = dashboard.DashboardHandler.__new__(dashboard.DashboardHandler)
     handler.path = path
     handler.headers = headers or {}
+    handler.command = command
     handler.wfile = BytesIO()
+    handler.rfile = BytesIO()
     handler._responses = []
     handler.send_response = lambda code: handler._responses.append(("status", code))
     handler.send_header = lambda key, value: handler._responses.append(("header", key, value))
@@ -145,7 +147,8 @@ def test_dashboard_rejects_query_param_token(monkeypatch):
     allowed = handler._check_auth()
 
     assert allowed is False
-    assert ("status", 401) in handler._responses
+    assert ("status", 303) in handler._responses
+    assert ("header", "Location", "/login?next=/?token=secret-token") in handler._responses
 
 
 def test_dashboard_bearer_auth_sets_cookie(monkeypatch):
@@ -158,3 +161,43 @@ def test_dashboard_bearer_auth_sets_cookie(monkeypatch):
 
     assert allowed is True
     assert handler._pending_auth_cookie == "secret-token"
+
+
+def test_dashboard_redirects_page_requests_to_login(monkeypatch):
+    monkeypatch.setenv("DASHBOARD_AUTH_TOKEN", "secret-token")
+    handler = _make_dashboard_handler(path="/options")
+
+    allowed = handler._check_auth()
+
+    assert allowed is False
+    assert ("status", 303) in handler._responses
+    assert ("header", "Location", "/login?next=/options") in handler._responses
+
+
+def test_dashboard_login_post_sets_cookie_and_redirects(monkeypatch):
+    monkeypatch.setenv("DASHBOARD_AUTH_TOKEN", "secret-token")
+    handler = _make_dashboard_handler(
+        path="/api/auth/login",
+        headers={"Content-Length": "29"},
+    )
+    handler.rfile = BytesIO(b"token=secret-token&next=%2F")
+
+    handler._handle_login()
+
+    assert handler._pending_auth_cookie == "secret-token"
+    assert ("status", 303) in handler._responses
+    assert ("header", "Location", "/") in handler._responses
+
+
+def test_dashboard_login_post_rejects_invalid_token(monkeypatch):
+    monkeypatch.setenv("DASHBOARD_AUTH_TOKEN", "secret-token")
+    handler = _make_dashboard_handler(
+        path="/api/auth/login",
+        headers={"Content-Length": "22"},
+    )
+    handler.rfile = BytesIO(b"token=wrong&next=%2F")
+
+    handler._handle_login()
+
+    assert ("status", 303) in handler._responses
+    assert ("header", "Location", "/login?error=invalid&next=/") in handler._responses

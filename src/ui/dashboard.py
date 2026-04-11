@@ -15,7 +15,7 @@ from http.cookies import SimpleCookie
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime, timezone
 from typing import Dict
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
 import logging
 
@@ -35,8 +35,8 @@ logger.addHandler(logging.NullHandler())
 _options_scanner = None
 
 # ─── Dashboard Authentication ─────────────────────────────────
-# Paths that are always open (health probes, Railway readiness checks)
-_AUTH_EXEMPT_PATHS = {"/api/health", "/api/ready", "/api/live_ready"}
+# Paths that are always open (health probes, Railway readiness checks, login)
+_AUTH_EXEMPT_PATHS = {"/api/health", "/api/ready", "/api/live_ready", "/login", "/api/auth/login"}
 _AUTH_COOKIE_NAME = "dashboard_auth"
 
 
@@ -111,8 +111,7 @@ def _validate_dashboard_auth_configuration(host: str) -> None:
     if _is_hosted_dashboard_environment():
         raise RuntimeError(
             "DASHBOARD_AUTH_TOKEN is required for hosted public dashboard access. "
-            "Set it in Railway Variables, then send Authorization: Bearer <token> once "
-            "to establish the dashboard auth cookie."
+            "Set it in Railway Variables, then log in at /login with that token."
         )
     logger.warning(
         "Dashboard is binding publicly but DASHBOARD_AUTH_TOKEN is not set. "
@@ -134,6 +133,117 @@ def _safe_json(obj):
     if isinstance(obj, bytes):
         return obj.decode()
     return str(obj)
+
+
+def _login_html(error_message: str = "", next_path: str = "/") -> str:
+    """Render a small token login page that establishes the dashboard cookie."""
+    error_block = (
+        f'<p style="margin:0 0 16px;color:#b42318;background:#fef3f2;'
+        f'border:1px solid #fecdca;padding:12px 14px;border-radius:10px;">{error_message}</p>'
+        if error_message
+        else ""
+    )
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Dashboard Login</title>
+  <style>
+    :root {{
+      --bg: #f7f3ea;
+      --panel: #fffaf1;
+      --ink: #1f1a17;
+      --muted: #6e625a;
+      --accent: #1f6f5f;
+      --accent-2: #174f44;
+      --border: #d9cfc1;
+    }}
+    * {{ box-sizing: border-box; }}
+    body {{
+      margin: 0;
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      background:
+        radial-gradient(circle at top, rgba(31,111,95,0.12), transparent 32%),
+        linear-gradient(160deg, #f3ecdf 0%, var(--bg) 42%, #efe7d6 100%);
+      color: var(--ink);
+      font-family: Georgia, "Times New Roman", serif;
+      padding: 24px;
+    }}
+    .card {{
+      width: min(100%, 420px);
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 18px;
+      padding: 28px;
+      box-shadow: 0 18px 50px rgba(43, 35, 24, 0.12);
+    }}
+    h1 {{
+      margin: 0 0 10px;
+      font-size: 2rem;
+      line-height: 1.05;
+    }}
+    p {{
+      margin: 0 0 18px;
+      color: var(--muted);
+      line-height: 1.5;
+    }}
+    label {{
+      display: block;
+      margin-bottom: 8px;
+      font-size: 0.95rem;
+      font-weight: 700;
+    }}
+    input {{
+      width: 100%;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 14px 16px;
+      font-size: 1rem;
+      margin-bottom: 14px;
+      background: #fffdf8;
+    }}
+    button {{
+      width: 100%;
+      border: 0;
+      border-radius: 999px;
+      padding: 14px 18px;
+      background: linear-gradient(135deg, var(--accent), var(--accent-2));
+      color: #fff;
+      font-size: 1rem;
+      font-weight: 700;
+      cursor: pointer;
+    }}
+    .hint {{
+      margin-top: 16px;
+      font-size: 0.9rem;
+      color: var(--muted);
+    }}
+    code {{
+      font-family: Consolas, monospace;
+      background: rgba(31, 111, 95, 0.08);
+      padding: 0.15rem 0.35rem;
+      border-radius: 6px;
+    }}
+  </style>
+</head>
+<body>
+  <main class="card">
+    <h1>Dashboard Login</h1>
+    <p>Enter the dashboard auth token once. We will set a secure cookie for this browser and send you back to the dashboard.</p>
+    {error_block}
+    <form method="post" action="/api/auth/login">
+      <input type="hidden" name="next" value="{next_path}">
+      <label for="token">Auth Token</label>
+      <input id="token" name="token" type="password" autocomplete="current-password" required>
+      <button type="submit">Open Dashboard</button>
+    </form>
+    <p class="hint">The token is the value of <code>DASHBOARD_AUTH_TOKEN</code> in Railway Variables.</p>
+  </main>
+</body>
+</html>"""
 
 
 def _parse_trade_costs(trade: Dict) -> Dict:
@@ -1202,6 +1312,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass  # Suppress default logging
 
+    def _redirect(self, location: str, code: int = 303):
+        self.send_response(code)
+        self.send_header("Location", location)
+        self._send_no_cache_headers()
+        self.end_headers()
+
     def _send_no_cache_headers(self):
         self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
         self.send_header("Pragma", "no-cache")
@@ -1242,6 +1358,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return True
         if self._cookie_auth_token() == auth_token:
             return True
+        if self.command == "GET" and not parsed.path.startswith("/api/"):
+            next_path = parsed.path or "/"
+            if parsed.query:
+                next_path = f"{next_path}?{parsed.query}"
+            self._redirect(f"/login?next={quote(next_path, safe='/?=&')}")
+            return False
         self.send_response(401)
         self.send_header("Content-Type", "application/json")
         self.send_header("WWW-Authenticate", 'Bearer realm="dashboard"')
@@ -1250,12 +1372,46 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.wfile.write(b'{"error": "unauthorized", "hint": "Set Authorization: Bearer <token> header"}')
         return False
 
+    def _serve_login(self):
+        parsed = urlparse(self.path)
+        params = parse_qs(parsed.query)
+        next_path = params.get("next", ["/"])[0] or "/"
+        error_message = ""
+        if params.get("error", [""])[0] == "invalid":
+            error_message = "Token was not accepted. Double-check the Railway variable and try again."
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html")
+        self._send_no_cache_headers()
+        self.end_headers()
+        self.wfile.write(_login_html(error_message=error_message, next_path=next_path).encode())
+
+    def _handle_login(self):
+        auth_token = _dashboard_auth_token()
+        content_len = int(self.headers.get("Content-Length", 0) or 0)
+        raw_body = self.rfile.read(content_len) if content_len > 0 else b""
+        form = parse_qs(raw_body.decode("utf-8", errors="ignore"))
+        token = (form.get("token", [""])[0] or "").strip()
+        next_path = (form.get("next", ["/"])[0] or "/").strip()
+        if not next_path.startswith("/"):
+            next_path = "/"
+        if not auth_token:
+            self._json_response({"error": "dashboard_auth_not_configured"}, code=503)
+            return
+        if token != auth_token:
+            self._redirect(f"/login?error=invalid&next={quote(next_path, safe='/?=&')}")
+            return
+        self._pending_auth_cookie = auth_token
+        self._redirect(next_path)
+
     def do_GET(self):
         if not self._check_auth():
             return
         parsed = urlparse(self.path)
 
-        if parsed.path == "/" or parsed.path == "/dashboard":
+        if parsed.path == "/login":
+            self._serve_login()
+
+        elif parsed.path == "/" or parsed.path == "/dashboard":
             self.send_response(200)
             self.send_header("Content-Type", "text/html")
             self._send_no_cache_headers()
@@ -1437,7 +1593,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if not self._check_auth():
             return
         parsed = urlparse(self.path)
-        if parsed.path == "/api/order":
+        if parsed.path == "/api/auth/login":
+            self._handle_login()
+        elif parsed.path == "/api/order":
             self._handle_order()
         elif parsed.path == "/api/backtest/run":
             self._handle_backtest_run()
