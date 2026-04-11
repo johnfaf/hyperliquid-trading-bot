@@ -15,7 +15,7 @@ from http.cookies import SimpleCookie
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime, timezone
 from typing import Dict
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import parse_qs, urlparse
 
 import logging
 
@@ -111,7 +111,8 @@ def _validate_dashboard_auth_configuration(host: str) -> None:
     if _is_hosted_dashboard_environment():
         raise RuntimeError(
             "DASHBOARD_AUTH_TOKEN is required for hosted public dashboard access. "
-            "Set it in Railway Variables, then open the dashboard with ?token=<value>."
+            "Set it in Railway Variables, then send Authorization: Bearer <token> once "
+            "to establish the dashboard auth cookie."
         )
     logger.warning(
         "Dashboard is binding publicly but DASHBOARD_AUTH_TOKEN is not set. "
@@ -1237,13 +1238,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
         # Check Authorization header: "Bearer <token>"
         auth_header = self.headers.get("Authorization", "")
         if auth_header.startswith("Bearer ") and auth_header[7:].strip() == auth_token:
+            self._pending_auth_cookie = auth_token
             return True
         if self._cookie_auth_token() == auth_token:
-            return True
-        # Check query parameter: ?token=<token>
-        qs = parse_qs(parsed.query)
-        if qs.get("token", [None])[0] == auth_token:
-            self._pending_auth_cookie = auth_token
             return True
         self.send_response(401)
         self.send_header("Content-Type", "application/json")

@@ -138,13 +138,15 @@ The backup includes: traders, golden wallets, wallet fills, strategies, strategy
 
 The Dockerfile configures a health check that pings `http://localhost:8080/api/health` every 30 seconds. Railway marks the service unhealthy after 3 consecutive failures.
 
-The dashboard itself requires `DASHBOARD_AUTH_TOKEN` on Railway. Open it with:
+The dashboard itself requires `DASHBOARD_AUTH_TOKEN` on Railway. Send it once as a Bearer token:
 
 ```
-https://<your-railway-domain>/?token=<DASHBOARD_AUTH_TOKEN>
+curl -i \
+  -H "Authorization: Bearer <DASHBOARD_AUTH_TOKEN>" \
+  https://<your-railway-domain>/
 ```
 
-After the first successful request, the browser receives a same-origin auth cookie so the dashboard pages and API actions continue working normally. The health probe remains open on `/api/health`.
+After the first successful request, the browser receives a same-origin auth cookie so the dashboard pages and API actions continue working normally in that browser. The health probe remains open on `/api/health`.
 
 Check the Logs tab for:
 

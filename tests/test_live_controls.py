@@ -2764,3 +2764,156 @@ def test_live_trader_canary_signal_cap_blocks_after_limit(monkeypatch):
     stats = trader.get_stats()
     assert stats["canary_mode"] is True
     assert stats["total_entry_signals_today"] == 1
+
+
+def test_post_order_uses_monotonic_nonce_with_same_millisecond(monkeypatch):
+    nonces = []
+
+    class FakeManager:
+        def post(self, payload, **kwargs):
+            return {"status": "ok"}
+
+    class FakeSigner:
+        address = "0x1111111111111111111111111111111111111111"
+
+        def sign_action(self, action, nonce, vault_address=None):
+            nonces.append(nonce)
+            return {"r": "0x1", "s": "0x2", "v": 27}
+
+    def _load_credentials(self):
+        self.signer = FakeSigner()
+        self.agent_wallet_address = self.signer.address
+        self.public_address = "0x2222222222222222222222222222222222222222"
+        self.status_reason = "credentials_loaded"
+
+    class FakeFirewall:
+        def validate(self, signal, **kwargs):
+            return True, "ok"
+
+    monkeypatch.setattr("src.trading.live_trader.get_manager", lambda: FakeManager())
+    monkeypatch.setattr(LiveTrader, "_load_credentials", _load_credentials)
+    monkeypatch.setattr(LiveTrader, "_load_asset_index_map", lambda self: None)
+    monkeypatch.setattr("src.trading.live_trader.time.time", lambda: 1700000000.123)
+
+    trader = LiveTrader(firewall=FakeFirewall(), dry_run=False)
+    trader._post_order({"type": "order", "orders": [{"id": 1}]})
+    trader._post_order({"type": "order", "orders": [{"id": 2}]})
+
+    assert len(nonces) == 2
+    assert nonces[1] == nonces[0] + 1
+
+
+def test_protect_orphaned_positions_aborts_when_open_orders_unavailable(monkeypatch):
+    class FakeFirewall:
+        def validate(self, signal, **kwargs):
+            return True, "ok"
+
+    trigger_calls = []
+
+    monkeypatch.setattr(LiveTrader, "_load_credentials", _fake_live_credentials)
+    monkeypatch.setattr(LiveTrader, "_load_asset_index_map", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "reconcile_positions", lambda self: None)
+    monkeypatch.setattr(
+        LiveTrader,
+        "get_positions",
+        lambda self: [
+            {
+                "coin": "ETH",
+                "size": 0.1,
+                "szi": 0.1,
+                "side": "long",
+                "entry_price": 2000.0,
+                "entryPx": 2000.0,
+            }
+        ],
+    )
+    monkeypatch.setattr(LiveTrader, "get_open_orders", lambda self: None)
+    monkeypatch.setattr(
+        LiveTrader,
+        "place_trigger_order",
+        lambda self, *args, **kwargs: trigger_calls.append((args, kwargs)) or {"status": "success"},
+    )
+
+    trader = LiveTrader(firewall=FakeFirewall(), dry_run=False, max_order_usd=15.0)
+    summary = trader.protect_orphaned_positions()
+
+    assert summary["status"] == "degraded"
+    assert summary["reason"] == "open_orders_unavailable"
+    assert trigger_calls == []
+
+
+def test_execute_signal_rejects_when_live_positions_are_unavailable(monkeypatch):
+    class FakeFirewall:
+        def __init__(self):
+            self.calls = 0
+
+        def validate(self, signal, **kwargs):
+            self.calls += 1
+            return True, "ok"
+
+    firewall = FakeFirewall()
+
+    monkeypatch.setattr(LiveTrader, "_load_credentials", _fake_live_credentials)
+    monkeypatch.setattr(LiveTrader, "_load_asset_index_map", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "reconcile_positions", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "get_firewall_positions", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "get_account_value", lambda self: 2500.0)
+    monkeypatch.setattr(LiveTrader, "update_daily_pnl_from_fills", lambda self, trigger_check=True: None)
+
+    trader = LiveTrader(firewall=firewall, dry_run=False, max_order_usd=1_000_000)
+    result = trader.execute_signal(
+        {
+            "coin": "ETH",
+            "side": "long",
+            "confidence": 0.8,
+            "entry_price": 2000.0,
+            "position_pct": 0.05,
+            "leverage": 2,
+            "size": 0.1,
+        }
+    )
+
+    assert result is None
+    assert firewall.calls == 0
+
+
+def test_execute_signal_refreshes_daily_pnl_before_firewall(monkeypatch):
+    class FakeFirewall:
+        def __init__(self):
+            self.calls = 0
+
+        def validate(self, signal, **kwargs):
+            self.calls += 1
+            return True, "ok"
+
+    firewall = FakeFirewall()
+
+    def _refresh_daily_pnl(self, trigger_check=True):
+        self.daily_pnl = -150.0
+
+    monkeypatch.setattr(LiveTrader, "_load_credentials", _fake_live_credentials)
+    monkeypatch.setattr(LiveTrader, "_load_asset_index_map", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "reconcile_positions", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "update_daily_pnl_from_fills", _refresh_daily_pnl)
+
+    trader = LiveTrader(
+        firewall=firewall,
+        dry_run=False,
+        max_daily_loss=100.0,
+        max_order_usd=1_000_000,
+    )
+    result = trader.execute_signal(
+        {
+            "coin": "ETH",
+            "side": "long",
+            "confidence": 0.8,
+            "entry_price": 2000.0,
+            "position_pct": 0.05,
+            "leverage": 2,
+            "size": 0.1,
+        }
+    )
+
+    assert result is None
+    assert firewall.calls == 0
+    assert trader.kill_switch_active is True

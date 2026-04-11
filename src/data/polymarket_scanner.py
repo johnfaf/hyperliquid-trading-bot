@@ -747,6 +747,20 @@ class PolymarketScanner:
 
         return ""
 
+    @staticmethod
+    def _market_bias(title: str) -> str:
+        """Classify whether a market title is bullish or bearish for the asset."""
+        text = str(title or "").lower()
+        bullish_keywords = ["above", "bull", "rally", "surge", "pump"]
+        bearish_keywords = ["below", "bear", "crash", "down", "dump"]
+        is_bullish = any(keyword in text for keyword in bullish_keywords)
+        is_bearish = any(keyword in text for keyword in bearish_keywords)
+        if is_bearish and not is_bullish:
+            return "bearish"
+        if is_bullish and not is_bearish:
+            return "bullish"
+        return "neutral"
+
     def _get_event_sentiment_boost(self, market_title: str, hl_regime: str) -> float:
         """
         Determine sentiment boost from event-to-crypto mapping.
@@ -820,8 +834,12 @@ class PolymarketScanner:
             if movement.smart_money_score < 0.15:
                 continue
 
-            # Determine signal direction
-            signal_side = "long" if movement.direction == "up" else "short"
+            # Movement direction is the odds move, not the underlying asset move.
+            market_bias = self._market_bias(movement.title)
+            is_bullish_move = movement.direction == "up"
+            if market_bias == "bearish":
+                is_bullish_move = not is_bullish_move
+            signal_side = "long" if is_bullish_move else "short"
 
             # Map to crypto coin
             coin = self._map_market_to_coin(movement.title)
@@ -900,20 +918,16 @@ class PolymarketScanner:
 
             # Heuristic: if most outcomes are bullish (e.g., "BTC above X"),
             # the highest price outcome is bullish
-            title_lower = market.title.lower()
-            is_bullish_market = any(kw in title_lower for kw in
-                                   ["above", "bull", "rally", "surge", "pump"])
-            is_bearish_market = any(kw in title_lower for kw in
-                                   ["below", "bear", "crash", "down", "dump"])
+            market_bias = self._market_bias(market.title)
 
             # Take probability of highest-priced outcome
             if market.current_prices:
                 max_idx = market.current_prices.index(max(market.current_prices))
                 prob = market.current_prices[max_idx]
 
-                if is_bullish_market:
+                if market_bias == "bullish":
                     bullish_probs.append(prob)
-                elif is_bearish_market:
+                elif market_bias == "bearish":
                     bearish_probs.append(prob)
                 else:
                     # Neutral market — use 50/50

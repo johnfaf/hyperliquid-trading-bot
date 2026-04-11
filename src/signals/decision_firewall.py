@@ -273,6 +273,24 @@ class DecisionFirewall:
         if not signal.validate():
             return _reject("rejected_schema", f"Invalid signal schema: {signal.coin} {signal.side.value}")
 
+        predictive_regime = None
+        if self._forecaster and self.enable_predictive_derisk:
+            try:
+                predictive_regime = self._forecaster.predict_regime(signal.coin)
+            except Exception as e:
+                logger.debug(f"Forecaster check failed: {e}")
+
+        if predictive_regime and predictive_regime.get("partial_signal"):
+            original_confidence = float(signal.confidence)
+            signal.confidence = original_confidence * 0.5
+            logger.warning(
+                "Partial predictive inputs for %s (%s) - halving confidence %.0f%% -> %.0f%%",
+                signal.coin,
+                ", ".join(predictive_regime.get("partial_inputs", [])) or "unknown",
+                original_confidence * 100,
+                signal.confidence * 100,
+            )
+
         # 2. Minimum confidence
         if signal.confidence < self.min_confidence:
             return _reject("rejected_confidence",
@@ -417,16 +435,15 @@ class DecisionFirewall:
         #     NOTE: We do NOT mutate self.max_aggregate_exposure_pct here —
         #     that was a thread-safety bug (one thread's crash detection affected
         #     all other threads). Instead, the size reduction is per-signal only.
-        if self._forecaster and self.enable_predictive_derisk:
+        if predictive_regime:
             try:
-                pred = self._forecaster.predict_regime(signal.coin)
-                if (pred["regime"] == "crash" and
-                        pred["confidence"] > self.crash_confidence_threshold):
+                if (predictive_regime["regime"] == "crash" and
+                        predictive_regime["confidence"] > self.crash_confidence_threshold):
                     # De-risk: cut position size dramatically
                     signal.size *= self.crash_size_multiplier  # 80% reduction
                     logger.warning(
                         f"CRASH REGIME detected for {signal.coin} "
-                        f"(conf={pred['confidence']:.2f}) — "
+                        f"(conf={predictive_regime['confidence']:.2f}) — "
                         f"de-risking: size *= {self.crash_size_multiplier}"
                     )
             except Exception as e:

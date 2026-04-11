@@ -1,4 +1,5 @@
 import pytest
+from io import BytesIO
 from datetime import datetime, timedelta, timezone
 
 from src.core.health_registry import SubsystemHealthRegistry, SubsystemState
@@ -123,3 +124,37 @@ def test_local_public_dashboard_can_warn_without_auth_token(monkeypatch):
     monkeypatch.delenv("DASHBOARD_AUTH_TOKEN", raising=False)
 
     dashboard._validate_dashboard_auth_configuration("0.0.0.0")
+
+
+def _make_dashboard_handler(path="/", headers=None):
+    handler = dashboard.DashboardHandler.__new__(dashboard.DashboardHandler)
+    handler.path = path
+    handler.headers = headers or {}
+    handler.wfile = BytesIO()
+    handler._responses = []
+    handler.send_response = lambda code: handler._responses.append(("status", code))
+    handler.send_header = lambda key, value: handler._responses.append(("header", key, value))
+    handler.end_headers = lambda: handler._responses.append(("end",))
+    return handler
+
+
+def test_dashboard_rejects_query_param_token(monkeypatch):
+    monkeypatch.setenv("DASHBOARD_AUTH_TOKEN", "secret-token")
+    handler = _make_dashboard_handler(path="/?token=secret-token")
+
+    allowed = handler._check_auth()
+
+    assert allowed is False
+    assert ("status", 401) in handler._responses
+
+
+def test_dashboard_bearer_auth_sets_cookie(monkeypatch):
+    monkeypatch.setenv("DASHBOARD_AUTH_TOKEN", "secret-token")
+    handler = _make_dashboard_handler(
+        headers={"Authorization": "Bearer secret-token"},
+    )
+
+    allowed = handler._check_auth()
+
+    assert allowed is True
+    assert handler._pending_auth_cookie == "secret-token"

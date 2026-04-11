@@ -61,7 +61,7 @@ def get_execution_open_positions(container) -> List[Dict]:
     """Use exchange positions as the source of truth when live trading is active."""
     trader = get_live_trader(container)
     if trader and is_live_trading_active(container):
-        return trader.get_positions()
+        return trader.get_positions() or []
     return db.get_open_paper_trades()
 
 

@@ -326,3 +326,41 @@ def test_firewall_derisks_degraded_sources_and_uses_policy_cap(mock_db):
     assert first.position_pct == 0.05
     assert passed2 is False
     assert "source/day cap" in reason2.lower()
+
+
+@patch("src.signals.decision_firewall.db")
+def test_firewall_halves_confidence_when_predictive_inputs_are_partial(mock_db):
+    mock_db.get_open_paper_trades.return_value = []
+    mock_db.get_paper_account.return_value = {"balance": 10000}
+    mock_db.audit_log = MagicMock()
+
+    from src.signals.decision_firewall import DecisionFirewall
+
+    class _PartialForecaster:
+        def predict_regime(self, coin):
+            return {
+                "signal": 0.0,
+                "regime": "neutral",
+                "confidence": 0.1,
+                "components": {},
+                "active_inputs": ["funding_slope", "imbalance"],
+                "active_input_count": 2,
+                "partial_signal": True,
+                "partial_inputs": ["polymarket"],
+            }
+
+    fw = DecisionFirewall(
+        {
+            "min_confidence": 0.3,
+            "forecaster": _PartialForecaster(),
+            "enable_predictive_derisk": True,
+            "funding_risk_enabled": False,
+        }
+    )
+    signal = MockSignal(confidence=0.5)
+
+    passed, reason = fw.validate(signal)
+
+    assert passed is False
+    assert signal.confidence == 0.25
+    assert "low confidence" in reason.lower()

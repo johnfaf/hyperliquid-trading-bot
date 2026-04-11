@@ -2,6 +2,7 @@
 Unit tests for Predictive Regime Forecaster.
 """
 import os
+import time
 import pytest
 
 from unittest.mock import patch, MagicMock
@@ -98,3 +99,39 @@ def test_forecaster_output_structure():
         assert "components" in result
         assert "funding_slope" in result["components"]
         assert "imbalance" in result["components"]
+
+
+def test_forecaster_decays_recently_stale_polymarket_signal(monkeypatch):
+    forecaster = PredictiveRegimeForecaster(
+        {"external_data_ttl": 600, "external_data_partial_ttl": 1800}
+    )
+    monkeypatch.setattr(forecaster, "_get_funding_slope", lambda coin: 0.0)
+    monkeypatch.setattr(forecaster, "_get_orderbook_imbalance", lambda coin: 0.0)
+    monkeypatch.setattr(forecaster, "_get_arkham_flow", lambda coin: 0.0)
+    forecaster._polymarket_sentiment = {"sentiment": "bullish", "confidence": 0.4}
+    forecaster._polymarket_ts = time.time() - 900
+
+    result = forecaster.predict_regime("BTC")
+
+    assert result["components"]["polymarket"] == pytest.approx(0.4)
+    assert result["partial_signal"] is False
+    assert result["partial_inputs"] == []
+
+
+def test_forecaster_marks_long_stale_external_inputs_as_partial(monkeypatch):
+    forecaster = PredictiveRegimeForecaster(
+        {"external_data_ttl": 600, "external_data_partial_ttl": 1800}
+    )
+    monkeypatch.setattr(forecaster, "_get_funding_slope", lambda coin: 0.0)
+    monkeypatch.setattr(forecaster, "_get_orderbook_imbalance", lambda coin: 0.0)
+    monkeypatch.setattr(forecaster, "_get_arkham_flow", lambda coin: 0.0)
+    forecaster._options_convictions = [
+        {"ticker": "BTC", "direction": "BULLISH", "conviction_pct": 70}
+    ]
+    forecaster._options_ts = time.time() - 2400
+
+    result = forecaster.predict_regime("BTC")
+
+    assert result["components"]["options_flow"] == 0.0
+    assert result["partial_signal"] is True
+    assert result["partial_inputs"] == ["options_flow"]

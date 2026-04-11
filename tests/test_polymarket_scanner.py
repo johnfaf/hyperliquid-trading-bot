@@ -1,6 +1,6 @@
 import logging
 
-from src.data.polymarket_scanner import PolymarketScanner
+from src.data.polymarket_scanner import OddsMovement, PolymarketScanner
 
 
 def _raw_market(mid: str, title: str, volume: float, liquidity: float):
@@ -182,3 +182,37 @@ def test_scan_markets_falls_back_to_active_crypto_markets_when_strict_filters_ze
     assert scanner._last_filtered_market_count == 0
     assert scanner._markets_tracked == 2
     assert "falling back to 2 active crypto markets" in caplog.text
+
+
+def test_generate_signals_inverts_bearish_market_odds_moves(monkeypatch):
+    scanner = PolymarketScanner(
+        config={
+            "min_volume_threshold": 1000.0,
+            "min_liquidity_threshold": 500.0,
+        }
+    )
+    monkeypatch.setattr(
+        scanner,
+        "_fetch_raw_markets",
+        lambda: [_raw_market("m1", "Will Bitcoin crash below 50k?", 4000.0, 3000.0)],
+    )
+
+    markets = scanner.scan_markets()
+    assert len(markets) == 1
+    movement = OddsMovement(
+        market_id="m1",
+        title="Will Bitcoin crash below 50k?",
+        direction="up",
+        magnitude=0.15,
+        timeframe="1h",
+        current_probability=0.35,
+        volume_move=4000.0,
+        smart_money_score=0.5,
+    )
+    monkeypatch.setattr(scanner, "detect_odds_movements", lambda markets: [movement])
+
+    signals = scanner.generate_signals()
+
+    assert len(signals) == 1
+    assert signals[0]["coin"] == "BTC"
+    assert signals[0]["side"] == "short"

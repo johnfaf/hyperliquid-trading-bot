@@ -27,6 +27,7 @@ import time
 import json
 import hashlib
 import copy
+import threading
 from collections import defaultdict
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -484,6 +485,8 @@ class LiveTrader:
         )
         self._last_hash_cleanup_ts = 0.0
         self._HASH_CLEANUP_INTERVAL = 60.0  # periodic cleanup every 60s
+        self._nonce_lock = threading.Lock()
+        self._last_nonce = 0
 
         # Price sanity state (instance-level; class-level cache leaks across traders).
         self._price_history: Dict[str, float] = {}  # coin -> last known good mid
@@ -1000,7 +1003,7 @@ class LiveTrader:
             "raw": pos,
         }
 
-    def get_firewall_positions(self) -> List[Dict[str, Any]]:
+    def get_firewall_positions(self) -> Optional[List[Dict[str, Any]]]:
         """Return normalized live positions in the format the firewall expects."""
         return self.get_positions()
 
@@ -1087,7 +1090,7 @@ class LiveTrader:
             # Keep external kill-switch state sticky across day boundaries.
             self._refresh_external_kill_switch()
 
-    def check_daily_loss(self) -> bool:
+    def check_daily_loss(self, refresh_from_fills: bool = False) -> bool:
         """
         Check if daily loss limit exceeded.
 
@@ -1097,6 +1100,12 @@ class LiveTrader:
         self._check_daily_reset()
         if self._refresh_external_kill_switch():
             return True
+        if refresh_from_fills:
+            try:
+                self.update_daily_pnl_from_fills(trigger_check=False)
+            except TypeError:
+                # Backward compatibility for tests/monkeypatches using the old signature.
+                self.update_daily_pnl_from_fills()
 
         if self.daily_pnl < -self.max_daily_loss:
             logger.warning(f"⚠️  Daily loss limit exceeded: ${abs(self.daily_pnl):.2f} > ${self.max_daily_loss:.2f}")
@@ -1118,6 +1127,12 @@ class LiveTrader:
         logger.info("Reconciling positions with exchange...")
         try:
             exchange_positions = self.get_positions()
+            if exchange_positions is None:
+                logger.warning(
+                    "Position reconciliation skipped: exchange positions unavailable. "
+                    "Will not assume a clean state while the account snapshot is degraded."
+                )
+                return
             active_coins = []
             unprotected = []
 
@@ -1195,15 +1210,34 @@ class LiveTrader:
         if positions is None:
             positions = self.get_positions()
 
+        if positions is None:
+            logger.warning(
+                "protect_orphaned_positions: positions unavailable - aborting protection sweep"
+            )
+            return {
+                "status": "degraded",
+                "reason": "positions_unavailable",
+                "protected": 0,
+                "skipped": 0,
+                "failed": 0,
+            }
+
         if not positions:
             return {"status": "ok", "protected": 0, "skipped": 0, "failed": 0}
 
         # One fetch of open orders, then index by coin for O(1) lookup.
-        try:
-            open_orders = self.get_open_orders()
-        except Exception as exc:
-            logger.warning("protect_orphaned_positions: open-orders fetch failed: %s", exc)
-            open_orders = []
+        open_orders = self.get_open_orders()
+        if open_orders is None:
+            logger.warning(
+                "protect_orphaned_positions: open-orders unavailable - aborting protection sweep"
+            )
+            return {
+                "status": "degraded",
+                "reason": "open_orders_unavailable",
+                "protected": 0,
+                "skipped": 0,
+                "failed": 0,
+            }
 
         # Index protective orders by coin. Track order IDs for stale cleanup.
         _MAX_PROTECTIVE_ORDERS_PER_COIN = 2  # 1 SL + 1 TP expected
@@ -1343,6 +1377,12 @@ class LiveTrader:
 
             # Check actual position size
             positions = self.get_positions()
+            if positions is None:
+                logger.warning(
+                    "Deferred resize for %s skipped: positions unavailable during verification",
+                    coin,
+                )
+                return
             actual_size = 0.0
             for pos in positions:
                 if pos.get("coin") == coin:
@@ -1374,6 +1414,12 @@ class LiveTrader:
             # Cancel all existing protective orders for this coin
             try:
                 open_orders = self.get_open_orders()
+                if open_orders is None:
+                    logger.warning(
+                        "Deferred resize cancel phase skipped for %s: open orders unavailable",
+                        coin,
+                    )
+                    return
                 for order in open_orders:
                     if not isinstance(order, dict):
                         continue
@@ -1409,7 +1455,7 @@ class LiveTrader:
         except Exception as exc:
             logger.error("Deferred protective resize error for %s: %s", coin, exc)
 
-    def update_daily_pnl_from_fills(self):
+    def update_daily_pnl_from_fills(self, trigger_check: bool = True):
         """
         Fetch recent fills from the exchange and update daily_pnl.
 
@@ -1451,14 +1497,19 @@ class LiveTrader:
 
             # Include current unrealized PnL so daily loss controls react to
             # open-position drawdowns, not only realized closes.
-            unrealized = 0.0
-            try:
-                for pos in self.get_positions():
+            unrealized = self.daily_unrealized_pnl
+            positions = self.get_positions()
+            if positions is None:
+                logger.warning(
+                    "Could not refresh positions for unrealized PnL - keeping prior estimate %+.2f",
+                    unrealized,
+                )
+            else:
+                unrealized = 0.0
+                for pos in positions:
                     unrealized += self._coerce_float(
                         pos.get("unrealized_pnl", pos.get("unrealizedPnl", 0))
                     )
-            except Exception as exc:
-                logger.debug("Could not include unrealized PnL in daily tracking: %s", exc)
 
             today_pnl = today_realized + unrealized
 
@@ -1481,7 +1532,8 @@ class LiveTrader:
                 self.firewall.set_daily_losses(abs(min(self.daily_pnl, 0.0)))
 
             # Check if kill switch should trigger
-            self.check_daily_loss()
+            if trigger_check:
+                self.check_daily_loss(refresh_from_fills=False)
 
         except Exception as e:
             logger.error(f"Failed to update daily PnL from fills: {e}")
@@ -1740,7 +1792,9 @@ class LiveTrader:
         """
         is_dry_run = dry_run_override if dry_run_override is not None else self.dry_run
 
-        nonce = int(time.time() * 1000)
+        with self._nonce_lock:
+            nonce = max(int(time.time() * 1000), self._last_nonce + 1)
+            self._last_nonce = nonce
         action_hash = HyperliquidSigner.get_action_hash(action)
 
         if is_dry_run:
@@ -1917,7 +1971,7 @@ class LiveTrader:
                 logger.warning(f"Kill switch active - rejecting market order {coin} {side}")
                 return {"status": "rejected", "reason": "kill_switch_active"}
 
-            if self.check_daily_loss():
+            if self.check_daily_loss(refresh_from_fills=True):
                 logger.warning(f"Daily loss limit exceeded - rejecting market order {coin} {side}")
                 return {"status": "rejected", "reason": "daily_loss_exceeded"}
 
@@ -2097,6 +2151,8 @@ class LiveTrader:
 
         def _poll_once(attempt: int) -> Optional[Dict]:
             positions = self.get_positions()
+            if positions is None:
+                raise RuntimeError("positions_unavailable")
             for pos in positions:
                 pos_coin = pos.get("coin", "")
                 pos_size = float(pos.get("szi", 0) or 0)
@@ -2192,6 +2248,9 @@ class LiveTrader:
             if self.kill_switch_active:
                 logger.warning(f"Kill switch active - rejecting limit order {coin}")
                 return {"status": "rejected", "reason": "kill_switch_active"}
+            if self.check_daily_loss(refresh_from_fills=True):
+                logger.warning(f"Daily loss limit exceeded - rejecting limit order {coin} {side}")
+                return {"status": "rejected", "reason": "daily_loss_exceeded"}
 
         asset_idx = self._get_asset_index(coin)
         if asset_idx is None:
@@ -2409,6 +2468,11 @@ class LiveTrader:
 
         try:
             orders = self.get_open_orders()
+            if orders is None:
+                logger.warning(
+                    "cancel_all_orders: open orders unavailable - refusing to assume there are none"
+                )
+                return 0
             if not orders:
                 return 0
 
@@ -2446,6 +2510,9 @@ class LiveTrader:
 
         try:
             positions = self.get_positions()
+            if positions is None:
+                logger.warning("close_position(%s): positions unavailable", coin)
+                return {"status": "error", "message": "Positions unavailable"}
             pos = next((p for p in positions if p.get("coin") == coin), None)
 
             if not pos:
@@ -2483,6 +2550,9 @@ class LiveTrader:
 
             # Close all positions
             positions = self.get_positions()
+            if positions is None:
+                logger.error("Emergency close aborted: positions unavailable")
+                return results
             for pos in positions:
                 coin = pos.get("coin")
                 if not coin:
@@ -2523,17 +2593,17 @@ class LiveTrader:
 
         return results
 
-    def get_positions(self) -> List[Dict]:
+    def get_positions(self) -> Optional[List[Dict]]:
         """
         Get current open positions from exchange.
 
         Returns:
-            List of position dicts
+            List of position dicts, or None when exchange state is unavailable
         """
         try:
             if not self.public_address:
                 logger.warning("No public address configured")
-                return []
+                return None
 
             data = self.get_account_state()
             positions = data.get("assetPositions", []) if isinstance(data, dict) else []
@@ -2542,19 +2612,19 @@ class LiveTrader:
 
         except Exception as e:
             logger.error(f"Error getting positions: {e}")
-            return []
+            return None
 
-    def get_open_orders(self) -> List[Dict]:
+    def get_open_orders(self) -> Optional[List[Dict]]:
         """
         Get current open orders from exchange.
 
         Returns:
-            List of open order dicts
+            List of open order dicts, or None when exchange state is unavailable
         """
         try:
             if not self.public_address:
                 logger.warning("No public address configured")
-                return []
+                return None
 
             data = self.api_manager.post(
                 {"type": "openOrders", "user": self.public_address},
@@ -2567,7 +2637,7 @@ class LiveTrader:
 
         except Exception as e:
             logger.error(f"Error getting open orders: {e}")
-            return []
+            return None
 
     def apply_regime_overlay(self, signal: TradeSignal, regime_data: Optional[Dict] = None) -> TradeSignal:
         """
@@ -2750,10 +2820,18 @@ class LiveTrader:
 
         # External kill-switch takes precedence over any other gate.
         self._refresh_external_kill_switch()
+        if self.check_daily_loss(refresh_from_fills=True):
+            logger.warning("Daily loss limit exceeded - rejecting signal")
+            return None
 
         if not bypass_firewall:
             live_positions = self.get_firewall_positions() if self.is_deployable() else None
             live_account_value = self.get_account_value() if self.is_deployable() else None
+            if self.is_deployable() and live_positions is None:
+                logger.warning(
+                    "Live positions unavailable - rejecting signal rather than trading blind"
+                )
+                return None
 
             # Validate through firewall
             passed, reason = self.firewall.validate(
@@ -2773,11 +2851,6 @@ class LiveTrader:
         # Check kill switch
         if self.kill_switch_active:
             logger.warning("Kill switch active - rejecting signal")
-            return None
-
-        # Check daily loss
-        if self.check_daily_loss():
-            logger.warning("Daily loss limit exceeded - rejecting signal")
             return None
 
         # Canary/source caps apply to NEW live entries only.

@@ -80,7 +80,7 @@ def _positions_report(container, live_active: bool) -> Dict[str, Any]:
     mids = get_all_mids() or {}
     source = "paper"
     if live_active and getattr(container, "live_trader", None):
-        open_trades = container.live_trader.get_positions()
+        open_trades = container.live_trader.get_positions() or []
         source = "live"
     else:
         open_trades = db.get_open_paper_trades()

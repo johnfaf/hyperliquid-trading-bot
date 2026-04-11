@@ -33,7 +33,7 @@ Regime Classification:
 import logging
 import time
 import os
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 from collections import deque
 
 import requests
@@ -139,6 +139,7 @@ class PredictiveRegimeForecaster:
         self._options_convictions: list = []
         self._options_ts: float = 0.0
         self._external_data_ttl = cfg.get("external_data_ttl", 600)  # 10 min staleness limit
+        self._external_data_partial_ttl = cfg.get("external_data_partial_ttl", 1800)  # 30 min
 
         logger.info("PredictiveRegimeForecaster V2 initialized (5-input model)")
 
@@ -230,19 +231,33 @@ class PredictiveRegimeForecaster:
             active_weights.append((W_ARKHAM, arkham_signal))
             active_input_names.append("arkham_flow")
 
+        partial_inputs = []
+
         # 4. Polymarket prediction-market sentiment
-        pm_signal = self._get_polymarket_signal(now)
+        pm_result = self._get_polymarket_signal(now)
+        if isinstance(pm_result, tuple):
+            pm_signal, pm_state = pm_result
+        else:
+            pm_signal, pm_state = pm_result, "fresh"
         components["polymarket"] = pm_signal
         if pm_signal != 0.0:
             active_weights.append((W_POLYMARKET, pm_signal))
             active_input_names.append("polymarket")
+        if pm_state == "partial":
+            partial_inputs.append("polymarket")
 
         # 5. Options flow conviction (Deribit unusual activity)
-        of_signal = self._get_options_flow_signal(coin, now)
+        of_result = self._get_options_flow_signal(coin, now)
+        if isinstance(of_result, tuple):
+            of_signal, of_state = of_result
+        else:
+            of_signal, of_state = of_result, "fresh"
         components["options_flow"] = of_signal
         if of_signal != 0.0:
             active_weights.append((W_OPTIONS_FLOW, of_signal))
             active_input_names.append("options_flow")
+        if of_state == "partial":
+            partial_inputs.append("options_flow")
 
         # Compute composite with dynamic weight re-normalization
         total_weight = sum(w for w, _ in active_weights)
@@ -275,6 +290,8 @@ class PredictiveRegimeForecaster:
             "components": {k: round(v, 4) for k, v in components.items()},
             "active_inputs": active_input_names,
             "active_input_count": len(active_input_names),
+            "partial_signal": bool(partial_inputs),
+            "partial_inputs": partial_inputs,
         }
 
         self.cache[coin] = {"data": data, "ts": now}
@@ -285,35 +302,56 @@ class PredictiveRegimeForecaster:
 
     # ─── Internal: derive signals from external data ─────────────
 
-    def _get_polymarket_signal(self, now: float) -> float:
+    def _external_feed_state(self, timestamp: float, now: float) -> str:
+        """Classify freshness for an injected external feed timestamp."""
+        if timestamp <= 0:
+            return "missing"
+        age = max(0.0, now - timestamp)
+        if age <= self._external_data_ttl:
+            return "fresh"
+        if age <= self._external_data_partial_ttl:
+            return "decayed"
+        return "partial"
+
+    def _get_polymarket_signal(self, now: float) -> Tuple[float, str]:
         """
         Convert Polymarket sentiment into a -1 to +1 signal.
         Bullish sentiment → positive, bearish → negative.
-        Returns 0 if data is stale or unavailable.
+        Returns (signal, state) where state tracks stale-data handling.
         """
-        if (self._polymarket_sentiment is None or
-                now - self._polymarket_ts > self._external_data_ttl):
-            return 0.0
+        if self._polymarket_sentiment is None:
+            return 0.0, "missing"
+
+        state = self._external_feed_state(self._polymarket_ts, now)
+        if state == "partial":
+            return 0.0, state
 
         sent = self._polymarket_sentiment
         sentiment = sent.get("sentiment", "neutral")
         conf = float(sent.get("confidence", 0))
 
+        value = 0.0
         if sentiment == "bullish":
-            return min(conf * 2.0, 1.0)   # scale confidence (0-0.5) → signal (0-1)
+            value = min(conf * 2.0, 1.0)   # scale confidence (0-0.5) → signal (0-1)
         elif sentiment == "bearish":
-            return max(-conf * 2.0, -1.0)
-        return 0.0
+            value = max(-conf * 2.0, -1.0)
 
-    def _get_options_flow_signal(self, coin: str, now: float) -> float:
+        if state == "decayed":
+            value *= 0.5
+        return value, state
+
+    def _get_options_flow_signal(self, coin: str, now: float) -> Tuple[float, str]:
         """
         Convert options flow conviction for a coin into a -1 to +1 signal.
         Strong bullish net flow → positive, bearish → negative.
-        Returns 0 if data is stale, unavailable, or coin has no conviction entry.
+        Returns (signal, state) where state tracks stale-data handling.
         """
-        if (not self._options_convictions or
-                now - self._options_ts > self._external_data_ttl):
-            return 0.0
+        if not self._options_convictions:
+            return 0.0, "missing"
+
+        state = self._external_feed_state(self._options_ts, now)
+        if state == "partial":
+            return 0.0, state
 
         for conv in self._options_convictions:
             if conv.get("ticker", "").upper() == coin.upper():
@@ -321,11 +359,15 @@ class PredictiveRegimeForecaster:
                 direction = conv.get("direction", "")
                 # conviction_pct is 0-100; normalize to 0-1 then sign
                 normalized = min(pct / 100.0, 1.0)
+                value = 0.0
                 if direction == "BULLISH":
-                    return normalized
+                    value = normalized
                 elif direction == "BEARISH":
-                    return -normalized
-        return 0.0
+                    value = -normalized
+                if state == "decayed":
+                    value *= 0.5
+                return value, state
+        return 0.0, state
 
     def _get_arkham_flow(self, coin: str) -> float:
         """Fetch Arkham smart-money flow score in [-1, 1]."""
