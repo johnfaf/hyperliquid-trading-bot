@@ -715,156 +715,132 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Fraunces:wght@600;700&family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap');
 :root{
-  --bg:#f4ecde;
-  --bg-soft:#fbf6ed;
-  --panel:#fffaf2;
-  --panel-strong:#f7efdf;
-  --ink:#1f1a17;
-  --muted:#6f655b;
-  --line:#d9ccb8;
+  --bg:#f6f2ea;
+  --panel:#fffdf9;
+  --panel-soft:#f9f4ec;
+  --ink:#181512;
+  --muted:#6b645c;
+  --line:#e3d8c7;
   --teal:#1f6f5f;
-  --teal-deep:#16483e;
   --blue:#2f5b9f;
   --amber:#b9771f;
   --red:#b54d3f;
   --green:#207f59;
-  --shadow:0 24px 60px rgba(48,37,22,.10);
+  --shadow:0 10px 30px rgba(40,31,20,.05);
 }
 *{margin:0;padding:0;box-sizing:border-box}
 body{
-  background:
-    radial-gradient(circle at top, rgba(31,111,95,.12), transparent 32%),
-    linear-gradient(180deg, #efe5d2 0%, var(--bg) 42%, #f8f1e3 100%);
+  background:linear-gradient(180deg,#f8f4ec 0%,var(--bg) 100%);
   color:var(--ink);
   font-family:'IBM Plex Sans',sans-serif;
-  padding:28px 20px 44px;
+  padding:24px 18px 40px;
 }
 a{color:inherit}
-.page-shell{max-width:1580px;margin:0 auto}
+.page-shell{max-width:1520px;margin:0 auto}
 .masthead{
-  display:flex;justify-content:space-between;align-items:flex-start;gap:20px;
-  margin-bottom:20px;padding:24px 26px;border:1px solid rgba(31,111,95,.18);
-  border-radius:30px;background:linear-gradient(135deg, rgba(255,250,242,.96), rgba(244,236,222,.92));
-  box-shadow:var(--shadow);
+  display:flex;justify-content:space-between;align-items:flex-start;gap:18px;
+  margin-bottom:22px;padding:0 2px;
 }
 .eyebrow,.section-tag{
-  font-size:.78rem;text-transform:uppercase;letter-spacing:.18em;color:var(--teal);font-weight:700;
+  font-size:.74rem;text-transform:uppercase;letter-spacing:.16em;color:var(--teal);font-weight:700;
 }
 h1{
-  font-family:'Fraunces',serif;font-size:clamp(2.2rem,4vw,4rem);line-height:.95;margin:10px 0 10px;color:var(--ink);
+  font-family:'Fraunces',serif;font-size:clamp(2rem,3.2vw,3.4rem);line-height:.98;margin:8px 0 10px;color:var(--ink);
 }
-.subtitle{max-width:760px;color:var(--muted);font-size:1rem;line-height:1.6}
-.status-row{display:flex;flex-wrap:wrap;gap:10px;margin-top:18px}
+.subtitle{max-width:720px;color:var(--muted);font-size:.96rem;line-height:1.55}
+.status-row{display:flex;flex-wrap:wrap;gap:10px;margin-top:16px}
 .status-chip{
-  display:inline-flex;align-items:center;gap:10px;padding:10px 14px;border-radius:999px;
-  background:rgba(255,255,255,.72);border:1px solid rgba(31,111,95,.14);font-size:.86rem;font-weight:600;color:var(--ink);
+  display:inline-flex;align-items:center;gap:8px;padding:9px 12px;border-radius:999px;
+  background:var(--panel);border:1px solid var(--line);font-size:.82rem;font-weight:600;color:var(--ink);
 }
-.ws-dot{display:inline-block;width:10px;height:10px;border-radius:50%;background:var(--red);box-shadow:0 0 0 4px rgba(181,77,63,.12)}
+.ws-dot{display:inline-block;width:9px;height:9px;border-radius:50%;background:var(--red)}
 .nav-cluster{display:flex;flex-wrap:wrap;gap:10px;justify-content:flex-end}
 .nav-pill{
-  min-width:150px;padding:12px 16px;border-radius:18px;text-decoration:none;border:1px solid var(--line);
-  background:rgba(255,255,255,.64);display:flex;flex-direction:column;gap:3px;transition:transform .18s ease,box-shadow .18s ease,border-color .18s ease;
-  box-shadow:0 8px 24px rgba(43,35,24,.06);
+  min-width:138px;padding:11px 14px;border-radius:14px;text-decoration:none;border:1px solid var(--line);
+  background:var(--panel);display:flex;flex-direction:column;gap:2px;transition:border-color .15s ease,transform .15s ease;
 }
-.nav-pill:hover{transform:translateY(-2px);border-color:rgba(31,111,95,.35);box-shadow:0 16px 28px rgba(43,35,24,.10)}
-.nav-pill strong{font-size:.95rem;color:var(--ink)}
-.nav-pill span{font-size:.74rem;color:var(--muted);line-height:1.4}
-.nav-pill.nav-teal{border-color:rgba(31,111,95,.28)}
-.nav-pill.nav-blue{border-color:rgba(47,91,159,.22)}
-.nav-pill.nav-amber{border-color:rgba(185,119,31,.24)}
-.hero-grid,.board-grid{display:grid;grid-template-columns:repeat(12,minmax(0,1fr));gap:18px;margin-bottom:18px}
-.hero-panel,.section{
-  background:linear-gradient(180deg, rgba(255,250,242,.97), rgba(247,239,223,.92));
-  border:1px solid rgba(79,63,40,.10);border-radius:28px;padding:22px;box-shadow:var(--shadow);
-}
-.hero-grid .hero-panel:first-child{grid-column:span 7}
-.hero-grid .hero-panel:last-child{grid-column:span 5}
-.hero-title{font-family:'Fraunces',serif;font-size:clamp(1.6rem,2.1vw,2.5rem);line-height:1.1;margin:12px 0;color:var(--ink)}
-.hero-copy{color:var(--muted);line-height:1.7;max-width:62ch}
-.quick-links{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;margin-top:14px}
-.quick-link{
-  text-decoration:none;padding:18px;border-radius:22px;background:rgba(255,255,255,.7);
-  border:1px solid rgba(79,63,40,.10);display:block;min-height:108px;
-}
-.quick-link strong{display:block;font-size:1rem;margin-bottom:8px}
-.quick-link small{display:block;color:var(--muted);line-height:1.55;font-size:.82rem}
+.nav-pill:hover{transform:translateY(-1px);border-color:#c6b8a1}
+.nav-pill strong{font-size:.9rem;color:var(--ink)}
+.nav-pill span{font-size:.73rem;color:var(--muted);line-height:1.35}
 .metric-band{margin-bottom:18px}
-.section-head{display:flex;justify-content:space-between;align-items:flex-end;gap:14px;margin-bottom:14px}
-.section-title{font-family:'Fraunces',serif;font-size:1.45rem;line-height:1.1}
-.section-note{color:var(--muted);font-size:.92rem;line-height:1.6;max-width:58ch}
+.section-head{display:flex;justify-content:space-between;align-items:flex-end;gap:14px;margin-bottom:12px}
+.section-title{font-family:'Fraunces',serif;font-size:1.28rem;line-height:1.08}
+.section-note{color:var(--muted);font-size:.88rem;line-height:1.5;max-width:54ch}
 .section-actions{display:flex;flex-wrap:wrap;gap:10px}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:14px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px}
 .card{
-  position:relative;overflow:hidden;padding:18px;border-radius:24px;border:1px solid rgba(79,63,40,.10);
-  background:linear-gradient(180deg, rgba(255,255,255,.82), rgba(248,240,226,.92));
-  box-shadow:0 10px 30px rgba(43,35,24,.06);
+  padding:18px;border-radius:18px;border:1px solid var(--line);
+  background:var(--panel);box-shadow:var(--shadow);
 }
-.card::before{content:'';position:absolute;inset:0 auto auto 0;width:100%;height:4px;background:linear-gradient(90deg,var(--teal),var(--amber))}
-.card .label{color:var(--muted);font-size:.76rem;text-transform:uppercase;letter-spacing:.18em;font-weight:700}
-.card .value{font-size:2rem;font-weight:700;margin-top:10px;line-height:1;font-family:'IBM Plex Mono',monospace}
-.card .sub{color:var(--muted);font-size:.86rem;margin-top:10px;line-height:1.5}
+.card .label{color:var(--muted);font-size:.72rem;text-transform:uppercase;letter-spacing:.14em;font-weight:700}
+.card .value{font-size:1.8rem;font-weight:700;margin-top:10px;line-height:1;font-family:'IBM Plex Mono',monospace}
+.card .sub{color:var(--muted);font-size:.84rem;margin-top:9px;line-height:1.45}
 .green{color:var(--green)} .red{color:var(--red)} .yellow{color:var(--amber)} .blue{color:var(--blue)}
-.span-12{grid-column:span 12}.span-8{grid-column:span 8}.span-7{grid-column:span 7}.span-6{grid-column:span 6}.span-5{grid-column:span 5}.span-4{grid-column:span 4}
-.stack{display:grid;gap:18px}
-.table-shell{overflow:auto;border:1px solid rgba(79,63,40,.10);border-radius:20px;background:rgba(255,255,255,.66)}
-table{width:100%;border-collapse:collapse;font-size:.9rem;min-width:720px}
-th{
-  position:sticky;top:0;background:rgba(247,239,223,.96);color:var(--muted);text-align:left;padding:12px 14px;
-  border-bottom:1px solid rgba(79,63,40,.10);font-weight:700;text-transform:uppercase;font-size:.74rem;letter-spacing:.12em;
+.layout{display:grid;grid-template-columns:minmax(0,1.5fr) minmax(360px,.9fr);gap:18px;margin-bottom:18px}
+.panel-stack{display:grid;gap:18px}
+.section{
+  background:var(--panel);border:1px solid var(--line);border-radius:20px;padding:18px;box-shadow:var(--shadow);
 }
-td{padding:12px 14px;border-bottom:1px solid rgba(79,63,40,.08);vertical-align:middle}
+.table-shell{overflow:auto;border:1px solid var(--line);border-radius:16px;background:var(--panel-soft)}
+table{width:100%;border-collapse:collapse;font-size:.88rem;min-width:680px}
+th{
+  position:sticky;top:0;background:var(--panel-soft);color:var(--muted);text-align:left;padding:11px 13px;
+  border-bottom:1px solid var(--line);font-weight:700;text-transform:uppercase;font-size:.7rem;letter-spacing:.11em;
+}
+td{padding:11px 13px;border-bottom:1px solid rgba(227,216,199,.75);vertical-align:middle}
 tr:hover td{background:rgba(255,255,255,.6)}
-.badge{display:inline-flex;align-items:center;gap:6px;padding:5px 10px;border-radius:999px;font-size:.74rem;font-weight:700;letter-spacing:.04em;border:1px solid transparent}
-.badge-long{background:rgba(32,127,89,.12);color:var(--green);border-color:rgba(32,127,89,.18)}
-.badge-short{background:rgba(181,77,63,.12);color:var(--red);border-color:rgba(181,77,63,.18)}
-.badge-type{background:rgba(47,91,159,.10);color:var(--blue);border-color:rgba(47,91,159,.16)}
-code{font-family:'IBM Plex Mono',monospace;background:rgba(31,111,95,.08);padding:2px 6px;border-radius:8px;font-size:.84rem}
-canvas{width:100%!important;height:320px!important}
-#type-chart{height:320px!important}
-#equity-chart{height:320px!important}
+.badge{display:inline-flex;align-items:center;gap:6px;padding:4px 9px;border-radius:999px;font-size:.72rem;font-weight:700;letter-spacing:.04em;border:1px solid transparent}
+.badge-long{background:rgba(32,127,89,.1);color:var(--green);border-color:rgba(32,127,89,.18)}
+.badge-short{background:rgba(181,77,63,.1);color:var(--red);border-color:rgba(181,77,63,.18)}
+.badge-type{background:rgba(47,91,159,.08);color:var(--blue);border-color:rgba(47,91,159,.14)}
+code{font-family:'IBM Plex Mono',monospace;background:rgba(31,111,95,.07);padding:2px 6px;border-radius:8px;font-size:.82rem}
+canvas{width:100%!important;height:290px!important}
+#type-chart{height:290px!important}
+#equity-chart{height:290px!important}
 .btn{
-  padding:10px 14px;border-radius:999px;border:none;cursor:pointer;font-size:.82rem;font-weight:700;transition:transform .15s ease,opacity .15s ease;
+  padding:9px 13px;border-radius:999px;border:none;cursor:pointer;font-size:.8rem;font-weight:700;transition:transform .15s ease,opacity .15s ease;
 }
 .btn:hover{opacity:.92;transform:translateY(-1px)}
 .btn:disabled{opacity:.45;cursor:not-allowed;transform:none}
-.btn-close{background:rgba(181,77,63,.12);color:var(--red);border:1px solid rgba(181,77,63,.22)}
-.btn-close-all{background:rgba(181,77,63,.12);color:var(--red);border:1px solid rgba(181,77,63,.22)}
-.btn-reset{background:rgba(185,119,31,.12);color:var(--amber);border:1px solid rgba(185,119,31,.24)}
-.btn-success{background:rgba(32,127,89,.12);color:var(--green);border:1px solid rgba(32,127,89,.24)}
-.panel-copy{color:var(--muted);font-size:.92rem;line-height:1.6}
-.detail-list{color:var(--muted);font-size:.9rem;line-height:1.7;margin-top:12px}
+.btn-close,.btn-close-all{background:rgba(181,77,63,.10);color:var(--red);border:1px solid rgba(181,77,63,.18)}
+.btn-reset{background:rgba(185,119,31,.10);color:var(--amber);border:1px solid rgba(185,119,31,.2)}
+.btn-success{background:rgba(32,127,89,.1);color:var(--green);border:1px solid rgba(32,127,89,.2)}
+.detail-list{color:var(--muted);font-size:.88rem;line-height:1.65;margin-top:10px}
 .detail-list strong{color:var(--ink)}
-.mini-panel{margin-top:16px;padding:16px 18px;border-radius:20px;background:rgba(255,255,255,.56);border:1px solid rgba(79,63,40,.10)}
-.mini-panel h3{font-size:.84rem;text-transform:uppercase;letter-spacing:.16em;color:var(--teal);margin-bottom:10px}
-#runtime-health-detail div,#firewall-stats div{margin-bottom:6px}
-#consensus-log{display:grid;gap:10px}
-.refresh-info{color:var(--muted);font-size:.82rem;text-align:right}
+.split-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px;margin-bottom:18px}
+.details-grid{display:grid;gap:14px}
+details.section{padding:0;overflow:hidden}
+details.section[open]{background:var(--panel)}
+details summary{
+  list-style:none;cursor:pointer;padding:18px;display:flex;justify-content:space-between;align-items:center;gap:10px;
+}
+details summary::-webkit-details-marker{display:none}
+.summary-copy{color:var(--muted);font-size:.84rem}
+.details-body{padding:0 18px 18px}
 .empty-row{padding:20px 14px!important;color:var(--muted);text-align:center;font-style:italic}
 .table-note{display:block;margin-top:4px;color:var(--muted);font-size:.76rem;line-height:1.45}
 .reason-tag{
   display:inline-flex;align-items:center;padding:5px 9px;border-radius:999px;margin:0 8px 8px 0;
-  font-size:.72rem;font-weight:700;letter-spacing:.04em;background:rgba(181,77,63,.1);color:var(--red);
-  border:1px solid rgba(181,77,63,.16)
+  font-size:.7rem;font-weight:700;letter-spacing:.04em;background:rgba(181,77,63,.08);color:var(--red);
+  border:1px solid rgba(181,77,63,.14)
 }
-.regime-card{padding:20px;text-align:center}
-.regime-card .value{font-size:1.08rem}
-.consensus-item{
-  padding:12px 14px;border-radius:18px;background:rgba(255,255,255,.68);
-  border:1px solid rgba(79,63,40,.10)
-}
+.regime-card{padding:18px;text-align:center}
+.regime-card .value{font-size:1rem}
+.consensus-item{padding:12px 13px;border-radius:14px;background:var(--panel-soft);border:1px solid var(--line)}
 .consensus-meta{display:block;margin-top:6px;color:var(--muted);font-size:.8rem;line-height:1.45}
 .agent-key{display:inline-block;max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-@media (max-width: 1220px){
-  .hero-grid .hero-panel:first-child,.hero-grid .hero-panel:last-child,.span-8,.span-7,.span-6,.span-5,.span-4{grid-column:span 12}
+.runtime-grid{display:grid;gap:12px}
+@media (max-width: 1180px){
+  .layout,.split-grid{grid-template-columns:1fr}
 }
 @media (max-width: 820px){
-  body{padding:18px 14px 30px}
-  .masthead{padding:18px;border-radius:24px;flex-direction:column}
-  h1{font-size:2.2rem}
+  body{padding:16px 12px 28px}
+  .masthead{flex-direction:column}
   .nav-cluster{width:100%}
   .nav-pill{flex:1}
-  .hero-panel,.section{padding:18px;border-radius:22px}
-  canvas,#type-chart,#equity-chart{height:260px!important}
+  h1{font-size:2rem}
+  .section,.card{border-radius:16px}
+  canvas,#type-chart,#equity-chart{height:250px!important}
 }
 </style>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
@@ -873,51 +849,28 @@ canvas{width:100%!important;height:320px!important}
 <div class="page-shell">
   <header class="masthead">
     <div>
-      <p class="eyebrow">Operations Deck</p>
-      <h1>Hyperliquid Trading Cockpit</h1>
-      <p class="subtitle">Read live readiness, exposure, source quality, and research throughput on one surface. This layout is tuned for operating the bot, not admiring a metrics wall.</p>
+      <p class="eyebrow">Trading Desk</p>
+      <h1>Hyperliquid Cockpit</h1>
+      <p class="subtitle">A cleaner operator view for readiness, positions, allocator quality, and live trading pressure. The goal is to make the next decision obvious, not to show every metric equally.</p>
       <div class="status-row">
-        <span class="status-chip">Research system</span>
+        <span class="status-chip">Overview</span>
         <span class="status-chip"><span id="update-time">loading...</span></span>
-        <span class="status-chip"><span id="ws-status" class="ws-dot" title="WebSocket disconnected"></span> mids stream</span>
+        <span class="status-chip"><span id="ws-status" class="ws-dot" title="WebSocket disconnected"></span> live mids</span>
       </div>
     </div>
     <div class="nav-cluster">
-      <a href="/options" class="nav-pill nav-teal"><strong>Options Flow</strong><span>Conviction ladder, unusual prints, and flow heatmap.</span></a>
-      <a href="/backtest" class="nav-pill nav-blue"><strong>Backtest Lab</strong><span>Replay ideas, compare strategy behavior, and inspect outcomes.</span></a>
-      <a href="/stress" class="nav-pill nav-amber"><strong>Stress Lab</strong><span>Run adverse scenarios before trusting a regime shift.</span></a>
+      <a href="/options" class="nav-pill"><strong>Options</strong><span>Flow and unusual prints</span></a>
+      <a href="/backtest" class="nav-pill"><strong>Backtest</strong><span>Replay changes safely</span></a>
+      <a href="/stress" class="nav-pill"><strong>Stress</strong><span>Scenario pressure testing</span></a>
     </div>
   </header>
 
-  <section class="hero-grid">
-    <article class="hero-panel">
-      <p class="section-tag">Mission Control</p>
-      <h2 class="hero-title">Safe first. Then risk. Then alpha.</h2>
-      <p class="hero-copy">The dashboard is organized like a desk view: capital posture at the top, live positions and runtime health in the middle, and research plus allocator context below. If something degrades, it should be obvious before the next trade fires.</p>
-    </article>
-    <article class="hero-panel">
-      <p class="section-tag">Quick Context</p>
-      <div class="quick-links">
-        <a href="/options" class="quick-link"><strong>Watch signal pressure</strong><small>See whether options flow is actually contributing usable directional conviction.</small></a>
-        <a href="/backtest" class="quick-link"><strong>Replay the thesis</strong><small>Test threshold changes before promoting them into live behavior.</small></a>
-        <a href="/stress" class="quick-link"><strong>Pressure the system</strong><small>Use scenario views to understand where risk stacks before it hurts.</small></a>
-      </div>
-    </article>
-  </section>
-
   <section class="metric-band">
-    <div class="section-head">
-      <div>
-        <p class="section-tag">Situation Board</p>
-        <h2 class="section-title">Capital and Throughput</h2>
-      </div>
-      <p class="section-note">Track account posture, trade throughput, and operating tempo before drilling into positions or source performance.</p>
-    </div>
     <div class="grid" id="stats-cards"></div>
   </section>
 
-  <section class="board-grid">
-    <article class="section span-8">
+  <section class="layout">
+    <article class="section">
       <div class="section-head">
         <div>
           <p class="section-tag">Execution</p>
@@ -935,12 +888,24 @@ canvas{width:100%!important;height:320px!important}
         </table>
       </div>
     </article>
-    <aside class="stack span-4">
+    <aside class="panel-stack">
       <section class="section">
         <div class="section-head">
           <div>
-            <p class="section-tag">Copy Desk</p>
-            <h2 class="section-title">Mirrored Flow</h2>
+            <p class="section-tag">Runtime</p>
+            <h2 class="section-title">Readiness</h2>
+          </div>
+        </div>
+        <div class="runtime-grid">
+          <div class="grid" id="runtime-cards"></div>
+          <div id="runtime-health-detail" class="detail-list">Loading runtime health...</div>
+        </div>
+      </section>
+      <section class="section">
+        <div class="section-head">
+          <div>
+            <p class="section-tag">Copy Flow</p>
+            <h2 class="section-title">Mirrored Trades</h2>
           </div>
         </div>
         <div class="table-shell">
@@ -950,122 +915,46 @@ canvas{width:100%!important;height:320px!important}
           </table>
         </div>
       </section>
-      <section class="section">
-        <div class="section-head">
-          <div>
-            <p class="section-tag">Operations</p>
-            <h2 class="section-title">Runtime Health</h2>
-          </div>
-        </div>
-        <div class="grid" id="runtime-cards"></div>
-        <div id="runtime-health-detail" class="detail-list">Loading runtime health...</div>
-      </section>
     </aside>
   </section>
 
-  <section class="board-grid">
-    <article class="section span-7">
+  <section class="split-grid">
+    <article class="section">
       <div class="section-head">
         <div>
           <p class="section-tag">Performance</p>
           <h2 class="section-title">Equity Curve</h2>
         </div>
-        <p class="section-note">Cumulative closed-trade PnL. This keeps the operating view grounded in realized results, not just current mark-to-market noise.</p>
       </div>
       <canvas id="equity-chart"></canvas>
     </article>
-    <article class="section span-5">
+    <article class="section">
       <div class="section-head">
         <div>
-          <p class="section-tag">Composition</p>
-          <h2 class="section-title">Strategy Mix</h2>
+          <p class="section-tag">Mix</p>
+          <h2 class="section-title">Strategy Distribution</h2>
         </div>
       </div>
       <canvas id="type-chart"></canvas>
     </article>
   </section>
 
-  <section class="board-grid">
-    <article class="section span-7">
-      <div class="section-head">
-        <div>
-          <p class="section-tag">Research Engine</p>
-          <h2 class="section-title">Strategy Rankings</h2>
-        </div>
-      </div>
-      <div class="table-shell">
-        <table>
-          <thead><tr><th>#</th><th>Strategy</th><th>Type</th><th>Score</th><th>PnL</th><th>Win Rate</th><th>Trades</th></tr></thead>
-          <tbody id="strategies-table"></tbody>
-        </table>
-      </div>
-    </article>
-    <article class="section span-5">
-      <div class="section-head">
-        <div>
-          <p class="section-tag">Discovery</p>
-          <h2 class="section-title">Top Tracked Traders</h2>
-        </div>
-      </div>
-      <div class="table-shell">
-        <table>
-          <thead><tr><th>#</th><th>Address</th><th>Account Value</th><th>PnL</th><th>Win Rate</th><th>Trades</th></tr></thead>
-          <tbody id="traders-table"></tbody>
-        </table>
-      </div>
-    </article>
-  </section>
-
-  <section class="board-grid">
-    <article class="section span-7">
-      <div class="section-head">
-        <div>
-          <p class="section-tag">Audit Trail</p>
-          <h2 class="section-title">Closed Trades</h2>
-        </div>
-      </div>
-      <div class="table-shell">
-        <table>
-          <thead><tr><th>Coin</th><th>Side</th><th>Entry</th><th>Exit</th><th>Gross PnL</th><th>Fees</th><th>Slippage</th><th>Net PnL</th><th>Lev</th><th>Closed</th></tr></thead>
-          <tbody id="closed-trades"></tbody>
-        </table>
-      </div>
-    </article>
-    <article class="section span-5">
-      <div class="section-head">
-        <div>
-          <p class="section-tag">Cycle Feed</p>
-          <h2 class="section-title">Research Activity</h2>
-        </div>
-      </div>
-      <div class="table-shell">
-        <table>
-          <thead><tr><th>Time</th><th>Type</th><th>Summary</th><th>Traders</th><th>Strategies</th></tr></thead>
-          <tbody id="logs-table"></tbody>
-        </table>
-      </div>
-    </article>
-  </section>
-
-  <section class="board-grid">
-    <article class="section span-7">
+  <section class="split-grid">
+    <article class="section">
       <div class="section-head">
         <div>
           <p class="section-tag">Decision Layer</p>
-          <h2 class="section-title">Pipeline Metrics</h2>
+          <h2 class="section-title">Pipeline</h2>
         </div>
       </div>
       <div class="grid" id="v2-cards"></div>
-      <div class="mini-panel">
-        <h3>Decision Firewall</h3>
-        <div id="firewall-stats" class="detail-list">Loading...</div>
-      </div>
+      <div style="margin-top:14px" id="firewall-stats" class="detail-list">Loading...</div>
     </article>
-    <article class="section span-5">
+    <article class="section">
       <div class="section-head">
         <div>
           <p class="section-tag">Source Quality</p>
-          <h2 class="section-title">Source Scorecard</h2>
+          <h2 class="section-title">Scorecard</h2>
         </div>
       </div>
       <div class="table-shell">
@@ -1077,38 +966,111 @@ canvas{width:100%!important;height:320px!important}
     </article>
   </section>
 
-  <section class="section">
-    <div class="section-head">
-      <div>
-        <p class="section-tag">Regime Map</p>
-        <h2 class="section-title">Per-Coin Context</h2>
+  <section class="details-grid">
+    <details class="section" open>
+      <summary>
+        <div>
+          <p class="section-tag">Audit Trail</p>
+          <h2 class="section-title">Closed Trades</h2>
+        </div>
+        <span class="summary-copy">Realized outcomes and execution costs</span>
+      </summary>
+      <div class="details-body">
+        <div class="table-shell">
+          <table>
+            <thead><tr><th>Coin</th><th>Side</th><th>Entry</th><th>Exit</th><th>Gross PnL</th><th>Fees</th><th>Slippage</th><th>Net PnL</th><th>Lev</th><th>Closed</th></tr></thead>
+            <tbody id="closed-trades"></tbody>
+          </table>
+        </div>
       </div>
-      <p class="section-note">Keep regime state visible next to execution and source quality. If the bot is de-risking, the reason should not be buried.</p>
-    </div>
-    <div id="regime-grid" class="grid"></div>
-  </section>
+    </details>
 
-  <section class="section" style="margin-top:18px;">
-    <div class="section-head">
-      <div>
-        <p class="section-tag">Arena</p>
-        <h2 class="section-title">Alpha Arena</h2>
+    <details class="section">
+      <summary>
+        <div>
+          <p class="section-tag">Regime</p>
+          <h2 class="section-title">Per-Coin Context</h2>
+        </div>
+        <span class="summary-copy">Market state, ADX, ATR, and confidence by coin</span>
+      </summary>
+      <div class="details-body">
+        <div id="regime-grid" class="grid"></div>
       </div>
-    </div>
-    <div class="grid" id="arena-cards"></div>
-    <div class="mini-panel">
-      <h3>Arena Leaderboard</h3>
-      <div class="table-shell">
-        <table>
-          <thead><tr><th>#</th><th>Agent</th><th>Strategy</th><th>Status</th><th>ELO</th><th>Fitness</th><th>Capital</th><th>PnL</th><th>Trades</th><th>Win%</th><th>Sharpe</th><th>Gen</th></tr></thead>
-          <tbody id="arena-leaderboard"></tbody>
-        </table>
+    </details>
+
+    <details class="section">
+      <summary>
+        <div>
+          <p class="section-tag">Research</p>
+          <h2 class="section-title">Strategy Rankings</h2>
+        </div>
+        <span class="summary-copy">Top strategies by current score and realized outcomes</span>
+      </summary>
+      <div class="details-body">
+        <div class="table-shell">
+          <table>
+            <thead><tr><th>#</th><th>Strategy</th><th>Type</th><th>Score</th><th>PnL</th><th>Win Rate</th><th>Trades</th></tr></thead>
+            <tbody id="strategies-table"></tbody>
+          </table>
+        </div>
       </div>
-    </div>
-    <div class="mini-panel">
-      <h3>Recent Consensus Votes</h3>
-      <div id="consensus-log" class="detail-list"></div>
-    </div>
+    </details>
+
+    <details class="section">
+      <summary>
+        <div>
+          <p class="section-tag">Discovery</p>
+          <h2 class="section-title">Tracked Traders</h2>
+        </div>
+        <span class="summary-copy">Addresses, account values, and copy-trading candidates</span>
+      </summary>
+      <div class="details-body">
+        <div class="table-shell">
+          <table>
+            <thead><tr><th>#</th><th>Address</th><th>Account Value</th><th>PnL</th><th>Win Rate</th><th>Trades</th></tr></thead>
+            <tbody id="traders-table"></tbody>
+          </table>
+        </div>
+      </div>
+    </details>
+
+    <details class="section">
+      <summary>
+        <div>
+          <p class="section-tag">Cycle Feed</p>
+          <h2 class="section-title">Research Activity</h2>
+        </div>
+        <span class="summary-copy">Recent scans, discoveries, and cycle summaries</span>
+      </summary>
+      <div class="details-body">
+        <div class="table-shell">
+          <table>
+            <thead><tr><th>Time</th><th>Type</th><th>Summary</th><th>Traders</th><th>Strategies</th></tr></thead>
+            <tbody id="logs-table"></tbody>
+          </table>
+        </div>
+      </div>
+    </details>
+
+    <details class="section">
+      <summary>
+        <div>
+          <p class="section-tag">Arena</p>
+          <h2 class="section-title">Alpha Arena</h2>
+        </div>
+        <span class="summary-copy">Leaderboard and recent consensus votes</span>
+      </summary>
+      <div class="details-body">
+        <div class="grid" id="arena-cards" style="margin-bottom:14px"></div>
+        <div class="table-shell" style="margin-bottom:14px">
+          <table>
+            <thead><tr><th>#</th><th>Agent</th><th>Strategy</th><th>Status</th><th>ELO</th><th>Fitness</th><th>Capital</th><th>PnL</th><th>Trades</th><th>Win%</th><th>Sharpe</th><th>Gen</th></tr></thead>
+            <tbody id="arena-leaderboard"></tbody>
+          </table>
+        </div>
+        <div id="consensus-log" class="detail-list"></div>
+      </div>
+    </details>
   </section>
 </div>
 <script>

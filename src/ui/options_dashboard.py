@@ -26,301 +26,161 @@ def _get_dashboard_html() -> str:
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Fraunces:wght@600;700&family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap');
 :root {
-  --bg: #f4ecde;
-  --bg-soft: #fbf6ed;
-  --panel: #fffaf2;
-  --panel-strong: #f7efdf;
-  --ink: #1f1a17;
-  --muted: #6f655b;
-  --line: #d9ccb8;
+  --bg: #f6f2ea;
+  --panel: #fffdf9;
+  --panel-soft: #f9f4ec;
+  --ink: #181512;
+  --muted: #6b645c;
+  --line: #e3d8c7;
   --teal: #1f6f5f;
-  --teal-deep: #16483e;
   --blue: #2f5b9f;
   --amber: #b9771f;
   --red: #b54d3f;
   --green: #207f59;
-  --shadow: 0 24px 60px rgba(48, 37, 22, 0.10);
+  --shadow: 0 10px 30px rgba(40,31,20,.05);
 }
 * { margin: 0; padding: 0; box-sizing: border-box; }
 body {
   min-height: 100vh;
-  background:
-    radial-gradient(circle at top, rgba(31,111,95,0.12), transparent 32%),
-    linear-gradient(180deg, #efe5d2 0%, var(--bg) 42%, #f8f1e3 100%);
+  background: linear-gradient(180deg, #f8f4ec 0%, var(--bg) 100%);
   color: var(--ink);
   font-family: 'IBM Plex Sans', sans-serif;
-  padding: 28px 20px 36px;
+  padding: 24px 18px 34px;
 }
 a { color: inherit; }
-.shell { max-width: 1600px; margin: 0 auto; }
+.shell { max-width: 1500px; margin: 0 auto; }
 .topbar {
   display: flex;
   justify-content: space-between;
   align-items: flex-start;
   gap: 18px;
   margin-bottom: 18px;
-  padding: 24px 26px;
-  border: 1px solid rgba(31,111,95,.18);
-  border-radius: 30px;
-  background: linear-gradient(135deg, rgba(255,250,242,.96), rgba(244,236,222,.92));
-  box-shadow: var(--shadow);
 }
 .eyebrow {
-  font-size: .78rem;
+  font-size: .74rem;
   text-transform: uppercase;
-  letter-spacing: .18em;
+  letter-spacing: .16em;
   color: var(--teal);
   font-weight: 700;
 }
-.topbar h1 {
-  margin: 10px 0 8px;
+h1 {
+  margin: 8px 0 10px;
   font-family: 'Fraunces', serif;
-  font-size: clamp(2rem, 3vw, 3.4rem);
-  line-height: .96;
+  font-size: clamp(1.9rem, 2.8vw, 3rem);
+  line-height: .98;
 }
-.subtitle {
-  max-width: 68ch;
-  color: var(--muted);
-  line-height: 1.6;
+.subtitle { max-width: 64ch; color: var(--muted); line-height: 1.55; font-size: .94rem; }
+.header-actions { display: flex; flex-wrap: wrap; gap: 10px; justify-content: flex-end; }
+.pill {
+  display: inline-flex; align-items: center; gap: 8px; padding: 9px 12px;
+  border-radius: 999px; border: 1px solid var(--line); background: var(--panel); text-decoration: none;
+  font-size: .82rem; font-weight: 600;
 }
-.header-actions {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 10px;
-  justify-content: flex-end;
-}
-.link-pill,
-.status-pill {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  padding: 10px 14px;
-  border-radius: 999px;
-  border: 1px solid rgba(79,63,40,.10);
-  background: rgba(255,255,255,.72);
-  text-decoration: none;
-  font-size: .84rem;
-  font-weight: 600;
-}
-.link-pill:hover { transform: translateY(-1px); }
 .live-dot {
-  display: inline-block;
-  width: 10px;
-  height: 10px;
-  border-radius: 50%;
+  display: inline-block; width: 9px; height: 9px; border-radius: 50%;
   background: var(--green);
-  box-shadow: 0 0 0 4px rgba(32,127,89,.12);
 }
-.main {
-  display: grid;
-  grid-template-columns: 300px minmax(0, 1fr) 430px;
-  gap: 18px;
-}
+.main { display: grid; grid-template-columns: 280px minmax(0, 1fr) 400px; gap: 18px; }
 .stack,
 .workspace,
 .tape-stack { display: grid; gap: 18px; align-content: start; }
 .panel {
-  background: linear-gradient(180deg, rgba(255,250,242,.97), rgba(247,239,223,.92));
-  border: 1px solid rgba(79,63,40,.10);
-  border-radius: 28px;
-  padding: 20px;
-  box-shadow: var(--shadow);
+  background: var(--panel); border: 1px solid var(--line); border-radius: 20px; padding: 18px; box-shadow: var(--shadow);
 }
-.panel-head {
-  display: flex;
-  justify-content: space-between;
-  align-items: flex-end;
-  gap: 10px;
-  margin-bottom: 14px;
-}
-.panel-title {
-  font-family: 'Fraunces', serif;
-  font-size: 1.35rem;
-  line-height: 1.1;
-}
-.panel-copy {
-  color: var(--muted);
-  font-size: .9rem;
-  line-height: 1.55;
-}
+.panel-head { display: flex; justify-content: space-between; align-items: flex-end; gap: 10px; margin-bottom: 12px; }
+.panel-title { font-family: 'Fraunces', serif; font-size: 1.22rem; line-height: 1.08; }
+.panel-copy { color: var(--muted); font-size: .86rem; line-height: 1.5; }
 .metric-row {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  gap: 10px;
-  padding: 10px 0;
-  border-bottom: 1px solid rgba(79,63,40,.08);
+  display: flex; justify-content: space-between; align-items: center; gap: 10px; padding: 10px 0;
+  border-bottom: 1px solid rgba(227,216,199,.75);
 }
 .metric-row:last-child { border-bottom: 0; }
-.metric-row .label { color: var(--muted); font-size: .86rem; }
+.metric-row .label { color: var(--muted); font-size: .85rem; }
 .metric-row .value { color: var(--ink); font-weight: 700; font-family: 'IBM Plex Mono', monospace; }
-.metric-row .value.positive { color: var(--green); }
-.metric-row .value.negative { color: var(--red); }
 .conviction-card {
-  background: rgba(255,255,255,.72);
-  border: 1px solid rgba(79,63,40,.10);
-  border-radius: 20px;
-  padding: 14px;
-  margin-bottom: 10px;
+  background: var(--panel-soft); border: 1px solid var(--line); border-radius: 16px; padding: 13px; margin-bottom: 10px;
 }
-.conviction-card .ticker { font-size: 1rem; font-weight: 700; }
+.conviction-card .ticker { font-size: .96rem; font-weight: 700; }
 .conviction-card .ticker.bullish,
 .conviction-card .net-flow.bullish { color: var(--green); }
 .conviction-card .ticker.bearish,
 .conviction-card .net-flow.bearish { color: var(--red); }
-.conviction-card .flow-detail { font-size: .8rem; color: var(--muted); margin-top: 6px; line-height: 1.45; }
-.conviction-card .net-flow { font-size: 1rem; font-weight: 700; margin-top: 6px; }
-.conviction-bar { height: 6px; border-radius: 999px; margin-top: 10px; }
-.conviction-bar.bullish { background: linear-gradient(90deg, rgba(32,127,89,.18), var(--green)); }
-.conviction-bar.bearish { background: linear-gradient(90deg, rgba(181,77,63,.18), var(--red)); }
+.conviction-card .flow-detail { font-size: .79rem; color: var(--muted); margin-top: 5px; line-height: 1.45; }
+.conviction-card .net-flow { font-size: .96rem; font-weight: 700; margin-top: 6px; }
+.conviction-bar { height: 5px; border-radius: 999px; margin-top: 9px; }
+.conviction-bar.bullish { background: linear-gradient(90deg, rgba(32,127,89,.14), var(--green)); }
+.conviction-bar.bearish { background: linear-gradient(90deg, rgba(181,77,63,.14), var(--red)); }
 .heatmap-grid {
-  display: grid;
-  grid-template-columns: 88px repeat(4, minmax(0, 1fr));
-  gap: 8px;
-  margin-top: 8px;
+  display: grid; grid-template-columns: 84px repeat(4, minmax(0, 1fr)); gap: 8px; margin-top: 8px;
 }
 .heatmap-header {
-  font-size: .72rem;
-  color: var(--muted);
-  text-align: center;
-  padding: 8px;
-  text-transform: uppercase;
-  letter-spacing: .12em;
+  font-size: .7rem; color: var(--muted); text-align: center; padding: 8px; text-transform: uppercase; letter-spacing: .12em;
 }
 .heatmap-label {
-  display: flex;
-  align-items: center;
-  font-size: .82rem;
-  color: var(--ink);
-  padding: 8px;
-  font-weight: 700;
+  display: flex; align-items: center; font-size: .8rem; color: var(--ink); padding: 8px; font-weight: 700;
 }
 .heatmap-cell {
-  min-height: 52px;
-  border-radius: 16px;
-  padding: 10px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  text-align: center;
-  font-size: .78rem;
-  font-weight: 700;
-  border: 1px solid rgba(79,63,40,.08);
+  min-height: 50px; border-radius: 14px; padding: 10px; display: flex; align-items: center; justify-content: center;
+  text-align: center; font-size: .76rem; font-weight: 700; border: 1px solid rgba(227,216,199,.75);
 }
-.flow-chart-container { height: 340px; }
-.tape-panel { padding-bottom: 12px; }
+.flow-chart-container { height: 320px; }
 .tape-header,
 .tape-row {
-  display: grid;
-  grid-template-columns: 60px 50px 100px 74px 72px 66px 84px 74px;
-  gap: 8px;
-  align-items: center;
+  display: grid; grid-template-columns: 58px 46px 96px 72px 70px 64px 82px 72px; gap: 8px; align-items: center;
 }
 .tape-header {
-  padding: 10px 2px;
-  border-bottom: 1px solid rgba(79,63,40,.10);
-  font-size: .68rem;
-  color: var(--muted);
-  text-transform: uppercase;
-  letter-spacing: .12em;
+  padding: 10px 2px; border-bottom: 1px solid var(--line); font-size: .67rem; color: var(--muted);
+  text-transform: uppercase; letter-spacing: .12em;
 }
 .tape-body { max-height: 620px; overflow: auto; }
 .tape-row {
-  padding: 12px 2px;
-  border-bottom: 1px solid rgba(79,63,40,.08);
-  font-size: .8rem;
-  cursor: pointer;
-  transition: background .15s ease, transform .15s ease;
+  padding: 11px 2px; border-bottom: 1px solid rgba(227,216,199,.75); font-size: .79rem; cursor: pointer;
+  transition: background .15s ease;
 }
-.tape-row:hover {
-  background: rgba(255,255,255,.62);
-  transform: translateX(2px);
-}
+.tape-row:hover { background: rgba(249,244,236,.85); }
 .tier {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  padding: 3px 7px;
-  border-radius: 999px;
-  font-size: .64rem;
-  font-weight: 700;
-  border: 1px solid transparent;
+  display: inline-flex; align-items: center; justify-content: center; padding: 3px 7px; border-radius: 999px;
+  font-size: .64rem; font-weight: 700; border: 1px solid transparent;
 }
-.tier-MEGA_BLOCK { background: rgba(127,95,159,.12); color: #7f5f9f; border-color: rgba(127,95,159,.18); }
-.tier-BLOCK { background: rgba(185,119,31,.12); color: var(--amber); border-color: rgba(185,119,31,.18); }
-.tier-SWEEP { background: rgba(47,91,159,.10); color: var(--blue); border-color: rgba(47,91,159,.16); }
-.tier-LARGE { background: rgba(111,101,91,.10); color: var(--muted); border-color: rgba(111,101,91,.18); }
+.tier-MEGA_BLOCK { background: rgba(127,95,159,.10); color: #7f5f9f; border-color: rgba(127,95,159,.15); }
+.tier-BLOCK { background: rgba(185,119,31,.10); color: var(--amber); border-color: rgba(185,119,31,.15); }
+.tier-SWEEP { background: rgba(47,91,159,.08); color: var(--blue); border-color: rgba(47,91,159,.12); }
+.tier-LARGE { background: rgba(107,100,92,.08); color: var(--muted); border-color: rgba(107,100,92,.12); }
 .dir-bullish { color: var(--green); }
 .dir-bearish { color: var(--red); }
 .order-panel { display: grid; gap: 14px; }
-.order-grid {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 10px;
-}
+.order-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
 .order-field { display: flex; flex-direction: column; gap: 6px; }
-.order-field label {
-  font-size: .72rem;
-  color: var(--muted);
-  text-transform: uppercase;
-  letter-spacing: .12em;
-}
+.order-field label { font-size: .7rem; color: var(--muted); text-transform: uppercase; letter-spacing: .12em; }
 .order-field input,
 .order-field select {
-  width: 100%;
-  border: 1px solid var(--line);
-  border-radius: 14px;
-  padding: 12px 14px;
-  background: rgba(255,255,255,.78);
-  color: var(--ink);
-  font-size: .9rem;
-  font-family: 'IBM Plex Mono', monospace;
+  width: 100%; border: 1px solid var(--line); border-radius: 12px; padding: 11px 13px; background: var(--panel-soft);
+  color: var(--ink); font-size: .88rem; font-family: 'IBM Plex Mono', monospace;
 }
 .order-field .computed {
-  min-height: 44px;
-  display: flex;
-  align-items: center;
-  padding: 12px 14px;
-  border-radius: 14px;
-  background: rgba(255,255,255,.56);
-  border: 1px solid rgba(79,63,40,.10);
-  color: var(--amber);
-  font-family: 'IBM Plex Mono', monospace;
-  font-weight: 600;
+  min-height: 42px; display: flex; align-items: center; padding: 11px 13px; border-radius: 12px;
+  background: var(--panel-soft); border: 1px solid var(--line); color: var(--amber); font-family: 'IBM Plex Mono', monospace; font-weight: 600;
 }
 .order-actions { display: flex; gap: 10px; }
 .btn-order {
-  flex: 1;
-  border: 0;
-  border-radius: 999px;
-  padding: 12px 16px;
-  font-weight: 700;
-  font-size: .9rem;
-  cursor: pointer;
+  flex: 1; border: 0; border-radius: 999px; padding: 11px 15px; font-weight: 700; font-size: .88rem; cursor: pointer;
 }
-.btn-order.buy { background: rgba(32,127,89,.14); color: var(--green); border: 1px solid rgba(32,127,89,.22); }
-.btn-order.sell { background: rgba(181,77,63,.12); color: var(--red); border: 1px solid rgba(181,77,63,.22); }
+.btn-order.buy { background: rgba(32,127,89,.1); color: var(--green); border: 1px solid rgba(32,127,89,.18); }
+.btn-order.sell { background: rgba(181,77,63,.1); color: var(--red); border: 1px solid rgba(181,77,63,.18); }
 .empty-state {
-  text-align: center;
-  color: var(--muted);
-  padding: 28px 16px;
-  font-size: .9rem;
-  line-height: 1.5;
+  text-align: center; color: var(--muted); padding: 24px 16px; font-size: .88rem; line-height: 1.45;
 }
-@media (max-width: 1320px) {
+@media (max-width: 1260px) {
   .main { grid-template-columns: 280px minmax(0, 1fr); }
   .tape-stack { grid-column: 1 / -1; }
 }
-@media (max-width: 940px) {
-  body { padding: 18px 14px 24px; }
-  .topbar { flex-direction: column; padding: 18px; border-radius: 24px; }
+@media (max-width: 900px) {
+  body { padding: 16px 12px 26px; }
+  .topbar { flex-direction: column; }
   .main { grid-template-columns: 1fr; }
   .order-grid { grid-template-columns: 1fr; }
   .tape-header,
-  .tape-row {
-    grid-template-columns: 60px 52px 1.2fr 1fr 70px 70px 84px 78px;
-    font-size: .74rem;
-  }
+  .tape-row { grid-template-columns: 58px 48px 1.2fr 1fr 70px 66px 80px 76px; font-size: .73rem; }
 }
 </style>
 </head>
@@ -328,15 +188,15 @@ a { color: inherit; }
 <div class="shell">
   <header class="topbar">
     <div>
-      <p class="eyebrow">Signal Pressure Desk</p>
-      <h1>Options Flow Desk</h1>
-      <p class="subtitle">This view is for reading directional pressure quickly: spot anchors on the left, where conviction is building in the center, and the raw unusual prints tape plus order ticket on the right.</p>
+      <p class="eyebrow">Options Desk</p>
+      <h1>Flow Overview</h1>
+      <p class="subtitle">A simpler read on options pressure: spot board on the left, directional concentration in the center, and the raw tape with a staging ticket on the right.</p>
     </div>
     <div class="header-actions">
-      <a class="link-pill" href="/">Back to cockpit</a>
-      <span class="status-pill"><span class="live-dot"></span> live scan</span>
-      <span class="status-pill" id="last-update">Loading...</span>
-      <span class="status-pill"><span id="print-count">0</span></span>
+      <a class="pill" href="/">Back to cockpit</a>
+      <span class="pill"><span class="live-dot"></span> live scan</span>
+      <span class="pill" id="last-update">Loading...</span>
+      <span class="pill"><span id="print-count">0</span></span>
     </div>
   </header>
 
@@ -345,8 +205,8 @@ a { color: inherit; }
       <article class="panel">
         <div class="panel-head">
           <div>
-            <p class="eyebrow">Underlyings</p>
-            <h2 class="panel-title">Spot Board</h2>
+            <p class="eyebrow">Spot</p>
+            <h2 class="panel-title">Underlyings</h2>
           </div>
         </div>
         <div id="spot-prices"></div>
@@ -355,8 +215,8 @@ a { color: inherit; }
       <article class="panel">
         <div class="panel-head">
           <div>
-            <p class="eyebrow">Risk Frame</p>
-            <h2 class="panel-title">Sizing Guardrails</h2>
+            <p class="eyebrow">Risk</p>
+            <h2 class="panel-title">Guardrails</h2>
           </div>
         </div>
         <div class="metric-row"><span class="label">Per trade</span><span class="value">1%</span></div>
@@ -367,11 +227,10 @@ a { color: inherit; }
       <article class="panel">
         <div class="panel-head">
           <div>
-            <p class="eyebrow">Highest Conviction</p>
-            <h2 class="panel-title">Directional Pressure</h2>
+            <p class="eyebrow">Conviction</p>
+            <h2 class="panel-title">Top Pressure</h2>
           </div>
         </div>
-        <p class="panel-copy">The strongest flow clusters stay here so you can see whether the tape is leaning with real size or just noise.</p>
         <div id="convictions-list"><div class="empty-state">Scanning options flow...</div></div>
       </article>
     </aside>
@@ -380,10 +239,9 @@ a { color: inherit; }
       <article class="panel">
         <div class="panel-head">
           <div>
-            <p class="eyebrow">Distribution</p>
-            <h2 class="panel-title">Flow Heatmap</h2>
+            <p class="eyebrow">Heatmap</p>
+            <h2 class="panel-title">Net Notional by Expiry</h2>
           </div>
-          <p class="panel-copy">Net notional by expiry bucket. Positive cells lean bullish. Negative cells lean bearish.</p>
         </div>
         <div class="heatmap-grid" id="heatmap-grid"></div>
       </article>
@@ -391,10 +249,9 @@ a { color: inherit; }
       <article class="panel">
         <div class="panel-head">
           <div>
-            <p class="eyebrow">Net Bias</p>
+            <p class="eyebrow">Bias</p>
             <h2 class="panel-title">Ticker Flow Balance</h2>
           </div>
-          <p class="panel-copy">This is the fast answer for which names are taking the heaviest directional pressure right now.</p>
         </div>
         <div class="flow-chart-container">
           <canvas id="flow-chart"></canvas>
@@ -403,13 +260,12 @@ a { color: inherit; }
     </main>
 
     <aside class="tape-stack">
-      <article class="panel tape-panel">
+      <article class="panel">
         <div class="panel-head">
           <div>
             <p class="eyebrow">Tape</p>
             <h2 class="panel-title">Unusual Prints</h2>
           </div>
-          <p class="panel-copy">Click a print to prefill the order ticket.</p>
         </div>
         <div class="tape-header">
           <span>Time</span><span>Ticker</span><span>Strike/Type</span><span>Expiry</span>
@@ -423,10 +279,9 @@ a { color: inherit; }
       <article class="panel order-panel" id="order-panel" style="display:none;">
         <div class="panel-head">
           <div>
-            <p class="eyebrow">Order Ticket</p>
-            <h2 class="panel-title">Execution Stub</h2>
+            <p class="eyebrow">Ticket</p>
+            <h2 class="panel-title">Order Stub</h2>
           </div>
-          <p class="panel-copy">This still posts to the placeholder order endpoint. Keep it as a staging surface until live options execution is implemented.</p>
         </div>
         <div class="order-grid">
           <div class="order-field">
@@ -552,7 +407,7 @@ function renderHeatmap(heatmap) {
       let bg;
       if (val > 0) bg = 'rgba(32, 127, 89, ' + (0.10 + intensity * 0.50) + ')';
       else if (val < 0) bg = 'rgba(181, 77, 63, ' + (0.10 + intensity * 0.50) + ')';
-      else bg = 'rgba(111, 101, 91, 0.08)';
+      else bg = 'rgba(107, 100, 92, 0.08)';
       const text = val !== 0 ? formatUSD(val) : '--';
       html += '<div class="heatmap-cell" style="background:' + bg + '">' + text + '</div>';
     });
@@ -578,7 +433,7 @@ function renderFlowChart(flowBars) {
         data: values,
         backgroundColor: colors,
         borderWidth: 0,
-        borderRadius: 10,
+        borderRadius: 8,
       }]
     },
     options: {
@@ -595,12 +450,12 @@ function renderFlowChart(flowBars) {
       },
       scales: {
         x: {
-          grid: { color: 'rgba(111,101,91,0.12)' },
-          ticks: { color: '#6f655b', callback: v => formatUSD(v) }
+          grid: { color: 'rgba(107,100,92,0.12)' },
+          ticks: { color: '#6b645c', callback: v => formatUSD(v) }
         },
         y: {
           grid: { display: false },
-          ticks: { color: '#1f1a17', font: { weight: '700' } }
+          ticks: { color: '#181512', font: { weight: '700' } }
         }
       }
     }
