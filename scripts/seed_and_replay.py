@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# ruff: noqa: E402
 """
 Seed & Replay — One-command reproducible backtest from a fresh checkout
 ========================================================================
@@ -18,19 +19,15 @@ Requires only: numpy, pandas, requests (no websocket/eth_account needed).
 import argparse
 import json
 import logging
-import math
-import os
 import random
 import sys
-import time
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 
 # ─── Path setup ────────────────────────────────────────────────
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-import config
 from src.data import database as db
 from src.discovery.golden_wallet import init_golden_tables
 
@@ -335,8 +332,7 @@ def seed_database():
 def run_replay(sweep: bool = False):
     """Run the backtester on seeded data."""
     from src.backtest.backtester import (
-        BacktestConfig, BacktestEngine, BacktestFill,
-        load_fills_from_db, init_experiments_table, save_experiment,
+        BacktestConfig, BacktestEngine, load_fills_from_db, init_experiments_table, save_experiment,
         parameter_sweep,
     )
 
@@ -391,7 +387,7 @@ def run_replay(sweep: bool = False):
         result = engine.run(fills, experiment_id="sample_replay_001")
 
         print(f"\n{'='*60}")
-        print(f"  Sample Replay Results")
+        print("  Sample Replay Results")
         print(f"{'='*60}")
         print(f"  Wallets:           {len(result.wallets_used)}")
         print(f"  Total Trades:      {result.total_trades}")
@@ -407,7 +403,7 @@ def run_replay(sweep: bool = False):
         print(f"  Duration:          {result.duration_seconds:.1f}s")
 
         if result.coin_breakdown:
-            print(f"\n  Coin Breakdown:")
+            print("\n  Coin Breakdown:")
             print(f"    {'Coin':<8}  {'Trades':>7}  {'WR%':>6}  {'PnL':>11}")
             for coin, d in sorted(result.coin_breakdown.items(),
                                     key=lambda x: x[1]["pnl"], reverse=True):

@@ -272,6 +272,43 @@ def notify_cycle_summary(summary: Dict):
     _send_message(text)
 
 
+def notify_runtime_incident(snapshot: Dict, resolved: bool = False):
+    """Notify operators when runtime readiness changes materially."""
+    checks = snapshot.get("checks", {}) if isinstance(snapshot, dict) else {}
+    reasons = list(snapshot.get("reasons", []) or []) if isinstance(snapshot, dict) else []
+    ready = bool(snapshot.get("ready", False)) if isinstance(snapshot, dict) else False
+    live_ready = bool(snapshot.get("live_ready", False)) if isinstance(snapshot, dict) else False
+
+    title = "RUNTIME RECOVERED" if resolved else "RUNTIME INCIDENT"
+    emoji = "✅" if resolved else "🚨"
+    text = (
+        f"{emoji} <b>{title}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"<b>Ready:</b> {'YES' if ready else 'NO'}\n"
+        f"<b>Live Ready:</b> {'YES' if live_ready else 'NO'}\n"
+        f"<b>Live Requested:</b> {'YES' if checks.get('live_requested') else 'NO'}\n"
+    )
+
+    if reasons:
+        text += "\n<b>Reasons:</b>\n"
+        for reason in reasons[:6]:
+            text += f"• {reason}\n"
+
+    stale = checks.get("stale_trading_subsystems", []) or []
+    at_risk = checks.get("at_risk_trading_subsystems", []) or []
+    if stale:
+        text += f"\n<b>Stale Trading Subsystems:</b> {', '.join(stale[:6])}\n"
+    if at_risk:
+        text += f"<b>At-Risk Trading Subsystems:</b> {', '.join(at_risk[:6])}\n"
+
+    status_reason = checks.get("live_status_reason")
+    if status_reason:
+        text += f"<b>Live Status:</b> {status_reason}\n"
+
+    text += f"\n⏰ {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}"
+    _send_message(text)
+
+
 def notify_strong_signal(coin: str, side: str, reasons: List[str], confidence: float):
     """Notify about a high-confidence convergence signal."""
     emoji = "⚡🟢" if side == "long" else "⚡🔴"

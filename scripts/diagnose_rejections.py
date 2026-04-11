@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# ruff: noqa: E402
 """
 Firewall Rejection Diagnostics
 ===============================
@@ -15,18 +16,14 @@ import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import json
 import logging
-from datetime import datetime
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger(__name__)
 
 # ─── Import pipeline components ────────────────────────────────
-from src.signals.signal_schema import TradeSignal, SignalSide, SignalSource, SignalStrength, RiskParams
+from src.signals.signal_schema import TradeSignal, SignalSide, SignalSource, RiskParams
 from src.signals.decision_firewall import DecisionFirewall
-from src.signals.signal_processor import SignalProcessor
-from src.signals.decision_engine import DecisionEngine
 from src.data import database as db
 
 

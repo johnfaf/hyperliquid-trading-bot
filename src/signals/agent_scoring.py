@@ -14,7 +14,7 @@ import math
 import json
 import time
 from datetime import datetime, timezone
-from typing import Dict, List
+from typing import Dict, List, Optional
 from collections import defaultdict
 from dataclasses import dataclass, asdict
 
@@ -55,12 +55,39 @@ class AgentScorer:
     3. Before execution: weight = scorer.get_weight(source_key)
     """
 
-    def __init__(self):
+    def __init__(self, config: Optional[Dict] = None):
+        cfg = config or {}
         # In-memory score tracking
         self.scores: Dict[str, SourceScore] = {}
 
         # Trade-level tracking for time decay
         self._trade_history: Dict[str, List[Dict]] = defaultdict(list)
+
+        # Source policy thresholds. These gate weak sources before they keep
+        # consuming paper/live capacity.
+        self.policy_enabled = bool(cfg.get("policy_enabled", True))
+        self.policy_min_closed_trades = int(cfg.get("policy_min_closed_trades", 3))
+        self.policy_keep_top_n = int(cfg.get("policy_keep_top_n", 5))
+        self.policy_pause_weight = float(cfg.get("policy_pause_weight", 0.12))
+        self.policy_degrade_weight = float(cfg.get("policy_degrade_weight", 0.32))
+        self.policy_warmup_max_signals_per_day = int(
+            cfg.get("policy_warmup_max_signals_per_day", 1)
+        )
+        self.policy_degraded_max_signals_per_day = int(
+            cfg.get("policy_degraded_max_signals_per_day", 1)
+        )
+        self.policy_warmup_size_multiplier = float(
+            cfg.get("policy_warmup_size_multiplier", 0.75)
+        )
+        self.policy_degraded_size_multiplier = float(
+            cfg.get("policy_degraded_size_multiplier", 0.60)
+        )
+        self.policy_warmup_min_confidence = float(
+            cfg.get("policy_warmup_min_confidence", 0.45)
+        )
+        self.policy_degraded_min_confidence = float(
+            cfg.get("policy_degraded_min_confidence", 0.55)
+        )
 
         # Load existing scores from DB
         self._load_scores()
@@ -290,6 +317,7 @@ class AgentScorer:
             source = signal.source.value if hasattr(signal.source, 'value') else str(signal.source)
         else:
             source = signal.get("source", "unknown")
+        source = str(source or "unknown").strip().lower() or "unknown"
 
         stype = ""
         if hasattr(signal, 'strategy_type'):
@@ -297,6 +325,17 @@ class AgentScorer:
         elif isinstance(signal, dict):
             stype = signal.get("strategy_type", "")
 
+        trader_address = ""
+        if hasattr(signal, "trader_address"):
+            trader_address = getattr(signal, "trader_address", "")
+        elif isinstance(signal, dict):
+            trader_address = signal.get("trader_address", "") or signal.get("source_trader", "")
+        trader_address = str(trader_address or "").strip().lower()
+
+        if source == "copy_trade":
+            if trader_address:
+                return f"{source}:{trader_address}"
+            return source
         if stype:
             return f"{source}:{stype}"
         return source
@@ -304,7 +343,9 @@ class AgentScorer:
     def get_all_scores(self) -> List[Dict]:
         """Get scores for all tracked sources, sorted by weight."""
         result = []
+        scorecard_map = {row["source_key"]: row for row in self.get_scorecard()}
         for key, score in self.scores.items():
+            source_row = scorecard_map.get(key, {})
             result.append({
                 "source_key": key,
                 "total_signals": score.total_signals,
@@ -313,9 +354,157 @@ class AgentScorer:
                 "sharpe": round(score.sharpe, 3),
                 "dynamic_weight": round(score.dynamic_weight, 3),
                 "total_pnl": round(score.total_pnl, 2),
+                "completed_trades": int(source_row.get("completed_trades", 0)),
+                "status": source_row.get("status", "unknown"),
+                "recent_pnl": round(float(source_row.get("recent_pnl", 0.0) or 0.0), 2),
             })
         result.sort(key=lambda x: x["dynamic_weight"], reverse=True)
         return result
+
+    def _completed_history(self, source_key: str) -> List[Dict]:
+        history = self._trade_history.get(source_key, []) or []
+        return [entry for entry in history if entry.get("pnl") is not None]
+
+    def _eligible_ranks(self) -> Dict[str, int]:
+        eligible = []
+        for source_key in set(self.scores) | set(self._trade_history):
+            completed = self._completed_history(source_key)
+            if len(completed) < self.policy_min_closed_trades:
+                continue
+            score = self.scores.get(source_key) or SourceScore(source_key=source_key)
+            eligible.append((source_key, score.dynamic_weight, score.total_pnl, len(completed)))
+        eligible.sort(key=lambda item: (item[1], item[2], item[3]), reverse=True)
+        return {source_key: rank + 1 for rank, (source_key, *_rest) in enumerate(eligible)}
+
+    def get_scorecard(self) -> List[Dict]:
+        """Return per-source scorecards used by the allocator/dashboard."""
+        rank_map = self._eligible_ranks()
+        rows = []
+        for source_key in set(self.scores) | set(self._trade_history):
+            score = self.scores.get(source_key) or SourceScore(source_key=source_key)
+            completed = self._completed_history(source_key)
+            completed_count = len(completed)
+            wins = sum(1 for item in completed if item.get("correct"))
+            recent = completed[-10:]
+            recent_pnl = sum(float(item.get("pnl", 0.0) or 0.0) for item in recent)
+            recent_avg_return = (
+                sum(float(item.get("return_pct", 0.0) or 0.0) for item in recent) / len(recent)
+                if recent
+                else 0.0
+            )
+            last_trade_at = completed[-1].get("timestamp") if completed else score.last_updated
+            win_rate = wins / completed_count if completed_count > 0 else 0.0
+            rank = rank_map.get(source_key)
+
+            if not self.policy_enabled:
+                status = "active"
+            elif completed_count < self.policy_min_closed_trades:
+                status = "warmup"
+            elif (
+                score.dynamic_weight <= self.policy_pause_weight
+                or (
+                    completed_count >= max(self.policy_min_closed_trades, 5)
+                    and recent_pnl < 0
+                    and score.weighted_accuracy <= (self.policy_pause_weight + 0.08)
+                )
+            ):
+                status = "paused"
+            elif (
+                score.dynamic_weight <= self.policy_degrade_weight
+                or (rank is not None and rank > self.policy_keep_top_n)
+                or (completed_count >= max(self.policy_min_closed_trades, 3) and recent_pnl < 0)
+            ):
+                status = "degraded"
+            else:
+                status = "active"
+
+            rows.append(
+                {
+                    "source_key": source_key,
+                    "rank": rank,
+                    "status": status,
+                    "completed_trades": completed_count,
+                    "win_rate": round(win_rate, 3),
+                    "accuracy": round(score.accuracy, 3),
+                    "weighted_accuracy": round(score.weighted_accuracy, 3),
+                    "dynamic_weight": round(score.dynamic_weight, 3),
+                    "sharpe": round(score.sharpe, 3),
+                    "avg_return": round(score.avg_return, 4),
+                    "recent_avg_return": round(recent_avg_return, 4),
+                    "total_pnl": round(score.total_pnl, 2),
+                    "recent_pnl": round(recent_pnl, 2),
+                    "last_trade_at": last_trade_at,
+                }
+            )
+        rows.sort(
+            key=lambda row: (
+                {"active": 0, "warmup": 1, "degraded": 2, "paused": 3}.get(row["status"], 9),
+                row["rank"] if row["rank"] is not None else 999999,
+                -row["dynamic_weight"],
+            )
+        )
+        return rows
+
+    def get_source_policy(self, source_key: str) -> Dict:
+        """Return the current allocator policy for a source."""
+        default_policy = {
+            "source_key": source_key,
+            "status": "unknown",
+            "rank": None,
+            "blocked": False,
+            "max_signals_per_day": 0,
+            "size_multiplier": 1.0,
+            "min_confidence": 0.0,
+            "dynamic_weight": round(self.get_weight(source_key), 3),
+            "weighted_accuracy": round(self.get_accuracy(source_key), 3),
+            "completed_trades": len(self._completed_history(source_key)),
+            "recent_pnl": 0.0,
+        }
+        if not self.policy_enabled:
+            default_policy["status"] = "active"
+            return default_policy
+
+        row = next((item for item in self.get_scorecard() if item["source_key"] == source_key), None)
+        if not row:
+            return default_policy
+
+        policy = {
+            **default_policy,
+            "status": row["status"],
+            "rank": row["rank"],
+            "dynamic_weight": row["dynamic_weight"],
+            "weighted_accuracy": row["weighted_accuracy"],
+            "completed_trades": row["completed_trades"],
+            "recent_pnl": row["recent_pnl"],
+        }
+        if row["status"] == "paused":
+            policy.update(
+                {
+                    "blocked": True,
+                    "max_signals_per_day": 0,
+                    "size_multiplier": 0.0,
+                    "min_confidence": 1.0,
+                }
+            )
+        elif row["status"] == "warmup":
+            policy.update(
+                {
+                    "max_signals_per_day": self.policy_warmup_max_signals_per_day,
+                    "size_multiplier": self.policy_warmup_size_multiplier,
+                    "min_confidence": self.policy_warmup_min_confidence,
+                }
+            )
+        elif row["status"] == "degraded":
+            policy.update(
+                {
+                    "max_signals_per_day": self.policy_degraded_max_signals_per_day,
+                    "size_multiplier": self.policy_degraded_size_multiplier,
+                    "min_confidence": self.policy_degraded_min_confidence,
+                }
+            )
+        else:
+            policy["status"] = "active"
+        return policy
 
     def apply_weights_to_signals(self, signals: List) -> List:
         """

@@ -20,10 +20,11 @@ This enables:
 import logging
 import os
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 import statistics
 
-import sys, os as os_module
+import sys
+import os as os_module
 sys.path.insert(0, os_module.path.join(os_module.path.dirname(__file__), ".."))
 import config
 

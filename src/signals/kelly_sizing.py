@@ -23,8 +23,7 @@ We use Half-Kelly (f* × 0.5) because:
   - Half-Kelly dramatically reduces drawdown risk
 """
 import logging
-import math
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional
 from dataclasses import dataclass, asdict
 
 import numpy as np

@@ -22,6 +22,9 @@ class SignalSource(str, Enum):
     STRATEGY = "strategy"
     COPY_TRADE = "copy_trade"
     OPTIONS_FLOW = "options_flow"
+    POLYMARKET = "polymarket"
+    LIQUIDATION_STRATEGY = "liquidation_strategy"
+    ARENA_CHAMPION = "arena_champion"
     MANUAL = "manual"
     WHALE_TRADE = "whale_trade"
 
@@ -166,6 +169,12 @@ def signal_from_execution_dict(execution: Dict[str, Any]) -> TradeSignal:
         source = SignalSource.COPY_TRADE
     elif source_raw == SignalSource.OPTIONS_FLOW.value:
         source = SignalSource.OPTIONS_FLOW
+    elif source_raw == SignalSource.POLYMARKET.value:
+        source = SignalSource.POLYMARKET
+    elif source_raw == SignalSource.LIQUIDATION_STRATEGY.value:
+        source = SignalSource.LIQUIDATION_STRATEGY
+    elif source_raw == SignalSource.ARENA_CHAMPION.value:
+        source = SignalSource.ARENA_CHAMPION
     elif source_raw == SignalSource.WHALE_TRADE.value:
         source = SignalSource.WHALE_TRADE
     else:

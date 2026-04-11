@@ -7,8 +7,6 @@ paper-trade reset logic.  Keeps ``main.py`` focused on orchestration.
 Extracted from the bottom ~400 lines of the old monolithic main.py.
 """
 import argparse
-import os
-import time
 from datetime import datetime
 
 import config

@@ -1025,6 +1025,11 @@ class LiveTrader:
             trader_address = str(getattr(signal, "trader_address", "") or "").strip().lower()
             if trader_address:
                 return f"{key}:{trader_address}"
+            return key
+
+        strategy_type = str(getattr(signal, "strategy_type", "") or "").strip().lower()
+        if strategy_type:
+            return f"{key}:{strategy_type}"
 
         return key
 
@@ -3135,6 +3140,11 @@ class LiveTrader:
             "order_dedup_window_s": self._ORDER_DEDUP_WINDOW,
             "fill_verify_blocking": self._fill_verify_blocking,
             "execute_fill_verify_blocking": self._execute_fill_verify_blocking,
+            "source_policies": (
+                self.firewall.get_stats().get("source_policies", [])
+                if self.firewall and hasattr(self.firewall, "get_stats")
+                else []
+            ),
             "wallet_balance": dict(self._last_balance_snapshot),
             "asset_indices_loaded": len(self.asset_index_map),
             "timestamp": datetime.now(timezone.utc).isoformat()

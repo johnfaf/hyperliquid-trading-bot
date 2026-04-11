@@ -164,7 +164,37 @@ def build_subsystems(
         lambda: RegimeDetector(exchange_agg=c.exchange_agg),
         health,
     )
-    c.agent_scorer = _safe_init("agent_scorer", AgentScorer, health)
+    c.agent_scorer = _safe_init(
+        "agent_scorer",
+        lambda: AgentScorer(
+            {
+                "policy_enabled": getattr(config, "SOURCE_POLICY_ENABLED", True),
+                "policy_min_closed_trades": getattr(config, "SOURCE_POLICY_MIN_CLOSED_TRADES", 3),
+                "policy_keep_top_n": getattr(config, "SOURCE_POLICY_KEEP_TOP_N", 5),
+                "policy_pause_weight": getattr(config, "SOURCE_POLICY_PAUSE_WEIGHT", 0.12),
+                "policy_degrade_weight": getattr(config, "SOURCE_POLICY_DEGRADE_WEIGHT", 0.32),
+                "policy_warmup_max_signals_per_day": getattr(
+                    config, "SOURCE_POLICY_WARMUP_MAX_SIGNALS_PER_DAY", 1
+                ),
+                "policy_degraded_max_signals_per_day": getattr(
+                    config, "SOURCE_POLICY_DEGRADED_MAX_SIGNALS_PER_DAY", 1
+                ),
+                "policy_warmup_size_multiplier": getattr(
+                    config, "SOURCE_POLICY_WARMUP_SIZE_MULTIPLIER", 0.75
+                ),
+                "policy_degraded_size_multiplier": getattr(
+                    config, "SOURCE_POLICY_DEGRADED_SIZE_MULTIPLIER", 0.60
+                ),
+                "policy_warmup_min_confidence": getattr(
+                    config, "SOURCE_POLICY_WARMUP_MIN_CONFIDENCE", 0.45
+                ),
+                "policy_degraded_min_confidence": getattr(
+                    config, "SOURCE_POLICY_DEGRADED_MIN_CONFIDENCE", 0.55
+                ),
+            }
+        ),
+        health,
+    )
     c.feature_engine = _safe_init("feature_engine", FeatureEngine, health, affects_trading=False)
     c.reporter = _safe_init("reporter", Reporter, health, affects_trading=False)
 
@@ -196,6 +226,7 @@ def build_subsystems(
         "decision_firewall",
         lambda: DecisionFirewall({
             "forecaster": c.predictive_forecaster,
+            "agent_scorer": c.agent_scorer,
             "min_confidence": getattr(_fw_cfg, "FIREWALL_MIN_CONFIDENCE", 0.45),
             "max_signals_per_source_per_day": getattr(
                 _fw_cfg, "FIREWALL_MAX_SIGNALS_PER_SOURCE_PER_DAY", 0
@@ -356,6 +387,10 @@ def build_subsystems(
         c.shadow_tracker = _safe_init(
             "shadow_tracker", ShadowTracker, health, affects_trading=False,
         )
+        if c.paper_trader:
+            c.paper_trader.shadow_tracker = c.shadow_tracker
+        if c.copy_trader:
+            c.copy_trader.shadow_tracker = c.shadow_tracker
 
     # ─── Bot detector + regime filter ─────────────────────────
     if "adaptive_bot_detector" in profile:
@@ -400,6 +435,7 @@ def build_subsystems(
                 firewall=c.firewall,
                 regime_detector=c.regime_detector,
                 arena=c.arena,
+                agent_scorer=c.agent_scorer,
                 kelly_sizer=c.kelly_sizer,
                 trade_memory=c.trade_memory,
                 calibration=c.calibration,
@@ -409,6 +445,7 @@ def build_subsystems(
                 arena_incubator=c.arena_incubator,
                 decision_engine=c.decision_engine,
                 multi_scanner=c.multi_scanner,
+                shadow_tracker=c.shadow_tracker,
                 health_registry=health,
             )
             if c.live_trader:

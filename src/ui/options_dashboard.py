@@ -6,7 +6,6 @@ import json
 import logging
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from typing import Optional
 import os
 
 logger = logging.getLogger(__name__)

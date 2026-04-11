@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# ruff: noqa: E402
 """
 Download Real Market Data & Stress Test
 ========================================
@@ -19,8 +20,6 @@ Usage:
 import argparse
 import json
 import logging
-import math
-import os
 import random
 import sys
 import time
@@ -32,7 +31,6 @@ from typing import List, Dict, Tuple, Optional
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-import config
 from src.data import database as db
 from src.discovery.golden_wallet import init_golden_tables
 from src.backtest.data_fetcher import DataFetcher, Candle
@@ -393,7 +391,7 @@ def run_backtest_and_stress(fills_raw: List[Dict]):
         init_experiments_table, save_experiment,
     )
     from src.backtest.stress_test import (
-        StressTestEngine, StressTestReport, generate_html_report,
+        StressTestEngine, generate_html_report,
     )
 
     # ── Backtest ──
@@ -433,7 +431,7 @@ def run_backtest_and_stress(fills_raw: List[Dict]):
     result = engine.run(bt_fills, experiment_id="real_data_backtest")
 
     print(f"\n{'='*65}")
-    print(f"  BACKTEST RESULTS (Real Market Data)")
+    print("  BACKTEST RESULTS (Real Market Data)")
     print(f"{'='*65}")
     print(f"  Fills:             {len(bt_fills)}")
     print(f"  Total Trades:      {result.total_trades}")
@@ -447,7 +445,7 @@ def run_backtest_and_stress(fills_raw: List[Dict]):
     print(f"  Avg Hold Time:     {result.avg_hold_hours:.1f}h")
 
     if result.coin_breakdown:
-        print(f"\n  Coin Breakdown:")
+        print("\n  Coin Breakdown:")
         print(f"    {'Coin':<8}  {'Trades':>7}  {'WR%':>6}  {'PnL':>11}")
         for coin, d in sorted(result.coin_breakdown.items(),
                               key=lambda x: x[1]["pnl"], reverse=True):
@@ -466,7 +464,7 @@ def run_backtest_and_stress(fills_raw: List[Dict]):
 
     # ── Stress Test ──
     print(f"\n{'='*65}")
-    print(f"  STRESS TEST (Real Market Data)")
+    print("  STRESS TEST (Real Market Data)")
     print(f"{'='*65}")
 
     stress_engine = StressTestEngine(cfg)
@@ -505,7 +503,7 @@ def run_backtest_and_stress(fills_raw: List[Dict]):
     html_path = reports_dir / f"real_data_stress_{ts}.html"
     generate_html_report(report, str(html_path))
 
-    print(f"\n  Reports saved:")
+    print("\n  Reports saved:")
     print(f"    JSON: {json_path}")
     print(f"    HTML: {html_path}")
     print(f"{'='*65}")
@@ -578,7 +576,7 @@ Examples:
     print("=" * 65)
 
     # ── Phase 1: Download ──
-    print(f"\nPhase 1: Downloading candle data from Hyperliquid...")
+    print("\nPhase 1: Downloading candle data from Hyperliquid...")
     candle_data = download_candles(coins, start_date, end_date, args.timeframe)
 
     if not candle_data:
@@ -599,11 +597,11 @@ Examples:
               f"{end_dt.strftime('%Y-%m-%d'):>12} {days:>5.0f}")
 
     if args.download_only:
-        print(f"\nData cached in data/candle_cache.db. Run without --download-only to test.")
+        print("\nData cached in data/candle_cache.db. Run without --download-only to test.")
         return
 
     # ── Phase 2: Generate fills ──
-    print(f"\nPhase 2: Generating wallet fills from real price action...")
+    print("\nPhase 2: Generating wallet fills from real price action...")
     wallet_label = f"seed{seed}"
     wallet_address = f"0xreal_data_{wallet_label}"
 
@@ -623,13 +621,13 @@ Examples:
     print(f"  Generated {len(fills)} fills ({n_trades} trades) across {n_coins} coins")
 
     # ── Phase 3: Seed database ──
-    print(f"\nPhase 3: Seeding database...")
+    print("\nPhase 3: Seeding database...")
     actual_coins = list(set(f["coin"] for f in fills))
     seed_real_data(fills, actual_coins, wallet_label, window_label)
 
     # ── Phase 4: Run tests ──
     if args.no_stress:
-        print(f"\nPhase 4: Running backtest only (stress test skipped)...")
+        print("\nPhase 4: Running backtest only (stress test skipped)...")
         from src.backtest.backtester import (
             BacktestConfig, BacktestEngine, BacktestFill,
             init_experiments_table, save_experiment,
@@ -671,7 +669,7 @@ Examples:
         result = engine.run(bt_fills, experiment_id="real_data_backtest")
 
         print(f"\n{'='*65}")
-        print(f"  BACKTEST RESULTS (Real Market Data)")
+        print("  BACKTEST RESULTS (Real Market Data)")
         print(f"{'='*65}")
         print(f"  Total Trades:  {result.total_trades}")
         print(f"  Win Rate:      {result.win_rate:.1f}%")
@@ -683,7 +681,7 @@ Examples:
         init_experiments_table()
         save_experiment(result, notes="real_data_backtest_no_stress")
     else:
-        print(f"\nPhase 4: Running backtest + stress test suite...")
+        print("\nPhase 4: Running backtest + stress test suite...")
         run_backtest_and_stress(fills)
 
     print(f"\nDone! Seed={seed} -- rerun with --seed {seed} to reproduce.")

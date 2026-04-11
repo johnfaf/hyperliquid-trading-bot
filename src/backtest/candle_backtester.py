@@ -25,9 +25,7 @@ import logging
 import time
 import numpy as np
 from dataclasses import dataclass, field, asdict
-from typing import List, Dict, Optional, Callable, Tuple
-from datetime import datetime, timezone
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from typing import List, Dict, Tuple
 
 logger = logging.getLogger("candle_backtester")
 
@@ -694,7 +692,10 @@ class CandleBacktester:
         # Convert to numpy arrays
         if isinstance(candles, dict):
             ts = candles["timestamp_ms"]
-            o, h, l, c, v = candles["open"], candles["high"], candles["low"], candles["close"], candles["volume"]
+            high = candles["high"]
+            low = candles["low"]
+            close = candles["close"]
+            volume = candles["volume"]
             coin = candles.get("coin", coin or "UNKNOWN")
             tf = candles.get("timeframe", "1h")
         else:
@@ -707,13 +708,12 @@ class CandleBacktester:
             coin = coin or candles[0].coin
             tf = candles[0].timeframe
             ts = np.array([c.timestamp_ms for c in candles], dtype=np.int64)
-            o = np.array([c.open for c in candles], dtype=np.float64)
-            h = np.array([c.high for c in candles], dtype=np.float64)
-            l = np.array([c.low for c in candles], dtype=np.float64)
-            c = np.array([c.close for c in candles], dtype=np.float64)
-            v = np.array([c.volume for c in candles], dtype=np.float64)
+            high = np.array([c.high for c in candles], dtype=np.float64)
+            low = np.array([c.low for c in candles], dtype=np.float64)
+            close = np.array([c.close for c in candles], dtype=np.float64)
+            volume = np.array([c.volume for c in candles], dtype=np.float64)
 
-        n = len(c)
+        n = len(close)
         logger.info(f"Running {strat} backtest on {coin} {tf}: {n:,} candles")
 
         # Generate signals
@@ -726,14 +726,14 @@ class CandleBacktester:
         NEEDS_HL = {"breakout", "stochastic", "adx_trend", "supertrend", "ichimoku"}
 
         if strat in NEEDS_HLV:
-            signals = sig_fn(c, h, l, v, self.cfg)
+            signals = sig_fn(close, high, low, volume, self.cfg)
         elif strat in NEEDS_HL:
-            signals = sig_fn(c, h, l, self.cfg)
+            signals = sig_fn(close, high, low, self.cfg)
         else:
-            signals = sig_fn(c, self.cfg)
+            signals = sig_fn(close, self.cfg)
 
         # Simulate trades
-        trades, equity = self._simulate(c, h, l, ts, signals)
+        trades, equity = self._simulate(close, high, low, ts, signals)
 
         # Compute metrics from equity curve
         equity_arr = np.array(equity)

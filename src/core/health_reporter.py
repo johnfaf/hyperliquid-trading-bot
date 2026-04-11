@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from src.core.live_execution import is_live_trading_active
+from src.core.readiness import evaluate_readiness
 
 logger = logging.getLogger(__name__)
 
@@ -258,10 +259,30 @@ def write_health_report(
             pass
 
     try:
+        report["readiness"] = evaluate_readiness(
+            container=container,
+            health_registry=health_registry,
+        )
+    except Exception as exc:
+        report["readiness"] = {"ready": False, "live_ready": False, "error": str(exc)}
+
+    try:
         if container.copy_trader:
             report["copy_trading"] = {
                 "total_executed": getattr(container.copy_trader, "_copy_count", 0),
             }
+    except Exception:
+        pass
+
+    try:
+        if getattr(container, "agent_scorer", None):
+            report["source_scorecard"] = container.agent_scorer.get_scorecard()
+    except Exception:
+        pass
+
+    try:
+        if getattr(container, "shadow_tracker", None):
+            report["shadow_summary"] = container.shadow_tracker.get_summary(days=30)
     except Exception:
         pass
 

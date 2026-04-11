@@ -21,6 +21,7 @@ Usage:
     python -m src.backtest.stress_test --scenario flash_crash
     python -m src.backtest.stress_test --report html     # generate HTML report
 """
+# ruff: noqa: E402
 
 import argparse
 import json

@@ -26,6 +26,7 @@ try:
 except ImportError:
     pass
 import config
+from src.core.readiness import evaluate_readiness
 
 logger = logging.getLogger(__name__)
 logger.addHandler(logging.NullHandler())
@@ -35,7 +36,7 @@ _options_scanner = None
 
 # ─── Dashboard Authentication ─────────────────────────────────
 # Paths that are always open (health probes, Railway readiness checks)
-_AUTH_EXEMPT_PATHS = {"/api/health"}
+_AUTH_EXEMPT_PATHS = {"/api/health", "/api/ready", "/api/live_ready"}
 _AUTH_COOKIE_NAME = "dashboard_auth"
 
 
@@ -282,6 +283,7 @@ def _get_v2_metrics(conn) -> Dict:
     v2 = {
         "firewall": {},
         "agent_scores": [],
+        "source_scorecard": [],
         "regime": {},
     }
 
@@ -303,6 +305,18 @@ def _get_v2_metrics(conn) -> Dict:
     except Exception:
         pass  # Table may not exist yet
 
+    try:
+        if _agent_scorer:
+            v2["source_scorecard"] = _agent_scorer.get_scorecard()[:20]
+    except Exception:
+        pass
+
+    try:
+        if _shadow_tracker:
+            v2["shadow_summary"] = _shadow_tracker.get_summary(days=30)
+    except Exception:
+        pass
+
     return v2
 
 
@@ -310,6 +324,7 @@ def _get_v2_metrics(conn) -> Dict:
 _firewall = None
 _regime_detector = None
 _arena = None
+_agent_scorer = None
 _kelly_sizer = None
 _trade_memory = None
 _calibration = None
@@ -320,6 +335,7 @@ _arena_incubator = None
 _decision_engine = None
 _multi_scanner = None
 _health_registry = None
+_shadow_tracker = None
 
 # Module-level live trader reference for closing positions on exchange
 _live_trader = None
@@ -431,19 +447,22 @@ def _close_paper_trade_at_market(trade_id: int) -> dict:
 
 
 def set_v2_components(firewall=None, regime_detector=None, arena=None,
-                       kelly_sizer=None, trade_memory=None, calibration=None,
-                       llm_filter=None, liquidation_strategy=None,
-                       signal_processor=None, arena_incubator=None,
-                       decision_engine=None, multi_scanner=None,
+                       agent_scorer=None, kelly_sizer=None, trade_memory=None,
+                       calibration=None, llm_filter=None,
+                       liquidation_strategy=None, signal_processor=None,
+                       arena_incubator=None, decision_engine=None,
+                       multi_scanner=None, shadow_tracker=None,
                        health_registry=None):
     """Set V2 + V2.5 + V3 + V4 component references for dashboard metrics."""
     global _firewall, _regime_detector, _arena  # noqa: PLW0603
+    global _agent_scorer, _shadow_tracker  # noqa: PLW0603
     global _kelly_sizer, _trade_memory, _calibration, _llm_filter, _liquidation_strategy  # noqa
     global _signal_processor, _arena_incubator, _decision_engine  # noqa
     global _multi_scanner, _health_registry  # noqa
     _firewall = firewall
     _regime_detector = regime_detector
     _arena = arena
+    _agent_scorer = agent_scorer
     _kelly_sizer = kelly_sizer
     _trade_memory = trade_memory
     _calibration = calibration
@@ -453,6 +472,7 @@ def set_v2_components(firewall=None, regime_detector=None, arena=None,
     _arena_incubator = arena_incubator
     _decision_engine = decision_engine
     _multi_scanner = multi_scanner
+    _shadow_tracker = shadow_tracker
     _health_registry = health_registry
 
 
@@ -519,6 +539,18 @@ def _build_runtime_health_snapshot() -> Dict:
         snapshot["error"] = f"health_registry_unavailable: {exc}"
 
     try:
+        class _Container:
+            live_trader = _live_trader
+
+        snapshot["readiness"] = evaluate_readiness(
+            container=_Container(),
+            health_registry=_health_registry,
+            stale_seconds=stale_timeout_s,
+        )
+    except Exception as exc:
+        snapshot["readiness"] = {"ready": False, "live_ready": False, "error": str(exc)}
+
+    try:
         if _firewall:
             fw = _firewall.get_stats()
             snapshot["firewall"] = {
@@ -526,6 +558,7 @@ def _build_runtime_health_snapshot() -> Dict:
                 "passed": int(fw.get("passed", 0) or 0),
                 "top_rejection_reason": fw.get("top_rejection_reason", "none"),
                 "daily_losses": float(fw.get("daily_losses", 0.0) or 0.0),
+                "source_policies": fw.get("source_policies", [])[:10],
             }
     except Exception:
         pass
@@ -543,6 +576,7 @@ def _build_runtime_health_snapshot() -> Dict:
                 "entry_signals_today": stats.get("total_entry_signals_today"),
                 "max_orders_per_source_per_day": stats.get("max_orders_per_source_per_day"),
                 "source_orders_today": stats.get("source_orders_today", {}),
+                "source_policies": stats.get("source_policies", [])[:10],
             }
     except Exception:
         pass
@@ -1048,10 +1082,13 @@ function renderRuntimeHealth(runtime) {
   const atRiskCount = (runtime.at_risk_subsystems || []).length;
   const live = runtime.live_trader || {};
   const fw = runtime.firewall || {};
+  const readiness = runtime.readiness || {};
 
   const cards = [
     {label:'Overall', value:(runtime.overall || 'unknown').toUpperCase(), cls: runtime.overall === 'ok' ? 'green' : 'red'},
     {label:'Trading Safe', value: runtime.all_trading_safe === true ? 'YES' : runtime.all_trading_safe === false ? 'NO' : 'N/A', cls: runtime.all_trading_safe ? 'green' : 'yellow'},
+    {label:'Ready', value: readiness.ready ? 'YES' : 'NO', cls: readiness.ready ? 'green' : 'red'},
+    {label:'Live Ready', value: readiness.live_ready ? 'YES' : 'NO', cls: readiness.live_ready ? 'green' : 'yellow'},
     {label:'At-Risk Subsystems', value: atRiskCount, cls: atRiskCount > 0 ? 'red' : 'green'},
     {label:'Stale Heartbeats', value: staleCount, cls: staleCount > 0 ? 'yellow' : 'green'},
     {label:'Failed', value: counts.FAILED || 0, cls: (counts.FAILED || 0) > 0 ? 'red' : 'green'},
@@ -1069,6 +1106,7 @@ function renderRuntimeHealth(runtime) {
   const topReject = fw.top_rejection_reason || 'none';
   const sourceUsage = live.source_orders_today || {};
   const sourceCap = Number(live.max_orders_per_source_per_day || 0);
+  const sourcePolicies = (live.source_policies || fw.source_policies || []).slice(0, 5);
   const sourceUsageSummary = Object.keys(sourceUsage).length
     ? Object.entries(sourceUsage)
         .sort((a, b) => b[1] - a[1])
@@ -1076,12 +1114,20 @@ function renderRuntimeHealth(runtime) {
         .map(([key, used]) => sourceCap > 0 ? `${key}: ${used}/${sourceCap}` : `${key}: ${used}`)
         .join(', ')
     : 'none';
+  const sourcePolicySummary = sourcePolicies.length
+    ? sourcePolicies
+        .map(p => `${p.source_key}: ${String(p.status || 'unknown').toUpperCase()} (${Math.round((p.dynamic_weight || 0) * 100)}%)`)
+        .join(', ')
+    : 'none';
+  const readinessReasons = (readiness.reasons || []).slice(0, 5).join(', ') || 'none';
   document.getElementById('runtime-health-detail').innerHTML =
     `<div>At-risk: <strong>${atRiskList}</strong></div>` +
     `<div>Stale: <strong>${staleList}</strong></div>` +
+    `<div>Readiness blockers: <strong>${readinessReasons}</strong></div>` +
     `<div>Firewall top reject: <strong>${topReject}</strong></div>` +
     `<div>Kill-switch reason: ${killReason}</div>` +
-    `<div>Live source usage: <strong>${sourceUsageSummary}</strong></div>`;
+    `<div>Live source usage: <strong>${sourceUsageSummary}</strong></div>` +
+    `<div>Source allocator: <strong>${sourcePolicySummary}</strong></div>`;
 }
 
 function renderArena(arena) {
@@ -1327,6 +1373,30 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
         elif parsed.path == "/api/health":
             self._json_response({"status": "ok", "timestamp": datetime.now(timezone.utc).isoformat()})
+
+        elif parsed.path in {"/api/ready", "/api/live_ready"}:
+            class _Container:
+                live_trader = _live_trader
+
+            readiness = evaluate_readiness(
+                container=_Container(),
+                health_registry=_health_registry,
+            )
+            if parsed.path == "/api/live_ready":
+                live_ready = bool(readiness.get("live_ready", False))
+                payload = {
+                    **readiness,
+                    "ready": live_ready,
+                    "status": "ready" if live_ready else "not_ready",
+                }
+                if not readiness.get("checks", {}).get("live_requested", False):
+                    payload["reasons"] = list(payload.get("reasons", [])) + ["live_trading_disabled"]
+                self._json_response(payload, code=200 if live_ready else 503)
+            else:
+                self._json_response(
+                    readiness,
+                    code=200 if bool(readiness.get("ready", False)) else 503,
+                )
 
         elif parsed.path == "/api/health_report":
             # Full structured health report for Claude monitoring

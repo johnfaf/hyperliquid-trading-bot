@@ -28,6 +28,30 @@ class MockSignal:
         return True
 
 
+class _FakeScorer:
+    def __init__(self, policy):
+        self._policy = policy
+
+    def get_source_policy(self, source_key):
+        return {
+            "source_key": source_key,
+            "status": "active",
+            "rank": 1,
+            "blocked": False,
+            "max_signals_per_day": 0,
+            "size_multiplier": 1.0,
+            "min_confidence": 0.0,
+            "dynamic_weight": 0.6,
+            "weighted_accuracy": 0.6,
+            "completed_trades": 10,
+            "recent_pnl": 0.0,
+            **self._policy,
+        }
+
+    def get_scorecard(self):
+        return [self.get_source_policy("test:momentum")]
+
+
 @patch("src.signals.decision_firewall.db")
 def test_firewall_passes_valid_signal(mock_db):
     """Valid signal should pass all checks."""
@@ -234,3 +258,71 @@ def test_firewall_canary_mode_tightens_position_limit(mock_db):
     passed, reason = fw.validate(MockSignal(coin="BTC", confidence=0.8))
     assert passed is False
     assert "max positions" in reason.lower()
+
+
+@patch("src.signals.decision_firewall.db")
+def test_firewall_rejects_paused_source_policy(mock_db):
+    """Allocator-paused sources should be blocked before consuming capacity."""
+    mock_db.get_open_paper_trades.return_value = []
+    mock_db.get_paper_account.return_value = {"balance": 10000}
+    mock_db.audit_log = MagicMock()
+
+    from src.signals.decision_firewall import DecisionFirewall
+
+    fw = DecisionFirewall(
+        {
+            "agent_scorer": _FakeScorer({"status": "paused", "blocked": True}),
+            "enable_predictive_derisk": False,
+            "funding_risk_enabled": False,
+        }
+    )
+    signal = MockSignal(confidence=0.9)
+    signal.source = "strategy"
+
+    passed, reason = fw.validate(signal)
+
+    assert passed is False
+    assert "allocator paused" in reason.lower()
+    assert fw.get_stats()["rejected_source_policy"] == 1
+
+
+@patch("src.signals.decision_firewall.db")
+def test_firewall_derisks_degraded_sources_and_uses_policy_cap(mock_db):
+    """Degraded sources should trade smaller and respect the tighter policy cap."""
+    mock_db.get_open_paper_trades.return_value = []
+    mock_db.get_paper_account.return_value = {"balance": 10000}
+    mock_db.audit_log = MagicMock()
+
+    from src.signals.decision_firewall import DecisionFirewall
+
+    fw = DecisionFirewall(
+        {
+            "max_signals_per_source_per_day": 2,
+            "agent_scorer": _FakeScorer(
+                {
+                    "status": "degraded",
+                    "max_signals_per_day": 1,
+                    "size_multiplier": 0.5,
+                    "min_confidence": 0.55,
+                    "dynamic_weight": 0.18,
+                    "recent_pnl": -25.0,
+                }
+            ),
+            "enable_predictive_derisk": False,
+            "funding_risk_enabled": False,
+        }
+    )
+
+    first = MockSignal(coin="BTC", confidence=0.60, size=0.2, position_pct=0.10)
+    first.source = "strategy"
+    second = MockSignal(coin="ETH", confidence=0.60, size=0.2, position_pct=0.10)
+    second.source = "strategy"
+
+    passed1, _ = fw.validate(first)
+    passed2, reason2 = fw.validate(second)
+
+    assert passed1 is True
+    assert first.size == 0.1
+    assert first.position_pct == 0.05
+    assert passed2 is False
+    assert "source/day cap" in reason2.lower()

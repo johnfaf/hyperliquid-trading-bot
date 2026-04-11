@@ -270,6 +270,7 @@ def test_live_trader_maps_long_to_buy_and_places_sell_protection(monkeypatch):
             trigger_calls.append((coin, side, size, trigger_price, tp_or_sl)) or {"status": "success"}
         ),
     )
+    monkeypatch.setattr(config, "LIVE_CANARY_MODE", False)
 
     # Disable the bootstrap $ cap so entry_calls reflects the requested 0.1 ETH.
     trader = LiveTrader(firewall=FakeFirewall(), dry_run=False, max_order_usd=1_000_000)
@@ -394,6 +395,7 @@ def test_live_trader_uses_verified_fill_size_for_protection(monkeypatch):
             trigger_calls.append((coin, side, size, trigger_price, tp_or_sl)) or {"status": "success"}
         ),
     )
+    monkeypatch.setattr(config, "LIVE_CANARY_MODE", False)
 
     # Disable the bootstrap $ cap so fill verification preserves the requested 0.1 size.
     trader = LiveTrader(firewall=FakeFirewall(), dry_run=False, max_order_usd=1_000_000)
@@ -444,6 +446,7 @@ def test_execute_signal_uses_submitted_entry_size_for_fill_verification(monkeypa
     )
     monkeypatch.setattr(LiveTrader, "_get_mid_price", lambda self, coin: 2000.0)
     monkeypatch.setattr(LiveTrader, "place_trigger_order", lambda self, *args, **kwargs: {"status": "success"})
+    monkeypatch.setattr(config, "LIVE_CANARY_MODE", False)
 
     trader = LiveTrader(firewall=FakeFirewall(), dry_run=False, max_order_usd=1_000_000)
     result = trader.execute_signal(

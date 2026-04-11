@@ -44,7 +44,8 @@ class PaperTrader:
                  kelly_sizer: Optional[KellySizer] = None,
                  trade_memory: Optional[TradeMemory] = None,
                  calibration: Optional[CalibrationTracker] = None,
-                 llm_filter: Optional[LLMFilter] = None):
+                 llm_filter: Optional[LLMFilter] = None,
+                 shadow_tracker: Optional[object] = None):
         self.firewall = firewall
         self.agent_scorer = agent_scorer
         self.feature_engine = feature_engine
@@ -52,6 +53,7 @@ class PaperTrader:
         self.trade_memory = trade_memory
         self.calibration = calibration
         self.llm_filter = llm_filter
+        self.shadow_tracker = shadow_tracker
         self.rotation_manager = PortfolioRotationManager()
         self._closed_events: List[Dict] = []
         self._ensure_account()
@@ -93,6 +95,39 @@ class PaperTrader:
                         if account and account["total_trades"] > 0 else 0),
             "open_positions": len(open_trades),
             "roi_pct": round(((total_equity / config.PAPER_TRADING_INITIAL_BALANCE) - 1) * 100, 2),
+        }
+
+    @staticmethod
+    def _signal_source_enum(source_name: str) -> SignalSource:
+        raw = str(source_name or "strategy").strip().lower() or "strategy"
+        try:
+            return SignalSource(raw)
+        except ValueError:
+            return SignalSource.STRATEGY
+
+    @staticmethod
+    def _resolve_source_context(trade_meta: Dict, trade: Dict) -> Dict[str, str]:
+        source = str(
+            trade_meta.get("source", trade.get("source", "strategy")) or "strategy"
+        ).strip().lower() or "strategy"
+        strategy_type = str(
+            trade_meta.get("strategy_type", trade.get("strategy_type", "")) or ""
+        ).strip().lower()
+        source_key = str(trade_meta.get("source_key", "") or "").strip().lower()
+        if not source_key:
+            if source == "copy_trade":
+                trader = str(
+                    trade_meta.get("source_trader", trade.get("trader_address", "")) or ""
+                ).strip().lower()
+                source_key = f"{source}:{trader}" if trader else source
+            elif strategy_type:
+                source_key = f"{source}:{strategy_type}"
+            else:
+                source_key = source
+        return {
+            "source": source,
+            "source_key": source_key,
+            "strategy_type": strategy_type or "unknown",
         }
 
     def execute_strategy_signals(self, strategies: List[Dict], exchange_agg=None,
@@ -258,11 +293,12 @@ class PaperTrader:
         trade_signals = []
         for sig in raw_signals:
             try:
+                source_name = str(sig["strategy"].get("source", "strategy") or "strategy")
                 trade_signal = TradeSignal(
                     coin=sig["coin"],
                     side=SignalSide(sig["side"]),
                     confidence=sig.get("confidence", 0.5),
-                    source=SignalSource.STRATEGY,
+                    source=self._signal_source_enum(source_name),
                     reason=f"Strategy: {sig['strategy'].get('name', '?')} ({sig.get('strategy_type', '')})",
                     strategy_id=sig["strategy"].get("id"),
                     strategy_type=sig.get("strategy_type", ""),
@@ -344,7 +380,11 @@ class PaperTrader:
                 # Calibration adjustment — correct miscalibrated confidence
                 if self.calibration:
                     try:
-                        source_key = f"strategy:{sig.get('strategy_type', 'unknown')}"
+                        source_key = (
+                            self.agent_scorer.get_source_key(trade_signal)
+                            if self.agent_scorer
+                            else self._resolve_source_context(sig, {}).get("source_key", "strategy")
+                        )
                         adjusted = self.calibration.get_adjustment_factor(
                             source_key, trade_signal.confidence
                         )
@@ -564,6 +604,12 @@ class PaperTrader:
                     "side": sig["side"],
                     "confidence": trade_signal.confidence,
                 })
+                sig["source_key"] = source_key
+                sig["source"] = (
+                    trade_signal.source.value
+                    if hasattr(trade_signal.source, "value")
+                    else str(trade_signal.source)
+                )
             sig["signal_id"] = signal_id
 
             # CRIT-FIX CRIT-6: close victim BEFORE opening replacement.
@@ -876,6 +922,8 @@ class PaperTrader:
                 take_profit=signal["take_profit"],
                 metadata={
                     "strategy_type": signal.get("strategy_type", ""),
+                    "source": signal.get("source", "strategy"),
+                    "source_key": signal.get("source_key", ""),
                     "confidence": signal.get("confidence", 0),
                     "signal_id": signal.get("signal_id", ""),
                     "execution_role": signal.get("execution_role", config.PAPER_TRADING_DEFAULT_EXECUTION_ROLE),
@@ -909,10 +957,13 @@ class PaperTrader:
                 "take_profit": signal["take_profit"],
                 "strategy_id": strategy.get("id"),
                 "strategy_type": signal.get("strategy_type", ""),
+                "source": signal.get("source", "strategy"),
                 "confidence": signal.get("confidence", 0),
                 "opened_at": datetime.now(timezone.utc).isoformat(),
                 "metadata": {
                     "strategy_type": signal.get("strategy_type", ""),
+                    "source": signal.get("source", "strategy"),
+                    "source_key": signal.get("source_key", ""),
                     "confidence": signal.get("confidence", 0),
                     "signal_id": signal.get("signal_id", ""),
                     "execution_role": signal.get("execution_role", config.PAPER_TRADING_DEFAULT_EXECUTION_ROLE),
@@ -1039,7 +1090,9 @@ class PaperTrader:
             f"{pnl:,.2f}",
         )
 
-        strategy_type = trade_meta.get("strategy_type", "unknown")
+        source_ctx = self._resolve_source_context(trade_meta, trade)
+        strategy_type = source_ctx["strategy_type"]
+        source_key = source_ctx["source_key"]
         signal_id = trade_meta.get("signal_id", "")
         return_pct = pnl / max(
             trade["entry_price"] * max(trade["size"], 1e-8) * max(trade.get("leverage", 1), 1),
@@ -1048,7 +1101,6 @@ class PaperTrader:
 
         if self.agent_scorer:
             try:
-                source_key = f"strategy:{strategy_type}"
                 self.agent_scorer.record_outcome(source_key, signal_id, pnl, return_pct)
             except Exception as e:
                 logger.debug(f"Agent scorer outcome error: {e}")
@@ -1062,7 +1114,7 @@ class PaperTrader:
         if self.kelly_sizer:
             try:
                 self.kelly_sizer.record_outcome(
-                    strategy_key=strategy_type,
+                    strategy_key=source_key,
                     pnl=pnl,
                     entry_price=trade["entry_price"],
                     size=trade["size"],
@@ -1073,7 +1125,6 @@ class PaperTrader:
 
         if self.calibration:
             try:
-                source_key = f"strategy:{strategy_type}"
                 predicted_conf = trade_meta.get("confidence", 0.5)
                 self.calibration.record(
                     source_key=source_key,
@@ -1100,13 +1151,39 @@ class PaperTrader:
                     opened_at=trade.get("opened_at", ""),
                     closed_at=datetime.now(timezone.utc).isoformat(),
                     confidence=trade_meta.get("confidence", 0),
-                    source="strategy",
+                    source=source_key,
                     regime=trade_meta.get("regime", ""),
                     setup_type=trade_meta.get("setup_type", strategy_type),
                     features=trade_meta.get("features", {}),
                 )
             except Exception:
                 pass
+
+        if self.shadow_tracker:
+            try:
+                self.shadow_tracker.record_trade(
+                    {
+                        "signal_source": source_key,
+                        "coin": trade["coin"],
+                        "side": trade["side"],
+                        "entry_price": trade["entry_price"],
+                        "exit_price": slipped_exit,
+                        "size": trade["size"],
+                        "entry_ts": trade.get("opened_at", ""),
+                        "exit_ts": datetime.now(timezone.utc).isoformat(),
+                        "pnl": pnl,
+                        "pnl_pct": return_pct * 100,
+                        "regime_at_entry": trade_meta.get("regime", ""),
+                        "confidence": trade_meta.get("confidence", 0),
+                        "metadata": {
+                            "strategy_type": strategy_type,
+                            "source": source_ctx["source"],
+                            "signal_id": signal_id,
+                        },
+                    }
+                )
+            except Exception as e:
+                logger.debug(f"Shadow tracker outcome error: {e}")
 
         closed_event = {
             "trade_id": trade["id"],

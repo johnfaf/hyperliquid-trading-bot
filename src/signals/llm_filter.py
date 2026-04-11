@@ -23,7 +23,7 @@ Filter checks:
   5. Risk cluster — too many positions in correlated assets
 """
 import logging
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -104,10 +104,10 @@ class LLMFilter:
 
             if regime == "TRENDING_UP" and side == "short":
                 confidence *= 0.6
-                reasons.append(f"contra-regime: shorting in TRENDING_UP")
+                reasons.append("contra-regime: shorting in TRENDING_UP")
             elif regime == "TRENDING_DOWN" and side == "long":
                 confidence *= 0.6
-                reasons.append(f"contra-regime: longing in TRENDING_DOWN")
+                reasons.append("contra-regime: longing in TRENDING_DOWN")
             elif regime == "VOLATILE":
                 confidence *= 0.8
                 reasons.append("volatile regime: reduced confidence")

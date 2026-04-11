@@ -16,7 +16,6 @@ Scenarios modeled from actual Hyperliquid / crypto events:
 """
 
 import copy
-import math
 import random
 from dataclasses import dataclass, field, asdict
 from typing import List, Dict, Optional, Tuple

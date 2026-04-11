@@ -40,7 +40,8 @@ class CopyTrader:
                  kelly_sizer: Optional[KellySizer] = None,
                  trade_memory: Optional[TradeMemory] = None,
                  calibration: Optional[CalibrationTracker] = None,
-                 regime_forecaster: Optional[object] = None):
+                 regime_forecaster: Optional[object] = None,
+                 shadow_tracker: Optional[object] = None):
         # Cache of last-known positions per trader: {address: {coin: position_dict}}
         self._position_cache: Dict[str, Dict[str, Dict]] = {}
         self._copy_count = 0
@@ -50,8 +51,14 @@ class CopyTrader:
         self.trade_memory = trade_memory
         self.calibration = calibration
         self.regime_forecaster = regime_forecaster
+        self.shadow_tracker = shadow_tracker
         self.rotation_manager = PortfolioRotationManager()
         self._closed_events: List[Dict] = []
+
+    @staticmethod
+    def _source_key(payload: Dict) -> str:
+        trader = str(payload.get("source_trader", "") or "").strip().lower()
+        return f"copy_trade:{trader}" if trader else "copy_trade"
 
     def scan_top_traders(self, top_n: int = 10) -> List[Dict]:
         """
@@ -277,7 +284,7 @@ class CopyTrader:
                         trade_signal.regime = regime_data.get("overall_regime", "") if regime_data else ""
 
                         if self.agent_scorer:
-                            source_key = f"copy_trade:{signal.get('source_trader', 'unknown')}"
+                            source_key = self._source_key(signal)
                             weight = self.agent_scorer.get_weight(source_key)
                             trade_signal.confidence = trade_signal.confidence * 0.6 + weight * 0.4
 
@@ -422,7 +429,7 @@ class CopyTrader:
                     continue
 
             if self.agent_scorer:
-                source_key = f"copy_trade:{signal.get('source_trader', 'unknown')}"
+                source_key = self._source_key(signal)
                 signal_id = self.agent_scorer.record_signal(source_key, {
                     "coin": signal["coin"],
                     "side": signal["side"],
@@ -496,7 +503,7 @@ class CopyTrader:
         # Kelly-based position sizing if available, else default 5%
         if self.kelly_sizer:
             try:
-                source_key = f"copy_trade:{signal.get('source_trader', 'unknown')}"
+                source_key = self._source_key(signal)
                 sizing = self.kelly_sizer.get_sizing(
                     strategy_key=source_key,
                     account_balance=account["balance"],
@@ -550,6 +557,7 @@ class CopyTrader:
                     "source_trader": signal.get("source_trader", ""),
                     "confidence": signal.get("confidence", 0),
                     "signal_id": signal.get("_signal_id", ""),
+                    "source_key": signal.get("_source_key", ""),
                     "source_accuracy": signal.get("source_accuracy", 0),
                     "regime": signal.get("regime", ""),
                     "is_copy_trade": True,
@@ -587,6 +595,7 @@ class CopyTrader:
                     "source_trader": signal.get("source_trader", ""),
                     "confidence": signal.get("confidence", 0),
                     "signal_id": signal.get("_signal_id", ""),
+                    "source_key": signal.get("_source_key", ""),
                     "source_accuracy": signal.get("source_accuracy", 0),
                     "regime": signal.get("regime", ""),
                     "is_copy_trade": True,
@@ -699,7 +708,9 @@ class CopyTrader:
             trade["entry_price"] * max(trade["size"], 1e-8) * max(trade.get("leverage", 1), 1),
             1e-8,
         )
-        source_key = f"copy_trade:{meta.get('source_trader', 'unknown')}"
+        source_key = str(meta.get("source_key", "") or "").strip().lower()
+        if not source_key:
+            source_key = self._source_key(meta)
 
         if self.agent_scorer and meta.get("source_trader"):
             try:
@@ -751,7 +762,32 @@ class CopyTrader:
                     opened_at=trade.get("opened_at", ""),
                     closed_at=datetime.now(timezone.utc).isoformat(),
                     confidence=meta.get("confidence", 0),
-                    source="copy_trade",
+                    source=source_key,
+                )
+            except Exception:
+                pass
+
+        if self.shadow_tracker:
+            try:
+                self.shadow_tracker.record_trade(
+                    {
+                        "signal_source": source_key,
+                        "coin": trade["coin"],
+                        "side": trade.get("side", ""),
+                        "entry_price": trade["entry_price"],
+                        "exit_price": exit_price,
+                        "size": trade["size"],
+                        "entry_ts": trade.get("opened_at", ""),
+                        "exit_ts": datetime.now(timezone.utc).isoformat(),
+                        "pnl": pnl,
+                        "pnl_pct": return_pct * 100,
+                        "regime_at_entry": meta.get("regime", ""),
+                        "confidence": meta.get("confidence", 0),
+                        "metadata": {
+                            "source_trader": meta.get("source_trader", ""),
+                            "signal_id": meta.get("signal_id", ""),
+                        },
+                    }
                 )
             except Exception:
                 pass

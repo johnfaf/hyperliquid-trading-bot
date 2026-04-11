@@ -59,6 +59,7 @@ class DecisionFirewall:
         self.max_signals_per_source_per_day = int(
             cfg.get("max_signals_per_source_per_day", 0)
         )
+        self.agent_scorer = cfg.get("agent_scorer")
         self.canary_mode = bool(cfg.get("canary_mode", False))
         self.canary_max_positions = max(1, int(cfg.get("canary_max_positions", 2)))
         # Lowered from 300 → 60: 5-minute cooldown was blocking re-entries
@@ -124,6 +125,7 @@ class DecisionFirewall:
             "rejected_cooldown": 0,
             "rejected_accuracy": 0,
             "rejected_source_cap": 0,
+            "rejected_source_policy": 0,
             "rejected_drawdown": 0,
             "rejected_exposure": 0,
             "rejected_funding": 0,
@@ -147,7 +149,77 @@ class DecisionFirewall:
         if hasattr(source, "value"):
             source = source.value
         key = str(source or "unknown").strip().lower()
-        return key or "unknown"
+        key = key or "unknown"
+
+        trader_address = str(getattr(signal, "trader_address", "") or "").strip().lower()
+        if key == "copy_trade":
+            if trader_address:
+                return f"{key}:{trader_address}"
+            return key
+
+        strategy_type = str(getattr(signal, "strategy_type", "") or "").strip().lower()
+        if strategy_type:
+            return f"{key}:{strategy_type}"
+        return key
+
+    def _effective_source_cap(self, policy: Dict) -> int:
+        """Combine static per-source/day caps with allocator-driven caps."""
+        configured_cap = int(self.max_signals_per_source_per_day or 0)
+        policy_cap = int(policy.get("max_signals_per_day", 0) or 0)
+        if configured_cap > 0 and policy_cap > 0:
+            return min(configured_cap, policy_cap)
+        return configured_cap or policy_cap
+
+    def _apply_source_policy(
+        self,
+        signal: TradeSignal,
+        source_key: str,
+        dry_run: bool = False,
+    ) -> Tuple[bool, str, Dict]:
+        if not self.agent_scorer:
+            return True, "", {
+                "source_key": source_key,
+                "status": "unknown",
+                "max_signals_per_day": int(self.max_signals_per_source_per_day or 0),
+            }
+
+        try:
+            policy = self.agent_scorer.get_source_policy(source_key)
+        except Exception as exc:
+            logger.debug("Source policy lookup failed for %s: %s", source_key, exc)
+            return True, "", {
+                "source_key": source_key,
+                "status": "policy_error",
+                "max_signals_per_day": int(self.max_signals_per_source_per_day or 0),
+            }
+
+        status = str(policy.get("status", "unknown") or "unknown")
+        if policy.get("blocked"):
+            return False, f"Source allocator paused {source_key} ({status})", policy
+
+        min_conf = float(policy.get("min_confidence", 0.0) or 0.0)
+        if signal.confidence < min_conf:
+            return (
+                False,
+                f"Source allocator requires {min_conf:.0%} confidence for {source_key} "
+                f"(got {signal.confidence:.0%})",
+                policy,
+            )
+
+        size_mult = float(policy.get("size_multiplier", 1.0) or 1.0)
+        if size_mult < 1.0:
+            signal.position_pct *= size_mult
+            if signal.size > 0:
+                signal.size *= size_mult
+            logger.info(
+                "Source allocator de-risked %s: size *= %.2f (status=%s, weight=%.2f)",
+                source_key,
+                size_mult,
+                status,
+                float(policy.get("dynamic_weight", 0.0) or 0.0),
+            )
+
+        return True, "", policy
 
     def validate(self, signal: TradeSignal, regime_data: Optional[Dict] = None,
                  open_positions: Optional[List[Dict]] = None,
@@ -209,13 +281,22 @@ class DecisionFirewall:
         # 2b. Per-source/day throughput cap (approved signals).
         self._check_daily_reset()
         source_key = self._source_key(signal)
-        if self.max_signals_per_source_per_day > 0:
+        policy_ok, policy_reason, source_policy = self._apply_source_policy(
+            signal,
+            source_key,
+            dry_run=dry_run,
+        )
+        if not policy_ok:
+            return _reject("rejected_source_policy", policy_reason)
+
+        effective_source_cap = self._effective_source_cap(source_policy)
+        if effective_source_cap > 0:
             used = self._source_signal_counts.get(source_key, 0)
-            if used >= self.max_signals_per_source_per_day:
+            if used >= effective_source_cap:
                 return _reject(
                     "rejected_source_cap",
                     f"Source/day cap hit for {source_key} "
-                    f"({used}/{self.max_signals_per_source_per_day})",
+                    f"({used}/{effective_source_cap})",
                 )
 
         # 3. Leverage check
@@ -355,7 +436,7 @@ class DecisionFirewall:
         if not dry_run:
             self.stats["passed"] += 1
             self._recent_trades[signal.coin] = now
-            if self.max_signals_per_source_per_day > 0:
+            if effective_source_cap > 0:
                 self._source_signal_counts[source_key] += 1
 
             # Audit trail: record approval
@@ -477,4 +558,5 @@ class DecisionFirewall:
             "canary_mode": self.canary_mode,
             "max_signals_per_source_per_day": int(self.max_signals_per_source_per_day),
             "source_signal_counts": dict(self._source_signal_counts),
+            "source_policies": self.agent_scorer.get_scorecard() if self.agent_scorer else [],
         }

@@ -16,15 +16,12 @@ Scoring: Each confirmation adds to the signal's composite score.
          No confirmation doesn't kill a signal — it just doesn't boost it.
 """
 import logging
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 from dataclasses import dataclass, field
-from datetime import datetime
 
 from .base_adapter import (
     BaseExchangeAdapter,
     NormalizedMarketData,
-    NormalizedPosition,
-    NormalizedFill,
 )
 
 logger = logging.getLogger(__name__)

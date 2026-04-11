@@ -16,7 +16,8 @@ from .base_adapter import (
     NormalizedMarketData,
 )
 
-import sys, os
+import sys
+import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 from src.data import hyperliquid_client as hl
 
@@ -259,7 +260,7 @@ class HyperliquidAdapter(BaseExchangeAdapter):
                 coin: float(ctx.get("funding", 0))
                 for coin, ctx in contexts.items()
             }
-        except Exception as e:
+        except Exception:
             self._error_count += 1
             return {}
 
@@ -274,6 +275,6 @@ class HyperliquidAdapter(BaseExchangeAdapter):
                 return []
             # Portfolio response format varies; return raw for now
             return portfolio if isinstance(portfolio, list) else [portfolio]
-        except Exception as e:
+        except Exception:
             self._error_count += 1
             return []

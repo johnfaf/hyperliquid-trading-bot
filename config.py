@@ -230,6 +230,46 @@ FIREWALL_CANARY_MAX_POSITIONS = int(
     os.environ.get("FIREWALL_CANARY_MAX_POSITIONS", 2)
 )
 
+# Per-source capital allocator / throttling.
+SOURCE_POLICY_ENABLED = os.environ.get(
+    "SOURCE_POLICY_ENABLED", "true"
+).lower() in ("true", "1", "yes")
+SOURCE_POLICY_MIN_CLOSED_TRADES = int(
+    os.environ.get("SOURCE_POLICY_MIN_CLOSED_TRADES", 3)
+)
+SOURCE_POLICY_KEEP_TOP_N = int(os.environ.get("SOURCE_POLICY_KEEP_TOP_N", 5))
+SOURCE_POLICY_PAUSE_WEIGHT = float(
+    os.environ.get("SOURCE_POLICY_PAUSE_WEIGHT", 0.12)
+)
+SOURCE_POLICY_DEGRADE_WEIGHT = float(
+    os.environ.get("SOURCE_POLICY_DEGRADE_WEIGHT", 0.32)
+)
+SOURCE_POLICY_WARMUP_MAX_SIGNALS_PER_DAY = int(
+    os.environ.get("SOURCE_POLICY_WARMUP_MAX_SIGNALS_PER_DAY", 1)
+)
+SOURCE_POLICY_DEGRADED_MAX_SIGNALS_PER_DAY = int(
+    os.environ.get("SOURCE_POLICY_DEGRADED_MAX_SIGNALS_PER_DAY", 1)
+)
+SOURCE_POLICY_WARMUP_SIZE_MULTIPLIER = float(
+    os.environ.get("SOURCE_POLICY_WARMUP_SIZE_MULTIPLIER", 0.75)
+)
+SOURCE_POLICY_DEGRADED_SIZE_MULTIPLIER = float(
+    os.environ.get("SOURCE_POLICY_DEGRADED_SIZE_MULTIPLIER", 0.60)
+)
+SOURCE_POLICY_WARMUP_MIN_CONFIDENCE = float(
+    os.environ.get("SOURCE_POLICY_WARMUP_MIN_CONFIDENCE", 0.45)
+)
+SOURCE_POLICY_DEGRADED_MIN_CONFIDENCE = float(
+    os.environ.get("SOURCE_POLICY_DEGRADED_MIN_CONFIDENCE", 0.55)
+)
+
+# Runtime readiness / incident monitoring.
+READINESS_STALE_SECONDS = int(os.environ.get("READINESS_STALE_SECONDS", 600))
+READINESS_DB_WRITE_TTL_S = int(os.environ.get("READINESS_DB_WRITE_TTL_S", 60))
+READINESS_ALERT_COOLDOWN_S = int(
+    os.environ.get("READINESS_ALERT_COOLDOWN_S", 900)
+)
+
 # ─── Scheduling ────────────────────────────────────────────────
 # 3-tier scheduling:
 #   Tier 1 — Fast cycle:   position checks, SL/TP, copy-trade scan
@@ -372,6 +412,16 @@ def _validate_config_bounds() -> None:
         ("FIREWALL_MIN_CONFIDENCE", 0.0, 1.0, 0.45),
         ("FIREWALL_MAX_SIGNALS_PER_SOURCE_PER_DAY", 0, 100_000, 0),
         ("FIREWALL_CANARY_MAX_POSITIONS", 1, 100, 2),
+        ("SOURCE_POLICY_MIN_CLOSED_TRADES", 1, 1000, 3),
+        ("SOURCE_POLICY_KEEP_TOP_N", 1, 1000, 5),
+        ("SOURCE_POLICY_PAUSE_WEIGHT", 0.0, 1.0, 0.12),
+        ("SOURCE_POLICY_DEGRADE_WEIGHT", 0.0, 1.0, 0.32),
+        ("SOURCE_POLICY_WARMUP_MAX_SIGNALS_PER_DAY", 0, 100_000, 1),
+        ("SOURCE_POLICY_DEGRADED_MAX_SIGNALS_PER_DAY", 0, 100_000, 1),
+        ("SOURCE_POLICY_WARMUP_SIZE_MULTIPLIER", 0.0, 1.0, 0.75),
+        ("SOURCE_POLICY_DEGRADED_SIZE_MULTIPLIER", 0.0, 1.0, 0.60),
+        ("SOURCE_POLICY_WARMUP_MIN_CONFIDENCE", 0.0, 1.0, 0.45),
+        ("SOURCE_POLICY_DEGRADED_MIN_CONFIDENCE", 0.0, 1.0, 0.55),
         ("TRADING_CYCLE_INTERVAL", 10, 86_400, 900),
         ("DISCOVERY_CYCLE_INTERVAL", 60, 2_592_000, 86400),
         ("POLYMARKET_SCAN_INTERVAL", 10, 3600, 180),
@@ -405,6 +455,9 @@ def _validate_config_bounds() -> None:
         ("LIVE_CANARY_MAX_ORDER_USD", 10.0, 1_000_000.0, 25.0),
         ("LIVE_CANARY_MAX_SIGNALS_PER_DAY", 1, 100_000, 25),
         ("LIVE_MAX_ORDERS_PER_SOURCE_PER_DAY", 0, 100_000, 0),
+        ("READINESS_STALE_SECONDS", 30, 86_400, 600),
+        ("READINESS_DB_WRITE_TTL_S", 1, 3_600, 60),
+        ("READINESS_ALERT_COOLDOWN_S", 30, 86_400, 900),
         ("VAULT_KV_VERSION", 1, 2, 2),
     ]
     for name, min_value, max_value, fallback in rules:
@@ -423,6 +476,13 @@ def _validate_config_bounds() -> None:
             "raising hard max to target."
         )
         globals()["PORTFOLIO_HARD_MAX_POSITIONS"] = int(PORTFOLIO_TARGET_POSITIONS)
+
+    if SOURCE_POLICY_PAUSE_WEIGHT > SOURCE_POLICY_DEGRADE_WEIGHT:
+        _warn_config(
+            "SOURCE_POLICY_PAUSE_WEIGHT is above SOURCE_POLICY_DEGRADE_WEIGHT; "
+            "clamping pause threshold down to the degrade threshold."
+        )
+        globals()["SOURCE_POLICY_PAUSE_WEIGHT"] = float(SOURCE_POLICY_DEGRADE_WEIGHT)
 
 
 _validate_config_bounds()

@@ -30,7 +30,6 @@ Outputs:
   - Or None if no trade setup detected
 """
 import logging
-import numpy as np
 from typing import Dict, List, Optional
 from dataclasses import dataclass, asdict
 

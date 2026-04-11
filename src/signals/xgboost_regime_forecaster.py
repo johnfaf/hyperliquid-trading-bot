@@ -23,6 +23,7 @@ Same interface as PredictiveRegimeForecaster so it's a drop-in replacement.
 Requires: scikit-learn>=1.3.0, xgboost>=2.0.0 (optional deps).
 If not installed, falls back to the weighted-signal PredictiveRegimeForecaster.
 """
+# ruff: noqa: E402
 
 import logging
 import os

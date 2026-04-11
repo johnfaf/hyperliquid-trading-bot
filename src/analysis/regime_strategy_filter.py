@@ -18,10 +18,9 @@ Regimes:
   - low_liquidity: Thin markets, high spreads
 """
 import logging
-from typing import List, Dict, Optional
+from typing import List, Dict
 from dataclasses import dataclass, field
 
-import numpy as np
 
 logger = logging.getLogger(__name__)
 
@@ -157,11 +156,6 @@ class RegimeStrategyFilter:
             regime.get("overall_regime")
             or regime.get("regime")
             or "unknown"
-        )
-        regime_confidence = (
-            regime.get("overall_confidence")
-            or regime.get("confidence")
-            or 0.5
         )
 
         # Get regime strength (how strong is this regime signal?)
@@ -336,7 +330,7 @@ class RegimeStrategyFilter:
         # Show worst strategies (low compatibility)
         worst = filtered[-3:] if len(filtered) > 3 else []
         if worst:
-            lines.append(f"  Low Compatibility (avoid):")
+            lines.append("  Low Compatibility (avoid):")
             for strat in worst[:3]:
                 stype = strat.get("strategy_type") or strat.get("type") or "unknown"
                 adj_score = strat.get("adjusted_score", 0)

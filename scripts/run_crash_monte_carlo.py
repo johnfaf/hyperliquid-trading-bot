@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# ruff: noqa: E402
 """
 Crash Monte-Carlo Simulator
 ============================
@@ -20,7 +21,6 @@ and Sharpe/Calmar distributions.
 """
 
 import sys
-import time
 from pathlib import Path
 
 import numpy as np
@@ -238,7 +238,7 @@ def print_comparison_summary(result_with_crashes, result_without_crashes):
     print(f"  Crash injection reduces mean return by {impact_return:.2f}% (base effect size)")
     print(f"  Crash injection increases mean max drawdown by {impact_dd:.2f}% (risk amplification)")
     print(f"  Probability of ruin increases by {impact_ruin:.2f} percentage points")
-    print(f"\n  Impact Assessment: Crashes shift tail risk significantly:")
+    print("\n  Impact Assessment: Crashes shift tail risk significantly:")
     print(f"    - Worst-case scenario: {result_with_crashes.worst_return:+.2f}% (vs {result_without_crashes.worst_return:+.2f}% without crashes)")
     print(f"    - 5th percentile:      {result_with_crashes.return_percentiles['p5']:+.2f}% (vs {result_without_crashes.return_percentiles['p5']:+.2f}% without crashes)")
 
@@ -280,7 +280,6 @@ def main():
         trades_per_path=len(trade_returns),
     )
 
-    t0 = time.time()
     result_with_crashes = simulator.run(trade_returns, config_with_crashes)
     print(f"Completed in {result_with_crashes.duration_seconds:.2f}s")
     print_results_table(result_with_crashes, "WITH CRASH INJECTION ENABLED")

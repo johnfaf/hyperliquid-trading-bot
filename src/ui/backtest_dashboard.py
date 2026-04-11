@@ -46,7 +46,7 @@ def get_backtest_dashboard_data() -> Dict:
         for w in wallets:
             try:
                 w["coins_traded"] = json.loads(w.get("coins_traded", "[]"))
-            except:
+            except (TypeError, ValueError, json.JSONDecodeError):
                 w["coins_traded"] = []
 
         golden_count = len([w for w in wallets if w["is_golden"]])
@@ -97,7 +97,7 @@ def get_wallet_detail(address: str) -> Optional[Dict]:
         for field in ["raw_equity_curve", "penalised_equity_curve", "equity_timestamps", "coins_traded"]:
             try:
                 wallet[field] = json.loads(wallet.get(field, "[]"))
-            except:
+            except (TypeError, ValueError, json.JSONDecodeError):
                 wallet[field] = []
 
         # Timeframe results with period detail
@@ -111,7 +111,7 @@ def get_wallet_detail(address: str) -> Optional[Dict]:
                 row = dict(row)
                 try:
                     row["periods"] = json.loads(row.get("periods_json", "[]"))
-                except:
+                except (TypeError, ValueError, json.JSONDecodeError):
                     row["periods"] = []
                 del row["periods_json"]
                 timeframes[tf] = row

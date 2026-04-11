@@ -16,7 +16,7 @@ Features computed:
 """
 import logging
 import numpy as np
-from typing import Dict, List, Optional
+from typing import Dict, List
 from dataclasses import dataclass, asdict
 
 logger = logging.getLogger(__name__)
