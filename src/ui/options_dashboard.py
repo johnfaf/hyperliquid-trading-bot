@@ -1,5 +1,5 @@
 """
-Options Flow Dashboard — Standalone web dashboard on port 8081.
+Options Flow Dashboard - Standalone web dashboard on port 8081.
 Three-panel layout: Account/Convictions | Flow Heatmap | Unusual Prints Tape
 """
 import json
@@ -21,167 +21,449 @@ def _get_dashboard_html() -> str:
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Options Flow Scanner</title>
+<title>Options Flow Desk</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
 <style>
+@import url('https://fonts.googleapis.com/css2?family=Fraunces:wght@600;700&family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap');
+:root {
+  --bg: #f4ecde;
+  --bg-soft: #fbf6ed;
+  --panel: #fffaf2;
+  --panel-strong: #f7efdf;
+  --ink: #1f1a17;
+  --muted: #6f655b;
+  --line: #d9ccb8;
+  --teal: #1f6f5f;
+  --teal-deep: #16483e;
+  --blue: #2f5b9f;
+  --amber: #b9771f;
+  --red: #b54d3f;
+  --green: #207f59;
+  --shadow: 0 24px 60px rgba(48, 37, 22, 0.10);
+}
 * { margin: 0; padding: 0; box-sizing: border-box; }
-body { font-family: 'Courier New', monospace; background: #0a0a0f; color: #e0e0e0; }
-.header { background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); padding: 12px 24px; display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #2a2a4a; }
-.header h1 { font-size: 18px; color: #00ff88; letter-spacing: 2px; }
-.header .status { font-size: 12px; color: #888; }
-.header .live-dot { display: inline-block; width: 8px; height: 8px; background: #00ff88; border-radius: 50%; margin-right: 6px; animation: pulse 2s infinite; }
-@keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.3; } }
-
-.main { display: grid; grid-template-columns: 280px 1fr 420px; height: calc(100vh - 50px); gap: 1px; background: #1a1a2e; }
-
-/* Left Panel */
-.left-panel { background: #0d0d15; padding: 16px; overflow-y: auto; }
-.panel-title { font-size: 13px; color: #00ff88; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 12px; border-bottom: 1px solid #2a2a4a; padding-bottom: 6px; }
-.account-row { display: flex; justify-content: space-between; padding: 6px 0; font-size: 12px; border-bottom: 1px solid #151520; }
-.account-row .label { color: #888; }
-.account-row .value { color: #fff; font-weight: bold; }
-.account-row .value.positive { color: #00ff88; }
-.account-row .value.negative { color: #ff4444; }
-
-.conviction-card { background: #12121e; border: 1px solid #2a2a4a; border-radius: 6px; padding: 10px; margin-bottom: 8px; }
-.conviction-card .ticker { font-size: 16px; font-weight: bold; }
-.conviction-card .ticker.bullish { color: #00ff88; }
-.conviction-card .ticker.bearish { color: #ff4444; }
-.conviction-card .flow-detail { font-size: 11px; color: #888; margin-top: 4px; }
-.conviction-card .net-flow { font-size: 14px; font-weight: bold; margin-top: 4px; }
-.conviction-bar { height: 4px; border-radius: 2px; margin-top: 6px; }
-.conviction-bar.bullish { background: linear-gradient(90deg, #00ff88, #004422); }
-.conviction-bar.bearish { background: linear-gradient(90deg, #ff4444, #440000); }
-
-/* Center Panel */
-.center-panel { background: #0d0d15; padding: 16px; overflow-y: auto; }
-.heatmap-container { margin-bottom: 24px; }
-.heatmap-grid { display: grid; grid-template-columns: 80px repeat(4, 1fr); gap: 2px; margin-top: 8px; }
-.heatmap-header { font-size: 10px; color: #888; text-align: center; padding: 6px; text-transform: uppercase; }
-.heatmap-label { font-size: 12px; color: #fff; padding: 6px; display: flex; align-items: center; font-weight: bold; }
-.heatmap-cell { border-radius: 4px; padding: 8px; text-align: center; font-size: 11px; font-weight: bold; min-height: 40px; display: flex; align-items: center; justify-content: center; }
-.flow-chart-container { height: 200px; margin-top: 16px; }
-
-/* Right Panel */
-.right-panel { background: #0d0d15; overflow-y: auto; }
-.tape-header { display: grid; grid-template-columns: 55px 45px 90px 70px 65px 55px 80px 70px; padding: 8px 12px; font-size: 10px; color: #888; text-transform: uppercase; border-bottom: 1px solid #2a2a4a; position: sticky; top: 0; background: #0d0d15; z-index: 10; }
-.tape-row { display: grid; grid-template-columns: 55px 45px 90px 70px 65px 55px 80px 70px; padding: 6px 12px; font-size: 11px; border-bottom: 1px solid #0f0f1a; cursor: pointer; transition: background 0.15s; }
-.tape-row:hover { background: #1a1a2e; }
-.tape-row .tier { font-weight: bold; padding: 1px 4px; border-radius: 3px; font-size: 9px; text-align: center; }
-.tier-MEGA_BLOCK { background: #ff00ff33; color: #ff88ff; border: 1px solid #ff00ff; }
-.tier-BLOCK { background: #ffaa0033; color: #ffcc44; border: 1px solid #ffaa00; }
-.tier-SWEEP { background: #00aaff33; color: #44ccff; border: 1px solid #00aaff; }
-.tier-LARGE { background: #88888833; color: #aaa; border: 1px solid #888; }
-.dir-bullish { color: #00ff88; }
-.dir-bearish { color: #ff4444; }
-
-/* Order Entry */
-.order-panel { background: #12121e; border-top: 2px solid #2a2a4a; padding: 12px; }
-.order-panel .panel-title { margin-bottom: 8px; }
-.order-grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; }
-.order-field { display: flex; flex-direction: column; }
-.order-field label { font-size: 10px; color: #888; margin-bottom: 2px; }
-.order-field input, .order-field select { background: #1a1a2e; border: 1px solid #2a2a4a; color: #fff; padding: 6px 8px; border-radius: 4px; font-size: 12px; font-family: 'Courier New', monospace; }
-.order-field .computed { font-size: 11px; color: #ffcc44; font-weight: bold; }
-.btn-order { background: #00ff88; color: #000; border: none; padding: 10px 20px; font-weight: bold; font-size: 13px; border-radius: 4px; cursor: pointer; margin-top: 8px; font-family: 'Courier New', monospace; }
-.btn-order:hover { background: #00cc66; }
-.btn-order.sell { background: #ff4444; color: #fff; }
-.btn-order.sell:hover { background: #cc3333; }
-
-.empty-state { text-align: center; color: #555; padding: 40px; font-size: 14px; }
+body {
+  min-height: 100vh;
+  background:
+    radial-gradient(circle at top, rgba(31,111,95,0.12), transparent 32%),
+    linear-gradient(180deg, #efe5d2 0%, var(--bg) 42%, #f8f1e3 100%);
+  color: var(--ink);
+  font-family: 'IBM Plex Sans', sans-serif;
+  padding: 28px 20px 36px;
+}
+a { color: inherit; }
+.shell { max-width: 1600px; margin: 0 auto; }
+.topbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 18px;
+  margin-bottom: 18px;
+  padding: 24px 26px;
+  border: 1px solid rgba(31,111,95,.18);
+  border-radius: 30px;
+  background: linear-gradient(135deg, rgba(255,250,242,.96), rgba(244,236,222,.92));
+  box-shadow: var(--shadow);
+}
+.eyebrow {
+  font-size: .78rem;
+  text-transform: uppercase;
+  letter-spacing: .18em;
+  color: var(--teal);
+  font-weight: 700;
+}
+.topbar h1 {
+  margin: 10px 0 8px;
+  font-family: 'Fraunces', serif;
+  font-size: clamp(2rem, 3vw, 3.4rem);
+  line-height: .96;
+}
+.subtitle {
+  max-width: 68ch;
+  color: var(--muted);
+  line-height: 1.6;
+}
+.header-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  justify-content: flex-end;
+}
+.link-pill,
+.status-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 14px;
+  border-radius: 999px;
+  border: 1px solid rgba(79,63,40,.10);
+  background: rgba(255,255,255,.72);
+  text-decoration: none;
+  font-size: .84rem;
+  font-weight: 600;
+}
+.link-pill:hover { transform: translateY(-1px); }
+.live-dot {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--green);
+  box-shadow: 0 0 0 4px rgba(32,127,89,.12);
+}
+.main {
+  display: grid;
+  grid-template-columns: 300px minmax(0, 1fr) 430px;
+  gap: 18px;
+}
+.stack,
+.workspace,
+.tape-stack { display: grid; gap: 18px; align-content: start; }
+.panel {
+  background: linear-gradient(180deg, rgba(255,250,242,.97), rgba(247,239,223,.92));
+  border: 1px solid rgba(79,63,40,.10);
+  border-radius: 28px;
+  padding: 20px;
+  box-shadow: var(--shadow);
+}
+.panel-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-end;
+  gap: 10px;
+  margin-bottom: 14px;
+}
+.panel-title {
+  font-family: 'Fraunces', serif;
+  font-size: 1.35rem;
+  line-height: 1.1;
+}
+.panel-copy {
+  color: var(--muted);
+  font-size: .9rem;
+  line-height: 1.55;
+}
+.metric-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 0;
+  border-bottom: 1px solid rgba(79,63,40,.08);
+}
+.metric-row:last-child { border-bottom: 0; }
+.metric-row .label { color: var(--muted); font-size: .86rem; }
+.metric-row .value { color: var(--ink); font-weight: 700; font-family: 'IBM Plex Mono', monospace; }
+.metric-row .value.positive { color: var(--green); }
+.metric-row .value.negative { color: var(--red); }
+.conviction-card {
+  background: rgba(255,255,255,.72);
+  border: 1px solid rgba(79,63,40,.10);
+  border-radius: 20px;
+  padding: 14px;
+  margin-bottom: 10px;
+}
+.conviction-card .ticker { font-size: 1rem; font-weight: 700; }
+.conviction-card .ticker.bullish,
+.conviction-card .net-flow.bullish { color: var(--green); }
+.conviction-card .ticker.bearish,
+.conviction-card .net-flow.bearish { color: var(--red); }
+.conviction-card .flow-detail { font-size: .8rem; color: var(--muted); margin-top: 6px; line-height: 1.45; }
+.conviction-card .net-flow { font-size: 1rem; font-weight: 700; margin-top: 6px; }
+.conviction-bar { height: 6px; border-radius: 999px; margin-top: 10px; }
+.conviction-bar.bullish { background: linear-gradient(90deg, rgba(32,127,89,.18), var(--green)); }
+.conviction-bar.bearish { background: linear-gradient(90deg, rgba(181,77,63,.18), var(--red)); }
+.heatmap-grid {
+  display: grid;
+  grid-template-columns: 88px repeat(4, minmax(0, 1fr));
+  gap: 8px;
+  margin-top: 8px;
+}
+.heatmap-header {
+  font-size: .72rem;
+  color: var(--muted);
+  text-align: center;
+  padding: 8px;
+  text-transform: uppercase;
+  letter-spacing: .12em;
+}
+.heatmap-label {
+  display: flex;
+  align-items: center;
+  font-size: .82rem;
+  color: var(--ink);
+  padding: 8px;
+  font-weight: 700;
+}
+.heatmap-cell {
+  min-height: 52px;
+  border-radius: 16px;
+  padding: 10px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  font-size: .78rem;
+  font-weight: 700;
+  border: 1px solid rgba(79,63,40,.08);
+}
+.flow-chart-container { height: 340px; }
+.tape-panel { padding-bottom: 12px; }
+.tape-header,
+.tape-row {
+  display: grid;
+  grid-template-columns: 60px 50px 100px 74px 72px 66px 84px 74px;
+  gap: 8px;
+  align-items: center;
+}
+.tape-header {
+  padding: 10px 2px;
+  border-bottom: 1px solid rgba(79,63,40,.10);
+  font-size: .68rem;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: .12em;
+}
+.tape-body { max-height: 620px; overflow: auto; }
+.tape-row {
+  padding: 12px 2px;
+  border-bottom: 1px solid rgba(79,63,40,.08);
+  font-size: .8rem;
+  cursor: pointer;
+  transition: background .15s ease, transform .15s ease;
+}
+.tape-row:hover {
+  background: rgba(255,255,255,.62);
+  transform: translateX(2px);
+}
+.tier {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 3px 7px;
+  border-radius: 999px;
+  font-size: .64rem;
+  font-weight: 700;
+  border: 1px solid transparent;
+}
+.tier-MEGA_BLOCK { background: rgba(127,95,159,.12); color: #7f5f9f; border-color: rgba(127,95,159,.18); }
+.tier-BLOCK { background: rgba(185,119,31,.12); color: var(--amber); border-color: rgba(185,119,31,.18); }
+.tier-SWEEP { background: rgba(47,91,159,.10); color: var(--blue); border-color: rgba(47,91,159,.16); }
+.tier-LARGE { background: rgba(111,101,91,.10); color: var(--muted); border-color: rgba(111,101,91,.18); }
+.dir-bullish { color: var(--green); }
+.dir-bearish { color: var(--red); }
+.order-panel { display: grid; gap: 14px; }
+.order-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+}
+.order-field { display: flex; flex-direction: column; gap: 6px; }
+.order-field label {
+  font-size: .72rem;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: .12em;
+}
+.order-field input,
+.order-field select {
+  width: 100%;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  padding: 12px 14px;
+  background: rgba(255,255,255,.78);
+  color: var(--ink);
+  font-size: .9rem;
+  font-family: 'IBM Plex Mono', monospace;
+}
+.order-field .computed {
+  min-height: 44px;
+  display: flex;
+  align-items: center;
+  padding: 12px 14px;
+  border-radius: 14px;
+  background: rgba(255,255,255,.56);
+  border: 1px solid rgba(79,63,40,.10);
+  color: var(--amber);
+  font-family: 'IBM Plex Mono', monospace;
+  font-weight: 600;
+}
+.order-actions { display: flex; gap: 10px; }
+.btn-order {
+  flex: 1;
+  border: 0;
+  border-radius: 999px;
+  padding: 12px 16px;
+  font-weight: 700;
+  font-size: .9rem;
+  cursor: pointer;
+}
+.btn-order.buy { background: rgba(32,127,89,.14); color: var(--green); border: 1px solid rgba(32,127,89,.22); }
+.btn-order.sell { background: rgba(181,77,63,.12); color: var(--red); border: 1px solid rgba(181,77,63,.22); }
+.empty-state {
+  text-align: center;
+  color: var(--muted);
+  padding: 28px 16px;
+  font-size: .9rem;
+  line-height: 1.5;
+}
+@media (max-width: 1320px) {
+  .main { grid-template-columns: 280px minmax(0, 1fr); }
+  .tape-stack { grid-column: 1 / -1; }
+}
+@media (max-width: 940px) {
+  body { padding: 18px 14px 24px; }
+  .topbar { flex-direction: column; padding: 18px; border-radius: 24px; }
+  .main { grid-template-columns: 1fr; }
+  .order-grid { grid-template-columns: 1fr; }
+  .tape-header,
+  .tape-row {
+    grid-template-columns: 60px 52px 1.2fr 1fr 70px 70px 84px 78px;
+    font-size: .74rem;
+  }
+}
 </style>
 </head>
 <body>
-
-<div class="header">
-  <h1><span class="live-dot"></span>OPTIONS FLOW SCANNER</h1>
-  <div class="status">
-    <span id="last-update">Loading...</span> |
-    <span id="print-count">0</span> unusual prints tracked
-  </div>
-</div>
-
-<div class="main">
-  <!-- LEFT PANEL: Account + Convictions -->
-  <div class="left-panel">
-    <div class="panel-title">Spot Prices</div>
-    <div id="spot-prices"></div>
-
-    <div class="panel-title" style="margin-top: 16px;">Risk Limits</div>
-    <div class="account-row"><span class="label">Per Trade</span><span class="value">1%</span></div>
-    <div class="account-row"><span class="label">Total Risk</span><span class="value">5%</span></div>
-    <div class="account-row"><span class="label">Max Positions</span><span class="value">5</span></div>
-
-    <div class="panel-title" style="margin-top: 16px;">Top Convictions</div>
-    <div id="convictions-list">
-      <div class="empty-state">Scanning...</div>
+<div class="shell">
+  <header class="topbar">
+    <div>
+      <p class="eyebrow">Signal Pressure Desk</p>
+      <h1>Options Flow Desk</h1>
+      <p class="subtitle">This view is for reading directional pressure quickly: spot anchors on the left, where conviction is building in the center, and the raw unusual prints tape plus order ticket on the right.</p>
     </div>
-  </div>
+    <div class="header-actions">
+      <a class="link-pill" href="/">Back to cockpit</a>
+      <span class="status-pill"><span class="live-dot"></span> live scan</span>
+      <span class="status-pill" id="last-update">Loading...</span>
+      <span class="status-pill"><span id="print-count">0</span></span>
+    </div>
+  </header>
 
-  <!-- CENTER PANEL: Heatmap + Flow Chart -->
-  <div class="center-panel">
-    <div class="panel-title">Flow Heatmap (Net Notional by Expiry)</div>
-    <div class="heatmap-container">
-      <div class="heatmap-grid" id="heatmap-grid">
-        <!-- Generated by JS -->
-      </div>
-    </div>
+  <section class="main">
+    <aside class="stack">
+      <article class="panel">
+        <div class="panel-head">
+          <div>
+            <p class="eyebrow">Underlyings</p>
+            <h2 class="panel-title">Spot Board</h2>
+          </div>
+        </div>
+        <div id="spot-prices"></div>
+      </article>
 
-    <div class="panel-title">Net Directional Flow by Ticker</div>
-    <div class="flow-chart-container">
-      <canvas id="flow-chart"></canvas>
-    </div>
-  </div>
+      <article class="panel">
+        <div class="panel-head">
+          <div>
+            <p class="eyebrow">Risk Frame</p>
+            <h2 class="panel-title">Sizing Guardrails</h2>
+          </div>
+        </div>
+        <div class="metric-row"><span class="label">Per trade</span><span class="value">1%</span></div>
+        <div class="metric-row"><span class="label">Total risk</span><span class="value">5%</span></div>
+        <div class="metric-row"><span class="label">Max positions</span><span class="value">5</span></div>
+      </article>
 
-  <!-- RIGHT PANEL: Tape + Order Entry -->
-  <div class="right-panel">
-    <div class="panel-title" style="padding: 8px 12px;">Unusual Prints Tape</div>
-    <div class="tape-header">
-      <span>Time</span><span>Ticker</span><span>Strike/Type</span><span>Expiry</span>
-      <span>Vol/OI</span><span>Tier</span><span>Notional</span><span>Flow</span>
-    </div>
-    <div id="tape-body">
-      <div class="empty-state">Waiting for unusual prints...</div>
-    </div>
+      <article class="panel">
+        <div class="panel-head">
+          <div>
+            <p class="eyebrow">Highest Conviction</p>
+            <h2 class="panel-title">Directional Pressure</h2>
+          </div>
+        </div>
+        <p class="panel-copy">The strongest flow clusters stay here so you can see whether the tape is leaning with real size or just noise.</p>
+        <div id="convictions-list"><div class="empty-state">Scanning options flow...</div></div>
+      </article>
+    </aside>
 
-    <!-- Order Entry -->
-    <div class="order-panel" id="order-panel" style="display:none;">
-      <div class="panel-title">Order Entry</div>
-      <div class="order-grid">
-        <div class="order-field">
-          <label>Instrument</label>
-          <input type="text" id="order-instrument" readonly>
+    <main class="workspace">
+      <article class="panel">
+        <div class="panel-head">
+          <div>
+            <p class="eyebrow">Distribution</p>
+            <h2 class="panel-title">Flow Heatmap</h2>
+          </div>
+          <p class="panel-copy">Net notional by expiry bucket. Positive cells lean bullish. Negative cells lean bearish.</p>
         </div>
-        <div class="order-field">
-          <label>Side</label>
-          <select id="order-side">
-            <option value="buy">BUY</option>
-            <option value="sell">SELL</option>
-          </select>
+        <div class="heatmap-grid" id="heatmap-grid"></div>
+      </article>
+
+      <article class="panel">
+        <div class="panel-head">
+          <div>
+            <p class="eyebrow">Net Bias</p>
+            <h2 class="panel-title">Ticker Flow Balance</h2>
+          </div>
+          <p class="panel-copy">This is the fast answer for which names are taking the heaviest directional pressure right now.</p>
         </div>
-        <div class="order-field">
-          <label>Quantity</label>
-          <input type="number" id="order-qty" value="1" min="0.1" step="0.1">
+        <div class="flow-chart-container">
+          <canvas id="flow-chart"></canvas>
         </div>
-        <div class="order-field">
-          <label>Limit Price</label>
-          <input type="number" id="order-price" step="0.0001">
+      </article>
+    </main>
+
+    <aside class="tape-stack">
+      <article class="panel tape-panel">
+        <div class="panel-head">
+          <div>
+            <p class="eyebrow">Tape</p>
+            <h2 class="panel-title">Unusual Prints</h2>
+          </div>
+          <p class="panel-copy">Click a print to prefill the order ticket.</p>
         </div>
-        <div class="order-field">
-          <label>Breakeven</label>
-          <span class="computed" id="order-breakeven">—</span>
+        <div class="tape-header">
+          <span>Time</span><span>Ticker</span><span>Strike/Type</span><span>Expiry</span>
+          <span>Vol/OI</span><span>Tier</span><span>Notional</span><span>Flow</span>
         </div>
-        <div class="order-field">
-          <label>% Move Needed</label>
-          <span class="computed" id="order-pct-move">—</span>
+        <div class="tape-body" id="tape-body">
+          <div class="empty-state">Waiting for unusual prints...</div>
         </div>
-      </div>
-      <div style="display:flex; gap:8px; margin-top:8px;">
-        <button class="btn-order" onclick="placeOrder('buy')">BUY</button>
-        <button class="btn-order sell" onclick="placeOrder('sell')">SELL</button>
-      </div>
-    </div>
-  </div>
+      </article>
+
+      <article class="panel order-panel" id="order-panel" style="display:none;">
+        <div class="panel-head">
+          <div>
+            <p class="eyebrow">Order Ticket</p>
+            <h2 class="panel-title">Execution Stub</h2>
+          </div>
+          <p class="panel-copy">This still posts to the placeholder order endpoint. Keep it as a staging surface until live options execution is implemented.</p>
+        </div>
+        <div class="order-grid">
+          <div class="order-field">
+            <label>Instrument</label>
+            <input type="text" id="order-instrument" readonly>
+          </div>
+          <div class="order-field">
+            <label>Side</label>
+            <select id="order-side">
+              <option value="buy">BUY</option>
+              <option value="sell">SELL</option>
+            </select>
+          </div>
+          <div class="order-field">
+            <label>Quantity</label>
+            <input type="number" id="order-qty" value="1" min="0.1" step="0.1">
+          </div>
+          <div class="order-field">
+            <label>Limit price</label>
+            <input type="number" id="order-price" step="0.0001">
+          </div>
+          <div class="order-field">
+            <label>Breakeven</label>
+            <span class="computed" id="order-breakeven">--</span>
+          </div>
+          <div class="order-field">
+            <label>Move needed</label>
+            <span class="computed" id="order-pct-move">--</span>
+          </div>
+        </div>
+        <div class="order-actions">
+          <button class="btn-order buy" onclick="placeOrder('buy')">Buy</button>
+          <button class="btn-order sell" onclick="placeOrder('sell')">Sell</button>
+        </div>
+      </article>
+    </aside>
+  </section>
 </div>
 
 <script>
@@ -194,62 +476,70 @@ async function fetchData() {
     if (!resp.ok) return;
     currentData = await resp.json();
     renderAll(currentData);
-  } catch(e) { console.error('Fetch error:', e); }
+  } catch (e) {
+    console.error('Fetch error:', e);
+  }
 }
 
 function formatUSD(val) {
-  if (Math.abs(val) >= 1e6) return '$' + (val/1e6).toFixed(2) + 'M';
-  if (Math.abs(val) >= 1e3) return '$' + (val/1e3).toFixed(1) + 'K';
-  return '$' + val.toFixed(0);
+  if (Math.abs(val) >= 1e6) return '$' + (val / 1e6).toFixed(2) + 'M';
+  if (Math.abs(val) >= 1e3) return '$' + (val / 1e3).toFixed(1) + 'K';
+  return '$' + Number(val || 0).toFixed(0);
 }
 
 function renderAll(data) {
-  document.getElementById('last-update', '').textContent = 'Updated: ' + new Date(data.timestamp).toLocaleTimeString();
-  document.getElementById('print-count').textContent = data.summary.total_unusual;
-
-  renderSpotPrices(data.spot_prices);
-  renderConvictions(data.convictions);
-  renderHeatmap(data.heatmap, data.spot_prices);
-  renderFlowChart(data.flow_bars);
-  renderTape(data.unusual_prints);
+  const summary = data.summary || {};
+  const underlyings = summary.currencies_tracked || Object.keys(data.spot_prices || {}).length;
+  document.getElementById('last-update').textContent = 'Updated ' + new Date(data.timestamp).toLocaleTimeString();
+  document.getElementById('print-count').textContent = `${summary.total_unusual || 0} prints | ${underlyings} names`;
+  renderSpotPrices(data.spot_prices || {});
+  renderConvictions(data.convictions || []);
+  renderHeatmap(data.heatmap || []);
+  renderFlowChart(data.flow_bars || []);
+  renderTape(data.unusual_prints || []);
 }
 
 function renderSpotPrices(prices) {
   const el = document.getElementById('spot-prices');
-  let html = '';
-  for (const [ticker, price] of Object.entries(prices)) {
-    html += '<div class="account-row"><span class="label">' + ticker + '</span><span class="value">' + formatUSD(price) + '</span></div>';
+  const entries = Object.entries(prices || {});
+  if (!entries.length) {
+    el.innerHTML = '<div class="empty-state">No spot prices yet.</div>';
+    return;
   }
-  el.innerHTML = html;
+  el.innerHTML = entries.map(([ticker, price]) => (
+    '<div class="metric-row"><span class="label">' + ticker + '</span><span class="value">' + formatUSD(price) + '</span></div>'
+  )).join('');
 }
 
 function renderConvictions(convictions) {
   const el = document.getElementById('convictions-list');
-  if (!convictions.length) { el.innerHTML = '<div class="empty-state">No strong convictions yet</div>'; return; }
-  let html = '';
-  convictions.slice(0, 5).forEach(c => {
+  if (!convictions.length) {
+    el.innerHTML = '<div class="empty-state">No strong convictions yet.</div>';
+    return;
+  }
+  el.innerHTML = convictions.slice(0, 5).map(c => {
     const dir = c.direction === 'BULLISH' ? 'bullish' : 'bearish';
     const netStr = formatUSD(Math.abs(c.net_flow));
-    html += '<div class="conviction-card">' +
+    return '<div class="conviction-card">' +
       '<div class="ticker ' + dir + '">' + c.ticker + ' ' + c.direction + '</div>' +
       '<div class="net-flow ' + dir + '">Net ' + netStr + ' across ' + c.total_prints + ' prints</div>' +
       '<div class="flow-detail">Bullish: ' + formatUSD(c.bullish_notional) + ' | Bearish: ' + formatUSD(c.bearish_notional) + '</div>' +
       '<div class="flow-detail">Conviction: ' + c.conviction_pct + '% | Spot: ' + formatUSD(c.spot_price) + '</div>' +
-      '<div class="conviction-bar ' + dir + '" style="width:' + c.conviction_pct + '%"></div>' +
+      '<div class="conviction-bar ' + dir + '" style="width:' + Math.max(8, c.conviction_pct) + '%"></div>' +
       '</div>';
-  });
-  el.innerHTML = html;
+  }).join('');
 }
 
-function renderHeatmap(heatmap, spotPrices) {
+function renderHeatmap(heatmap) {
   const grid = document.getElementById('heatmap-grid');
   const windows = ['weekly', 'monthly', 'quarterly', 'leap'];
   const tickers = [...new Set(heatmap.map(h => h.ticker))];
-  if (!tickers.length) { grid.innerHTML = '<div class="empty-state" style="grid-column:1/-1">No heatmap data</div>'; return; }
+  if (!tickers.length) {
+    grid.innerHTML = '<div class="empty-state" style="grid-column:1/-1">No heatmap data yet.</div>';
+    return;
+  }
 
-  // Find max value for color scaling
   const maxVal = Math.max(...heatmap.map(h => Math.abs(h.net_notional)), 1);
-
   let html = '<div class="heatmap-header"></div>';
   windows.forEach(w => { html += '<div class="heatmap-header">' + w + '</div>'; });
 
@@ -260,10 +550,10 @@ function renderHeatmap(heatmap, spotPrices) {
       const val = cell ? cell.net_notional : 0;
       const intensity = Math.min(Math.abs(val) / maxVal, 1);
       let bg;
-      if (val > 0) bg = 'rgba(0, 255, 136, ' + (0.1 + intensity * 0.6) + ')';
-      else if (val < 0) bg = 'rgba(255, 68, 68, ' + (0.1 + intensity * 0.6) + ')';
-      else bg = 'rgba(30, 30, 50, 0.5)';
-      const text = val !== 0 ? formatUSD(val) : '—';
+      if (val > 0) bg = 'rgba(32, 127, 89, ' + (0.10 + intensity * 0.50) + ')';
+      else if (val < 0) bg = 'rgba(181, 77, 63, ' + (0.10 + intensity * 0.50) + ')';
+      else bg = 'rgba(111, 101, 91, 0.08)';
+      const text = val !== 0 ? formatUSD(val) : '--';
       html += '<div class="heatmap-cell" style="background:' + bg + '">' + text + '</div>';
     });
   });
@@ -276,7 +566,7 @@ function renderFlowChart(flowBars) {
 
   const labels = flowBars.map(f => f.ticker);
   const values = flowBars.map(f => f.net_flow);
-  const colors = values.map(v => v >= 0 ? '#00ff88' : '#ff4444');
+  const colors = values.map(v => v >= 0 ? '#1f6f5f' : '#b54d3f');
 
   if (flowChart) flowChart.destroy();
   flowChart = new Chart(ctx, {
@@ -288,7 +578,7 @@ function renderFlowChart(flowBars) {
         data: values,
         backgroundColor: colors,
         borderWidth: 0,
-        borderRadius: 4,
+        borderRadius: 10,
       }]
     },
     options: {
@@ -299,18 +589,18 @@ function renderFlowChart(flowBars) {
         legend: { display: false },
         tooltip: {
           callbacks: {
-            label: function(ctx) { return 'Net: ' + formatUSD(ctx.parsed.x); }
+            label: function(ctx) { return 'Net ' + formatUSD(ctx.parsed.x); }
           }
         }
       },
       scales: {
         x: {
-          grid: { color: '#1a1a2e' },
-          ticks: { color: '#888', callback: v => formatUSD(v) }
+          grid: { color: 'rgba(111,101,91,0.12)' },
+          ticks: { color: '#6f655b', callback: v => formatUSD(v) }
         },
         y: {
           grid: { display: false },
-          ticks: { color: '#fff', font: { weight: 'bold' } }
+          ticks: { color: '#1f1a17', font: { weight: '700' } }
         }
       }
     }
@@ -319,60 +609,66 @@ function renderFlowChart(flowBars) {
 
 function renderTape(prints) {
   const el = document.getElementById('tape-body');
-  if (!prints.length) { el.innerHTML = '<div class="empty-state">Waiting for unusual prints...</div>'; return; }
+  if (!prints.length) {
+    el.innerHTML = '<div class="empty-state">Waiting for unusual prints...</div>';
+    return;
+  }
 
-  let html = '';
-  prints.forEach((p, i) => {
+  el.innerHTML = prints.map((p, i) => {
     const dirClass = p.direction === 'bullish' ? 'dir-bullish' : 'dir-bearish';
     const tierClass = 'tier-' + p.tier;
-    html += '<div class="tape-row" onclick="selectPrint(' + i + ')">' +
+    return '<div class="tape-row" onclick="selectPrint(' + i + ')">' +
       '<span>' + p.time + '</span>' +
-      '<span style="font-weight:bold">' + p.ticker + '</span>' +
+      '<span style="font-weight:700">' + p.ticker + '</span>' +
       '<span>' + p.strike + ' ' + p.option_type.toUpperCase() + '</span>' +
       '<span>' + p.expiry + '</span>' +
-      '<span style="color:#ffcc44">' + p.vol_oi_ratio + 'x</span>' +
+      '<span style="color:#b9771f;font-weight:700">' + p.vol_oi_ratio + 'x</span>' +
       '<span><span class="tier ' + tierClass + '">' + p.tier.replace('_', ' ') + '</span></span>' +
-      '<span style="font-weight:bold">' + formatUSD(p.notional) + '</span>' +
+      '<span style="font-weight:700">' + formatUSD(p.notional) + '</span>' +
       '<span class="' + dirClass + '">' + p.direction.toUpperCase() + '</span>' +
       '</div>';
-  });
-  el.innerHTML = html;
+  }).join('');
 }
 
 function selectPrint(idx) {
   if (!currentData || !currentData.unusual_prints[idx]) return;
   const p = currentData.unusual_prints[idx];
-  document.getElementById('order-panel').style.display = 'block';
+  document.getElementById('order-panel').style.display = 'grid';
   document.getElementById('order-instrument').value = p.instrument;
   document.getElementById('order-side').value = p.direction === 'bullish' ? 'buy' : 'sell';
+  document.getElementById('order-price').value = p.price || '';
 
-  // Compute breakeven
   const spot = p.spot_price || 0;
   const strike = p.strike || 0;
   if (spot > 0 && strike > 0) {
     const pctMove = ((strike - spot) / spot * 100).toFixed(2);
     document.getElementById('order-breakeven').textContent = formatUSD(strike);
     document.getElementById('order-pct-move').textContent = pctMove + '%';
+  } else {
+    document.getElementById('order-breakeven').textContent = '--';
+    document.getElementById('order-pct-move').textContent = '--';
   }
+  document.getElementById('order-panel').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
 }
 
 function placeOrder(side) {
   const instrument = document.getElementById('order-instrument').value;
   const qty = document.getElementById('order-qty').value;
   const price = document.getElementById('order-price').value;
-  if (!instrument) { alert('Select a print first'); return; }
-  // POST to /api/order
+  if (!instrument) {
+    alert('Select a print first');
+    return;
+  }
   fetch('/api/order', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({ instrument, side, qty: parseFloat(qty), price: parseFloat(price) })
   })
-  .then(r => r.json())
-  .then(data => { alert(data.status || 'Order submitted'); })
-  .catch(e => { alert('Order error: ' + e); });
+    .then(r => r.json())
+    .then(data => { alert(data.status || 'Order submitted'); })
+    .catch(e => { alert('Order error: ' + e); });
 }
 
-// Auto-refresh every 30 seconds
 fetchData();
 setInterval(fetchData, 30000);
 </script>
@@ -421,7 +717,7 @@ class FlowDashboardHandler(BaseHTTPRequestHandler):
         self._json_response(data)
 
     def _handle_order(self):
-        """Handle order placement (placeholder — needs Deribit API keys)."""
+        """Handle order placement (placeholder - needs Deribit API keys)."""
         try:
             content_len = int(self.headers.get("Content-Length", 0))
             body = json.loads(self.rfile.read(content_len))
