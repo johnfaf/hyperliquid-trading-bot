@@ -104,11 +104,14 @@ class PositionMonitor:
         self._reconnect_count = 0
         self._signals_emitted = 0
         self._connected = False
+        self._connected_since = 0.0
         self._last_msg_time = 0.0
         self._last_ws_activity_time = 0.0
         self._gap_count = 0
         self._max_gap_ms = 0.0
         self._last_gap_warn_time = 0.0
+        self._transient_disconnects = 0
+        self._rest_fallback_cycles = 0
 
         # Mid-price cache is refreshed by a dedicated REST thread so the
         # WebSocket message handler never blocks on external HTTP calls.
@@ -164,6 +167,15 @@ class PositionMonitor:
             5.0,
             float(getattr(config, "POSITION_MONITOR_GAP_WARN_COOLDOWN_S", 60.0)),
         )
+        self._stable_connection_reset_s = max(
+            10.0,
+            float(getattr(config, "POSITION_MONITOR_STABLE_CONNECTION_RESET_S", 180.0)),
+        )
+        self._rest_fallback_interval_s = max(
+            5.0,
+            float(getattr(config, "POSITION_MONITOR_REST_FALLBACK_INTERVAL_S", 20.0)),
+        )
+        self._rest_fallback_thread = None
 
     def start(self, addresses: List[str]) -> None:
         """
@@ -188,6 +200,8 @@ class PositionMonitor:
         self._mids_thread.start()
         self._watchdog_thread = threading.Thread(target=self._watchdog_loop, daemon=True)
         self._watchdog_thread.start()
+        self._rest_fallback_thread = threading.Thread(target=self._rest_reconcile_loop, daemon=True)
+        self._rest_fallback_thread.start()
         logger.info(f"PositionMonitor starting with {len(addresses)} traders")
 
     def stop(self) -> None:
@@ -260,6 +274,8 @@ class PositionMonitor:
                 "messages_received": self._messages_received,
                 "signals_emitted": self._signals_emitted,
                 "reconnect_count": self._reconnect_count,
+                "transient_disconnects": self._transient_disconnects,
+                "rest_fallback_cycles": self._rest_fallback_cycles,
                 "gaps_detected": self._gap_count,
                 "max_gap_ms": round(self._max_gap_ms, 0),
                 "gap_warn_threshold_s": round(self._gap_warn_threshold_s, 2),
@@ -318,6 +334,20 @@ class PositionMonitor:
             return False
         return any(marker in text for marker in cls._TRANSIENT_CLOSE_MARKERS)
 
+    def _note_disconnect(self, *, transient: bool) -> None:
+        """Record disconnect state and preserve backoff on short-lived flaps."""
+        with self._lock:
+            now = time.time()
+            connected_since = self._connected_since
+            if transient:
+                self._transient_disconnects += 1
+            self._connected = False
+            self._connected_since = 0.0
+            self._last_ws_activity_time = now
+            uptime_s = (now - connected_since) if connected_since > 0 else 0.0
+            if connected_since > 0 and uptime_s >= self._stable_connection_reset_s:
+                self._reconnect_count = 0
+
     def _on_open(self, ws) -> None:
         """
         Connected — subscribe to all tracked traders' userEvents.
@@ -327,6 +357,7 @@ class PositionMonitor:
         with self._lock:
             self._connected = True
             now = time.time()
+            self._connected_since = now
             self._last_msg_time = now
             self._last_ws_activity_time = now
             self._watchdog_grace_until = now + self._watchdog_startup_grace_s
@@ -344,10 +375,6 @@ class PositionMonitor:
             logger.info("PositionMonitor connected")
             for address in tracked:
                 self._bootstrap_positions(address)
-
-        # Reset reconnect counter on successful connection so backoff
-        # doesn't permanently escalate to 60s after transient failures.
-        self._reconnect_count = 0
 
         # Subscribe to all tracked addresses
         for address in tracked:
@@ -460,18 +487,26 @@ class PositionMonitor:
 
     def _on_error(self, ws, error) -> None:
         """Handle WebSocket errors."""
+        transient = self._is_transient_ws_close_error(error)
         if self._running:
-            if self._is_transient_ws_close_error(error):
+            if transient:
                 logger.info("PositionMonitor transient WebSocket close: %s", error)
             else:
                 logger.warning(f"PositionMonitor WebSocket error: {error}")
-        with self._lock:
-            self._connected = False
+        self._note_disconnect(transient=transient)
 
     def _on_close(self, ws, close_status_code=None, close_msg=None) -> None:
         """Handle WebSocket closure."""
-        with self._lock:
-            self._connected = False
+        close_text = " ".join(
+            part for part in (str(close_status_code or ""), str(close_msg or "")) if part
+        )
+        transient = self._is_transient_ws_close_error(close_text) or close_status_code in {
+            None,
+            1000,
+            1001,
+            1006,
+        }
+        self._note_disconnect(transient=transient)
         if self._running:
             logger.info(f"PositionMonitor WebSocket closed (code={close_status_code})")
 
@@ -689,7 +724,66 @@ class PositionMonitor:
             except Exception as exc:
                 logger.debug("PositionMonitor watchdog close error: %s", exc)
 
+    def _rest_reconcile_once(self) -> int:
+        """Reconcile tracked positions via REST when the WebSocket is unavailable."""
+        with self._lock:
+            if self._connected:
+                return 0
+            tracked = list(self._tracked_addresses)
+
+        emitted = 0
+        for address in tracked:
+            with self._lock:
+                cached = dict(self._position_cache.get(address, {}))
+            fresh_positions = self._fetch_positions_snapshot(address)
+            with self._lock:
+                self._position_cache[address] = fresh_positions
+            signals = self._detect_position_changes(address, cached, fresh_positions)
+            if not signals:
+                continue
+            with self._lock:
+                for signal in signals:
+                    self._signal_queue.append(signal)
+                    self._signals_emitted += 1
+                    emitted += 1
+            logger.info(
+                "PositionMonitor REST fallback detected %d position changes for %s",
+                len(signals),
+                address[:10],
+            )
+
+        with self._lock:
+            self._rest_fallback_cycles += 1
+        return emitted
+
+    def _rest_reconcile_loop(self) -> None:
+        """Poll REST periodically while disconnected so position tracking still advances."""
+        while self._running:
+            time.sleep(self._rest_fallback_interval_s)
+            try:
+                self._rest_reconcile_once()
+            except Exception as exc:
+                logger.debug("PositionMonitor REST fallback error: %s", exc)
+
     # ─── Bootstrap: Initial position fetch ──────────────────────────
+
+    def _fetch_positions_snapshot(self, address: str) -> Dict[str, Dict]:
+        """Fetch current positions for a trader without mutating internal state."""
+        state = hl.get_user_state(address)
+        if not state:
+            return {}
+
+        positions = {}
+        for pos in state["positions"]:
+            if pos["size"] > 0:  # Only non-zero positions
+                positions[pos["coin"]] = {
+                    "size": pos["size"],
+                    "side": pos["side"],
+                    "entry_price": pos["entry_price"],
+                    "leverage": pos["leverage"],
+                    "unrealized_pnl": pos.get("unrealized_pnl", 0),
+                }
+        return positions
 
     def _bootstrap_positions(self, address: str) -> Dict[str, Dict]:
         """
@@ -703,20 +797,7 @@ class PositionMonitor:
             Current positions dict: {coin: {size, side, entry_price, leverage, ...}}
         """
         try:
-            state = hl.get_user_state(address)
-            if not state:
-                return {}
-
-            positions = {}
-            for pos in state["positions"]:
-                if pos["size"] > 0:  # Only non-zero positions
-                    positions[pos["coin"]] = {
-                        "size": pos["size"],
-                        "side": pos["side"],
-                        "entry_price": pos["entry_price"],
-                        "leverage": pos["leverage"],
-                        "unrealized_pnl": pos.get("unrealized_pnl", 0),
-                    }
+            positions = self._fetch_positions_snapshot(address)
 
             with self._lock:
                 self._position_cache[address] = positions

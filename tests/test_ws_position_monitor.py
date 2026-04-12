@@ -136,6 +136,81 @@ def test_on_error_logs_warning_for_non_transient_error(caplog):
     assert "websocket error" in caplog.text.lower()
 
 
+def test_note_disconnect_preserves_backoff_for_short_lived_flaps(monkeypatch):
+    monitor = PositionMonitor()
+    monitor._connected = True
+    monitor._connected_since = 100.0
+    monitor._reconnect_count = 3
+    monitor._stable_connection_reset_s = 180.0
+
+    monkeypatch.setattr("src.notifications.ws_position_monitor.time.time", lambda: 150.0)
+    monitor._note_disconnect(transient=True)
+
+    assert monitor._connected is False
+    assert monitor._reconnect_count == 3
+    assert monitor._transient_disconnects == 1
+
+
+def test_note_disconnect_resets_backoff_after_stable_connection(monkeypatch):
+    monitor = PositionMonitor()
+    monitor._connected = True
+    monitor._connected_since = 100.0
+    monitor._reconnect_count = 3
+    monitor._stable_connection_reset_s = 120.0
+
+    monkeypatch.setattr("src.notifications.ws_position_monitor.time.time", lambda: 260.0)
+    monitor._note_disconnect(transient=True)
+
+    assert monitor._reconnect_count == 0
+
+
+def test_rest_reconcile_once_detects_changes_while_disconnected(monkeypatch):
+    monitor = PositionMonitor()
+    monitor._connected = False
+    monitor._tracked_addresses = {"0xabc"}
+    monitor._position_cache = {
+        "0xabc": {
+            "BTC": {
+                "size": 1.0,
+                "side": "long",
+                "entry_price": 100.0,
+                "leverage": 2.0,
+                "unrealized_pnl": 0.0,
+            }
+        }
+    }
+    monitor._mids_cache = {"ETH": 200.0}
+
+    monkeypatch.setattr(
+        monitor,
+        "_fetch_positions_snapshot",
+        lambda address: {
+            "BTC": {
+                "size": 1.0,
+                "side": "long",
+                "entry_price": 100.0,
+                "leverage": 2.0,
+                "unrealized_pnl": 0.0,
+            },
+            "ETH": {
+                "size": 2.0,
+                "side": "long",
+                "entry_price": 200.0,
+                "leverage": 3.0,
+                "unrealized_pnl": 0.0,
+            },
+        },
+    )
+
+    emitted = monitor._rest_reconcile_once()
+
+    assert emitted == 1
+    signal = monitor.drain_signals()[0]
+    assert signal["type"] == "copy_open"
+    assert signal["coin"] == "ETH"
+    assert monitor.get_stats()["rest_fallback_cycles"] == 1
+
+
 def test_websocket_library_filter_suppresses_transient_close_frame_errors():
     filt = _TransientWebSocketLibraryLogFilter(PositionMonitor._TRANSIENT_CLOSE_MARKERS)
     transient = logging.LogRecord(
