@@ -348,6 +348,19 @@ EVENT_SCANNER_MAX_RECENT = int(os.environ.get("EVENT_SCANNER_MAX_RECENT", 12))
 EVENT_SCANNER_INCLUDE_MEDIUM = os.environ.get(
     "EVENT_SCANNER_INCLUDE_MEDIUM", "true"
 ).lower() in ("true", "1", "yes")
+EVENT_SCANNER_ENABLE_CRYPTO_INCIDENTS = os.environ.get(
+    "EVENT_SCANNER_ENABLE_CRYPTO_INCIDENTS", "true"
+).lower() in ("true", "1", "yes")
+EVENT_RISK_ENABLED = os.environ.get("EVENT_RISK_ENABLED", "true").lower() in ("true", "1", "yes")
+EVENT_RISK_BLOCK_MINUTES = int(os.environ.get("EVENT_RISK_BLOCK_MINUTES", 10))
+EVENT_RISK_COOLDOWN_MINUTES = int(os.environ.get("EVENT_RISK_COOLDOWN_MINUTES", 30))
+EVENT_RISK_DEGRADE_LOOKAHEAD_MINUTES = int(
+    os.environ.get("EVENT_RISK_DEGRADE_LOOKAHEAD_MINUTES", 60)
+)
+EVENT_RISK_CONFIDENCE_MULTIPLIER = float(
+    os.environ.get("EVENT_RISK_CONFIDENCE_MULTIPLIER", 0.65)
+)
+EVENT_RISK_SIZE_MULTIPLIER = float(os.environ.get("EVENT_RISK_SIZE_MULTIPLIER", 0.60))
 
 # ─── Forecaster External Data ───────────────────────────────
 # How long before external data (Polymarket, Options) is considered stale
@@ -443,6 +456,11 @@ def _validate_config_bounds() -> None:
         ("EVENT_SCANNER_REFRESH_SECONDS", 60, 86_400, 900),
         ("EVENT_SCANNER_MAX_UPCOMING", 1, 200, 12),
         ("EVENT_SCANNER_MAX_RECENT", 1, 200, 12),
+        ("EVENT_RISK_BLOCK_MINUTES", 0, 1_440, 10),
+        ("EVENT_RISK_COOLDOWN_MINUTES", 0, 1_440, 30),
+        ("EVENT_RISK_DEGRADE_LOOKAHEAD_MINUTES", 0, 2_880, 60),
+        ("EVENT_RISK_CONFIDENCE_MULTIPLIER", 0.0, 1.0, 0.65),
+        ("EVENT_RISK_SIZE_MULTIPLIER", 0.0, 1.0, 0.60),
         ("FORECASTER_EXTERNAL_DATA_TTL", 10, 86_400, 600),
         ("ARENA_CHAMPION_MIN_FITNESS", 0.0, 1.0, 0.15),
         ("ARENA_CHAMPION_MIN_TRADES", 1, 500, 5),

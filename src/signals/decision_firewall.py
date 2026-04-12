@@ -60,6 +60,8 @@ class DecisionFirewall:
             cfg.get("max_signals_per_source_per_day", 0)
         )
         self.agent_scorer = cfg.get("agent_scorer")
+        self.event_scanner = cfg.get("event_scanner")
+        self.event_risk_enabled = bool(cfg.get("event_risk_enabled", True))
         self.canary_mode = bool(cfg.get("canary_mode", False))
         self.canary_max_positions = max(1, int(cfg.get("canary_max_positions", 2)))
         # Lowered from 300 → 60: 5-minute cooldown was blocking re-entries
@@ -129,6 +131,7 @@ class DecisionFirewall:
             "rejected_drawdown": 0,
             "rejected_exposure": 0,
             "rejected_funding": 0,
+            "rejected_event_risk": 0,
             # LOW-FIX LOW-1: count audit-log write failures so ops can detect
             # when the audit trail is silently broken (DB full, locked, etc.)
             "audit_log_failures": 0,
@@ -169,6 +172,42 @@ class DecisionFirewall:
         if configured_cap > 0 and policy_cap > 0:
             return min(configured_cap, policy_cap)
         return configured_cap or policy_cap
+
+    def set_event_scanner(self, event_scanner) -> None:
+        self.event_scanner = event_scanner
+
+    def _apply_event_risk(self, signal: TradeSignal, dry_run: bool = False) -> Tuple[bool, str]:
+        if not self.event_risk_enabled or not self.event_scanner:
+            return True, ""
+
+        try:
+            risk = self.event_scanner.get_risk_state(signal.coin)
+        except Exception as exc:
+            logger.debug("Event risk lookup failed for %s: %s", signal.coin, exc)
+            return True, ""
+
+        reasons = "; ".join(risk.get("reasons", []) or [])
+        if risk.get("block_new_entries"):
+            return False, reasons or f"Event risk blocks new {signal.coin} entries"
+
+        if risk.get("degrade"):
+            conf_mult = float(risk.get("confidence_multiplier", 1.0) or 1.0)
+            size_mult = float(risk.get("size_multiplier", 1.0) or 1.0)
+            original_confidence = float(signal.confidence)
+            signal.confidence *= conf_mult
+            if size_mult < 1.0:
+                signal.position_pct *= size_mult
+                if signal.size > 0:
+                    signal.size *= size_mult
+            logger.warning(
+                "Event risk de-risking %s: confidence %.0f%% -> %.0f%%, size *= %.2f (%s)",
+                signal.coin,
+                original_confidence * 100,
+                signal.confidence * 100,
+                size_mult,
+                reasons or "scheduled event window",
+            )
+        return True, ""
 
     def _apply_source_policy(
         self,
@@ -290,6 +329,10 @@ class DecisionFirewall:
                 original_confidence * 100,
                 signal.confidence * 100,
             )
+
+        event_risk_ok, event_risk_reason = self._apply_event_risk(signal, dry_run=dry_run)
+        if not event_risk_ok:
+            return _reject("rejected_event_risk", event_risk_reason)
 
         # 2. Minimum confidence
         if signal.confidence < self.min_confidence:

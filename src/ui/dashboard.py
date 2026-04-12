@@ -1075,6 +1075,12 @@ details[open] summary::after{content:'-'}
               <tbody id="events-recent"></tbody>
             </table>
           </div>
+          <div class="table-shell">
+            <table>
+              <thead><tr><th>Source</th><th>Impact</th><th>Assets</th><th>Incident</th></tr></thead>
+              <tbody id="events-incidents"></tbody>
+            </table>
+          </div>
         </div>
       </div>
     </details>
@@ -1270,16 +1276,18 @@ function renderEvents(events){
     document.getElementById('events-summary').textContent = 'Event scanner not initialized.';
     document.getElementById('events-upcoming').innerHTML = '<tr><td colspan="4" class="empty-row">No event data</td></tr>';
     document.getElementById('events-recent').innerHTML = '<tr><td colspan="4" class="empty-row">No recent official releases</td></tr>';
+    document.getElementById('events-incidents').innerHTML = '<tr><td colspan="4" class="empty-row">No active crypto incidents</td></tr>';
     return;
   }
 
   const summary = events.summary || {};
   const nextLabel = summary.next_event_title
-    ? `${summary.next_event_title} at ${(summary.next_event_time || '').slice(0,16).replace('T',' ')}`
+    ? `${summary.next_event_title} at ${(summary.next_event_time || '').slice(0,16).replace('T',' ')}` 
     : 'No upcoming core events in the lookahead window.';
   document.getElementById('events-summary').innerHTML =
     `<div>Sources healthy: <strong>${summary.sources_ok || 0}/${summary.sources_total || 0}</strong></div>` +
     `<div>High impact next 24h: <strong>${summary.high_impact_next_24h || 0}</strong></div>` +
+    `<div>Active incidents: <strong>${summary.incident_count || 0}</strong></div>` +
     `<div>Next event: <strong>${nextLabel}</strong></div>`;
 
   const upcoming = events.upcoming || [];
@@ -1299,6 +1307,15 @@ function renderEvents(events){
       <td><span class="badge badge-type">${event.category}</span></td>
       <td>${event.title}</td>
     </tr>`).join('') : '<tr><td colspan="4" class="empty-row">No recent official releases</td></tr>';
+
+  const incidents = events.incidents || [];
+  document.getElementById('events-incidents').innerHTML = incidents.length ? incidents.map(event=>`
+    <tr>
+      <td>${event.source}</td>
+      <td><span class="badge badge-type">${event.severity}</span></td>
+      <td>${(event.assets || []).join(', ') || 'ALL'}</td>
+      <td>${event.title}</td>
+    </tr>`).join('') : '<tr><td colspan="4" class="empty-row">No active crypto incidents</td></tr>';
 }
 
 function renderCopyTrades(trades){

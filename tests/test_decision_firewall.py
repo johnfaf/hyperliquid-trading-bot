@@ -52,6 +52,14 @@ class _FakeScorer:
         return [self.get_source_policy("test:momentum")]
 
 
+class _FakeEventScanner:
+    def __init__(self, payload):
+        self.payload = payload
+
+    def get_risk_state(self, asset=None):
+        return dict(self.payload)
+
+
 @patch("src.signals.decision_firewall.db")
 def test_firewall_passes_valid_signal(mock_db):
     """Valid signal should pass all checks."""
@@ -364,3 +372,71 @@ def test_firewall_halves_confidence_when_predictive_inputs_are_partial(mock_db):
     assert passed is False
     assert signal.confidence == 0.25
     assert "low confidence" in reason.lower()
+
+
+@patch("src.signals.decision_firewall.db")
+def test_firewall_blocks_on_active_event_risk(mock_db):
+    mock_db.get_open_paper_trades.return_value = []
+    mock_db.get_paper_account.return_value = {"balance": 10000}
+    mock_db.audit_log = MagicMock()
+
+    from src.signals.decision_firewall import DecisionFirewall
+
+    fw = DecisionFirewall(
+        {
+            "event_scanner": _FakeEventScanner(
+                {
+                    "enabled": True,
+                    "block_new_entries": True,
+                    "degrade": False,
+                    "confidence_multiplier": 1.0,
+                    "size_multiplier": 1.0,
+                    "reasons": ["Active critical incident: Coinbase Status API outage"],
+                }
+            ),
+            "enable_predictive_derisk": False,
+            "funding_risk_enabled": False,
+        }
+    )
+
+    passed, reason = fw.validate(MockSignal(confidence=0.8))
+
+    assert passed is False
+    assert "incident" in reason.lower()
+    assert fw.get_stats()["rejected_event_risk"] == 1
+
+
+@patch("src.signals.decision_firewall.db")
+def test_firewall_derisks_on_upcoming_event_window(mock_db):
+    mock_db.get_open_paper_trades.return_value = []
+    mock_db.get_paper_account.return_value = {"balance": 10000}
+    mock_db.audit_log = MagicMock()
+
+    from src.signals.decision_firewall import DecisionFirewall
+
+    fw = DecisionFirewall(
+        {
+            "min_confidence": 0.3,
+            "event_scanner": _FakeEventScanner(
+                {
+                    "enabled": True,
+                    "block_new_entries": False,
+                    "degrade": True,
+                    "confidence_multiplier": 0.6,
+                    "size_multiplier": 0.5,
+                    "reasons": ["High-impact release ahead: CPI (20m)"],
+                }
+            ),
+            "enable_predictive_derisk": False,
+            "funding_risk_enabled": False,
+        }
+    )
+    signal = MockSignal(confidence=0.8, size=0.2, position_pct=0.1)
+
+    passed, reason = fw.validate(signal)
+
+    assert passed is True
+    assert reason == "approved"
+    assert signal.confidence == 0.48
+    assert signal.size == 0.1
+    assert signal.position_pct == 0.05

@@ -203,8 +203,10 @@ def write_health_report(
             pipeline["events"] = {
                 "upcoming": stats.get("upcoming_count", 0),
                 "recent": stats.get("recent_count", 0),
+                "incidents": stats.get("incident_count", 0),
                 "active": stats.get("active_count", 0),
                 "high_impact_next_24h": stats.get("high_impact_next_24h", 0),
+                "critical_incidents": stats.get("critical_incidents", 0),
             }
     except Exception:
         pass

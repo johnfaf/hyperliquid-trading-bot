@@ -228,6 +228,8 @@ def build_subsystems(
         lambda: DecisionFirewall({
             "forecaster": c.predictive_forecaster,
             "agent_scorer": c.agent_scorer,
+            "event_scanner": c.event_scanner,
+            "event_risk_enabled": bool(getattr(_fw_cfg, "EVENT_RISK_ENABLED", True)),
             "min_confidence": getattr(_fw_cfg, "FIREWALL_MIN_CONFIDENCE", 0.45),
             "max_signals_per_source_per_day": getattr(
                 _fw_cfg, "FIREWALL_MAX_SIGNALS_PER_SOURCE_PER_DAY", 0
@@ -319,6 +321,11 @@ def build_subsystems(
             health,
             affects_trading=False,
         )
+        if c.firewall and c.event_scanner and hasattr(c.firewall, "set_event_scanner"):
+            try:
+                c.firewall.set_event_scanner(c.event_scanner)
+            except Exception:
+                pass
 
     # ─── Copy trader ──────────────────────────────────────────
     if "copy_trader" in profile:

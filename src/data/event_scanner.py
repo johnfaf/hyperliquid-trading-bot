@@ -9,6 +9,7 @@ official release calendars and release feeds over noisy headline scraping.
 from __future__ import annotations
 
 import logging
+import json
 import re
 import threading
 import time
@@ -32,9 +33,21 @@ BLS_CALENDAR_ICS_URL = "https://www.bls.gov/schedule/news_release/bls.ics"
 BLS_LATEST_RSS_URL = "https://www.bls.gov/feed/bls_latest.rss"
 FED_MONETARY_RSS_URL = "https://www.federalreserve.gov/feeds/press_monetary.xml"
 BEA_SCHEDULE_URL = "https://www.bea.gov/news/schedule"
+COINBASE_STATUS_INCIDENTS_URL = "https://status.coinbase.com/api/v2/incidents/unresolved.json"
+COINBASE_STATUS_MAINTENANCE_URL = "https://status.coinbase.com/api/v2/scheduled-maintenances/active.json"
+KRAKEN_STATUS_INCIDENTS_URL = "https://status.kraken.com/api/v2/incidents/unresolved.json"
+KRAKEN_STATUS_MAINTENANCE_URL = "https://status.kraken.com/api/v2/scheduled-maintenances/active.json"
 
 DEFAULT_ASSETS = ["BTC", "ETH", "SOL"]
 SEVERITY_RANK = {"critical": 4, "high": 3, "medium": 2, "low": 1}
+_STATUSPAGE_IMPACT_SEVERITY = {
+    "critical": "critical",
+    "major": "high",
+    "minor": "medium",
+    "maintenance": "medium",
+    "none": "low",
+}
+_KNOWN_ASSETS = ("BTC", "ETH", "SOL", "BNB", "XRP", "DOGE", "AVAX", "ARB", "USDT", "USDC")
 
 _EVENT_RULES = [
     (("fomc", "federal open market", "interest rate", "policy decision", "statement from the federal open market committee"), "central_bank", "critical", True),
@@ -74,6 +87,42 @@ class EventScanner:
         self.max_upcoming = int(cfg.get("max_upcoming", getattr(config, "EVENT_SCANNER_MAX_UPCOMING", 12)))
         self.max_recent = int(cfg.get("max_recent", getattr(config, "EVENT_SCANNER_MAX_RECENT", 12)))
         self.include_medium = bool(cfg.get("include_medium", _parse_bool_like(getattr(config, "EVENT_SCANNER_INCLUDE_MEDIUM", True))))
+        self.enable_crypto_incidents = bool(
+            cfg.get(
+                "enable_crypto_incidents",
+                _parse_bool_like(getattr(config, "EVENT_SCANNER_ENABLE_CRYPTO_INCIDENTS", True)),
+            )
+        )
+        self.event_risk_enabled = bool(
+            cfg.get(
+                "event_risk_enabled",
+                _parse_bool_like(getattr(config, "EVENT_RISK_ENABLED", True)),
+            )
+        )
+        self.event_risk_block_minutes = int(
+            cfg.get("event_risk_block_minutes", getattr(config, "EVENT_RISK_BLOCK_MINUTES", 10))
+        )
+        self.event_risk_cooldown_minutes = int(
+            cfg.get("event_risk_cooldown_minutes", getattr(config, "EVENT_RISK_COOLDOWN_MINUTES", 30))
+        )
+        self.event_risk_degrade_lookahead_minutes = int(
+            cfg.get(
+                "event_risk_degrade_lookahead_minutes",
+                getattr(config, "EVENT_RISK_DEGRADE_LOOKAHEAD_MINUTES", 60),
+            )
+        )
+        self.event_risk_confidence_multiplier = float(
+            cfg.get(
+                "event_risk_confidence_multiplier",
+                getattr(config, "EVENT_RISK_CONFIDENCE_MULTIPLIER", 0.65),
+            )
+        )
+        self.event_risk_size_multiplier = float(
+            cfg.get(
+                "event_risk_size_multiplier",
+                getattr(config, "EVENT_RISK_SIZE_MULTIPLIER", 0.60),
+            )
+        )
 
         self.session = requests.Session()
         self.session.headers.update(
@@ -136,6 +185,24 @@ class EventScanner:
             "tags": tags[:3],
         }
 
+    @staticmethod
+    def _infer_assets(*texts: str) -> List[str]:
+        haystack = " ".join(_normalize_whitespace(text).upper() for text in texts if text)
+        assets = [asset for asset in _KNOWN_ASSETS if re.search(rf"\b{re.escape(asset)}\b", haystack)]
+        exchange_wide_tokens = (
+            "TRADING",
+            "ORDER ENTRY",
+            "MATCHING ENGINE",
+            "EXCHANGE",
+            "DEPOSITS",
+            "WITHDRAWALS",
+            "API",
+            "WEBSITE",
+        )
+        if not assets and any(token in haystack for token in exchange_wide_tokens):
+            return ["ALL"]
+        return assets
+
     def _to_event(
         self,
         *,
@@ -182,6 +249,7 @@ class EventScanner:
             "status": status,
             "freshness_seconds": freshness_seconds,
             "minutes_until": minutes_until,
+            "event_kind": "macro",
         }
 
     @staticmethod
@@ -358,6 +426,71 @@ class EventScanner:
                 events.append(event)
         return events
 
+    def _parse_statuspage_feed(self, text: str, source: str, list_key: str) -> List[Dict]:
+        now = _utc_now()
+        cutoff = now - timedelta(hours=self.recent_hours)
+        incidents: List[Dict] = []
+        try:
+            payload = json.loads(text)
+        except Exception as exc:
+            logger.warning("EventScanner failed to parse %s status payload: %s", source, exc)
+            return incidents
+
+        for item in payload.get(list_key, []) or []:
+            title = _normalize_whitespace(item.get("name", ""))
+            if not title:
+                continue
+            impact = str(item.get("impact", "minor") or "minor").lower()
+            started_at_raw = item.get("started_at") or item.get("created_at") or item.get("scheduled_for")
+            scheduled_for_raw = item.get("scheduled_for")
+            update_body = ""
+            updates = item.get("incident_updates") or item.get("scheduled_maintenances") or []
+            if updates:
+                update_body = _normalize_whitespace(updates[-1].get("body", ""))
+
+            try:
+                published = datetime.fromisoformat(str(started_at_raw).replace("Z", "+00:00")).astimezone(timezone.utc)
+            except Exception:
+                published = now
+            if published < cutoff:
+                continue
+
+            event_time = None
+            if scheduled_for_raw:
+                try:
+                    event_time = datetime.fromisoformat(str(scheduled_for_raw).replace("Z", "+00:00")).astimezone(timezone.utc)
+                except Exception:
+                    event_time = None
+
+            severity = _STATUSPAGE_IMPACT_SEVERITY.get(impact, "medium")
+            assets = self._infer_assets(title, update_body, " ".join(component.get("name", "") for component in item.get("components", []) or []))
+            event = {
+                "id": f"{source}|{title.lower()}|{published.isoformat()}",
+                "source": source,
+                "source_type": "status",
+                "title": title,
+                "summary": update_body,
+                "link": item.get("shortlink", "") or "",
+                "category": "exchange_ops",
+                "severity": severity,
+                "severity_rank": SEVERITY_RANK[severity],
+                "is_core": False,
+                "assets": assets or ["ALL"],
+                "tags": ["incident", source.lower().replace(" ", "_")],
+                "event_time": event_time.isoformat() if event_time else None,
+                "published_time": published.isoformat(),
+                "status": "upcoming" if event_time and event_time > now else "recent",
+                "freshness_seconds": max(int((now - published).total_seconds()), 0),
+                "minutes_until": int((event_time - now).total_seconds() // 60) if event_time and event_time > now else 0,
+                "event_kind": "incident",
+                "incident_status": str(item.get("status", "") or ""),
+                "impact": impact,
+            }
+            if severity == "medium" and not self.include_medium:
+                continue
+            incidents.append(event)
+        return incidents
+
     @staticmethod
     def _dedupe(events: List[Dict]) -> List[Dict]:
         deduped: Dict[str, Dict] = {}
@@ -374,6 +507,7 @@ class EventScanner:
 
             upcoming: List[Dict] = []
             recent: List[Dict] = []
+            incidents: List[Dict] = []
 
             ics_text = self._fetch_text(BLS_CALENDAR_ICS_URL)
             if ics_text:
@@ -407,13 +541,36 @@ class EventScanner:
             else:
                 self._set_source_status("Fed Monetary Feed", False, 0, "fetch_failed")
 
+            if self.enable_crypto_incidents:
+                for source_name, url, list_key in (
+                    ("Coinbase Status", COINBASE_STATUS_INCIDENTS_URL, "incidents"),
+                    ("Coinbase Maintenance", COINBASE_STATUS_MAINTENANCE_URL, "scheduled_maintenances"),
+                    ("Kraken Status", KRAKEN_STATUS_INCIDENTS_URL, "incidents"),
+                    ("Kraken Maintenance", KRAKEN_STATUS_MAINTENANCE_URL, "scheduled_maintenances"),
+                ):
+                    payload = self._fetch_text(url)
+                    if payload:
+                        parsed = self._parse_statuspage_feed(payload, source_name, list_key)
+                        incidents.extend(parsed)
+                        self._set_source_status(source_name, True, len(parsed))
+                    else:
+                        self._set_source_status(source_name, False, 0, "fetch_failed")
+
             now = _utc_now()
             upcoming = self._dedupe(upcoming)
             recent = self._dedupe(recent)
+            incidents = self._dedupe(incidents)
             upcoming.sort(key=lambda item: (item["event_time"] or "", -item["severity_rank"], item["title"]))
             recent.sort(
                 key=lambda item: (
                     item["published_time"] or item["event_time"] or "",
+                    item["severity_rank"],
+                ),
+                reverse=True,
+            )
+            incidents.sort(
+                key=lambda item: (
+                    item["event_time"] or item["published_time"] or "",
                     item["severity_rank"],
                 ),
                 reverse=True,
@@ -430,6 +587,10 @@ class EventScanner:
                 if event["severity_rank"] >= SEVERITY_RANK["high"]
                 and event["freshness_seconds"] <= 6 * 3600
             )
+            active.extend(
+                event for event in incidents
+                if event["severity_rank"] >= SEVERITY_RANK["high"]
+            )
             active = self._dedupe(active)
             active.sort(key=lambda item: (-item["severity_rank"], item["minutes_until"], item["title"]))
 
@@ -437,12 +598,15 @@ class EventScanner:
                 "timestamp": now.isoformat(),
                 "upcoming": upcoming[: self.max_upcoming],
                 "recent": recent[: self.max_recent],
+                "incidents": incidents[: self.max_recent],
                 "active": active[:8],
                 "summary": {
                     "upcoming_count": len(upcoming),
                     "recent_count": len(recent),
+                    "incident_count": len(incidents),
                     "active_count": len(active),
                     "high_impact_next_24h": sum(1 for event in active if event["status"] == "upcoming"),
+                    "critical_incidents": sum(1 for event in incidents if event["severity_rank"] >= SEVERITY_RANK["critical"]),
                     "sources_ok": sum(1 for source in self._source_status.values() if source.get("ok")),
                     "sources_total": len(self._source_status),
                     "next_event_title": upcoming[0]["title"] if upcoming else "",
@@ -465,7 +629,70 @@ class EventScanner:
             "last_refresh_ts": snapshot.get("timestamp"),
             "upcoming_count": snapshot.get("summary", {}).get("upcoming_count", 0),
             "recent_count": snapshot.get("summary", {}).get("recent_count", 0),
+            "incident_count": snapshot.get("summary", {}).get("incident_count", 0),
             "active_count": snapshot.get("summary", {}).get("active_count", 0),
             "high_impact_next_24h": snapshot.get("summary", {}).get("high_impact_next_24h", 0),
+            "critical_incidents": snapshot.get("summary", {}).get("critical_incidents", 0),
             "sources": snapshot.get("sources", {}),
+        }
+
+    def get_risk_state(self, asset: Optional[str] = None) -> Dict:
+        """Return a compact event-risk policy snapshot for the firewall."""
+        if not self.event_risk_enabled:
+            return {
+                "enabled": False,
+                "block_new_entries": False,
+                "degrade": False,
+                "confidence_multiplier": 1.0,
+                "size_multiplier": 1.0,
+                "reasons": [],
+            }
+
+        asset_upper = str(asset or "").upper()
+        snapshot = self.scan_events(force=False)
+        reasons: List[str] = []
+        block_new_entries = False
+        degrade = False
+
+        def _matches(event: Dict) -> bool:
+            assets = [str(value).upper() for value in event.get("assets", []) or []]
+            return not asset_upper or "ALL" in assets or asset_upper in assets or not assets
+
+        for event in snapshot.get("incidents", []) or []:
+            if not _matches(event):
+                continue
+            if event.get("severity_rank", 0) >= SEVERITY_RANK["high"]:
+                block_new_entries = True
+                reasons.append(f"Active {event.get('severity')} incident: {event.get('title')}")
+
+        for event in snapshot.get("upcoming", []) or []:
+            if event.get("severity_rank", 0) < SEVERITY_RANK["high"]:
+                continue
+            minutes_until = int(event.get("minutes_until", 0) or 0)
+            if minutes_until <= self.event_risk_block_minutes:
+                block_new_entries = True
+                reasons.append(f"High-impact release imminent: {event.get('title')} ({minutes_until}m)")
+            elif minutes_until <= self.event_risk_degrade_lookahead_minutes:
+                degrade = True
+                reasons.append(f"High-impact release ahead: {event.get('title')} ({minutes_until}m)")
+
+        for event in snapshot.get("recent", []) or []:
+            if event.get("severity_rank", 0) < SEVERITY_RANK["high"]:
+                continue
+            freshness_seconds = int(event.get("freshness_seconds", 0) or 0)
+            if freshness_seconds <= self.event_risk_cooldown_minutes * 60:
+                block_new_entries = True
+                reasons.append(
+                    f"High-impact release cooldown: {event.get('title')} ({freshness_seconds // 60}m ago)"
+                )
+
+        return {
+            "enabled": True,
+            "block_new_entries": block_new_entries,
+            "degrade": (degrade and not block_new_entries),
+            "confidence_multiplier": self.event_risk_confidence_multiplier if degrade and not block_new_entries else 1.0,
+            "size_multiplier": self.event_risk_size_multiplier if degrade and not block_new_entries else 1.0,
+            "reasons": reasons[:3],
+            "active_count": snapshot.get("summary", {}).get("active_count", 0),
+            "incident_count": snapshot.get("summary", {}).get("incident_count", 0),
         }

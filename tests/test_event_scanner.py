@@ -5,8 +5,10 @@ from src.data.event_scanner import (
     BEA_SCHEDULE_URL,
     BLS_CALENDAR_ICS_URL,
     BLS_LATEST_RSS_URL,
+    COINBASE_STATUS_INCIDENTS_URL,
     ET_TZ,
     FED_MONETARY_RSS_URL,
+    KRAKEN_STATUS_INCIDENTS_URL,
     EventScanner,
 )
 
@@ -163,4 +165,79 @@ END:VCALENDAR
 
     assert first["summary"]["upcoming_count"] == 1
     assert second["summary"]["upcoming_count"] == 1
-    assert calls["n"] == 4
+    assert calls["n"] == 8
+
+
+def test_parse_statuspage_feed_extracts_crypto_incident():
+    scanner = EventScanner()
+    payload = """
+    {
+      "incidents": [
+        {
+          "name": "API and trading degraded for BTC-USD",
+          "status": "identified",
+          "impact": "major",
+          "shortlink": "https://status.example/inc",
+          "started_at": "2026-04-10T12:00:00Z",
+          "incident_updates": [
+            {"body": "BTC trading and API latency are elevated"}
+          ],
+          "components": [
+            {"name": "BTC Trading"}
+          ]
+        }
+      ]
+    }
+    """
+
+    incidents = scanner._parse_statuspage_feed(payload, "Coinbase Status", "incidents")
+
+    assert len(incidents) == 1
+    assert incidents[0]["event_kind"] == "incident"
+    assert incidents[0]["severity"] == "high"
+    assert "BTC" in incidents[0]["assets"]
+
+
+def test_get_risk_state_blocks_on_imminent_event_and_incident(monkeypatch):
+    scanner = EventScanner(
+        {
+            "event_risk_block_minutes": 15,
+            "event_risk_degrade_lookahead_minutes": 60,
+            "event_risk_cooldown_minutes": 30,
+        }
+    )
+    cpi_dt = _future_et(days=0, hour=datetime.now(ET_TZ).hour, minute=(datetime.now(ET_TZ).minute + 5) % 60)
+    ics = f"""BEGIN:VCALENDAR
+BEGIN:VEVENT
+DTSTART;TZID=America/New_York:{cpi_dt.strftime('%Y%m%dT%H%M')}
+SUMMARY:Consumer Price Index
+END:VEVENT
+END:VCALENDAR
+"""
+    incident_payload = """
+    {
+      "incidents": [
+        {
+          "name": "ETH trading degraded",
+          "status": "identified",
+          "impact": "major",
+          "started_at": "2026-04-10T12:00:00Z",
+          "incident_updates": [{"body": "ETH order entry degraded"}],
+          "components": [{"name": "ETH Trading"}]
+        }
+      ]
+    }
+    """
+
+    payloads = {
+        BLS_CALENDAR_ICS_URL: ics,
+        COINBASE_STATUS_INCIDENTS_URL: incident_payload,
+        KRAKEN_STATUS_INCIDENTS_URL: '{"incidents":[]}',
+    }
+    monkeypatch.setattr(scanner, "_fetch_text", lambda url: payloads.get(url))
+
+    scanner.scan_events(force=True)
+    eth_risk = scanner.get_risk_state("ETH")
+
+    assert eth_risk["block_new_entries"] is True
+    assert eth_risk["incident_count"] >= 1
