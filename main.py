@@ -104,6 +104,14 @@ class HyperliquidResearchBot:
         self.container = build_subsystems(health_registry, effective_profile)
         self.runtime_monitor = RuntimeIncidentMonitor()
 
+        # Wire Telegram critical alert for any subsystem that transitions
+        # to FAILED — operator is notified within seconds, not on next log read.
+        try:
+            from src.notifications.telegram_alerts import send_subsystem_failure_alert
+            health_registry.set_failure_callback(send_subsystem_failure_alert)
+        except Exception as exc:
+            self.logger.warning("Could not wire failure alert callback: %s", exc)
+
         # ── Supervised background tasks ──
         self.task_runner = SupervisedTaskRunner(health_registry=health_registry)
         self._register_background_tasks()

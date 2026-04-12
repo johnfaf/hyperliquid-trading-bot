@@ -45,7 +45,7 @@ class JSONFormatter(logging.Formatter):
     """
     Structured JSON log formatter for production.
     Railway, Datadog, ELK, and most log aggregators parse JSON natively.
-    Includes secret-scrubbing.
+    Includes secret-scrubbing and automatic trade trace_id injection.
     """
     def format(self, record):
         import json as _json
@@ -58,6 +58,15 @@ class JSONFormatter(logging.Formatter):
         }
         if record.exc_info and record.exc_info[0]:
             entry["exception"] = _scrub_secrets(self.formatException(record.exc_info))
+        # Inject active trade trace_id from contextvars so every log line
+        # in the signal→firewall→execution→fill pipeline shares an ID.
+        try:
+            from src.signals.signal_schema import current_trace_id
+            tid = current_trace_id.get("")
+            if tid:
+                entry["trace_id"] = tid
+        except Exception:
+            pass
         for key in ("wallet", "coin", "action", "latency_ms", "status_code"):
             if hasattr(record, key):
                 entry[key] = getattr(record, key)

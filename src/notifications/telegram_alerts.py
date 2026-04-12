@@ -541,6 +541,40 @@ def send_top_movers_alert(movers: List[Dict]) -> bool:
         return False
 
 
+# ─── Critical Subsystem Failure Alert ────────────────────────────
+
+
+def send_subsystem_failure_alert(subsystem_name: str, reason: str) -> bool:
+    """
+    Send an immediate CRITICAL alert when a subsystem transitions to FAILED.
+
+    Designed to be passed as the callback to
+    ``SubsystemHealthRegistry.set_failure_callback()``.
+
+    Args:
+        subsystem_name: Name of the failed subsystem.
+        reason: Human-readable failure reason.
+
+    Returns True if sent, False otherwise.
+    """
+    if not is_configured():
+        return False
+
+    try:
+        ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+        text = (
+            f"<b>SUBSYSTEM FAILED</b>\n"
+            f"<b>Component:</b> {subsystem_name}\n"
+            f"<b>Reason:</b> {reason or 'unknown'}\n"
+            f"<b>Time:</b> {ts}\n\n"
+            f"Trading safety may be compromised. Check logs immediately."
+        )
+        return _send_message(text)
+    except Exception as e:
+        logger.error("Failed to send subsystem failure alert: %s", e)
+        return False
+
+
 # ─── Testing Utilities ────────────────────────────────────────────
 
 

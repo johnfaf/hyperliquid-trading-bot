@@ -7,10 +7,19 @@ This is the "contract" between signal generation and execution.
 Every signal source (strategy scorer, copy trader, options flow)
 must produce a TradeSignal before it reaches the decision firewall.
 """
+import contextvars
+import uuid
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any
 from enum import Enum
+
+# Context variable carrying the current trade's trace ID.
+# Set automatically when a TradeSignal is created; read by JSONFormatter
+# so every log line in the call chain includes the same trace_id.
+current_trace_id: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "current_trace_id", default="",
+)
 
 
 class SignalSide(str, Enum):
@@ -80,7 +89,7 @@ class TradeSignal:
 
     # Metadata
     timestamp: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
-    signal_id: str = ""               # Unique ID for tracking
+    signal_id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])  # Auto-generated trace ID
     regime: str = ""                  # Market regime when signal was generated
     regime_size_modifier: float = 1.0 # Size adjustment from regime
     options_flow_aligned: Optional[bool] = None  # Did options flow confirm?
@@ -103,6 +112,20 @@ class TradeSignal:
     def effective_size(self) -> float:
         """Position size adjusted by regime and confidence."""
         return self.position_pct * self.regime_size_modifier * min(self.confidence * 1.5, 1.0)
+
+    def activate_trace(self) -> str:
+        """Set this signal's ID as the active trace for downstream logging.
+
+        Call once when the signal enters the execution pipeline (e.g. at
+        firewall validation).  All log lines emitted in the same thread
+        will include ``trace_id`` until another signal activates its trace
+        or the context var is reset.
+
+        Returns:
+            The active trace_id.
+        """
+        current_trace_id.set(self.signal_id)
+        return self.signal_id
 
     def to_dict(self) -> Dict[str, Any]:
         d = asdict(self)

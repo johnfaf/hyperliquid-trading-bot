@@ -10,7 +10,7 @@ import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Dict, Optional
+from typing import Callable, Dict, Optional
 
 logger = logging.getLogger(__name__)
 # Prevent "No handler found" warnings and stderr lastResort output
@@ -68,7 +68,20 @@ class SubsystemHealthRegistry:
         """Initialize the health registry with thread safety."""
         self._subsystems: Dict[str, SubsystemStatus] = {}
         self._lock = threading.RLock()
+        # Optional callback invoked when any subsystem transitions to FAILED.
+        # Signature: callback(subsystem_name: str, reason: str) -> None
+        # Set via set_failure_callback() to avoid circular imports.
+        self._on_failure_callback: Optional[Callable[[str, str], None]] = None
         logger.debug("SubsystemHealthRegistry initialized")
+
+    def set_failure_callback(self, callback: Callable[[str, str], None]) -> None:
+        """Register a callback for FAILED transitions (e.g. Telegram alert).
+
+        Args:
+            callback: Called with (subsystem_name, reason) when a subsystem
+                      transitions to FAILED.  Must be non-blocking.
+        """
+        self._on_failure_callback = callback
 
     def register(self, name: str, affects_trading: bool = True) -> SubsystemStatus:
         """
@@ -156,6 +169,15 @@ class SubsystemHealthRegistry:
                     name, old_state.value, state.value,
                     f" ({reason})" if reason else "",
                 )
+                # Fire alert callback on transitions INTO FAILED so the
+                # operator knows immediately (e.g. Telegram critical alert).
+                if state == SubsystemState.FAILED and self._on_failure_callback:
+                    try:
+                        self._on_failure_callback(name, reason)
+                    except Exception as cb_err:
+                        logger.warning(
+                            "Failure callback for '%s' raised: %s", name, cb_err,
+                        )
 
     def get_status(self, name: str) -> Optional[SubsystemStatus]:
         """

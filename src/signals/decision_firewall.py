@@ -373,6 +373,11 @@ class DecisionFirewall:
                          dry_run: bool = False,
                          account_balance: Optional[float] = None) -> Tuple[bool, str]:
         """Inner validate — must be called with _lock held."""
+        # Activate the signal's trace ID so every downstream log line
+        # (execution, fill verification, SL/TP placement) includes it.
+        if hasattr(signal, "activate_trace"):
+            signal.activate_trace()
+
         if not dry_run:
             self.stats["total_signals"] += 1
 
@@ -386,7 +391,11 @@ class DecisionFirewall:
                         coin=signal.coin,
                         side=signal.side.value if hasattr(signal.side, 'value') else str(signal.side),
                         source=getattr(signal, "source", None) or "unknown",
-                        details={"reason": reason_msg, "confidence": getattr(signal, "confidence", 0)},
+                        details={
+                            "reason": reason_msg,
+                            "confidence": getattr(signal, "confidence", 0),
+                            "trace_id": signal.signal_id,
+                        },
                     )
                 except Exception:
                     self.stats["audit_log_failures"] += 1
@@ -594,8 +603,12 @@ class DecisionFirewall:
                     coin=signal.coin,
                     side=signal.side.value,
                     source=getattr(signal, "source", None) or "unknown",
-                    details={"confidence": signal.confidence, "leverage": signal.leverage,
-                             "strategy_type": signal.strategy_type},
+                    details={
+                        "confidence": signal.confidence,
+                        "leverage": signal.leverage,
+                        "strategy_type": signal.strategy_type,
+                        "trace_id": signal.signal_id,
+                    },
                 )
             except Exception:
                 pass  # audit logging must never break the trading path
