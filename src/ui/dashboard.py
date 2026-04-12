@@ -1282,7 +1282,7 @@ function renderEvents(events){
 
   const summary = events.summary || {};
   const nextLabel = summary.next_event_title
-    ? `${summary.next_event_title} at ${(summary.next_event_time || '').slice(0,16).replace('T',' ')}` 
+    ? `${summary.next_event_title} at ${(summary.next_event_time || '').slice(0,16).replace('T',' ')}`
     : 'No upcoming core events in the lookahead window.';
   document.getElementById('events-summary').innerHTML =
     `<div>Sources healthy: <strong>${summary.sources_ok || 0}/${summary.sources_total || 0}</strong></div>` +
