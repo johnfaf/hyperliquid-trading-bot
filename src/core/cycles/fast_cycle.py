@@ -7,6 +7,7 @@ Runs every 60s between trading cycles.
 Extracted from ``HyperliquidResearchBot._fast_cycle``.
 """
 import logging
+import os
 import time
 
 from src.core.live_execution import (
@@ -18,6 +19,43 @@ from src.core.live_execution import (
 logger = logging.getLogger(__name__)
 logger.addHandler(logging.NullHandler())
 
+DEFAULT_KILL_SWITCH_FILE = "/data/KILL_SWITCH"
+
+
+def check_file_kill_switch(container) -> bool:
+    """Emergency stop via file presence.
+
+    If the configured kill-switch file exists, cancel all live orders, mark the
+    live trader as killed, and request the bot loop to stop. The trigger is
+    sticky for the current process lifetime.
+    """
+    path = os.environ.get("LIVE_EXTERNAL_KILL_SWITCH_FILE", "").strip() or DEFAULT_KILL_SWITCH_FILE
+    if not path or not os.path.exists(path):
+        return False
+
+    if getattr(container, "_file_kill_switch_triggered", False):
+        return True
+
+    setattr(container, "_file_kill_switch_triggered", True)
+    setattr(container, "_stop_requested", True)
+    logger.critical("[fast] KILL_SWITCH file detected at %s", path)
+
+    live_trader = getattr(container, "live_trader", None)
+    if live_trader:
+        try:
+            live_trader.kill_switch_active = True
+            live_trader._kill_switch_reason = f"file:{path}"
+            live_trader.status_reason = "external_kill_switch"
+        except Exception:
+            pass
+        try:
+            cancelled = live_trader.cancel_all_orders()
+            logger.critical("[fast] Cancelled %d live orders due to KILL_SWITCH", cancelled)
+        except Exception as exc:
+            logger.error("[fast] Failed to cancel live orders for KILL_SWITCH: %s", exc)
+
+    return True
+
 
 def run_fast_cycle(container, cycle_count: int) -> None:
     """
@@ -25,6 +63,10 @@ def run_fast_cycle(container, cycle_count: int) -> None:
     and monitor crypto.com for whale trades.
     """
     try:
+        if check_file_kill_switch(container):
+            logger.critical("[fast] Emergency stop requested by KILL_SWITCH file")
+            return
+
         # Always run paper SL/TP monitoring — even when live trading is active,
         # paper positions still need stop-loss/take-profit/time-exit checks.
         # Previously this was skipped when live was active, leaving paper
@@ -76,6 +118,10 @@ def run_fast_cycle(container, cycle_count: int) -> None:
 
         # Scan for whale trades on crypto.com and feed into signal pipeline
         _scan_whale_trades(container)
+
+        if check_file_kill_switch(container):
+            logger.critical("[fast] Emergency stop requested after fast cycle work")
+            return
 
     except Exception as exc:
         logger.error("Error in fast cycle: %s", exc)

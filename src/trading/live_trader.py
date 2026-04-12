@@ -27,6 +27,7 @@ import time
 import json
 import hashlib
 import copy
+import random
 import threading
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -538,6 +539,18 @@ class LiveTrader:
         self._emergency_close_retry_delay_s = max(
             0.1,
             float(os.environ.get("LIVE_EMERGENCY_CLOSE_RETRY_DELAY_S", "1.5")),
+        )
+        self._protective_order_retries = max(
+            1,
+            int(os.environ.get("LIVE_PROTECTIVE_ORDER_RETRIES", "3")),
+        )
+        self._protective_order_retry_delay_s = max(
+            0.1,
+            float(os.environ.get("LIVE_PROTECTIVE_ORDER_RETRY_DELAY_S", "0.5")),
+        )
+        self._protective_order_retry_jitter_s = max(
+            0.0,
+            float(os.environ.get("LIVE_PROTECTIVE_ORDER_RETRY_JITTER_S", "0.35")),
         )
 
         # Wallet balance tracking (last-known snapshots for dashboards/cycles).
@@ -2497,6 +2510,75 @@ class LiveTrader:
 
         return result
 
+    def _place_protective_orders_with_retries(
+        self,
+        coin: str,
+        close_side: str,
+        size: float,
+        sl_price: float,
+        tp_price: float,
+    ) -> Tuple[Dict[str, Any], Dict[str, Any], int]:
+        """Place SL/TP with bounded retries and cleanup between attempts."""
+        sl_result: Dict[str, Any] = {"status": "error", "message": "not_attempted"}
+        tp_result: Dict[str, Any] = {"status": "error", "message": "not_attempted"}
+
+        for attempt in range(1, self._protective_order_retries + 1):
+            sl_result = self.place_trigger_order(
+                coin,
+                close_side,
+                size,
+                sl_price,
+                tp_or_sl="sl",
+            )
+            tp_result = self.place_trigger_order(
+                coin,
+                close_side,
+                size,
+                tp_price,
+                tp_or_sl="tp",
+            )
+
+            if self._is_order_result_success(sl_result) and self._is_order_result_success(tp_result):
+                return sl_result, tp_result, attempt
+
+            logger.error(
+                "Protective order placement failed for %s on attempt %d/%d: sl=%s tp=%s",
+                coin,
+                attempt,
+                self._protective_order_retries,
+                sl_result,
+                tp_result,
+            )
+
+            if attempt >= self._protective_order_retries:
+                break
+
+            try:
+                self.cancel_all_orders(coin=coin)
+            except Exception as exc:
+                logger.warning(
+                    "Failed to clear partial protective orders for %s before retry %d/%d: %s",
+                    coin,
+                    attempt + 1,
+                    self._protective_order_retries,
+                    exc,
+                )
+
+            delay = (self._protective_order_retry_delay_s * attempt) + random.uniform(
+                0.0,
+                self._protective_order_retry_jitter_s,
+            )
+            logger.warning(
+                "Retrying protective orders for %s in %.2fs (attempt %d/%d)",
+                coin,
+                delay,
+                attempt + 1,
+                self._protective_order_retries,
+            )
+            time.sleep(delay)
+
+        return sl_result, tp_result, self._protective_order_retries
+
     def cancel_order(self, coin: str, order_id: int) -> bool:
         """
         Cancel a specific order.
@@ -3262,25 +3344,17 @@ class LiveTrader:
                 sl_price = entry_anchor_price * (1 + signal.risk.stop_loss_pct)
                 tp_price = entry_anchor_price * (1 - signal.risk.take_profit_pct)
 
-            # 3. Place stop loss
-            sl_result = self.place_trigger_order(
-                coin, "sell" if side == "buy" else "buy",
-                protective_size, sl_price, tp_or_sl="sl"
-            )
-
-            # 4. Place take profit
-            tp_result = self.place_trigger_order(
-                coin, "sell" if side == "buy" else "buy",
-                protective_size, tp_price, tp_or_sl="tp"
+            close_side = "sell" if side == "buy" else "buy"
+            sl_result, tp_result, protective_attempts = self._place_protective_orders_with_retries(
+                coin,
+                close_side,
+                protective_size,
+                sl_price,
+                tp_price,
             )
 
             if not self._is_order_result_success(sl_result) or not self._is_order_result_success(tp_result):
-                logger.error(
-                    "Protective order placement failed for %s: sl=%s tp=%s",
-                    coin,
-                    sl_result,
-                    tp_result,
-                )
+                logger.error("Protective order placement failed for %s after %d attempts", coin, protective_attempts)
                 close_result = None
                 if not self.dry_run:
                     close_result = self.close_position(coin)
@@ -3288,6 +3362,7 @@ class LiveTrader:
                     "status": "error",
                     "message": "protective_order_failed",
                     "coin": coin,
+                    "protective_order_attempts": protective_attempts,
                     "entry_result": entry_result,
                     "stop_loss_result": sl_result,
                     "take_profit_result": tp_result,
@@ -3329,6 +3404,7 @@ class LiveTrader:
                     exchange_reported_fill_price if exchange_reported_fill_price > 0 else None
                 ),
                 "fill_verified": bool(fill_check),
+                "protective_order_attempts": protective_attempts,
                 "leverage": signal.leverage,
                 "entry_result": entry_result,
                 "dry_run": self.dry_run,

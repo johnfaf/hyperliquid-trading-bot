@@ -11,6 +11,7 @@ import config
 import main
 from src.core import boot
 from src.core.api_manager import Priority
+from src.core.cycles.fast_cycle import check_file_kill_switch
 from src.core.cycles.reporting_cycle import run_reporting
 from src.core.cycles.trading_cycle import (
     _execute_signal_live,
@@ -541,9 +542,14 @@ def test_live_trader_closes_position_when_protection_fails(monkeypatch):
         [
             {"status": "success"},
             {"status": "error", "message": "tp rejected"},
+            {"status": "success"},
+            {"status": "error", "message": "tp rejected"},
+            {"status": "success"},
+            {"status": "error", "message": "tp rejected"},
         ]
     )
     close_calls = []
+    cancel_calls = []
 
     monkeypatch.setattr(LiveTrader, "_load_credentials", _fake_live_credentials)
     monkeypatch.setattr(LiveTrader, "_load_asset_index_map", lambda self: None)
@@ -557,9 +563,16 @@ def test_live_trader_closes_position_when_protection_fails(monkeypatch):
     monkeypatch.setattr(LiveTrader, "place_trigger_order", lambda self, *args, **kwargs: next(trigger_results))
     monkeypatch.setattr(
         LiveTrader,
+        "cancel_all_orders",
+        lambda self, coin=None: (cancel_calls.append(coin) or 1),
+    )
+    monkeypatch.setattr(
+        LiveTrader,
         "close_position",
         lambda self, coin: close_calls.append(coin) or {"status": "success", "coin": coin},
     )
+    monkeypatch.setattr("src.trading.live_trader.time.sleep", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr("src.trading.live_trader.random.uniform", lambda *_args, **_kwargs: 0.0)
 
     # Disable the bootstrap $ cap so the sizing reaches place_trigger_order unmodified.
     trader = LiveTrader(firewall=FakeFirewall(), dry_run=False, max_order_usd=1_000_000)
@@ -579,7 +592,9 @@ def test_live_trader_closes_position_when_protection_fails(monkeypatch):
     assert result is not None
     assert result["status"] == "error"
     assert result["message"] == "protective_order_failed"
+    assert result["protective_order_attempts"] == 3
     assert close_calls == ["ETH"]
+    assert cancel_calls == ["ETH", "ETH"]
 
 
 def test_verify_fill_waits_for_minimum_meaningful_fill(monkeypatch):
@@ -1976,6 +1991,127 @@ def test_execute_signal_tracks_approved_but_not_executable(monkeypatch):
     assert stats["min_order_floorups_today"] == 0
 
 
+def test_execute_signal_retries_protective_orders_before_succeeding(monkeypatch):
+    placed_sizes = []
+    cancel_calls = []
+    trigger_results = iter(
+        [
+            {"status": "error", "message": "sl_failed"},
+            {"status": "error", "message": "tp_failed"},
+            {"status": "success"},
+            {"status": "success"},
+        ]
+    )
+
+    class FakeFirewall:
+        def validate(self, signal, **kwargs):
+            return True, "ok"
+
+    monkeypatch.setattr(LiveTrader, "_load_credentials", _fake_live_credentials)
+    monkeypatch.setattr(LiveTrader, "_load_asset_index_map", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "reconcile_positions", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "get_firewall_positions", lambda self: [])
+    monkeypatch.setattr(LiveTrader, "get_account_value", lambda self: 2500.0)
+    monkeypatch.setattr(
+        LiveTrader,
+        "place_market_order",
+        lambda self, coin, side, size, leverage=1, reduce_only=False: (
+            placed_sizes.append(size) or {"status": "success"}
+        ),
+    )
+    monkeypatch.setattr(LiveTrader, "update_daily_pnl_from_fills", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "verify_fill", lambda self, *args, **kwargs: {"status": "verified"})
+    monkeypatch.setattr(LiveTrader, "_get_mid_price", lambda self, coin: 2000.0)
+    monkeypatch.setattr(LiveTrader, "place_trigger_order", lambda self, *args, **kwargs: next(trigger_results))
+    monkeypatch.setattr(
+        LiveTrader,
+        "cancel_all_orders",
+        lambda self, coin=None: (cancel_calls.append(coin) or 1),
+    )
+    monkeypatch.setattr("src.trading.live_trader.time.sleep", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr("src.trading.live_trader.random.uniform", lambda *_args, **_kwargs: 0.0)
+
+    trader = LiveTrader(firewall=FakeFirewall(), dry_run=False, max_order_usd=15.0)
+    result = trader.execute_signal(
+        {
+            "coin": "ETH",
+            "side": "long",
+            "confidence": 0.85,
+            "entry_price": 2000.0,
+            "position_pct": 0.02,
+            "leverage": 2,
+            "size": 0.01,
+            "strategy_type": "momentum_long",
+        }
+    )
+
+    assert result is not None
+    assert result["status"] == "success"
+    assert result["protective_order_attempts"] == 2
+    assert cancel_calls == ["ETH"]
+
+
+def test_execute_signal_closes_position_after_protective_retries_exhausted(monkeypatch):
+    cancel_calls = []
+    close_calls = []
+
+    class FakeFirewall:
+        def validate(self, signal, **kwargs):
+            return True, "ok"
+
+    monkeypatch.setattr(LiveTrader, "_load_credentials", _fake_live_credentials)
+    monkeypatch.setattr(LiveTrader, "_load_asset_index_map", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "reconcile_positions", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "get_firewall_positions", lambda self: [])
+    monkeypatch.setattr(LiveTrader, "get_account_value", lambda self: 2500.0)
+    monkeypatch.setattr(
+        LiveTrader,
+        "place_market_order",
+        lambda self, coin, side, size, leverage=1, reduce_only=False: {"status": "success"},
+    )
+    monkeypatch.setattr(LiveTrader, "update_daily_pnl_from_fills", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "verify_fill", lambda self, *args, **kwargs: {"status": "verified"})
+    monkeypatch.setattr(LiveTrader, "_get_mid_price", lambda self, coin: 2000.0)
+    monkeypatch.setattr(
+        LiveTrader,
+        "place_trigger_order",
+        lambda self, *args, **kwargs: {"status": "error", "message": "trigger_failed"},
+    )
+    monkeypatch.setattr(
+        LiveTrader,
+        "cancel_all_orders",
+        lambda self, coin=None: (cancel_calls.append(coin) or 1),
+    )
+    monkeypatch.setattr(
+        LiveTrader,
+        "close_position",
+        lambda self, coin: (close_calls.append(coin) or {"status": "success"}),
+    )
+    monkeypatch.setattr("src.trading.live_trader.time.sleep", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr("src.trading.live_trader.random.uniform", lambda *_args, **_kwargs: 0.0)
+
+    trader = LiveTrader(firewall=FakeFirewall(), dry_run=False, max_order_usd=15.0)
+    result = trader.execute_signal(
+        {
+            "coin": "ETH",
+            "side": "long",
+            "confidence": 0.85,
+            "entry_price": 2000.0,
+            "position_pct": 0.02,
+            "leverage": 2,
+            "size": 0.01,
+            "strategy_type": "momentum_long",
+        }
+    )
+
+    assert result is not None
+    assert result["status"] == "error"
+    assert result["message"] == "protective_order_failed"
+    assert result["protective_order_attempts"] == 3
+    assert close_calls == ["ETH"]
+    assert cancel_calls == ["ETH", "ETH"]
+
+
 def test_copy_trade_preserves_precise_stops_for_low_priced_assets(monkeypatch):
     opened = {}
 
@@ -2050,6 +2186,58 @@ def test_discovery_time_persistence_round_trips_through_db_context(monkeypatch):
     finally:
         if os.path.exists(db_path):
             os.remove(db_path)
+
+
+def test_check_file_kill_switch_cancels_live_orders_and_stops(tmp_path, monkeypatch):
+    kill_file = tmp_path / "KILL_SWITCH"
+    kill_file.write_text("kill", encoding="utf-8")
+
+    class FakeLiveTrader:
+        def __init__(self):
+            self.kill_switch_active = False
+            self._kill_switch_reason = ""
+            self.status_reason = "live_ready"
+            self.cancel_calls = 0
+
+        def cancel_all_orders(self):
+            self.cancel_calls += 1
+            return 3
+
+    live_trader = FakeLiveTrader()
+    container = types.SimpleNamespace(live_trader=live_trader)
+    monkeypatch.setenv("LIVE_EXTERNAL_KILL_SWITCH_FILE", str(kill_file))
+
+    assert check_file_kill_switch(container) is True
+    assert getattr(container, "_file_kill_switch_triggered", False) is True
+    assert getattr(container, "_stop_requested", False) is True
+    assert live_trader.kill_switch_active is True
+    assert live_trader._kill_switch_reason == f"file:{kill_file}"
+    assert live_trader.status_reason == "external_kill_switch"
+    assert live_trader.cancel_calls == 1
+
+    assert check_file_kill_switch(container) is True
+    assert live_trader.cancel_calls == 1
+
+
+def test_shutdown_cancels_live_orders_once():
+    class FakeLiveTrader:
+        def __init__(self):
+            self.dry_run = False
+            self.cancel_calls = 0
+
+        def cancel_all_orders(self):
+            self.cancel_calls += 1
+            return 2
+
+    bot = main.HyperliquidResearchBot.__new__(main.HyperliquidResearchBot)
+    bot.container = types.SimpleNamespace(live_trader=FakeLiveTrader())
+    bot.logger = logging.getLogger("test-shutdown-cancel")
+    bot._shutdown_orders_cancelled = False
+
+    bot._cancel_live_orders_for_shutdown("signal:test")
+    bot._cancel_live_orders_for_shutdown("run_loop_exit")
+
+    assert bot.container.live_trader.cancel_calls == 1
 
 
 # ────────────────────────────────────────────────────────────────────────

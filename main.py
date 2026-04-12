@@ -61,7 +61,7 @@ from src.core.subsystem_registry import (
 )
 from src.core.cycles.research_cycle import run_discovery
 from src.core.cycles.trading_cycle import run_trading_cycle
-from src.core.cycles.fast_cycle import run_fast_cycle
+from src.core.cycles.fast_cycle import run_fast_cycle, check_file_kill_switch
 from src.core.cycles.reporting_cycle import run_reporting
 from src.data import database as db
 from src.data.database import backup_to_json
@@ -92,6 +92,7 @@ class HyperliquidResearchBot:
         self._last_report = 0
         self._cycle_count = 0
         self._fast_cycle_count = 0
+        self._shutdown_orders_cancelled = False
 
         # ── Boot sequence ──
         log_persistence_info(self.logger)
@@ -199,12 +200,49 @@ class HyperliquidResearchBot:
 
     def _fast_cycle(self):
         self._fast_cycle_count += 1
+        if check_file_kill_switch(self.container):
+            self.logger.critical("KILL_SWITCH triggered before fast cycle execution")
+            self.running = False
+            return
         run_fast_cycle(self.container, self._fast_cycle_count)
+        if getattr(self.container, "_stop_requested", False):
+            self.logger.critical("Stop requested during fast cycle; exiting main loop")
+            self.running = False
+            return
         heartbeat_active(self.container, health_registry)
         self.runtime_monitor.evaluate_and_alert(
             container=self.container,
             health_registry=health_registry,
         )
+
+    def _cancel_live_orders_for_shutdown(self, reason: str) -> None:
+        if self._shutdown_orders_cancelled:
+            return
+        live_trader = getattr(self.container, "live_trader", None)
+        if not live_trader or getattr(live_trader, "dry_run", True):
+            self._shutdown_orders_cancelled = True
+            return
+        try:
+            cancelled = live_trader.cancel_all_orders()
+            self.logger.warning(
+                "Cancelled %d live orders during shutdown (%s)",
+                cancelled,
+                reason,
+            )
+        except Exception as exc:
+            self.logger.error("Failed to cancel live orders during shutdown (%s): %s", reason, exc)
+        finally:
+            self._shutdown_orders_cancelled = True
+
+    def _sleep_with_kill_switch_checks(self, interval_s: float) -> None:
+        deadline = time.time() + max(0.0, float(interval_s))
+        while self.running and time.time() < deadline:
+            if check_file_kill_switch(self.container):
+                self.logger.critical("KILL_SWITCH detected during sleep window")
+                self.running = False
+                return
+            remaining = deadline - time.time()
+            time.sleep(min(1.0, max(0.0, remaining)))
 
     def run_once(self):
         """Run discovery + trading cycle (CLI --once)."""
@@ -234,6 +272,7 @@ class HyperliquidResearchBot:
         # ── Graceful shutdown handler ──
         def signal_handler(sig, frame):
             self.logger.info("Shutdown signal received. Stopping background tasks…")
+            self._cancel_live_orders_for_shutdown(reason=f"signal:{sig}")
             self.task_runner.stop_all(timeout=10)
             try:
                 backup_to_json()
@@ -317,9 +356,10 @@ class HyperliquidResearchBot:
 
             sys.stdout.flush()
             if self.running:
-                time.sleep(config.FAST_CYCLE_INTERVAL)
+                self._sleep_with_kill_switch_checks(config.FAST_CYCLE_INTERVAL)
 
         # ── Shutdown ──
+        self._cancel_live_orders_for_shutdown(reason="run_loop_exit")
         self.task_runner.stop_all(timeout=10)
         try:
             if getattr(self.container, "position_monitor", None):
