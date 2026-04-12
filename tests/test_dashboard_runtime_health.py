@@ -26,8 +26,18 @@ class _FakeLiveTrader:
             "daily_pnl": -7.5,
             "daily_pnl_limit": 100.0,
             "total_entry_signals_today": 3,
+            "attempted_entry_signals": 5,
+            "executed_entry_signals": 2,
             "max_orders_per_source_per_day": 2,
             "source_orders_today": {"copy_trade:0xabc": 1},
+            "entry_metrics": {"approved_but_not_executable": 1},
+            "min_order_rejects_today": 4,
+            "min_order_floorups_today": 2,
+            "min_order_top_tier_floorups_today": 1,
+            "min_order_same_side_merges_today": 1,
+            "approved_but_not_executable_today": 1,
+            "canary_headroom_ratio": 2.27,
+            "crash_safe_canary_order_usd": 55.0,
         }
 
 
@@ -78,6 +88,8 @@ def test_build_runtime_health_snapshot_includes_subsystems_and_safety(monkeypatc
     assert snapshot["firewall"]["top_rejection_reason"] == "rejected_confidence"
     assert snapshot["live_trader"]["kill_switch_active"] is True
     assert snapshot["live_trader"]["source_orders_today"] == {"copy_trade:0xabc": 1}
+    assert snapshot["live_trader"]["min_order_top_tier_floorups_today"] == 1
+    assert snapshot["live_trader"]["approved_but_not_executable_today"] == 1
     assert snapshot["copy_trader"]["guardrail"]["status"] == "blocked"
 
 

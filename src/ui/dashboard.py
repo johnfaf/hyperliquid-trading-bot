@@ -731,6 +731,9 @@ def _build_runtime_health_snapshot() -> Dict:
                 "entry_metrics": stats.get("entry_metrics", {}),
                 "min_order_rejects_today": stats.get("min_order_rejects_today"),
                 "min_order_floorups_today": stats.get("min_order_floorups_today"),
+                "min_order_top_tier_floorups_today": stats.get("min_order_top_tier_floorups_today"),
+                "min_order_same_side_merges_today": stats.get("min_order_same_side_merges_today"),
+                "approved_but_not_executable_today": stats.get("approved_but_not_executable_today"),
                 "canary_headroom_ratio": stats.get("canary_headroom_ratio"),
                 "crash_safe_canary_order_usd": stats.get("crash_safe_canary_order_usd"),
             }
@@ -1398,6 +1401,9 @@ function renderTradeAnalytics(analytics, runtime){
     ['Execution hit rate', acceptRate],
     ['Min-order rejects', Number(runtimeLive.min_order_rejects_today || 0)],
     ['Min-order floor-ups', Number(runtimeLive.min_order_floorups_today || 0)],
+    ['Top-tier floor-ups', Number(runtimeLive.min_order_top_tier_floorups_today || 0)],
+    ['Same-side merge fills', Number(runtimeLive.min_order_same_side_merges_today || 0)],
+    ['Approved but not executable', Number(runtimeLive.approved_but_not_executable_today || 0)],
     ['Canary headroom', runtimeLive.canary_headroom_ratio != null ? `${runtimeLive.canary_headroom_ratio}x` : 'n/a'],
     ['Crash-safe cap', runtimeLive.crash_safe_canary_order_usd != null ? fmtUsd(runtimeLive.crash_safe_canary_order_usd) : 'n/a'],
     ['Top reject', (runtime || {}).firewall?.top_rejection_reason || 'none'],
@@ -1798,6 +1804,7 @@ function renderRuntimeHealth(runtime) {
     `<div>Firewall top reject: <strong>${topReject}</strong></div>` +
     `<div>Kill-switch reason: ${killReason}</div>` +
     `<div>Canary execution: <strong>${executed}/${attempted}</strong> (${hitRate}) | min-order rejects <strong>${live.min_order_rejects_today || 0}</strong> | floor-ups <strong>${live.min_order_floorups_today || 0}</strong></div>` +
+    `<div>Execution rescue: top-tier floor-ups <strong>${live.min_order_top_tier_floorups_today || 0}</strong> | same-side merges <strong>${live.min_order_same_side_merges_today || 0}</strong> | approved but not executable <strong>${live.approved_but_not_executable_today || 0}</strong></div>` +
     `<div>Canary headroom: <strong>${live.canary_headroom_ratio != null ? live.canary_headroom_ratio + 'x' : 'n/a'}</strong> | crash-safe cap <strong>${live.crash_safe_canary_order_usd != null ? fmtUsd(live.crash_safe_canary_order_usd) : 'n/a'}</strong></div>` +
     `<div>Short guardrail: <strong>${String(shortPolicy.status || 'unknown').toUpperCase()}</strong> — ${shortPolicy.reason || 'n/a'}</div>` +
     copyGuardrailLine +

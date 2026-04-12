@@ -1823,6 +1823,159 @@ def test_execute_signal_rejects_below_exchange_minimum(monkeypatch):
     assert placed_sizes == []
 
 
+def test_execute_signal_top_tier_floorup_executes(monkeypatch):
+    """High-confidence approved signals can be bumped just enough to clear the
+    exchange minimum without relaxing any signal filters."""
+    placed_sizes = []
+
+    class FakeFirewall:
+        def validate(self, signal, **kwargs):
+            return True, "ok"
+
+    monkeypatch.setattr(LiveTrader, "_load_credentials", _fake_live_credentials)
+    monkeypatch.setattr(LiveTrader, "_load_asset_index_map", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "reconcile_positions", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "get_firewall_positions", lambda self: [])
+    monkeypatch.setattr(LiveTrader, "get_account_value", lambda self: 2500.0)
+    monkeypatch.setattr(
+        LiveTrader,
+        "place_market_order",
+        lambda self, coin, side, size, leverage=1, reduce_only=False: (
+            placed_sizes.append(size) or {"status": "success"}
+        ),
+    )
+    monkeypatch.setattr(LiveTrader, "update_daily_pnl_from_fills", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "verify_fill", lambda self, *args, **kwargs: {"status": "verified"})
+    monkeypatch.setattr(LiveTrader, "_get_mid_price", lambda self, coin: 2000.0)
+    monkeypatch.setattr(LiveTrader, "place_trigger_order", lambda self, *args, **kwargs: {"status": "success"})
+
+    trader = LiveTrader(firewall=FakeFirewall(), dry_run=False, max_order_usd=15.0)
+    result = trader.execute_signal(
+        {
+            "coin": "ETH",
+            "side": "long",
+            "confidence": 0.90,
+            "entry_price": 2000.0,
+            "position_pct": 0.02,
+            "leverage": 2,
+            "size": 0.005,  # $10 notional -> eligible for bounded top-tier floor-up
+            "strategy_type": "momentum_long",
+        }
+    )
+
+    assert result is not None
+    assert result["status"] == "success"
+    assert len(placed_sizes) == 1
+    assert placed_sizes[0] * 2000.0 >= trader.min_order_usd
+    assert trader.get_stats()["min_order_top_tier_floorups_today"] == 1
+    assert trader.get_stats()["approved_but_not_executable_today"] == 0
+
+
+def test_execute_signal_same_side_merge_executes_under_minimum(monkeypatch):
+    """If we already hold the same coin and side, an undersized add-on can be
+    lifted to the exchange minimum as a same-side merge instead of being dropped."""
+    placed_sizes = []
+    existing_positions = [
+        {
+            "coin": "ETH",
+            "side": "long",
+            "size": 0.25,
+            "entry_price": 1900.0,
+            "leverage": 2,
+        }
+    ]
+
+    class FakeFirewall:
+        def validate(self, signal, **kwargs):
+            return True, "ok"
+
+    monkeypatch.setattr(LiveTrader, "_load_credentials", _fake_live_credentials)
+    monkeypatch.setattr(LiveTrader, "_load_asset_index_map", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "reconcile_positions", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "get_firewall_positions", lambda self: list(existing_positions))
+    monkeypatch.setattr(LiveTrader, "get_account_value", lambda self: 2500.0)
+    monkeypatch.setattr(
+        LiveTrader,
+        "place_market_order",
+        lambda self, coin, side, size, leverage=1, reduce_only=False: (
+            placed_sizes.append(size) or {"status": "success"}
+        ),
+    )
+    monkeypatch.setattr(LiveTrader, "update_daily_pnl_from_fills", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "verify_fill", lambda self, *args, **kwargs: {"status": "verified"})
+    monkeypatch.setattr(LiveTrader, "_get_mid_price", lambda self, coin: 2000.0)
+    monkeypatch.setattr(LiveTrader, "place_trigger_order", lambda self, *args, **kwargs: {"status": "success"})
+
+    trader = LiveTrader(firewall=FakeFirewall(), dry_run=False, max_order_usd=15.0)
+    result = trader.execute_signal(
+        {
+            "coin": "ETH",
+            "side": "long",
+            "confidence": 0.50,
+            "entry_price": 2000.0,
+            "position_pct": 0.01,
+            "leverage": 2,
+            "size": 0.0025,  # $5 notional -> too small unless same-side merge is allowed
+            "strategy_type": "momentum_long",
+        }
+    )
+
+    assert result is not None
+    assert result["status"] == "success"
+    assert len(placed_sizes) == 1
+    assert placed_sizes[0] * 2000.0 >= trader.min_order_usd
+    stats = trader.get_stats()
+    assert stats["min_order_same_side_merges_today"] == 1
+    assert stats["min_order_top_tier_floorups_today"] == 0
+
+
+def test_execute_signal_tracks_approved_but_not_executable(monkeypatch):
+    """Approved signals that stay below the exchange minimum after bounded
+    execution checks should be visible in telemetry instead of disappearing."""
+    placed_sizes = []
+
+    class FakeFirewall:
+        def validate(self, signal, **kwargs):
+            return True, "ok"
+
+    monkeypatch.setattr(LiveTrader, "_load_credentials", _fake_live_credentials)
+    monkeypatch.setattr(LiveTrader, "_load_asset_index_map", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "reconcile_positions", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "get_firewall_positions", lambda self: [])
+    monkeypatch.setattr(LiveTrader, "get_account_value", lambda self: 2500.0)
+    monkeypatch.setattr(
+        LiveTrader,
+        "place_market_order",
+        lambda self, coin, side, size, leverage=1, reduce_only=False: (
+            placed_sizes.append(size) or {"status": "success"}
+        ),
+    )
+    monkeypatch.setattr(LiveTrader, "update_daily_pnl_from_fills", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "verify_fill", lambda self, *args, **kwargs: {"status": "verified"})
+    monkeypatch.setattr(LiveTrader, "_get_mid_price", lambda self, coin: 2000.0)
+    monkeypatch.setattr(LiveTrader, "place_trigger_order", lambda self, *args, **kwargs: {"status": "success"})
+
+    trader = LiveTrader(firewall=FakeFirewall(), dry_run=False, max_order_usd=15.0)
+    result = trader.execute_signal(
+        {
+            "coin": "ETH",
+            "side": "long",
+            "confidence": 0.60,
+            "entry_price": 2000.0,
+            "position_pct": 0.01,
+            "leverage": 2,
+            "size": 0.002,  # $4 notional -> too far below min for top-tier floor-up
+            "strategy_type": "momentum_long",
+        }
+    )
+
+    assert result is None
+    assert placed_sizes == []
+    stats = trader.get_stats()
+    assert stats["approved_but_not_executable_today"] == 1
+    assert stats["min_order_floorups_today"] == 0
+
+
 def test_copy_trade_preserves_precise_stops_for_low_priced_assets(monkeypatch):
     opened = {}
 

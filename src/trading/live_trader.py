@@ -434,6 +434,24 @@ class LiveTrader:
         self.max_orders_per_source_per_day = int(
             getattr(config, "LIVE_MAX_ORDERS_PER_SOURCE_PER_DAY", 0)
         )
+        self.min_order_top_tier_enabled = bool(
+            getattr(config, "LIVE_MIN_ORDER_TOP_TIER_ENABLED", True)
+        )
+        self.min_order_top_tier_min_confidence = float(
+            getattr(config, "LIVE_MIN_ORDER_TOP_TIER_MIN_CONFIDENCE", 0.72)
+        )
+        self.min_order_top_tier_max_bump_multiplier = float(
+            getattr(config, "LIVE_MIN_ORDER_TOP_TIER_MAX_BUMP_MULTIPLIER", 1.35)
+        )
+        self.min_order_allow_degraded_sources = bool(
+            getattr(config, "LIVE_MIN_ORDER_ALLOW_DEGRADED_SOURCES", False)
+        )
+        self.min_order_same_side_merge_enabled = bool(
+            getattr(config, "LIVE_MIN_ORDER_SAME_SIDE_MERGE_ENABLED", True)
+        )
+        self.min_order_same_side_max_bump_multiplier = float(
+            getattr(config, "LIVE_MIN_ORDER_SAME_SIDE_MAX_BUMP_MULTIPLIER", 2.5)
+        )
 
         # Optional external kill-switch controls.
         self.external_kill_switch_file = str(
@@ -1036,6 +1054,59 @@ class LiveTrader:
             return f"{key}:{strategy_type}"
 
         return key
+
+    @staticmethod
+    def _signal_side_value(signal: TradeSignal) -> str:
+        side = getattr(signal, "side", None)
+        if hasattr(side, "value"):
+            side = side.value
+        return str(side or "").strip().lower()
+
+    def _get_source_policy(self, signal: TradeSignal) -> Dict[str, Any]:
+        source_key = self._signal_source_key(signal)
+        scorer = getattr(getattr(self.firewall, "agent_scorer", None), "get_source_policy", None)
+        if not scorer:
+            return {
+                "source_key": source_key,
+                "status": "unknown",
+                "blocked": False,
+                "dynamic_weight": 0.0,
+                "min_confidence": 0.0,
+            }
+        try:
+            policy = scorer(source_key) or {}
+        except Exception as exc:
+            logger.debug("LiveTrader source policy lookup failed for %s: %s", source_key, exc)
+            policy = {}
+        policy = dict(policy)
+        policy.setdefault("source_key", source_key)
+        policy.setdefault("status", "unknown")
+        policy.setdefault("blocked", False)
+        return policy
+
+    def _find_same_side_position(
+        self,
+        signal: TradeSignal,
+        open_positions: Optional[List[Dict[str, Any]]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        positions = open_positions
+        if positions is None:
+            positions = self.get_positions()
+        if not positions:
+            return None
+
+        coin = str(getattr(signal, "coin", "") or "").upper()
+        side = self._signal_side_value(signal)
+        for pos in positions:
+            if str(pos.get("coin", "") or "").upper() != coin:
+                continue
+            if str(pos.get("side", "") or "").strip().lower() != side:
+                continue
+            size = abs(self._coerce_float(pos.get("size", pos.get("szi", 0))))
+            if size <= 0:
+                continue
+            return pos
+        return None
 
     def _refresh_external_kill_switch(self) -> bool:
         """
@@ -2717,7 +2788,12 @@ class LiveTrader:
 
         return adjusted
 
-    def _apply_order_usd_cap(self, signal: TradeSignal) -> Optional[TradeSignal]:
+    def _apply_order_usd_cap(
+        self,
+        signal: TradeSignal,
+        open_positions: Optional[List[Dict[str, Any]]] = None,
+        source_policy: Optional[Dict[str, Any]] = None,
+    ) -> Optional[TradeSignal]:
         """
         Clamp signal.size so its notional never exceeds self.max_order_usd.
 
@@ -2729,6 +2805,9 @@ class LiveTrader:
 
         Args:
             signal: TradeSignal with signal.size already computed.
+            open_positions: Optional normalized live positions for same-side
+                merge detection.
+            source_policy: Optional allocator policy for the signal source.
 
         Returns:
             Same signal (possibly with shrunken size), or None if the cap
@@ -2779,13 +2858,71 @@ class LiveTrader:
         # Reject anything below the exchange minimum — Hyperliquid silently
         # drops sub-$10 orders and fill verification times out.
         if self.min_order_usd and notional < self.min_order_usd:
+            target_notional = min(self.max_order_usd, self.min_order_usd * 1.02)
+            target_size = (target_notional / mid) if target_notional > 0 else 0.0
+            bump_multiplier = (target_notional / notional) if notional > 0 else float("inf")
+            policy = dict(source_policy or {})
+            policy_status = str(policy.get("status", "unknown") or "unknown").lower()
+            same_side_position = self._find_same_side_position(signal, open_positions)
+
+            floor_reason = ""
+            floor_metric = ""
+            if (
+                same_side_position
+                and self.min_order_same_side_merge_enabled
+                and bump_multiplier <= self.min_order_same_side_max_bump_multiplier
+            ):
+                floor_reason = (
+                    f"same-side merge into existing {signal.coin} {self._signal_side_value(signal)}"
+                )
+                floor_metric = "min_notional_same_side_merges"
+            else:
+                allowed_source_status = {"active", "unknown", "policy_error"}
+                if self.min_order_allow_degraded_sources:
+                    allowed_source_status.update({"warmup", "degraded"})
+                if (
+                    self.min_order_top_tier_enabled
+                    and float(signal.confidence or 0.0) >= self.min_order_top_tier_min_confidence
+                    and policy_status in allowed_source_status
+                    and bump_multiplier <= self.min_order_top_tier_max_bump_multiplier
+                ):
+                    floor_reason = (
+                        f"top-tier signal (confidence {float(signal.confidence or 0.0):.0%}, "
+                        f"source status {policy_status})"
+                    )
+                    floor_metric = "min_notional_top_tier_floorups"
+
+            if floor_reason and target_size > 0:
+                self._entry_metrics["min_notional_floorups"] += 1
+                self._entry_metrics[floor_metric] += 1
+                logger.info(
+                    "Flooring %s to exchange minimum via %s: %.6f -> %.6f "
+                    "(notional $%.2f -> $%.2f, bump %.2fx)",
+                    signal.coin,
+                    floor_reason,
+                    size,
+                    target_size,
+                    notional,
+                    target_notional,
+                    bump_multiplier,
+                )
+                signal.size = target_size
+                return signal
+
+            self._entry_metrics["rejected_below_min_notional"] += 1
+            self._entry_metrics["approved_but_not_executable"] += 1
             logger.warning(
-                "Dropping %s trade: notional $%.2f is below Hyperliquid's "
-                "$%.2f minimum per order.  Raise LIVE_MAX_ORDER_USD or fund "
-                "the live wallet so the rescaled size clears the minimum.",
+                "Approved %s signal is not executable: notional $%.2f is below "
+                "Hyperliquid's $%.2f minimum and no safe floor-up path applied "
+                "(confidence %.0f%%, source=%s, source_status=%s, same_side=%s, bump %.2fx).",
                 signal.coin,
                 notional,
                 self.min_order_usd,
+                float(signal.confidence or 0.0) * 100,
+                self._signal_source_key(signal),
+                policy_status,
+                "yes" if same_side_position else "no",
+                bump_multiplier,
             )
             return None
 
@@ -2822,6 +2959,8 @@ class LiveTrader:
         signal = self._coerce_signal(signal)
         source_key = self._signal_source_key(signal)
         self._entry_metrics["attempted_entry_signals"] += 1
+        live_positions: Optional[List[Dict[str, Any]]] = None
+        source_policy = self._get_source_policy(signal)
 
         # External kill-switch takes precedence over any other gate.
         self._refresh_external_kill_switch()
@@ -2919,7 +3058,11 @@ class LiveTrader:
 
         # Hard per-order $ cap — applied AFTER regime overlay and any paper→live
         # rescaling so nothing above max_order_usd ever hits the exchange.
-        capped_signal = self._apply_order_usd_cap(signal)
+        capped_signal = self._apply_order_usd_cap(
+            signal,
+            open_positions=live_positions,
+            source_policy=source_policy,
+        )
         if capped_signal is None:
             return None
         signal = capped_signal
@@ -3246,6 +3389,15 @@ class LiveTrader:
             "entry_metrics": dict(self._entry_metrics),
             "min_order_rejects_today": int(self._entry_metrics.get("rejected_below_min_notional", 0)),
             "min_order_floorups_today": int(self._entry_metrics.get("min_notional_floorups", 0)),
+            "min_order_top_tier_floorups_today": int(
+                self._entry_metrics.get("min_notional_top_tier_floorups", 0)
+            ),
+            "min_order_same_side_merges_today": int(
+                self._entry_metrics.get("min_notional_same_side_merges", 0)
+            ),
+            "approved_but_not_executable_today": int(
+                self._entry_metrics.get("approved_but_not_executable", 0)
+            ),
             "attempted_entry_signals": int(self._entry_metrics.get("attempted_entry_signals", 0)),
             "executed_entry_signals": int(self._entry_metrics.get("executed_entry_signals", 0)),
             "canary_headroom_ratio": round(
