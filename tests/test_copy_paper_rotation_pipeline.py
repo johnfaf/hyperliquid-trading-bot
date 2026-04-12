@@ -32,6 +32,8 @@ def _open_trade(
 
 
 def test_copy_trader_rotation_prescreen_bypasses_capacity(monkeypatch):
+    monkeypatch.setattr(config, "COPY_TRADER_ENABLED", True, raising=False)
+    monkeypatch.setattr(config, "COPY_TRADER_AUTO_PAUSE_MIN_CLOSED_TRADES", 10, raising=False)
     account = {"balance": 10_000.0}
     open_trades = [
         _open_trade(i, f"C{i}", "long", confidence=0.2 + i * 0.01)
@@ -49,6 +51,7 @@ def test_copy_trader_rotation_prescreen_bypasses_capacity(monkeypatch):
 
     monkeypatch.setattr("src.trading.copy_trader.db.get_paper_account", lambda: account)
     monkeypatch.setattr("src.trading.copy_trader.db.get_open_paper_trades", lambda: list(open_trades))
+    monkeypatch.setattr("src.trading.copy_trader.db.get_paper_trade_history", lambda limit=250: [])
     monkeypatch.setattr("src.trading.copy_trader.hl.get_all_mids", lambda: {"BTC": 100.0})
 
     trader = CopyTrader(firewall=FakeFirewall())
@@ -115,6 +118,92 @@ def test_copy_trader_crash_weight_preserves_strong_signal_above_firewall_floor()
 
     assert weighted["confidence"] == pytest.approx(0.54)
     assert weighted["confidence"] >= getattr(config, "FIREWALL_MIN_CONFIDENCE", 0.45)
+
+
+def test_copy_trader_auto_pauses_new_entries_when_copy_book_is_bad(monkeypatch):
+    monkeypatch.setattr(config, "COPY_TRADER_ENABLED", True, raising=False)
+    monkeypatch.setattr(config, "COPY_TRADER_MAX_CONCURRENT_TRADES", 2, raising=False)
+    monkeypatch.setattr(config, "COPY_TRADER_MAX_NEW_TRADES_PER_CYCLE", 1, raising=False)
+    monkeypatch.setattr(config, "COPY_TRADER_AUTO_PAUSE_MIN_CLOSED_TRADES", 3, raising=False)
+    monkeypatch.setattr(config, "COPY_TRADER_AUTO_PAUSE_DEGRADE_WIN_RATE", 0.40, raising=False)
+    monkeypatch.setattr(config, "COPY_TRADER_AUTO_PAUSE_BLOCK_WIN_RATE", 0.25, raising=False)
+    monkeypatch.setattr(config, "COPY_TRADER_AUTO_PAUSE_BLOCK_NET_PNL", -25.0, raising=False)
+
+    monkeypatch.setattr("src.trading.copy_trader.db.get_paper_account", lambda: {"balance": 10_000.0})
+    monkeypatch.setattr("src.trading.copy_trader.db.get_open_paper_trades", lambda: [])
+    monkeypatch.setattr(
+        "src.trading.copy_trader.db.get_paper_trade_history",
+        lambda limit=250: [
+            {"side": "short", "pnl": -12.0, "metadata": {"source_key": "copy_trade:0xabc"}},
+            {"side": "short", "pnl": -9.0, "metadata": {"source_key": "copy_trade:0xdef"}},
+            {"side": "long", "pnl": -8.0, "metadata": {"source_key": "copy_trade:0xabc"}},
+        ],
+    )
+    monkeypatch.setattr("src.trading.copy_trader.hl.get_all_mids", lambda: {"BTC": 100.0})
+
+    trader = CopyTrader()
+    monkeypatch.setattr(trader, "_annotate_open_trades", lambda trades, mids: None)
+
+    executed = trader.execute_copy_signals(
+        [
+            {
+                "type": "copy_open",
+                "coin": "BTC",
+                "side": "long",
+                "price": 100.0,
+                "leverage": 2,
+                "confidence": 0.8,
+                "source_trader": "0xabc",
+            }
+        ],
+        regime_data={"overall_regime": "neutral"},
+    )
+
+    assert executed == []
+    assert trader.get_stats()["guardrail"]["status"] == "blocked"
+
+
+def test_copy_trader_hard_caps_concurrent_copy_positions(monkeypatch):
+    monkeypatch.setattr(config, "COPY_TRADER_ENABLED", True, raising=False)
+    monkeypatch.setattr(config, "COPY_TRADER_MAX_CONCURRENT_TRADES", 1, raising=False)
+    monkeypatch.setattr(config, "COPY_TRADER_MAX_NEW_TRADES_PER_CYCLE", 1, raising=False)
+    monkeypatch.setattr(config, "COPY_TRADER_AUTO_PAUSE_MIN_CLOSED_TRADES", 10, raising=False)
+    monkeypatch.setattr(config, "COPY_TRADER_AUTO_PAUSE_DEGRADE_WIN_RATE", 0.40, raising=False)
+    monkeypatch.setattr(config, "COPY_TRADER_AUTO_PAUSE_BLOCK_WIN_RATE", 0.25, raising=False)
+    monkeypatch.setattr(config, "COPY_TRADER_AUTO_PAUSE_BLOCK_NET_PNL", -25.0, raising=False)
+
+    open_copy = _open_trade(99, "SOL", "short")
+    open_copy["metadata"] = {"is_copy_trade": True, "source": "copy_trade"}
+
+    monkeypatch.setattr("src.trading.copy_trader.db.get_paper_account", lambda: {"balance": 10_000.0})
+    monkeypatch.setattr("src.trading.copy_trader.db.get_open_paper_trades", lambda: [open_copy])
+    monkeypatch.setattr("src.trading.copy_trader.db.get_paper_trade_history", lambda limit=250: [])
+    monkeypatch.setattr("src.trading.copy_trader.hl.get_all_mids", lambda: {"BTC": 100.0, "SOL": 100.0})
+
+    trader = CopyTrader()
+    monkeypatch.setattr(trader, "_annotate_open_trades", lambda trades, mids: None)
+    monkeypatch.setattr(
+        trader,
+        "_open_copy_trade",
+        lambda *args, **kwargs: pytest.fail("hard cap should prevent opening a new copy trade"),
+    )
+
+    executed = trader.execute_copy_signals(
+        [
+            {
+                "type": "copy_open",
+                "coin": "BTC",
+                "side": "long",
+                "price": 100.0,
+                "leverage": 2,
+                "confidence": 0.8,
+                "source_trader": "0xabc",
+            }
+        ],
+        regime_data={"overall_regime": "neutral"},
+    )
+
+    assert executed == []
 
 
 def test_paper_trader_replaces_existing_strategy_position_instead_of_dropping(monkeypatch):

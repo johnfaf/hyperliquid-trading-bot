@@ -144,6 +144,27 @@ LIVE_MAX_ORDERS_PER_SOURCE_PER_DAY = int(
     os.environ.get("LIVE_MAX_ORDERS_PER_SOURCE_PER_DAY", 0)
 )
 LIVE_ANALYTICS_LOOKBACK_TRADES = int(os.environ.get("LIVE_ANALYTICS_LOOKBACK_TRADES", 200))
+COPY_TRADER_ENABLED = os.environ.get(
+    "COPY_TRADER_ENABLED", "true"
+).lower() in ("true", "1", "yes")
+COPY_TRADER_MAX_CONCURRENT_TRADES = int(
+    os.environ.get("COPY_TRADER_MAX_CONCURRENT_TRADES", 2)
+)
+COPY_TRADER_MAX_NEW_TRADES_PER_CYCLE = int(
+    os.environ.get("COPY_TRADER_MAX_NEW_TRADES_PER_CYCLE", 1)
+)
+COPY_TRADER_AUTO_PAUSE_MIN_CLOSED_TRADES = int(
+    os.environ.get("COPY_TRADER_AUTO_PAUSE_MIN_CLOSED_TRADES", 6)
+)
+COPY_TRADER_AUTO_PAUSE_DEGRADE_WIN_RATE = float(
+    os.environ.get("COPY_TRADER_AUTO_PAUSE_DEGRADE_WIN_RATE", 0.40)
+)
+COPY_TRADER_AUTO_PAUSE_BLOCK_WIN_RATE = float(
+    os.environ.get("COPY_TRADER_AUTO_PAUSE_BLOCK_WIN_RATE", 0.25)
+)
+COPY_TRADER_AUTO_PAUSE_BLOCK_NET_PNL = float(
+    os.environ.get("COPY_TRADER_AUTO_PAUSE_BLOCK_NET_PNL", -25.0)
+)
 LIVE_EXTERNAL_KILL_SWITCH_FILE = os.environ.get("LIVE_EXTERNAL_KILL_SWITCH_FILE", "").strip()
 HL_WALLET_MODE = os.environ.get("HL_WALLET_MODE", "agent_only").strip().lower()
 SECRET_MANAGER_PROVIDER = os.environ.get(
@@ -501,6 +522,12 @@ def _validate_config_bounds() -> None:
         ("LIVE_CANARY_MAX_SIGNALS_PER_DAY", 1, 100_000, 25),
         ("LIVE_MAX_ORDERS_PER_SOURCE_PER_DAY", 0, 100_000, 0),
         ("LIVE_ANALYTICS_LOOKBACK_TRADES", 10, 5_000, 200),
+        ("COPY_TRADER_MAX_CONCURRENT_TRADES", 0, 100, 2),
+        ("COPY_TRADER_MAX_NEW_TRADES_PER_CYCLE", 0, 100, 1),
+        ("COPY_TRADER_AUTO_PAUSE_MIN_CLOSED_TRADES", 1, 5_000, 6),
+        ("COPY_TRADER_AUTO_PAUSE_DEGRADE_WIN_RATE", 0.0, 1.0, 0.40),
+        ("COPY_TRADER_AUTO_PAUSE_BLOCK_WIN_RATE", 0.0, 1.0, 0.25),
+        ("COPY_TRADER_AUTO_PAUSE_BLOCK_NET_PNL", -1_000_000.0, 1_000_000.0, -25.0),
         ("SHORT_HARDENING_LOOKBACK_TRADES", 10, 5_000, 120),
         ("SHORT_HARDENING_MIN_CLOSED_TRADES", 1, 1_000, 12),
         ("SHORT_HARDENING_DEGRADE_WIN_RATE", 0.0, 1.0, 0.45),
@@ -536,6 +563,16 @@ def _validate_config_bounds() -> None:
             "clamping pause threshold down to the degrade threshold."
         )
         globals()["SOURCE_POLICY_PAUSE_WEIGHT"] = float(SOURCE_POLICY_DEGRADE_WEIGHT)
+
+    if COPY_TRADER_AUTO_PAUSE_BLOCK_WIN_RATE > COPY_TRADER_AUTO_PAUSE_DEGRADE_WIN_RATE:
+        _warn_config(
+            "COPY_TRADER_AUTO_PAUSE_BLOCK_WIN_RATE is above "
+            "COPY_TRADER_AUTO_PAUSE_DEGRADE_WIN_RATE; clamping block threshold "
+            "down to the degrade threshold."
+        )
+        globals()["COPY_TRADER_AUTO_PAUSE_BLOCK_WIN_RATE"] = float(
+            COPY_TRADER_AUTO_PAUSE_DEGRADE_WIN_RATE
+        )
 
 
 _validate_config_bounds()

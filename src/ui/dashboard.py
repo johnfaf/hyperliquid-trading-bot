@@ -26,7 +26,7 @@ try:
 except ImportError:
     pass
 import config
-from src.analysis.trade_analytics import compute_trade_analytics
+from src.analysis.trade_analytics import compute_live_paper_drift, compute_trade_analytics
 from src.core.readiness import evaluate_readiness
 
 logger = logging.getLogger(__name__)
@@ -294,7 +294,7 @@ def _parse_trade_costs(trade: Dict) -> Dict:
     }
 
 
-def get_dashboard_data():
+def get_dashboard_data(runtime_snapshot: Dict | None = None):
     """Collect all data needed for the dashboard."""
     conn = _get_db()
     try:
@@ -339,6 +339,10 @@ def get_dashboard_data():
         recent_fees = sum(float(t.get("fees_paid", 0) or 0) for t in closed_trades)
         recent_slippage = sum(float(t.get("slippage_cost", 0) or 0) for t in closed_trades)
         trade_analytics = compute_trade_analytics(all_closed, source_limit=10)
+        audit_rows = [dict(r) for r in conn.execute(
+            "SELECT timestamp, action, coin, side, source, details "
+            "FROM audit_trail ORDER BY timestamp DESC LIMIT 200"
+        ).fetchall()]
 
         # Copy trades (from metadata)
         copy_trades = [dict(r) for r in conn.execute(
@@ -374,6 +378,14 @@ def get_dashboard_data():
             events = _event_scanner.get_dashboard_data() if _event_scanner else None
         except Exception:
             events = None
+        runtime_snapshot = runtime_snapshot or _build_runtime_health_snapshot()
+        drift_analytics = compute_live_paper_drift(
+            closed_trades=all_closed,
+            open_trades=open_trades,
+            audit_rows=audit_rows,
+            live_source_orders_today=((runtime_snapshot.get("live_trader", {}) or {}).get("source_orders_today", {}) or {}),
+            source_limit=10,
+        )
 
         return {
             "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -402,6 +414,7 @@ def get_dashboard_data():
             "score_history": score_history,
             "events": events,
             "trade_analytics": trade_analytics,
+            "drift_analytics": drift_analytics,
             "v2": _get_v2_metrics(conn),
         }
     finally:
@@ -467,6 +480,7 @@ _multi_scanner = None
 _event_scanner = None
 _health_registry = None
 _shadow_tracker = None
+_copy_trader = None
 
 # Module-level live trader reference for closing positions on exchange
 _live_trader = None
@@ -583,13 +597,13 @@ def set_v2_components(firewall=None, regime_detector=None, arena=None,
                        liquidation_strategy=None, signal_processor=None,
                        arena_incubator=None, decision_engine=None,
                        multi_scanner=None, event_scanner=None, shadow_tracker=None,
-                       health_registry=None):
+                       health_registry=None, copy_trader=None):
     """Set V2 + V2.5 + V3 + V4 component references for dashboard metrics."""
     global _firewall, _regime_detector, _arena  # noqa: PLW0603
     global _agent_scorer, _shadow_tracker  # noqa: PLW0603
     global _kelly_sizer, _trade_memory, _calibration, _llm_filter, _liquidation_strategy  # noqa
     global _signal_processor, _arena_incubator, _decision_engine  # noqa
-    global _multi_scanner, _event_scanner, _health_registry  # noqa
+    global _multi_scanner, _event_scanner, _health_registry, _copy_trader  # noqa
     _firewall = firewall
     _regime_detector = regime_detector
     _arena = arena
@@ -606,6 +620,7 @@ def set_v2_components(firewall=None, regime_detector=None, arena=None,
     _event_scanner = event_scanner
     _shadow_tracker = shadow_tracker
     _health_registry = health_registry
+    _copy_trader = copy_trader
 
 
 def _build_runtime_health_snapshot() -> Dict:
@@ -719,6 +734,12 @@ def _build_runtime_health_snapshot() -> Dict:
                 "canary_headroom_ratio": stats.get("canary_headroom_ratio"),
                 "crash_safe_canary_order_usd": stats.get("crash_safe_canary_order_usd"),
             }
+    except Exception:
+        pass
+
+    try:
+        if _copy_trader and hasattr(_copy_trader, "get_stats"):
+            snapshot["copy_trader"] = _copy_trader.get_stats()
     except Exception:
         pass
 
@@ -1051,6 +1072,33 @@ details[open] summary::after{content:'-'}
     <details class="section">
       <summary>
         <div>
+          <p class="section-tag">Drift Monitor</p>
+          <h2 class="section-title">Live vs Paper</h2>
+        </div>
+        <span class="summary-copy">Source-level drift between paper outcomes, audit approvals, and live entry flow</span>
+      </summary>
+      <div class="details-body">
+        <div id="drift-summary" class="detail-list">Loading live vs paper drift...</div>
+        <div class="split-grid" style="margin-top:14px;margin-bottom:0">
+          <div class="table-shell">
+            <table>
+              <thead><tr><th>Source</th><th>Paper Open</th><th>Paper Closed</th><th>Paper PnL</th><th>Approved</th><th>Rejected</th><th>Live Today</th><th>Top Reject</th></tr></thead>
+              <tbody id="drift-source-table"></tbody>
+            </table>
+          </div>
+          <div class="table-shell">
+            <table>
+              <thead><tr><th>Side</th><th>Paper Open</th><th>Paper Closed</th><th>Paper PnL</th><th>Approved</th><th>Rejected</th></tr></thead>
+              <tbody id="drift-side-table"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </details>
+
+    <details class="section">
+      <summary>
+        <div>
           <p class="section-tag">Regime</p>
           <h2 class="section-title">Per-Coin Context</h2>
         </div>
@@ -1367,6 +1415,51 @@ function renderTradeAnalytics(analytics, runtime){
     </tr>`).join('');
 }
 
+function renderDriftAnalytics(drift, runtime){
+  const summaryEl = document.getElementById('drift-summary');
+  const sourceEl = document.getElementById('drift-source-table');
+  const sideEl = document.getElementById('drift-side-table');
+  if(!drift){
+    summaryEl.textContent = 'Live vs paper drift is not available yet.';
+    sourceEl.innerHTML = '<tr><td colspan="8" class="empty-row">No source drift data</td></tr>';
+    sideEl.innerHTML = '<tr><td colspan="6" class="empty-row">No side drift data</td></tr>';
+    return;
+  }
+
+  const summary = drift.summary || {};
+  const copyStats = (runtime || {}).copy_trader || {};
+  const copyGuardrail = copyStats.guardrail || {};
+  summaryEl.innerHTML =
+    `<div>Paper open: <strong>${summary.paper_open_positions || 0}</strong> | paper closed: <strong>${summary.paper_closed_trades || 0}</strong> | realized paper PnL: <strong class="${pnlClass(summary.paper_net_pnl || 0)}">${fmtUsd(summary.paper_net_pnl || 0)}</strong></div>` +
+    `<div>Audit approvals: <strong>${summary.audit_approved || 0}</strong> | audit rejects: <strong>${summary.audit_rejected || 0}</strong> | live entries today: <strong>${summary.live_entries_today || 0}</strong> | approval gap: <strong>${summary.approval_gap || 0}</strong></div>` +
+    `<div>Realized paper sources: <strong>${summary.paper_sources_realized || 0}</strong> | live-active sources: <strong>${summary.live_sources_active || 0}</strong></div>` +
+    `<div>Copy-trade guardrail: <strong>${String(copyGuardrail.status || 'unknown').toUpperCase()}</strong> | ${copyGuardrail.reason || 'No copy-trader guardrail data yet.'}</div>`;
+
+  const bySource = drift.by_source || [];
+  sourceEl.innerHTML = bySource.length ? bySource.map(row => `
+    <tr>
+      <td><code class="agent-key">${row.label}</code></td>
+      <td>${row.paper_open}</td>
+      <td>${row.paper_closed}</td>
+      <td class="${pnlClass(row.paper_net_pnl || 0)}">${fmtUsd(row.paper_net_pnl || 0)}</td>
+      <td>${row.audit_approved}</td>
+      <td>${row.audit_rejected}</td>
+      <td>${row.live_entries_today}</td>
+      <td>${row.top_reject_reason || 'n/a'}</td>
+    </tr>`).join('') : '<tr><td colspan="8" class="empty-row">No source drift data yet</td></tr>';
+
+  const bySide = drift.by_side || [];
+  sideEl.innerHTML = bySide.length ? bySide.map(row => `
+    <tr>
+      <td><span class="badge badge-${row.label}">${String(row.label || 'unknown').toUpperCase()}</span></td>
+      <td>${row.paper_open}</td>
+      <td>${row.paper_closed}</td>
+      <td class="${pnlClass(row.paper_net_pnl || 0)}">${fmtUsd(row.paper_net_pnl || 0)}</td>
+      <td>${row.audit_approved}</td>
+      <td>${row.audit_rejected}</td>
+    </tr>`).join('') : '<tr><td colspan="6" class="empty-row">No side drift data yet</td></tr>';
+}
+
 function renderTypeChart(dist){
   const ctx = document.getElementById('type-chart').getContext('2d');
   const labels = dist.map(d=>d.strategy_type);
@@ -1568,6 +1661,7 @@ async function refresh(){
     renderTraders(d.traders);
     renderClosedTrades(d.closed_trades);
     renderTradeAnalytics(d.trade_analytics, d.runtime_health);
+    renderDriftAnalytics(d.drift_analytics, d.runtime_health);
     renderCopyTrades(d.copy_trades || []);
     renderEquityChart(d.closed_trades);
     renderTypeChart(d.type_distribution);
@@ -1693,6 +1787,10 @@ function renderRuntimeHealth(runtime) {
   const executed = Number(live.executed_entry_signals || 0);
   const hitRate = attempted > 0 ? `${((executed / attempted) * 100).toFixed(1)}%` : 'n/a';
   const shortPolicy = live.short_side_policy || fw.short_side_policy || {};
+  const copyGuardrail = (runtime.copy_trader || {}).guardrail || {};
+  const copyGuardrailLine = copyGuardrail.reason
+    ? `<div>Copy-trade guardrail: <strong>${String(copyGuardrail.status || 'unknown').toUpperCase()}</strong> | ${copyGuardrail.reason}</div>`
+    : '';
   document.getElementById('runtime-health-detail').innerHTML =
     `<div>At-risk: <strong>${atRiskList}</strong></div>` +
     `<div>Stale: <strong>${staleList}</strong></div>` +
@@ -1702,6 +1800,7 @@ function renderRuntimeHealth(runtime) {
     `<div>Canary execution: <strong>${executed}/${attempted}</strong> (${hitRate}) | min-order rejects <strong>${live.min_order_rejects_today || 0}</strong> | floor-ups <strong>${live.min_order_floorups_today || 0}</strong></div>` +
     `<div>Canary headroom: <strong>${live.canary_headroom_ratio != null ? live.canary_headroom_ratio + 'x' : 'n/a'}</strong> | crash-safe cap <strong>${live.crash_safe_canary_order_usd != null ? fmtUsd(live.crash_safe_canary_order_usd) : 'n/a'}</strong></div>` +
     `<div>Short guardrail: <strong>${String(shortPolicy.status || 'unknown').toUpperCase()}</strong> — ${shortPolicy.reason || 'n/a'}</div>` +
+    copyGuardrailLine +
     `<div>Live source usage: <strong>${sourceUsageSummary}</strong></div>` +
     `<div>Source allocator: <strong>${sourcePolicySummary}</strong></div>`;
 }
@@ -1887,7 +1986,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
         elif parsed.path == "/api/data":
             try:
-                data = get_dashboard_data()
+                runtime_snapshot = _build_runtime_health_snapshot()
+                data = get_dashboard_data(runtime_snapshot=runtime_snapshot)
                 # Inject live V2 metrics
                 if _firewall:
                     data["v2"]["firewall"] = _firewall.get_stats()
@@ -1978,7 +2078,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 if v25:
                     data["v25"] = v25
 
-                data["runtime_health"] = _build_runtime_health_snapshot()
+                data["runtime_health"] = runtime_snapshot
                 self._json_response(data)
             except Exception as e:
                 self._json_response({"error": str(e)}, code=500)

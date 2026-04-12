@@ -8,8 +8,8 @@ without duplicating parsing logic.
 from __future__ import annotations
 
 import json
-from collections import defaultdict
-from typing import Dict, Iterable, List
+from collections import Counter, defaultdict
+from typing import Dict, Iterable, List, Mapping
 
 
 def _coerce_float(value, default: float = 0.0) -> float:
@@ -30,6 +30,32 @@ def _trade_metadata(trade: Dict) -> Dict:
         except Exception:
             return {}
     return {}
+
+
+def _normalize_source_label(value) -> str:
+    raw = str(value or "").strip().lower()
+    if not raw:
+        return "unknown"
+    if raw.startswith("copy_trade"):
+        return "copy_trade"
+    if raw.startswith("options_flow"):
+        return "options_flow"
+    if raw.startswith("strategy"):
+        return "strategy"
+    if ":" in raw:
+        return raw.split(":", 1)[0] or "unknown"
+    return raw
+
+
+def _trade_source_label(trade: Dict) -> str:
+    meta = _trade_metadata(trade)
+    return _normalize_source_label(
+        meta.get("source_key")
+        or meta.get("source")
+        or trade.get("source")
+        or trade.get("strategy_type")
+        or "unknown"
+    )
 
 
 def _new_bucket() -> Dict:
@@ -84,13 +110,7 @@ def compute_trade_analytics(
         fees = _coerce_float(meta.get("total_fees_paid", 0.0))
         slippage = _coerce_float(meta.get("total_slippage_cost", 0.0))
         gross_pnl = _coerce_float(meta.get("gross_pnl_before_fees", pnl + fees))
-        source_key = str(
-            meta.get("source_key")
-            or meta.get("source")
-            or trade.get("source")
-            or trade.get("strategy_type")
-            or "unknown"
-        ).strip().lower() or "unknown"
+        source_key = _trade_source_label(trade)
 
         for bucket in (summary, by_side[side], by_source[source_key]):
             bucket["count"] += 1
@@ -130,6 +150,211 @@ def compute_trade_analytics(
             "long_net_pnl": float(long_row["net_pnl"]) if long_row else 0.0,
             "long_win_rate": float(long_row["win_rate"]) if long_row else 0.0,
         },
+    }
+
+
+def evaluate_source_policy(
+    trades: Iterable[Dict],
+    *,
+    source_label: str,
+    min_trades: int,
+    degrade_win_rate: float,
+    block_win_rate: float,
+    block_net_pnl: float,
+) -> Dict:
+    normalized = _normalize_source_label(source_label)
+    source_trades = [
+        trade for trade in (trades or [])
+        if _trade_source_label(trade) == normalized
+    ]
+    analytics = compute_trade_analytics(source_trades, source_limit=8)
+    summary = analytics["summary"]
+    count = int(summary.get("count", 0) or 0)
+    win_rate = float(summary.get("win_rate", 0.0) or 0.0)
+    net_pnl = float(summary.get("net_pnl", 0.0) or 0.0)
+    metrics = {"count": count, "win_rate": win_rate, "net_pnl": net_pnl}
+
+    if count < int(min_trades):
+        return {
+            "status": "insufficient",
+            "reason": f"Need {min_trades} closed {normalized} trades before policy activates",
+            "metrics": metrics,
+            "source": normalized,
+        }
+    if win_rate < float(block_win_rate) and net_pnl <= float(block_net_pnl):
+        return {
+            "status": "blocked",
+            "reason": (
+                f"Recent {normalized} trades are underperforming ({count} trades, "
+                f"win rate {win_rate:.0%}, net {net_pnl:.2f})"
+            ),
+            "metrics": metrics,
+            "source": normalized,
+        }
+    if win_rate < float(degrade_win_rate) and net_pnl < 0:
+        return {
+            "status": "degraded",
+            "reason": (
+                f"Recent {normalized} trades need caution ({count} trades, "
+                f"win rate {win_rate:.0%}, net {net_pnl:.2f})"
+            ),
+            "metrics": metrics,
+            "source": normalized,
+        }
+    return {
+        "status": "healthy",
+        "reason": (
+            f"{normalized} healthy enough ({count} trades, "
+            f"win rate {win_rate:.0%}, net {net_pnl:.2f})"
+        ),
+        "metrics": metrics,
+        "source": normalized,
+    }
+
+
+def compute_live_paper_drift(
+    *,
+    closed_trades: Iterable[Dict],
+    open_trades: Iterable[Dict],
+    audit_rows: Iterable[Mapping],
+    live_source_orders_today: Mapping[str, object] | None = None,
+    source_limit: int = 8,
+) -> Dict:
+    by_source = defaultdict(
+        lambda: {
+            "paper_open": 0,
+            "paper_closed": 0,
+            "paper_net_pnl": 0.0,
+            "audit_approved": 0,
+            "audit_rejected": 0,
+            "live_entries_today": 0,
+            "reject_reasons": Counter(),
+        }
+    )
+    by_side = defaultdict(
+        lambda: {
+            "paper_open": 0,
+            "paper_closed": 0,
+            "paper_net_pnl": 0.0,
+            "audit_approved": 0,
+            "audit_rejected": 0,
+        }
+    )
+    summary = {
+        "paper_open_positions": 0,
+        "paper_closed_trades": 0,
+        "paper_net_pnl": 0.0,
+        "audit_approved": 0,
+        "audit_rejected": 0,
+        "live_entries_today": 0,
+        "live_sources_active": 0,
+        "paper_sources_realized": 0,
+    }
+
+    for trade in open_trades or []:
+        source = _trade_source_label(trade)
+        side = str(trade.get("side", "") or "unknown").strip().lower() or "unknown"
+        by_source[source]["paper_open"] += 1
+        by_side[side]["paper_open"] += 1
+        summary["paper_open_positions"] += 1
+
+    for trade in closed_trades or []:
+        source = _trade_source_label(trade)
+        side = str(trade.get("side", "") or "unknown").strip().lower() or "unknown"
+        pnl = _coerce_float(trade.get("pnl", 0.0))
+        by_source[source]["paper_closed"] += 1
+        by_source[source]["paper_net_pnl"] += pnl
+        by_side[side]["paper_closed"] += 1
+        by_side[side]["paper_net_pnl"] += pnl
+        summary["paper_closed_trades"] += 1
+        summary["paper_net_pnl"] += pnl
+
+    for row in audit_rows or []:
+        action = str(row.get("action", "") or "").strip().lower()
+        source = _normalize_source_label(row.get("source"))
+        side = str(row.get("side", "") or "unknown").strip().lower() or "unknown"
+        if action == "signal_approved":
+            by_source[source]["audit_approved"] += 1
+            by_side[side]["audit_approved"] += 1
+            summary["audit_approved"] += 1
+        elif action == "signal_rejected":
+            by_source[source]["audit_rejected"] += 1
+            by_side[side]["audit_rejected"] += 1
+            summary["audit_rejected"] += 1
+            details = row.get("details") or {}
+            if isinstance(details, str):
+                try:
+                    details = json.loads(details or "{}")
+                except Exception:
+                    details = {}
+            reason = str((details or {}).get("reason", "") or "").strip()
+            if reason:
+                by_source[source]["reject_reasons"][reason] += 1
+
+    live_source_orders_today = dict(live_source_orders_today or {})
+    for source_key, value in live_source_orders_today.items():
+        source = _normalize_source_label(source_key)
+        count = int(_coerce_float(value, 0.0))
+        by_source[source]["live_entries_today"] += count
+        summary["live_entries_today"] += count
+
+    source_rows = []
+    for label, bucket in by_source.items():
+        if not any(
+            bucket[key]
+            for key in ("paper_open", "paper_closed", "audit_approved", "audit_rejected", "live_entries_today")
+        ):
+            continue
+        top_reject_reason = ""
+        if bucket["reject_reasons"]:
+            top_reject_reason = bucket["reject_reasons"].most_common(1)[0][0]
+        source_rows.append(
+            {
+                "label": label,
+                "paper_open": int(bucket["paper_open"]),
+                "paper_closed": int(bucket["paper_closed"]),
+                "paper_net_pnl": round(float(bucket["paper_net_pnl"]), 4),
+                "audit_approved": int(bucket["audit_approved"]),
+                "audit_rejected": int(bucket["audit_rejected"]),
+                "live_entries_today": int(bucket["live_entries_today"]),
+                "top_reject_reason": top_reject_reason,
+            }
+        )
+    source_rows.sort(
+        key=lambda row: (
+            row["live_entries_today"],
+            row["paper_closed"],
+            row["audit_approved"],
+            row["paper_net_pnl"],
+        ),
+        reverse=True,
+    )
+
+    side_rows = []
+    for label, bucket in by_side.items():
+        if not any(bucket.values()):
+            continue
+        side_rows.append(
+            {
+                "label": label,
+                "paper_open": int(bucket["paper_open"]),
+                "paper_closed": int(bucket["paper_closed"]),
+                "paper_net_pnl": round(float(bucket["paper_net_pnl"]), 4),
+                "audit_approved": int(bucket["audit_approved"]),
+                "audit_rejected": int(bucket["audit_rejected"]),
+            }
+        )
+    side_rows.sort(key=lambda row: row["label"])
+
+    summary["paper_net_pnl"] = round(float(summary["paper_net_pnl"]), 4)
+    summary["paper_sources_realized"] = sum(1 for row in source_rows if row["paper_closed"] > 0)
+    summary["live_sources_active"] = sum(1 for row in source_rows if row["live_entries_today"] > 0)
+    summary["approval_gap"] = int(summary["audit_approved"] - summary["live_entries_today"])
+
+    return {
+        "summary": summary,
+        "by_source": source_rows[:source_limit],
+        "by_side": side_rows,
     }
 
 

@@ -488,6 +488,7 @@ def build_subsystems(
                 event_scanner=c.event_scanner,
                 shadow_tracker=c.shadow_tracker,
                 health_registry=health,
+                copy_trader=c.copy_trader,
             )
             if c.live_trader:
                 set_live_trader(c.live_trader)

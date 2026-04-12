@@ -283,9 +283,12 @@ def write_health_report(
 
     try:
         if container.copy_trader:
-            report["copy_trading"] = {
-                "total_executed": getattr(container.copy_trader, "_copy_count", 0),
-            }
+            if hasattr(container.copy_trader, "get_stats"):
+                report["copy_trading"] = container.copy_trader.get_stats()
+            else:
+                report["copy_trading"] = {
+                    "total_executed": getattr(container.copy_trader, "_copy_count", 0),
+                }
     except Exception:
         pass
 

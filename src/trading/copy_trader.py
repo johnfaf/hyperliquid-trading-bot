@@ -17,6 +17,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import config
 from src.data import database as db
 from src.data import hyperliquid_client as hl
+from src.analysis.trade_analytics import evaluate_source_policy
 from src.signals.signal_schema import signal_from_copy_trade
 from src.signals.decision_firewall import DecisionFirewall
 from src.signals.agent_scoring import AgentScorer
@@ -54,11 +55,107 @@ class CopyTrader:
         self.shadow_tracker = shadow_tracker
         self.rotation_manager = PortfolioRotationManager()
         self._closed_events: List[Dict] = []
+        self.enabled = bool(getattr(config, "COPY_TRADER_ENABLED", True))
+        self.max_concurrent_trades = max(
+            0, int(getattr(config, "COPY_TRADER_MAX_CONCURRENT_TRADES", 2))
+        )
+        self.max_new_trades_per_cycle = max(
+            0, int(getattr(config, "COPY_TRADER_MAX_NEW_TRADES_PER_CYCLE", 1))
+        )
+        self.auto_pause_min_closed_trades = max(
+            1, int(getattr(config, "COPY_TRADER_AUTO_PAUSE_MIN_CLOSED_TRADES", 6))
+        )
+        self.auto_pause_degrade_win_rate = float(
+            getattr(config, "COPY_TRADER_AUTO_PAUSE_DEGRADE_WIN_RATE", 0.40)
+        )
+        self.auto_pause_block_win_rate = float(
+            getattr(config, "COPY_TRADER_AUTO_PAUSE_BLOCK_WIN_RATE", 0.25)
+        )
+        self.auto_pause_block_net_pnl = float(
+            getattr(config, "COPY_TRADER_AUTO_PAUSE_BLOCK_NET_PNL", -25.0)
+        )
+        self._copy_guardrail_status: Dict[str, object] = {
+            "status": "healthy" if self.enabled else "paused",
+            "reason": (
+                "Copy trader enabled by config"
+                if self.enabled
+                else "Copy trader disabled by config"
+            ),
+            "metrics": {"count": 0, "win_rate": 0.0, "net_pnl": 0.0},
+            "source": "copy_trade",
+            "max_concurrent_trades": self.max_concurrent_trades,
+            "max_new_trades_per_cycle": self.max_new_trades_per_cycle,
+        }
 
     @staticmethod
     def _source_key(payload: Dict) -> str:
         trader = str(payload.get("source_trader", "") or "").strip().lower()
         return f"copy_trade:{trader}" if trader else "copy_trade"
+
+    @staticmethod
+    def _is_copy_trade(trade: Dict) -> bool:
+        meta = trade.get("metadata", {})
+        if isinstance(meta, str):
+            try:
+                meta = json.loads(meta or "{}")
+            except (json.JSONDecodeError, TypeError):
+                meta = {}
+        meta = dict(meta or {})
+        source = str(meta.get("source") or trade.get("source") or "").strip().lower()
+        return bool(meta.get("is_copy_trade")) or source.startswith("copy_trade")
+
+    def _open_copy_trade_count(self, trades: List[Dict]) -> int:
+        return sum(1 for trade in (trades or []) if self._is_copy_trade(trade))
+
+    def _refresh_copy_guardrail_status(self) -> Dict[str, object]:
+        if not self.enabled:
+            self._copy_guardrail_status = {
+                "status": "paused",
+                "reason": "Copy trader disabled by config",
+                "metrics": {"count": 0, "win_rate": 0.0, "net_pnl": 0.0},
+                "source": "copy_trade",
+                "max_concurrent_trades": self.max_concurrent_trades,
+                "max_new_trades_per_cycle": self.max_new_trades_per_cycle,
+            }
+            return dict(self._copy_guardrail_status)
+
+        try:
+            closed = db.get_paper_trade_history(limit=250)
+            policy = evaluate_source_policy(
+                closed,
+                source_label="copy_trade",
+                min_trades=self.auto_pause_min_closed_trades,
+                degrade_win_rate=self.auto_pause_degrade_win_rate,
+                block_win_rate=self.auto_pause_block_win_rate,
+                block_net_pnl=self.auto_pause_block_net_pnl,
+            )
+        except Exception as exc:
+            policy = {
+                "status": "unknown",
+                "reason": f"Copy guardrail unavailable: {exc}",
+                "metrics": {"count": 0, "win_rate": 0.0, "net_pnl": 0.0},
+                "source": "copy_trade",
+            }
+
+        policy["max_concurrent_trades"] = self.max_concurrent_trades
+        policy["max_new_trades_per_cycle"] = self.max_new_trades_per_cycle
+        self._copy_guardrail_status = dict(policy)
+        return dict(self._copy_guardrail_status)
+
+    def get_stats(self) -> Dict:
+        status = self._refresh_copy_guardrail_status()
+        try:
+            open_copy_trades = self._open_copy_trade_count(db.get_open_paper_trades())
+        except Exception:
+            open_copy_trades = 0
+        return {
+            "enabled": self.enabled,
+            "total_executed": self._copy_count,
+            "open_copy_trades": open_copy_trades,
+            "guardrail": status,
+            "max_concurrent_trades": self.max_concurrent_trades,
+            "max_new_trades_per_cycle": self.max_new_trades_per_cycle,
+        }
 
     def scan_top_traders(self, top_n: int = 10) -> List[Dict]:
         """
@@ -259,6 +356,14 @@ class CopyTrader:
         executed = []
         pending_entries = []
         self._annotate_open_trades(open_trades, mids)
+        guardrail = self._refresh_copy_guardrail_status()
+        allow_new_entries = guardrail.get("status") not in {"blocked", "paused"}
+        if not allow_new_entries:
+            logger.warning(
+                "Copy trader open signals paused: %s",
+                guardrail.get("reason", "copy guardrail blocked"),
+            )
+        new_entries_seen = 0
 
         for signal in signals:
             try:
@@ -269,6 +374,20 @@ class CopyTrader:
                     continue
 
                 if signal["type"] in ("copy_open", "copy_scale_in", "copy_flip", "golden_copy"):
+                    if not allow_new_entries:
+                        continue
+                    if (
+                        self.max_new_trades_per_cycle > 0
+                        and new_entries_seen >= self.max_new_trades_per_cycle
+                    ):
+                        logger.info(
+                            "  Copy-trader cycle cap reached (%d/%d); skipping %s %s",
+                            new_entries_seen,
+                            self.max_new_trades_per_cycle,
+                            signal["side"],
+                            signal["coin"],
+                        )
+                        continue
                     signal = self._apply_regime_weight(signal, signal["coin"])
                     trade_signal = None
 
@@ -321,6 +440,7 @@ class CopyTrader:
                         "signal": signal,
                         "trade_signal": trade_signal,
                     })
+                    new_entries_seen += 1
 
             except Exception as e:
                 logger.error(f"Error executing copy signal: {e}")
@@ -412,6 +532,18 @@ class CopyTrader:
                 candidate_open_positions = [
                     trade for trade in open_trades if trade.get("id") != victim.get("id")
                 ]
+
+            if self.max_concurrent_trades > 0:
+                projected_copy_count = self._open_copy_trade_count(candidate_open_positions)
+                if projected_copy_count >= self.max_concurrent_trades:
+                    logger.info(
+                        "  Copy-trader cap reached (%d/%d open copy trades); skipping %s %s",
+                        projected_copy_count,
+                        self.max_concurrent_trades,
+                        signal["side"],
+                        signal["coin"],
+                    )
+                    continue
 
             if self.firewall:
                 passed, reason = self.firewall.validate(

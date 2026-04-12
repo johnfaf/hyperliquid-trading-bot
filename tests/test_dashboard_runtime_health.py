@@ -31,6 +31,18 @@ class _FakeLiveTrader:
         }
 
 
+class _FakeCopyTrader:
+    def get_stats(self):
+        return {
+            "enabled": True,
+            "open_copy_trades": 1,
+            "guardrail": {
+                "status": "blocked",
+                "reason": "Recent copy_trade trades are underperforming",
+            },
+        }
+
+
 def test_build_runtime_health_snapshot_includes_subsystems_and_safety(monkeypatch):
     registry = SubsystemHealthRegistry()
     registry.register("decision_firewall", affects_trading=True)
@@ -54,6 +66,7 @@ def test_build_runtime_health_snapshot_includes_subsystems_and_safety(monkeypatc
     monkeypatch.setattr(dashboard, "_health_registry", registry)
     monkeypatch.setattr(dashboard, "_firewall", _FakeFirewall())
     monkeypatch.setattr(dashboard, "_live_trader", _FakeLiveTrader())
+    monkeypatch.setattr(dashboard, "_copy_trader", _FakeCopyTrader())
     monkeypatch.setenv("DASHBOARD_HEALTH_STALE_SECONDS", "600")
 
     snapshot = dashboard._build_runtime_health_snapshot()
@@ -65,6 +78,7 @@ def test_build_runtime_health_snapshot_includes_subsystems_and_safety(monkeypatc
     assert snapshot["firewall"]["top_rejection_reason"] == "rejected_confidence"
     assert snapshot["live_trader"]["kill_switch_active"] is True
     assert snapshot["live_trader"]["source_orders_today"] == {"copy_trade:0xabc": 1}
+    assert snapshot["copy_trader"]["guardrail"]["status"] == "blocked"
 
 
 def test_dashboard_host_defaults_to_localhost_when_not_hosted(monkeypatch):
