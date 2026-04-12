@@ -52,6 +52,7 @@ from src.core.boot import (
 )
 from src.core.health_registry import registry as health_registry
 from src.core.readiness import RuntimeIncidentMonitor
+from src.core.runtime_config import RuntimeConfigManager
 from src.core.task_runner import SupervisedTaskRunner
 from src.core.subsystem_registry import (
     build_subsystems,
@@ -102,6 +103,8 @@ class HyperliquidResearchBot:
         # ── Build subsystems ──
         effective_profile = profile or FULL_PROFILE
         self.container = build_subsystems(health_registry, effective_profile)
+        self.runtime_config = RuntimeConfigManager()
+        self.runtime_config.poll(self.container, force=True)
         self.runtime_monitor = RuntimeIncidentMonitor()
 
         # Wire Telegram critical alert for any subsystem that transitions
@@ -187,6 +190,7 @@ class HyperliquidResearchBot:
     # ── Scheduling loops ──────────────────────────────────────
 
     def _run_discovery(self):
+        self.runtime_config.poll(self.container)
         run_discovery(self.container)
         heartbeat_active(self.container, health_registry)
         self.runtime_monitor.evaluate_and_alert(
@@ -197,6 +201,7 @@ class HyperliquidResearchBot:
         self._save_last_discovery_time()
 
     def _run_trading_cycle(self):
+        self.runtime_config.poll(self.container)
         self._cycle_count += 1
         run_trading_cycle(self.container, self._cycle_count)
         run_reporting(self.container, self._cycle_count, health_registry)
@@ -207,6 +212,7 @@ class HyperliquidResearchBot:
         )
 
     def _fast_cycle(self):
+        self.runtime_config.poll(self.container)
         self._fast_cycle_count += 1
         if check_file_kill_switch(self.container):
             self.logger.critical("KILL_SWITCH triggered before fast cycle execution")
@@ -245,6 +251,7 @@ class HyperliquidResearchBot:
     def _sleep_with_kill_switch_checks(self, interval_s: float) -> None:
         deadline = time.time() + max(0.0, float(interval_s))
         while self.running and time.time() < deadline:
+            self.runtime_config.poll(self.container)
             if check_file_kill_switch(self.container):
                 self.logger.critical("KILL_SWITCH detected during sleep window")
                 self.running = False

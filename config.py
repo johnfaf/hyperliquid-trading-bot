@@ -184,6 +184,8 @@ COPY_TRADER_AUTO_PAUSE_BLOCK_NET_PNL = float(
     os.environ.get("COPY_TRADER_AUTO_PAUSE_BLOCK_NET_PNL", -25.0)
 )
 LIVE_EXTERNAL_KILL_SWITCH_FILE = os.environ.get("LIVE_EXTERNAL_KILL_SWITCH_FILE", "").strip()
+RUNTIME_CONFIG_OVERRIDE_FILE = os.environ.get("RUNTIME_CONFIG_OVERRIDE_FILE", "/data/config.json").strip()
+RUNTIME_CONFIG_POLL_SECONDS = int(os.environ.get("RUNTIME_CONFIG_POLL_SECONDS", 10))
 HL_WALLET_MODE = os.environ.get("HL_WALLET_MODE", "agent_only").strip().lower()
 SECRET_MANAGER_PROVIDER = os.environ.get(
     "SECRET_MANAGER_PROVIDER", "none"
@@ -559,6 +561,7 @@ def _validate_config_bounds() -> None:
         ("READINESS_STALE_SECONDS", 30, 86_400, 600),
         ("READINESS_DB_WRITE_TTL_S", 1, 3_600, 60),
         ("READINESS_ALERT_COOLDOWN_S", 30, 86_400, 900),
+        ("RUNTIME_CONFIG_POLL_SECONDS", 1, 3_600, 10),
         ("VAULT_KV_VERSION", 1, 2, 2),
     ]
     for name, min_value, max_value, fallback in rules:

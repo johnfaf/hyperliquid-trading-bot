@@ -202,6 +202,86 @@ class DecisionFirewall:
     def set_event_scanner(self, event_scanner) -> None:
         self.event_scanner = event_scanner
 
+    def apply_runtime_overrides(self, overrides: Dict) -> None:
+        """Apply hot-reloadable config values without recreating the firewall."""
+        if not overrides:
+            return
+        with self._lock:
+            self.min_confidence = float(
+                overrides.get("FIREWALL_MIN_CONFIDENCE", self.min_confidence)
+            )
+            self.max_signals_per_source_per_day = int(
+                overrides.get(
+                    "FIREWALL_MAX_SIGNALS_PER_SOURCE_PER_DAY",
+                    self.max_signals_per_source_per_day,
+                )
+                or 0
+            )
+            self.event_risk_enabled = bool(
+                overrides.get("EVENT_RISK_ENABLED", self.event_risk_enabled)
+            )
+            self.short_hardening_enabled = bool(
+                overrides.get("SHORT_HARDENING_ENABLED", self.short_hardening_enabled)
+            )
+            self.short_hardening_lookback_trades = max(
+                10,
+                int(
+                    overrides.get(
+                        "SHORT_HARDENING_LOOKBACK_TRADES",
+                        self.short_hardening_lookback_trades,
+                    )
+                ),
+            )
+            self.short_hardening_min_closed_trades = max(
+                1,
+                int(
+                    overrides.get(
+                        "SHORT_HARDENING_MIN_CLOSED_TRADES",
+                        self.short_hardening_min_closed_trades,
+                    )
+                ),
+            )
+            self.short_hardening_degrade_win_rate = float(
+                overrides.get(
+                    "SHORT_HARDENING_DEGRADE_WIN_RATE",
+                    self.short_hardening_degrade_win_rate,
+                )
+            )
+            self.short_hardening_block_win_rate = float(
+                overrides.get(
+                    "SHORT_HARDENING_BLOCK_WIN_RATE",
+                    self.short_hardening_block_win_rate,
+                )
+            )
+            self.short_hardening_block_net_pnl = float(
+                overrides.get(
+                    "SHORT_HARDENING_BLOCK_NET_PNL",
+                    self.short_hardening_block_net_pnl,
+                )
+            )
+            self.short_hardening_confidence_multiplier = float(
+                overrides.get(
+                    "SHORT_HARDENING_CONFIDENCE_MULTIPLIER",
+                    self.short_hardening_confidence_multiplier,
+                )
+            )
+            self.short_hardening_size_multiplier = float(
+                overrides.get(
+                    "SHORT_HARDENING_SIZE_MULTIPLIER",
+                    self.short_hardening_size_multiplier,
+                )
+            )
+            self._side_policy_cache = {"ts": 0.0, "short": {}}
+
+        logger.info(
+            "DecisionFirewall runtime overrides applied: min_confidence=%s, source_cap=%s, "
+            "short_hardening=%s, event_risk=%s",
+            f"{self.min_confidence:.0%}",
+            self.max_signals_per_source_per_day,
+            self.short_hardening_enabled,
+            self.event_risk_enabled,
+        )
+
     def _get_short_side_policy(self) -> Dict:
         if not self.short_hardening_enabled:
             return {

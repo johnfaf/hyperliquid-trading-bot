@@ -1287,6 +1287,7 @@ def test_execution_open_positions_prefer_live_state_when_deployable():
 def test_sync_shadow_book_closes_paper_trade_when_live_position_missing(monkeypatch):
     metadata_updates = []
     closed = []
+    alerts = []
 
     class FakeLiveTrader:
         def is_live_enabled(self):
@@ -1323,6 +1324,10 @@ def test_sync_shadow_book_closes_paper_trade_when_live_position_missing(monkeypa
         "src.core.live_execution.db.close_paper_trade",
         lambda trade_id, exit_price, pnl: closed.append((trade_id, exit_price, pnl)) or True,
     )
+    monkeypatch.setattr(
+        "src.core.live_execution._notify_manual_close_detected",
+        lambda trade, exit_price: alerts.append((trade["coin"], exit_price)),
+    )
 
     reconciled = sync_shadow_book_to_live(container)
     assert len(reconciled) == 1
@@ -1331,9 +1336,76 @@ def test_sync_shadow_book_closes_paper_trade_when_live_position_missing(monkeypa
     assert reconciled[0]["reason"] == "live_reconciled_closed"
     assert reconciled[0]["pnl"] == 0.0
     assert closed == [(7, 2100.0, 0.0)]
+    assert alerts == [("ETH", 2100.0)]
     assert metadata_updates[0][0] == 7
     assert metadata_updates[0][1]["synthetic_reconciliation"] is True
     assert metadata_updates[0][1]["reconciliation_reason"] == "live_reconciled_closed"
+
+
+def test_sync_shadow_book_creates_synthetic_trade_for_orphan_live_position(monkeypatch):
+    opened = []
+    audits = []
+
+    class FakeLiveTrader:
+        def is_live_enabled(self):
+            return True
+
+        def is_deployable(self):
+            return True
+
+        def get_positions(self):
+            return [
+                {
+                    "coin": "BTC",
+                    "side": "long",
+                    "size": 0.15,
+                    "szi": 0.15,
+                    "entry_price": 64000.0,
+                    "leverage": 3,
+                }
+            ]
+
+        def get_account_value(self):
+            return 500.0
+
+    container = type(
+        "Container",
+        (),
+        {"live_trader": FakeLiveTrader(), "paper_trader": object()},
+    )()
+
+    monkeypatch.setattr("src.core.live_execution.db.get_open_paper_trades", lambda: [])
+    monkeypatch.setattr("src.core.live_execution.get_all_mids", lambda: {})
+    monkeypatch.setattr(
+        "src.core.live_execution.db.open_paper_trade",
+        lambda strategy_id, coin, side, entry_price, size, leverage=1, stop_loss=None, take_profit=None, metadata=None:
+            opened.append(
+                {
+                    "strategy_id": strategy_id,
+                    "coin": coin,
+                    "side": side,
+                    "entry_price": entry_price,
+                    "size": size,
+                    "leverage": leverage,
+                    "metadata": metadata,
+                }
+            ) or 99,
+    )
+    monkeypatch.setattr(
+        "src.core.live_execution.db.audit_log",
+        lambda **kwargs: audits.append(kwargs),
+    )
+
+    reconciled = sync_shadow_book_to_live(container)
+
+    assert reconciled == []
+    assert len(opened) == 1
+    assert opened[0]["coin"] == "BTC"
+    assert opened[0]["side"] == "long"
+    assert opened[0]["metadata"]["orphan_found"] is True
+    assert opened[0]["metadata"]["reconciliation_reason"] == "orphan_found"
+    assert opened[0]["metadata"]["source"] == "live_orphan"
+    assert audits[0]["action"] == "orphan_found"
 
 
 def test_process_closed_trades_skips_synthetic_reconciliation():

@@ -92,6 +92,7 @@ class SubsystemContainer:
     cross_venue_hedger: Any = None
     shadow_tracker: Any = None
     dashboard: Any = None
+    data_source_registry: Any = None
 
 
 # ---------------------------------------------------------------------------
@@ -137,11 +138,15 @@ def build_subsystems(
     Subsystems not in the profile are skipped (left as None).
     """
     import config
+    from src.core.data_source_registry import DataSourceRegistry
 
     if profile is None:
         profile = FULL_PROFILE
 
     c = SubsystemContainer()
+    c.data_source_registry = DataSourceRegistry()
+    for source_name in ("polymarket", "options_flow", "deribit"):
+        c.data_source_registry.register_source(source_name)
     logger.info("Building subsystems (profile has %d features)…", len(profile))
 
     # ─── Core ─────────────────────────────────────────────────
@@ -211,13 +216,16 @@ def build_subsystems(
                 lambda: XGBoostRegimeForecaster({
                     "model_path": getattr(_cfg, "XGBOOST_MODEL_PATH", "models/regime_xgboost.json"),
                     "retrain_interval": getattr(_cfg, "XGBOOST_RETRAIN_INTERVAL", 86400),
+                    "source_registry": c.data_source_registry,
                 }),
                 health,
             )
         else:
             from src.signals.predictive_regime_forecaster import PredictiveRegimeForecaster
             c.predictive_forecaster = _safe_init(
-                "predictive_forecaster", PredictiveRegimeForecaster, health,
+                "predictive_forecaster",
+                lambda: PredictiveRegimeForecaster({"source_registry": c.data_source_registry}),
+                health,
             )
 
     # Firewall — needs forecaster injected
@@ -304,7 +312,11 @@ def build_subsystems(
     # ─── Options Flow ─────────────────────────────────────────
     if "options_flow" in profile:
         from src.data.options_flow import OptionsFlowScanner
-        c.options_scanner = _safe_init("options_flow", OptionsFlowScanner, health)
+        c.options_scanner = _safe_init(
+            "options_flow",
+            lambda: OptionsFlowScanner(source_registry=c.data_source_registry),
+            health,
+        )
 
     # ─── Polymarket ───────────────────────────────────────────
     if "polymarket" in profile:
@@ -320,6 +332,7 @@ def build_subsystems(
                     "max_markets_per_scan": int(
                         getattr(config, "POLYMARKET_MAX_MARKETS_PER_SCAN", 100)
                     ),
+                    "source_registry": c.data_source_registry,
                 }
             ),
             health,

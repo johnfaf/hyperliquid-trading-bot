@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
 from src.data import database as db
@@ -15,6 +16,28 @@ from src.data.hyperliquid_client import get_all_mids
 from src.signals.signal_schema import signal_from_execution_dict
 
 logger = logging.getLogger(__name__)
+
+
+def _trade_metadata(trade: Dict) -> Dict:
+    try:
+        existing_meta = trade.get("metadata", {})
+        if isinstance(existing_meta, str):
+            existing_meta = json.loads(existing_meta or "{}")
+        return dict(existing_meta or {})
+    except Exception:
+        return {}
+
+
+def _notify_manual_close_detected(trade: Dict, exit_price: float) -> None:
+    try:
+        from src.notifications import telegram_bot as tg
+    except Exception:
+        return
+
+    try:
+        tg.notify_manual_close_detected(trade, exit_price=exit_price)
+    except Exception as exc:
+        logger.debug("Manual close notification failed for %s: %s", trade.get("coin", "?"), exc)
 
 
 def _is_insufficient_margin_rejection(result) -> bool:
@@ -104,20 +127,32 @@ def sync_shadow_book_to_live(container) -> List[Dict]:
     if account_value is None or account_value <= 0:
         return []
 
+    fetched_positions = trader.get_positions() if trader else None
+    if fetched_positions is None:
+        logger.warning("Skipping shadow/live reconciliation: exchange positions unavailable")
+        return []
+
     live_positions = {
         pos.get("coin", ""): pos
-        for pos in (trader.get_positions() or [])
+        for pos in fetched_positions
         if pos.get("coin") and abs(float(pos.get("szi", pos.get("size", 0)) or 0)) > 0
     }
     open_trades = db.get_open_paper_trades()
     if not open_trades:
-        return []
+        open_trades = []
 
     mids = get_all_mids() or {}
     closed = []
+    matched_live_keys = set()
     for trade in open_trades:
         live_pos = live_positions.get(trade.get("coin", ""))
         if live_pos and live_pos.get("side") == trade.get("side"):
+            matched_live_keys.add(
+                (
+                    str(trade.get("coin", "") or "").upper(),
+                    str(trade.get("side", "") or "").lower(),
+                )
+            )
             continue
 
         current_price = float(
@@ -132,13 +167,7 @@ def sync_shadow_book_to_live(container) -> List[Dict]:
         if trade_id is None:
             continue
 
-        try:
-            existing_meta = trade.get("metadata", {})
-            if isinstance(existing_meta, str):
-                existing_meta = json.loads(existing_meta or "{}")
-            existing_meta = dict(existing_meta or {})
-        except Exception:
-            existing_meta = {}
+        existing_meta = _trade_metadata(trade)
 
         existing_meta.update({
             "synthetic_reconciliation": True,
@@ -148,6 +177,13 @@ def sync_shadow_book_to_live(container) -> List[Dict]:
         db.update_paper_trade_metadata(trade_id, existing_meta)
         if not db.close_paper_trade(trade_id, current_price, 0.0):
             continue
+        _notify_manual_close_detected(
+            {
+                **trade,
+                "metadata": existing_meta,
+            },
+            exit_price=current_price,
+        )
 
         closed_trade = {
             "trade_id": trade_id,
@@ -173,6 +209,65 @@ def sync_shadow_book_to_live(container) -> List[Dict]:
             "Shadow paper trade reconciled to exchange truth: %s %s",
             trade.get("side", "?").upper(),
             trade.get("coin", "?"),
+        )
+
+    for live_pos in live_positions.values():
+        coin = str(live_pos.get("coin", "") or "").upper()
+        side = str(live_pos.get("side", "") or "").lower()
+        if not coin or side not in {"long", "short"}:
+            continue
+        if (coin, side) in matched_live_keys:
+            continue
+
+        entry_price = float(
+            live_pos.get("entry_price", live_pos.get("entryPx", 0))
+            or 0
+        )
+        size = abs(float(live_pos.get("size", live_pos.get("szi", 0)) or 0))
+        leverage = float(live_pos.get("leverage", 1) or 1)
+        if entry_price <= 0 or size <= 0:
+            continue
+
+        metadata = {
+            "synthetic_reconciliation": True,
+            "reconciliation_reason": "orphan_found",
+            "orphan_found": True,
+            "orphan_found_at": datetime.now(timezone.utc).isoformat(),
+            "source": "live_orphan",
+            "source_key": "live_orphan",
+            "strategy_type": "orphan_found",
+            "live_snapshot": {
+                "coin": coin,
+                "side": side,
+                "entry_price": entry_price,
+                "size": size,
+                "leverage": leverage,
+            },
+        }
+        trade_id = db.open_paper_trade(
+            None,
+            coin,
+            side,
+            entry_price,
+            size,
+            leverage=leverage,
+            metadata=metadata,
+        )
+        db.audit_log(
+            action="orphan_found",
+            coin=coin,
+            side=side,
+            price=entry_price,
+            size=size,
+            source="live_execution",
+            details={"trade_id": trade_id, "metadata": metadata},
+        )
+        logger.warning(
+            "Created synthetic paper trade for orphan live position: %s %s size=%.6f entry=%.6f",
+            side.upper(),
+            coin,
+            size,
+            entry_price,
         )
 
     return closed

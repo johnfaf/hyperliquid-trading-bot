@@ -6,6 +6,7 @@ import time
 import pytest
 
 from unittest.mock import patch, MagicMock
+from src.core.data_source_registry import DataSourceRegistry
 from src.signals.predictive_regime_forecaster import (
     PredictiveRegimeForecaster, ArkhamClient,
     W_FUNDING, W_IMBALANCE, W_ARKHAM,
@@ -135,3 +136,53 @@ def test_forecaster_marks_long_stale_external_inputs_as_partial(monkeypatch):
     assert result["components"]["options_flow"] == 0.0
     assert result["partial_signal"] is True
     assert result["partial_inputs"] == ["options_flow"]
+
+
+def test_forecaster_marks_polymarket_partial_when_source_registry_down(monkeypatch):
+    registry = DataSourceRegistry()
+    registry.mark_down("polymarket", reason="feed unavailable")
+    forecaster = PredictiveRegimeForecaster(
+        {
+            "external_data_ttl": 600,
+            "external_data_partial_ttl": 1800,
+            "source_registry": registry,
+        }
+    )
+    monkeypatch.setattr(forecaster, "_get_funding_slope", lambda coin: 0.0)
+    monkeypatch.setattr(forecaster, "_get_orderbook_imbalance", lambda coin: 0.0)
+    monkeypatch.setattr(forecaster, "_get_arkham_flow", lambda coin: 0.0)
+    forecaster._polymarket_sentiment = {"sentiment": "bullish", "confidence": 0.3}
+    forecaster._polymarket_ts = time.time()
+
+    result = forecaster.predict_regime("BTC")
+
+    assert result["components"]["polymarket"] == pytest.approx(0.6)
+    assert result["partial_signal"] is True
+    assert "polymarket" in result["partial_inputs"]
+    assert result["data_source_health"]["polymarket"]["state"] == "DOWN"
+
+
+def test_forecaster_marks_options_partial_when_registry_degraded(monkeypatch):
+    registry = DataSourceRegistry()
+    registry.mark_degraded("options_flow", reason="all currencies failed")
+    forecaster = PredictiveRegimeForecaster(
+        {
+            "external_data_ttl": 600,
+            "external_data_partial_ttl": 1800,
+            "source_registry": registry,
+        }
+    )
+    monkeypatch.setattr(forecaster, "_get_funding_slope", lambda coin: 0.0)
+    monkeypatch.setattr(forecaster, "_get_orderbook_imbalance", lambda coin: 0.0)
+    monkeypatch.setattr(forecaster, "_get_arkham_flow", lambda coin: 0.0)
+    forecaster._options_convictions = [
+        {"ticker": "BTC", "direction": "BEARISH", "conviction_pct": 55}
+    ]
+    forecaster._options_ts = time.time()
+
+    result = forecaster.predict_regime("BTC")
+
+    assert result["components"]["options_flow"] == pytest.approx(-0.55)
+    assert result["partial_signal"] is True
+    assert "options_flow" in result["partial_inputs"]
+    assert result["data_source_health"]["options_flow"]["state"] == "DEGRADED"

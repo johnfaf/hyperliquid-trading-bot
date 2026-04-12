@@ -53,9 +53,10 @@ class OptionsFlowScanner:
     # Expose as class attribute so tests and callers can access via instance
     TRACKED_CURRENCIES = TRACKED_CURRENCIES
 
-    def __init__(self):
+    def __init__(self, source_registry=None):
         self.session = requests.Session()
         self.session.headers.update({"Content-Type": "application/json"})
+        self.source_registry = source_registry
 
         # Caches
         self._instruments_cache = {}  # currency -> {instruments, ts}
@@ -80,6 +81,7 @@ class OptionsFlowScanner:
         )
         self._venue_last_request = {"deribit": 0.0, "binance_options": 0.0}
         self._venue_min_interval = {"deribit": 0.2, "binance_options": 0.2}
+        self._last_trade_fetch_success: Dict[str, bool] = {}
 
         logger.info("OptionsFlowScanner initialized")
 
@@ -107,6 +109,12 @@ class OptionsFlowScanner:
                 resp = self.session.get(url, params=params or {}, timeout=10)
                 if resp.status_code == 200:
                     data = resp.json()
+                    if self.source_registry:
+                        self.source_registry.mark_up(
+                            "deribit",
+                            reason=f"{method} ok",
+                            metadata={"method": method},
+                        )
                     return data.get("result", data)
                 elif resp.status_code == 429:
                     backoff = min(30, 2 ** (attempt + 1))
@@ -138,6 +146,12 @@ class OptionsFlowScanner:
                 backoff = min(10, 2 ** attempt)
                 time.sleep(backoff)
         logger.warning(f"Deribit {method} failed after {max_retries} attempts")
+        if self.source_registry:
+            self.source_registry.mark_degraded(
+                "deribit",
+                reason=f"{method} failed after retries",
+                metadata={"method": method},
+            )
         return None
 
     def _binance_options_get(self, endpoint: str, params: dict = None) -> Optional[dict]:
@@ -253,11 +267,13 @@ class OptionsFlowScanner:
     def get_recent_trades(self, currency: str, count: int = 500) -> List[Dict]:
         """Get recent options trades from Deribit for a currency."""
         trades = []
+        self._last_trade_fetch_success[currency] = False
 
         data = self._deribit_get("public/get_last_trades_by_currency", {
             "currency": currency, "kind": "option", "count": min(count, 1000)
         })
         if data and "trades" in data:
+            self._last_trade_fetch_success[currency] = True
             for t in data["trades"]:
                 inst_name = t.get("instrument_name", "")
                 # Parse instrument name: BTC-28MAR26-90000-C
@@ -439,10 +455,18 @@ class OptionsFlowScanner:
         """
         logger.info("Starting options flow scan...")
         all_unusual = []
+        successful_fetches = 0
+        fetch_failures = 0
+        total_trades_seen = 0
 
         for currency in TRACKED_CURRENCIES:
             try:
                 trades = self.get_recent_trades(currency, count=500)
+                if self._last_trade_fetch_success.get(currency):
+                    successful_fetches += 1
+                else:
+                    fetch_failures += 1
+                total_trades_seen += len(trades)
                 logger.info(f"{currency}: fetched {len(trades)} recent options trades")
 
                 passed_notional = 0
@@ -463,6 +487,7 @@ class OptionsFlowScanner:
                 time.sleep(0.3)  # Rate limiting between currencies
 
             except Exception as e:
+                fetch_failures += 1
                 logger.error(f"Error scanning {currency} flow: {e}")
 
         # Update state
@@ -494,8 +519,26 @@ class OptionsFlowScanner:
             "unusual_prints": len(all_unusual),
             "total_tracked": len(self.unusual_prints),
             "top_convictions": len(self.top_convictions),
+            "successful_fetches": successful_fetches,
+            "fetch_failures": fetch_failures,
+            "total_trades_seen": total_trades_seen,
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
+        if self.source_registry:
+            if successful_fetches <= 0:
+                self.source_registry.mark_down(
+                    "options_flow",
+                    reason="all tracked currencies failed",
+                    metadata=summary,
+                )
+            else:
+                state_method = self.source_registry.mark_degraded if fetch_failures > 0 else self.source_registry.mark_up
+                state_reason = (
+                    f"partial scan: {successful_fetches} ok / {fetch_failures} failed"
+                    if fetch_failures > 0
+                    else f"scan ok: {successful_fetches} currencies"
+                )
+                state_method("options_flow", reason=state_reason, metadata=summary)
         logger.info(f"Flow scan complete: {len(all_unusual)} new unusual prints, "
                     f"{len(self.unusual_prints)} total tracked")
         return summary

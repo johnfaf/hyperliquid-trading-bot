@@ -323,6 +323,22 @@ def notify_runtime_incident(snapshot: Dict, resolved: bool = False):
     _send_message(text)
 
 
+def notify_manual_close_detected(trade: Dict, exit_price: float):
+    """Alert when reconcile finds an exchange position disappeared unexpectedly."""
+    text = (
+        f"âš ï¸ <b>MANUAL / EXTERNAL CLOSE DETECTED</b>\n"
+        f"â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”\n"
+        f"<b>Coin:</b> {trade.get('coin', '?')}\n"
+        f"<b>Side:</b> {str(trade.get('side', '?')).upper()}\n"
+        f"<b>Entry:</b> ${float(trade.get('entry_price', 0) or 0):,.4f}\n"
+        f"<b>Exchange Exit:</b> ${float(exit_price or 0):,.4f}\n"
+        f"<b>Paper Trade ID:</b> {trade.get('id', trade.get('trade_id', '?'))}\n"
+        f"<b>Reason:</b> exchange position missing during reconcile\n"
+        f"\nâ° {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}"
+    )
+    _send_message(text)
+
+
 def notify_strong_signal(coin: str, side: str, reasons: List[str], confidence: float):
     """Notify about a high-confidence convergence signal."""
     emoji = "⚡🟢" if side == "long" else "⚡🔴"

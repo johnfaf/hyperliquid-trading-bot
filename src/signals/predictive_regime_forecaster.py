@@ -125,6 +125,7 @@ class PredictiveRegimeForecaster:
         self.hl_info_url = cfg.get("hl_info_url", "https://api.hyperliquid.xyz/info")
         self.cache_ttl = cfg.get("cache_ttl", 60)  # seconds
         self.cache: Dict[str, Dict] = {}
+        self.source_registry = cfg.get("source_registry")
 
         # Funding rate history for slope computation
         self._funding_history: Dict[str, deque] = {}
@@ -190,11 +191,16 @@ class PredictiveRegimeForecaster:
             }
         """
         now = time.time()
+        data_source_health = self._data_source_snapshot()
+        source_registry_version = self._source_registry_version()
 
         # Check cache
         if coin in self.cache:
             cached = self.cache[coin]
-            if now - cached.get("ts", 0) < self.cache_ttl:
+            if (
+                now - cached.get("ts", 0) < self.cache_ttl
+                and cached.get("source_registry_version") == source_registry_version
+            ):
                 return cached["data"]
 
         # Collect (weight, value) pairs — inactive sources are excluded
@@ -245,6 +251,9 @@ class PredictiveRegimeForecaster:
             active_input_names.append("polymarket")
         if pm_state == "partial":
             partial_inputs.append("polymarket")
+        registry_pm_state = self._registry_state("polymarket")
+        if registry_pm_state in {"DOWN", "DEGRADED"} and "polymarket" not in partial_inputs:
+            partial_inputs.append("polymarket")
 
         # 5. Options flow conviction (Deribit unusual activity)
         of_result = self._get_options_flow_signal(coin, now)
@@ -257,6 +266,9 @@ class PredictiveRegimeForecaster:
             active_weights.append((W_OPTIONS_FLOW, of_signal))
             active_input_names.append("options_flow")
         if of_state == "partial":
+            partial_inputs.append("options_flow")
+        registry_options_state = self._registry_state("options_flow")
+        if registry_options_state in {"DOWN", "DEGRADED"} and "options_flow" not in partial_inputs:
             partial_inputs.append("options_flow")
 
         # Compute composite with dynamic weight re-normalization
@@ -292,9 +304,14 @@ class PredictiveRegimeForecaster:
             "active_input_count": len(active_input_names),
             "partial_signal": bool(partial_inputs),
             "partial_inputs": partial_inputs,
+            "data_source_health": data_source_health,
         }
 
-        self.cache[coin] = {"data": data, "ts": now}
+        self.cache[coin] = {
+            "data": data,
+            "ts": now,
+            "source_registry_version": source_registry_version,
+        }
         inputs_str = "/".join(k for k in components if components[k] != 0.0) or "funding+book"
         logger.info(f"Forecaster {coin} → {regime} (signal={signal:.3f}, "
                     f"conf={confidence:.3f}, inputs={len(active_weights)}: {inputs_str})")
@@ -312,6 +329,29 @@ class PredictiveRegimeForecaster:
         if age <= self._external_data_partial_ttl:
             return "decayed"
         return "partial"
+
+    def _source_registry_version(self) -> int:
+        registry = self.source_registry
+        if not registry or not hasattr(registry, "version"):
+            return 0
+        try:
+            return int(registry.version())
+        except Exception:
+            return 0
+
+    def _data_source_snapshot(self) -> Dict[str, Dict]:
+        registry = self.source_registry
+        if not registry or not hasattr(registry, "snapshot"):
+            return {}
+        try:
+            return registry.snapshot()
+        except Exception:
+            return {}
+
+    def _registry_state(self, name: str) -> str:
+        snapshot = self._data_source_snapshot()
+        state = snapshot.get(str(name or "").strip().lower(), {}).get("state")
+        return str(state or "UNKNOWN").upper()
 
     def _get_polymarket_signal(self, now: float) -> Tuple[float, str]:
         """

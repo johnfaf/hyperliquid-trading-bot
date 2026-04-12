@@ -157,6 +157,7 @@ class PolymarketScanner:
 
     def __init__(self, config: Optional[Dict] = None):
         self.config = config or {}
+        self.source_registry = self.config.get("source_registry")
 
         # Cache configuration
         self.cache_ttl_minutes = self.config.get("cache_ttl_minutes", 5)
@@ -373,6 +374,12 @@ class PolymarketScanner:
             self._markets_tracked = 0
             self._crypto_markets_found = 0
             self._market_cache = {}
+            if self.source_registry:
+                self.source_registry.mark_down(
+                    "polymarket",
+                    reason="raw market fetch failed",
+                    metadata={"raw_markets": 0},
+                )
             return []
 
         enriched = []
@@ -571,6 +578,34 @@ class PolymarketScanner:
 
         # Cache only markets that survive liquidity and top-N filters.
         self._market_cache = {market.market_id: market for market in capped}
+        if self.source_registry:
+            if capped:
+                state_method = self.source_registry.mark_degraded if fallback_used else self.source_registry.mark_up
+                state_reason = (
+                    f"fallback active with {len(capped)} markets"
+                    if fallback_used
+                    else f"{len(capped)} markets active"
+                )
+                state_method(
+                    "polymarket",
+                    reason=state_reason,
+                    metadata={
+                        "raw_markets": len(raw_markets),
+                        "filtered_markets": len(filtered),
+                        "tracked_markets": len(capped),
+                        "fallback_used": fallback_used,
+                    },
+                )
+            else:
+                self.source_registry.mark_degraded(
+                    "polymarket",
+                    reason="no usable crypto markets after filtering",
+                    metadata={
+                        "raw_markets": len(raw_markets),
+                        "filtered_markets": len(filtered),
+                        "tracked_markets": 0,
+                    },
+                )
 
         return capped
 
