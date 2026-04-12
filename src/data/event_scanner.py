@@ -73,7 +73,11 @@ def _normalize_whitespace(text: str) -> str:
 
 
 def _sanitize_xml_text(text: str) -> str:
-    text = (text or "").lstrip("\ufeff")
+    text = (text or "").replace("\x00", "")
+    if text.startswith("\ufeff"):
+        text = text[1:]
+    if text.startswith("ï»¿"):
+        text = text[3:]
     if text.startswith("\x00"):
         text = text.replace("\x00", "")
     return text.lstrip()

@@ -1,7 +1,9 @@
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 from src.core import readiness
 from src.core.health_registry import SubsystemHealthRegistry, SubsystemState
+from src.core.subsystem_registry import heartbeat_active
 
 
 class _FakeLiveTrader:
@@ -170,3 +172,16 @@ def test_runtime_incident_monitor_alerts_on_resolution(monkeypatch):
     monitor.evaluate_and_alert()
 
     assert alerts == [("ready", True)]
+
+
+def test_heartbeat_active_refreshes_telegram_when_configured(monkeypatch):
+    import src.notifications.telegram_bot as telegram_bot
+
+    calls = []
+    monkeypatch.setattr(telegram_bot, "is_configured", lambda: True)
+    monkeypatch.setattr(telegram_bot, "heartbeat", lambda: calls.append("telegram"))
+
+    registry = SubsystemHealthRegistry()
+    heartbeat_active(SimpleNamespace(), registry)
+
+    assert calls == ["telegram"]

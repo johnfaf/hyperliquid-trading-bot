@@ -548,6 +548,14 @@ def heartbeat_active(container: SubsystemContainer,
             except Exception:
                 pass  # heartbeat is best-effort
 
+    try:
+        from src.notifications import telegram_bot as tg
+
+        if tg.is_configured():
+            tg.heartbeat()
+    except Exception:
+        pass
+
 
 # ---------------------------------------------------------------------------
 # Helpers

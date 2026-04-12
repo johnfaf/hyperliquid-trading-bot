@@ -61,6 +61,20 @@ def _report_health(success: bool, reason: str = "") -> None:
         return
 
 
+def heartbeat() -> None:
+    """Refresh Telegram subsystem heartbeat without changing its current state."""
+    try:
+        from src.core.health_registry import registry
+    except Exception:
+        return
+
+    try:
+        registry.register(_TELEGRAM_SUBSYSTEM, affects_trading=False)
+        registry.heartbeat(_TELEGRAM_SUBSYSTEM)
+    except Exception:
+        return
+
+
 def is_configured() -> bool:
     """Check if Telegram credentials are set."""
     token, chat_id, _ = _load_credentials()
