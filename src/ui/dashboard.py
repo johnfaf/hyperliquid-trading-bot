@@ -368,6 +368,10 @@ def get_dashboard_data():
         initial_balance = config.PAPER_TRADING_INITIAL_BALANCE
         balance = account.get("balance", initial_balance)
         roi = ((balance / initial_balance) - 1) * 100 if initial_balance else 0
+        try:
+            events = _event_scanner.get_dashboard_data() if _event_scanner else None
+        except Exception:
+            events = None
 
         return {
             "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -394,6 +398,7 @@ def get_dashboard_data():
             "type_distribution": type_dist,
             "research_logs": logs,
             "score_history": score_history,
+            "events": events,
             "v2": _get_v2_metrics(conn),
         }
     finally:
@@ -456,6 +461,7 @@ _signal_processor = None
 _arena_incubator = None
 _decision_engine = None
 _multi_scanner = None
+_event_scanner = None
 _health_registry = None
 _shadow_tracker = None
 
@@ -573,14 +579,14 @@ def set_v2_components(firewall=None, regime_detector=None, arena=None,
                        calibration=None, llm_filter=None,
                        liquidation_strategy=None, signal_processor=None,
                        arena_incubator=None, decision_engine=None,
-                       multi_scanner=None, shadow_tracker=None,
+                       multi_scanner=None, event_scanner=None, shadow_tracker=None,
                        health_registry=None):
     """Set V2 + V2.5 + V3 + V4 component references for dashboard metrics."""
     global _firewall, _regime_detector, _arena  # noqa: PLW0603
     global _agent_scorer, _shadow_tracker  # noqa: PLW0603
     global _kelly_sizer, _trade_memory, _calibration, _llm_filter, _liquidation_strategy  # noqa
     global _signal_processor, _arena_incubator, _decision_engine  # noqa
-    global _multi_scanner, _health_registry  # noqa
+    global _multi_scanner, _event_scanner, _health_registry  # noqa
     _firewall = firewall
     _regime_detector = regime_detector
     _arena = arena
@@ -594,6 +600,7 @@ def set_v2_components(firewall=None, regime_detector=None, arena=None,
     _arena_incubator = arena_incubator
     _decision_engine = decision_engine
     _multi_scanner = multi_scanner
+    _event_scanner = event_scanner
     _shadow_tracker = shadow_tracker
     _health_registry = health_registry
 
@@ -1048,6 +1055,33 @@ details[open] summary::after{content:'-'}
     <details class="section">
       <summary>
         <div>
+          <p class="section-tag">Events</p>
+          <h2 class="section-title">Macro and Policy Calendar</h2>
+        </div>
+        <span class="summary-copy">Upcoming core data and recent official releases</span>
+      </summary>
+      <div class="details-body">
+        <div id="events-summary" class="detail-list">Loading event scanner...</div>
+        <div class="split-grid" style="margin-top:14px;margin-bottom:0">
+          <div class="table-shell">
+            <table>
+              <thead><tr><th>Time</th><th>Source</th><th>Severity</th><th>Event</th></tr></thead>
+              <tbody id="events-upcoming"></tbody>
+            </table>
+          </div>
+          <div class="table-shell">
+            <table>
+              <thead><tr><th>Published</th><th>Source</th><th>Category</th><th>Release</th></tr></thead>
+              <tbody id="events-recent"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </details>
+
+    <details class="section">
+      <summary>
+        <div>
           <p class="section-tag">Cycle Feed</p>
           <h2 class="section-title">Research Activity</h2>
         </div>
@@ -1231,6 +1265,42 @@ function renderLogs(logs){
     <td>${l.summary}</td><td>${l.traders_analyzed||0}</td><td>${l.strategies_found||0}</td></tr>`).join('');
 }
 
+function renderEvents(events){
+  if(!events){
+    document.getElementById('events-summary').textContent = 'Event scanner not initialized.';
+    document.getElementById('events-upcoming').innerHTML = '<tr><td colspan="4" class="empty-row">No event data</td></tr>';
+    document.getElementById('events-recent').innerHTML = '<tr><td colspan="4" class="empty-row">No recent official releases</td></tr>';
+    return;
+  }
+
+  const summary = events.summary || {};
+  const nextLabel = summary.next_event_title
+    ? `${summary.next_event_title} at ${(summary.next_event_time || '').slice(0,16).replace('T',' ')}`
+    : 'No upcoming core events in the lookahead window.';
+  document.getElementById('events-summary').innerHTML =
+    `<div>Sources healthy: <strong>${summary.sources_ok || 0}/${summary.sources_total || 0}</strong></div>` +
+    `<div>High impact next 24h: <strong>${summary.high_impact_next_24h || 0}</strong></div>` +
+    `<div>Next event: <strong>${nextLabel}</strong></div>`;
+
+  const upcoming = events.upcoming || [];
+  document.getElementById('events-upcoming').innerHTML = upcoming.length ? upcoming.map(event=>`
+    <tr>
+      <td>${event.event_time ? event.event_time.slice(5,16).replace('T',' ') : 'n/a'}</td>
+      <td>${event.source}</td>
+      <td><span class="badge badge-type">${event.severity}</span></td>
+      <td>${event.title}</td>
+    </tr>`).join('') : '<tr><td colspan="4" class="empty-row">No upcoming core events</td></tr>';
+
+  const recent = events.recent || [];
+  document.getElementById('events-recent').innerHTML = recent.length ? recent.map(event=>`
+    <tr>
+      <td>${(event.published_time || event.event_time || '').slice(5,16).replace('T',' ') || 'n/a'}</td>
+      <td>${event.source}</td>
+      <td><span class="badge badge-type">${event.category}</span></td>
+      <td>${event.title}</td>
+    </tr>`).join('') : '<tr><td colspan="4" class="empty-row">No recent official releases</td></tr>';
+}
+
 function renderCopyTrades(trades){
   document.getElementById('copy-trades').innerHTML = trades.length ? trades.slice(0,15).map(t=>{
     let meta = {};
@@ -1367,6 +1437,7 @@ async function refresh(){
     renderEquityChart(d.closed_trades);
     renderTypeChart(d.type_distribution);
     renderLogs(d.research_logs);
+    renderEvents(d.events);
     if(d.v2) renderV2(d.v2);
     if(d.runtime_health) renderRuntimeHealth(d.runtime_health);
     if(d.v2 && d.v2.arena) renderArena(d.v2.arena);

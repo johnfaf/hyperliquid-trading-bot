@@ -37,7 +37,7 @@ FUNDABLE_CORE = {
 
 FULL_PROFILE = FUNDABLE_CORE | {
     "copy_trader", "live_trader", "options_flow", "polymarket",
-    "predictive_forecaster", "xgboost_forecaster", "multi_scanner",
+    "predictive_forecaster", "xgboost_forecaster", "multi_scanner", "event_scanner",
     "liquidation_strategy", "kelly_sizer", "trade_memory", "calibration",
     "llm_filter", "signal_processor", "arena_incubator", "decision_engine",
     "alpha_arena", "position_monitor", "dashboard", "telegram",
@@ -75,6 +75,7 @@ class SubsystemContainer:
     polymarket: Any = None
     predictive_forecaster: Any = None
     multi_scanner: Any = None
+    event_scanner: Any = None
     liquidation_strategy: Any = None
     kelly_sizer: Any = None
     trade_memory: Any = None
@@ -309,6 +310,16 @@ def build_subsystems(
             health,
         )
 
+    # Structured event scanner (official macro / policy releases)
+    if "event_scanner" in profile and getattr(config, "EVENT_SCANNER_ENABLED", True):
+        from src.data.event_scanner import EventScanner
+        c.event_scanner = _safe_init(
+            "event_scanner",
+            EventScanner,
+            health,
+            affects_trading=False,
+        )
+
     # ─── Copy trader ──────────────────────────────────────────
     if "copy_trader" in profile:
         from src.trading.copy_trader import CopyTrader
@@ -445,6 +456,7 @@ def build_subsystems(
                 arena_incubator=c.arena_incubator,
                 decision_engine=c.decision_engine,
                 multi_scanner=c.multi_scanner,
+                event_scanner=c.event_scanner,
                 shadow_tracker=c.shadow_tracker,
                 health_registry=health,
             )
@@ -501,6 +513,7 @@ _FIELD_TO_HEALTH_NAME: dict = {
     "options_scanner":        "options_flow",
     "polymarket":             "polymarket",
     "multi_scanner":          "multi_scanner",
+    "event_scanner":          "event_scanner",
     "copy_trader":            "copy_trader",
     "paper_trader":           "paper_trader",
     "live_trader":            "live_trader",

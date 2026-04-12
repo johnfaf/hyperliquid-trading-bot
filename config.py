@@ -338,6 +338,17 @@ POLYMARKET_MAX_MARKETS_PER_SCAN = int(
 OPTIONS_FLOW_ENABLED = os.environ.get("OPTIONS_FLOW_ENABLED", "true").lower() in ("true", "1", "yes")
 OPTIONS_FLOW_SCAN_INTERVAL = int(os.environ.get("OPTIONS_FLOW_SCAN_INTERVAL", 120))  # 2 minutes
 
+# ─── Structured Event Scanner ──────────────────────────────
+EVENT_SCANNER_ENABLED = os.environ.get("EVENT_SCANNER_ENABLED", "true").lower() in ("true", "1", "yes")
+EVENT_SCANNER_LOOKAHEAD_DAYS = int(os.environ.get("EVENT_SCANNER_LOOKAHEAD_DAYS", 14))
+EVENT_SCANNER_RECENT_HOURS = int(os.environ.get("EVENT_SCANNER_RECENT_HOURS", 72))
+EVENT_SCANNER_REFRESH_SECONDS = int(os.environ.get("EVENT_SCANNER_REFRESH_SECONDS", 900))
+EVENT_SCANNER_MAX_UPCOMING = int(os.environ.get("EVENT_SCANNER_MAX_UPCOMING", 12))
+EVENT_SCANNER_MAX_RECENT = int(os.environ.get("EVENT_SCANNER_MAX_RECENT", 12))
+EVENT_SCANNER_INCLUDE_MEDIUM = os.environ.get(
+    "EVENT_SCANNER_INCLUDE_MEDIUM", "true"
+).lower() in ("true", "1", "yes")
+
 # ─── Forecaster External Data ───────────────────────────────
 # How long before external data (Polymarket, Options) is considered stale
 FORECASTER_EXTERNAL_DATA_TTL = int(os.environ.get("FORECASTER_EXTERNAL_DATA_TTL", 600))  # 10 min
@@ -427,6 +438,11 @@ def _validate_config_bounds() -> None:
         ("POLYMARKET_SCAN_INTERVAL", 10, 3600, 180),
         ("POLYMARKET_MAX_MARKETS_PER_SCAN", 10, 10_000, 100),
         ("OPTIONS_FLOW_SCAN_INTERVAL", 10, 3600, 120),
+        ("EVENT_SCANNER_LOOKAHEAD_DAYS", 1, 90, 14),
+        ("EVENT_SCANNER_RECENT_HOURS", 1, 720, 72),
+        ("EVENT_SCANNER_REFRESH_SECONDS", 60, 86_400, 900),
+        ("EVENT_SCANNER_MAX_UPCOMING", 1, 200, 12),
+        ("EVENT_SCANNER_MAX_RECENT", 1, 200, 12),
         ("FORECASTER_EXTERNAL_DATA_TTL", 10, 86_400, 600),
         ("ARENA_CHAMPION_MIN_FITNESS", 0.0, 1.0, 0.15),
         ("ARENA_CHAMPION_MIN_TRADES", 1, 500, 5),

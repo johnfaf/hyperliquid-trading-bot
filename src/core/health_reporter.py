@@ -198,6 +198,17 @@ def write_health_report(
     except Exception:
         pass
     try:
+        if getattr(container, "event_scanner", None):
+            stats = container.event_scanner.get_stats()
+            pipeline["events"] = {
+                "upcoming": stats.get("upcoming_count", 0),
+                "recent": stats.get("recent_count", 0),
+                "active": stats.get("active_count", 0),
+                "high_impact_next_24h": stats.get("high_impact_next_24h", 0),
+            }
+    except Exception:
+        pass
+    try:
         if container.kelly_sizer:
             all_stats = container.kelly_sizer.get_all_sizing_stats()
             edge_count = sum(1 for value in all_stats.values() if value.get("has_edge"))
