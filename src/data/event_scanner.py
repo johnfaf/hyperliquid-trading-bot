@@ -72,6 +72,13 @@ def _normalize_whitespace(text: str) -> str:
     return re.sub(r"\s+", " ", (text or "").strip())
 
 
+def _sanitize_xml_text(text: str) -> str:
+    text = (text or "").lstrip("\ufeff")
+    if text.startswith("\x00"):
+        text = text.replace("\x00", "")
+    return text.lstrip()
+
+
 def _parse_bool_like(value) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
@@ -397,7 +404,7 @@ class EventScanner:
         cutoff = now - timedelta(hours=self.recent_hours)
         events: List[Dict] = []
         try:
-            root = ET.fromstring(text)
+            root = ET.fromstring(_sanitize_xml_text(text))
         except Exception as exc:
             logger.warning("EventScanner failed to parse %s feed: %s", source, exc)
             return events

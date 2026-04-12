@@ -198,6 +198,18 @@ def test_parse_statuspage_feed_extracts_crypto_incident():
     assert "BTC" in incidents[0]["assets"]
 
 
+def test_parse_rss_feed_accepts_utf8_bom():
+    scanner = EventScanner({"recent_hours": 96})
+    recent_pub = format_datetime(datetime.now(timezone.utc) - timedelta(hours=2))
+    rss = f"\ufeff<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<rss><channel><item><title>Statement from the Federal Open Market Committee</title><link>https://www.federalreserve.gov/example</link><pubDate>{recent_pub}</pubDate><description>Monetary policy decision</description></item></channel></rss>"
+
+    events = scanner._parse_rss_feed(rss, "Federal Reserve")
+
+    assert len(events) == 1
+    assert events[0]["source"] == "Federal Reserve"
+    assert events[0]["severity"] == "critical"
+
+
 def test_get_risk_state_blocks_on_imminent_event_and_incident(monkeypatch):
     scanner = EventScanner(
         {
