@@ -107,6 +107,13 @@ PAPER_TRADING_TAKER_FEE_BPS = float(os.environ.get("PAPER_TRADING_TAKER_FEE_BPS"
 PAPER_TRADING_DEFAULT_EXECUTION_ROLE = os.environ.get(
     "PAPER_TRADING_DEFAULT_EXECUTION_ROLE", "taker"
 ).lower()
+# Simulated slippage range applied to paper market orders (basis points).
+PAPER_TRADING_SLIPPAGE_MIN_BPS = float(os.environ.get("PAPER_TRADING_SLIPPAGE_MIN_BPS", 1.0))
+PAPER_TRADING_SLIPPAGE_MAX_BPS = float(os.environ.get("PAPER_TRADING_SLIPPAGE_MAX_BPS", 5.0))
+# Accrue Hyperliquid 8h funding payments on open paper positions.
+PAPER_TRADING_FUNDING_ENABLED = os.environ.get(
+    "PAPER_TRADING_FUNDING_ENABLED", "true"
+).lower() in ("true", "1", "yes")
 
 # Live trading wallet / secret-management controls.
 # Agent-wallet-only mode: signer key must be for a delegated agent wallet, and

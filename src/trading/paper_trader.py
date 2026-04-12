@@ -57,6 +57,7 @@ class PaperTrader:
         self.rotation_manager = PortfolioRotationManager()
         self._closed_events: List[Dict] = []
         self._ensure_account()
+        self._sync_fee_tier()
 
     def _ensure_account(self):
         """Initialize paper trading account if it doesn't exist."""
@@ -64,6 +65,36 @@ class PaperTrader:
         if not account:
             db.init_paper_account(config.PAPER_TRADING_INITIAL_BALANCE)
             logger.info(f"Paper account initialized with ${config.PAPER_TRADING_INITIAL_BALANCE:,.2f}")
+
+    def _sync_fee_tier(self):
+        """Query the live Hyperliquid account's fee schedule and align paper fees.
+
+        Runs once at init.  On failure the config defaults are kept, so paper
+        trading is never blocked by a fee-lookup hiccup.
+        """
+        address = os.environ.get("HL_PUBLIC_ADDRESS", "").strip()
+        if not address:
+            return
+        try:
+            data = hl.get_user_fee_rate(address)
+            if not data:
+                return
+            # API returns decimal strings, e.g. "0.000245" = 2.45 bps.
+            maker_raw = data.get("makerRate") or data.get("maker")
+            taker_raw = data.get("takerRate") or data.get("taker")
+            if maker_raw is not None:
+                maker_bps = round(float(maker_raw) * 10_000, 4)
+                config.PAPER_TRADING_MAKER_FEE_BPS = maker_bps
+            if taker_raw is not None:
+                taker_bps = round(float(taker_raw) * 10_000, 4)
+                config.PAPER_TRADING_TAKER_FEE_BPS = taker_bps
+            logger.info(
+                "Paper fees synced to live tier: maker=%.2f bps, taker=%.2f bps",
+                config.PAPER_TRADING_MAKER_FEE_BPS,
+                config.PAPER_TRADING_TAKER_FEE_BPS,
+            )
+        except Exception as exc:
+            logger.debug("Fee tier sync failed (using defaults): %s", exc)
 
     def get_account_summary(self) -> Dict:
         """Get current paper trading account summary."""
@@ -870,11 +901,13 @@ class PaperTrader:
         - Orderbook depth (larger orders move price more)
         - Latency (price moves between signal and fill)
 
-        We apply 0.01% to 0.05% adverse slippage, randomized.
+        Slippage range is configurable via PAPER_TRADING_SLIPPAGE_MIN/MAX_BPS.
         Entry longs get a higher price, entry shorts get a lower price.
         Exit is the reverse.
         """
-        slippage_bps = random.uniform(1, 5)  # 0.01% to 0.05%
+        lo = max(config.PAPER_TRADING_SLIPPAGE_MIN_BPS, 0.0)
+        hi = max(config.PAPER_TRADING_SLIPPAGE_MAX_BPS, lo)
+        slippage_bps = random.uniform(lo, hi)
         slippage_pct = slippage_bps / 10_000
 
         if is_entry:
@@ -1006,7 +1039,9 @@ class PaperTrader:
         entry_fee = entry_notional * fee_rate
         exit_fee = exit_notional * fee_rate
         total_fees = entry_fee + exit_fee
-        pnl = round(gross_pnl - total_fees, 2)
+        # Include accumulated funding payments (positive = cost to holder).
+        funding_accrued = float(trade_meta.get("funding_accrued", 0.0))
+        pnl = round(gross_pnl - total_fees - funding_accrued, 2)
 
         intended_entry = float(trade_meta.get("intended_entry_price", trade.get("entry_price", 0)) or trade.get("entry_price", 0) or 0)
         entry_slippage_cost = self._slippage_cost(
@@ -1038,6 +1073,7 @@ class PaperTrader:
                 "exit_slippage_cost": round(exit_slippage_cost, 4),
                 "total_slippage_cost": total_slippage_cost,
                 "gross_pnl_before_fees": round(gross_pnl, 4),
+                "funding_accrued": round(funding_accrued, 4),
                 "net_pnl_after_fees": pnl,
                 "intended_exit_price": float(current_price or 0),
                 "exit_slipped_price": slipped_exit,
@@ -1051,6 +1087,7 @@ class PaperTrader:
                 "entry_fee_paid": round(entry_fee, 4),
                 "exit_fee_paid": round(exit_fee, 4),
                 "total_fees_paid": round(total_fees, 4),
+                "funding_accrued": round(funding_accrued, 4),
                 "entry_slippage_cost": round(entry_slippage_cost, 4),
                 "exit_slippage_cost": round(exit_slippage_cost, 4),
                 "total_slippage_cost": total_slippage_cost,
@@ -1079,7 +1116,7 @@ class PaperTrader:
             db.update_paper_account(new_balance, new_total_pnl, new_total_trades, new_winning)
 
         logger.info(
-            "Paper trade closed (%s): %s %s entry=$%s exit=$%s gross=$%s fees=$%s net=$%s",
+            "Paper trade closed (%s): %s %s entry=$%s exit=$%s gross=$%s fees=$%s funding=$%s net=$%s",
             close_reason,
             trade["side"].upper(),
             trade["coin"],
@@ -1087,6 +1124,7 @@ class PaperTrader:
             f"{slipped_exit:,.2f}",
             f"{gross_pnl:,.2f}",
             f"{total_fees:,.2f}",
+            f"{funding_accrued:,.4f}",
             f"{pnl:,.2f}",
         )
 
@@ -1224,12 +1262,29 @@ class PaperTrader:
         Close any that hit stop-loss, take-profit, or trailing stop.
         Also implements trailing stop: if price moves 3%+ in our favor,
         ratchet the stop-loss to lock in at least breakeven.
+
+        When PAPER_TRADING_FUNDING_ENABLED is True, accrues Hyperliquid 8h
+        funding on every open position proportional to elapsed time.
         """
         open_trades = db.get_open_paper_trades()
         if not open_trades:
             return []
 
         mids = hl.get_all_mids() or {}
+
+        # Fetch live funding rates for accrual (best-effort; empty on failure).
+        funding_rates: Dict[str, float] = {}
+        if config.PAPER_TRADING_FUNDING_ENABLED:
+            try:
+                ctxs = hl.get_asset_contexts() or {}
+                for coin, ctx in ctxs.items():
+                    rate = float(ctx.get("funding", 0) if isinstance(ctx, dict) else 0)
+                    if rate:
+                        funding_rates[coin.upper()] = rate
+            except Exception as exc:
+                logger.debug("Funding rate fetch for paper accrual failed: %s", exc)
+
+        now_utc = datetime.now(timezone.utc)
         closed = []
 
         for trade in open_trades:
@@ -1287,6 +1342,47 @@ class PaperTrader:
                     if trail_sl < sl:
                         self._update_stop_loss(trade["id"], trail_sl)
                         sl = trail_sl
+
+            # --- Funding rate accrual ---
+            # Hyperliquid settles funding every 8h.  We prorate the current
+            # rate across the time elapsed since our last accrual so paper
+            # positions reflect the real cost of carry.
+            coin_upper = trade["coin"].upper() if trade.get("coin") else ""
+            fr = funding_rates.get(coin_upper, 0.0)
+            if fr and config.PAPER_TRADING_FUNDING_ENABLED:
+                try:
+                    meta_raw = trade.get("metadata", "{}")
+                    t_meta = json.loads(meta_raw) if isinstance(meta_raw, str) else dict(meta_raw or {})
+                    last_ts = t_meta.get("last_funding_ts", "")
+                    if last_ts:
+                        last_dt = datetime.fromisoformat(last_ts)
+                        if last_dt.tzinfo is None:
+                            last_dt = last_dt.replace(tzinfo=timezone.utc)
+                    else:
+                        # First accrual — use position open time
+                        opened_str = trade.get("opened_at", "")
+                        last_dt = datetime.fromisoformat(opened_str) if opened_str else now_utc
+                        if last_dt.tzinfo is None:
+                            last_dt = last_dt.replace(tzinfo=timezone.utc)
+
+                    elapsed_h = max((now_utc - last_dt).total_seconds() / 3600, 0.0)
+                    if elapsed_h > 0.01:  # skip trivially small intervals
+                        notional = current_price * float(trade.get("size", 0) or 0) * float(trade.get("leverage", 1) or 1)
+                        # funding_rate is per 8h period; prorate to elapsed time.
+                        # Longs pay when rate > 0, shorts pay when rate < 0.
+                        if trade["side"] == "long":
+                            payment = notional * fr * (elapsed_h / 8.0)
+                        else:
+                            payment = notional * (-fr) * (elapsed_h / 8.0)
+                        prev_accrued = float(t_meta.get("funding_accrued", 0.0))
+                        new_accrued = round(prev_accrued + payment, 6)
+                        db.update_paper_trade_metadata(trade["id"], {
+                            "funding_accrued": new_accrued,
+                            "last_funding_ts": now_utc.isoformat(),
+                            "last_funding_rate": fr,
+                        })
+                except Exception as exc:
+                    logger.debug("Funding accrual failed for trade %s: %s", trade.get("id"), exc)
 
             # Check stop loss (using potentially updated SL)
             if sl:

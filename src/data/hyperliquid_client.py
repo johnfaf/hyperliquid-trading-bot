@@ -127,6 +127,30 @@ def get_asset_contexts():
     return {}
 
 
+def get_user_fee_rate(address: str) -> Optional[dict]:
+    """Fetch the account's current maker/taker fee rates from Hyperliquid.
+
+    Returns a dict like ``{"makerRate": "0.00002", "takerRate": "0.000245"}``
+    or *None* on failure / invalid address.  Rates are decimal strings
+    (e.g. "0.000245" = 2.45 bps).
+    """
+    if not _is_valid_eth_address(address):
+        return None
+    try:
+        data = _post(
+            {"type": "userFees", "user": address.strip()},
+            priority=Priority.LOW,
+        )
+        if isinstance(data, dict):
+            return data
+        # Some API versions nest inside a list; unwrap if needed.
+        if isinstance(data, list) and data:
+            return data[0] if isinstance(data[0], dict) else None
+    except Exception as exc:
+        logger.debug("get_user_fee_rate failed for %s: %s", address[:10], exc)
+    return None
+
+
 # ─── User / Trader Data ───────────────────────────────────────
 
 def get_user_state(address: str):
