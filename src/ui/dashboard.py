@@ -26,6 +26,7 @@ try:
 except ImportError:
     pass
 import config
+from src.analysis.trade_analytics import compute_trade_analytics
 from src.core.readiness import evaluate_readiness
 
 logger = logging.getLogger(__name__)
@@ -327,7 +328,7 @@ def get_dashboard_data():
 
         # Lifetime execution-cost rollup across all closed trades
         all_closed = [dict(r) for r in conn.execute(
-            "SELECT id, pnl, entry_price, exit_price, size, leverage, metadata FROM paper_trades WHERE status = 'closed'"
+            "SELECT id, side, pnl, entry_price, exit_price, size, leverage, metadata FROM paper_trades WHERE status = 'closed'"
         ).fetchall()]
         total_fees = 0.0
         total_slippage = 0.0
@@ -337,6 +338,7 @@ def get_dashboard_data():
             total_slippage += costs["slippage_cost"]
         recent_fees = sum(float(t.get("fees_paid", 0) or 0) for t in closed_trades)
         recent_slippage = sum(float(t.get("slippage_cost", 0) or 0) for t in closed_trades)
+        trade_analytics = compute_trade_analytics(all_closed, source_limit=10)
 
         # Copy trades (from metadata)
         copy_trades = [dict(r) for r in conn.execute(
@@ -399,6 +401,7 @@ def get_dashboard_data():
             "research_logs": logs,
             "score_history": score_history,
             "events": events,
+            "trade_analytics": trade_analytics,
             "v2": _get_v2_metrics(conn),
         }
     finally:
@@ -688,6 +691,7 @@ def _build_runtime_health_snapshot() -> Dict:
                 "top_rejection_reason": fw.get("top_rejection_reason", "none"),
                 "daily_losses": float(fw.get("daily_losses", 0.0) or 0.0),
                 "source_policies": fw.get("source_policies", [])[:10],
+                "short_side_policy": fw.get("short_side_policy", {}),
             }
     except Exception:
         pass
@@ -703,9 +707,17 @@ def _build_runtime_health_snapshot() -> Dict:
                 "daily_pnl": stats.get("daily_pnl"),
                 "daily_pnl_limit": stats.get("daily_pnl_limit"),
                 "entry_signals_today": stats.get("total_entry_signals_today"),
+                "attempted_entry_signals": stats.get("attempted_entry_signals"),
+                "executed_entry_signals": stats.get("executed_entry_signals"),
                 "max_orders_per_source_per_day": stats.get("max_orders_per_source_per_day"),
                 "source_orders_today": stats.get("source_orders_today", {}),
                 "source_policies": stats.get("source_policies", [])[:10],
+                "short_side_policy": stats.get("short_side_policy", {}),
+                "entry_metrics": stats.get("entry_metrics", {}),
+                "min_order_rejects_today": stats.get("min_order_rejects_today"),
+                "min_order_floorups_today": stats.get("min_order_floorups_today"),
+                "canary_headroom_ratio": stats.get("canary_headroom_ratio"),
+                "crash_safe_canary_order_usd": stats.get("crash_safe_canary_order_usd"),
             }
     except Exception:
         pass
@@ -1006,6 +1018,39 @@ details[open] summary::after{content:'-'}
     <details class="section">
       <summary>
         <div>
+          <p class="section-tag">Execution Analytics</p>
+          <h2 class="section-title">Sides, Sources, and Canary</h2>
+        </div>
+        <span class="summary-copy">Recent side performance, realized source results, and live execution friction</span>
+      </summary>
+      <div class="details-body">
+        <div id="analytics-summary" class="detail-list">Loading execution analytics...</div>
+        <div class="split-grid" style="margin-top:14px;margin-bottom:0">
+          <div class="table-shell">
+            <table>
+              <thead><tr><th>Side</th><th>Trades</th><th>Win Rate</th><th>Fees</th><th>Net PnL</th></tr></thead>
+              <tbody id="analytics-sides"></tbody>
+            </table>
+          </div>
+          <div class="table-shell">
+            <table>
+              <thead><tr><th>Source</th><th>Trades</th><th>Win Rate</th><th>Fees</th><th>Net PnL</th></tr></thead>
+              <tbody id="analytics-sources"></tbody>
+            </table>
+          </div>
+          <div class="table-shell">
+            <table>
+              <thead><tr><th>Live Metric</th><th>Value</th></tr></thead>
+              <tbody id="analytics-live"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </details>
+
+    <details class="section">
+      <summary>
+        <div>
           <p class="section-tag">Regime</p>
           <h2 class="section-title">Per-Coin Context</h2>
         </div>
@@ -1250,6 +1295,78 @@ function renderClosedTrades(trades){
     : '<tr><td colspan="10" class="empty-row">No closed trades yet</td></tr>';
 }
 
+function renderTradeAnalytics(analytics, runtime){
+  const summaryEl = document.getElementById('analytics-summary');
+  const sidesEl = document.getElementById('analytics-sides');
+  const sourcesEl = document.getElementById('analytics-sources');
+  const liveEl = document.getElementById('analytics-live');
+  if(!analytics){
+    summaryEl.textContent = 'Execution analytics not available yet.';
+    sidesEl.innerHTML = '<tr><td colspan="5" class="empty-row">No side analytics</td></tr>';
+    sourcesEl.innerHTML = '<tr><td colspan="5" class="empty-row">No source analytics</td></tr>';
+    liveEl.innerHTML = '<tr><td colspan="2" class="empty-row">No live analytics</td></tr>';
+    return;
+  }
+
+  const summary = analytics.summary || {};
+  const comp = analytics.short_vs_long || {};
+  const runtimeLive = (runtime || {}).live_trader || {};
+  const shortPolicy = runtimeLive.short_side_policy || ((runtime || {}).firewall || {}).short_side_policy || {};
+  const policyStatus = String(shortPolicy.status || 'unknown').toUpperCase();
+  const policyReason = shortPolicy.reason || 'No short-side policy data yet.';
+  summaryEl.innerHTML =
+    `<div>Closed trades: <strong>${summary.count || 0}</strong> | Net PnL: <strong class="${pnlClass(summary.net_pnl || 0)}">${fmtUsd(summary.net_pnl || 0)}</strong> | Win rate: <strong>${((summary.win_rate || 0) * 100).toFixed(1)}%</strong></div>` +
+    `<div>Short vs long: <strong class="${pnlClass(comp.short_net_pnl || 0)}">short ${fmtUsd(comp.short_net_pnl || 0)}</strong> vs <strong class="${pnlClass(comp.long_net_pnl || 0)}">long ${fmtUsd(comp.long_net_pnl || 0)}</strong></div>` +
+    `<div>Short guardrail: <strong>${policyStatus}</strong> — ${policyReason}</div>`;
+
+  const sides = analytics.by_side || [];
+  sidesEl.innerHTML = sides.length ? sides.map(row => `
+    <tr>
+      <td><span class="badge badge-${row.label}">${row.label.toUpperCase()}</span></td>
+      <td>${row.count}</td>
+      <td>${((row.win_rate || 0) * 100).toFixed(1)}%</td>
+      <td class="red">${fmtUsd(-(row.fees || 0))}</td>
+      <td class="${pnlClass(row.net_pnl || 0)}">${fmtUsd(row.net_pnl || 0)}</td>
+    </tr>`).join('') : '<tr><td colspan="5" class="empty-row">No side analytics yet</td></tr>';
+
+  const sources = analytics.by_source || [];
+  sourcesEl.innerHTML = sources.length ? sources.map(row => `
+    <tr>
+      <td><code class="agent-key">${row.label}</code></td>
+      <td>${row.count}</td>
+      <td>${((row.win_rate || 0) * 100).toFixed(1)}%</td>
+      <td class="red">${fmtUsd(-(row.fees || 0))}</td>
+      <td class="${pnlClass(row.net_pnl || 0)}">${fmtUsd(row.net_pnl || 0)}</td>
+    </tr>`).join('') : '<tr><td colspan="5" class="empty-row">No realized source results yet</td></tr>';
+
+  const entryMetrics = runtimeLive.entry_metrics || {};
+  const attempted = Number(runtimeLive.attempted_entry_signals || 0);
+  const executed = Number(runtimeLive.executed_entry_signals || 0);
+  const acceptRate = attempted > 0 ? `${((executed / attempted) * 100).toFixed(1)}%` : 'n/a';
+  const liveRows = [
+    ['Canary mode', runtimeLive.canary_mode ? 'ON' : 'OFF'],
+    ['Attempted entries', attempted],
+    ['Executed entries', executed],
+    ['Execution hit rate', acceptRate],
+    ['Min-order rejects', Number(runtimeLive.min_order_rejects_today || 0)],
+    ['Min-order floor-ups', Number(runtimeLive.min_order_floorups_today || 0)],
+    ['Canary headroom', runtimeLive.canary_headroom_ratio != null ? `${runtimeLive.canary_headroom_ratio}x` : 'n/a'],
+    ['Crash-safe cap', runtimeLive.crash_safe_canary_order_usd != null ? fmtUsd(runtimeLive.crash_safe_canary_order_usd) : 'n/a'],
+    ['Top reject', (runtime || {}).firewall?.top_rejection_reason || 'none'],
+  ];
+  Object.entries(entryMetrics)
+    .filter(([key, value]) => String(key).startsWith('rejected_') && Number(value) > 0)
+    .sort((a, b) => Number(b[1]) - Number(a[1]))
+    .slice(0, 5)
+    .forEach(([key, value]) => liveRows.push([key.replaceAll('_', ' '), value]));
+
+  liveEl.innerHTML = liveRows.map(([label, value]) => `
+    <tr>
+      <td>${label}</td>
+      <td>${value}</td>
+    </tr>`).join('');
+}
+
 function renderTypeChart(dist){
   const ctx = document.getElementById('type-chart').getContext('2d');
   const labels = dist.map(d=>d.strategy_type);
@@ -1450,6 +1567,7 @@ async function refresh(){
     renderStrategies(d.strategies);
     renderTraders(d.traders);
     renderClosedTrades(d.closed_trades);
+    renderTradeAnalytics(d.trade_analytics, d.runtime_health);
     renderCopyTrades(d.copy_trades || []);
     renderEquityChart(d.closed_trades);
     renderTypeChart(d.type_distribution);
@@ -1482,16 +1600,21 @@ function renderV2(v2) {
     <div class="value ${c.cls||''}">${c.value}</div>
     ${c.sub?`<div class="sub">${c.sub}</div>`:''}</div>`).join('');
 
-  const reasons = ['confidence','risk','regime','conflict','cooldown','accuracy','drawdown','schema']
+  const reasons = ['confidence','risk','regime','conflict','cooldown','accuracy','drawdown','schema','source_policy','source_cap','event_risk','side_policy','exposure','funding']
     .filter(r => fw['rejected_'+r] > 0)
     .map(r => `<span class="reason-tag">${r}: ${fw['rejected_'+r]}</span>`)
     .join('');
   const shadowLine = shadow.total_trades
     ? `<div>Shadow ${shadow.period_days || 30}d: <strong class="${pnlClass(shadow.total_pnl || 0)}">${fmtUsd(shadow.total_pnl || 0)}</strong> across ${shadow.total_trades} trades. Best ${shadow.best_source || 'n/a'}, worst ${shadow.worst_source || 'n/a'}.</div>`
     : '<div class="table-note">Shadow attribution will populate as more trades close.</div>';
+  const shortPolicy = fw.short_side_policy || {};
+  const shortPolicyLine = shortPolicy.status
+    ? `<div>Short guardrail: <strong>${String(shortPolicy.status).toUpperCase()}</strong> — ${shortPolicy.reason || 'n/a'}</div>`
+    : '';
   document.getElementById('firewall-stats').innerHTML =
     `<div>Total: <strong>${fw.total_signals || 0}</strong> | Passed: <span class="green">${fw.passed || 0}</span> | Rejected: <span class="red">${Math.max((fw.total_signals || 0) - (fw.passed || 0), 0)}</span></div>` +
     `<div>${reasons || '<span class="green">No rejection pressure right now.</span>'}</div>` +
+    shortPolicyLine +
     shadowLine;
 
   document.getElementById('agent-scores').innerHTML = scorecard.length ? scorecard.map(s=>{
@@ -1566,12 +1689,19 @@ function renderRuntimeHealth(runtime) {
         .join(', ')
     : 'none';
   const readinessReasons = (readiness.reasons || []).slice(0, 5).join(', ') || 'none';
+  const attempted = Number(live.attempted_entry_signals || 0);
+  const executed = Number(live.executed_entry_signals || 0);
+  const hitRate = attempted > 0 ? `${((executed / attempted) * 100).toFixed(1)}%` : 'n/a';
+  const shortPolicy = live.short_side_policy || fw.short_side_policy || {};
   document.getElementById('runtime-health-detail').innerHTML =
     `<div>At-risk: <strong>${atRiskList}</strong></div>` +
     `<div>Stale: <strong>${staleList}</strong></div>` +
     `<div>Readiness blockers: <strong>${readinessReasons}</strong></div>` +
     `<div>Firewall top reject: <strong>${topReject}</strong></div>` +
     `<div>Kill-switch reason: ${killReason}</div>` +
+    `<div>Canary execution: <strong>${executed}/${attempted}</strong> (${hitRate}) | min-order rejects <strong>${live.min_order_rejects_today || 0}</strong> | floor-ups <strong>${live.min_order_floorups_today || 0}</strong></div>` +
+    `<div>Canary headroom: <strong>${live.canary_headroom_ratio != null ? live.canary_headroom_ratio + 'x' : 'n/a'}</strong> | crash-safe cap <strong>${live.crash_safe_canary_order_usd != null ? fmtUsd(live.crash_safe_canary_order_usd) : 'n/a'}</strong></div>` +
+    `<div>Short guardrail: <strong>${String(shortPolicy.status || 'unknown').toUpperCase()}</strong> — ${shortPolicy.reason || 'n/a'}</div>` +
     `<div>Live source usage: <strong>${sourceUsageSummary}</strong></div>` +
     `<div>Source allocator: <strong>${sourcePolicySummary}</strong></div>`;
 }

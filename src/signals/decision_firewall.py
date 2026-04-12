@@ -21,6 +21,7 @@ from datetime import datetime, timezone
 from typing import List, Dict, Optional, Tuple
 from collections import defaultdict
 
+from src.analysis.trade_analytics import evaluate_short_side_policy
 from src.signals.signal_schema import TradeSignal
 from src.data import database as db
 
@@ -62,6 +63,28 @@ class DecisionFirewall:
         self.agent_scorer = cfg.get("agent_scorer")
         self.event_scanner = cfg.get("event_scanner")
         self.event_risk_enabled = bool(cfg.get("event_risk_enabled", True))
+        self.short_hardening_enabled = bool(cfg.get("short_hardening_enabled", True))
+        self.short_hardening_lookback_trades = max(
+            10, int(cfg.get("short_hardening_lookback_trades", 120))
+        )
+        self.short_hardening_min_closed_trades = max(
+            1, int(cfg.get("short_hardening_min_closed_trades", 12))
+        )
+        self.short_hardening_degrade_win_rate = float(
+            cfg.get("short_hardening_degrade_win_rate", 0.45)
+        )
+        self.short_hardening_block_win_rate = float(
+            cfg.get("short_hardening_block_win_rate", 0.35)
+        )
+        self.short_hardening_block_net_pnl = float(
+            cfg.get("short_hardening_block_net_pnl", -1.0)
+        )
+        self.short_hardening_confidence_multiplier = float(
+            cfg.get("short_hardening_confidence_multiplier", 0.85)
+        )
+        self.short_hardening_size_multiplier = float(
+            cfg.get("short_hardening_size_multiplier", 0.60)
+        )
         self.canary_mode = bool(cfg.get("canary_mode", False))
         self.canary_max_positions = max(1, int(cfg.get("canary_max_positions", 2)))
         # Lowered from 300 → 60: 5-minute cooldown was blocking re-entries
@@ -114,6 +137,8 @@ class DecisionFirewall:
         self._daily_losses: float = 0.0
         self._daily_reset_date: str = ""
         self._source_signal_counts: Dict[str, int] = defaultdict(int)
+        self._side_policy_cache: Dict[str, object] = {"ts": 0.0, "short": {}}
+        self._side_policy_cache_ttl_s = 300.0
 
         # Stats
         self.stats = {
@@ -132,6 +157,7 @@ class DecisionFirewall:
             "rejected_exposure": 0,
             "rejected_funding": 0,
             "rejected_event_risk": 0,
+            "rejected_side_policy": 0,
             # LOW-FIX LOW-1: count audit-log write failures so ops can detect
             # when the audit trail is silently broken (DB full, locked, etc.)
             "audit_log_failures": 0,
@@ -175,6 +201,64 @@ class DecisionFirewall:
 
     def set_event_scanner(self, event_scanner) -> None:
         self.event_scanner = event_scanner
+
+    def _get_short_side_policy(self) -> Dict:
+        if not self.short_hardening_enabled:
+            return {
+                "status": "disabled",
+                "reason": "Short hardening disabled",
+                "metrics": {"count": 0, "win_rate": 0.0, "net_pnl": 0.0},
+            }
+
+        now = time.time()
+        cached = self._side_policy_cache.get("short") or {}
+        if cached and (now - float(self._side_policy_cache.get("ts", 0.0) or 0.0)) < self._side_policy_cache_ttl_s:
+            return dict(cached)
+
+        try:
+            closed = db.get_paper_trade_history(limit=self.short_hardening_lookback_trades)
+            policy = evaluate_short_side_policy(
+                closed,
+                min_trades=self.short_hardening_min_closed_trades,
+                degrade_win_rate=self.short_hardening_degrade_win_rate,
+                block_win_rate=self.short_hardening_block_win_rate,
+                block_net_pnl=self.short_hardening_block_net_pnl,
+            )
+        except Exception as exc:
+            logger.debug("Short-side policy lookup failed: %s", exc)
+            policy = {
+                "status": "policy_error",
+                "reason": str(exc),
+                "metrics": {"count": 0, "win_rate": 0.0, "net_pnl": 0.0},
+            }
+
+        self._side_policy_cache = {"ts": now, "short": dict(policy)}
+        return dict(policy)
+
+    def _apply_side_policy(self, signal: TradeSignal) -> Tuple[bool, str]:
+        side_val = signal.side.value if hasattr(signal.side, "value") else str(signal.side)
+        if str(side_val).lower() != "short":
+            return True, ""
+
+        policy = self._get_short_side_policy()
+        status = str(policy.get("status", "healthy") or "healthy")
+        if status == "blocked":
+            return False, policy.get("reason", "Short-side guardrail blocked the signal")
+        if status == "degraded":
+            original_confidence = float(signal.confidence)
+            signal.confidence *= self.short_hardening_confidence_multiplier
+            signal.position_pct *= self.short_hardening_size_multiplier
+            if signal.size > 0:
+                signal.size *= self.short_hardening_size_multiplier
+            logger.warning(
+                "Short hardening de-risked %s: confidence %.0f%% -> %.0f%%, size *= %.2f (%s)",
+                signal.coin,
+                original_confidence * 100,
+                signal.confidence * 100,
+                self.short_hardening_size_multiplier,
+                policy.get("reason", "recent short underperformance"),
+            )
+        return True, ""
 
     def _apply_event_risk(self, signal: TradeSignal, dry_run: bool = False) -> Tuple[bool, str]:
         if not self.event_risk_enabled or not self.event_scanner:
@@ -333,6 +417,10 @@ class DecisionFirewall:
         event_risk_ok, event_risk_reason = self._apply_event_risk(signal, dry_run=dry_run)
         if not event_risk_ok:
             return _reject("rejected_event_risk", event_risk_reason)
+
+        side_policy_ok, side_policy_reason = self._apply_side_policy(signal)
+        if not side_policy_ok:
+            return _reject("rejected_side_policy", side_policy_reason)
 
         # 2. Minimum confidence
         if signal.confidence < self.min_confidence:
@@ -558,6 +646,7 @@ class DecisionFirewall:
         with self._lock:
             if pnl < 0:
                 self._daily_losses += abs(pnl)
+            self._side_policy_cache["ts"] = 0.0
 
     def set_daily_losses(self, loss_amount: float):
         """Set the current day's realized loss snapshot directly."""
@@ -619,4 +708,5 @@ class DecisionFirewall:
             "max_signals_per_source_per_day": int(self.max_signals_per_source_per_day),
             "source_signal_counts": dict(self._source_signal_counts),
             "source_policies": self.agent_scorer.get_scorecard() if self.agent_scorer else [],
+            "short_side_policy": self._get_short_side_policy(),
         }

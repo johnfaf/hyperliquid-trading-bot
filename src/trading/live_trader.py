@@ -472,6 +472,7 @@ class LiveTrader:
         self.orders_today = 0
         self.fills_today = 0
         self._source_orders_today: Dict[str, int] = defaultdict(int)
+        self._entry_metrics: Dict[str, int] = defaultdict(int)
 
         # Track realized PnL from closed positions for daily loss enforcement
         self._last_known_positions: Dict[str, Dict] = {}  # coin -> position snapshot
@@ -1084,6 +1085,7 @@ class LiveTrader:
             self.orders_today = 0
             self.fills_today = 0
             self._source_orders_today.clear()
+            self._entry_metrics.clear()
             self.kill_switch_active = False
             self._kill_switch_reason = ""
             logger.info("Daily counters reset")
@@ -2043,6 +2045,7 @@ class LiveTrader:
                         and candidate_notional <= self.max_order_usd
                         and candidate_size <= size * 1.25
                     ):
+                        self._entry_metrics["min_notional_floorups"] += 1
                         logger.info(
                             "place_market_order: floor-up %s %s %.6f → "
                             "%.6f (notional $%.2f → $%.2f) to clear "
@@ -2054,6 +2057,7 @@ class LiveTrader:
                         notional = candidate_notional
                         bumped = True
                 if not bumped:
+                    self._entry_metrics["rejected_below_min_notional"] += 1
                     logger.warning(
                         "place_market_order: rejecting %s %s size %.6f — "
                         "notional $%.2f is below Hyperliquid's $%.2f "
@@ -2817,10 +2821,12 @@ class LiveTrader:
         """
         signal = self._coerce_signal(signal)
         source_key = self._signal_source_key(signal)
+        self._entry_metrics["attempted_entry_signals"] += 1
 
         # External kill-switch takes precedence over any other gate.
         self._refresh_external_kill_switch()
         if self.check_daily_loss(refresh_from_fills=True):
+            self._entry_metrics["rejected_daily_loss"] += 1
             logger.warning("Daily loss limit exceeded - rejecting signal")
             return None
 
@@ -2828,6 +2834,7 @@ class LiveTrader:
             live_positions = self.get_firewall_positions() if self.is_deployable() else None
             live_account_value = self.get_account_value() if self.is_deployable() else None
             if self.is_deployable() and live_positions is None:
+                self._entry_metrics["rejected_positions_unavailable"] += 1
                 logger.warning(
                     "Live positions unavailable - rejecting signal rather than trading blind"
                 )
@@ -2840,6 +2847,7 @@ class LiveTrader:
                 account_balance=live_account_value,
             )
             if not passed:
+                self._entry_metrics["rejected_firewall"] += 1
                 logger.info(f"Signal rejected by firewall: {reason}")
                 return None
         else:
@@ -2850,6 +2858,7 @@ class LiveTrader:
 
         # Check kill switch
         if self.kill_switch_active:
+            self._entry_metrics["rejected_kill_switch"] += 1
             logger.warning("Kill switch active - rejecting signal")
             return None
 
@@ -2857,6 +2866,7 @@ class LiveTrader:
         total_signals_today = sum(self._source_orders_today.values())
         if self.canary_mode and self.canary_max_signals_per_day > 0:
             if total_signals_today >= self.canary_max_signals_per_day:
+                self._entry_metrics["rejected_canary_cap"] += 1
                 logger.warning(
                     "Canary signal cap reached (%d/%d) - rejecting %s (source=%s)",
                     total_signals_today,
@@ -2868,6 +2878,7 @@ class LiveTrader:
         if self.max_orders_per_source_per_day > 0:
             used = self._source_orders_today.get(source_key, 0)
             if used >= self.max_orders_per_source_per_day:
+                self._entry_metrics["rejected_source_cap"] += 1
                 logger.warning(
                     "Source/day cap reached for %s (%d/%d) - rejecting %s",
                     source_key,
@@ -2890,6 +2901,7 @@ class LiveTrader:
             # Compute coin quantity from USD notional: position_pct × max_position_size / mid
             mid = self._get_mid_price(coin)
             if not mid or mid <= 0:
+                self._entry_metrics["rejected_no_mid_price"] += 1
                 logger.warning(
                     f"Cannot compute order size for {coin}: no mid price available — skipping"
                 )
@@ -2917,6 +2929,7 @@ class LiveTrader:
             requested_entry_size = float(size)
 
             if not size or size <= 0:
+                self._entry_metrics["rejected_invalid_size"] += 1
                 logger.warning(f"Calculated size is 0 or negative for {coin} — skipping")
                 return None
 
@@ -2933,6 +2946,7 @@ class LiveTrader:
 
             if not self._is_order_result_success(entry_result):
                 if self._is_insufficient_margin_rejection(entry_result):
+                    self._entry_metrics["rejected_insufficient_margin"] += 1
                     logger.warning(
                         "Skipping %s %s entry due to insufficient margin: %s",
                         coin,
@@ -2940,6 +2954,11 @@ class LiveTrader:
                         entry_result,
                     )
                 else:
+                    reason = ""
+                    if isinstance(entry_result, dict):
+                        reason = str(entry_result.get("reason", "") or "")
+                    if reason != "below_exchange_minimum_notional":
+                        self._entry_metrics["rejected_exchange"] += 1
                     logger.error(f"Failed to place entry order: {entry_result}")
                 return entry_result
 
@@ -3150,6 +3169,7 @@ class LiveTrader:
             # Return summary
             if self._is_order_result_success(entry_result) and not self.dry_run:
                 self._source_orders_today[source_key] += 1
+                self._entry_metrics["executed_entry_signals"] += 1
             return {
                 "status": "success",
                 "coin": coin,
@@ -3218,6 +3238,23 @@ class LiveTrader:
                 if self.firewall and hasattr(self.firewall, "get_stats")
                 else []
             ),
+            "short_side_policy": (
+                self.firewall.get_stats().get("short_side_policy", {})
+                if self.firewall and hasattr(self.firewall, "get_stats")
+                else {}
+            ),
+            "entry_metrics": dict(self._entry_metrics),
+            "min_order_rejects_today": int(self._entry_metrics.get("rejected_below_min_notional", 0)),
+            "min_order_floorups_today": int(self._entry_metrics.get("min_notional_floorups", 0)),
+            "attempted_entry_signals": int(self._entry_metrics.get("attempted_entry_signals", 0)),
+            "executed_entry_signals": int(self._entry_metrics.get("executed_entry_signals", 0)),
+            "canary_headroom_ratio": round(
+                (self.max_order_usd / self.min_order_usd), 2
+            ) if self.min_order_usd else None,
+            "crash_safe_canary_order_usd": round(
+                self.min_order_usd / max(getattr(self.firewall, "crash_size_multiplier", 1.0), 1e-6),
+                2,
+            ) if self.firewall and self.min_order_usd else None,
             "wallet_balance": dict(self._last_balance_snapshot),
             "asset_indices_loaded": len(self.asset_index_map),
             "timestamp": datetime.now(timezone.utc).isoformat()

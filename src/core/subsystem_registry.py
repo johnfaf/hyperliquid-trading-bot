@@ -234,6 +234,28 @@ def build_subsystems(
             "max_signals_per_source_per_day": getattr(
                 _fw_cfg, "FIREWALL_MAX_SIGNALS_PER_SOURCE_PER_DAY", 0
             ),
+            "short_hardening_enabled": bool(getattr(_fw_cfg, "SHORT_HARDENING_ENABLED", True)),
+            "short_hardening_lookback_trades": int(
+                getattr(_fw_cfg, "SHORT_HARDENING_LOOKBACK_TRADES", 120)
+            ),
+            "short_hardening_min_closed_trades": int(
+                getattr(_fw_cfg, "SHORT_HARDENING_MIN_CLOSED_TRADES", 12)
+            ),
+            "short_hardening_degrade_win_rate": float(
+                getattr(_fw_cfg, "SHORT_HARDENING_DEGRADE_WIN_RATE", 0.45)
+            ),
+            "short_hardening_block_win_rate": float(
+                getattr(_fw_cfg, "SHORT_HARDENING_BLOCK_WIN_RATE", 0.35)
+            ),
+            "short_hardening_block_net_pnl": float(
+                getattr(_fw_cfg, "SHORT_HARDENING_BLOCK_NET_PNL", -1.0)
+            ),
+            "short_hardening_confidence_multiplier": float(
+                getattr(_fw_cfg, "SHORT_HARDENING_CONFIDENCE_MULTIPLIER", 0.85)
+            ),
+            "short_hardening_size_multiplier": float(
+                getattr(_fw_cfg, "SHORT_HARDENING_SIZE_MULTIPLIER", 0.60)
+            ),
             "canary_mode": bool(getattr(_fw_cfg, "FIREWALL_CANARY_MODE", False)),
             "canary_max_positions": int(getattr(_fw_cfg, "FIREWALL_CANARY_MAX_POSITIONS", 2)),
         }),

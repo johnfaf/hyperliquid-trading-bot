@@ -10,8 +10,10 @@ import os
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
+import config
 from src.core.live_execution import is_live_trading_active
 from src.core.readiness import evaluate_readiness
+from src.analysis.trade_analytics import compute_trade_analytics
 
 logger = logging.getLogger(__name__)
 
@@ -301,7 +303,26 @@ def write_health_report(
 
     try:
         if getattr(container, "live_trader", None):
-            report["live_trading"] = container.live_trader.get_stats()
+            live_stats = container.live_trader.get_stats()
+            report["live_trading"] = live_stats
+            report["canary"] = {
+                "mode": bool(live_stats.get("canary_mode", False)),
+                "attempted_entries": int(live_stats.get("attempted_entry_signals", 0) or 0),
+                "executed_entries": int(live_stats.get("executed_entry_signals", 0) or 0),
+                "min_order_rejects": int(live_stats.get("min_order_rejects_today", 0) or 0),
+                "min_order_floorups": int(live_stats.get("min_order_floorups_today", 0) or 0),
+                "crash_safe_canary_order_usd": live_stats.get("crash_safe_canary_order_usd"),
+            }
+    except Exception:
+        pass
+
+    try:
+        from src.data import database as db
+
+        report["trade_analytics"] = compute_trade_analytics(
+            db.get_paper_trade_history(limit=getattr(config, "LIVE_ANALYTICS_LOOKBACK_TRADES", 200)),
+            source_limit=8,
+        )
     except Exception:
         pass
 
