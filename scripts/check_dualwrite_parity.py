@@ -18,7 +18,6 @@ Usage::
     python scripts/check_dualwrite_parity.py --stats
 """
 import argparse
-import json
 import logging
 import os
 import sqlite3
@@ -49,6 +48,11 @@ TABLES = [
     "wallet_fills",
     "calibration_records",
     "agent_scores",
+    "arena_agents",
+    "arena_rounds",
+    "trade_memory",
+    "shadow_trades",
+    "shadow_attribution",
 ]
 
 

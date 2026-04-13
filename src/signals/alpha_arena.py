@@ -21,7 +21,6 @@ import logging
 import json
 import copy
 import random
-import sqlite3
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple, Any
 from dataclasses import dataclass, field, asdict
@@ -32,7 +31,7 @@ import numpy as np
 import sys
 import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-import config
+from src.data import database as db
 from src.signals.signal_schema import TradeSignal
 
 logger = logging.getLogger(__name__)
@@ -997,58 +996,105 @@ class AlphaArena:
     def _init_db(self):
         """Create arena tables if they don't exist."""
         try:
-            conn = sqlite3.connect(config.DB_PATH)
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS arena_agents (
-                    agent_id TEXT PRIMARY KEY,
-                    name TEXT,
-                    strategy_type TEXT,
-                    status TEXT DEFAULT 'incubating',
-                    params TEXT DEFAULT '{}',
-                    capital_allocated REAL DEFAULT 1000,
-                    total_pnl REAL DEFAULT 0,
-                    total_trades INTEGER DEFAULT 0,
-                    winning_trades INTEGER DEFAULT 0,
-                    sharpe_ratio REAL DEFAULT 0,
-                    max_drawdown REAL DEFAULT 0,
-                    win_rate REAL DEFAULT 0,
-                    generation INTEGER DEFAULT 0,
-                    parent_id TEXT DEFAULT '',
-                    elo_rating REAL DEFAULT 1000,
-                    tournament_rank INTEGER DEFAULT 0,
-                    backtest_sharpe REAL DEFAULT 0,
-                    backtest_pnl REAL DEFAULT 0,
-                    backtest_trades INTEGER DEFAULT 0,
-                    backtest_win_rate REAL DEFAULT 0,
-                    created_at TEXT,
-                    last_updated TEXT
-                )
-            """)
-            # Migrate existing tables that might be missing the new columns
-            for col, typedef in [
-                ("backtest_trades", "INTEGER DEFAULT 0"),
-                ("backtest_win_rate", "REAL DEFAULT 0"),
-            ]:
-                try:
-                    conn.execute(f"ALTER TABLE arena_agents ADD COLUMN {col} {typedef}")
-                except Exception:
-                    pass  # Column already exists
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS arena_rounds (
-                    round_id INTEGER PRIMARY KEY,
-                    started_at TEXT,
-                    ended_at TEXT,
-                    agents_entered INTEGER,
-                    agents_eliminated INTEGER,
-                    agents_promoted INTEGER,
-                    agents_spawned INTEGER,
-                    best_agent TEXT,
-                    best_fitness REAL,
-                    summary TEXT
-                )
-            """)
-            conn.commit()
-            conn.close()
+            with db.get_connection() as conn:
+                if db.get_backend_name() == "postgres":
+                    conn.execute("""
+                        CREATE TABLE IF NOT EXISTS arena_agents (
+                            agent_id TEXT PRIMARY KEY,
+                            name TEXT,
+                            strategy_type TEXT,
+                            status TEXT DEFAULT 'incubating',
+                            params TEXT DEFAULT '{}',
+                            capital_allocated DOUBLE PRECISION DEFAULT 1000,
+                            total_pnl DOUBLE PRECISION DEFAULT 0,
+                            total_trades INTEGER DEFAULT 0,
+                            winning_trades INTEGER DEFAULT 0,
+                            sharpe_ratio DOUBLE PRECISION DEFAULT 0,
+                            max_drawdown DOUBLE PRECISION DEFAULT 0,
+                            win_rate DOUBLE PRECISION DEFAULT 0,
+                            generation INTEGER DEFAULT 0,
+                            parent_id TEXT DEFAULT '',
+                            elo_rating DOUBLE PRECISION DEFAULT 1000,
+                            tournament_rank INTEGER DEFAULT 0,
+                            backtest_sharpe DOUBLE PRECISION DEFAULT 0,
+                            backtest_pnl DOUBLE PRECISION DEFAULT 0,
+                            backtest_trades INTEGER DEFAULT 0,
+                            backtest_win_rate DOUBLE PRECISION DEFAULT 0,
+                            created_at TIMESTAMPTZ,
+                            last_updated TIMESTAMPTZ
+                        )
+                    """)
+                    for col, typedef in [
+                        ("backtest_trades", "INTEGER DEFAULT 0"),
+                        ("backtest_win_rate", "DOUBLE PRECISION DEFAULT 0"),
+                    ]:
+                        try:
+                            conn.execute(f"ALTER TABLE arena_agents ADD COLUMN {col} {typedef}")
+                        except Exception:
+                            pass
+                    conn.execute("""
+                        CREATE TABLE IF NOT EXISTS arena_rounds (
+                            round_id BIGINT PRIMARY KEY,
+                            started_at TIMESTAMPTZ,
+                            ended_at TIMESTAMPTZ,
+                            agents_entered INTEGER,
+                            agents_eliminated INTEGER,
+                            agents_promoted INTEGER,
+                            agents_spawned INTEGER,
+                            best_agent TEXT,
+                            best_fitness DOUBLE PRECISION,
+                            summary TEXT
+                        )
+                    """)
+                else:
+                    conn.execute("""
+                        CREATE TABLE IF NOT EXISTS arena_agents (
+                            agent_id TEXT PRIMARY KEY,
+                            name TEXT,
+                            strategy_type TEXT,
+                            status TEXT DEFAULT 'incubating',
+                            params TEXT DEFAULT '{}',
+                            capital_allocated REAL DEFAULT 1000,
+                            total_pnl REAL DEFAULT 0,
+                            total_trades INTEGER DEFAULT 0,
+                            winning_trades INTEGER DEFAULT 0,
+                            sharpe_ratio REAL DEFAULT 0,
+                            max_drawdown REAL DEFAULT 0,
+                            win_rate REAL DEFAULT 0,
+                            generation INTEGER DEFAULT 0,
+                            parent_id TEXT DEFAULT '',
+                            elo_rating REAL DEFAULT 1000,
+                            tournament_rank INTEGER DEFAULT 0,
+                            backtest_sharpe REAL DEFAULT 0,
+                            backtest_pnl REAL DEFAULT 0,
+                            backtest_trades INTEGER DEFAULT 0,
+                            backtest_win_rate REAL DEFAULT 0,
+                            created_at TEXT,
+                            last_updated TEXT
+                        )
+                    """)
+                    for col, typedef in [
+                        ("backtest_trades", "INTEGER DEFAULT 0"),
+                        ("backtest_win_rate", "REAL DEFAULT 0"),
+                    ]:
+                        try:
+                            conn.execute(f"ALTER TABLE arena_agents ADD COLUMN {col} {typedef}")
+                        except Exception:
+                            pass
+                    conn.execute("""
+                        CREATE TABLE IF NOT EXISTS arena_rounds (
+                            round_id INTEGER PRIMARY KEY,
+                            started_at TEXT,
+                            ended_at TEXT,
+                            agents_entered INTEGER,
+                            agents_eliminated INTEGER,
+                            agents_promoted INTEGER,
+                            agents_spawned INTEGER,
+                            best_agent TEXT,
+                            best_fitness REAL,
+                            summary TEXT
+                        )
+                    """)
         except Exception as e:
             logger.warning(f"Arena DB init error: {e}")
 
@@ -1089,9 +1135,8 @@ class AlphaArena:
     def _load_agents(self):
         """Load agents from DB, purge non-seed agents, refill with seeds if needed."""
         try:
-            conn = sqlite3.connect(config.DB_PATH)
-            conn.row_factory = sqlite3.Row
-            rows = conn.execute("SELECT * FROM arena_agents").fetchall()
+            with db.get_connection(for_read=True) as conn:
+                rows = conn.execute("SELECT * FROM arena_agents").fetchall()
 
             # Load all agents from DB first
             for row in rows:
@@ -1120,8 +1165,6 @@ class AlphaArena:
                     created_at=row.get("created_at", ""),
                 )
                 self.agents[row["agent_id"]] = agent
-            conn.close()
-
             # Purge non-seed agents (only keep agents with IDs starting with "seed_")
             non_seed_ids = [aid for aid in self.agents.keys() if not aid.startswith("seed_")]
             for aid in non_seed_ids:
@@ -1142,32 +1185,52 @@ class AlphaArena:
     def _save_agents(self):
         """Persist all agents to DB."""
         try:
-            conn = sqlite3.connect(config.DB_PATH)
             now = datetime.now(timezone.utc).isoformat()
-            for agent in self.agents.values():
-                conn.execute("""
-                    INSERT OR REPLACE INTO arena_agents
-                    (agent_id, name, strategy_type, status, params,
-                     capital_allocated, total_pnl, total_trades, winning_trades,
-                     sharpe_ratio, max_drawdown, win_rate, generation, parent_id,
-                     elo_rating, tournament_rank, backtest_sharpe, backtest_pnl,
-                     backtest_trades, backtest_win_rate,
-                     created_at, last_updated)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                """, (
-                    agent.agent_id, agent.name, agent.strategy_type,
-                    agent.status.value, json.dumps(agent.params),
-                    agent.capital_allocated, agent.total_pnl,
-                    agent.total_trades, agent.winning_trades,
-                    agent.sharpe_ratio, agent.max_drawdown, agent.win_rate,
-                    agent.generation, agent.parent_id,
-                    agent.elo_rating, agent.tournament_rank,
-                    agent.backtest_sharpe, agent.backtest_pnl,
-                    agent.backtest_trades, agent.backtest_win_rate,
-                    agent.created_at, now,
-                ))
-            conn.commit()
-            conn.close()
+            with db.get_connection() as conn:
+                for agent in self.agents.values():
+                    conn.execute("""
+                        INSERT INTO arena_agents
+                        (agent_id, name, strategy_type, status, params,
+                         capital_allocated, total_pnl, total_trades, winning_trades,
+                         sharpe_ratio, max_drawdown, win_rate, generation, parent_id,
+                         elo_rating, tournament_rank, backtest_sharpe, backtest_pnl,
+                         backtest_trades, backtest_win_rate,
+                         created_at, last_updated)
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                        ON CONFLICT (agent_id) DO UPDATE SET
+                            name = EXCLUDED.name,
+                            strategy_type = EXCLUDED.strategy_type,
+                            status = EXCLUDED.status,
+                            params = EXCLUDED.params,
+                            capital_allocated = EXCLUDED.capital_allocated,
+                            total_pnl = EXCLUDED.total_pnl,
+                            total_trades = EXCLUDED.total_trades,
+                            winning_trades = EXCLUDED.winning_trades,
+                            sharpe_ratio = EXCLUDED.sharpe_ratio,
+                            max_drawdown = EXCLUDED.max_drawdown,
+                            win_rate = EXCLUDED.win_rate,
+                            generation = EXCLUDED.generation,
+                            parent_id = EXCLUDED.parent_id,
+                            elo_rating = EXCLUDED.elo_rating,
+                            tournament_rank = EXCLUDED.tournament_rank,
+                            backtest_sharpe = EXCLUDED.backtest_sharpe,
+                            backtest_pnl = EXCLUDED.backtest_pnl,
+                            backtest_trades = EXCLUDED.backtest_trades,
+                            backtest_win_rate = EXCLUDED.backtest_win_rate,
+                            created_at = EXCLUDED.created_at,
+                            last_updated = EXCLUDED.last_updated
+                    """, (
+                        agent.agent_id, agent.name, agent.strategy_type,
+                        agent.status.value, json.dumps(agent.params),
+                        agent.capital_allocated, agent.total_pnl,
+                        agent.total_trades, agent.winning_trades,
+                        agent.sharpe_ratio, agent.max_drawdown, agent.win_rate,
+                        agent.generation, agent.parent_id,
+                        agent.elo_rating, agent.tournament_rank,
+                        agent.backtest_sharpe, agent.backtest_pnl,
+                        agent.backtest_trades, agent.backtest_win_rate,
+                        agent.created_at, now,
+                    ))
         except Exception as e:
             logger.warning(f"Arena save error: {e}")
 

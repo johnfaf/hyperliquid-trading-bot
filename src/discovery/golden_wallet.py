@@ -12,7 +12,6 @@ startTime to cover the full 90-day window.
 import logging
 import time
 import json
-import sqlite3
 import os
 import sys
 from datetime import datetime, timedelta, timezone
@@ -20,7 +19,7 @@ from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Tuple
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-import config
+from src.data import database as db
 from src.data import hyperliquid_client as hl
 
 logger = logging.getLogger("golden_wallet")
@@ -429,76 +428,131 @@ def evaluate_wallet(address: str, bot_score: int = 0) -> Optional[Tuple[WalletRe
 # ─── Database persistence ────────────────────────────────────────
 
 def _get_db():
-    conn = sqlite3.connect(config.DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+    return db.get_connection()
 
 
 def init_golden_tables():
     """Create tables for golden wallet pipeline."""
-    conn = _get_db()
-    try:
-        conn.executescript("""
-        CREATE TABLE IF NOT EXISTS golden_wallets (
-            address TEXT PRIMARY KEY,
-            bot_score INTEGER DEFAULT 0,
-            total_fills INTEGER DEFAULT 0,
-            raw_pnl REAL DEFAULT 0,
-            penalised_pnl REAL DEFAULT 0,
-            max_drawdown_pct REAL DEFAULT 0,
-            penalised_max_drawdown_pct REAL DEFAULT 0,
-            sharpe_ratio REAL DEFAULT 0,
-            win_rate REAL DEFAULT 0,
-            trades_per_day REAL DEFAULT 0,
-            is_golden INTEGER DEFAULT 0,
-            coins_traded TEXT DEFAULT '[]',
-            best_coin TEXT DEFAULT '',
-            worst_coin TEXT DEFAULT '',
-            raw_equity_curve TEXT DEFAULT '[]',
-            penalised_equity_curve TEXT DEFAULT '[]',
-            equity_timestamps TEXT DEFAULT '[]',
-            evaluated_at TEXT NOT NULL,
-            connected_to_live INTEGER DEFAULT 0
-        );
+    with _get_db() as conn:
+        if db.get_backend_name() == "postgres":
+            conn.executescript("""
+            CREATE TABLE IF NOT EXISTS golden_wallets (
+                address TEXT PRIMARY KEY,
+                bot_score INTEGER DEFAULT 0,
+                total_fills INTEGER DEFAULT 0,
+                raw_pnl DOUBLE PRECISION DEFAULT 0,
+                penalised_pnl DOUBLE PRECISION DEFAULT 0,
+                max_drawdown_pct DOUBLE PRECISION DEFAULT 0,
+                penalised_max_drawdown_pct DOUBLE PRECISION DEFAULT 0,
+                sharpe_ratio DOUBLE PRECISION DEFAULT 0,
+                win_rate DOUBLE PRECISION DEFAULT 0,
+                trades_per_day DOUBLE PRECISION DEFAULT 0,
+                is_golden BOOLEAN DEFAULT FALSE,
+                coins_traded TEXT DEFAULT '[]',
+                best_coin TEXT DEFAULT '',
+                worst_coin TEXT DEFAULT '',
+                raw_equity_curve TEXT DEFAULT '[]',
+                penalised_equity_curve TEXT DEFAULT '[]',
+                equity_timestamps TEXT DEFAULT '[]',
+                evaluated_at TIMESTAMPTZ NOT NULL,
+                connected_to_live BOOLEAN DEFAULT FALSE
+            );
+            CREATE TABLE IF NOT EXISTS wallet_fills (
+                id BIGSERIAL PRIMARY KEY,
+                wallet_address TEXT NOT NULL REFERENCES golden_wallets(address),
+                coin TEXT NOT NULL,
+                side TEXT NOT NULL,
+                original_price DOUBLE PRECISION NOT NULL,
+                penalised_price DOUBLE PRECISION NOT NULL,
+                size DOUBLE PRECISION NOT NULL,
+                time_ms BIGINT NOT NULL,
+                delayed_time_ms BIGINT NOT NULL,
+                closed_pnl DOUBLE PRECISION DEFAULT 0,
+                penalised_pnl DOUBLE PRECISION DEFAULT 0,
+                fee DOUBLE PRECISION DEFAULT 0,
+                is_liquidation BOOLEAN DEFAULT FALSE,
+                direction TEXT DEFAULT ''
+            );
+            CREATE INDEX IF NOT EXISTS idx_wf_addr ON wallet_fills(wallet_address);
+            CREATE INDEX IF NOT EXISTS idx_wf_time ON wallet_fills(time_ms);
+            CREATE INDEX IF NOT EXISTS idx_wf_coin ON wallet_fills(coin);
+            """)
+        else:
+            conn.executescript("""
+            CREATE TABLE IF NOT EXISTS golden_wallets (
+                address TEXT PRIMARY KEY,
+                bot_score INTEGER DEFAULT 0,
+                total_fills INTEGER DEFAULT 0,
+                raw_pnl REAL DEFAULT 0,
+                penalised_pnl REAL DEFAULT 0,
+                max_drawdown_pct REAL DEFAULT 0,
+                penalised_max_drawdown_pct REAL DEFAULT 0,
+                sharpe_ratio REAL DEFAULT 0,
+                win_rate REAL DEFAULT 0,
+                trades_per_day REAL DEFAULT 0,
+                is_golden INTEGER DEFAULT 0,
+                coins_traded TEXT DEFAULT '[]',
+                best_coin TEXT DEFAULT '',
+                worst_coin TEXT DEFAULT '',
+                raw_equity_curve TEXT DEFAULT '[]',
+                penalised_equity_curve TEXT DEFAULT '[]',
+                equity_timestamps TEXT DEFAULT '[]',
+                evaluated_at TEXT NOT NULL,
+                connected_to_live INTEGER DEFAULT 0
+            );
 
-        CREATE TABLE IF NOT EXISTS wallet_fills (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            wallet_address TEXT NOT NULL,
-            coin TEXT NOT NULL,
-            side TEXT NOT NULL,
-            original_price REAL NOT NULL,
-            penalised_price REAL NOT NULL,
-            size REAL NOT NULL,
-            time_ms INTEGER NOT NULL,
-            delayed_time_ms INTEGER NOT NULL,
-            closed_pnl REAL DEFAULT 0,
-            penalised_pnl REAL DEFAULT 0,
-            fee REAL DEFAULT 0,
-            is_liquidation INTEGER DEFAULT 0,
-            direction TEXT DEFAULT '',
-            FOREIGN KEY (wallet_address) REFERENCES golden_wallets(address)
-        );
-        CREATE INDEX IF NOT EXISTS idx_wf_addr ON wallet_fills(wallet_address);
-        CREATE INDEX IF NOT EXISTS idx_wf_time ON wallet_fills(time_ms);
-        CREATE INDEX IF NOT EXISTS idx_wf_coin ON wallet_fills(coin);
-        """)
-        conn.commit()
-    finally:
-        conn.close()
+            CREATE TABLE IF NOT EXISTS wallet_fills (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                wallet_address TEXT NOT NULL,
+                coin TEXT NOT NULL,
+                side TEXT NOT NULL,
+                original_price REAL NOT NULL,
+                penalised_price REAL NOT NULL,
+                size REAL NOT NULL,
+                time_ms INTEGER NOT NULL,
+                delayed_time_ms INTEGER NOT NULL,
+                closed_pnl REAL DEFAULT 0,
+                penalised_pnl REAL DEFAULT 0,
+                fee REAL DEFAULT 0,
+                is_liquidation INTEGER DEFAULT 0,
+                direction TEXT DEFAULT '',
+                FOREIGN KEY (wallet_address) REFERENCES golden_wallets(address)
+            );
+            CREATE INDEX IF NOT EXISTS idx_wf_addr ON wallet_fills(wallet_address);
+            CREATE INDEX IF NOT EXISTS idx_wf_time ON wallet_fills(time_ms);
+            CREATE INDEX IF NOT EXISTS idx_wf_coin ON wallet_fills(coin);
+            """)
 
 
 def save_wallet_report(report: WalletReport):
     """Persist a wallet evaluation report + all its fills."""
-    conn = _get_db()
-    try:
+    with _get_db() as conn:
         conn.execute("""
-            INSERT OR REPLACE INTO golden_wallets
+            INSERT INTO golden_wallets
             (address, bot_score, total_fills, raw_pnl, penalised_pnl,
              max_drawdown_pct, penalised_max_drawdown_pct, sharpe_ratio,
              win_rate, trades_per_day, is_golden, coins_traded, best_coin,
              worst_coin, raw_equity_curve, penalised_equity_curve,
              equity_timestamps, evaluated_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (address) DO UPDATE SET
+                bot_score = EXCLUDED.bot_score,
+                total_fills = EXCLUDED.total_fills,
+                raw_pnl = EXCLUDED.raw_pnl,
+                penalised_pnl = EXCLUDED.penalised_pnl,
+                max_drawdown_pct = EXCLUDED.max_drawdown_pct,
+                penalised_max_drawdown_pct = EXCLUDED.penalised_max_drawdown_pct,
+                sharpe_ratio = EXCLUDED.sharpe_ratio,
+                win_rate = EXCLUDED.win_rate,
+                trades_per_day = EXCLUDED.trades_per_day,
+                is_golden = EXCLUDED.is_golden,
+                coins_traded = EXCLUDED.coins_traded,
+                best_coin = EXCLUDED.best_coin,
+                worst_coin = EXCLUDED.worst_coin,
+                raw_equity_curve = EXCLUDED.raw_equity_curve,
+                penalised_equity_curve = EXCLUDED.penalised_equity_curve,
+                equity_timestamps = EXCLUDED.equity_timestamps,
+                evaluated_at = EXCLUDED.evaluated_at
         """, (
             report.address, report.bot_score, report.total_fills,
             report.raw_pnl, report.penalised_pnl,
@@ -511,15 +565,11 @@ def save_wallet_report(report: WalletReport):
             json.dumps(report.equity_timestamps[-500:]),
             report.evaluated_at,
         ))
-        conn.commit()
-    finally:
-        conn.close()
 
 
 def save_wallet_fills(address: str, penalised_fills: List[PenalisedFill]):
     """Persist penalised fills for backtest replay."""
-    conn = _get_db()
-    try:
+    with _get_db() as conn:
         # Clear old fills for this wallet
         conn.execute("DELETE FROM wallet_fills WHERE wallet_address = ?", (address,))
         for f in penalised_fills:
@@ -535,23 +585,17 @@ def save_wallet_fills(address: str, penalised_fills: List[PenalisedFill]):
                 f.penalised_pnl, f.fee, 1 if f.is_liquidation else 0,
                 f.direction,
             ))
-        conn.commit()
         logger.debug(f"Saved {len(penalised_fills)} fills for {address[:10]}")
-    finally:
-        conn.close()
 
 
 def get_golden_wallets() -> List[Dict]:
     """Get all wallets flagged as golden."""
-    conn = _get_db()
-    try:
+    with _get_db() as conn:
         rows = conn.execute(
             "SELECT * FROM golden_wallets WHERE is_golden = 1 "
             "ORDER BY penalised_pnl DESC"
         ).fetchall()
         return [dict(r) for r in rows]
-    finally:
-        conn.close()
 
 
 def purge_non_golden_wallets() -> int:
@@ -560,8 +604,7 @@ def purge_non_golden_wallets() -> int:
     Frees DB space and ensures only proven wallets remain.
     Returns number of wallets purged.
     """
-    conn = _get_db()
-    try:
+    with _get_db() as conn:
         # Get non-golden addresses first (for fill cleanup)
         rows = conn.execute(
             "SELECT address FROM golden_wallets WHERE is_golden = 0"
@@ -578,45 +621,35 @@ def purge_non_golden_wallets() -> int:
 
         # Delete non-golden wallet records
         conn.execute("DELETE FROM golden_wallets WHERE is_golden = 0")
-        conn.commit()
 
         logger.info(f"Purged {len(non_golden)} non-golden wallets and their fills")
         return len(non_golden)
-    finally:
-        conn.close()
 
 
 def get_all_wallet_reports() -> List[Dict]:
     """Get all evaluated wallets (golden and non-golden)."""
-    conn = _get_db()
-    try:
+    with _get_db() as conn:
         rows = conn.execute(
             "SELECT * FROM golden_wallets ORDER BY penalised_pnl DESC"
         ).fetchall()
         return [dict(r) for r in rows]
-    finally:
-        conn.close()
 
 
 def get_wallet_fills(address: str) -> List[Dict]:
     """Get all stored fills for a wallet."""
-    conn = _get_db()
-    try:
+    with _get_db() as conn:
         rows = conn.execute(
             "SELECT * FROM wallet_fills WHERE wallet_address = ? ORDER BY time_ms",
             (address,)
         ).fetchall()
         return [dict(r) for r in rows]
-    finally:
-        conn.close()
 
 
 # ─── Batch evaluation ────────────────────────────────────────────
 
 def get_human_wallets_from_db() -> List[Dict]:
     """Get all active human-like traders from the bot's DB."""
-    conn = _get_db()
-    try:
+    with _get_db() as conn:
         rows = conn.execute(
             "SELECT address, metadata FROM traders WHERE active = 1"
         ).fetchall()
@@ -630,8 +663,6 @@ def get_human_wallets_from_db() -> List[Dict]:
                     "bot_score": bot_score,
                 })
         return wallets
-    finally:
-        conn.close()
 
 
 def run_golden_scan(max_wallets: int = 200) -> Dict:

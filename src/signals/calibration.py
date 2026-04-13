@@ -17,10 +17,11 @@ This module:
   4. Provides adjustment factors to correct miscalibrated confidence
 """
 import logging
-import sqlite3
 from typing import Dict, List, Optional
 from datetime import datetime, timezone
 from collections import defaultdict
+
+from src.data import database as db
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +39,7 @@ class CalibrationTracker:
     def __init__(self, db_path: Optional[str] = None):
         import config
         self.db_path = db_path or config.DB_PATH
+        self._use_shared_db = self.db_path == config.DB_PATH
         self._init_table()
 
         # In-memory bins for fast computation
@@ -55,37 +57,78 @@ class CalibrationTracker:
     def _init_table(self):
         """Create calibration tracking table."""
         try:
-            conn = sqlite3.connect(self.db_path)
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS calibration_records (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    source_key TEXT NOT NULL,
-                    predicted_confidence REAL NOT NULL,
-                    actual_win INTEGER NOT NULL,
-                    pnl REAL,
-                    coin TEXT,
-                    side TEXT,
-                    timestamp TEXT
-                )
-            """)
-            conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_calibration_source
-                ON calibration_records(source_key)
-            """)
-            conn.commit()
-            conn.close()
+            if self._use_shared_db:
+                with db.get_connection() as conn:
+                    if db.get_backend_name() == "postgres":
+                        conn.execute("""
+                            CREATE TABLE IF NOT EXISTS calibration_records (
+                                id BIGSERIAL PRIMARY KEY,
+                                source_key TEXT NOT NULL,
+                                predicted_confidence DOUBLE PRECISION NOT NULL,
+                                actual_win INTEGER NOT NULL,
+                                pnl DOUBLE PRECISION,
+                                coin TEXT,
+                                side TEXT,
+                                timestamp TIMESTAMPTZ
+                            )
+                        """)
+                    else:
+                        conn.execute("""
+                            CREATE TABLE IF NOT EXISTS calibration_records (
+                                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                                source_key TEXT NOT NULL,
+                                predicted_confidence REAL NOT NULL,
+                                actual_win INTEGER NOT NULL,
+                                pnl REAL,
+                                coin TEXT,
+                                side TEXT,
+                                timestamp TEXT
+                            )
+                        """)
+                    conn.execute("""
+                        CREATE INDEX IF NOT EXISTS idx_calibration_source
+                        ON calibration_records(source_key)
+                    """)
+            else:
+                import sqlite3
+                conn = sqlite3.connect(self.db_path)
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS calibration_records (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        source_key TEXT NOT NULL,
+                        predicted_confidence REAL NOT NULL,
+                        actual_win INTEGER NOT NULL,
+                        pnl REAL,
+                        coin TEXT,
+                        side TEXT,
+                        timestamp TEXT
+                    )
+                """)
+                conn.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_calibration_source
+                    ON calibration_records(source_key)
+                """)
+                conn.commit()
+                conn.close()
         except Exception as e:
             logger.warning(f"Could not init calibration table: {e}")
 
     def _load_from_db(self):
         """Load existing calibration data from DB into bins."""
         try:
-            conn = sqlite3.connect(self.db_path)
-            conn.row_factory = sqlite3.Row
-            rows = conn.execute(
-                "SELECT source_key, predicted_confidence, actual_win FROM calibration_records"
-            ).fetchall()
-            conn.close()
+            if self._use_shared_db:
+                with db.get_connection(for_read=True) as conn:
+                    rows = conn.execute(
+                        "SELECT source_key, predicted_confidence, actual_win FROM calibration_records"
+                    ).fetchall()
+            else:
+                import sqlite3
+                conn = sqlite3.connect(self.db_path)
+                conn.row_factory = sqlite3.Row
+                rows = conn.execute(
+                    "SELECT source_key, predicted_confidence, actual_win FROM calibration_records"
+                ).fetchall()
+                conn.close()
 
             for row in rows:
                 source = row["source_key"]
@@ -138,14 +181,23 @@ class CalibrationTracker:
 
         # Persist to DB
         try:
-            conn = sqlite3.connect(self.db_path)
-            conn.execute("""
-                INSERT INTO calibration_records
-                (source_key, predicted_confidence, actual_win, pnl, coin, side, timestamp)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            """, (source_key, conf, win, pnl, coin, side, datetime.now(timezone.utc).isoformat()))
-            conn.commit()
-            conn.close()
+            if self._use_shared_db:
+                with db.get_connection() as conn:
+                    conn.execute("""
+                        INSERT INTO calibration_records
+                        (source_key, predicted_confidence, actual_win, pnl, coin, side, timestamp)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """, (source_key, conf, win, pnl, coin, side, datetime.now(timezone.utc).isoformat()))
+            else:
+                import sqlite3
+                conn = sqlite3.connect(self.db_path)
+                conn.execute("""
+                    INSERT INTO calibration_records
+                    (source_key, predicted_confidence, actual_win, pnl, coin, side, timestamp)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                """, (source_key, conf, win, pnl, coin, side, datetime.now(timezone.utc).isoformat()))
+                conn.commit()
+                conn.close()
         except Exception as e:
             logger.debug(f"Could not save calibration record: {e}")
 

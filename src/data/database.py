@@ -10,7 +10,6 @@ Supports three backends selected by ``DB_BACKEND`` env var:
 Public API is unchanged — callers keep using ``get_connection()``,
 ``open_paper_trade()``, etc.
 """
-import sqlite3
 import json
 import os
 import shutil
@@ -54,15 +53,27 @@ def _assert_db_disk_space() -> None:
 
 
 @contextmanager
-def get_connection():
+def get_connection(*, for_read: bool = False):
     """Yield a connection for the active backend.
 
     In ``sqlite`` mode this behaves identically to the original implementation.
     In ``postgres`` or ``dualwrite`` mode the router transparently switches
     the underlying driver while keeping the same interface.
     """
-    with _routed_connection() as conn:
+    with _routed_connection(for_read=for_read) as conn:
         yield conn
+
+
+def _insert_and_get_id(conn, sql: str, params):
+    """Execute an insert and return the generated id on both backends."""
+    if getattr(conn, "backend", "sqlite") == "postgres":
+        cursor = conn.execute(sql.rstrip().rstrip(";") + " RETURNING id", params)
+        row = cursor.fetchone()
+        if not row:
+            return None
+        return row["id"] if isinstance(row, dict) else row[0]
+    cursor = conn.execute(sql, params)
+    return cursor.lastrowid
 
 
 def table_exists(name: str) -> bool:
@@ -89,9 +100,11 @@ def init_db():
     ``migrations/0001_init_schema.sql``).  This function only runs
     the SQLite DDL when SQLite is the active backend.
     """
-    if _is_pg():
+    if config.DB_BACKEND in ("postgres", "dualwrite"):
         # Postgres schema is managed by the migration runner.
         init_postgres_schema()
+
+    if _is_pg():
         return
 
     with get_connection() as conn:
@@ -330,14 +343,13 @@ def save_strategy(name, description, strategy_type, parameters=None,
                   total_pnl=0, trade_count=0, win_rate=0, sharpe_ratio=0):
     now = datetime.now(timezone.utc).isoformat()
     with get_connection() as conn:
-        cursor = conn.execute("""
+        return _insert_and_get_id(conn, """
             INSERT INTO strategies
             (name, description, strategy_type, parameters, discovered_at,
              total_pnl, trade_count, win_rate, sharpe_ratio)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (name, description, strategy_type, json.dumps(parameters or {}),
               now, total_pnl, trade_count, win_rate, sharpe_ratio))
-        return cursor.lastrowid
 
 
 def save_strategies_batch(strategies_data):
@@ -346,7 +358,7 @@ def save_strategies_batch(strategies_data):
     saved_ids = []
     with get_connection() as conn:
         for s in strategies_data:
-            cursor = conn.execute("""
+            saved_ids.append(_insert_and_get_id(conn, """
                 INSERT INTO strategies
                 (name, description, strategy_type, parameters, discovered_at,
                  total_pnl, trade_count, win_rate, sharpe_ratio)
@@ -354,8 +366,7 @@ def save_strategies_batch(strategies_data):
             """, (s["name"], s["description"], s["strategy_type"],
                   json.dumps(s.get("parameters") or {}),
                   now, s.get("total_pnl", 0), s.get("trade_count", 0),
-                  s.get("win_rate", 0), s.get("sharpe_ratio", 0)))
-            saved_ids.append(cursor.lastrowid)
+                  s.get("win_rate", 0), s.get("sharpe_ratio", 0))))
     return saved_ids
 
 
@@ -411,22 +422,16 @@ def get_strategy_score_history(strategy_id, limit=30):
 def init_paper_account(balance):
     now = datetime.now(timezone.utc).isoformat()
     with get_connection() as conn:
-        if _is_pg():
-            conn.execute("""
-                INSERT INTO paper_account (id, balance, total_pnl, total_trades, winning_trades, last_updated)
-                VALUES (?, ?, 0, 0, 0, ?)
-                ON CONFLICT (id) DO UPDATE SET
-                    balance = EXCLUDED.balance,
-                    total_pnl = 0,
-                    total_trades = 0,
-                    winning_trades = 0,
-                    last_updated = EXCLUDED.last_updated
-            """, (1, balance, now))
-        else:
-            conn.execute("""
-                INSERT OR REPLACE INTO paper_account (id, balance, total_pnl, total_trades, winning_trades, last_updated)
-                VALUES (1, ?, 0, 0, 0, ?)
-            """, (balance, now))
+        conn.execute("""
+            INSERT INTO paper_account (id, balance, total_pnl, total_trades, winning_trades, last_updated)
+            VALUES (?, ?, 0, 0, 0, ?)
+            ON CONFLICT (id) DO UPDATE SET
+                balance = EXCLUDED.balance,
+                total_pnl = 0,
+                total_trades = 0,
+                winning_trades = 0,
+                last_updated = EXCLUDED.last_updated
+        """, (1, balance, now))
 
 
 def get_paper_account():
@@ -449,14 +454,13 @@ def open_paper_trade(strategy_id, coin, side, entry_price, size, leverage=1,
                      stop_loss=None, take_profit=None, metadata=None):
     now = datetime.now(timezone.utc).isoformat()
     with get_connection() as conn:
-        cursor = conn.execute("""
+        return _insert_and_get_id(conn, """
             INSERT INTO paper_trades
             (strategy_id, opened_at, coin, side, entry_price, size, leverage,
              stop_loss, take_profit, status, metadata)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?)
         """, (strategy_id, now, coin, side, entry_price, size, leverage,
               stop_loss, take_profit, json.dumps(metadata or {})))
-        return cursor.lastrowid
 
 
 def update_paper_trade_metadata(trade_id: int, extra: dict):
@@ -535,22 +539,16 @@ def reset_paper_trades(initial_balance: float = None):
 
         conn.execute("DELETE FROM paper_trades")
         now = datetime.now(timezone.utc).isoformat()
-        if _is_pg():
-            conn.execute("""
-                INSERT INTO paper_account (id, balance, total_pnl, total_trades, winning_trades, last_updated)
-                VALUES (?, ?, 0, 0, 0, ?)
-                ON CONFLICT (id) DO UPDATE SET
-                    balance = EXCLUDED.balance,
-                    total_pnl = 0,
-                    total_trades = 0,
-                    winning_trades = 0,
-                    last_updated = EXCLUDED.last_updated
-            """, (1, initial_balance, now))
-        else:
-            conn.execute("""
-                INSERT OR REPLACE INTO paper_account (id, balance, total_pnl, total_trades, winning_trades, last_updated)
-                VALUES (1, ?, 0, 0, 0, ?)
-            """, (initial_balance, now))
+        conn.execute("""
+            INSERT INTO paper_account (id, balance, total_pnl, total_trades, winning_trades, last_updated)
+            VALUES (?, ?, 0, 0, 0, ?)
+            ON CONFLICT (id) DO UPDATE SET
+                balance = EXCLUDED.balance,
+                total_pnl = 0,
+                total_trades = 0,
+                winning_trades = 0,
+                last_updated = EXCLUDED.last_updated
+        """, (1, initial_balance, now))
 
     logger.info(f"Paper trades reset: cleared {open_count} open + {closed_count} closed trades, "
                f"balance reset to ${initial_balance:,.2f}")
@@ -653,25 +651,13 @@ def backup_to_json(filepath: str = None):
         # Golden wallets + fills (the most expensive data to regenerate)
         try:
             with get_connection() as conn:
-                def _table_exists(name):
-                    if _is_pg():
-                        return conn.execute(
-                            "SELECT table_name AS name FROM information_schema.tables "
-                            "WHERE table_schema='public' AND table_name=?",
-                            (name,)
-                        ).fetchone() is not None
-                    return conn.execute(
-                        "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
-                        (name,)
-                    ).fetchone() is not None
-
-                if _table_exists("golden_wallets"):
+                if table_exists("golden_wallets"):
                     rows = conn.execute(
                         "SELECT * FROM golden_wallets ORDER BY penalised_pnl DESC"
                     ).fetchall()
                     data["golden_wallets"] = [dict(r) for r in rows]
 
-                if _table_exists("wallet_fills"):
+                if table_exists("wallet_fills"):
                     # Only backup fills from golden wallets (not all fills)
                     rows = conn.execute("""
                         SELECT wf.* FROM wallet_fills wf
@@ -681,7 +667,7 @@ def backup_to_json(filepath: str = None):
                     """).fetchall()
                     data["wallet_fills"] = [dict(r) for r in rows]
 
-                if _table_exists("calibration_records"):
+                if table_exists("calibration_records"):
                     rows = conn.execute(
                         "SELECT * FROM calibration_records ORDER BY timestamp DESC LIMIT 100"
                     ).fetchall()
@@ -801,13 +787,6 @@ def restore_from_json(filepath: str = None):
                     "best_coin, evaluated_at, connected_to_live) "
                     "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
                     "ON CONFLICT (address) DO NOTHING"
-                ) if _is_pg() else (
-                    "INSERT OR IGNORE INTO golden_wallets "
-                    "(address, penalised_pnl, raw_pnl, sharpe_ratio, "
-                    "max_drawdown_pct, penalised_max_drawdown_pct, "
-                    "win_rate, trades_per_day, is_golden, coins_traded, "
-                    "best_coin, evaluated_at, connected_to_live) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
                 )
                 with get_connection() as conn:
                     for gw in data["golden_wallets"]:
@@ -850,12 +829,13 @@ def restore_from_json(filepath: str = None):
                     for fill in data["wallet_fills"]:
                         try:
                             conn.execute("""
-                                INSERT OR IGNORE INTO wallet_fills
+                                INSERT INTO wallet_fills
                                 (wallet_address, coin, side, original_price,
                                  penalised_price, size, time_ms, delayed_time_ms,
                                  closed_pnl, penalised_pnl, fee, is_liquidation,
                                  direction)
                                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                ON CONFLICT DO NOTHING
                             """, (
                                 fill["wallet_address"],
                                 fill.get("coin", ""),

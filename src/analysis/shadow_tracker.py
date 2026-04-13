@@ -7,15 +7,15 @@ PnL attribution per signal source. Enables comparison of:
   - Polymarket event signals vs technical analysis
   - Options flow signals vs regime-based sizing
 
-Stores data in SQLite for persistence across restarts.
+Stores data in the shared runtime database for persistence across restarts.
 """
-import sqlite3
 import json
-import os
 import logging
 from datetime import datetime, timedelta, timezone
 from contextlib import contextmanager
 from statistics import mean, stdev
+
+from src.data import database as db
 
 logger = logging.getLogger(__name__)
 
@@ -33,77 +33,103 @@ class ShadowTracker:
         Initialize the shadow tracker.
 
         Args:
-            db_path (str, optional): Path to shadow tracking database.
-                                    Defaults to shadow.db in project root.
+            db_path (str, optional): Legacy parameter retained for compatibility.
+                                    ShadowTracker now uses the shared runtime DB.
         """
-        if db_path is None:
-            # Default to shadow.db alongside the main database
-            project_root = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
-            db_path = os.path.join(project_root, "shadow.db")
-
-        self.db_path = db_path
-        os.makedirs(os.path.dirname(os.path.abspath(db_path)), exist_ok=True)
+        if db_path:
+            logger.warning(
+                "ShadowTracker db_path override (%s) is ignored; "
+                "using shared runtime database instead.",
+                db_path,
+            )
+        self.db_path = db.get_db_path()
 
         self._ensure_tables()
-        logger.info(f"ShadowTracker initialized with DB at {db_path}")
+        logger.info("ShadowTracker initialized with shared DB at %s", self.db_path)
 
     @contextmanager
     def _get_connection(self):
-        """Context manager for shadow database connections."""
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
-        try:
+        """Context manager for shared database connections."""
+        with db.get_connection() as conn:
             yield conn
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
-        finally:
-            conn.close()
 
     def _ensure_tables(self):
         """Create shadow_trades and shadow_attribution tables if they don't exist."""
         with self._get_connection() as conn:
-            conn.executescript("""
-            -- Shadow mode trades with per-source attribution
-            CREATE TABLE IF NOT EXISTS shadow_trades (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                signal_source TEXT NOT NULL,
-                coin TEXT NOT NULL,
-                side TEXT NOT NULL,
-                entry_price REAL NOT NULL,
-                exit_price REAL,
-                size REAL NOT NULL,
-                pnl REAL DEFAULT 0,
-                pnl_pct REAL DEFAULT 0,
-                entry_ts TEXT NOT NULL,
-                exit_ts TEXT,
-                regime_at_entry TEXT,
-                confidence REAL DEFAULT 1.0,
-                metadata_json TEXT DEFAULT '{}'
-            );
-            CREATE INDEX IF NOT EXISTS idx_shadow_source ON shadow_trades(signal_source);
-            CREATE INDEX IF NOT EXISTS idx_shadow_entry_ts ON shadow_trades(entry_ts);
-            CREATE INDEX IF NOT EXISTS idx_shadow_exit_ts ON shadow_trades(exit_ts);
-
-            -- Daily attribution per source for charting and trend analysis
-            CREATE TABLE IF NOT EXISTS shadow_attribution (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                date TEXT NOT NULL,
-                signal_source TEXT NOT NULL,
-                trade_count INTEGER DEFAULT 0,
-                total_pnl REAL DEFAULT 0,
-                avg_pnl_pct REAL DEFAULT 0,
-                win_rate REAL DEFAULT 0,
-                best_trade_pnl REAL,
-                worst_trade_pnl REAL,
-                sharpe_proxy REAL DEFAULT 0,
-                UNIQUE(date, signal_source)
-            );
-            CREATE INDEX IF NOT EXISTS idx_attribution_date ON shadow_attribution(date);
-            CREATE INDEX IF NOT EXISTS idx_attribution_source ON shadow_attribution(signal_source);
-            """)
+            if db.get_backend_name() == "postgres":
+                conn.executescript("""
+                CREATE TABLE IF NOT EXISTS shadow_trades (
+                    id BIGSERIAL PRIMARY KEY,
+                    signal_source TEXT NOT NULL,
+                    coin TEXT NOT NULL,
+                    side TEXT NOT NULL,
+                    entry_price DOUBLE PRECISION NOT NULL,
+                    exit_price DOUBLE PRECISION,
+                    size DOUBLE PRECISION NOT NULL,
+                    pnl DOUBLE PRECISION DEFAULT 0,
+                    pnl_pct DOUBLE PRECISION DEFAULT 0,
+                    entry_ts TIMESTAMPTZ NOT NULL,
+                    exit_ts TIMESTAMPTZ,
+                    regime_at_entry TEXT,
+                    confidence DOUBLE PRECISION DEFAULT 1.0,
+                    metadata_json TEXT DEFAULT '{}'
+                );
+                CREATE INDEX IF NOT EXISTS idx_shadow_source ON shadow_trades(signal_source);
+                CREATE INDEX IF NOT EXISTS idx_shadow_entry_ts ON shadow_trades(entry_ts);
+                CREATE INDEX IF NOT EXISTS idx_shadow_exit_ts ON shadow_trades(exit_ts);
+                CREATE TABLE IF NOT EXISTS shadow_attribution (
+                    id BIGSERIAL PRIMARY KEY,
+                    date TEXT NOT NULL,
+                    signal_source TEXT NOT NULL,
+                    trade_count INTEGER DEFAULT 0,
+                    total_pnl DOUBLE PRECISION DEFAULT 0,
+                    avg_pnl_pct DOUBLE PRECISION DEFAULT 0,
+                    win_rate DOUBLE PRECISION DEFAULT 0,
+                    best_trade_pnl DOUBLE PRECISION,
+                    worst_trade_pnl DOUBLE PRECISION,
+                    sharpe_proxy DOUBLE PRECISION DEFAULT 0,
+                    UNIQUE(date, signal_source)
+                );
+                CREATE INDEX IF NOT EXISTS idx_attribution_date ON shadow_attribution(date);
+                CREATE INDEX IF NOT EXISTS idx_attribution_source ON shadow_attribution(signal_source);
+                """)
+            else:
+                conn.executescript("""
+                CREATE TABLE IF NOT EXISTS shadow_trades (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    signal_source TEXT NOT NULL,
+                    coin TEXT NOT NULL,
+                    side TEXT NOT NULL,
+                    entry_price REAL NOT NULL,
+                    exit_price REAL,
+                    size REAL NOT NULL,
+                    pnl REAL DEFAULT 0,
+                    pnl_pct REAL DEFAULT 0,
+                    entry_ts TEXT NOT NULL,
+                    exit_ts TEXT,
+                    regime_at_entry TEXT,
+                    confidence REAL DEFAULT 1.0,
+                    metadata_json TEXT DEFAULT '{}'
+                );
+                CREATE INDEX IF NOT EXISTS idx_shadow_source ON shadow_trades(signal_source);
+                CREATE INDEX IF NOT EXISTS idx_shadow_entry_ts ON shadow_trades(entry_ts);
+                CREATE INDEX IF NOT EXISTS idx_shadow_exit_ts ON shadow_trades(exit_ts);
+                CREATE TABLE IF NOT EXISTS shadow_attribution (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    date TEXT NOT NULL,
+                    signal_source TEXT NOT NULL,
+                    trade_count INTEGER DEFAULT 0,
+                    total_pnl REAL DEFAULT 0,
+                    avg_pnl_pct REAL DEFAULT 0,
+                    win_rate REAL DEFAULT 0,
+                    best_trade_pnl REAL,
+                    worst_trade_pnl REAL,
+                    sharpe_proxy REAL DEFAULT 0,
+                    UNIQUE(date, signal_source)
+                );
+                CREATE INDEX IF NOT EXISTS idx_attribution_date ON shadow_attribution(date);
+                CREATE INDEX IF NOT EXISTS idx_attribution_source ON shadow_attribution(signal_source);
+                """)
             logger.info("Shadow tracker tables ensured")
 
     def record_trade(self, trade_dict):
@@ -330,9 +356,10 @@ class ShadowTracker:
                 )
 
                 # Delete orphaned attribution records
+                cutoff_date = (datetime.now(timezone.utc) - timedelta(days=keep_days)).date().isoformat()
                 conn.execute(
-                    "DELETE FROM shadow_attribution WHERE date < date(?, '-' || ? || ' days')",
-                    (datetime.now(timezone.utc).isoformat(), keep_days)
+                    "DELETE FROM shadow_attribution WHERE date < ?",
+                    (cutoff_date,)
                 )
 
             logger.info(f"Pruned {count_before} shadow trades older than {keep_days} days")

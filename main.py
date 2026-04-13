@@ -166,7 +166,8 @@ class HyperliquidResearchBot:
                     "(key TEXT PRIMARY KEY, value TEXT)"
                 )
                 conn.execute(
-                    "INSERT OR REPLACE INTO bot_state (key, value) VALUES (?, ?)",
+                    "INSERT INTO bot_state (key, value) VALUES (?, ?) "
+                    "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
                     ("last_discovery_ts", str(self._last_discovery)),
                 )
         except Exception:

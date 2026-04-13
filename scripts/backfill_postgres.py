@@ -48,6 +48,11 @@ TABLES = [
     "wallet_fills",
     "calibration_records",
     "agent_scores",
+    "arena_agents",
+    "arena_rounds",
+    "trade_memory",
+    "shadow_trades",
+    "shadow_attribution",
 ]
 
 # Tables with auto-increment sequences to reset
@@ -60,11 +65,24 @@ SERIAL_TABLES = [
     "audit_trail",
     "wallet_fills",
     "calibration_records",
+    "shadow_trades",
+    "shadow_attribution",
 ]
+
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+SHADOW_DB_PATH = os.path.join(PROJECT_ROOT, "shadow.db")
 
 
 def _sqlite_conn():
     conn = sqlite3.connect(config.DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _shadow_sqlite_conn():
+    if not os.path.exists(SHADOW_DB_PATH):
+        return None
+    conn = sqlite3.connect(SHADOW_DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -144,6 +162,17 @@ def _backfill_table(sq_conn, pg_conn, table):
     return inserted
 
 
+def _backfill_table_from_source(sq_conn, pg_conn, table, source_label: str):
+    """Copy rows from a specified SQLite source into Postgres."""
+    if sq_conn is None:
+        logger.info("  %-25s SKIP (%s missing)", table, source_label)
+        return 0
+    if not _table_exists_sqlite(sq_conn, table):
+        logger.info("  %-25s SKIP (not in %s)", table, source_label)
+        return 0
+    return _backfill_table(sq_conn, pg_conn, table)
+
+
 def _reset_sequences(pg_conn):
     """Reset Postgres sequences to max(id) + 1 so new inserts don't collide."""
     cur = pg_conn.cursor()
@@ -164,7 +193,7 @@ def _reset_sequences(pg_conn):
     pg_conn.commit()
 
 
-def _parity_check(sq_conn, pg_conn):
+def _parity_check(sq_conn, pg_conn, shadow_conn=None):
     """Compare row counts and key values between SQLite and Postgres."""
     logger.info("\n=== PARITY CHECK ===")
     cur = pg_conn.cursor()
@@ -176,7 +205,10 @@ def _parity_check(sq_conn, pg_conn):
         if not _table_exists_pg(cur, table):
             continue
 
-        sq_count = sq_conn.execute(f"SELECT COUNT(*) as c FROM {table}").fetchone()["c"]
+        source_conn = shadow_conn if table in {"shadow_trades", "shadow_attribution"} and shadow_conn else sq_conn
+        if not _table_exists_sqlite(source_conn, table):
+            continue
+        sq_count = source_conn.execute(f"SELECT COUNT(*) as c FROM {table}").fetchone()["c"]
         cur.execute(f"SELECT COUNT(*) as c FROM {table}")
         pg_count = cur.fetchone()["c"]
 
@@ -235,6 +267,7 @@ def main():
 
     # Open connections
     sq_conn = _sqlite_conn()
+    shadow_conn = _shadow_sqlite_conn()
 
     from src.data.db.postgres import get_connection as pg_get_conn, return_connection as pg_return
     pg_raw = pg_get_conn()
@@ -245,12 +278,15 @@ def main():
         logger.info("Postgres: %s", config.POSTGRES_DSN[:40] + "...")
 
         for table in TABLES:
-            _backfill_table(sq_conn, pg_raw, table)
+            if table in {"shadow_trades", "shadow_attribution"}:
+                _backfill_table_from_source(shadow_conn, pg_raw, table, "shadow.db")
+            else:
+                _backfill_table(sq_conn, pg_raw, table)
 
         logger.info("\n=== RESETTING SEQUENCES ===")
         _reset_sequences(pg_raw)
 
-        ok = _parity_check(sq_conn, pg_raw)
+        ok = _parity_check(sq_conn, pg_raw, shadow_conn=shadow_conn)
 
         if ok:
             logger.info("\n PARITY CHECK PASSED — safe to enable dualwrite.")
@@ -259,6 +295,8 @@ def main():
 
     finally:
         sq_conn.close()
+        if shadow_conn is not None:
+            shadow_conn.close()
         pg_return(pg_raw)
 
 

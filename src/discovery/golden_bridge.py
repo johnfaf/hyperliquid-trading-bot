@@ -13,13 +13,13 @@ copy trader's scan cycle.
 """
 import logging
 import json
-import sqlite3
 import os
 import sys
 from typing import List, Dict, Optional
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import config
+from src.data import database as db
 from src.data import hyperliquid_client as hl
 
 logger = logging.getLogger("golden_bridge")
@@ -33,9 +33,7 @@ MAX_DD_FOR_LIVE = 40.0
 
 
 def _get_db():
-    conn = sqlite3.connect(config.DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+    return db.get_connection(for_read=True)
 
 
 def get_live_golden_wallets() -> List[Dict]:
@@ -43,8 +41,7 @@ def get_live_golden_wallets() -> List[Dict]:
     Get golden wallets that are connected to live execution.
     Returns list of dicts with address, sharpe, penalised_pnl, etc.
     """
-    conn = _get_db()
-    try:
+    with _get_db() as conn:
         rows = conn.execute(
             "SELECT address, sharpe_ratio, penalised_pnl, win_rate, "
             "penalised_max_drawdown_pct, trades_per_day, best_coin, coins_traded "
@@ -61,8 +58,6 @@ def get_live_golden_wallets() -> List[Dict]:
                 d["coins_traded"] = []
             results.append(d)
         return results
-    finally:
-        conn.close()
 
 
 def auto_connect_golden_wallets() -> int:
@@ -70,8 +65,7 @@ def auto_connect_golden_wallets() -> int:
     Automatically connect golden wallets that meet quality thresholds.
     Returns number of newly connected wallets.
     """
-    conn = _get_db()
-    try:
+    with db.get_connection() as conn:
         # Find golden wallets not yet connected that meet quality bars
         rows = conn.execute(
             "SELECT address, sharpe_ratio, penalised_max_drawdown_pct, penalised_pnl "
@@ -93,27 +87,19 @@ def auto_connect_golden_wallets() -> int:
                 f"Sharpe={r['sharpe_ratio']:.2f}, DD={r['penalised_max_drawdown_pct']:.1f}%, "
                 f"PnL=${r['penalised_pnl']:+,.0f}"
             )
-
-        conn.commit()
         if connected:
             logger.info(f"Connected {connected} new golden wallets to live execution")
         return connected
-    finally:
-        conn.close()
 
 
 def disconnect_wallet(address: str):
     """Manually disconnect a golden wallet from live execution."""
-    conn = _get_db()
-    try:
+    with db.get_connection() as conn:
         conn.execute(
             "UPDATE golden_wallets SET connected_to_live = 0 WHERE address = ?",
             (address,)
         )
-        conn.commit()
         logger.info(f"Disconnected golden wallet {address[:10]} from live execution")
-    finally:
-        conn.close()
 
 
 def get_golden_copy_signals(mids: Optional[Dict] = None) -> List[Dict]:
@@ -179,17 +165,15 @@ def get_golden_copy_signals(mids: Optional[Dict] = None) -> List[Dict]:
 
 def get_stats() -> Dict:
     """Get golden bridge stats for dashboard/logging."""
-    conn = _get_db()
     try:
-        total = conn.execute("SELECT COUNT(*) FROM golden_wallets").fetchone()[0]
-        golden = conn.execute("SELECT COUNT(*) FROM golden_wallets WHERE is_golden = 1").fetchone()[0]
-        live = conn.execute("SELECT COUNT(*) FROM golden_wallets WHERE connected_to_live = 1").fetchone()[0]
-        return {
-            "total_evaluated": total,
-            "golden_wallets": golden,
-            "live_connected": live,
-        }
+        with _get_db() as conn:
+            total = conn.execute("SELECT COUNT(*) FROM golden_wallets").fetchone()[0]
+            golden = conn.execute("SELECT COUNT(*) FROM golden_wallets WHERE is_golden = 1").fetchone()[0]
+            live = conn.execute("SELECT COUNT(*) FROM golden_wallets WHERE connected_to_live = 1").fetchone()[0]
+            return {
+                "total_evaluated": total,
+                "golden_wallets": golden,
+                "live_connected": live,
+            }
     except Exception:
         return {"total_evaluated": 0, "golden_wallets": 0, "live_connected": 0}
-    finally:
-        conn.close()

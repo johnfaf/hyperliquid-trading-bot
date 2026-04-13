@@ -161,10 +161,20 @@ class AgentScorer:
             # LOW-FIX LOW-7 (continued): use shared WAL connection pool
             with db.get_connection() as conn:
                 conn.execute("""
-                    INSERT OR REPLACE INTO agent_scores
+                    INSERT INTO agent_scores
                     (source_key, total_signals, correct_signals, total_pnl,
                      total_return, accuracy, sharpe, dynamic_weight, trade_history, last_updated)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT (source_key) DO UPDATE SET
+                        total_signals = EXCLUDED.total_signals,
+                        correct_signals = EXCLUDED.correct_signals,
+                        total_pnl = EXCLUDED.total_pnl,
+                        total_return = EXCLUDED.total_return,
+                        accuracy = EXCLUDED.accuracy,
+                        sharpe = EXCLUDED.sharpe,
+                        dynamic_weight = EXCLUDED.dynamic_weight,
+                        trade_history = EXCLUDED.trade_history,
+                        last_updated = EXCLUDED.last_updated
                 """, (source_key, score.total_signals, score.correct_signals,
                       score.total_pnl, score.total_return, score.accuracy, score.sharpe,
                       score.dynamic_weight, history_json,

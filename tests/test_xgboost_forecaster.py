@@ -105,8 +105,9 @@ class TestXGBoostRegimeForecaster:
     def test_prediction_caching(self, forecaster):
         """Second call within cache_ttl returns cached result."""
         forecaster.model = None
-        r1 = forecaster.predict_regime("BTC")
-        r2 = forecaster.predict_regime("BTC")
+        with patch("src.signals.xgboost_regime_forecaster.HAS_XGBOOST", False):
+            r1 = forecaster.predict_regime("BTC")
+            r2 = forecaster.predict_regime("BTC")
         # Both should be identical (cached)
         assert r1["regime"] == r2["regime"]
         assert r1["confidence"] == r2["confidence"]

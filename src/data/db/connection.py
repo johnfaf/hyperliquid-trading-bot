@@ -5,8 +5,6 @@ Provides a thin adapter so that database.py can use the same SQL (with ``?``
 placeholders) against both backends.  The adapter translates:
 
   - ``?`` -> ``%s`` for Postgres
-  - ``INSERT OR REPLACE`` -> ``INSERT ... ON CONFLICT ... DO UPDATE``
-  - ``INSERT OR IGNORE``  -> ``INSERT ... ON CONFLICT DO NOTHING``
   - ``sqlite_master``     -> ``information_schema.tables``
   - Row access via dict-like interface
 
@@ -20,7 +18,7 @@ import logging
 import re
 import threading
 import time
-from typing import Any, List, Optional, Sequence
+from typing import Optional, Sequence
 
 logger = logging.getLogger(__name__)
 
@@ -36,10 +34,8 @@ def _translate_sql(sql: str, backend: str) -> str:
     # ? -> %s
     translated = _PLACEHOLDER_RE.sub("%s", sql)
 
-    # INSERT OR REPLACE INTO <table> (...) VALUES (...)
-    # -> INSERT INTO <table> (...) VALUES (...) ON CONFLICT DO UPDATE SET ...
-    # We handle this at the caller level for complex cases, but provide a
-    # simple rewrite for the common pattern.
+    # UPSERT behaviour is handled by the callers with explicit
+    # ``ON CONFLICT`` clauses so both backends share the same semantics.
     translated = translated.replace("INSERT OR REPLACE INTO", "INSERT INTO")
     translated = translated.replace("INSERT OR IGNORE INTO", "INSERT INTO")
 
@@ -64,11 +60,7 @@ class CursorAdapter:
 
     @property
     def lastrowid(self) -> Optional[int]:
-        """Return the last inserted row ID.
-
-        For Postgres, the caller must add RETURNING id to the INSERT and
-        fetch the result.  We try to read it; if not available, return None.
-        """
+        """Return the last inserted row ID when the query used RETURNING."""
         try:
             row = self._cur.fetchone()
             if row:
@@ -105,14 +97,6 @@ class ConnectionAdapter:
         translated = _translate_sql(sql, self.backend)
 
         if self.backend == "postgres":
-            # Postgres needs RETURNING id for INSERT ... to get lastrowid
-            needs_returning = (
-                translated.strip().upper().startswith("INSERT")
-                and "RETURNING" not in translated.upper()
-            )
-            if needs_returning:
-                translated = translated.rstrip().rstrip(";") + " RETURNING id"
-
             cur = self._conn.cursor()
             cur.execute(translated, params or ())
             return CursorAdapter(cur)

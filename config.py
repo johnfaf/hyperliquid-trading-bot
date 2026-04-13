@@ -481,6 +481,10 @@ def _validate_numeric_bounds(name: str, min_value: float, max_value: float, fall
 
 def _validate_config_bounds() -> None:
     """Best-effort guardrails for env-configurable numeric settings."""
+    if DB_BACKEND not in {"sqlite", "dualwrite", "postgres"}:
+        _warn_config(f"Invalid DB_BACKEND={DB_BACKEND!r}; using 'sqlite'.")
+        globals()["DB_BACKEND"] = "sqlite"
+
     rules = [
         ("MIN_STRATEGY_SCORE", 0.0, 1.0, 0.05),
         ("MAX_ACTIVE_STRATEGIES", 1, 5000, 200),

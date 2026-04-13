@@ -8,7 +8,7 @@ This gives the system "memory" — instead of treating every trade as independen
 it can say: "The last 5 times we saw this exact setup, 4 lost money."
 
 Architecture:
-  - SQLite-backed persistent storage
+  - Shared runtime database-backed persistent storage
   - Feature vector similarity search (cosine similarity)
   - Retrieval returns most similar past trades with outcomes
   - Summary statistics for similar trade clusters
@@ -19,10 +19,10 @@ feature comparison which is more appropriate for structured trading data.
 import logging
 import json
 import math
-import sqlite3
-import threading
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, asdict
+
+from src.data import database as db
 
 logger = logging.getLogger(__name__)
 
@@ -94,35 +94,22 @@ class TradeMemory:
     def __init__(self, db_path: Optional[str] = None):
         import config
         self.db_path = db_path or config.DB_PATH
-        self._local = threading.local()
+        if self.db_path != config.DB_PATH:
+            logger.warning(
+                "TradeMemory db_path override (%s) is no longer used; "
+                "using shared runtime database instead.",
+                self.db_path,
+            )
+        self.db_path = config.DB_PATH
         self._init_table()
         self._cache_count = 0
         self._update_cache_count()
 
         logger.info(f"TradeMemory initialized with {self._cache_count} stored trades")
 
-    def _get_conn(self, row_factory=None) -> sqlite3.Connection:
-        """
-        Return a persistent thread-local SQLite connection.
-        Avoids open/close-per-operation overhead under fast cycles.
-        """
-        conn = getattr(self._local, "conn", None)
-        if conn is None:
-            conn = sqlite3.connect(self.db_path, timeout=5)
-            conn.execute("PRAGMA busy_timeout=5000")
-            self._local.conn = conn
-        conn.row_factory = row_factory
-        return conn
-
     def close(self):
-        """Close the thread-local SQLite connection, if present."""
-        conn = getattr(self._local, "conn", None)
-        if conn is None:
-            return
-        try:
-            conn.close()
-        finally:
-            self._local.conn = None
+        """No-op: TradeMemory now uses the shared database connection layer."""
+        return
 
     def __del__(self):
         try:
@@ -132,46 +119,67 @@ class TradeMemory:
 
     def _init_table(self):
         """Create the trade_memory table if it doesn't exist."""
-        conn = None
         try:
-            conn = self._get_conn()
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS trade_memory (
-                    trade_id TEXT PRIMARY KEY,
-                    coin TEXT NOT NULL,
-                    side TEXT NOT NULL,
-                    strategy_type TEXT,
-                    entry_price REAL,
-                    exit_price REAL,
-                    pnl REAL,
-                    return_pct REAL,
-                    win INTEGER,
-                    opened_at TEXT,
-                    closed_at TEXT,
-                    confidence REAL,
-                    source TEXT,
-                    regime TEXT,
-                    setup_type TEXT,
-                    features_json TEXT,
-                    feature_vector TEXT
-                )
-            """)
-            conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_trade_memory_coin
-                ON trade_memory(coin)
-            """)
-            conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_trade_memory_strategy
-                ON trade_memory(strategy_type)
-            """)
-            conn.commit()
+            with db.get_connection() as conn:
+                if db.get_backend_name() == "postgres":
+                    conn.execute("""
+                        CREATE TABLE IF NOT EXISTS trade_memory (
+                            trade_id TEXT PRIMARY KEY,
+                            coin TEXT NOT NULL,
+                            side TEXT NOT NULL,
+                            strategy_type TEXT,
+                            entry_price DOUBLE PRECISION,
+                            exit_price DOUBLE PRECISION,
+                            pnl DOUBLE PRECISION,
+                            return_pct DOUBLE PRECISION,
+                            win INTEGER,
+                            opened_at TIMESTAMPTZ,
+                            closed_at TIMESTAMPTZ,
+                            confidence DOUBLE PRECISION,
+                            source TEXT,
+                            regime TEXT,
+                            setup_type TEXT,
+                            features_json TEXT,
+                            feature_vector TEXT
+                        )
+                    """)
+                else:
+                    conn.execute("""
+                        CREATE TABLE IF NOT EXISTS trade_memory (
+                            trade_id TEXT PRIMARY KEY,
+                            coin TEXT NOT NULL,
+                            side TEXT NOT NULL,
+                            strategy_type TEXT,
+                            entry_price REAL,
+                            exit_price REAL,
+                            pnl REAL,
+                            return_pct REAL,
+                            win INTEGER,
+                            opened_at TEXT,
+                            closed_at TEXT,
+                            confidence REAL,
+                            source TEXT,
+                            regime TEXT,
+                            setup_type TEXT,
+                            features_json TEXT,
+                            feature_vector TEXT
+                        )
+                    """)
+                conn.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_trade_memory_coin
+                    ON trade_memory(coin)
+                """)
+                conn.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_trade_memory_strategy
+                    ON trade_memory(strategy_type)
+                """)
         except Exception as e:
             logger.warning(f"Could not init trade_memory table: {e}")
 
     def _update_cache_count(self):
         try:
-            conn = self._get_conn()
-            row = conn.execute("SELECT COUNT(*) FROM trade_memory").fetchone()
+            with db.get_connection(for_read=True) as conn:
+                row = conn.execute("SELECT COUNT(*) FROM trade_memory").fetchone()
             self._cache_count = row[0] if row else 0
         except Exception:
             self._cache_count = 0
@@ -192,29 +200,39 @@ class TradeMemory:
         # Extract feature vector for similarity search
         feature_vector = self._extract_feature_vector(features)
 
-        conn = None
         try:
-            conn = self._get_conn()
-            conn.execute("""
-                INSERT OR REPLACE INTO trade_memory
-                (trade_id, coin, side, strategy_type, entry_price, exit_price,
-                 pnl, return_pct, win, opened_at, closed_at, confidence,
-                 source, regime, setup_type, features_json, feature_vector)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                trade_id, coin, side, strategy_type, entry_price, exit_price,
-                pnl, return_pct, win, opened_at, closed_at, confidence,
-                source, regime, setup_type,
-                json.dumps(features), json.dumps(feature_vector),
-            ))
-            conn.commit()
+            with db.get_connection() as conn:
+                conn.execute("""
+                    INSERT INTO trade_memory
+                    (trade_id, coin, side, strategy_type, entry_price, exit_price,
+                     pnl, return_pct, win, opened_at, closed_at, confidence,
+                     source, regime, setup_type, features_json, feature_vector)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT (trade_id) DO UPDATE SET
+                        coin = EXCLUDED.coin,
+                        side = EXCLUDED.side,
+                        strategy_type = EXCLUDED.strategy_type,
+                        entry_price = EXCLUDED.entry_price,
+                        exit_price = EXCLUDED.exit_price,
+                        pnl = EXCLUDED.pnl,
+                        return_pct = EXCLUDED.return_pct,
+                        win = EXCLUDED.win,
+                        opened_at = EXCLUDED.opened_at,
+                        closed_at = EXCLUDED.closed_at,
+                        confidence = EXCLUDED.confidence,
+                        source = EXCLUDED.source,
+                        regime = EXCLUDED.regime,
+                        setup_type = EXCLUDED.setup_type,
+                        features_json = EXCLUDED.features_json,
+                        feature_vector = EXCLUDED.feature_vector
+                """, (
+                    trade_id, coin, side, strategy_type, entry_price, exit_price,
+                    pnl, return_pct, win, opened_at, closed_at, confidence,
+                    source, regime, setup_type,
+                    json.dumps(features), json.dumps(feature_vector),
+                ))
             self._cache_count += 1
         except Exception as e:
-            try:
-                if conn is not None:
-                    conn.rollback()
-            except Exception:
-                pass
             logger.debug(f"Could not record trade to memory: {e}")
 
     def find_similar(self, features: Dict, coin: Optional[str] = None,
@@ -247,8 +265,6 @@ class TradeMemory:
 
         # Query past trades
         try:
-            conn = self._get_conn(row_factory=sqlite3.Row)
-
             query = "SELECT * FROM trade_memory WHERE 1=1"
             params = []
 
@@ -262,7 +278,8 @@ class TradeMemory:
                 query += " AND side = ?"
                 params.append(side)
 
-            rows = conn.execute(query, params).fetchall()
+            with db.get_connection(for_read=True) as conn:
+                rows = conn.execute(query, params).fetchall()
         except Exception as e:
             # MED-FIX MED-8: elevate to WARNING and return "caution" instead of
             # "proceed" — a DB error here means historical loss patterns on this
@@ -359,11 +376,11 @@ class TradeMemory:
     def get_stats(self) -> Dict:
         """Get memory statistics."""
         try:
-            conn = self._get_conn()
-            total = conn.execute("SELECT COUNT(*) FROM trade_memory").fetchone()[0]
-            wins = conn.execute("SELECT COUNT(*) FROM trade_memory WHERE win = 1").fetchone()[0]
-            coins = conn.execute("SELECT COUNT(DISTINCT coin) FROM trade_memory").fetchone()[0]
-            strategies = conn.execute("SELECT COUNT(DISTINCT strategy_type) FROM trade_memory").fetchone()[0]
+            with db.get_connection(for_read=True) as conn:
+                total = conn.execute("SELECT COUNT(*) FROM trade_memory").fetchone()[0]
+                wins = conn.execute("SELECT COUNT(*) FROM trade_memory WHERE win = 1").fetchone()[0]
+                coins = conn.execute("SELECT COUNT(DISTINCT coin) FROM trade_memory").fetchone()[0]
+                strategies = conn.execute("SELECT COUNT(DISTINCT strategy_type) FROM trade_memory").fetchone()[0]
             return {
                 "total_trades": total,
                 "win_rate": wins / total if total > 0 else 0,

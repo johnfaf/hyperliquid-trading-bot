@@ -8,8 +8,9 @@ from __future__ import annotations
 
 import atexit
 import logging
+import os
+import sys
 import threading
-from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +28,6 @@ def _get_pool():
         if _pool is not None:
             return _pool
 
-        import sys, os
         sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", ".."))
         import config
 

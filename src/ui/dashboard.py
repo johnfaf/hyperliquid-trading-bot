@@ -9,7 +9,6 @@ Both dashboards served from the same port for Railway compatibility.
 import json
 import os
 import sys
-import sqlite3
 import threading
 from http.cookies import SimpleCookie
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -28,6 +27,7 @@ except ImportError:
 import config
 from src.analysis.trade_analytics import compute_live_paper_drift, compute_trade_analytics
 from src.core.readiness import evaluate_readiness
+from src.data import database as db
 
 logger = logging.getLogger(__name__)
 logger.addHandler(logging.NullHandler())
@@ -122,9 +122,7 @@ def _validate_dashboard_auth_configuration(host: str) -> None:
 
 
 def _get_db():
-    conn = sqlite3.connect(config.DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+    return db.get_connection(for_read=True)
 
 
 def _safe_json(obj):
@@ -296,8 +294,7 @@ def _parse_trade_costs(trade: Dict) -> Dict:
 
 def get_dashboard_data(runtime_snapshot: Dict | None = None):
     """Collect all data needed for the dashboard."""
-    conn = _get_db()
-    try:
+    with _get_db() as conn:
         # Account
         account = conn.execute("SELECT * FROM paper_account WHERE id = 1").fetchone()
         account = dict(account) if account else {"balance": 0, "total_pnl": 0, "total_trades": 0, "winning_trades": 0}
@@ -417,8 +414,6 @@ def get_dashboard_data(runtime_snapshot: Dict | None = None):
             "drift_analytics": drift_analytics,
             "v2": _get_v2_metrics(conn),
         }
-    finally:
-        conn.close()
 
 
 def _get_v2_metrics(conn) -> Dict:
@@ -499,17 +494,13 @@ def _close_paper_trade_at_market(trade_id: int) -> dict:
 
     Returns dict with status and details.
     """
-    from src.data import database as db
     from src.data.hyperliquid_client import get_all_mids
 
     # Fetch the trade
-    conn = _get_db()
-    try:
+    with _get_db() as conn:
         row = conn.execute(
             "SELECT * FROM paper_trades WHERE id = ? AND status = 'open'", (trade_id,)
         ).fetchone()
-    finally:
-        conn.close()
 
     if not row:
         return {"error": f"Trade {trade_id} not found or already closed", "status": "error"}

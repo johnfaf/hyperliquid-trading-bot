@@ -92,6 +92,23 @@ def get_connection(*, for_read: bool = False):
             _pg_return(raw)
 
     elif backend == "dualwrite":
+        if for_read:
+            raw = _sqlite_connect()
+            adapter = ConnectionAdapter(raw, "sqlite")
+            try:
+                yield adapter
+                raw.commit()
+            except sqlite3.OperationalError as exc:
+                logger.warning("SQLite operational error: %s", exc)
+                raw.rollback()
+                raise
+            except Exception:
+                raw.rollback()
+                raise
+            finally:
+                raw.close()
+            return
+
         # Every statement executes on SQLite first (authoritative), then
         # mirrors to Postgres (best-effort).  Postgres failures are logged
         # and counted but never propagate to the caller.
