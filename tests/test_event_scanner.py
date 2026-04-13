@@ -80,7 +80,8 @@ def test_scan_events_combines_upcoming_and_recent_sources(monkeypatch):
             "max_recent": 10,
         }
     )
-    cpi_dt = _future_et(days=1)
+    cpi_dt = datetime.now(ET_TZ) + timedelta(hours=6)
+    cpi_dt = cpi_dt.replace(second=0, microsecond=0)
     gdp_dt = _future_et(days=2)
     recent_pub = format_datetime(datetime.now(timezone.utc) - timedelta(hours=2))
 
@@ -170,6 +171,7 @@ END:VCALENDAR
 
 def test_parse_statuspage_feed_extracts_crypto_incident():
     scanner = EventScanner()
+    recent_started = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat().replace("+00:00", "Z")
     payload = """
     {
       "incidents": [
@@ -178,7 +180,7 @@ def test_parse_statuspage_feed_extracts_crypto_incident():
           "status": "identified",
           "impact": "major",
           "shortlink": "https://status.example/inc",
-          "started_at": "2026-04-10T12:00:00Z",
+          "started_at": "%s",
           "incident_updates": [
             {"body": "BTC trading and API latency are elevated"}
           ],
@@ -188,7 +190,7 @@ def test_parse_statuspage_feed_extracts_crypto_incident():
         }
       ]
     }
-    """
+    """ % recent_started
 
     incidents = scanner._parse_statuspage_feed(payload, "Coinbase Status", "incidents")
 
@@ -230,7 +232,9 @@ def test_get_risk_state_blocks_on_imminent_event_and_incident(monkeypatch):
             "event_risk_cooldown_minutes": 30,
         }
     )
-    cpi_dt = _future_et(days=0, hour=datetime.now(ET_TZ).hour, minute=(datetime.now(ET_TZ).minute + 5) % 60)
+    cpi_dt = datetime.now(ET_TZ) + timedelta(minutes=5)
+    cpi_dt = cpi_dt.replace(second=0, microsecond=0)
+    recent_started = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat().replace("+00:00", "Z")
     ics = f"""BEGIN:VCALENDAR
 BEGIN:VEVENT
 DTSTART;TZID=America/New_York:{cpi_dt.strftime('%Y%m%dT%H%M')}
@@ -245,13 +249,13 @@ END:VCALENDAR
           "name": "ETH trading degraded",
           "status": "identified",
           "impact": "major",
-          "started_at": "2026-04-10T12:00:00Z",
+          "started_at": "%s",
           "incident_updates": [{"body": "ETH order entry degraded"}],
           "components": [{"name": "ETH Trading"}]
         }
       ]
     }
-    """
+    """ % recent_started
 
     payloads = {
         BLS_CALENDAR_ICS_URL: ics,

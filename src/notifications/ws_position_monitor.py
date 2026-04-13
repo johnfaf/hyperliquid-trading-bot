@@ -63,6 +63,7 @@ class PositionMonitor:
     WS_URL = "wss://api.hyperliquid.xyz/ws"
     _TRANSIENT_CLOSE_MARKERS = (
         "inactive",
+        "expired",
         "goodbye",
         "connection to remote host was lost",
         "closed connection",
@@ -176,6 +177,8 @@ class PositionMonitor:
             float(getattr(config, "POSITION_MONITOR_REST_FALLBACK_INTERVAL_S", 20.0)),
         )
         self._rest_fallback_thread = None
+        self._reconnect_delay_override_s: Optional[float] = None
+        self._reconnect_reason: Optional[str] = None
 
     def start(self, addresses: List[str]) -> None:
         """
@@ -304,12 +307,18 @@ class PositionMonitor:
                     logger.error(f"WebSocket error: {e}")
 
             if self._running:
-                self._reconnect_count += 1
-                wait = min(5 * (2 ** min(self._reconnect_count, 4)), 60)
-                import random
-                wait += random.uniform(0, 3)
-                logger.info(f"PositionMonitor reconnecting in {wait:.1f}s "
-                           f"(reconnect #{self._reconnect_count})")
+                wait, reason = self._consume_reconnect_wait()
+                if reason:
+                    logger.info(
+                        "PositionMonitor refreshing %s in %.1fs",
+                        reason,
+                        wait,
+                    )
+                else:
+                    logger.info(
+                        f"PositionMonitor reconnecting in {wait:.1f}s "
+                        f"(reconnect #{self._reconnect_count})"
+                    )
                 time.sleep(wait)
 
     @classmethod
@@ -347,6 +356,31 @@ class PositionMonitor:
             uptime_s = (now - connected_since) if connected_since > 0 else 0.0
             if connected_since > 0 and uptime_s >= self._stable_connection_reset_s:
                 self._reconnect_count = 0
+
+    def _request_fast_reconnect(self, reason: str, delay_s: float = 1.0) -> None:
+        """Override the next reconnect delay for session-expiry style refreshes."""
+        with self._lock:
+            self._reconnect_delay_override_s = max(0.0, float(delay_s))
+            self._reconnect_reason = reason
+            self._reconnect_count = 0
+
+    def _consume_reconnect_wait(self) -> tuple[float, Optional[str]]:
+        """Return the next reconnect wait and clear any one-shot override."""
+        with self._lock:
+            if self._reconnect_delay_override_s is not None:
+                wait = self._reconnect_delay_override_s
+                reason = self._reconnect_reason
+                self._reconnect_delay_override_s = None
+                self._reconnect_reason = None
+                return wait, reason
+            self._reconnect_count += 1
+            reconnect_count = self._reconnect_count
+
+        import random
+
+        wait = min(5 * (2 ** min(reconnect_count, 4)), 60)
+        wait += random.uniform(0, 3)
+        return wait, None
 
     def _on_open(self, ws) -> None:
         """
@@ -487,26 +521,37 @@ class PositionMonitor:
 
     def _on_error(self, ws, error) -> None:
         """Handle WebSocket errors."""
-        transient = self._is_transient_ws_close_error(error)
+        error_text = str(error or "")
+        transient = self._is_transient_ws_close_error(error_text)
+        expired = "expired" in error_text.lower()
         if self._running:
-            if transient:
+            if expired:
+                logger.info(
+                    "PositionMonitor WebSocket session expired; refreshing subscription"
+                )
+            elif transient:
                 logger.info("PositionMonitor transient WebSocket close: %s", error)
             else:
                 logger.warning(f"PositionMonitor WebSocket error: {error}")
-        self._note_disconnect(transient=transient)
+        self._note_disconnect(transient=transient or expired)
+        if expired:
+            self._request_fast_reconnect("expired WebSocket session")
 
     def _on_close(self, ws, close_status_code=None, close_msg=None) -> None:
         """Handle WebSocket closure."""
         close_text = " ".join(
             part for part in (str(close_status_code or ""), str(close_msg or "")) if part
         )
+        expired = "expired" in close_text.lower()
         transient = self._is_transient_ws_close_error(close_text) or close_status_code in {
             None,
             1000,
             1001,
             1006,
         }
-        self._note_disconnect(transient=transient)
+        self._note_disconnect(transient=transient or expired)
+        if expired:
+            self._request_fast_reconnect("expired WebSocket session")
         if self._running:
             logger.info(f"PositionMonitor WebSocket closed (code={close_status_code})")
 

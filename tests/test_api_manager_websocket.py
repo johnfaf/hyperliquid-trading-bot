@@ -11,6 +11,9 @@ def test_transient_disconnect_classifier_matches_remote_host_lost():
     assert api_manager.HyperliquidWebSocket._is_transient_disconnect_error(
         "Connection to remote host was lost. - goodbye"
     )
+    assert api_manager.HyperliquidWebSocket._is_transient_disconnect_error(
+        "fin=1 opcode=8 data=b'\\x03\\xe8Expired'"
+    )
     assert not api_manager.HyperliquidWebSocket._is_transient_disconnect_error(
         "invalid subscription payload"
     )
@@ -32,6 +35,23 @@ def test_on_error_transient_disconnect_logs_info(monkeypatch):
     assert warnings == []
 
 
+def test_on_error_expired_disconnect_requests_fast_reconnect(monkeypatch):
+    ws = api_manager.HyperliquidWebSocket()
+    ws._running = True
+    infos = []
+    warnings = []
+    monkeypatch.setattr(api_manager.logger, "info", lambda msg, *args: infos.append(msg % args if args else msg))
+    monkeypatch.setattr(api_manager.logger, "warning", lambda msg, *args: warnings.append(msg % args if args else msg))
+
+    ws._on_error(None, "fin=1 opcode=8 data=b'\\x03\\xe8Expired'")
+
+    wait, reason = ws._consume_reconnect_wait()
+    assert wait == 1.0
+    assert reason == "expired WebSocket session"
+    assert any("session expired" in m.lower() for m in infos)
+    assert warnings == []
+
+
 def test_gap_under_default_threshold_does_not_warn(monkeypatch):
     ws = api_manager.HyperliquidWebSocket()
     ws._last_msg_time = 100.0
@@ -44,4 +64,3 @@ def test_gap_under_default_threshold_does_not_warn(monkeypatch):
     ws._on_message(None, "{}")
 
     assert warned == []
-

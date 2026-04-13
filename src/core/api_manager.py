@@ -264,6 +264,7 @@ class HyperliquidWebSocket:
 
     WS_URL = "wss://api.hyperliquid.xyz/ws"
     _TRANSIENT_DISCONNECT_MARKERS = (
+        "expired",
         "connection to remote host was lost",
         "goodbye",
         "closed connection",
@@ -316,6 +317,8 @@ class HyperliquidWebSocket:
         )
         self._gap_warn_grace_until: float = 0.0
         self._last_gap_warn_time: float = 0.0
+        self._reconnect_delay_override_s: Optional[float] = None
+        self._reconnect_reason: Optional[str] = None
 
     def start(self):
         """Start the WebSocket connection in a background thread."""
@@ -383,11 +386,14 @@ class HyperliquidWebSocket:
                         logger.error("WebSocket loop error: %s", e)
 
             if self._running:
-                self._reconnect_count += 1
-                wait = min(5 * (2 ** min(self._reconnect_count, 4)), 60)
-                wait += random.uniform(0, 3)  # jitter
-                logger.info(f"WebSocket reconnecting in {wait:.1f}s "
-                           f"(reconnect #{self._reconnect_count})")
+                wait, reason = self._consume_reconnect_wait()
+                if reason:
+                    logger.info("WebSocket refreshing %s in %.1fs", reason, wait)
+                else:
+                    logger.info(
+                        f"WebSocket reconnecting in {wait:.1f}s "
+                        f"(reconnect #{self._reconnect_count})"
+                    )
                 time.sleep(wait)
 
     def _on_open(self, ws):
@@ -549,16 +555,46 @@ class HyperliquidWebSocket:
         text = str(error).lower()
         return any(marker in text for marker in cls._TRANSIENT_DISCONNECT_MARKERS)
 
+    def _request_fast_reconnect(self, reason: str, delay_s: float = 1.0) -> None:
+        """Override the next reconnect delay for session-expiry refreshes."""
+        self._reconnect_delay_override_s = max(0.0, float(delay_s))
+        self._reconnect_reason = reason
+        self._reconnect_count = 0
+
+    def _consume_reconnect_wait(self) -> tuple[float, Optional[str]]:
+        """Return the next reconnect wait and clear any one-shot override."""
+        if self._reconnect_delay_override_s is not None:
+            wait = self._reconnect_delay_override_s
+            reason = self._reconnect_reason
+            self._reconnect_delay_override_s = None
+            self._reconnect_reason = None
+            return wait, reason
+        self._reconnect_count += 1
+        wait = min(5 * (2 ** min(self._reconnect_count, 4)), 60)
+        wait += random.uniform(0, 3)
+        return wait, None
+
     def _on_error(self, ws, error):
+        error_text = str(error or "")
+        expired = "expired" in error_text.lower()
         if self._running:
-            if self._is_transient_disconnect_error(error):
+            if expired:
+                logger.info("WebSocket session expired; refreshing subscription")
+            elif self._is_transient_disconnect_error(error):
                 logger.info("WebSocket transient disconnect: %s", error)
             else:
                 logger.warning("WebSocket error: %s", error)
         self._connected = False
+        if expired:
+            self._request_fast_reconnect("expired WebSocket session")
 
     def _on_close(self, ws, close_status_code=None, close_msg=None):
         self._connected = False
+        close_text = " ".join(
+            part for part in (str(close_status_code or ""), str(close_msg or "")) if part
+        )
+        if "expired" in close_text.lower():
+            self._request_fast_reconnect("expired WebSocket session")
         if self._running:
             logger.info(f"WebSocket closed (code={close_status_code})")
 

@@ -112,6 +112,12 @@ def test_transient_ws_close_error_detection_recognizes_inactive():
     )
 
 
+def test_transient_ws_close_error_detection_recognizes_expired():
+    assert PositionMonitor._is_transient_ws_close_error(
+        "fin=1 opcode=8 data=b'\\x03\\xe8Expired'"
+    )
+
+
 def test_transient_ws_close_error_detection_rejects_generic_error():
     assert not PositionMonitor._is_transient_ws_close_error("ssl cert verify failed")
 
@@ -134,6 +140,19 @@ def test_on_error_logs_warning_for_non_transient_error(caplog):
         monitor._on_error(None, "ssl cert verify failed")
 
     assert "websocket error" in caplog.text.lower()
+
+
+def test_on_error_expired_requests_fast_reconnect(caplog):
+    monitor = PositionMonitor()
+    monitor._running = True
+
+    with caplog.at_level(logging.INFO):
+        monitor._on_error(None, "fin=1 opcode=8 data=b'\\x03\\xe8Expired'")
+
+    wait, reason = monitor._consume_reconnect_wait()
+    assert wait == 1.0
+    assert reason == "expired WebSocket session"
+    assert "session expired" in caplog.text.lower()
 
 
 def test_note_disconnect_preserves_backoff_for_short_lived_flaps(monkeypatch):
