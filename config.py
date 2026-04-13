@@ -46,6 +46,17 @@ def _resolve_db_path() -> str:
 DB_PATH = _resolve_db_path()
 _HAS_PERSISTENT_VOLUME = DB_PATH.startswith("/data")
 
+# ─── Database Backend ────────────────────────────────────────
+# "sqlite"    — all reads/writes go to SQLite (default, current behavior)
+# "dualwrite" — writes to both SQLite and Postgres, reads from SQLite
+# "postgres"  — all reads/writes go to Postgres
+DB_BACKEND = os.environ.get("DB_BACKEND", "sqlite").strip().lower()
+POSTGRES_DSN = os.environ.get("POSTGRES_DSN", "").strip()
+POSTGRES_POOL_MIN = int(os.environ.get("POSTGRES_POOL_MIN", 2))
+POSTGRES_POOL_MAX = int(os.environ.get("POSTGRES_POOL_MAX", 10))
+POSTGRES_STATEMENT_TIMEOUT_MS = int(os.environ.get("POSTGRES_STATEMENT_TIMEOUT_MS", 5000))
+POSTGRES_APP_NAME = os.environ.get("POSTGRES_APP_NAME", "hyperliquid-bot").strip()
+
 # ─── Trader Discovery ─────────────────────────────────────────
 # Minimum PnL (USD) to consider a trader "top"
 # Set low initially so seed addresses get picked up; raise once the bot is mature

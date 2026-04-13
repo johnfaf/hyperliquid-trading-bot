@@ -1,5 +1,14 @@
 """
-SQLite database layer for persisting traders, strategies, scores, and paper trades.
+Database layer for persisting traders, strategies, scores, and paper trades.
+
+Supports three backends selected by ``DB_BACKEND`` env var:
+
+  - ``sqlite``    — local SQLite file (default, original behaviour)
+  - ``dualwrite`` — writes to both SQLite and Postgres; reads from SQLite
+  - ``postgres``  — Postgres only
+
+Public API is unchanged — callers keep using ``get_connection()``,
+``open_paper_trade()``, etc.
 """
 import sqlite3
 import json
@@ -20,6 +29,13 @@ _DB_PATH = config.DB_PATH
 os.makedirs(os.path.dirname(os.path.abspath(_DB_PATH)), exist_ok=True)
 _DB_MIN_FREE_MB = max(1.0, float(os.environ.get("DB_MIN_FREE_MB", "100")))
 
+# Import the router — it handles backend selection internally.
+from src.data.db.router import (                       # noqa: E402
+    get_connection as _routed_connection,
+    is_postgres_active as _is_pg,
+    init_postgres_schema,
+)
+
 
 def get_db_path():
     return _DB_PATH
@@ -39,27 +55,45 @@ def _assert_db_disk_space() -> None:
 
 @contextmanager
 def get_connection():
-    _assert_db_disk_space()
-    conn = sqlite3.connect(get_db_path())
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA busy_timeout=5000")
-    try:
+    """Yield a connection for the active backend.
+
+    In ``sqlite`` mode this behaves identically to the original implementation.
+    In ``postgres`` or ``dualwrite`` mode the router transparently switches
+    the underlying driver while keeping the same interface.
+    """
+    with _routed_connection() as conn:
         yield conn
-        conn.commit()
-    except sqlite3.OperationalError as exc:
-        logger.warning("SQLite operational error: %s", exc)
-        conn.rollback()
-        raise
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
+
+
+def table_exists(name: str) -> bool:
+    """Check whether a table exists in the active backend."""
+    with get_connection() as conn:
+        if _is_pg():
+            row = conn.execute(
+                "SELECT table_name AS name FROM information_schema.tables "
+                "WHERE table_schema='public' AND table_name=?",
+                (name,),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+                (name,),
+            ).fetchone()
+        return row is not None
 
 
 def init_db():
-    """Create all tables if they don't exist."""
+    """Create all tables if they don't exist.
+
+    For Postgres, schema creation is handled by migrations (see
+    ``migrations/0001_init_schema.sql``).  This function only runs
+    the SQLite DDL when SQLite is the active backend.
+    """
+    if _is_pg():
+        # Postgres schema is managed by the migration runner.
+        init_postgres_schema()
+        return
+
     with get_connection() as conn:
         conn.executescript("""
         -- Top traders we're tracking
@@ -377,10 +411,22 @@ def get_strategy_score_history(strategy_id, limit=30):
 def init_paper_account(balance):
     now = datetime.now(timezone.utc).isoformat()
     with get_connection() as conn:
-        conn.execute("""
-            INSERT OR REPLACE INTO paper_account (id, balance, total_pnl, total_trades, winning_trades, last_updated)
-            VALUES (1, ?, 0, 0, 0, ?)
-        """, (balance, now))
+        if _is_pg():
+            conn.execute("""
+                INSERT INTO paper_account (id, balance, total_pnl, total_trades, winning_trades, last_updated)
+                VALUES (?, ?, 0, 0, 0, ?)
+                ON CONFLICT (id) DO UPDATE SET
+                    balance = EXCLUDED.balance,
+                    total_pnl = 0,
+                    total_trades = 0,
+                    winning_trades = 0,
+                    last_updated = EXCLUDED.last_updated
+            """, (1, balance, now))
+        else:
+            conn.execute("""
+                INSERT OR REPLACE INTO paper_account (id, balance, total_pnl, total_trades, winning_trades, last_updated)
+                VALUES (1, ?, 0, 0, 0, ?)
+            """, (balance, now))
 
 
 def get_paper_account():
@@ -488,10 +534,23 @@ def reset_paper_trades(initial_balance: float = None):
         ).fetchone()["c"]
 
         conn.execute("DELETE FROM paper_trades")
-        conn.execute("""
-            INSERT OR REPLACE INTO paper_account (id, balance, total_pnl, total_trades, winning_trades, last_updated)
-            VALUES (1, ?, 0, 0, 0, ?)
-        """, (initial_balance, datetime.now(timezone.utc).isoformat()))
+        now = datetime.now(timezone.utc).isoformat()
+        if _is_pg():
+            conn.execute("""
+                INSERT INTO paper_account (id, balance, total_pnl, total_trades, winning_trades, last_updated)
+                VALUES (?, ?, 0, 0, 0, ?)
+                ON CONFLICT (id) DO UPDATE SET
+                    balance = EXCLUDED.balance,
+                    total_pnl = 0,
+                    total_trades = 0,
+                    winning_trades = 0,
+                    last_updated = EXCLUDED.last_updated
+            """, (1, initial_balance, now))
+        else:
+            conn.execute("""
+                INSERT OR REPLACE INTO paper_account (id, balance, total_pnl, total_trades, winning_trades, last_updated)
+                VALUES (1, ?, 0, 0, 0, ?)
+            """, (initial_balance, now))
 
     logger.info(f"Paper trades reset: cleared {open_count} open + {closed_count} closed trades, "
                f"balance reset to ${initial_balance:,.2f}")
@@ -595,6 +654,12 @@ def backup_to_json(filepath: str = None):
         try:
             with get_connection() as conn:
                 def _table_exists(name):
+                    if _is_pg():
+                        return conn.execute(
+                            "SELECT table_name AS name FROM information_schema.tables "
+                            "WHERE table_schema='public' AND table_name=?",
+                            (name,)
+                        ).fetchone() is not None
                     return conn.execute(
                         "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
                         (name,)
@@ -728,17 +793,26 @@ def restore_from_json(filepath: str = None):
                 from src.discovery.golden_wallet import init_golden_tables
                 init_golden_tables()
 
+                _ignore_sql = (
+                    "INSERT INTO golden_wallets "
+                    "(address, penalised_pnl, raw_pnl, sharpe_ratio, "
+                    "max_drawdown_pct, penalised_max_drawdown_pct, "
+                    "win_rate, trades_per_day, is_golden, coins_traded, "
+                    "best_coin, evaluated_at, connected_to_live) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                    "ON CONFLICT (address) DO NOTHING"
+                ) if _is_pg() else (
+                    "INSERT OR IGNORE INTO golden_wallets "
+                    "(address, penalised_pnl, raw_pnl, sharpe_ratio, "
+                    "max_drawdown_pct, penalised_max_drawdown_pct, "
+                    "win_rate, trades_per_day, is_golden, coins_traded, "
+                    "best_coin, evaluated_at, connected_to_live) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                )
                 with get_connection() as conn:
                     for gw in data["golden_wallets"]:
                         try:
-                            conn.execute("""
-                                INSERT OR IGNORE INTO golden_wallets
-                                (address, penalised_pnl, raw_pnl, sharpe_ratio,
-                                 max_drawdown_pct, penalised_max_drawdown_pct,
-                                 win_rate, trades_per_day, is_golden, coins_traded,
-                                 best_coin, evaluated_at, connected_to_live)
-                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                            """, (
+                            conn.execute(_ignore_sql, (
                                 gw["address"],
                                 gw.get("penalised_pnl", 0),
                                 gw.get("raw_pnl", 0),
@@ -823,6 +897,13 @@ def restore_from_json(filepath: str = None):
     except Exception as e:
         print(f"Restore failed: {e}")
         return False
+
+
+# ─── Backend-aware helpers for modules migrating off raw sqlite3 ──
+
+def get_backend_name() -> str:
+    """Return the active backend name: 'sqlite', 'dualwrite', or 'postgres'."""
+    return config.DB_BACKEND
 
 
 if __name__ == "__main__":
