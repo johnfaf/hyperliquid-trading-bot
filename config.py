@@ -57,6 +57,14 @@ POSTGRES_POOL_MAX = int(os.environ.get("POSTGRES_POOL_MAX", 10))
 POSTGRES_STATEMENT_TIMEOUT_MS = int(os.environ.get("POSTGRES_STATEMENT_TIMEOUT_MS", 5000))
 POSTGRES_APP_NAME = os.environ.get("POSTGRES_APP_NAME", "hyperliquid-bot").strip()
 
+# ─── Feature Store (Postgres-only, auto-enabled when POSTGRES_DSN set) ─
+FEATURE_STORE_COINS = os.environ.get("FEATURE_STORE_COINS", "").strip()
+FEATURE_STORE_MAX_COINS = int(os.environ.get("FEATURE_STORE_MAX_COINS", 30))
+FEATURE_STORE_BACKFILL_5M_DAYS = int(os.environ.get("FEATURE_STORE_BACKFILL_5M_DAYS", 7))
+FEATURE_STORE_BACKFILL_1H_DAYS = int(os.environ.get("FEATURE_STORE_BACKFILL_1H_DAYS", 30))
+FEATURE_STORE_BACKFILL_4H_DAYS = int(os.environ.get("FEATURE_STORE_BACKFILL_4H_DAYS", 90))
+FEATURE_STORE_BACKFILL_1D_DAYS = int(os.environ.get("FEATURE_STORE_BACKFILL_1D_DAYS", 365))
+
 # ─── Trader Discovery ─────────────────────────────────────────
 # Minimum PnL (USD) to consider a trader "top"
 # Set low initially so seed addresses get picked up; raise once the bot is mature

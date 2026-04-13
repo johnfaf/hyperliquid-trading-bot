@@ -64,6 +64,7 @@ from src.core.cycles.research_cycle import run_discovery
 from src.core.cycles.trading_cycle import run_trading_cycle
 from src.core.cycles.fast_cycle import run_fast_cycle, check_file_kill_switch
 from src.core.cycles.reporting_cycle import run_reporting
+from src.core.cycles.feature_cycle import run_feature_cycle, backfill_all as backfill_features, feature_store_is_empty
 from src.data import database as db
 from src.data.database import backup_to_json
 
@@ -114,6 +115,17 @@ class HyperliquidResearchBot:
             health_registry.set_failure_callback(send_subsystem_failure_alert)
         except Exception as exc:
             self.logger.warning("Could not wire failure alert callback: %s", exc)
+
+        # ── Feature store initial backfill (Postgres-only, non-blocking) ──
+        if getattr(config, "POSTGRES_DSN", ""):
+            try:
+                from src.data.db.router import init_postgres_schema
+                init_postgres_schema()
+                if feature_store_is_empty():
+                    self.logger.info("Feature store empty — running initial backfill…")
+                    backfill_features(self.container)
+            except Exception as exc:
+                self.logger.warning("Feature store init skipped: %s", exc)
 
         # ── Supervised background tasks ──
         self.task_runner = SupervisedTaskRunner(health_registry=health_registry)
@@ -192,6 +204,7 @@ class HyperliquidResearchBot:
 
     def _run_discovery(self):
         self.runtime_config.poll(self.container)
+        run_feature_cycle(self.container, tier="daily")
         run_discovery(self.container)
         heartbeat_active(self.container, health_registry)
         self.runtime_monitor.evaluate_and_alert(
@@ -204,6 +217,7 @@ class HyperliquidResearchBot:
     def _run_trading_cycle(self):
         self.runtime_config.poll(self.container)
         self._cycle_count += 1
+        run_feature_cycle(self.container, tier="trading")
         run_trading_cycle(self.container, self._cycle_count)
         run_reporting(self.container, self._cycle_count, health_registry)
         heartbeat_active(self.container, health_registry)
