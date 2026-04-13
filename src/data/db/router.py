@@ -200,11 +200,28 @@ def is_dualwrite_active() -> bool:
 def init_postgres_schema() -> None:
     """Run pending Postgres migrations if Postgres is in use."""
     if config.DB_BACKEND in ("postgres", "dualwrite"):
-        if not config.POSTGRES_DSN:
-            logger.warning(
-                "DB_BACKEND=%s but POSTGRES_DSN is empty — skipping Postgres init.",
-                config.DB_BACKEND,
-            )
-            return
+        from src.data.db.postgres import get_postgres_config_error
+
+        config_error = get_postgres_config_error(config.DB_BACKEND, config.POSTGRES_DSN)
+        if config_error:
+            if config.DB_BACKEND == "dualwrite":
+                logger.warning(
+                    "Dualwrite Postgres init skipped: %s SQLite will remain authoritative.",
+                    config_error,
+                )
+                return
+            raise RuntimeError(config_error)
+
         from src.data.db.migrations import run_migrations
-        run_migrations()
+        if config.DB_BACKEND == "dualwrite":
+            try:
+                run_migrations()
+            except Exception as exc:
+                logger.warning(
+                    "Dualwrite Postgres init skipped because migrations could not run (%s). "
+                    "SQLite will remain authoritative.",
+                    exc,
+                )
+                return
+        else:
+            run_migrations()

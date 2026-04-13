@@ -9,13 +9,73 @@ from __future__ import annotations
 import atexit
 import logging
 import os
+import re
 import sys
 import threading
+from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
 
 _pool = None
 _pool_lock = threading.Lock()
+_LOCAL_POSTGRES_HOSTS = {"localhost", "127.0.0.1", "::1"}
+_HOST_KV_RE = re.compile(r"(?:^|\s)host=(?P<host>[^\s]+)")
+
+
+def _is_hosted_runtime() -> bool:
+    """Best-effort detection for managed deployments like Railway."""
+    hosted_markers = (
+        "RAILWAY_ENVIRONMENT_ID",
+        "RAILWAY_PROJECT_ID",
+        "RAILWAY_SERVICE_ID",
+        "RENDER",
+        "K_SERVICE",
+        "FLY_APP_NAME",
+    )
+    return any(os.environ.get(marker) for marker in hosted_markers)
+
+
+def _extract_dsn_host(dsn: str) -> str:
+    """Return the configured Postgres host from a DSN or libpq string."""
+    dsn = (dsn or "").strip()
+    if not dsn:
+        return ""
+
+    if "://" in dsn:
+        try:
+            parsed = urlparse(dsn)
+            return (parsed.hostname or "").strip("[]").lower()
+        except ValueError:
+            return ""
+
+    match = _HOST_KV_RE.search(dsn)
+    if not match:
+        return ""
+    return match.group("host").strip("[]'\"").lower()
+
+
+def get_postgres_config_error(backend: str, dsn: str) -> str:
+    """Return a human-readable config error, or an empty string if valid."""
+    if backend not in {"postgres", "dualwrite"}:
+        return ""
+
+    dsn = (dsn or "").strip()
+    if not dsn:
+        return (
+            "POSTGRES_DSN is required when DB_BACKEND is 'postgres' or 'dualwrite'. "
+            "Set it to a managed Postgres connection string such as "
+            "postgresql://user:pass@host:5432/dbname?sslmode=require"
+        )
+
+    host = _extract_dsn_host(dsn)
+    if _is_hosted_runtime() and host in _LOCAL_POSTGRES_HOSTS:
+        return (
+            "POSTGRES_DSN points to localhost inside a hosted deployment. "
+            "Use the managed Postgres DATABASE_URL for this environment instead "
+            "of a local sample DSN."
+        )
+
+    return ""
 
 
 def _get_pool():
@@ -32,12 +92,9 @@ def _get_pool():
         import config
 
         dsn = config.POSTGRES_DSN
-        if not dsn:
-            raise RuntimeError(
-                "POSTGRES_DSN is required when DB_BACKEND is 'postgres' or 'dualwrite'. "
-                "Set it to a connection string like: "
-                "postgresql://user:pass@host:5432/dbname?sslmode=require"
-            )
+        config_error = get_postgres_config_error(config.DB_BACKEND, dsn)
+        if config_error:
+            raise RuntimeError(config_error)
 
         try:
             from psycopg_pool import ConnectionPool

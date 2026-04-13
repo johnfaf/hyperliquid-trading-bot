@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+import logging
 import sqlite3
 from contextlib import contextmanager
 
+import pytest
+
 from src.analysis import shadow_tracker as shadow_tracker_module
+from src.data.db import migrations as migrations_module
+from src.data.db import postgres as postgres_module
 from src.data.db import router
 from src.trading import trade_memory as trade_memory_module
 
@@ -38,6 +43,82 @@ def test_dualwrite_read_only_path_skips_postgres(monkeypatch):
         row = conn.execute("SELECT 1").fetchone()
 
     assert row[0] == 1
+
+
+def test_localhost_postgres_dsn_is_allowed_for_local_development():
+    assert postgres_module.get_postgres_config_error(
+        "postgres",
+        "postgresql://postgres:secret@localhost:5432/hyperliquid_bot",
+    ) == ""
+
+
+def test_hosted_localhost_postgres_dsn_is_rejected_on_railway(monkeypatch):
+    monkeypatch.setenv("RAILWAY_ENVIRONMENT_ID", "env_123")
+
+    error = postgres_module.get_postgres_config_error(
+        "postgres",
+        "postgresql://postgres:secret@localhost:5432/hyperliquid_bot",
+    )
+
+    assert "localhost" in error
+    assert "managed Postgres" in error
+
+
+def test_dualwrite_init_postgres_schema_degrades_when_postgres_is_misconfigured(monkeypatch, caplog):
+    monkeypatch.setenv("RAILWAY_ENVIRONMENT_ID", "env_123")
+    monkeypatch.setattr(router.config, "DB_BACKEND", "dualwrite")
+    monkeypatch.setattr(
+        router.config,
+        "POSTGRES_DSN",
+        "postgresql://postgres:secret@localhost:5432/hyperliquid_bot",
+    )
+
+    called = {"value": False}
+
+    def _should_not_run():
+        called["value"] = True
+
+    monkeypatch.setattr(migrations_module, "run_migrations", _should_not_run)
+
+    with caplog.at_level(logging.WARNING):
+        router.init_postgres_schema()
+
+    assert called["value"] is False
+    assert "SQLite will remain authoritative" in caplog.text
+
+
+def test_postgres_init_postgres_schema_raises_when_postgres_is_misconfigured(monkeypatch):
+    monkeypatch.setenv("RAILWAY_ENVIRONMENT_ID", "env_123")
+    monkeypatch.setattr(router.config, "DB_BACKEND", "postgres")
+    monkeypatch.setattr(
+        router.config,
+        "POSTGRES_DSN",
+        "postgresql://postgres:secret@localhost:5432/hyperliquid_bot",
+    )
+
+    with pytest.raises(RuntimeError, match="localhost"):
+        router.init_postgres_schema()
+
+
+def test_dualwrite_init_postgres_schema_degrades_when_migrations_fail(monkeypatch, caplog):
+    monkeypatch.delenv("RAILWAY_ENVIRONMENT_ID", raising=False)
+    monkeypatch.setattr(router.config, "DB_BACKEND", "dualwrite")
+    monkeypatch.setattr(
+        router.config,
+        "POSTGRES_DSN",
+        "postgresql://postgres:secret@db.example.com:5432/hyperliquid_bot?sslmode=require",
+    )
+
+    def _boom():
+        raise RuntimeError("db unreachable")
+
+    monkeypatch.setattr(migrations_module, "run_migrations", _boom)
+
+    with caplog.at_level(logging.WARNING):
+        router.init_postgres_schema()
+
+    assert "migrations could not run" in caplog.text
+    assert "SQLite will remain authoritative" in caplog.text
 
 
 def test_trade_memory_uses_shared_runtime_database(monkeypatch, tmp_path):
