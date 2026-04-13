@@ -24,6 +24,14 @@ logger = logging.getLogger(__name__)
 
 # Pre-compiled patterns for SQL translation
 _PLACEHOLDER_RE = re.compile(r"\?")
+# Boolean columns that Postgres stores as BOOLEAN but SQLite stores as INTEGER.
+# Matches "column = 1" or "column=0" patterns for these known boolean columns.
+_BOOL_COLUMNS = ("active", "is_golden", "connected_to_live", "is_liquidation")
+_BOOL_RE = re.compile(
+    r"\b(" + "|".join(_BOOL_COLUMNS) + r")\s*=\s*([01])\b",
+    re.IGNORECASE,
+)
+_BOOL_MAP = {"1": "true", "0": "false"}
 
 
 def _translate_sql(sql: str, backend: str) -> str:
@@ -41,6 +49,11 @@ def _translate_sql(sql: str, backend: str) -> str:
 
     # AUTOINCREMENT -> not needed (Postgres SERIAL handles it)
     translated = translated.replace("AUTOINCREMENT", "")
+
+    # Boolean columns: SQLite uses 0/1, Postgres uses true/false
+    translated = _BOOL_RE.sub(
+        lambda m: f"{m.group(1)} = {_BOOL_MAP[m.group(2)]}", translated
+    )
 
     # sqlite_master -> information_schema
     translated = translated.replace(
