@@ -483,6 +483,18 @@ def run_trading_cycle(container, cycle_count: int) -> None:
             if injected_options:
                 logger.info("  Injected %d options flow signals into decision engine", injected_options)
 
+        if getattr(container, "alpha_pipeline", None):
+            try:
+                alpha_signals = container.alpha_pipeline.generate_signals()
+                if alpha_signals:
+                    top_strategies.extend(alpha_signals)
+                    logger.info(
+                        "  Injected %d ML alpha signals into decision engine",
+                        len(alpha_signals),
+                    )
+            except Exception as exc:
+                logger.warning("  Alpha pipeline signal generation error: %s", exc)
+
         # Keep the shadow ledger synced to exchange truth when live mode is active.
         if is_live_trading_active(container):
             closed = sync_shadow_book_to_live(container)

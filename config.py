@@ -391,6 +391,21 @@ XGBOOST_CRASH_THRESHOLD = float(os.environ.get("XGBOOST_CRASH_THRESHOLD", -0.18)
 XGBOOST_MIN_CONFIDENCE = float(os.environ.get("XGBOOST_MIN_CONFIDENCE", 0.52))
 XGBOOST_RETRAIN_INTERVAL = int(os.environ.get("XGBOOST_RETRAIN_INTERVAL", 86400))  # 24h walk-forward
 
+# --- Feature Store Alpha Pipeline (Phase B) ---
+ENABLE_ALPHA_PIPELINE = os.environ.get("ENABLE_ALPHA_PIPELINE", "true").lower() in ("true", "1", "yes")
+ALPHA_TIMEFRAME = os.environ.get("ALPHA_TIMEFRAME", "1h")
+ALPHA_LOOKBACK_DAYS = int(os.environ.get("ALPHA_LOOKBACK_DAYS", 120))
+ALPHA_MIN_TRAINING_SAMPLES = int(os.environ.get("ALPHA_MIN_TRAINING_SAMPLES", 250))
+ALPHA_RETRAIN_INTERVAL = int(os.environ.get("ALPHA_RETRAIN_INTERVAL", 21600))
+ALPHA_WALK_FORWARD_SPLITS = int(os.environ.get("ALPHA_WALK_FORWARD_SPLITS", 5))
+ALPHA_LABEL_MIN_ABS_RETURN = float(os.environ.get("ALPHA_LABEL_MIN_ABS_RETURN", 0.0005))
+ALPHA_SIGNAL_MIN_CONFIDENCE = float(os.environ.get("ALPHA_SIGNAL_MIN_CONFIDENCE", 0.58))
+ALPHA_MIN_SIGNIFICANT_TRADES = int(os.environ.get("ALPHA_MIN_SIGNIFICANT_TRADES", 60))
+ALPHA_MIN_SIGNIFICANCE_PVALUE = float(os.environ.get("ALPHA_MIN_SIGNIFICANCE_PVALUE", 0.10))
+ALPHA_MAX_PREDICTION_COINS = int(os.environ.get("ALPHA_MAX_PREDICTION_COINS", 12))
+ALPHA_CACHE_TTL = int(os.environ.get("ALPHA_CACHE_TTL", 180))
+ALPHA_MODEL_DIR = os.environ.get("ALPHA_MODEL_DIR", "models/alpha_direction")
+
 # ─── Kelly Sizing ─────────────────────────────────────────────
 # Multiplier: 1.0=full, 0.5=half, 0.25=quarter (recommended for crypto)
 KELLY_MULTIPLIER = float(os.environ.get("KELLY_MULTIPLIER", 0.25))
@@ -550,6 +565,16 @@ def _validate_config_bounds() -> None:
         ("OPTIONS_FLOW_MIN_CONVICTION_PCT", 0.0, 100.0, 30.0),
         ("XGBOOST_MIN_CONFIDENCE", 0.0, 1.0, 0.52),
         ("XGBOOST_RETRAIN_INTERVAL", 60, 2_592_000, 86400),
+        ("ALPHA_LOOKBACK_DAYS", 7, 3650, 120),
+        ("ALPHA_MIN_TRAINING_SAMPLES", 50, 100_000, 250),
+        ("ALPHA_RETRAIN_INTERVAL", 300, 2_592_000, 21600),
+        ("ALPHA_WALK_FORWARD_SPLITS", 2, 20, 5),
+        ("ALPHA_LABEL_MIN_ABS_RETURN", 0.0, 1.0, 0.0005),
+        ("ALPHA_SIGNAL_MIN_CONFIDENCE", 0.0, 1.0, 0.58),
+        ("ALPHA_MIN_SIGNIFICANT_TRADES", 1, 100_000, 60),
+        ("ALPHA_MIN_SIGNIFICANCE_PVALUE", 0.0, 1.0, 0.10),
+        ("ALPHA_MAX_PREDICTION_COINS", 1, 500, 12),
+        ("ALPHA_CACHE_TTL", 5, 86_400, 180),
         ("KELLY_MULTIPLIER", 0.0, 1.0, 0.25),
         ("MONTE_CARLO_PATHS", 100, 200_000, 5000),
         # Previously unvalidated float/int env vars:
@@ -596,6 +621,10 @@ def _validate_config_bounds() -> None:
     ]
     for name, min_value, max_value, fallback in rules:
         _validate_numeric_bounds(name, min_value, max_value, fallback)
+
+    if ALPHA_TIMEFRAME not in {"1h"}:
+        _warn_config(f"Invalid ALPHA_TIMEFRAME={ALPHA_TIMEFRAME!r}; using '1h'.")
+        globals()["ALPHA_TIMEFRAME"] = "1h"
 
     if LIVE_MAX_ORDER_USD < LIVE_MIN_ORDER_USD:
         _warn_config(

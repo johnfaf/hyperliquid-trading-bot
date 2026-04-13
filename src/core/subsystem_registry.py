@@ -37,7 +37,7 @@ FUNDABLE_CORE = {
 
 FULL_PROFILE = FUNDABLE_CORE | {
     "copy_trader", "live_trader", "options_flow", "polymarket",
-    "predictive_forecaster", "xgboost_forecaster", "multi_scanner", "event_scanner",
+    "predictive_forecaster", "xgboost_forecaster", "alpha_pipeline", "multi_scanner", "event_scanner",
     "liquidation_strategy", "kelly_sizer", "trade_memory", "calibration",
     "llm_filter", "signal_processor", "arena_incubator", "decision_engine",
     "alpha_arena", "position_monitor", "dashboard", "telegram",
@@ -76,6 +76,7 @@ class SubsystemContainer:
     predictive_forecaster: Any = None
     multi_scanner: Any = None
     event_scanner: Any = None
+    alpha_pipeline: Any = None
     liquidation_strategy: Any = None
     kelly_sizer: Any = None
     trade_memory: Any = None
@@ -227,6 +228,30 @@ def build_subsystems(
                 lambda: PredictiveRegimeForecaster({"source_registry": c.data_source_registry}),
                 health,
             )
+
+    if "alpha_pipeline" in profile and getattr(config, "ENABLE_ALPHA_PIPELINE", True):
+        from src.signals.feature_store_alpha import FeatureStoreAlphaPipeline
+        c.alpha_pipeline = _safe_init(
+            "alpha_pipeline",
+            lambda: FeatureStoreAlphaPipeline(
+                {
+                    "timeframe": getattr(config, "ALPHA_TIMEFRAME", "1h"),
+                    "lookback_days": getattr(config, "ALPHA_LOOKBACK_DAYS", 120),
+                    "min_training_samples": getattr(config, "ALPHA_MIN_TRAINING_SAMPLES", 250),
+                    "retrain_interval": getattr(config, "ALPHA_RETRAIN_INTERVAL", 21600),
+                    "walk_forward_splits": getattr(config, "ALPHA_WALK_FORWARD_SPLITS", 5),
+                    "label_min_abs_return": getattr(config, "ALPHA_LABEL_MIN_ABS_RETURN", 0.0005),
+                    "signal_min_confidence": getattr(config, "ALPHA_SIGNAL_MIN_CONFIDENCE", 0.58),
+                    "min_significant_trades": getattr(config, "ALPHA_MIN_SIGNIFICANT_TRADES", 60),
+                    "min_significance_pvalue": getattr(config, "ALPHA_MIN_SIGNIFICANCE_PVALUE", 0.10),
+                    "max_prediction_coins": getattr(config, "ALPHA_MAX_PREDICTION_COINS", 12),
+                    "cache_ttl": getattr(config, "ALPHA_CACHE_TTL", 180),
+                    "model_dir": getattr(config, "ALPHA_MODEL_DIR", "models/alpha_direction"),
+                }
+            ),
+            health,
+            affects_trading=False,
+        )
 
     # Firewall — needs forecaster injected
     # min_confidence is env-tunable via FIREWALL_MIN_CONFIDENCE (default 0.45)
@@ -557,6 +582,7 @@ _FIELD_TO_HEALTH_NAME: dict = {
     "polymarket":             "polymarket",
     "multi_scanner":          "multi_scanner",
     "event_scanner":          "event_scanner",
+    "alpha_pipeline":         "alpha_pipeline",
     "copy_trader":            "copy_trader",
     "paper_trader":           "paper_trader",
     "live_trader":            "live_trader",
