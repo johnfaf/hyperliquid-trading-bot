@@ -22,7 +22,7 @@ from contextlib import contextmanager
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 import config
 
-from src.data.db.connection import ConnectionAdapter
+from src.data.db.connection import ConnectionAdapter, DualWriteAdapter
 
 logger = logging.getLogger(__name__)
 
@@ -92,37 +92,56 @@ def get_connection(*, for_read: bool = False):
             _pg_return(raw)
 
     elif backend == "dualwrite":
-        # Reads go to SQLite, writes go to both.
-        if for_read:
-            raw_sq = _sqlite_connect()
-            adapter = ConnectionAdapter(raw_sq, "sqlite")
+        # Every statement executes on SQLite first (authoritative), then
+        # mirrors to Postgres (best-effort).  Postgres failures are logged
+        # and counted but never propagate to the caller.
+        raw_sq = _sqlite_connect()
+        pg_raw = None
+        try:
+            pg_raw = _pg_connect()
+        except Exception as exc:
+            logger.warning(
+                "Dualwrite: could not obtain Postgres connection (%s) — "
+                "falling back to SQLite-only for this transaction.", exc,
+            )
+
+        if pg_raw is not None:
+            adapter = DualWriteAdapter(raw_sq, pg_raw)
             try:
                 yield adapter
                 raw_sq.commit()
+                try:
+                    pg_raw.commit()
+                except Exception as exc:
+                    logger.warning("Dualwrite Postgres commit failed: %s", exc)
+                    try:
+                        pg_raw.rollback()
+                    except Exception:
+                        pass
+            except sqlite3.OperationalError as exc:
+                logger.warning("SQLite operational error: %s", exc)
+                raw_sq.rollback()
+                try:
+                    pg_raw.rollback()
+                except Exception:
+                    pass
+                raise
             except Exception:
                 raw_sq.rollback()
+                try:
+                    pg_raw.rollback()
+                except Exception:
+                    pass
                 raise
             finally:
                 raw_sq.close()
+                _pg_return(pg_raw)
         else:
-            # DualWriteAdapter: yield an adapter over SQLite, and mirror
-            # writes to Postgres after successful SQLite commit.
-            raw_sq = _sqlite_connect()
+            # Postgres unavailable — degrade to SQLite-only
             adapter = ConnectionAdapter(raw_sq, "sqlite")
-            pg_raw = None
             try:
                 yield adapter
                 raw_sq.commit()
-
-                # Best-effort mirror to Postgres.
-                # In dualwrite mode, Postgres failures are logged but do NOT
-                # roll back the authoritative SQLite write.
-                # The DualWriteAdapter only mirrors statement-level calls
-                # that were recorded during the with block.
-                # For now, dualwrite piggy-backs on the application-level
-                # helpers in database.py that call get_connection() for each
-                # individual operation.  A full statement-replay mechanism
-                # would be added in a follow-up if needed.
             except sqlite3.OperationalError as exc:
                 logger.warning("SQLite operational error: %s", exc)
                 raw_sq.rollback()

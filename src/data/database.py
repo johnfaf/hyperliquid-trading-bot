@@ -906,6 +906,23 @@ def get_backend_name() -> str:
     return config.DB_BACKEND
 
 
+def get_dualwrite_stats() -> dict:
+    """Return dual-write health counters.
+
+    Returns a dict with keys:
+      - ``pg_writes_ok``      — successful Postgres mirror writes
+      - ``pg_writes_failed``  — failed Postgres mirror writes
+      - ``pg_last_error``     — last error message (truncated)
+      - ``pg_last_error_ts``  — timestamp of last error
+
+    Returns an empty dict if dual-write is not active.
+    """
+    if config.DB_BACKEND != "dualwrite":
+        return {}
+    from src.data.db.connection import dualwrite_stats
+    return dualwrite_stats.snapshot()
+
+
 if __name__ == "__main__":
     init_db()
     print(f"Database initialized at {get_db_path()}")
