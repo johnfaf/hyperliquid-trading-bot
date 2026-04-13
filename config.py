@@ -50,8 +50,14 @@ _HAS_PERSISTENT_VOLUME = DB_PATH.startswith("/data")
 # "sqlite"    — all reads/writes go to SQLite (default, current behavior)
 # "dualwrite" — writes to both SQLite and Postgres, reads from SQLite
 # "postgres"  — all reads/writes go to Postgres
-DB_BACKEND = os.environ.get("DB_BACKEND", "sqlite").strip().lower()
+_raw_db_backend = os.environ.get("DB_BACKEND", "sqlite").strip().lower()
 POSTGRES_DSN = os.environ.get("POSTGRES_DSN", "").strip()
+# Auto-downgrade to sqlite if Postgres backends are requested but no DSN is set.
+# This prevents spamming warnings on deployments that don't have Postgres yet.
+if _raw_db_backend in ("dualwrite", "postgres") and not POSTGRES_DSN:
+    DB_BACKEND = "sqlite"
+else:
+    DB_BACKEND = _raw_db_backend
 POSTGRES_POOL_MIN = int(os.environ.get("POSTGRES_POOL_MIN", 2))
 POSTGRES_POOL_MAX = int(os.environ.get("POSTGRES_POOL_MAX", 10))
 POSTGRES_STATEMENT_TIMEOUT_MS = int(os.environ.get("POSTGRES_STATEMENT_TIMEOUT_MS", 5000))

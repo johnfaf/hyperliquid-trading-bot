@@ -17,6 +17,7 @@ import logging
 import os
 import sqlite3
 import sys
+import time
 from contextlib import contextmanager
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", ".."))
@@ -117,10 +118,14 @@ def get_connection(*, for_read: bool = False):
         try:
             pg_raw = _pg_connect()
         except Exception as exc:
-            logger.warning(
-                "Dualwrite: could not obtain Postgres connection (%s) — "
-                "falling back to SQLite-only for this transaction.", exc,
-            )
+            # Rate-limit this warning to avoid log spam when PG is down
+            if not hasattr(get_connection, "_pg_warn_ts") or \
+               (time.time() - get_connection._pg_warn_ts) > 300:
+                logger.warning(
+                    "Dualwrite: could not obtain Postgres connection (%s) — "
+                    "falling back to SQLite-only.", exc,
+                )
+                get_connection._pg_warn_ts = time.time()
 
         if pg_raw is not None:
             adapter = DualWriteAdapter(raw_sq, pg_raw)
