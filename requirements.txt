@@ -19,5 +19,15 @@ psycopg_pool>=3.1.0
 xgboost>=2.0.0
 scikit-learn>=1.3.0
 
+# ─── Claude API LLM Filter ────────────────────────────────────
+# Semantic trade reasoning via Claude (falls back to rules if no API key)
+anthropic>=0.39.0
+
+# ─── LSTM Alpha Agent + RL Position Sizer ─────────────────────
+# PyTorch for LSTM direction forecaster and DQN sizer
+# (graceful fallback to rule-based/Kelly if not installed)
+# CPU-only build keeps the image small (~200MB vs ~2GB for CUDA)
+torch>=2.1.0
+
 # ─── Optional extras (see requirements-optional.txt) ──────────
 # Install separately:  pip install -r requirements-optional.txt
