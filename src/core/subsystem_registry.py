@@ -361,7 +361,12 @@ def build_subsystems(
 
     if "alpha_arena" in profile:
         from src.signals.alpha_arena import AlphaArena
-        c.arena = _safe_init("alpha_arena", AlphaArena, health, affects_trading=False)
+        c.arena = _safe_init(
+            "alpha_arena",
+            lambda: AlphaArena(lstm_agent=c.lstm_agent),
+            health,
+            affects_trading=False,
+        )
 
     # ─── Options Flow ─────────────────────────────────────────
     if "options_flow" in profile:
@@ -425,6 +430,7 @@ def build_subsystems(
                 firewall=c.firewall,
                 agent_scorer=c.agent_scorer,
                 kelly_sizer=c.kelly_sizer,
+                rl_sizer=c.rl_sizer,
                 trade_memory=c.trade_memory,
                 calibration=c.calibration,
                 regime_forecaster=c.predictive_forecaster,
@@ -441,6 +447,7 @@ def build_subsystems(
             agent_scorer=c.agent_scorer,
             feature_engine=c.feature_engine,
             kelly_sizer=c.kelly_sizer,
+            rl_sizer=c.rl_sizer,
             trade_memory=c.trade_memory,
             calibration=c.calibration,
             llm_filter=c.llm_filter,

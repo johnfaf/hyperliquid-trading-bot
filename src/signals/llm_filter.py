@@ -81,6 +81,7 @@ class LLMFilter:
         self._llm_max_calls_per_min = cfg.get("llm_max_calls_per_min", 10)
         self._llm_call_timestamps: list = []
         self._client = None
+        self._client_supports_request_options = False
 
         # Stats
         self.stats = {
@@ -99,7 +100,21 @@ class LLMFilter:
         if self._llm_enabled:
             try:
                 import anthropic
-                self._client = anthropic.Anthropic(api_key=self._api_key)
+                client_kwargs = {
+                    "api_key": self._api_key,
+                    "max_retries": 0,
+                    "timeout": self._llm_timeout,
+                }
+                try:
+                    self._client = anthropic.Anthropic(**client_kwargs)
+                    self._client_supports_request_options = True
+                except TypeError:
+                    # Older SDKs may not accept timeout/max_retries on init.
+                    # We still try per-request options below.
+                    self._client = anthropic.Anthropic(api_key=self._api_key)
+                    self._client_supports_request_options = hasattr(
+                        self._client, "with_options"
+                    )
                 logger.info("LLMFilter initialized (Claude API mode: %s)", self._model)
             except ImportError:
                 logger.warning("LLMFilter: anthropic package not installed, falling back to rule-based")
@@ -254,7 +269,8 @@ class LLMFilter:
             self.stats["llm_calls"] += 1
             self._llm_call_timestamps.append(now)
 
-            response = self._client.messages.create(
+            client = self._get_request_client()
+            response = client.messages.create(
                 model=self._model,
                 max_tokens=self._llm_max_tokens,
                 messages=[{"role": "user", "content": prompt}],
@@ -267,6 +283,27 @@ class LLMFilter:
             logger.warning("LLMFilter Claude API error: %s — falling back to rules", e)
             self.stats["passed"] += 1
             return True, rule_confidence, rule_reason + " (LLM fallback)"
+
+    def _get_request_client(self):
+        """Return a client/view with the configured timeout budget applied."""
+        client = self._client
+        if client is None:
+            raise RuntimeError("Claude client is not initialized")
+
+        if not self._client_supports_request_options:
+            return client
+
+        with_options = getattr(client, "with_options", None)
+        if not callable(with_options):
+            return client
+
+        try:
+            return with_options(timeout=self._llm_timeout, max_retries=0)
+        except TypeError:
+            try:
+                return with_options(timeout=self._llm_timeout)
+            except TypeError:
+                return client
 
     def _build_prompt(self, signal: Dict, context: Dict,
                       rule_confidence: float, rule_reason: str) -> str:

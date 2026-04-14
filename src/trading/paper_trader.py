@@ -42,6 +42,7 @@ class PaperTrader:
                  agent_scorer: Optional[AgentScorer] = None,
                  feature_engine: Optional[FeatureEngine] = None,
                  kelly_sizer: Optional[KellySizer] = None,
+                 rl_sizer: Optional[object] = None,
                  trade_memory: Optional[TradeMemory] = None,
                  calibration: Optional[CalibrationTracker] = None,
                  llm_filter: Optional[LLMFilter] = None,
@@ -50,6 +51,7 @@ class PaperTrader:
         self.agent_scorer = agent_scorer
         self.feature_engine = feature_engine
         self.kelly_sizer = kelly_sizer
+        self.rl_sizer = rl_sizer
         self.trade_memory = trade_memory
         self.calibration = calibration
         self.llm_filter = llm_filter
@@ -160,6 +162,60 @@ class PaperTrader:
             "source_key": source_key,
             "strategy_type": strategy_type or "unknown",
         }
+
+    @staticmethod
+    def _drawdown_from_initial_balance(account_balance: float) -> float:
+        baseline = max(float(getattr(config, "PAPER_TRADING_INITIAL_BALANCE", 10_000.0)), 1.0)
+        return max(0.0, (baseline - max(float(account_balance), 0.0)) / baseline)
+
+    @staticmethod
+    def _resolve_signal_volatility(signal: Dict, regime_data: Optional[Dict]) -> float:
+        features = dict(signal.get("features") or {})
+        if "volatility" in features:
+            try:
+                return max(float(features["volatility"]), 0.0)
+            except (TypeError, ValueError):
+                pass
+        if regime_data:
+            per_coin = dict(regime_data.get("per_coin", {}).get(signal.get("coin"), {}) or {})
+            try:
+                return max(float(per_coin.get("atr_pct", 0.02) or 0.02), 0.0)
+            except (TypeError, ValueError):
+                pass
+        return 0.02
+
+    def _get_position_sizing(
+        self,
+        strategy_key: str,
+        account_balance: float,
+        signal_confidence: float,
+        signal: Optional[Dict] = None,
+        regime_data: Optional[Dict] = None,
+    ):
+        if self.rl_sizer:
+            regime = "unknown"
+            if regime_data:
+                per_coin = dict(regime_data.get("per_coin", {}).get((signal or {}).get("coin"), {}) or {})
+                regime = str(
+                    per_coin.get("regime")
+                    or regime_data.get("overall_regime")
+                    or "unknown"
+                )
+            return self.rl_sizer.get_sizing(
+                strategy_key=strategy_key,
+                account_balance=account_balance,
+                signal_confidence=signal_confidence,
+                regime=regime,
+                recent_volatility=self._resolve_signal_volatility(signal or {}, regime_data),
+                drawdown_from_peak=self._drawdown_from_initial_balance(account_balance),
+            )
+        if self.kelly_sizer:
+            return self.kelly_sizer.get_sizing(
+                strategy_key=strategy_key,
+                account_balance=account_balance,
+                signal_confidence=signal_confidence,
+            )
+        return None
 
     def execute_strategy_signals(self, strategies: List[Dict], exchange_agg=None,
                                   options_scanner=None,
@@ -427,6 +483,7 @@ class PaperTrader:
                         logger.debug(f"Calibration error: {e}")
 
                 # Trade memory lookup — check similar past trades
+                memory_result = None
                 if self.trade_memory:
                     try:
                         memory_result = self.trade_memory.find_similar(
@@ -464,20 +521,26 @@ class PaperTrader:
                     except Exception as e:
                         logger.debug(f"LLM filter error: {e}")
 
-                # Kelly sizing — mathematically optimal position size
-                if self.kelly_sizer:
+                # Dynamic position sizing — RL-adjusted Kelly when available
+                if self.kelly_sizer or self.rl_sizer:
                     try:
-                        sizing = self.kelly_sizer.get_sizing(
+                        sizing = self._get_position_sizing(
                             strategy_key=sig.get("strategy_type", "unknown"),
                             account_balance=account["balance"],
                             signal_confidence=trade_signal.confidence,
+                            signal=sig,
+                            regime_data=regime_data,
                         )
-                        trade_signal.position_pct = sizing.position_pct
-                        if sizing.has_edge:
-                            logger.debug(f"Kelly [{sig.get('strategy_type')}]: {sizing.position_pct:.1%} "
-                                       f"(WR={sizing.win_rate:.0%}, R:R={sizing.reward_risk_ratio:.2f})")
+                        if sizing:
+                            trade_signal.position_pct = sizing.position_pct
+                            if getattr(sizing, "has_edge", False):
+                                logger.debug(
+                                    f"Sizing [{sig.get('strategy_type')}]: {sizing.position_pct:.1%} "
+                                    f"(WR={getattr(sizing, 'win_rate', 0):.0%}, "
+                                    f"R:R={getattr(sizing, 'reward_risk_ratio', 0):.2f})"
+                                )
                     except Exception as e:
-                        logger.debug(f"Kelly sizing error: {e}")
+                        logger.debug(f"Dynamic sizing error: {e}")
 
                 sig["confidence"] = trade_signal.confidence
                 sig["source_accuracy"] = trade_signal.source_accuracy

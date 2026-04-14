@@ -21,10 +21,8 @@ Requirements:
 import logging
 import os
 import time
-import json
 import numpy as np
 from typing import Dict, List, Optional, Tuple
-from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
 
@@ -187,7 +185,6 @@ class DirectionLSTM:
         self.model.eval()
         with _torch.no_grad():
             val_preds = self.model(X_v)
-            val_probs = _torch.softmax(val_preds, dim=1)
             val_labels = val_preds.argmax(dim=1)
             acc = (val_labels == y_v).float().mean().item()
 

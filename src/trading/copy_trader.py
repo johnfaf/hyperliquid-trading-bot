@@ -39,6 +39,7 @@ class CopyTrader:
     def __init__(self, firewall: Optional[DecisionFirewall] = None,
                  agent_scorer: Optional[AgentScorer] = None,
                  kelly_sizer: Optional[KellySizer] = None,
+                 rl_sizer: Optional[object] = None,
                  trade_memory: Optional[TradeMemory] = None,
                  calibration: Optional[CalibrationTracker] = None,
                  regime_forecaster: Optional[object] = None,
@@ -49,6 +50,7 @@ class CopyTrader:
         self.firewall = firewall
         self.agent_scorer = agent_scorer
         self.kelly_sizer = kelly_sizer
+        self.rl_sizer = rl_sizer
         self.trade_memory = trade_memory
         self.calibration = calibration
         self.regime_forecaster = regime_forecaster
@@ -106,6 +108,37 @@ class CopyTrader:
 
     def _open_copy_trade_count(self, trades: List[Dict]) -> int:
         return sum(1 for trade in (trades or []) if self._is_copy_trade(trade))
+
+    @staticmethod
+    def _drawdown_from_initial_balance(account_balance: float) -> float:
+        baseline = max(float(getattr(config, "PAPER_TRADING_INITIAL_BALANCE", 10_000.0)), 1.0)
+        return max(0.0, (baseline - max(float(account_balance), 0.0)) / baseline)
+
+    def _get_position_sizing(self, signal: Dict, account_balance: float):
+        strategy_key = self._source_key(signal)
+        if self.rl_sizer:
+            regime = "unknown"
+            if self.regime_forecaster:
+                try:
+                    pred = self.regime_forecaster.predict_regime(signal.get("coin", "BTC"))
+                    regime = str(pred.get("regime", "unknown"))
+                except Exception:
+                    regime = "unknown"
+            return self.rl_sizer.get_sizing(
+                strategy_key=strategy_key,
+                account_balance=account_balance,
+                signal_confidence=signal.get("confidence", 0.5),
+                regime=regime,
+                recent_volatility=float(signal.get("volatility", 0.02) or 0.02),
+                drawdown_from_peak=self._drawdown_from_initial_balance(account_balance),
+            )
+        if self.kelly_sizer:
+            return self.kelly_sizer.get_sizing(
+                strategy_key=strategy_key,
+                account_balance=account_balance,
+                signal_confidence=signal.get("confidence", 0.5),
+            )
+        return None
 
     def _refresh_copy_guardrail_status(self) -> Dict[str, object]:
         if not self.enabled:
@@ -633,14 +666,9 @@ class CopyTrader:
     def _open_copy_trade(self, account: Dict, signal: Dict, open_trades: List) -> Optional[Dict]:
         """Open a paper trade based on a copy signal."""
         # Kelly-based position sizing if available, else default 5%
-        if self.kelly_sizer:
+        if self.kelly_sizer or self.rl_sizer:
             try:
-                source_key = self._source_key(signal)
-                sizing = self.kelly_sizer.get_sizing(
-                    strategy_key=source_key,
-                    account_balance=account["balance"],
-                    signal_confidence=signal.get("confidence", 0.5),
-                )
+                sizing = self._get_position_sizing(signal, account["balance"])
                 size_usd = sizing.position_usd
             except Exception:
                 size_usd = account["balance"] * 0.05 * signal.get("confidence", 0.5)

@@ -209,6 +209,61 @@ def _is_insufficient_margin_rejection(result) -> bool:
     return any("insufficient margin" in msg.lower() for msg in messages)
 
 
+def _drawdown_from_reference(account_balance: float, baseline: float = 10_000.0) -> float:
+    baseline = max(float(baseline), 1.0)
+    return max(0.0, (baseline - max(float(account_balance), 0.0)) / baseline)
+
+
+def _get_dynamic_sizing(container, strategy_key: str, account_balance: float,
+                        signal_confidence: float, regime_data=None, coin: str = "",
+                        volatility: float = 0.02):
+    """Use the RL sizer when available, otherwise fall back to Kelly."""
+    rl_sizer = getattr(container, "rl_sizer", None)
+    if rl_sizer:
+        regime = "unknown"
+        if regime_data:
+            per_coin = dict(regime_data.get("per_coin", {}).get(coin, {}) or {})
+            regime = str(per_coin.get("regime") or regime_data.get("overall_regime") or "unknown")
+            volatility = float(per_coin.get("atr_pct", volatility) or volatility)
+        return rl_sizer.get_sizing(
+            strategy_key=strategy_key,
+            account_balance=account_balance,
+            signal_confidence=signal_confidence,
+            regime=regime,
+            recent_volatility=float(volatility or 0.02),
+            drawdown_from_peak=_drawdown_from_reference(
+                account_balance,
+                float(getattr(config, "PAPER_TRADING_INITIAL_BALANCE", 10_000.0)),
+            ),
+        )
+
+    kelly_sizer = getattr(container, "kelly_sizer", None)
+    if kelly_sizer:
+        return kelly_sizer.get_sizing(
+            strategy_key=strategy_key,
+            account_balance=account_balance,
+            signal_confidence=signal_confidence,
+        )
+    return None
+
+
+def _train_rl_sizer_if_due(container):
+    rl_sizer = getattr(container, "rl_sizer", None)
+    if not rl_sizer:
+        return
+    try:
+        metrics = rl_sizer.train()
+        if metrics:
+            logger.info(
+                "  RL sizer trained: reward=%.4f, trades=%d, epsilon=%.3f",
+                metrics.get("mean_reward", 0.0),
+                metrics.get("trade_returns_used", 0),
+                metrics.get("epsilon", 0.0),
+            )
+    except Exception as exc:
+        logger.warning("  RL sizer training error: %s", exc)
+
+
 def _execute_signal_live(container, trade_signal, source_label: str, bypass_firewall: bool = True):
     """Execute a TradeSignal directly on the live trader and log the outcome."""
     trader = getattr(container, "live_trader", None)
@@ -564,6 +619,7 @@ def run_trading_cycle(container, cycle_count: int) -> None:
         # Phase 4c: Feed closed trade outcomes
         if closed:
             _process_closed_trades(container, closed)
+        _train_rl_sizer_if_due(container)
 
         # Phase 5: Alpha Arena
         _run_alpha_arena(container, regime_data)
@@ -809,11 +865,18 @@ def _execute_lcrs_signals(container, lcrs_signals, regime_data):
                         logger.info("  LCRS firewall rejected %s: %s", sig["coin"], reason)
                         continue
 
-                if container.kelly_sizer and account:
-                    sizing = container.kelly_sizer.get_sizing(
-                        "liquidation_reversal", account["balance"], trade_signal.confidence
+                if account and (container.kelly_sizer or getattr(container, "rl_sizer", None)):
+                    sizing = _get_dynamic_sizing(
+                        container,
+                        "liquidation_reversal",
+                        account["balance"],
+                        trade_signal.confidence,
+                        regime_data=regime_data,
+                        coin=sig["coin"],
+                        volatility=sig.get("features", {}).get("volatility", 0.02),
                     )
-                    trade_signal.position_pct = sizing.position_pct
+                    if sizing:
+                        trade_signal.position_pct = sizing.position_pct
 
                 if container.trade_memory:
                     mem = container.trade_memory.find_similar(
@@ -933,6 +996,26 @@ def _execute_options_flow_trades(container, regime_data):
                     estimated_notional = max_position_size * flow_signal.position_pct
                     if estimated_notional > 0:
                         flow_signal.size = estimated_notional / price
+
+            sizing_balance = live_account_value if live_active and live_account_value else None
+            if sizing_balance is None:
+                paper_account = db.get_paper_account()
+                sizing_balance = float(paper_account["balance"]) if paper_account else None
+            if sizing_balance and (getattr(container, "kelly_sizer", None) or getattr(container, "rl_sizer", None)):
+                try:
+                    sizing = _get_dynamic_sizing(
+                        container,
+                        "options_momentum",
+                        sizing_balance,
+                        flow_signal.confidence,
+                        regime_data=regime_data,
+                        coin=conv["ticker"],
+                        volatility=0.02,
+                    )
+                    if sizing:
+                        flow_signal.position_pct = sizing.position_pct
+                except Exception as exc:
+                    logger.debug("  Options flow dynamic sizing failed: %s", exc)
 
             if container.firewall:
                 passed, reason = container.firewall.validate(
@@ -1177,6 +1260,25 @@ def _run_alpha_arena(container, regime_data):
                             conf = sig["confidence"]
                             sl = price * (0.95 if side == "long" else 1.05)
                             tp = price * (1.10 if side == "long" else 0.90)
+                            position_pct = 0.05 * conf
+                            if getattr(container, "kelly_sizer", None) or getattr(container, "rl_sizer", None):
+                                try:
+                                    account_balance = float(
+                                        getattr(config, "PAPER_TRADING_INITIAL_BALANCE", 10_000.0)
+                                    )
+                                    sizing = _get_dynamic_sizing(
+                                        container,
+                                        sig["strategy_type"],
+                                        account_balance,
+                                        conf,
+                                        regime_data=regime_data,
+                                        coin="BTC",
+                                        volatility=sig.get("atr_pct", 0.02),
+                                    )
+                                    if sizing:
+                                        position_pct = sizing.position_pct
+                                except Exception as exc:
+                                    logger.debug("  Arena champion sizing failed: %s", exc)
                             if is_live_trading_active(container):
                                 live_signal = TradeSignal(
                                     coin=sig["coin"],
@@ -1187,7 +1289,7 @@ def _run_alpha_arena(container, regime_data):
                                     strategy_type=sig["strategy_type"],
                                     entry_price=price,
                                     leverage=2,
-                                    position_pct=0.05 * conf,
+                                    position_pct=position_pct,
                                     risk=RiskParams(stop_loss_pct=0.05, take_profit_pct=0.10),
                                     regime=regime_data.get("overall_regime", "") if regime_data else "",
                                 )
@@ -1196,7 +1298,22 @@ def _run_alpha_arena(container, regime_data):
                             if account is None:
                                 account = db.get_paper_account()
                             if account:
-                                size_usd = account["balance"] * 0.05 * conf
+                                if getattr(container, "kelly_sizer", None) or getattr(container, "rl_sizer", None):
+                                    try:
+                                        sizing = _get_dynamic_sizing(
+                                            container,
+                                            sig["strategy_type"],
+                                            account["balance"],
+                                            conf,
+                                            regime_data=regime_data,
+                                            coin="BTC",
+                                            volatility=sig.get("atr_pct", 0.02),
+                                        )
+                                        if sizing:
+                                            position_pct = sizing.position_pct
+                                    except Exception as exc:
+                                        logger.debug("  Arena paper sizing failed: %s", exc)
+                                size_usd = account["balance"] * position_pct
                                 size = size_usd / price
                                 db.open_paper_trade(
                                     strategy_id=None, coin=sig["coin"], side=side,

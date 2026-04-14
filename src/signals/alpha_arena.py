@@ -691,8 +691,9 @@ class Backtester:
     - Results only counted on test periods
     """
 
-    def __init__(self):
+    def __init__(self, lstm_agent: Optional[object] = None):
         self.results: Dict[str, Dict] = {}  # agent_id → backtest results
+        self.lstm_agent = lstm_agent
 
     def backtest_agent(self, agent: ArenaAgent,
                         historical_candles: List[Dict],
@@ -712,6 +713,12 @@ class Backtester:
         n = len(historical_candles)
         if n < 50:
             return {"error": "Insufficient data", "trades": 0}
+
+        if agent.strategy_type == "lstm_direction" and self.lstm_agent:
+            try:
+                self.lstm_agent.train(historical_candles)
+            except Exception as exc:
+                logger.debug("LSTM backtest train skipped: %s", exc)
 
         # Walk-forward windows
         train_end = int(n * train_pct)
@@ -854,33 +861,44 @@ class Backtester:
                 confidence = 0.55 + (60 - rsi) / 100
 
         elif stype == "lstm_direction":
-            # LSTM uses a richer feature set — delegate to LSTMAgent if available
-            # Fallback: use a multi-indicator consensus approach
-            signals_up = 0
-            signals_down = 0
-            if sma_fast > sma_slow:
-                signals_up += 1
-            else:
-                signals_down += 1
-            if rsi > 55:
-                signals_up += 1
-            elif rsi < 45:
-                signals_down += 1
-            # Volume momentum proxy
-            if len(closes) >= 10:
-                vol_recent = np.std(returns[-5:])
-                vol_older = np.std(returns[-10:-5]) if len(returns) >= 10 else vol_recent
-                if vol_recent > vol_older * 1.2:  # Expanding volatility
-                    if sma_fast > sma_slow:
-                        signals_up += 1
-                    else:
-                        signals_down += 1
-            if signals_up >= 2 and signals_down == 0:
-                side = "long"
-                confidence = 0.5 + signals_up * 0.1
-            elif signals_down >= 2 and signals_up == 0:
-                side = "short"
-                confidence = 0.5 + signals_down * 0.1
+            if self.lstm_agent:
+                try:
+                    lstm_signal = self.lstm_agent.generate_signal(bars)
+                except Exception as exc:
+                    logger.debug("LSTM signal generation failed: %s", exc)
+                    lstm_signal = None
+                if lstm_signal:
+                    side = lstm_signal.get("side")
+                    confidence = float(lstm_signal.get("confidence", 0.0) or 0.0)
+                    atr_pct = float(lstm_signal.get("atr_pct", atr_pct) or atr_pct)
+
+            # Fallback when the model is unavailable or not confident enough.
+            if side is None:
+                signals_up = 0
+                signals_down = 0
+                if sma_fast > sma_slow:
+                    signals_up += 1
+                else:
+                    signals_down += 1
+                if rsi > 55:
+                    signals_up += 1
+                elif rsi < 45:
+                    signals_down += 1
+                # Volume momentum proxy
+                if len(closes) >= 10:
+                    vol_recent = np.std(returns[-5:])
+                    vol_older = np.std(returns[-10:-5]) if len(returns) >= 10 else vol_recent
+                    if vol_recent > vol_older * 1.2:  # Expanding volatility
+                        if sma_fast > sma_slow:
+                            signals_up += 1
+                        else:
+                            signals_down += 1
+                if signals_up >= 2 and signals_down == 0:
+                    side = "long"
+                    confidence = 0.5 + signals_up * 0.1
+                elif signals_down >= 2 and signals_up == 0:
+                    side = "short"
+                    confidence = 0.5 + signals_down * 0.1
 
         else:
             # Default: simple momentum
@@ -1020,13 +1038,14 @@ class AlphaArena:
     SPAWN_INTERVAL = 0           # Disabled — no new agents spawned
     SPAWN_COUNT = 0              # Disabled — only 9 seed agents
 
-    def __init__(self):
+    def __init__(self, lstm_agent: Optional[object] = None):
         self.agents: Dict[str, ArenaAgent] = {}
         self.tournament = TournamentEngine()
         self.allocator = CapitalAllocator()
         self.consensus = ConsensusEngine()
         self.spawner = AgentSpawner()
-        self.backtester = Backtester()
+        self.lstm_agent = lstm_agent
+        self.backtester = Backtester(lstm_agent=lstm_agent)
         self.cycle_count = 0
 
         # Initialize with seed agents
@@ -1345,6 +1364,12 @@ class AlphaArena:
         No elimination — all 9 agents always compete.
         """
         self.cycle_count += 1
+
+        if historical_candles and self.lstm_agent:
+            try:
+                self.lstm_agent.train(historical_candles)
+            except Exception as exc:
+                logger.debug("Arena LSTM training skipped: %s", exc)
 
         # Tournament
         if self.cycle_count % self.TOURNAMENT_INTERVAL == 0:
