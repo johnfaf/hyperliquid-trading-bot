@@ -84,16 +84,21 @@ def test_candle_snapshot_server_errors_open_request_type_cooldown(monkeypatch):
     monkeypatch.setattr(mgr, "_do_request", fake_do_request)
 
     payload = {"type": "candleSnapshot", "req": {"coin": "BTC", "interval": "1h"}}
-    assert mgr.post(payload, priority=api_manager.Priority.LOW, cache_response=False) is None
+
+    # candleSnapshot threshold is 3 — need 3 failures to trigger cooldown
+    threshold = api_manager.REQUEST_TYPE_FAILURE_THRESHOLDS.get("candleSnapshot", 1)
+    for _ in range(threshold):
+        assert mgr.post(payload, priority=api_manager.Priority.LOW, cache_response=False) is None
 
     cooldown_until = mgr._req_type_cooldown_until.get("candleSnapshot", 0.0)
     assert cooldown_until > 0.0
 
     # Subsequent calls should short-circuit locally instead of hitting the upstream again.
+    prev_call_count = len(api_calls)
     assert mgr.post(payload, priority=api_manager.Priority.LOW, cache_response=False) is None
     assert mgr.post(payload, priority=api_manager.Priority.LOW, cache_response=False) is None
-    assert api_calls == ["candleSnapshot"]
-    assert len(acquire_calls) == 1
+    assert len(api_calls) == prev_call_count  # No new upstream calls
+    assert len(acquire_calls) == threshold  # Only acquired for the threshold failures
 
 
 def test_candle_snapshot_server_errors_fail_fast_without_retry_sleep(monkeypatch):
@@ -119,7 +124,10 @@ def test_candle_snapshot_server_errors_fail_fast_without_retry_sleep(monkeypatch
     )
 
     payload = {"type": "candleSnapshot", "req": {"coin": "BTC", "interval": "1h"}}
-    assert mgr.post(payload, priority=api_manager.Priority.LOW, cache_response=False) is None
+    # Need threshold failures to trigger cooldown
+    threshold = api_manager.REQUEST_TYPE_FAILURE_THRESHOLDS.get("candleSnapshot", 1)
+    for _ in range(threshold):
+        assert mgr.post(payload, priority=api_manager.Priority.LOW, cache_response=False) is None
     assert sleeps == []
     assert any("fail-fast cooldown trigger" in msg for msg in warns)
     assert mgr._req_type_cooldown_until.get("candleSnapshot", 0.0) > 0.0
@@ -129,19 +137,20 @@ def test_candle_snapshot_success_resets_request_type_failure_streak(monkeypatch)
     mgr = api_manager.APIManager()
     monkeypatch.setattr(mgr.bucket, "acquire", lambda priority, timeout=30: True)
 
-    responses = iter(
-        [
-            ([{"t": 1, "c": "1"}], None),
-            (None, "server_error"),
-        ]
-    )
+    threshold = api_manager.REQUEST_TYPE_FAILURE_THRESHOLDS.get("candleSnapshot", 1)
+    # Build response list: one success, then threshold failures to trigger cooldown
+    response_list = [([{"t": 1, "c": "1"}], None)] + [(None, "server_error")] * threshold
+    responses = iter(response_list)
 
     monkeypatch.setattr(mgr, "_do_request", lambda *args, **kwargs: next(responses))
     payload = {"type": "candleSnapshot", "req": {"coin": "ETH", "interval": "1h"}}
 
+    # Success resets failure streak
     assert mgr.post(payload, priority=api_manager.Priority.LOW, cache_response=False) == [{"t": 1, "c": "1"}]
     assert mgr._req_type_failures.get("candleSnapshot") == 0
     assert mgr._req_type_cooldown_until.get("candleSnapshot", 0.0) == 0.0
 
-    assert mgr.post(payload, priority=api_manager.Priority.LOW, cache_response=False) is None
+    # Now threshold failures to trigger cooldown
+    for _ in range(threshold):
+        assert mgr.post(payload, priority=api_manager.Priority.LOW, cache_response=False) is None
     assert mgr._req_type_cooldown_until.get("candleSnapshot", 0.0) > 0.0

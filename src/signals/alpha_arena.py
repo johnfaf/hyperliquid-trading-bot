@@ -437,6 +437,21 @@ class ConsensusEngine:
             confidence = 0.4
             reasoning = "Conservative strategy evaluating risk"
 
+        elif stype == "lstm_direction":
+            # LSTM agent votes based on signal confidence and its own track record
+            if signal.confidence >= 0.55:
+                vote = "approve"
+                confidence = 0.5 + agent.accuracy * 0.4
+                reasoning = "LSTM: high-confidence signal aligns"
+            elif agent.accuracy > 0.55 and signal.confidence >= 0.4:
+                vote = "approve"
+                confidence = 0.45
+                reasoning = "LSTM: moderate signal, good track record"
+            else:
+                vote = "abstain"
+                confidence = 0.3
+                reasoning = "LSTM: insufficient signal clarity"
+
         else:
             # Generic: vote based on accuracy history
             if agent.accuracy >= 0.55:
@@ -513,6 +528,7 @@ class AgentSpawner:
         "momentum_long", "momentum_short", "mean_reversion", "breakout",
         "scalping", "swing_trading", "funding_arb", "trend_following",
         "contrarian", "concentrated_bet", "diversified_portfolio",
+        "lstm_direction",
     ]
 
     MUTATION_RATE = 0.3    # 30% of params get mutated
@@ -837,6 +853,35 @@ class Backtester:
                 side = "long"
                 confidence = 0.55 + (60 - rsi) / 100
 
+        elif stype == "lstm_direction":
+            # LSTM uses a richer feature set — delegate to LSTMAgent if available
+            # Fallback: use a multi-indicator consensus approach
+            signals_up = 0
+            signals_down = 0
+            if sma_fast > sma_slow:
+                signals_up += 1
+            else:
+                signals_down += 1
+            if rsi > 55:
+                signals_up += 1
+            elif rsi < 45:
+                signals_down += 1
+            # Volume momentum proxy
+            if len(closes) >= 10:
+                vol_recent = np.std(returns[-5:])
+                vol_older = np.std(returns[-10:-5]) if len(returns) >= 10 else vol_recent
+                if vol_recent > vol_older * 1.2:  # Expanding volatility
+                    if sma_fast > sma_slow:
+                        signals_up += 1
+                    else:
+                        signals_down += 1
+            if signals_up >= 2 and signals_down == 0:
+                side = "long"
+                confidence = 0.5 + signals_up * 0.1
+            elif signals_down >= 2 and signals_up == 0:
+                side = "short"
+                confidence = 0.5 + signals_down * 0.1
+
         else:
             # Default: simple momentum
             if sma_fast > sma_slow:
@@ -1103,7 +1148,7 @@ class AlphaArena:
         strategy_types = [
             "momentum_long", "momentum_short", "mean_reversion",
             "breakout", "scalping", "swing_trading", "funding_arb",
-            "trend_following", "contrarian",
+            "trend_following", "contrarian", "lstm_direction",
         ]
 
         for stype in strategy_types:

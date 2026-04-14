@@ -11,11 +11,15 @@ Philosophy:
 The LLM asks: "Given everything I know about this setup, is there a reason
 NOT to take this trade?"
 
-This is a stub/rule-based implementation that can be upgraded to actual
-LLM calls (OpenAI, DeepSeek, Claude) when ready. The rule-based version
-captures the same logic patterns an LLM would use.
+Two modes:
+  1. Rule-based (default) — fast, deterministic heuristics
+  2. Claude API (opt-in via ANTHROPIC_API_KEY) — semantic reasoning on signals
 
-Filter checks:
+When Claude API is enabled, the rule-based checks still run first as a
+fast pre-filter.  Only signals that pass rules are sent to Claude for
+deeper reasoning.  This keeps API costs low (~1 call per surviving signal).
+
+Filter checks (rule-based):
   1. Regime contradiction — signal opposes current regime
   2. Memory warning — similar past trades lost money
   3. Multi-signal conflict — different sources disagree
@@ -23,6 +27,9 @@ Filter checks:
   5. Risk cluster — too many positions in correlated assets
 """
 import logging
+import os
+import json
+import time
 from typing import Dict, Optional, Tuple
 
 logger = logging.getLogger(__name__)
@@ -30,10 +37,11 @@ logger = logging.getLogger(__name__)
 
 class LLMFilter:
     """
-    Rule-based "LLM-like" filter that catches bad setups
+    Hybrid rule-based + LLM filter that catches bad setups
     the quantitative models might miss.
 
-    Upgradeable to actual LLM API calls in the future.
+    When ANTHROPIC_API_KEY is set, rule-passing signals are sent to Claude
+    for semantic reasoning.  Without the key, only rule-based filtering runs.
     """
 
     def __init__(self, config: Optional[Dict] = None):
@@ -61,6 +69,19 @@ class LLMFilter:
             "ai": {"FET", "RENDER", "TAO", "NEAR"},
         }
 
+        # Claude API configuration
+        self._api_key = cfg.get("anthropic_api_key") or os.environ.get("ANTHROPIC_API_KEY", "")
+        self._model = cfg.get("anthropic_model") or os.environ.get(
+            "ANTHROPIC_MODEL", "claude-haiku-4-5-20251001"
+        )
+        self._llm_enabled = bool(self._api_key)
+        self._llm_max_tokens = cfg.get("llm_max_tokens", 300)
+        self._llm_timeout = cfg.get("llm_timeout", 10)  # seconds
+        # Rate limiting: max N Claude calls per minute
+        self._llm_max_calls_per_min = cfg.get("llm_max_calls_per_min", 10)
+        self._llm_call_timestamps: list = []
+        self._client = None
+
         # Stats
         self.stats = {
             "total_filtered": 0,
@@ -70,13 +91,28 @@ class LLMFilter:
             "blocked_conflict": 0,
             "blocked_exhaustion": 0,
             "blocked_correlation": 0,
+            "blocked_llm": 0,
+            "llm_calls": 0,
+            "llm_errors": 0,
         }
 
-        logger.info("LLMFilter initialized (rule-based mode)")
+        if self._llm_enabled:
+            try:
+                import anthropic
+                self._client = anthropic.Anthropic(api_key=self._api_key)
+                logger.info("LLMFilter initialized (Claude API mode: %s)", self._model)
+            except ImportError:
+                logger.warning("LLMFilter: anthropic package not installed, falling back to rule-based")
+                self._llm_enabled = False
+            except Exception as e:
+                logger.warning("LLMFilter: Claude API init failed (%s), falling back to rule-based", e)
+                self._llm_enabled = False
+        else:
+            logger.info("LLMFilter initialized (rule-based mode, set ANTHROPIC_API_KEY to enable Claude)")
 
     def filter(self, signal: Dict, context: Dict) -> Tuple[bool, float, str]:
         """
-        Filter a trade signal through LLM-like reasoning.
+        Filter a trade signal through rule-based checks, then optionally Claude.
 
         Args:
             signal: The trade signal dict with coin, side, confidence, features, etc.
@@ -90,6 +126,22 @@ class LLMFilter:
             (approved: bool, adjusted_confidence: float, reason: str)
         """
         self.stats["total_filtered"] += 1
+
+        # ─── Phase 1: Rule-based fast pre-filter ─────────────────
+        approved, confidence, reason = self._rule_filter(signal, context)
+        if not approved:
+            return False, confidence, reason
+
+        # ─── Phase 2: Claude API semantic reasoning ──────────────
+        if self._llm_enabled and self._client:
+            return self._claude_filter(signal, context, confidence, reason)
+
+        # Rule-based only
+        self.stats["passed"] += 1
+        return True, confidence, reason
+
+    def _rule_filter(self, signal: Dict, context: Dict) -> Tuple[bool, float, str]:
+        """Fast deterministic rule-based checks."""
         coin = signal.get("coin", "")
         side = signal.get("side", "")
         confidence = signal.get("confidence", 0.5)
@@ -134,7 +186,6 @@ class LLMFilter:
                 if s.get("coin") == coin and s.get("side") != side
             ]
             if opposing:
-                # Different sources disagree on this coin
                 confidence *= 0.7
                 reasons.append(f"signal conflict: {len(opposing)} opposing signals for {coin}")
 
@@ -176,18 +227,152 @@ class LLMFilter:
                                       f"{side} positions in {coin_group} group already")
 
         # ─── Final Decision ──────────────────────────────────────
-
-        # If confidence was reduced too much, block
         if confidence < 0.20:
             reason_str = " | ".join(reasons) if reasons else "combined filters"
             return False, confidence, f"Confidence too low after filters: {reason_str}"
 
-        self.stats["passed"] += 1
-
         if reasons:
-            logger.debug(f"LLMFilter [{coin} {side}]: passed with adjustments — {', '.join(reasons)}")
+            logger.debug(f"LLMFilter [{coin} {side}]: passed rules with adjustments — {', '.join(reasons)}")
 
         return True, confidence, "approved" + (f" ({', '.join(reasons)})" if reasons else "")
+
+    # ─── Claude API Integration ──────────────────────────────────
+
+    def _claude_filter(self, signal: Dict, context: Dict,
+                       rule_confidence: float, rule_reason: str) -> Tuple[bool, float, str]:
+        """Send the signal to Claude for semantic reasoning."""
+        # Rate limit check
+        now = time.time()
+        self._llm_call_timestamps = [t for t in self._llm_call_timestamps if now - t < 60]
+        if len(self._llm_call_timestamps) >= self._llm_max_calls_per_min:
+            # Over rate limit — pass through with rule-based result
+            self.stats["passed"] += 1
+            return True, rule_confidence, rule_reason + " (LLM rate-limited)"
+
+        try:
+            prompt = self._build_prompt(signal, context, rule_confidence, rule_reason)
+            self.stats["llm_calls"] += 1
+            self._llm_call_timestamps.append(now)
+
+            response = self._client.messages.create(
+                model=self._model,
+                max_tokens=self._llm_max_tokens,
+                messages=[{"role": "user", "content": prompt}],
+            )
+
+            return self._parse_response(response, signal, rule_confidence)
+
+        except Exception as e:
+            self.stats["llm_errors"] += 1
+            logger.warning("LLMFilter Claude API error: %s — falling back to rules", e)
+            self.stats["passed"] += 1
+            return True, rule_confidence, rule_reason + " (LLM fallback)"
+
+    def _build_prompt(self, signal: Dict, context: Dict,
+                      rule_confidence: float, rule_reason: str) -> str:
+        """Build the Claude prompt for trade evaluation."""
+        coin = signal.get("coin", "?")
+        side = signal.get("side", "?")
+        features = signal.get("features", {})
+        regime_data = context.get("regime_data", {})
+        open_positions = context.get("open_positions", [])
+
+        # Summarize open positions
+        open_summary = "None"
+        if open_positions:
+            pos_list = [f"{p.get('coin','?')} {p.get('side','?')}" for p in open_positions[:8]]
+            open_summary = ", ".join(pos_list)
+
+        # Memory context
+        memory = context.get("memory_result")
+        memory_summary = "No similar trades"
+        if memory:
+            if isinstance(memory, dict):
+                wr = memory.get("win_rate", 0)
+                rec = memory.get("recommendation", "none")
+                memory_summary = f"Win rate on similar: {wr:.0%}, rec: {rec}"
+            else:
+                memory_summary = f"Rec: {getattr(memory, 'recommendation', 'none')}"
+
+        return f"""You are a risk-management filter for a crypto perpetual futures trading bot.
+
+TASK: Evaluate whether to APPROVE or REJECT this trade signal. You are NOT predicting price — you are checking for red flags the quant models might miss.
+
+SIGNAL:
+- Coin: {coin}
+- Side: {side}
+- Rule-adjusted confidence: {rule_confidence:.2f}
+- Rule notes: {rule_reason}
+
+FEATURES:
+- RSI: {features.get('rsi', 'N/A')}
+- Trend strength: {features.get('trend_strength', 'N/A')}
+- Volatility: {features.get('volatility', 'N/A')}
+- Volume ratio: {features.get('volume_ratio', 'N/A')}
+- Funding rate: {features.get('funding_rate', 'N/A')}
+- Bollinger position: {features.get('bollinger_position', 'N/A')}
+- Momentum score: {features.get('momentum_score', 'N/A')}
+- Setup type: {features.get('setup_type', 'N/A')}
+
+MARKET CONTEXT:
+- Regime: {regime_data.get('overall_regime', 'unknown')}
+- Regime confidence: {regime_data.get('confidence', 'N/A')}
+- Open positions: {open_summary}
+- Trade memory: {memory_summary}
+
+Respond with EXACTLY this JSON format (no other text):
+{{"decision": "approve" or "reject", "confidence_adjustment": float between 0.5 and 1.2, "reason": "brief one-line reason"}}
+
+Rules:
+- Default to APPROVE unless you see a clear red flag
+- confidence_adjustment multiplies the current confidence (1.0 = no change, 0.7 = reduce 30%, 1.1 = boost 10%)
+- Be concise in reason (under 80 chars)
+- Common red flags: regime mismatch, exhaustion, overcrowded trade, poor risk/reward timing"""
+
+    def _parse_response(self, response, signal: Dict,
+                        rule_confidence: float) -> Tuple[bool, float, str]:
+        """Parse Claude's response into filter decision."""
+        try:
+            text = response.content[0].text.strip()
+            # Handle potential markdown code blocks
+            if text.startswith("```"):
+                text = text.split("```")[1]
+                if text.startswith("json"):
+                    text = text[4:]
+                text = text.strip()
+
+            result = json.loads(text)
+            decision = result.get("decision", "approve").lower()
+            adj = float(result.get("confidence_adjustment", 1.0))
+            reason = result.get("reason", "Claude review")
+
+            # Clamp adjustment
+            adj = max(0.5, min(adj, 1.2))
+            final_confidence = rule_confidence * adj
+
+            if decision == "reject":
+                self.stats["blocked_llm"] += 1
+                logger.info("LLMFilter Claude REJECTED %s %s: %s",
+                           signal.get("coin"), signal.get("side"), reason)
+                return False, 0, f"Claude reject: {reason}"
+
+            # Approved
+            if final_confidence < 0.20:
+                self.stats["blocked_llm"] += 1
+                return False, final_confidence, f"Claude reduced confidence too low: {reason}"
+
+            self.stats["passed"] += 1
+            logger.debug("LLMFilter Claude APPROVED %s %s (conf %.2f -> %.2f): %s",
+                        signal.get("coin"), signal.get("side"),
+                        rule_confidence, final_confidence, reason)
+            return True, final_confidence, f"Claude approved: {reason}"
+
+        except (json.JSONDecodeError, KeyError, IndexError) as e:
+            # Parse failure — fall through with rule-based result
+            self.stats["llm_errors"] += 1
+            logger.warning("LLMFilter: Claude response parse error: %s", e)
+            self.stats["passed"] += 1
+            return True, rule_confidence, "approved (Claude parse fallback)"
 
     def _get_correlation_group(self, coin: str) -> Optional[str]:
         """Get the correlation group for a coin."""
@@ -201,6 +386,8 @@ class LLMFilter:
         total = self.stats["total_filtered"]
         return {
             **self.stats,
+            "llm_enabled": self._llm_enabled,
+            "llm_model": self._model if self._llm_enabled else "none",
             "pass_rate": self.stats["passed"] / total if total > 0 else 0,
             "block_rate": 1 - (self.stats["passed"] / total) if total > 0 else 0,
         }

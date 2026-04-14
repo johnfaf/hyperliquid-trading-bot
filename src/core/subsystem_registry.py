@@ -43,6 +43,7 @@ FULL_PROFILE = FUNDABLE_CORE | {
     "alpha_arena", "position_monitor", "dashboard", "telegram",
     "cross_venue_hedger", "shadow_tracker", "adaptive_bot_detector",
     "regime_strategy_filter", "exchange_aggregator",
+    "lstm_agent", "rl_sizer",
 }
 
 
@@ -88,6 +89,8 @@ class SubsystemContainer:
     arena: Any = None
     adaptive_bot_detector: Any = None
     regime_strategy_filter: Any = None
+    lstm_agent: Any = None
+    rl_sizer: Any = None
 
     # Infra
     cross_venue_hedger: Any = None
@@ -308,6 +311,32 @@ def build_subsystems(
                 c.kelly_sizer.load_from_agent_scorer(c.agent_scorer)
             except Exception:
                 pass
+
+    if "lstm_agent" in profile and getattr(config, "ENABLE_LSTM_AGENT", False):
+        from src.signals.lstm_agent import LSTMAgent
+        c.lstm_agent = _safe_init(
+            "lstm_agent",
+            lambda: LSTMAgent({
+                "sequence_length": getattr(config, "LSTM_SEQUENCE_LENGTH", 30),
+                "hidden_size": getattr(config, "LSTM_HIDDEN_SIZE", 64),
+                "retrain_interval": getattr(config, "LSTM_RETRAIN_INTERVAL", 21600),
+                "model_dir": getattr(config, "LSTM_MODEL_DIR", "models/lstm_direction"),
+            }),
+            health,
+            affects_trading=False,
+        )
+
+    if "rl_sizer" in profile and getattr(config, "ENABLE_RL_SIZER", False) and c.kelly_sizer:
+        from src.signals.rl_position_sizer import RLPositionSizer
+        c.rl_sizer = _safe_init(
+            "rl_sizer",
+            lambda: RLPositionSizer(c.kelly_sizer, {
+                "model_dir": getattr(config, "RL_SIZER_MODEL_DIR", "models/rl_sizer"),
+                "retrain_interval": getattr(config, "RL_SIZER_RETRAIN_INTERVAL", 43200),
+                "training_episodes": getattr(config, "RL_SIZER_TRAINING_EPISODES", 500),
+            }),
+            health,
+        )
 
     if "trade_memory" in profile:
         from src.trading.trade_memory import TradeMemory
@@ -591,6 +620,8 @@ _FIELD_TO_HEALTH_NAME: dict = {
     "adaptive_bot_detector":  "adaptive_bot_detector",
     "regime_strategy_filter": "regime_strategy_filter",
     "position_monitor":       "position_monitor",
+    "lstm_agent":             "lstm_agent",
+    "rl_sizer":               "rl_sizer",
 }
 
 

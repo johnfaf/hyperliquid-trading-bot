@@ -412,6 +412,19 @@ ALPHA_MAX_PREDICTION_COINS = int(os.environ.get("ALPHA_MAX_PREDICTION_COINS", 12
 ALPHA_CACHE_TTL = int(os.environ.get("ALPHA_CACHE_TTL", 180))
 ALPHA_MODEL_DIR = os.environ.get("ALPHA_MODEL_DIR", "models/alpha_direction")
 
+# ─── LSTM Alpha Agent ────────────────────────────────────────
+ENABLE_LSTM_AGENT = os.environ.get("ENABLE_LSTM_AGENT", "true").lower() in ("true", "1", "yes")
+LSTM_SEQUENCE_LENGTH = int(os.environ.get("LSTM_SEQUENCE_LENGTH", 30))
+LSTM_HIDDEN_SIZE = int(os.environ.get("LSTM_HIDDEN_SIZE", 64))
+LSTM_RETRAIN_INTERVAL = int(os.environ.get("LSTM_RETRAIN_INTERVAL", 21600))  # 6 hours
+LSTM_MODEL_DIR = os.environ.get("LSTM_MODEL_DIR", "models/lstm_direction")
+
+# ─── RL Position Sizer ──────────────────────────────────────
+ENABLE_RL_SIZER = os.environ.get("ENABLE_RL_SIZER", "true").lower() in ("true", "1", "yes")
+RL_SIZER_RETRAIN_INTERVAL = int(os.environ.get("RL_SIZER_RETRAIN_INTERVAL", 43200))  # 12 hours
+RL_SIZER_TRAINING_EPISODES = int(os.environ.get("RL_SIZER_TRAINING_EPISODES", 500))
+RL_SIZER_MODEL_DIR = os.environ.get("RL_SIZER_MODEL_DIR", "models/rl_sizer")
+
 # ─── Kelly Sizing ─────────────────────────────────────────────
 # Multiplier: 1.0=full, 0.5=half, 0.25=quarter (recommended for crypto)
 KELLY_MULTIPLIER = float(os.environ.get("KELLY_MULTIPLIER", 0.25))
