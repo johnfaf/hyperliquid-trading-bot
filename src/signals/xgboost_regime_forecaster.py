@@ -90,6 +90,32 @@ CREATE TABLE IF NOT EXISTS regime_history (
 )
 """
 
+_POSTGRES_REGIME_HISTORY_DDL = """
+CREATE TABLE IF NOT EXISTS regime_history (
+    id BIGSERIAL PRIMARY KEY,
+    timestamp TIMESTAMPTZ NOT NULL DEFAULT now(),
+    coin TEXT DEFAULT 'BTC',
+    funding_rate DOUBLE PRECISION DEFAULT 0,
+    funding_slope DOUBLE PRECISION DEFAULT 0,
+    orderbook_imbalance DOUBLE PRECISION DEFAULT 0,
+    arkham_flow DOUBLE PRECISION DEFAULT 0,
+    volatility_5m DOUBLE PRECISION DEFAULT 0,
+    basis_spread DOUBLE PRECISION DEFAULT 0,
+    polymarket_sentiment DOUBLE PRECISION DEFAULT 0,
+    options_flow_conviction DOUBLE PRECISION DEFAULT 0,
+    regime_label INTEGER,
+    confidence DOUBLE PRECISION DEFAULT 0,
+    predicted_regime TEXT DEFAULT 'neutral',
+    label_source TEXT DEFAULT 'predicted'
+);
+CREATE INDEX IF NOT EXISTS idx_regime_history_timestamp
+    ON regime_history (timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_regime_history_coin_timestamp
+    ON regime_history (coin, timestamp DESC);
+ALTER TABLE regime_history
+    ADD COLUMN IF NOT EXISTS label_source TEXT DEFAULT 'predicted';
+"""
+
 
 class XGBoostRegimeForecaster:
     """
@@ -593,11 +619,7 @@ class XGBoostRegimeForecaster:
             backend = db.get_backend_name()
             with get_connection() as conn:
                 if backend == "postgres":
-                    if not db.table_exists("regime_history"):
-                        logger.warning(
-                            "regime_history is missing in Postgres. "
-                            "Run pending migrations before enabling Postgres-backed regime history."
-                        )
+                    conn.executescript(_POSTGRES_REGIME_HISTORY_DDL)
                     return
 
                 conn.executescript(_SQLITE_REGIME_HISTORY_DDL)

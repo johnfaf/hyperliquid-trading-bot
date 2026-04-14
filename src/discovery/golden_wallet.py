@@ -651,7 +651,8 @@ def get_human_wallets_from_db() -> List[Dict]:
     """Get all active human-like traders from the bot's DB."""
     with _get_db() as conn:
         rows = conn.execute(
-            "SELECT address, metadata FROM traders WHERE active = 1"
+            "SELECT address, metadata FROM traders WHERE active = ?",
+            (True,),
         ).fetchall()
         wallets = []
         for r in rows:

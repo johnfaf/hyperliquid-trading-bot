@@ -70,7 +70,8 @@ def _get_watched_coins(container=None) -> List[str]:
         from src.data import database as db
         with db.get_connection() as conn:
             rows = conn.execute(
-                "SELECT DISTINCT name FROM strategies WHERE active=1 LIMIT 20"
+                "SELECT DISTINCT name FROM strategies WHERE active = ? LIMIT 20",
+                (True,),
             ).fetchall()
             for r in rows:
                 # Strategy names often contain the coin

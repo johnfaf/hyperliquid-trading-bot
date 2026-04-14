@@ -7,6 +7,7 @@ from contextlib import contextmanager
 import pytest
 
 from src.analysis import shadow_tracker as shadow_tracker_module
+from src.data import database as db
 from src.data.db.connection import DualWriteAdapter
 from src.data.db import migrations as migrations_module
 from src.data.db import postgres as postgres_module
@@ -187,6 +188,115 @@ def test_dualwrite_init_postgres_schema_degrades_when_migrations_fail(monkeypatc
 
     assert "migrations could not run" in caplog.text
     assert "SQLite will remain authoritative" in caplog.text
+
+
+def test_ensure_postgres_strategy_parent_backfills_from_sqlite_in_postgres_mode(monkeypatch, tmp_path):
+    sqlite_db = tmp_path / "runtime.db"
+    conn = sqlite3.connect(sqlite_db)
+    try:
+        conn.execute(
+            """
+            CREATE TABLE strategies (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                description TEXT,
+                strategy_type TEXT NOT NULL,
+                parameters TEXT DEFAULT '{}',
+                discovered_at TEXT NOT NULL,
+                last_scored TEXT,
+                current_score REAL DEFAULT 0,
+                total_pnl REAL DEFAULT 0,
+                trade_count INTEGER DEFAULT 0,
+                win_rate REAL DEFAULT 0,
+                sharpe_ratio REAL DEFAULT 0,
+                active INTEGER DEFAULT 1
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO strategies
+            (id, name, description, strategy_type, parameters, discovered_at,
+             last_scored, current_score, total_pnl, trade_count, win_rate,
+             sharpe_ratio, active)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                7,
+                "btc_momentum",
+                "test",
+                "momentum",
+                "{}",
+                "2026-04-14T00:00:00+00:00",
+                None,
+                0.9,
+                1.2,
+                5,
+                0.6,
+                1.1,
+                1,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    pg_conn = _RecordingPgConn()
+    monkeypatch.setattr(db.config, "DB_BACKEND", "postgres")
+    monkeypatch.setattr(db, "_DB_PATH", str(sqlite_db))
+    monkeypatch.setattr(postgres_module, "get_connection", lambda: pg_conn)
+    monkeypatch.setattr(postgres_module, "return_connection", lambda conn: None)
+
+    db._ensure_postgres_strategy_parent(7)
+
+    insert_sql, insert_params = pg_conn.executed[-2]
+    assert "INSERT INTO strategies" in insert_sql
+    assert insert_params[0] == 7
+    assert insert_params[1] == "btc_momentum"
+    assert insert_params[-1] is True
+    assert "setval" in pg_conn.executed[-1][0]
+
+
+def test_active_queries_bind_boolean_parameters(monkeypatch):
+    class _DummyCursor:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def fetchall(self):
+            return self._rows
+
+    class _DummyConn:
+        def __init__(self):
+            self.calls = []
+
+        def execute(self, sql, params=()):
+            self.calls.append((sql, tuple(params or ())))
+            return _DummyCursor([])
+
+    dummy = _DummyConn()
+
+    @contextmanager
+    def _ctx(*, for_read: bool = False):
+        yield dummy
+
+    monkeypatch.setattr(db, "get_connection", _ctx)
+
+    db.get_active_traders()
+    db.get_active_strategies()
+    db.get_known_bot_addresses()
+
+    assert dummy.calls[0] == (
+        "SELECT * FROM traders WHERE active = ? ORDER BY total_pnl DESC",
+        (True,),
+    )
+    assert dummy.calls[1] == (
+        "SELECT * FROM strategies WHERE active = ? ORDER BY current_score DESC",
+        (True,),
+    )
+    assert dummy.calls[2] == (
+        "SELECT address FROM traders WHERE active = ?",
+        (False,),
+    )
 
 
 def test_trade_memory_uses_shared_runtime_database(monkeypatch, tmp_path):

@@ -14,6 +14,7 @@ import json
 import os
 import shutil
 import logging
+import sqlite3
 from datetime import datetime, timezone
 from contextlib import contextmanager
 
@@ -276,14 +277,36 @@ def mark_trader_inactive(address):
                      (False, datetime.now(timezone.utc).isoformat(), address))
 
 
+def _get_sqlite_strategy_row(strategy_id):
+    """Load a strategy row from the local SQLite runtime DB if it exists."""
+    if strategy_id is None or not _DB_PATH or not os.path.exists(_DB_PATH):
+        return None
+
+    try:
+        conn = sqlite3.connect(_DB_PATH)
+        conn.row_factory = sqlite3.Row
+        try:
+            row = conn.execute(
+                "SELECT * FROM strategies WHERE id = ?",
+                (strategy_id,),
+            ).fetchone()
+        finally:
+            conn.close()
+    except Exception as exc:
+        logger.debug("Could not load strategy %s from SQLite fallback: %s", strategy_id, exc)
+        return None
+
+    return dict(row) if row else None
+
+
 def _ensure_postgres_strategy_parent(strategy_id) -> None:
-    """Backfill a missing strategy row into Postgres during dual-write.
+    """Backfill a missing strategy row into Postgres.
 
     This protects child writes such as ``strategy_scores`` and ``paper_trades``
-    when dual-write is enabled on a deployment that already had SQLite data
-    before Postgres was connected.
+    during cutover windows where SQLite may still contain the authoritative
+    parent row but Postgres has not seen it yet.
     """
-    if config.DB_BACKEND != "dualwrite" or strategy_id is None:
+    if config.DB_BACKEND not in ("dualwrite", "postgres") or strategy_id is None:
         return
 
     try:
@@ -292,11 +315,14 @@ def _ensure_postgres_strategy_parent(strategy_id) -> None:
     except Exception:
         return
 
-    with get_connection(for_read=True) as sqlite_conn:
-        strategy = sqlite_conn.execute(
-            "SELECT * FROM strategies WHERE id = ?",
-            (strategy_id,),
-        ).fetchone()
+    strategy = _get_sqlite_strategy_row(strategy_id)
+    if not strategy and config.DB_BACKEND == "dualwrite":
+        with get_connection(for_read=True) as sqlite_conn:
+            row = sqlite_conn.execute(
+                "SELECT * FROM strategies WHERE id = ?",
+                (strategy_id,),
+            ).fetchone()
+        strategy = dict(row) if row else None
 
     if not strategy:
         return
@@ -346,6 +372,16 @@ def _ensure_postgres_strategy_parent(strategy_id) -> None:
                 bool(strategy["active"]),
             ),
         )
+        cur.execute(
+            """
+            SELECT setval(
+                pg_get_serial_sequence('strategies', 'id'),
+                GREATEST((SELECT COALESCE(MAX(id), 1) FROM strategies), %s),
+                true
+            )
+            """,
+            (strategy["id"],),
+        )
         pg_conn.commit()
     except Exception as exc:
         try:
@@ -360,7 +396,8 @@ def _ensure_postgres_strategy_parent(strategy_id) -> None:
 def get_active_traders():
     with get_connection() as conn:
         rows = conn.execute(
-            "SELECT * FROM traders WHERE active = 1 ORDER BY total_pnl DESC"
+            "SELECT * FROM traders WHERE active = ? ORDER BY total_pnl DESC",
+            (True,),
         ).fetchall()
     return [dict(r) for r in rows]
 
@@ -379,7 +416,8 @@ def get_known_bot_addresses() -> set:
     """
     with get_connection() as conn:
         rows = conn.execute(
-            "SELECT address FROM traders WHERE active = 0"
+            "SELECT address FROM traders WHERE active = ?",
+            (False,),
         ).fetchall()
     return {r["address"] for r in rows}
 
@@ -462,7 +500,8 @@ def update_strategy_score(strategy_id, score):
 def get_active_strategies():
     with get_connection() as conn:
         rows = conn.execute(
-            "SELECT * FROM strategies WHERE active = 1 ORDER BY current_score DESC"
+            "SELECT * FROM strategies WHERE active = ? ORDER BY current_score DESC",
+            (True,),
         ).fetchall()
     return [dict(r) for r in rows]
 

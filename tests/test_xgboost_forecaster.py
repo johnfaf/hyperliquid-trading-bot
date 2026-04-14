@@ -134,12 +134,12 @@ class TestXGBoostRegimeForecaster:
             # train should NOT be called if HAS_XGBOOST is False
             # but if it is True and model is None, it should try
 
-    def test_postgres_regime_history_setup_skips_sqlite_ddl(self, forecaster, monkeypatch):
-        """Postgres mode should rely on migrations instead of SQLite DDL/PRAGMA."""
+    def test_postgres_regime_history_setup_bootstraps_postgres_table(self, forecaster, monkeypatch):
+        """Postgres mode should create native regime_history schema without SQLite PRAGMA."""
 
         class _DummyConn:
             def __init__(self):
-                self.executescript_called = False
+                self.executescript_sql = None
                 self.execute_calls = []
 
             def execute(self, sql, params=None):
@@ -147,7 +147,7 @@ class TestXGBoostRegimeForecaster:
                 return MagicMock(fetchall=lambda: [])
 
             def executescript(self, sql):
-                self.executescript_called = True
+                self.executescript_sql = sql
 
         dummy = _DummyConn()
 
@@ -156,10 +156,12 @@ class TestXGBoostRegimeForecaster:
             yield dummy
 
         monkeypatch.setattr("src.data.database.get_backend_name", lambda: "postgres")
-        monkeypatch.setattr("src.data.database.table_exists", lambda name: True)
         monkeypatch.setattr("src.data.database.get_connection", _ctx)
 
         forecaster._ensure_regime_history_table()
 
-        assert dummy.executescript_called is False
+        assert dummy.executescript_sql is not None
+        assert "CREATE TABLE IF NOT EXISTS regime_history" in dummy.executescript_sql
+        assert "PRAGMA table_info" not in dummy.executescript_sql
+        assert "datetime('now')" not in dummy.executescript_sql
         assert dummy.execute_calls == []

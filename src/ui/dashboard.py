@@ -302,13 +302,15 @@ def get_dashboard_data(runtime_snapshot: Dict | None = None):
         # Traders
         traders = [dict(r) for r in conn.execute(
             "SELECT address, account_value, total_pnl, roi_pct, win_rate, trade_count, last_updated "
-            "FROM traders WHERE active = 1 ORDER BY total_pnl DESC LIMIT 100"
+            "FROM traders WHERE active = ? ORDER BY total_pnl DESC LIMIT 100",
+            (True,),
         ).fetchall()]
 
         # Strategies
         strategies = [dict(r) for r in conn.execute(
             "SELECT id, name, strategy_type, current_score, total_pnl, win_rate, trade_count, discovered_at "
-            "FROM strategies WHERE active = 1 ORDER BY current_score DESC"
+            "FROM strategies WHERE active = ? ORDER BY current_score DESC",
+            (True,),
         ).fetchall()]
 
         # Open paper trades
@@ -341,16 +343,28 @@ def get_dashboard_data(runtime_snapshot: Dict | None = None):
             "FROM audit_trail ORDER BY timestamp DESC LIMIT 200"
         ).fetchall()]
 
-        # Copy trades (from metadata)
-        copy_trades = [dict(r) for r in conn.execute(
-            "SELECT * FROM paper_trades WHERE metadata LIKE '%copy_trade%' OR metadata LIKE '%golden_wallet%' ORDER BY opened_at DESC LIMIT 30"
+        # Copy trades: filter in Python so this works on both SQLite TEXT and Postgres JSONB.
+        recent_trade_rows = [dict(r) for r in conn.execute(
+            "SELECT * FROM paper_trades ORDER BY opened_at DESC LIMIT 120"
         ).fetchall()]
+        copy_trades = []
+        for trade in recent_trade_rows:
+            metadata = trade.get("metadata")
+            if isinstance(metadata, (dict, list)):
+                metadata_blob = json.dumps(metadata)
+            else:
+                metadata_blob = str(metadata or "")
+            if "copy_trade" in metadata_blob or "golden_wallet" in metadata_blob:
+                copy_trades.append(trade)
+                if len(copy_trades) >= 30:
+                    break
 
         # Strategy type distribution
         type_dist = [dict(r) for r in conn.execute(
             "SELECT strategy_type, COUNT(*) as count, AVG(current_score) as avg_score, "
-            "SUM(total_pnl) as total_pnl FROM strategies WHERE active = 1 "
-            "GROUP BY strategy_type ORDER BY count DESC"
+            "SUM(total_pnl) as total_pnl FROM strategies WHERE active = ? "
+            "GROUP BY strategy_type ORDER BY count DESC",
+            (True,),
         ).fetchall()]
 
         # Recent research logs
