@@ -241,11 +241,12 @@ REQUEST_PRIORITIES = {
 # Request-type cooldowns for endpoints that can fail globally but are safe to
 # skip temporarily because the bot can continue from cached or stored data.
 REQUEST_TYPE_FAILURE_THRESHOLDS = {
-    "candleSnapshot": 2,
+    "candleSnapshot": 1,
 }
 REQUEST_TYPE_COOLDOWNS = {
     "candleSnapshot": 120.0,
 }
+REQUEST_TYPE_FAIL_FAST_ON_SERVER_ERROR = {"candleSnapshot"}
 
 
 # ─── Jittered Backoff ────────────────────────────────────────────
@@ -871,6 +872,13 @@ class APIManager:
                 # ── 5xx: Server error — retry with backoff ──
                 if resp.status_code >= 500:
                     failure_kind = "server_error"
+                    if req_type in REQUEST_TYPE_FAIL_FAST_ON_SERVER_ERROR:
+                        logger.warning(
+                            "SERVER_ERROR %s type='%s' - fail-fast cooldown trigger",
+                            resp.status_code,
+                            req_type,
+                        )
+                        return None, failure_kind
                     wait = jittered_backoff(attempt, base=3.0, cap=30.0)
                     logger.warning(
                         f"SERVER_ERROR {resp.status_code} type='{req_type}' — "

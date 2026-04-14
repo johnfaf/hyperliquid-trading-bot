@@ -85,15 +85,44 @@ def test_candle_snapshot_server_errors_open_request_type_cooldown(monkeypatch):
 
     payload = {"type": "candleSnapshot", "req": {"coin": "BTC", "interval": "1h"}}
     assert mgr.post(payload, priority=api_manager.Priority.LOW, cache_response=False) is None
-    assert mgr.post(payload, priority=api_manager.Priority.LOW, cache_response=False) is None
 
     cooldown_until = mgr._req_type_cooldown_until.get("candleSnapshot", 0.0)
     assert cooldown_until > 0.0
 
-    # Third call should short-circuit locally instead of hitting the upstream again.
+    # Subsequent calls should short-circuit locally instead of hitting the upstream again.
     assert mgr.post(payload, priority=api_manager.Priority.LOW, cache_response=False) is None
-    assert api_calls == ["candleSnapshot", "candleSnapshot"]
-    assert len(acquire_calls) == 2
+    assert mgr.post(payload, priority=api_manager.Priority.LOW, cache_response=False) is None
+    assert api_calls == ["candleSnapshot"]
+    assert len(acquire_calls) == 1
+
+
+def test_candle_snapshot_server_errors_fail_fast_without_retry_sleep(monkeypatch):
+    mgr = api_manager.APIManager()
+    warns = []
+    sleeps = []
+
+    class FakeResponse:
+        status_code = 500
+        text = "boom"
+
+    monkeypatch.setattr(mgr.bucket, "acquire", lambda priority, timeout=30: True)
+    monkeypatch.setattr(
+        api_manager.requests,
+        "post",
+        lambda *args, **kwargs: FakeResponse(),
+    )
+    monkeypatch.setattr(api_manager.time, "sleep", lambda seconds: sleeps.append(seconds))
+    monkeypatch.setattr(
+        api_manager.logger,
+        "warning",
+        lambda msg, *args: warns.append(msg % args if args else msg),
+    )
+
+    payload = {"type": "candleSnapshot", "req": {"coin": "BTC", "interval": "1h"}}
+    assert mgr.post(payload, priority=api_manager.Priority.LOW, cache_response=False) is None
+    assert sleeps == []
+    assert any("fail-fast cooldown trigger" in msg for msg in warns)
+    assert mgr._req_type_cooldown_until.get("candleSnapshot", 0.0) > 0.0
 
 
 def test_candle_snapshot_success_resets_request_type_failure_streak(monkeypatch):
@@ -102,9 +131,7 @@ def test_candle_snapshot_success_resets_request_type_failure_streak(monkeypatch)
 
     responses = iter(
         [
-            (None, "server_error"),
             ([{"t": 1, "c": "1"}], None),
-            (None, "server_error"),
             (None, "server_error"),
         ]
     )
@@ -112,12 +139,9 @@ def test_candle_snapshot_success_resets_request_type_failure_streak(monkeypatch)
     monkeypatch.setattr(mgr, "_do_request", lambda *args, **kwargs: next(responses))
     payload = {"type": "candleSnapshot", "req": {"coin": "ETH", "interval": "1h"}}
 
-    assert mgr.post(payload, priority=api_manager.Priority.LOW, cache_response=False) is None
-    assert mgr._req_type_failures.get("candleSnapshot") == 1
-
     assert mgr.post(payload, priority=api_manager.Priority.LOW, cache_response=False) == [{"t": 1, "c": "1"}]
     assert mgr._req_type_failures.get("candleSnapshot") == 0
+    assert mgr._req_type_cooldown_until.get("candleSnapshot", 0.0) == 0.0
 
-    assert mgr.post(payload, priority=api_manager.Priority.LOW, cache_response=False) is None
     assert mgr.post(payload, priority=api_manager.Priority.LOW, cache_response=False) is None
     assert mgr._req_type_cooldown_until.get("candleSnapshot", 0.0) > 0.0
