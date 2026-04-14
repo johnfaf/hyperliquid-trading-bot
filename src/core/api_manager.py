@@ -241,7 +241,7 @@ REQUEST_PRIORITIES = {
 # Request-type cooldowns for endpoints that can fail globally but are safe to
 # skip temporarily because the bot can continue from cached or stored data.
 REQUEST_TYPE_FAILURE_THRESHOLDS = {
-    "candleSnapshot": 1,
+    "candleSnapshot": 3,
 }
 REQUEST_TYPE_COOLDOWNS = {
     "candleSnapshot": 120.0,

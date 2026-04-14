@@ -179,6 +179,11 @@ class PositionMonitor:
         self._rest_fallback_thread = None
         self._reconnect_delay_override_s: Optional[float] = None
         self._reconnect_reason: Optional[str] = None
+        # When all monitored traders have 0 positions, Hyperliquid
+        # disconnects with "Inactive" after ~60s.  Track consecutive
+        # empty-bootstrap reconnects so we can extend the delay.
+        self._consecutive_empty_reconnects: int = 0
+        self._IDLE_RECONNECT_CAP_S: float = 300.0  # 5 min when no positions
 
     def start(self, addresses: List[str]) -> None:
         """
@@ -378,7 +383,20 @@ class PositionMonitor:
 
         import random
 
+        # Normal backoff: 5, 10, 20, 40, 60 (capped)
         wait = min(5 * (2 ** min(reconnect_count, 4)), 60)
+
+        # If all monitored traders have 0 positions, Hyperliquid
+        # disconnects us as "Inactive" every ~60s.  Extend the cap
+        # to avoid noisy churn when there's nothing to monitor.
+        with self._lock:
+            empty_runs = self._consecutive_empty_reconnects
+        if empty_runs >= 3:
+            wait = min(
+                self._IDLE_RECONNECT_CAP_S,
+                60 * min(empty_runs - 2, 5),  # 60, 120, 180, 240, 300
+            )
+
         wait += random.uniform(0, 3)
         return wait, None
 
@@ -409,6 +427,18 @@ class PositionMonitor:
             logger.info("PositionMonitor connected")
             for address in tracked:
                 self._bootstrap_positions(address)
+
+        # Track whether any trader has positions — if none do,
+        # Hyperliquid will disconnect us as "Inactive" quickly.
+        total_positions = sum(
+            len(self._position_cache.get(addr, {}))
+            for addr in tracked
+        )
+        with self._lock:
+            if total_positions > 0:
+                self._consecutive_empty_reconnects = 0
+            else:
+                self._consecutive_empty_reconnects += 1
 
         # Subscribe to all tracked addresses
         for address in tracked:
