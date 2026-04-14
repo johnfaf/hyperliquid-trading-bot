@@ -8,6 +8,7 @@ Every signal source (strategy scorer, copy trader, options flow)
 must produce a TradeSignal before it reaches the decision firewall.
 """
 import contextvars
+import json
 import uuid
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
@@ -51,16 +52,22 @@ class RiskParams:
     take_profit_pct: float = 0.25     # 25% take-profit on margin / ROE (5:1)
     max_leverage: float = 5.0
     trailing_stop: bool = True
-    trailing_pct: float = 0.025       # 2.5% trailing stop
+    trailing_pct: float = 0.025       # Trailing distance (ROE or price, per risk_basis)
     time_limit_hours: float = 24.0    # Max time in position
     risk_basis: str = "roe"           # "roe" = margin-based, "price" = raw price move
     reward_to_risk_ratio: float = 5.0
     enforce_reward_to_risk: bool = True
+    break_even_at_r: float = 1.0      # Promote stop to breakeven after this many R
+    break_even_buffer_pct: float = 0.005  # Buffer above/below entry (same basis as risk_basis)
+    trail_activate_at_r: float = 2.0  # Start trailing after this many R
 
     def __post_init__(self) -> None:
         self.stop_loss_pct = max(float(self.stop_loss_pct or 0.0), 0.0)
         self.take_profit_pct = max(float(self.take_profit_pct or 0.0), 0.0)
         self.reward_to_risk_ratio = max(float(self.reward_to_risk_ratio or 0.0), 0.0)
+        self.break_even_at_r = max(float(self.break_even_at_r or 0.0), 0.0)
+        self.break_even_buffer_pct = max(float(self.break_even_buffer_pct or 0.0), 0.0)
+        self.trail_activate_at_r = max(float(self.trail_activate_at_r or 0.0), 0.0)
         basis = str(self.risk_basis or "roe").strip().lower()
         self.risk_basis = basis if basis in {"roe", "price"} else "roe"
         self.sync_reward_to_risk()
@@ -88,6 +95,30 @@ class RiskParams:
         if self.risk_basis == "roe":
             return self.take_profit_pct / self._normalized_leverage(leverage)
         return self.take_profit_pct
+
+    def resolve_price_trailing_pct(self, leverage: float) -> float:
+        """Resolve trailing-stop distance in raw price terms."""
+        if self.risk_basis == "roe":
+            return self.trailing_pct / self._normalized_leverage(leverage)
+        return self.trailing_pct
+
+    def resolve_price_break_even_buffer_pct(self, leverage: float) -> float:
+        """Resolve the breakeven buffer in raw price terms."""
+        if self.risk_basis == "roe":
+            return self.break_even_buffer_pct / self._normalized_leverage(leverage)
+        return self.break_even_buffer_pct
+
+    def resolve_roe_stop_loss_pct(self, leverage: float) -> float:
+        """Resolve stop distance in ROE space."""
+        if self.risk_basis == "roe":
+            return self.stop_loss_pct
+        return self.stop_loss_pct * self._normalized_leverage(leverage)
+
+    def resolve_roe_take_profit_pct(self, leverage: float) -> float:
+        """Resolve take-profit distance in ROE space."""
+        if self.risk_basis == "roe":
+            return self.take_profit_pct
+        return self.take_profit_pct * self._normalized_leverage(leverage)
 
     def resolve_trigger_prices(self, entry_price: float, side: str, leverage: float) -> tuple[float, float]:
         """Convert risk targets into absolute trigger prices."""
@@ -131,6 +162,7 @@ class TradeSignal:
     position_pct: float = 0.08        # % of portfolio (default 8%)
     leverage: float = 2.0             # Leverage to use
     size: float = 0.0                 # Position size in asset units (0 = auto from position_pct)
+    context: Dict[str, Any] = field(default_factory=dict)
 
     # Context
     entry_price: float = 0.0          # Expected entry price (0 = market)
@@ -268,6 +300,39 @@ def signal_from_execution_dict(execution: Dict[str, Any]) -> TradeSignal:
     if entry_price > 0 and tp_price > 0:
         risk.take_profit_pct = abs(tp_price - entry_price) / entry_price
 
+    metadata = execution.get("metadata", {})
+    if isinstance(metadata, str):
+        try:
+            metadata = json.loads(metadata or "{}")
+        except Exception:
+            metadata = {}
+    if not isinstance(metadata, dict):
+        metadata = {}
+
+    risk_policy = metadata.get("risk_policy", {}) if isinstance(metadata, dict) else {}
+    if isinstance(risk_policy, dict):
+        if "stop_roe_pct" in risk_policy:
+            risk.stop_loss_pct = float(risk_policy.get("stop_roe_pct") or risk.stop_loss_pct)
+            risk.risk_basis = "roe"
+        if "take_profit_roe_pct" in risk_policy:
+            risk.take_profit_pct = float(risk_policy.get("take_profit_roe_pct") or risk.take_profit_pct)
+        if "reward_multiple" in risk_policy:
+            risk.reward_to_risk_ratio = float(risk_policy.get("reward_multiple") or risk.reward_to_risk_ratio)
+        if "time_limit_hours" in risk_policy:
+            risk.time_limit_hours = float(risk_policy.get("time_limit_hours") or risk.time_limit_hours)
+        if "trailing_enabled" in risk_policy:
+            risk.trailing_stop = bool(risk_policy.get("trailing_enabled"))
+        if "trailing_distance_roe_pct" in risk_policy:
+            risk.trailing_pct = float(risk_policy.get("trailing_distance_roe_pct") or risk.trailing_pct)
+        if "breakeven_at_r" in risk_policy:
+            risk.break_even_at_r = float(risk_policy.get("breakeven_at_r") or risk.break_even_at_r)
+        if "breakeven_buffer_roe_pct" in risk_policy:
+            risk.break_even_buffer_pct = float(
+                risk_policy.get("breakeven_buffer_roe_pct") or risk.break_even_buffer_pct
+            )
+        if "trail_after_r" in risk_policy:
+            risk.trail_activate_at_r = float(risk_policy.get("trail_after_r") or risk.trail_activate_at_r)
+
     signal = TradeSignal(
         coin=str(execution.get("coin", "")),
         side=SignalSide(side_value or "long"),
@@ -282,6 +347,10 @@ def signal_from_execution_dict(execution: Dict[str, Any]) -> TradeSignal:
         leverage=float(execution.get("leverage", 2.0) or 2.0),
         position_pct=float(execution.get("position_pct", 0.08) or 0.08),
         size=float(execution.get("size", 0.0) or 0.0),
+        context={
+            "risk_policy": risk_policy if isinstance(risk_policy, dict) else {},
+            "features": metadata.get("features", {}) if isinstance(metadata, dict) else {},
+        },
         signal_id=str(execution.get("signal_id", "")),
         regime=str(execution.get("regime", "")),
         source_accuracy=float(execution.get("source_accuracy", 0.0) or 0.0),

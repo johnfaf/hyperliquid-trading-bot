@@ -36,6 +36,17 @@ _ARENA_CHAMPION_MIN_WIN_RATE = float(
 )
 
 
+def _apply_dynamic_risk_policy(container, trade_signal, regime_data=None, source_policy=None):
+    engine = getattr(container, "risk_policy_engine", None)
+    if not engine:
+        return trade_signal
+    try:
+        return engine.apply(trade_signal, regime_data=regime_data, source_policy=source_policy)
+    except Exception as exc:
+        logger.debug("  Risk policy apply error for %s: %s", getattr(trade_signal, "coin", "?"), exc)
+        return trade_signal
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -854,8 +865,14 @@ def _execute_lcrs_signals(container, lcrs_signals, regime_data):
                     entry_price=sig["price"], leverage=sig["leverage"],
                     position_pct=sig.get("position_pct", 0.06),
                     risk=RiskParams(stop_loss_pct=0.025, take_profit_pct=0.125),
+                    context={
+                        "features": sig.get("features", {}) or {},
+                        "volatility": (sig.get("features", {}) or {}).get("volatility"),
+                        "expected_return": sig.get("expected_return"),
+                    },
                     regime=regime_data.get("overall_regime", "") if regime_data else "",
                 )
+                trade_signal = _apply_dynamic_risk_policy(container, trade_signal, regime_data=regime_data)
 
                 if container.firewall:
                     passed, reason = container.firewall.validate(
@@ -978,6 +995,12 @@ def _execute_options_flow_trades(container, regime_data):
             if price <= 0:
                 continue
             flow_signal.entry_price = price
+            flow_signal.context = {
+                "features": {},
+                "expected_return": None,
+                "volatility": None,
+            }
+            flow_signal = _apply_dynamic_risk_policy(container, flow_signal, regime_data=regime_data)
 
             if live_active and live_account_value is not None and live_account_value <= 0:
                 logger.warning(
@@ -1066,6 +1089,7 @@ def _execute_options_flow_trades(container, regime_data):
                         "conviction": conv["conviction_pct"],
                         "net_flow": conv["net_flow"],
                         "prints": conv["total_prints"],
+                        "risk_policy": dict((flow_signal.context or {}).get("risk_policy", {}) or {}),
                     },
                 )
                 logger.info(
@@ -1258,7 +1282,25 @@ def _run_alpha_arena(container, regime_data):
                             side = sig["side"]
                             conf = sig["confidence"]
                             risk = RiskParams(stop_loss_pct=0.05, take_profit_pct=0.25)
-                            sl, tp = risk.resolve_trigger_prices(price, side, 2)
+                            live_signal = TradeSignal(
+                                coin=sig["coin"],
+                                side=SignalSide(side),
+                                confidence=conf,
+                                source=SignalSource.STRATEGY,
+                                reason=f"Arena champion: {sig['agent_name']}",
+                                strategy_type=sig["strategy_type"],
+                                entry_price=price,
+                                leverage=2,
+                                position_pct=0.05 * conf,
+                                risk=risk,
+                                context={
+                                    "features": {},
+                                    "atr_pct": sig.get("atr_pct", 0.0),
+                                },
+                                regime=regime_data.get("overall_regime", "") if regime_data else "",
+                            )
+                            live_signal = _apply_dynamic_risk_policy(container, live_signal, regime_data=regime_data)
+                            sl, tp = live_signal.risk.resolve_trigger_prices(price, side, live_signal.leverage)
                             position_pct = 0.05 * conf
                             if getattr(container, "kelly_sizer", None) or getattr(container, "rl_sizer", None):
                                 try:
@@ -1279,19 +1321,7 @@ def _run_alpha_arena(container, regime_data):
                                 except Exception as exc:
                                     logger.debug("  Arena champion sizing failed: %s", exc)
                             if is_live_trading_active(container):
-                                live_signal = TradeSignal(
-                                    coin=sig["coin"],
-                                    side=SignalSide(side),
-                                    confidence=conf,
-                                    source=SignalSource.STRATEGY,
-                                    reason=f"Arena champion: {sig['agent_name']}",
-                                    strategy_type=sig["strategy_type"],
-                                    entry_price=price,
-                                    leverage=2,
-                                    position_pct=position_pct,
-                                    risk=RiskParams(stop_loss_pct=0.05, take_profit_pct=0.25),
-                                    regime=regime_data.get("overall_regime", "") if regime_data else "",
-                                )
+                                live_signal.position_pct = position_pct
                                 _execute_signal_live(container, live_signal, "ARENA")
                                 continue
                             if account is None:
@@ -1326,6 +1356,7 @@ def _run_alpha_arena(container, regime_data):
                                         "agent_fitness": sig["agent_fitness"],
                                         "agent_elo": sig["agent_elo"],
                                         "confidence": conf,
+                                        "risk_policy": dict((live_signal.context or {}).get("risk_policy", {}) or {}),
                                     },
                                 )
                                 logger.info(

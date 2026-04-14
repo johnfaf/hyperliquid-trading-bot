@@ -13,7 +13,7 @@ V2 integration:
 import logging
 import json
 from datetime import datetime, timezone
-from typing import List, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import sys
 import os
@@ -30,6 +30,7 @@ from src.trading.trade_memory import TradeMemory
 from src.trading.portfolio_rotation import PortfolioRotationManager
 from src.signals.calibration import CalibrationTracker
 from src.signals.llm_filter import LLMFilter
+from src.signals.risk_policy import RiskPolicyEngine
 import random
 
 logger = logging.getLogger(__name__)
@@ -46,6 +47,7 @@ class PaperTrader:
                  trade_memory: Optional[TradeMemory] = None,
                  calibration: Optional[CalibrationTracker] = None,
                  llm_filter: Optional[LLMFilter] = None,
+                 risk_policy_engine: Optional[RiskPolicyEngine] = None,
                  shadow_tracker: Optional[object] = None):
         self.firewall = firewall
         self.agent_scorer = agent_scorer
@@ -55,6 +57,7 @@ class PaperTrader:
         self.trade_memory = trade_memory
         self.calibration = calibration
         self.llm_filter = llm_filter
+        self.risk_policy_engine = risk_policy_engine
         self.shadow_tracker = shadow_tracker
         self.rotation_manager = PortfolioRotationManager()
         self._closed_events: List[Dict] = []
@@ -97,6 +100,123 @@ class PaperTrader:
             )
         except Exception as exc:
             logger.debug("Fee tier sync failed (using defaults): %s", exc)
+
+    @staticmethod
+    def _signal_context(sig: Dict, regime_data: Optional[Dict] = None) -> Dict:
+        context = {
+            "features": sig.get("features", {}) or {},
+            "atr_pct": sig.get("atr_pct"),
+            "volatility": sig.get("volatility"),
+            "expected_return": sig.get("expected_return"),
+        }
+        if regime_data:
+            context["regime"] = regime_data.get("overall_regime", "")
+            context["regime_confidence"] = regime_data.get("overall_confidence", 0.0)
+        return context
+
+    def _resolve_trade_signal_risk(
+        self,
+        trade_signal: TradeSignal,
+        sig: Optional[Dict] = None,
+        regime_data: Optional[Dict] = None,
+    ) -> TradeSignal:
+        if not self.risk_policy_engine:
+            return trade_signal
+        adjusted = self.risk_policy_engine.apply(trade_signal, regime_data=regime_data)
+        if isinstance(sig, dict):
+            sig["risk_policy"] = dict((adjusted.context or {}).get("risk_policy", {}) or {})
+            sig["risk_params"] = adjusted.risk.to_dict()
+            entry_price = float(sig.get("price", 0.0) or 0.0)
+            leverage = float(sig.get("leverage", adjusted.leverage) or adjusted.leverage or 1.0)
+            if entry_price > 0:
+                sl, tp = adjusted.risk.resolve_trigger_prices(
+                    entry_price,
+                    str(sig.get("side", "")),
+                    leverage,
+                )
+                sig["stop_loss"] = round(sl, 8)
+                sig["take_profit"] = round(tp, 8)
+        return adjusted
+
+    @staticmethod
+    def _trade_metadata(trade: Dict) -> Dict:
+        meta = trade.get("metadata", {})
+        if isinstance(meta, str):
+            try:
+                meta = json.loads(meta or "{}")
+            except (json.JSONDecodeError, TypeError):
+                meta = {}
+        return dict(meta or {})
+
+    @staticmethod
+    def _fallback_risk_policy(trade: Dict) -> Dict[str, float]:
+        entry_price = float(trade.get("entry_price", 0) or 0)
+        leverage = max(float(trade.get("leverage", 1) or 1), 1.0)
+        stop_loss = float(trade.get("stop_loss", 0) or 0)
+        take_profit = float(trade.get("take_profit", 0) or 0)
+        stop_price_pct = abs(stop_loss - entry_price) / entry_price if entry_price > 0 and stop_loss > 0 else 0.0
+        take_price_pct = abs(take_profit - entry_price) / entry_price if entry_price > 0 and take_profit > 0 else 0.0
+        stop_roe_pct = stop_price_pct * leverage
+        take_roe_pct = take_price_pct * leverage
+        reward_multiple = (take_roe_pct / stop_roe_pct) if stop_roe_pct > 0 and take_roe_pct > 0 else 5.0
+        return {
+            "stop_roe_pct": stop_roe_pct,
+            "take_profit_roe_pct": take_roe_pct,
+            "reward_multiple": reward_multiple,
+            "time_limit_hours": 24.0,
+            "breakeven_at_r": 1.0,
+            "breakeven_buffer_roe_pct": 0.005,
+            "trail_after_r": 2.0,
+            "trailing_enabled": True,
+            "trailing_distance_roe_pct": max(stop_roe_pct * 0.75, 0.01),
+        }
+
+    def _resolve_trade_risk_policy(self, trade: Dict) -> Dict[str, float]:
+        meta = self._trade_metadata(trade)
+        risk_policy = meta.get("risk_policy", {})
+        if isinstance(risk_policy, dict) and risk_policy.get("stop_roe_pct"):
+            return dict(risk_policy)
+        return self._fallback_risk_policy(trade)
+
+    def _update_trade_risk_levels(
+        self,
+        trade_id: int,
+        *,
+        new_sl: Optional[float] = None,
+        new_tp: Optional[float] = None,
+        metadata_updates: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        metadata_updates = dict(metadata_updates or {})
+        with db.get_connection() as conn:
+            updates = []
+            params = []
+            if new_sl is not None:
+                updates.append("stop_loss = ?")
+                params.append(round(new_sl, 8))
+            if new_tp is not None:
+                updates.append("take_profit = ?")
+                params.append(round(new_tp, 8))
+            if metadata_updates:
+                row = conn.execute(
+                    "SELECT metadata FROM paper_trades WHERE id = ?",
+                    (trade_id,),
+                ).fetchone()
+                existing = {}
+                if row:
+                    try:
+                        existing = json.loads(row["metadata"] or "{}")
+                    except Exception:
+                        existing = {}
+                existing.update(metadata_updates)
+                updates.append("metadata = ?")
+                params.append(json.dumps(existing))
+            if not updates:
+                return
+            params.append(trade_id)
+            conn.execute(
+                f"UPDATE paper_trades SET {', '.join(updates)} WHERE id = ? AND status = 'open'",
+                tuple(params),
+            )
 
     def get_account_summary(self) -> Dict:
         """Get current paper trading account summary."""
@@ -381,6 +501,13 @@ class PaperTrader:
         for sig in raw_signals:
             try:
                 source_name = str(sig["strategy"].get("source", "strategy") or "strategy")
+                risk_payload = sig.get("risk_params") if isinstance(sig.get("risk_params"), dict) else {}
+                risk = RiskParams(**risk_payload) if risk_payload else RiskParams(
+                    stop_loss_pct=config.PAPER_TRADING_STOP_LOSS_PCT,
+                    take_profit_pct=config.PAPER_TRADING_TAKE_PROFIT_PCT,
+                    max_leverage=config.PAPER_TRADING_MAX_LEVERAGE,
+                    risk_basis="roe",
+                )
                 trade_signal = TradeSignal(
                     coin=sig["coin"],
                     side=SignalSide(sig["side"]),
@@ -392,18 +519,17 @@ class PaperTrader:
                     entry_price=sig["price"],
                     leverage=sig["leverage"],
                     position_pct=sig["size"] * sig["price"] / (db.get_paper_account() or {}).get("balance", 10000),
-                    risk=RiskParams(
-                        # Keep the signal in ROE space so live execution can
-                        # convert to trigger prices using the actual leverage.
-                        stop_loss_pct=config.PAPER_TRADING_STOP_LOSS_PCT,
-                        take_profit_pct=config.PAPER_TRADING_TAKE_PROFIT_PCT,
-                        max_leverage=config.PAPER_TRADING_MAX_LEVERAGE,
-                        risk_basis="roe",
-                    ),
+                    risk=risk,
+                    context=self._signal_context(sig, regime_data=regime_data),
                     regime=regime_data.get("overall_regime", "") if regime_data else "",
                     regime_size_modifier=sig["strategy"].get("regime_size_modifier", 1.0),
                     options_flow_aligned=sig.get("options_flow_aligned"),
                     volume_confirmed=sig.get("volume_confirmed"),
+                )
+                trade_signal = self._resolve_trade_signal_risk(
+                    trade_signal,
+                    sig=sig,
+                    regime_data=regime_data,
                 )
                 trade_signals.append((trade_signal, sig))
             except Exception as e:
@@ -883,13 +1009,33 @@ class PaperTrader:
         size_usd = max_position * (score / 1.0)  # Scale by confidence
         size = size_usd / target_price
 
-        # Stop loss and take profit
-        if side == "long":
-            stop_loss = target_price * (1 - config.PAPER_TRADING_STOP_LOSS_PCT / leverage)
-            take_profit = target_price * (1 + config.PAPER_TRADING_TAKE_PROFIT_PCT / leverage)
-        else:
-            stop_loss = target_price * (1 + config.PAPER_TRADING_STOP_LOSS_PCT / leverage)
-            take_profit = target_price * (1 - config.PAPER_TRADING_TAKE_PROFIT_PCT / leverage)
+        strategy_source = str(strategy.get("source", "strategy") or "strategy")
+        trade_signal = TradeSignal(
+            coin=target_coin,
+            side=SignalSide(side),
+            confidence=score,
+            source=self._signal_source_enum(strategy_source),
+            reason=f"Strategy: {strategy.get('name', '?')} ({strategy_type})",
+            strategy_id=strategy.get("id"),
+            strategy_type=strategy_type,
+            entry_price=target_price,
+            leverage=leverage,
+            position_pct=size_usd / max(account["balance"], 1.0),
+            risk=RiskParams(
+                stop_loss_pct=config.PAPER_TRADING_STOP_LOSS_PCT,
+                take_profit_pct=config.PAPER_TRADING_TAKE_PROFIT_PCT,
+                max_leverage=config.PAPER_TRADING_MAX_LEVERAGE,
+                risk_basis="roe",
+            ),
+            context={
+                "features": {},
+                "volatility": params.get("volatility", 0.0),
+                "atr_pct": params.get("atr_pct", 0.0),
+            },
+            regime=regime_data.get("overall_regime", "") if regime_data else "",
+        )
+        trade_signal = self._resolve_trade_signal_risk(trade_signal, regime_data=regime_data)
+        stop_loss, take_profit = trade_signal.risk.resolve_trigger_prices(target_price, side, leverage)
 
         return {
             "coin": target_coin,
@@ -901,6 +1047,8 @@ class PaperTrader:
             "take_profit": round(take_profit, 2),
             "strategy_type": strategy_type,
             "confidence": score,
+            "risk_params": trade_signal.risk.to_dict(),
+            "risk_policy": dict((trade_signal.context or {}).get("risk_policy", {}) or {}),
         }
 
     def _check_risk_limits(self, account: Dict, signal: Dict, open_trades: List) -> bool:
@@ -1024,6 +1172,7 @@ class PaperTrader:
                     "intended_entry_price": signal["price"],
                     "entry_slipped_price": slipped_price,
                     "features": signal.get("features", {}),
+                    "risk_policy": signal.get("risk_policy", {}),
                     "source_accuracy": signal.get("source_accuracy", 0),
                     "regime": signal.get("regime", ""),
                     "options_flow_aligned": signal.get("options_flow_aligned"),
@@ -1064,6 +1213,7 @@ class PaperTrader:
                     "intended_entry_price": signal["price"],
                     "entry_slipped_price": slipped_price,
                     "features": signal.get("features", {}),
+                    "risk_policy": signal.get("risk_policy", {}),
                     "source_accuracy": signal.get("source_accuracy", 0),
                     "regime": signal.get("regime", ""),
                     "options_flow_aligned": signal.get("options_flow_aligned"),
@@ -1367,39 +1517,81 @@ class PaperTrader:
             close_reason = ""
 
             # --- Trailing stop logic ---
-            # If price has moved 3%+ in our favor, tighten the stop to lock in profits
             entry = trade["entry_price"]
             leverage = trade.get("leverage", 1)
             sl = trade["stop_loss"]
+            risk_policy = self._resolve_trade_risk_policy(trade)
 
             if not entry or entry <= 0:
                 continue
 
+            stop_roe_pct = float(risk_policy.get("stop_roe_pct", 0.0) or 0.0)
+            breakeven_at_r = float(risk_policy.get("breakeven_at_r", 1.0) or 1.0)
+            breakeven_buffer_price_pct = float(
+                risk_policy.get("breakeven_buffer_roe_pct", 0.0) or 0.0
+            ) / max(leverage, 1)
+            trail_after_r = float(risk_policy.get("trail_after_r", 2.0) or 2.0)
+            trailing_enabled = bool(risk_policy.get("trailing_enabled", True))
+            trailing_distance_price_pct = float(
+                risk_policy.get("trailing_distance_roe_pct", 0.0) or 0.0
+            ) / max(leverage, 1)
+            current_r = RiskPolicyEngine.current_r_multiple(
+                float(entry),
+                float(current_price),
+                str(trade.get("side", "")),
+                float(leverage or 1),
+                stop_roe_pct,
+            )
+
             if trade["side"] == "long":
-                move_pct = (current_price - entry) / entry
-                if move_pct >= 0.03 and sl and sl < entry:
-                    # Move SL to breakeven + 0.5%
-                    new_sl = entry * 1.005
+                if current_r >= breakeven_at_r and sl and sl < entry:
+                    new_sl = entry * (1 + breakeven_buffer_price_pct)
                     if new_sl > sl:
-                        self._update_stop_loss(trade["id"], new_sl)
+                        self._update_trade_risk_levels(
+                            trade["id"],
+                            new_sl=new_sl,
+                            metadata_updates={
+                                "risk_event": "breakeven",
+                                "last_risk_update": now_utc.isoformat(),
+                            },
+                        )
                         sl = new_sl
-                elif move_pct >= 0.06 and sl:
-                    # Trail SL at 2.5% below current price
-                    trail_sl = current_price * (1 - 0.025 / max(leverage, 1))
+                elif trailing_enabled and current_r >= trail_after_r and sl:
+                    trail_sl = current_price * (1 - trailing_distance_price_pct)
                     if trail_sl > sl:
-                        self._update_stop_loss(trade["id"], trail_sl)
+                        self._update_trade_risk_levels(
+                            trade["id"],
+                            new_sl=trail_sl,
+                            metadata_updates={
+                                "risk_event": "trailing",
+                                "last_risk_update": now_utc.isoformat(),
+                            },
+                        )
                         sl = trail_sl
             else:
-                move_pct = (entry - current_price) / entry
-                if move_pct >= 0.03 and sl and sl > entry:
-                    new_sl = entry * 0.995
+                if current_r >= breakeven_at_r and sl and sl > entry:
+                    new_sl = entry * (1 - breakeven_buffer_price_pct)
                     if new_sl < sl:
-                        self._update_stop_loss(trade["id"], new_sl)
+                        self._update_trade_risk_levels(
+                            trade["id"],
+                            new_sl=new_sl,
+                            metadata_updates={
+                                "risk_event": "breakeven",
+                                "last_risk_update": now_utc.isoformat(),
+                            },
+                        )
                         sl = new_sl
-                elif move_pct >= 0.06 and sl:
-                    trail_sl = current_price * (1 + 0.025 / max(leverage, 1))
+                elif trailing_enabled and current_r >= trail_after_r and sl:
+                    trail_sl = current_price * (1 + trailing_distance_price_pct)
                     if trail_sl < sl:
-                        self._update_stop_loss(trade["id"], trail_sl)
+                        self._update_trade_risk_levels(
+                            trade["id"],
+                            new_sl=trail_sl,
+                            metadata_updates={
+                                "risk_event": "trailing",
+                                "last_risk_update": now_utc.isoformat(),
+                            },
+                        )
                         sl = trail_sl
 
             # --- Funding rate accrual ---
@@ -1471,9 +1663,10 @@ class PaperTrader:
                     if opened.tzinfo is None:
                         opened = opened.replace(tzinfo=timezone.utc)
                     age_hours = (datetime.now(timezone.utc) - opened).total_seconds() / 3600
-                    if age_hours > 24:
+                    time_limit_hours = float(risk_policy.get("time_limit_hours", 24.0) or 24.0)
+                    if age_hours > time_limit_hours:
                         should_close = True
-                        close_reason = "time_exit_24h"
+                        close_reason = "time_limit"
                 except (ValueError, TypeError):
                     pass
 
@@ -1487,18 +1680,6 @@ class PaperTrader:
                     closed.append(closed_trade)
 
         return closed
-
-    def _update_stop_loss(self, trade_id: int, new_sl: float):
-        """Update stop loss for a trade (trailing stop)."""
-        try:
-            with db.get_connection() as conn:
-                conn.execute(
-                    "UPDATE paper_trades SET stop_loss = ? WHERE id = ? AND status = 'open'",
-                    (round(new_sl, 2), trade_id)
-                )
-            logger.info(f"Trailing stop updated for trade {trade_id}: new SL=${new_sl:,.2f}")
-        except Exception as e:
-            logger.error(f"Error updating trailing stop: {e}")
 
     def _calculate_pnl(self, trade: Dict, exit_price: float) -> float:
         """Calculate PnL for a trade."""

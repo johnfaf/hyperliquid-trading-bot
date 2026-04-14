@@ -2738,9 +2738,9 @@ def test_protect_orphaned_positions_places_sl_tp_for_unprotected(monkeypatch):
     # Short SL is ABOVE entry, TP is BELOW entry
     assert sl["price"] > 2064.9
     assert tp["price"] < 2064.9
-    # 3% SL, 6% TP
+    # 3% SL, 15% TP fallback
     assert abs(sl["price"] - 2064.9 * 1.03) < 0.01
-    assert abs(tp["price"] - 2064.9 * 0.94) < 0.01
+    assert abs(tp["price"] - 2064.9 * 0.85) < 0.01
 
 
 def test_protect_orphaned_positions_skips_already_protected(monkeypatch):

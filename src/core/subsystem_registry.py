@@ -16,6 +16,7 @@ Usage::
     container = build_subsystems(health_registry, feature_profile)
     # container.firewall, container.paper_trader, etc.
 """
+import json
 import logging
 from dataclasses import dataclass
 from typing import Optional, Any
@@ -39,7 +40,7 @@ FULL_PROFILE = FUNDABLE_CORE | {
     "copy_trader", "live_trader", "options_flow", "polymarket",
     "predictive_forecaster", "xgboost_forecaster", "alpha_pipeline", "multi_scanner", "event_scanner",
     "liquidation_strategy", "kelly_sizer", "trade_memory", "calibration",
-    "llm_filter", "signal_processor", "arena_incubator", "decision_engine",
+    "llm_filter", "risk_policy_engine", "signal_processor", "arena_incubator", "decision_engine",
     "alpha_arena", "position_monitor", "dashboard", "telegram",
     "cross_venue_hedger", "shadow_tracker", "adaptive_bot_detector",
     "regime_strategy_filter", "exchange_aggregator",
@@ -83,6 +84,7 @@ class SubsystemContainer:
     trade_memory: Any = None
     calibration: Any = None
     llm_filter: Any = None
+    risk_policy_engine: Any = None
     signal_processor: Any = None
     arena_incubator: Any = None
     decision_engine: Any = None
@@ -350,6 +352,35 @@ def build_subsystems(
         from src.signals.llm_filter import LLMFilter
         c.llm_filter = _safe_init("llm_filter", LLMFilter, health)
 
+    if "risk_policy_engine" in profile:
+        from src.signals.risk_policy import RiskPolicyEngine
+        source_profiles = {}
+        if getattr(config, "RISK_POLICY_SOURCE_PROFILES_JSON", ""):
+            try:
+                source_profiles = json.loads(config.RISK_POLICY_SOURCE_PROFILES_JSON)
+            except Exception as exc:
+                logger.warning("Invalid RISK_POLICY_SOURCE_PROFILES_JSON override: %s", exc)
+        c.risk_policy_engine = _safe_init(
+            "risk_policy_engine",
+            lambda: RiskPolicyEngine(
+                {
+                    "default_reward_multiple": config.RISK_POLICY_DEFAULT_REWARD_MULTIPLE,
+                    "min_reward_multiple": config.RISK_POLICY_MIN_REWARD_MULTIPLE,
+                    "max_reward_multiple": config.RISK_POLICY_MAX_REWARD_MULTIPLE,
+                    "atr_stop_multiplier": config.RISK_POLICY_ATR_STOP_MULTIPLIER,
+                    "min_stop_roe_pct": config.RISK_POLICY_MIN_STOP_ROE_PCT,
+                    "max_stop_roe_pct": config.RISK_POLICY_MAX_STOP_ROE_PCT,
+                    "default_time_limit_hours": config.RISK_POLICY_DEFAULT_TIME_LIMIT_HOURS,
+                    "default_break_even_at_r": config.RISK_POLICY_DEFAULT_BREAKEVEN_AT_R,
+                    "default_break_even_buffer_roe_pct": config.RISK_POLICY_DEFAULT_BREAKEVEN_BUFFER_ROE_PCT,
+                    "default_trail_after_r": config.RISK_POLICY_DEFAULT_TRAIL_AFTER_R,
+                    "default_trailing_distance_ratio": config.RISK_POLICY_DEFAULT_TRAILING_DISTANCE_RATIO,
+                    "source_profiles": source_profiles,
+                }
+            ),
+            health,
+        )
+
     if "signal_processor" in profile:
         from src.signals.signal_processor import SignalProcessor, ArenaIncubator
         c.signal_processor = _safe_init("signal_processor", SignalProcessor, health)
@@ -434,6 +465,7 @@ def build_subsystems(
                 trade_memory=c.trade_memory,
                 calibration=c.calibration,
                 regime_forecaster=c.predictive_forecaster,
+                risk_policy_engine=c.risk_policy_engine,
             ),
             health,
         )
@@ -451,6 +483,7 @@ def build_subsystems(
             trade_memory=c.trade_memory,
             calibration=c.calibration,
             llm_filter=c.llm_filter,
+            risk_policy_engine=c.risk_policy_engine,
         ),
         health,
     )
@@ -466,6 +499,7 @@ def build_subsystems(
                 max_daily_loss=float(getattr(config, "LIVE_MAX_DAILY_LOSS_USD", 100.0)),
                 max_order_usd=float(getattr(config, "LIVE_MAX_ORDER_USD", 100.0)),
                 regime_forecaster=c.predictive_forecaster,
+                risk_policy_engine=c.risk_policy_engine,
             ),
             health,
             affects_trading=bool(getattr(config, "LIVE_TRADING_ENABLED", False)),
@@ -610,6 +644,7 @@ _FIELD_TO_HEALTH_NAME: dict = {
     "trade_memory":           "trade_memory",
     "calibration":            "calibration",
     "llm_filter":             "llm_filter",
+    "risk_policy_engine":     "risk_policy_engine",
     "signal_processor":       "signal_processor",
     "arena_incubator":        "arena_incubator",
     "decision_engine":        "decision_engine",

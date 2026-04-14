@@ -102,6 +102,9 @@ def run_fast_cycle(container, cycle_count: int) -> None:
             reconciled = sync_shadow_book_to_live(container)
             if reconciled:
                 logger.info("[fast] Reconciled %d shadow trades to exchange", len(reconciled))
+            manage_summary = container.live_trader.manage_open_positions()
+            if manage_summary.get("updated") or manage_summary.get("closed") or manage_summary.get("failed"):
+                logger.info("[fast] Live risk management summary: %s", manage_summary)
 
         if container.copy_trader:
             copy_signals = container.copy_trader.scan_top_traders(top_n=10)

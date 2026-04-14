@@ -68,9 +68,11 @@ except ImportError:
 import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import config
+from src.data import database as db
 from src.core.api_manager import Priority, get_manager
 from src.core.secret_manager import SecretManagerError, load_agent_private_key
 from src.signals.decision_firewall import DecisionFirewall
+from src.signals.risk_policy import RiskPolicyEngine
 from src.signals.signal_schema import TradeSignal, signal_from_execution_dict
 
 logger = logging.getLogger(__name__)
@@ -361,7 +363,8 @@ class LiveTrader:
     def __init__(self, firewall: DecisionFirewall, dry_run: bool = True,
                  max_daily_loss: float = 500, max_position_size: float = 1000,
                  max_order_usd: Optional[float] = None,
-                 regime_forecaster: Optional[object] = None):
+                 regime_forecaster: Optional[object] = None,
+                 risk_policy_engine: Optional[RiskPolicyEngine] = None):
         """
         Initialize live trader.
 
@@ -462,6 +465,7 @@ class LiveTrader:
         self.external_kill_switch_env = "LIVE_EXTERNAL_KILL_SWITCH"
         self._kill_switch_reason: str = ""
         self.regime_forecaster = regime_forecaster
+        self.risk_policy_engine = risk_policy_engine
         self.status_reason = "dry_run_requested" if dry_run else "initializing"
 
         # API endpoints (must come early since _load_* methods need these)
@@ -1299,7 +1303,7 @@ class LiveTrader:
 
         Designed to be safe to call repeatedly — checks open-order state
         first and skips positions that already have protective orders.
-        Uses conservative default SL/TP percentages (3% SL / 6% TP) when
+        Uses conservative fallback SL/TP percentages (3% SL / 15% TP) when
         no signal context is available.
 
         Args:
@@ -1406,9 +1410,9 @@ class LiveTrader:
                 continue
 
             side = "long" if szi > 0 else "short"
-            # Conservative defaults: 3% stop loss, 6% take profit
+            # Conservative fallback defaults when only the raw position survives.
             sl_pct = 0.03
-            tp_pct = 0.06
+            tp_pct = sl_pct * 5.0
             if side == "long":
                 sl_price = entry_price * (1 - sl_pct)
                 tp_price = entry_price * (1 + tp_pct)
@@ -1420,7 +1424,7 @@ class LiveTrader:
 
             logger.warning(
                 "UNPROTECTED POSITION: %s %s size=%.6f entry=$%.6f — "
-                "placing default 3%%/6%% SL/TP (SL=$%.6f TP=$%.6f)",
+                "placing fallback 3%%/15%% SL/TP (SL=$%.6f TP=$%.6f)",
                 side.upper(), coin, size, entry_price, sl_price, tp_price,
             )
 
@@ -1457,6 +1461,440 @@ class LiveTrader:
         if protected or failed or stale_cancelled:
             logger.warning("Orphan protection summary: %s", summary)
         return summary
+
+    @staticmethod
+    def _shadow_trade_metadata(trade: Dict[str, Any]) -> Dict[str, Any]:
+        metadata = trade.get("metadata", {})
+        if isinstance(metadata, str):
+            try:
+                metadata = json.loads(metadata or "{}")
+            except Exception:
+                metadata = {}
+        return dict(metadata or {})
+
+    @staticmethod
+    def _parse_timestamp(value: Any) -> Optional[datetime]:
+        if not value:
+            return None
+        try:
+            dt = datetime.fromisoformat(str(value))
+        except (TypeError, ValueError):
+            return None
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+
+    def _fallback_shadow_risk_policy(
+        self,
+        trade: Dict[str, Any],
+        live_position: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, float]:
+        entry_price = self._coerce_float(
+            (live_position or {}).get("entry_price", trade.get("entry_price", 0)),
+            0.0,
+        )
+        leverage = max(
+            self._coerce_float((live_position or {}).get("leverage", trade.get("leverage", 1)), 1.0),
+            1.0,
+        )
+        stop_loss = self._coerce_float(trade.get("stop_loss"), 0.0)
+        take_profit = self._coerce_float(trade.get("take_profit"), 0.0)
+        if entry_price > 0 and stop_loss > 0:
+            stop_price_pct = abs(stop_loss - entry_price) / entry_price
+        else:
+            stop_price_pct = 0.03
+        if entry_price > 0 and take_profit > 0:
+            take_price_pct = abs(take_profit - entry_price) / entry_price
+        else:
+            take_price_pct = stop_price_pct * 5.0
+        stop_roe_pct = stop_price_pct * leverage
+        take_roe_pct = take_price_pct * leverage
+        reward_multiple = (
+            take_roe_pct / stop_roe_pct if stop_roe_pct > 0 and take_roe_pct > 0 else 5.0
+        )
+        return {
+            "stop_roe_pct": stop_roe_pct,
+            "take_profit_roe_pct": take_roe_pct,
+            "reward_multiple": reward_multiple,
+            "time_limit_hours": 24.0,
+            "breakeven_at_r": 1.0,
+            "breakeven_buffer_roe_pct": 0.005,
+            "trail_after_r": 2.0,
+            "trailing_enabled": True,
+            "trailing_distance_roe_pct": max(stop_roe_pct * 0.75, 0.01),
+            "policy_version": "fallback_v1",
+        }
+
+    def _aggregate_shadow_risk_policy(
+        self,
+        trades: List[Dict[str, Any]],
+        live_position: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        if not trades:
+            return None
+
+        weighted_fields = [
+            "stop_roe_pct",
+            "take_profit_roe_pct",
+            "reward_multiple",
+            "breakeven_buffer_roe_pct",
+        ]
+        min_fields = ["breakeven_at_r", "trail_after_r", "time_limit_hours"]
+        sums = {field: 0.0 for field in weighted_fields}
+        weight_total = 0.0
+        min_values: Dict[str, Optional[float]] = {field: None for field in min_fields}
+        trailing_enabled = False
+        trailing_distance_roe_pct = None
+        earliest_opened_at: Optional[datetime] = None
+        earliest_deadline_at: Optional[datetime] = None
+        live_state: Dict[str, Any] = {}
+        live_state_ts: Optional[datetime] = None
+        rationale: List[str] = []
+
+        for trade in trades:
+            metadata = self._shadow_trade_metadata(trade)
+            policy = metadata.get("risk_policy", {})
+            if not isinstance(policy, dict) or not policy.get("stop_roe_pct"):
+                policy = self._fallback_shadow_risk_policy(trade, live_position=live_position)
+
+            weight = max(
+                self._coerce_float(trade.get("size"), 0.0)
+                * max(self._coerce_float(trade.get("entry_price"), 0.0), 1.0),
+                1.0,
+            )
+            weight_total += weight
+
+            for field in weighted_fields:
+                sums[field] += self._coerce_float(policy.get(field), 0.0) * weight
+
+            for field in min_fields:
+                value = self._coerce_float(policy.get(field), 0.0)
+                if value <= 0:
+                    continue
+                current = min_values[field]
+                min_values[field] = value if current is None else min(current, value)
+
+            policy_trailing_distance = self._coerce_float(policy.get("trailing_distance_roe_pct"), 0.0)
+            if policy_trailing_distance > 0:
+                trailing_distance_roe_pct = (
+                    policy_trailing_distance
+                    if trailing_distance_roe_pct is None
+                    else min(trailing_distance_roe_pct, policy_trailing_distance)
+                )
+            trailing_enabled = trailing_enabled or bool(policy.get("trailing_enabled", True))
+
+            opened_at = self._parse_timestamp(trade.get("opened_at"))
+            if opened_at and (earliest_opened_at is None or opened_at < earliest_opened_at):
+                earliest_opened_at = opened_at
+            if opened_at and min_values["time_limit_hours"]:
+                deadline = opened_at.timestamp() + (self._coerce_float(policy.get("time_limit_hours"), 24.0) * 3600.0)
+                deadline_dt = datetime.fromtimestamp(deadline, tz=timezone.utc)
+                if earliest_deadline_at is None or deadline_dt < earliest_deadline_at:
+                    earliest_deadline_at = deadline_dt
+
+            state = metadata.get("live_risk_state", {})
+            state_ts = self._parse_timestamp((state or {}).get("updated_at"))
+            if isinstance(state, dict) and state:
+                if live_state_ts is None or (state_ts and state_ts >= live_state_ts):
+                    live_state = dict(state)
+                    live_state_ts = state_ts
+
+            policy_rationale = policy.get("rationale", [])
+            if isinstance(policy_rationale, list):
+                rationale.extend(str(item) for item in policy_rationale if item)
+
+        if weight_total <= 0:
+            return None
+
+        aggregated: Dict[str, Any] = {
+            field: sums[field] / weight_total for field in weighted_fields
+        }
+        for field in min_fields:
+            aggregated[field] = (
+                min_values[field]
+                if min_values[field] is not None
+                else self._fallback_shadow_risk_policy(trades[0], live_position=live_position).get(field)
+            )
+        aggregated["trailing_enabled"] = trailing_enabled
+        aggregated["trailing_distance_roe_pct"] = (
+            trailing_distance_roe_pct
+            if trailing_distance_roe_pct is not None
+            else max(aggregated["stop_roe_pct"] * 0.75, 0.01)
+        )
+        aggregated["opened_at"] = earliest_opened_at.isoformat() if earliest_opened_at else ""
+        aggregated["deadline_at"] = earliest_deadline_at.isoformat() if earliest_deadline_at else ""
+        aggregated["live_risk_state"] = live_state
+        aggregated["rationale"] = rationale
+        aggregated["trade_count"] = len(trades)
+        return aggregated
+
+    @staticmethod
+    def _is_protective_order(order: Dict[str, Any], coin: Optional[str] = None) -> bool:
+        if not isinstance(order, dict):
+            return False
+        if coin and str(order.get("coin", "") or "").upper() != str(coin).upper():
+            return False
+        reduce_only = bool(order.get("reduceOnly") or order.get("reduce_only"))
+        order_type = str(order.get("orderType") or order.get("type") or "").lower()
+        return bool(reduce_only or "stop" in order_type or "take" in order_type or "trigger" in order_type)
+
+    def _cancel_protective_orders(self, coin: str) -> int:
+        open_orders = self.get_open_orders()
+        if open_orders is None:
+            raise RuntimeError("open_orders_unavailable")
+        cancelled = 0
+        for order in open_orders:
+            if not self._is_protective_order(order, coin=coin):
+                continue
+            oid = order.get("oid") or order.get("order_id") or order.get("id")
+            if oid is None:
+                continue
+            if self.cancel_order(coin, int(oid)):
+                cancelled += 1
+        return cancelled
+
+    def _update_shadow_trade_risk_levels(
+        self,
+        trades: List[Dict[str, Any]],
+        *,
+        stop_loss: Optional[float] = None,
+        take_profit: Optional[float] = None,
+        metadata_updates: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        metadata_updates = dict(metadata_updates or {})
+        if not trades:
+            return
+
+        with db.get_connection() as conn:
+            for trade in trades:
+                trade_id = trade.get("id")
+                if trade_id is None:
+                    continue
+                updates = []
+                params: List[Any] = []
+                if stop_loss is not None:
+                    updates.append("stop_loss = ?")
+                    params.append(round(stop_loss, 8))
+                if take_profit is not None:
+                    updates.append("take_profit = ?")
+                    params.append(round(take_profit, 8))
+                if metadata_updates:
+                    existing = self._shadow_trade_metadata(trade)
+                    existing.update(metadata_updates)
+                    updates.append("metadata = ?")
+                    params.append(json.dumps(existing))
+                if not updates:
+                    continue
+                params.append(trade_id)
+                conn.execute(
+                    f"UPDATE paper_trades SET {', '.join(updates)} WHERE id = ? AND status = 'open'",
+                    tuple(params),
+                )
+
+    def manage_open_positions(self) -> Dict[str, Any]:
+        """Apply dynamic time-stop, breakeven, and trailing updates to live positions."""
+        if self.dry_run:
+            return {"status": "skipped", "reason": "dry_run"}
+
+        positions = self.get_positions()
+        if positions is None:
+            logger.warning("manage_open_positions: positions unavailable")
+            return {"status": "degraded", "reason": "positions_unavailable"}
+
+        open_trades = db.get_open_paper_trades() or []
+        if not positions or not open_trades:
+            return {"status": "ok", "managed": 0, "updated": 0, "closed": 0, "skipped": 0, "failed": 0}
+
+        grouped_trades: Dict[Tuple[str, str], List[Dict[str, Any]]] = defaultdict(list)
+        for trade in open_trades:
+            coin = str(trade.get("coin", "") or "").upper()
+            side = str(trade.get("side", "") or "").strip().lower()
+            if coin and side in {"long", "short"}:
+                grouped_trades[(coin, side)].append(trade)
+
+        now_utc = datetime.now(timezone.utc)
+        managed = updated = closed = skipped = failed = 0
+
+        for position in positions:
+            coin = str(position.get("coin", "") or "").upper()
+            side = str(position.get("side", "") or "").strip().lower()
+            position_size = abs(self._coerce_float(position.get("size", position.get("szi", 0))))
+            entry_price = self._coerce_float(position.get("entry_price", position.get("entryPx", 0)), 0.0)
+            leverage = max(self._coerce_float(position.get("leverage", 1), 1.0), 1.0)
+            if not coin or side not in {"long", "short"} or position_size <= 0 or entry_price <= 0:
+                continue
+
+            shadow_trades = grouped_trades.get((coin, side), [])
+            if not shadow_trades:
+                continue
+            managed += 1
+
+            policy = self._aggregate_shadow_risk_policy(shadow_trades, live_position=position)
+            if not policy:
+                skipped += 1
+                continue
+
+            current_price = self._get_mid_price(coin) or entry_price
+            stop_roe_pct = max(self._coerce_float(policy.get("stop_roe_pct"), 0.0), 0.0)
+            take_profit_roe_pct = max(self._coerce_float(policy.get("take_profit_roe_pct"), 0.0), 0.0)
+            if stop_roe_pct <= 0 or take_profit_roe_pct <= 0:
+                fallback = self._fallback_shadow_risk_policy(shadow_trades[0], live_position=position)
+                stop_roe_pct = max(stop_roe_pct, self._coerce_float(fallback.get("stop_roe_pct"), 0.0))
+                take_profit_roe_pct = max(
+                    take_profit_roe_pct,
+                    self._coerce_float(fallback.get("take_profit_roe_pct"), 0.0),
+                )
+
+            stop_price_pct = stop_roe_pct / leverage
+            take_profit_price_pct = take_profit_roe_pct / leverage
+            if side == "long":
+                desired_sl = entry_price * (1 - stop_price_pct)
+                desired_tp = entry_price * (1 + take_profit_price_pct)
+                close_side = "sell"
+            else:
+                desired_sl = entry_price * (1 + stop_price_pct)
+                desired_tp = entry_price * (1 - take_profit_price_pct)
+                close_side = "buy"
+
+            current_r = RiskPolicyEngine.current_r_multiple(
+                entry_price,
+                current_price,
+                side,
+                leverage,
+                stop_roe_pct,
+            )
+            risk_event = "static"
+
+            breakeven_at_r = self._coerce_float(policy.get("breakeven_at_r"), 1.0)
+            breakeven_buffer_price_pct = self._coerce_float(
+                policy.get("breakeven_buffer_roe_pct"),
+                0.005,
+            ) / leverage
+            trail_after_r = self._coerce_float(policy.get("trail_after_r"), 2.0)
+            trailing_enabled = bool(policy.get("trailing_enabled", True))
+            trailing_distance_price_pct = self._coerce_float(
+                policy.get("trailing_distance_roe_pct"),
+                stop_roe_pct * 0.75,
+            ) / leverage
+
+            if current_r >= breakeven_at_r:
+                if side == "long":
+                    desired_sl = max(desired_sl, entry_price * (1 + breakeven_buffer_price_pct))
+                else:
+                    desired_sl = min(desired_sl, entry_price * (1 - breakeven_buffer_price_pct))
+                risk_event = "breakeven"
+
+            if trailing_enabled and current_r >= trail_after_r:
+                if side == "long":
+                    desired_sl = max(desired_sl, current_price * (1 - trailing_distance_price_pct))
+                else:
+                    desired_sl = min(desired_sl, current_price * (1 + trailing_distance_price_pct))
+                risk_event = "trailing"
+
+            deadline_at = self._parse_timestamp(policy.get("deadline_at"))
+            if deadline_at and now_utc >= deadline_at:
+                close_result = self.close_position(coin)
+                if self._is_order_result_success(close_result):
+                    closed += 1
+                    self._update_shadow_trade_risk_levels(
+                        shadow_trades,
+                        metadata_updates={
+                            "risk_event": "time_limit",
+                            "live_close_requested_at": now_utc.isoformat(),
+                            "live_close_reason": "time_limit",
+                            "live_risk_state": {
+                                "event": "time_limit",
+                                "current_r": round(current_r, 4),
+                                "updated_at": now_utc.isoformat(),
+                            },
+                        },
+                    )
+                else:
+                    failed += 1
+                    logger.error("manage_open_positions: failed to close %s on time limit: %s", coin, close_result)
+                continue
+
+            live_state = dict(policy.get("live_risk_state", {}) or {})
+            prior_sl = self._coerce_float(live_state.get("stop_loss"), 0.0)
+            prior_tp = self._coerce_float(live_state.get("take_profit"), 0.0)
+            sl_unchanged = prior_sl > 0 and math.isclose(prior_sl, desired_sl, rel_tol=0.0, abs_tol=max(entry_price * 0.0005, 1e-8))
+            tp_unchanged = prior_tp > 0 and math.isclose(prior_tp, desired_tp, rel_tol=0.0, abs_tol=max(entry_price * 0.0005, 1e-8))
+            if sl_unchanged and tp_unchanged:
+                skipped += 1
+                continue
+
+            try:
+                self._cancel_protective_orders(coin)
+                sl_result, tp_result, attempts = self._place_protective_orders_with_retries(
+                    coin,
+                    close_side,
+                    position_size,
+                    desired_sl,
+                    desired_tp,
+                )
+            except Exception as exc:
+                logger.error("manage_open_positions: protective update failed for %s: %s", coin, exc)
+                failed += 1
+                continue
+
+            if self._is_order_result_success(sl_result) and self._is_order_result_success(tp_result):
+                updated += 1
+                self._update_shadow_trade_risk_levels(
+                    shadow_trades,
+                    stop_loss=desired_sl,
+                    take_profit=desired_tp,
+                    metadata_updates={
+                        "risk_policy": {
+                            **dict(policy),
+                            "stop_roe_pct": stop_roe_pct,
+                            "take_profit_roe_pct": take_profit_roe_pct,
+                        },
+                        "risk_event": risk_event,
+                        "live_risk_state": {
+                            "event": risk_event,
+                            "stop_loss": round(desired_sl, 8),
+                            "take_profit": round(desired_tp, 8),
+                            "current_r": round(current_r, 4),
+                            "attempts": attempts,
+                            "updated_at": now_utc.isoformat(),
+                        },
+                    },
+                )
+            else:
+                failed += 1
+                logger.error(
+                    "manage_open_positions: %s protective update failed after %d attempts: sl=%s tp=%s",
+                    coin,
+                    attempts,
+                    sl_result,
+                    tp_result,
+                )
+                close_result = self.close_position(coin)
+                self._update_shadow_trade_risk_levels(
+                    shadow_trades,
+                    metadata_updates={
+                        "risk_event": "protective_update_failed",
+                        "live_close_requested_at": now_utc.isoformat(),
+                        "live_close_reason": "protective_update_failed",
+                        "live_risk_state": {
+                            "event": "protective_update_failed",
+                            "updated_at": now_utc.isoformat(),
+                        },
+                    },
+                )
+                if self._is_order_result_success(close_result):
+                    closed += 1
+                else:
+                    logger.error("manage_open_positions: close_position also failed for %s: %s", coin, close_result)
+
+        return {
+            "status": "ok",
+            "managed": managed,
+            "updated": updated,
+            "closed": closed,
+            "skipped": skipped,
+            "failed": failed,
+        }
 
     _PROTECTIVE_RESIZE_DELAY_S = 30.0  # Wait for remaining fills before resizing
 
@@ -3262,6 +3700,12 @@ class LiveTrader:
 
         # Apply regime overlay for dynamic position sizing (signal.size is now set)
         signal = self.apply_regime_overlay(signal)
+        if self.risk_policy_engine and not dict((signal.context or {}).get("risk_policy", {}) or {}):
+            signal = self.risk_policy_engine.apply(
+                signal,
+                regime_data={"regime": signal.regime} if signal.regime else None,
+                source_policy=source_policy,
+            )
 
         # Hard per-order $ cap — applied AFTER regime overlay and any paper→live
         # rescaling so nothing above max_order_usd ever hits the exchange.

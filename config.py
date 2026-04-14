@@ -71,6 +71,45 @@ FEATURE_STORE_BACKFILL_1H_DAYS = int(os.environ.get("FEATURE_STORE_BACKFILL_1H_D
 FEATURE_STORE_BACKFILL_4H_DAYS = int(os.environ.get("FEATURE_STORE_BACKFILL_4H_DAYS", 90))
 FEATURE_STORE_BACKFILL_1D_DAYS = int(os.environ.get("FEATURE_STORE_BACKFILL_1D_DAYS", 365))
 
+# Dynamic risk policy engine
+RISK_POLICY_DEFAULT_REWARD_MULTIPLE = float(
+    os.environ.get("RISK_POLICY_DEFAULT_REWARD_MULTIPLE", 5.0)
+)
+RISK_POLICY_MIN_REWARD_MULTIPLE = float(
+    os.environ.get("RISK_POLICY_MIN_REWARD_MULTIPLE", 1.5)
+)
+RISK_POLICY_MAX_REWARD_MULTIPLE = float(
+    os.environ.get("RISK_POLICY_MAX_REWARD_MULTIPLE", 6.5)
+)
+RISK_POLICY_ATR_STOP_MULTIPLIER = float(
+    os.environ.get("RISK_POLICY_ATR_STOP_MULTIPLIER", 1.25)
+)
+RISK_POLICY_MIN_STOP_ROE_PCT = float(
+    os.environ.get("RISK_POLICY_MIN_STOP_ROE_PCT", 0.01)
+)
+RISK_POLICY_MAX_STOP_ROE_PCT = float(
+    os.environ.get("RISK_POLICY_MAX_STOP_ROE_PCT", 0.35)
+)
+RISK_POLICY_DEFAULT_TIME_LIMIT_HOURS = float(
+    os.environ.get("RISK_POLICY_DEFAULT_TIME_LIMIT_HOURS", 24.0)
+)
+RISK_POLICY_DEFAULT_BREAKEVEN_AT_R = float(
+    os.environ.get("RISK_POLICY_DEFAULT_BREAKEVEN_AT_R", 1.0)
+)
+RISK_POLICY_DEFAULT_BREAKEVEN_BUFFER_ROE_PCT = float(
+    os.environ.get("RISK_POLICY_DEFAULT_BREAKEVEN_BUFFER_ROE_PCT", 0.005)
+)
+RISK_POLICY_DEFAULT_TRAIL_AFTER_R = float(
+    os.environ.get("RISK_POLICY_DEFAULT_TRAIL_AFTER_R", 2.0)
+)
+RISK_POLICY_DEFAULT_TRAILING_DISTANCE_RATIO = float(
+    os.environ.get("RISK_POLICY_DEFAULT_TRAILING_DISTANCE_RATIO", 0.75)
+)
+RISK_POLICY_SOURCE_PROFILES_JSON = os.environ.get(
+    "RISK_POLICY_SOURCE_PROFILES_JSON",
+    "",
+).strip()
+
 # ─── Trader Discovery ─────────────────────────────────────────
 # Minimum PnL (USD) to consider a trader "top"
 # Set low initially so seed addresses get picked up; raise once the bot is mature

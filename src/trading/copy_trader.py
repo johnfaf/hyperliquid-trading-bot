@@ -18,13 +18,14 @@ import config
 from src.data import database as db
 from src.data import hyperliquid_client as hl
 from src.analysis.trade_analytics import evaluate_source_policy
-from src.signals.signal_schema import signal_from_copy_trade
+from src.signals.signal_schema import RiskParams, SignalSide, SignalSource, TradeSignal, signal_from_copy_trade
 from src.signals.decision_firewall import DecisionFirewall
 from src.signals.agent_scoring import AgentScorer
 from src.signals.kelly_sizing import KellySizer
 from src.trading.trade_memory import TradeMemory
 from src.trading.portfolio_rotation import PortfolioRotationManager
 from src.signals.calibration import CalibrationTracker
+from src.signals.risk_policy import RiskPolicyEngine
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +44,7 @@ class CopyTrader:
                  trade_memory: Optional[TradeMemory] = None,
                  calibration: Optional[CalibrationTracker] = None,
                  regime_forecaster: Optional[object] = None,
+                 risk_policy_engine: Optional[RiskPolicyEngine] = None,
                  shadow_tracker: Optional[object] = None):
         # Cache of last-known positions per trader: {address: {coin: position_dict}}
         self._position_cache: Dict[str, Dict[str, Dict]] = {}
@@ -54,6 +56,7 @@ class CopyTrader:
         self.trade_memory = trade_memory
         self.calibration = calibration
         self.regime_forecaster = regime_forecaster
+        self.risk_policy_engine = risk_policy_engine
         self.shadow_tracker = shadow_tracker
         self.rotation_manager = PortfolioRotationManager()
         self._closed_events: List[Dict] = []
@@ -93,6 +96,37 @@ class CopyTrader:
     def _source_key(payload: Dict) -> str:
         trader = str(payload.get("source_trader", "") or "").strip().lower()
         return f"copy_trade:{trader}" if trader else "copy_trade"
+
+    def _resolve_copy_trade_risk(
+        self,
+        signal: Dict,
+        leverage: float,
+        regime_data: Optional[Dict] = None,
+    ) -> tuple[float, float, Dict[str, object]]:
+        price = float(signal.get("price", 0.0) or 0.0)
+        side = str(signal.get("side", "long") or "long")
+        trade_signal = TradeSignal(
+            coin=str(signal.get("coin", "")),
+            side=SignalSide(side),
+            confidence=float(signal.get("confidence", 0.5) or 0.5),
+            source=SignalSource.COPY_TRADE,
+            reason=f"Copy trade from {signal.get('source_trader', '?')}",
+            trader_address=str(signal.get("source_trader", "") or ""),
+            entry_price=price,
+            leverage=leverage,
+            risk=RiskParams(stop_loss_pct=0.04, take_profit_pct=0.20, risk_basis="roe"),
+            context={
+                "features": {},
+                "atr_pct": signal.get("atr_pct"),
+                "volatility": signal.get("volatility"),
+            },
+            regime=str(signal.get("regime", "")),
+            source_accuracy=float(signal.get("source_accuracy", 0.0) or 0.0),
+        )
+        if self.risk_policy_engine:
+            trade_signal = self.risk_policy_engine.apply(trade_signal, regime_data=regime_data)
+        stop_loss, take_profit = trade_signal.risk.resolve_trigger_prices(price, side, leverage)
+        return stop_loss, take_profit, dict((trade_signal.context or {}).get("risk_policy", {}) or {})
 
     @staticmethod
     def _is_copy_trade(trade: Dict) -> bool:
@@ -693,15 +727,11 @@ class CopyTrader:
         if coin_copies >= 5:
             return None
 
-        # SL/TP are defined on ROE and converted back into trigger prices.
-        stop_loss_roe_pct = 0.04
-        take_profit_roe_pct = stop_loss_roe_pct * 5.0
-        if side == "long":
-            stop_loss = price * (1 - stop_loss_roe_pct / leverage)
-            take_profit = price * (1 + take_profit_roe_pct / leverage)
-        else:
-            stop_loss = price * (1 + stop_loss_roe_pct / leverage)
-            take_profit = price * (1 - take_profit_roe_pct / leverage)
+        stop_loss, take_profit, risk_policy = self._resolve_copy_trade_risk(
+            signal,
+            leverage,
+            regime_data=signal.get("regime_data"),
+        )
 
         try:
             execution_role = signal.get("execution_role", config.PAPER_TRADING_DEFAULT_EXECUTION_ROLE)
@@ -722,6 +752,7 @@ class CopyTrader:
                     "source_key": signal.get("_source_key", ""),
                     "source_accuracy": signal.get("source_accuracy", 0),
                     "regime": signal.get("regime", ""),
+                    "risk_policy": risk_policy,
                     "is_copy_trade": True,
                     "is_golden": signal.get("is_golden", False),
                     "golden_wallet": signal.get("is_golden", False),
@@ -760,6 +791,7 @@ class CopyTrader:
                     "source_key": signal.get("_source_key", ""),
                     "source_accuracy": signal.get("source_accuracy", 0),
                     "regime": signal.get("regime", ""),
+                    "risk_policy": risk_policy,
                     "is_copy_trade": True,
                     "is_golden": signal.get("is_golden", False),
                     "golden_wallet": signal.get("is_golden", False),
