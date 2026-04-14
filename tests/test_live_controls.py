@@ -1128,8 +1128,8 @@ def test_execute_options_flow_paper_trade_preserves_precise_stops(monkeypatch):
 
     _execute_options_flow_trades(container, {"overall_regime": "neutral"})
 
-    assert abs(opened["stop_loss"] - (price * 0.95)) < 1e-12
-    assert abs(opened["take_profit"] - (price * 1.10)) < 1e-12
+    assert abs(opened["stop_loss"] - (price * 0.975)) < 1e-12
+    assert abs(opened["take_profit"] - (price * 1.125)) < 1e-12
 
 
 def test_run_alpha_arena_live_path_executes_signal(monkeypatch):
@@ -1264,8 +1264,8 @@ def test_run_alpha_arena_paper_trade_preserves_precise_stops(monkeypatch):
 
     _run_alpha_arena(container, {"overall_regime": "neutral"})
 
-    assert abs(opened["stop_loss"] - (price * 1.05)) < 1e-12
-    assert abs(opened["take_profit"] - (price * 0.90)) < 1e-12
+    assert abs(opened["stop_loss"] - (price * 1.025)) < 1e-12
+    assert abs(opened["take_profit"] - (price * 0.875)) < 1e-12
 
 
 def test_execution_open_positions_prefer_live_state_when_deployable():
@@ -2214,7 +2214,7 @@ def test_copy_trade_preserves_precise_stops_for_low_priced_assets(monkeypatch):
     )
 
     expected_stop_loss = price * (1 - 0.04 / leverage)
-    expected_take_profit = price * (1 + 0.08 / leverage)
+    expected_take_profit = price * (1 + 0.20 / leverage)
 
     assert trade is not None
     assert abs(opened["stop_loss"] - expected_stop_loss) < 1e-12
@@ -2224,7 +2224,7 @@ def test_copy_trade_preserves_precise_stops_for_low_priced_assets(monkeypatch):
 
     signal = signal_from_execution_dict(trade)
     assert abs(signal.risk.stop_loss_pct - (0.04 / leverage)) < 1e-12
-    assert abs(signal.risk.take_profit_pct - (0.08 / leverage)) < 1e-12
+    assert abs(signal.risk.take_profit_pct - (0.20 / leverage)) < 1e-12
 
 
 def test_discovery_time_persistence_round_trips_through_db_context(monkeypatch):

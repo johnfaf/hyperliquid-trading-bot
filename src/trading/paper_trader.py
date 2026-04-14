@@ -393,16 +393,12 @@ class PaperTrader:
                     leverage=sig["leverage"],
                     position_pct=sig["size"] * sig["price"] / (db.get_paper_account() or {}).get("balance", 10000),
                     risk=RiskParams(
-                        # LOW-FIX LOW-6: store the effective per-price stop-loss
-                        # percentage (divided by leverage) so RiskParams reflects
-                        # the actual price distance at which the stop fires.  The
-                        # _generate_signal formula computes stop_price as
-                        # target * (1 - SL_PCT / leverage), so a 5% config SL at
-                        # 5x leverage = 1% price-move trigger.  Storing 0.05 (raw)
-                        # was inconsistent with what the stop actually enforced.
-                        stop_loss_pct=config.PAPER_TRADING_STOP_LOSS_PCT / max(float(sig.get("leverage", 1) or 1), 1),
-                        take_profit_pct=config.PAPER_TRADING_TAKE_PROFIT_PCT / max(float(sig.get("leverage", 1) or 1), 1),
+                        # Keep the signal in ROE space so live execution can
+                        # convert to trigger prices using the actual leverage.
+                        stop_loss_pct=config.PAPER_TRADING_STOP_LOSS_PCT,
+                        take_profit_pct=config.PAPER_TRADING_TAKE_PROFIT_PCT,
                         max_leverage=config.PAPER_TRADING_MAX_LEVERAGE,
+                        risk_basis="roe",
                     ),
                     regime=regime_data.get("overall_regime", "") if regime_data else "",
                     regime_size_modifier=sig["strategy"].get("regime_size_modifier", 1.0),

@@ -853,7 +853,7 @@ def _execute_lcrs_signals(container, lcrs_signals, regime_data):
                     strategy_type="liquidation_reversal",
                     entry_price=sig["price"], leverage=sig["leverage"],
                     position_pct=sig.get("position_pct", 0.06),
-                    risk=RiskParams(stop_loss_pct=0.025, take_profit_pct=0.05),
+                    risk=RiskParams(stop_loss_pct=0.025, take_profit_pct=0.125),
                     regime=regime_data.get("overall_regime", "") if regime_data else "",
                 )
 
@@ -1056,11 +1056,10 @@ def _execute_options_flow_trades(container, regime_data):
                 size_usd = account["balance"] * flow_signal.effective_size
                 size = size_usd / price
                 side = flow_signal.side.value
-                sl = price * (1 - 0.05) if side == "long" else price * (1 + 0.05)
-                tp = price * (1 + 0.10) if side == "long" else price * (1 - 0.10)
+                sl, tp = flow_signal.risk.resolve_trigger_prices(price, side, flow_signal.leverage)
                 trade_id = db.open_paper_trade(
                     strategy_id=None, coin=conv["ticker"], side=side,
-                    entry_price=price, size=size, leverage=2,
+                    entry_price=price, size=size, leverage=flow_signal.leverage,
                     stop_loss=sl, take_profit=tp,
                     metadata={
                         "source": "options_flow",
@@ -1258,8 +1257,8 @@ def _run_alpha_arena(container, regime_data):
                                 continue
                             side = sig["side"]
                             conf = sig["confidence"]
-                            sl = price * (0.95 if side == "long" else 1.05)
-                            tp = price * (1.10 if side == "long" else 0.90)
+                            risk = RiskParams(stop_loss_pct=0.05, take_profit_pct=0.25)
+                            sl, tp = risk.resolve_trigger_prices(price, side, 2)
                             position_pct = 0.05 * conf
                             if getattr(container, "kelly_sizer", None) or getattr(container, "rl_sizer", None):
                                 try:
@@ -1290,7 +1289,7 @@ def _run_alpha_arena(container, regime_data):
                                     entry_price=price,
                                     leverage=2,
                                     position_pct=position_pct,
-                                    risk=RiskParams(stop_loss_pct=0.05, take_profit_pct=0.10),
+                                    risk=RiskParams(stop_loss_pct=0.05, take_profit_pct=0.25),
                                     regime=regime_data.get("overall_regime", "") if regime_data else "",
                                 )
                                 _execute_signal_live(container, live_signal, "ARENA")

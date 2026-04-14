@@ -693,13 +693,15 @@ class CopyTrader:
         if coin_copies >= 5:
             return None
 
-        # SL/TP
+        # SL/TP are defined on ROE and converted back into trigger prices.
+        stop_loss_roe_pct = 0.04
+        take_profit_roe_pct = stop_loss_roe_pct * 5.0
         if side == "long":
-            stop_loss = price * (1 - 0.04 / leverage)
-            take_profit = price * (1 + 0.08 / leverage)
+            stop_loss = price * (1 - stop_loss_roe_pct / leverage)
+            take_profit = price * (1 + take_profit_roe_pct / leverage)
         else:
-            stop_loss = price * (1 + 0.04 / leverage)
-            take_profit = price * (1 - 0.08 / leverage)
+            stop_loss = price * (1 + stop_loss_roe_pct / leverage)
+            take_profit = price * (1 - take_profit_roe_pct / leverage)
 
         try:
             execution_role = signal.get("execution_role", config.PAPER_TRADING_DEFAULT_EXECUTION_ROLE)

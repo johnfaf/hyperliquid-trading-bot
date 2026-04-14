@@ -121,12 +121,11 @@ SCORING_WEIGHTS = {
 PAPER_TRADING_INITIAL_BALANCE = 10_000  # USD
 PAPER_TRADING_MAX_POSITION_PCT = 0.08   # 8% of balance per trade (smaller = more concurrent trades)
 PAPER_TRADING_MAX_LEVERAGE = float(os.environ.get("PAPER_TRADING_MAX_LEVERAGE", 5))
-# Stop-loss is applied BEFORE leverage scaling in paper_trader.py (SL% / leverage).
-# At 5x leverage a 5% SL = 1% raw move — too tight for volatile crypto.
-# Raise this so the raw per-position SL allows normal intra-day noise:
-#   e.g. PAPER_TRADING_STOP_LOSS_PCT=0.15 at 5x → 3% raw move before exit.
+# Paper-trading risk is defined in ROE space, then converted back into raw
+# trigger prices by dividing by leverage. Take-profit is always kept at 5x the
+# configured stop-loss so every paper signal uses the same reward-to-risk shape.
 PAPER_TRADING_STOP_LOSS_PCT = float(os.environ.get("PAPER_TRADING_STOP_LOSS_PCT", 0.15))
-PAPER_TRADING_TAKE_PROFIT_PCT = float(os.environ.get("PAPER_TRADING_TAKE_PROFIT_PCT", 0.30))
+PAPER_TRADING_TAKE_PROFIT_PCT = PAPER_TRADING_STOP_LOSS_PCT * 5.0
 PAPER_TRADING_MAKER_FEE_BPS = float(os.environ.get("PAPER_TRADING_MAKER_FEE_BPS", 0.2))
 PAPER_TRADING_TAKER_FEE_BPS = float(os.environ.get("PAPER_TRADING_TAKER_FEE_BPS", 2.5))
 PAPER_TRADING_DEFAULT_EXECUTION_ROLE = os.environ.get(
@@ -534,7 +533,7 @@ def _validate_config_bounds() -> None:
         ("MAX_STRATEGIES_PER_CYCLE", 1, 200, 15),
         ("PAPER_TRADING_MAX_LEVERAGE", 1.0, 25.0, 5.0),
         ("PAPER_TRADING_STOP_LOSS_PCT", 0.001, 1.0, 0.15),
-        ("PAPER_TRADING_TAKE_PROFIT_PCT", 0.001, 3.0, 0.30),
+        ("PAPER_TRADING_TAKE_PROFIT_PCT", 0.001, 5.0, 0.75),
         ("LIVE_MIN_ORDER_USD", 10.0, 1_000_000.0, 11.0),
         ("LIVE_MAX_ORDER_USD", 10.0, 1_000_000.0, 100.0),
         ("LIVE_MAX_DAILY_LOSS_USD", 1.0, 10_000_000.0, 100.0),

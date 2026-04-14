@@ -47,12 +47,63 @@ class SignalStrength(str, Enum):
 @dataclass
 class RiskParams:
     """Risk parameters attached to every signal."""
-    stop_loss_pct: float = 0.05       # 5% default stop loss
-    take_profit_pct: float = 0.10     # 10% default take profit
+    stop_loss_pct: float = 0.05       # 5% stop on margin / ROE
+    take_profit_pct: float = 0.25     # 25% take-profit on margin / ROE (5:1)
     max_leverage: float = 5.0
     trailing_stop: bool = True
     trailing_pct: float = 0.025       # 2.5% trailing stop
     time_limit_hours: float = 24.0    # Max time in position
+    risk_basis: str = "roe"           # "roe" = margin-based, "price" = raw price move
+    reward_to_risk_ratio: float = 5.0
+    enforce_reward_to_risk: bool = True
+
+    def __post_init__(self) -> None:
+        self.stop_loss_pct = max(float(self.stop_loss_pct or 0.0), 0.0)
+        self.take_profit_pct = max(float(self.take_profit_pct or 0.0), 0.0)
+        self.reward_to_risk_ratio = max(float(self.reward_to_risk_ratio or 0.0), 0.0)
+        basis = str(self.risk_basis or "roe").strip().lower()
+        self.risk_basis = basis if basis in {"roe", "price"} else "roe"
+        self.sync_reward_to_risk()
+
+    def sync_reward_to_risk(self) -> None:
+        """Keep TP aligned to the configured reward-to-risk ratio."""
+        if self.enforce_reward_to_risk and self.stop_loss_pct > 0 and self.reward_to_risk_ratio > 0:
+            self.take_profit_pct = self.stop_loss_pct * self.reward_to_risk_ratio
+
+    @staticmethod
+    def _normalized_leverage(leverage: float) -> float:
+        try:
+            return max(float(leverage or 1.0), 1.0)
+        except (TypeError, ValueError):
+            return 1.0
+
+    def resolve_price_stop_loss_pct(self, leverage: float) -> float:
+        """Resolve the raw price-move stop percentage for the given leverage."""
+        if self.risk_basis == "roe":
+            return self.stop_loss_pct / self._normalized_leverage(leverage)
+        return self.stop_loss_pct
+
+    def resolve_price_take_profit_pct(self, leverage: float) -> float:
+        """Resolve the raw price-move TP percentage for the given leverage."""
+        if self.risk_basis == "roe":
+            return self.take_profit_pct / self._normalized_leverage(leverage)
+        return self.take_profit_pct
+
+    def resolve_trigger_prices(self, entry_price: float, side: str, leverage: float) -> tuple[float, float]:
+        """Convert risk targets into absolute trigger prices."""
+        stop_loss_pct = self.resolve_price_stop_loss_pct(leverage)
+        take_profit_pct = self.resolve_price_take_profit_pct(leverage)
+        side_value = str(side or "").strip().lower()
+        is_long = side_value in {"buy", "long"}
+        if is_long:
+            return (
+                entry_price * (1 - stop_loss_pct),
+                entry_price * (1 + take_profit_pct),
+            )
+        return (
+            entry_price * (1 + stop_loss_pct),
+            entry_price * (1 - take_profit_pct),
+        )
 
     def to_dict(self) -> Dict:
         return asdict(self)
@@ -209,7 +260,7 @@ def signal_from_execution_dict(execution: Dict[str, Any]) -> TradeSignal:
     # Reconstruct RiskParams from absolute SL/TP prices when available.
     # Paper trades carry stop_loss/take_profit as absolute prices; convert
     # them back to percentages so the live trader places correct triggers.
-    risk = RiskParams()
+    risk = RiskParams(risk_basis="price", enforce_reward_to_risk=False)
     sl_price = float(execution.get("stop_loss", 0.0) or 0.0)
     tp_price = float(execution.get("take_profit", 0.0) or 0.0)
     if entry_price > 0 and sl_price > 0:

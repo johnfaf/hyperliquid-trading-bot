@@ -2965,22 +2965,24 @@ class LiveTrader:
             )
             return adjusted
 
-        # 1. CRASH regime: reduce size 60%, tighten stop loss to 3%
+        # 1. CRASH regime: reduce size 60%, tighten stop loss to 3% ROE.
         if regime == "crash" and confidence > 0.4:
             adjusted.size = base_size * 0.4  # 60% reduction = multiply by 0.4
             adjusted.risk.stop_loss_pct = 0.03
+            adjusted.risk.sync_reward_to_risk()
             logger.warning(
                 f"REGIME OVERLAY: crash detected (conf={confidence:.2f}), "
-                f"reducing size 60%, tightening SL to 3% for {adjusted.coin}"
+                f"reducing size 60%, tightening SL to 3% ROE for {adjusted.coin}"
             )
 
-        # 2. VOLATILE regime: reduce size 30%, widen stop loss to 8%
+        # 2. VOLATILE regime: reduce size 30%, widen stop loss to 8% ROE.
         elif regime == "volatile":
             adjusted.size = base_size * 0.7  # 30% reduction = multiply by 0.7
             adjusted.risk.stop_loss_pct = 0.08
+            adjusted.risk.sync_reward_to_risk()
             logger.info(
                 f"REGIME OVERLAY: volatile detected, "
-                f"reducing size 30%, widening SL to 8% for {adjusted.coin}"
+                f"reducing size 30%, widening SL to 8% ROE for {adjusted.coin}"
             )
 
         # 3. BULLISH regime: allow full size, boost by 10%
@@ -3460,12 +3462,11 @@ class LiveTrader:
                     entry_anchor_price,
                 )
 
-            if side == "buy":
-                sl_price = entry_anchor_price * (1 - signal.risk.stop_loss_pct)
-                tp_price = entry_anchor_price * (1 + signal.risk.take_profit_pct)
-            else:
-                sl_price = entry_anchor_price * (1 + signal.risk.stop_loss_pct)
-                tp_price = entry_anchor_price * (1 - signal.risk.take_profit_pct)
+            sl_price, tp_price = signal.risk.resolve_trigger_prices(
+                entry_anchor_price,
+                side,
+                signal.leverage,
+            )
 
             close_side = "sell" if side == "buy" else "buy"
             sl_result, tp_result, protective_attempts = self._place_protective_orders_with_retries(

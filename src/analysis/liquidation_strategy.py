@@ -94,8 +94,8 @@ class LiquidationStrategy:
         self.max_position_pct = cfg.get("max_position_pct", 0.10)    # 10% max
 
         # Risk params
-        self.stop_loss_pct = cfg.get("stop_loss_pct", 0.025)    # 2.5% stop (tight for reversals)
-        self.take_profit_pct = cfg.get("take_profit_pct", 0.05)  # 5% TP (2:1 R:R)
+        self.stop_loss_pct = cfg.get("stop_loss_pct", 0.025)    # 2.5% stop on ROE
+        self.take_profit_pct = cfg.get("take_profit_pct", self.stop_loss_pct * 5.0)
         self.max_leverage = cfg.get("max_leverage", 3)            # Conservative leverage
 
         # Stats
