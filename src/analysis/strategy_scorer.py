@@ -254,7 +254,7 @@ class StrategyScorer:
                 with db.get_connection() as conn:
                     conn.execute(
                         "UPDATE strategies SET active = ? WHERE id = ?",
-                        (1 if should_be_active else 0, r["strategy_id"]),
+                        (bool(should_be_active), r["strategy_id"]),
                     )
             except Exception as e:
                 logger.error(

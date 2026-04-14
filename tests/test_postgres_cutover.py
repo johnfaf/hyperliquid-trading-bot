@@ -7,6 +7,7 @@ from contextlib import contextmanager
 import pytest
 
 from src.analysis import shadow_tracker as shadow_tracker_module
+from src.data.db.connection import DualWriteAdapter
 from src.data.db import migrations as migrations_module
 from src.data.db import postgres as postgres_module
 from src.data.db import router
@@ -30,6 +31,40 @@ def _shared_sqlite_ctx(db_file):
     return _ctx
 
 
+class _RecordingPgCursor:
+    def __init__(self, conn):
+        self._conn = conn
+
+    def execute(self, sql, params=()):
+        self._conn.executed.append((sql, tuple(params or ())))
+
+    def fetchone(self):
+        return None
+
+    def fetchall(self):
+        return []
+
+    @property
+    def rowcount(self):
+        return 1
+
+
+class _RecordingPgConn:
+    def __init__(self):
+        self.executed = []
+        self.rollback_calls = 0
+        self.commit_calls = 0
+
+    def cursor(self):
+        return _RecordingPgCursor(self)
+
+    def rollback(self):
+        self.rollback_calls += 1
+
+    def commit(self):
+        self.commit_calls += 1
+
+
 def test_dualwrite_read_only_path_skips_postgres(monkeypatch):
     monkeypatch.setattr(router.config, "DB_BACKEND", "dualwrite")
     monkeypatch.setattr(router, "_sqlite_connect", lambda: sqlite3.connect(":memory:"))
@@ -43,6 +78,39 @@ def test_dualwrite_read_only_path_skips_postgres(monkeypatch):
         row = conn.execute("SELECT 1").fetchone()
 
     assert row[0] == 1
+
+
+def test_dualwrite_insert_preserves_sqlite_generated_ids_in_postgres():
+    sqlite_conn = sqlite3.connect(":memory:")
+    sqlite_conn.row_factory = sqlite3.Row
+    sqlite_conn.execute(
+        "CREATE TABLE strategies (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL)"
+    )
+    pg_conn = _RecordingPgConn()
+    adapter = DualWriteAdapter(sqlite_conn, pg_conn)
+
+    cursor = adapter.execute(
+        "INSERT INTO strategies (name) VALUES (?)",
+        ("momentum",),
+    )
+
+    assert cursor.lastrowid == 1
+    assert pg_conn.executed[-1][0].startswith("INSERT INTO strategies (id, name) VALUES (%s, %s)")
+    assert pg_conn.executed[-1][1] == (1, "momentum")
+
+
+def test_dualwrite_skips_sqlite_only_pragmas_for_postgres():
+    sqlite_conn = sqlite3.connect(":memory:")
+    sqlite_conn.row_factory = sqlite3.Row
+    sqlite_conn.execute(
+        "CREATE TABLE strategies (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL)"
+    )
+    pg_conn = _RecordingPgConn()
+    adapter = DualWriteAdapter(sqlite_conn, pg_conn)
+
+    adapter.execute("PRAGMA table_info(strategies)")
+
+    assert pg_conn.executed == []
 
 
 def test_localhost_postgres_dsn_is_allowed_for_local_development():

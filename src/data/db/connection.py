@@ -24,20 +24,44 @@ logger = logging.getLogger(__name__)
 
 # Pre-compiled patterns for SQL translation
 _PLACEHOLDER_RE = re.compile(r"\?")
-# Boolean columns that Postgres stores as BOOLEAN but SQLite stores as INTEGER.
-# Matches "column = 1" or "column=0" patterns for these known boolean columns.
-_BOOL_COLUMNS = ("active", "is_golden", "connected_to_live", "is_liquidation")
-_BOOL_RE = re.compile(
-    r"\b(" + "|".join(_BOOL_COLUMNS) + r")\s*=\s*([01])\b",
+_PRAGMA_TABLE_INFO_RE = re.compile(
+    r"^\s*PRAGMA\s+table_info\((?P<table>[^)]+)\)\s*;?\s*$",
     re.IGNORECASE,
 )
-_BOOL_MAP = {"1": "true", "0": "false"}
+_BOOL_COLUMN_EQ_INT_RE = re.compile(
+    r"\b(?P<column>active|is_golden|connected_to_live|is_liquidation)\s*=\s*(?P<value>[01])\b",
+    re.IGNORECASE,
+)
+_INSERT_VALUES_RE = re.compile(
+    r"(?is)^\s*INSERT\s+(?:OR\s+(?:REPLACE|IGNORE)\s+)?INTO\s+"
+    r"(?P<table>[\"`\w\.]+)\s*\((?P<columns>.*?)\)\s*VALUES\s*"
+    r"\((?P<values>.*?)\)(?P<suffix>\s*.*)$"
+)
+_SQLITE_ONLY_PREFIXES = ("PRAGMA",)
+_DDL_PREFIXES = ("CREATE ", "ALTER ", "DROP ", "VACUUM", "REINDEX")
+
+
+def _clean_identifier(raw: str) -> str:
+    return raw.strip().strip("\"'`[]")
+
+
+def _bool_literal_replacer(match: re.Match) -> str:
+    return f"{match.group('column')} = {'TRUE' if match.group('value') == '1' else 'FALSE'}"
 
 
 def _translate_sql(sql: str, backend: str) -> str:
     """Translate SQLite SQL dialect to Postgres when necessary."""
     if backend == "sqlite":
         return sql
+
+    pragma_match = _PRAGMA_TABLE_INFO_RE.match(sql.strip())
+    if pragma_match:
+        table = _clean_identifier(pragma_match.group("table")).lower()
+        return (
+            "SELECT column_name AS name FROM information_schema.columns "
+            f"WHERE table_schema='public' AND table_name='{table}' "
+            "ORDER BY ordinal_position"
+        )
 
     # ? -> %s
     translated = _PLACEHOLDER_RE.sub("%s", sql)
@@ -50,17 +74,15 @@ def _translate_sql(sql: str, backend: str) -> str:
     # AUTOINCREMENT -> not needed (Postgres SERIAL handles it)
     translated = translated.replace("AUTOINCREMENT", "")
 
-    # Boolean columns: SQLite uses 0/1, Postgres uses true/false
-    translated = _BOOL_RE.sub(
-        lambda m: f"{m.group(1)} = {_BOOL_MAP[m.group(2)]}", translated
-    )
-
     # sqlite_master -> information_schema
     translated = translated.replace(
         "SELECT name FROM sqlite_master WHERE type='table' AND name=",
         "SELECT table_name AS name FROM information_schema.tables "
         "WHERE table_schema='public' AND table_name=",
     )
+    translated = translated.replace("datetime('now', '-90 days')", "(now() - INTERVAL '90 days')")
+    translated = translated.replace("datetime('now')", "CURRENT_TIMESTAMP")
+    translated = _BOOL_COLUMN_EQ_INT_RE.sub(_bool_literal_replacer, translated)
 
     return translated
 
@@ -205,16 +227,67 @@ class DualWriteAdapter:
         self._sq = sqlite_conn      # raw sqlite3.Connection
         self._pg = pg_conn           # raw psycopg connection
         self.backend = "sqlite"      # callers see SQLite semantics
+        self._sqlite_id_pk_cache: dict[str, bool] = {}
 
     # -- helpers -------------------------------------------------------------
 
-    def _mirror_to_pg(self, sql: str, params: Sequence = None) -> None:
-        """Best-effort replay of a single statement to Postgres."""
+    def _should_skip_pg_mirror(self, sql: str) -> bool:
+        stripped = (sql or "").lstrip().upper()
+        return stripped.startswith(_SQLITE_ONLY_PREFIXES) or stripped.startswith(_DDL_PREFIXES)
+
+    def _sqlite_table_has_integer_id_pk(self, table: str) -> bool:
+        table = _clean_identifier(table).split(".")[-1]
+        cached = self._sqlite_id_pk_cache.get(table)
+        if cached is not None:
+            return cached
         try:
-            pg_sql = _translate_sql(sql, "postgres")
+            rows = self._sq.execute(f"PRAGMA table_info({table})").fetchall()
+            has_id_pk = any(
+                _clean_identifier(str(row["name"])).lower() == "id" and int(row["pk"] or 0) == 1
+                for row in rows
+            )
+        except Exception:
+            has_id_pk = False
+        self._sqlite_id_pk_cache[table] = has_id_pk
+        return has_id_pk
+
+    def _prepare_pg_mirror(self, sql: str, params: Sequence = None, sqlite_result=None):
+        if self._should_skip_pg_mirror(sql):
+            return None, None
+
+        insert_match = _INSERT_VALUES_RE.match(sql)
+        if not insert_match:
+            return sql, tuple(params) if params else ()
+
+        table = _clean_identifier(insert_match.group("table"))
+        columns_raw = insert_match.group("columns").strip()
+        columns = [_clean_identifier(col).lower() for col in columns_raw.split(",")]
+        if "id" in columns:
+            return sql, tuple(params) if params else ()
+
+        inserted_id = getattr(sqlite_result, "lastrowid", None)
+        if not inserted_id or not self._sqlite_table_has_integer_id_pk(table):
+            return sql, tuple(params) if params else ()
+
+        values_raw = insert_match.group("values").strip()
+        suffix = insert_match.group("suffix") or ""
+        mirror_sql = (
+            f"INSERT INTO {insert_match.group('table')} (id, {columns_raw}) "
+            f"VALUES (?, {values_raw}){suffix}"
+        )
+        mirror_params = (inserted_id,) + tuple(params or ())
+        return mirror_sql, mirror_params
+
+    def _mirror_to_pg(self, sql: str, params: Sequence = None, sqlite_result=None) -> None:
+        """Best-effort replay of a single statement to Postgres."""
+        pg_sql, pg_params = self._prepare_pg_mirror(sql, params, sqlite_result=sqlite_result)
+        if pg_sql is None:
+            return
+        try:
+            pg_sql = _translate_sql(pg_sql, "postgres")
             # Don't add RETURNING for mirror writes — we don't need lastrowid
             cur = self._pg.cursor()
-            cur.execute(pg_sql, tuple(params) if params else ())
+            cur.execute(pg_sql, pg_params or ())
             dualwrite_stats.record_ok()
         except Exception as exc:
             err_str = f"{type(exc).__name__}: {exc}"
@@ -239,7 +312,7 @@ class DualWriteAdapter:
             result = self._sq.execute(sql)
 
         # 2. Best-effort Postgres mirror
-        self._mirror_to_pg(sql, params)
+        self._mirror_to_pg(sql, params, sqlite_result=result)
 
         return result  # SQLite cursor — callers see .lastrowid / .rowcount
 

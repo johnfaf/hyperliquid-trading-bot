@@ -1,5 +1,6 @@
 import pytest
 import time
+from contextlib import contextmanager
 from unittest.mock import patch, MagicMock
 
 from src.signals.xgboost_regime_forecaster import (
@@ -132,3 +133,33 @@ class TestXGBoostRegimeForecaster:
             forecaster.predict_regime("BTC")
             # train should NOT be called if HAS_XGBOOST is False
             # but if it is True and model is None, it should try
+
+    def test_postgres_regime_history_setup_skips_sqlite_ddl(self, forecaster, monkeypatch):
+        """Postgres mode should rely on migrations instead of SQLite DDL/PRAGMA."""
+
+        class _DummyConn:
+            def __init__(self):
+                self.executescript_called = False
+                self.execute_calls = []
+
+            def execute(self, sql, params=None):
+                self.execute_calls.append((sql, params))
+                return MagicMock(fetchall=lambda: [])
+
+            def executescript(self, sql):
+                self.executescript_called = True
+
+        dummy = _DummyConn()
+
+        @contextmanager
+        def _ctx(*, for_read: bool = False):
+            yield dummy
+
+        monkeypatch.setattr("src.data.database.get_backend_name", lambda: "postgres")
+        monkeypatch.setattr("src.data.database.table_exists", lambda name: True)
+        monkeypatch.setattr("src.data.database.get_connection", _ctx)
+
+        forecaster._ensure_regime_history_table()
+
+        assert dummy.executescript_called is False
+        assert dummy.execute_calls == []

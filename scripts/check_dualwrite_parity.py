@@ -39,6 +39,7 @@ TABLES = [
     "position_snapshots",
     "strategies",
     "strategy_scores",
+    "regime_history",
     "paper_account",
     "paper_trades",
     "research_logs",

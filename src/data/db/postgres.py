@@ -154,6 +154,10 @@ def return_connection(conn):
     """Return a connection back to the pool."""
     pool = _get_pool()
     try:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
         pool.putconn(conn)
     except Exception:
         pass

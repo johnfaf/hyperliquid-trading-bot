@@ -4,7 +4,7 @@ XGBoost Regime Forecaster (V2 — DB-backed walk-forward)
 ML-based upgrade to PredictiveRegimeForecaster.
 
 Uses an XGBoost gradient-boosted classifier trained on the bot's own
-SQLite history (``regime_history`` table) with walk-forward retraining
+regime history (``regime_history`` table) with walk-forward retraining
 every 24 hours.
 
 Features (8-input model):
@@ -70,7 +70,7 @@ REGIME_LABELS = {"crash": 0, "neutral": 1, "bullish": 2}
 REGIME_NAMES = {0: "crash", 1: "neutral", 2: "bullish"}
 
 # ─── DB schema for training data ──────────────────────────────────
-_REGIME_HISTORY_DDL = """
+_SQLITE_REGIME_HISTORY_DDL = """
 CREATE TABLE IF NOT EXISTS regime_history (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     timestamp TEXT DEFAULT (datetime('now')),
@@ -478,27 +478,35 @@ class XGBoostRegimeForecaster:
         y_rows = []
 
         try:
+            from src.data import database as db
             from src.data.database import get_connection
-            with get_connection() as conn:
-                rows = conn.execute("""
+            with get_connection(for_read=True) as conn:
+                cutoff_sql = (
+                    "now() - INTERVAL '90 days'"
+                    if db.get_backend_name() == "postgres"
+                    else "datetime('now', '-90 days')"
+                )
+                rows = conn.execute(f"""
                     SELECT funding_rate, funding_slope, orderbook_imbalance,
                            volatility_5m, basis_spread, options_flow_conviction,
                            regime_label
                     FROM regime_history
-                    WHERE timestamp > datetime('now', '-90 days')
+                    WHERE timestamp > {cutoff_sql}
                       AND regime_label IN (0, 1, 2)
                       AND label_source = 'observed'
                     ORDER BY timestamp ASC
                 """).fetchall()
 
             if rows:
-                n_features = len(FEATURE_NAMES)  # 6
                 X_rows = np.array(
-                    [[float(r[i]) for i in range(n_features)] for r in rows],
+                    [
+                        [float(r[name]) for name in FEATURE_NAMES]
+                        for r in rows
+                    ],
                     dtype=np.float32,
                 )
                 y_rows = np.array(
-                    [int(r[n_features]) for r in rows],
+                    [int(r["regime_label"]) for r in rows],
                     dtype=np.int32,
                 )
                 logger.info(
@@ -580,10 +588,20 @@ class XGBoostRegimeForecaster:
     def _ensure_regime_history_table(self):
         """Create regime_history table if it doesn't exist."""
         try:
+            from src.data import database as db
             from src.data.database import get_connection
+            backend = db.get_backend_name()
             with get_connection() as conn:
-                conn.execute(_REGIME_HISTORY_DDL)
-                # Backward-compatible migrations for existing deployments.
+                if backend == "postgres":
+                    if not db.table_exists("regime_history"):
+                        logger.warning(
+                            "regime_history is missing in Postgres. "
+                            "Run pending migrations before enabling Postgres-backed regime history."
+                        )
+                    return
+
+                conn.executescript(_SQLITE_REGIME_HISTORY_DDL)
+                # Backward-compatible migrations for existing SQLite deployments.
                 cols = conn.execute("PRAGMA table_info(regime_history)").fetchall()
                 col_names = {str(row["name"]) for row in cols} if cols else set()
                 if "label_source" not in col_names:

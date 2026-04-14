@@ -249,7 +249,7 @@ def upsert_trader(address, total_pnl=0, roi_pct=0, account_value=0,
                   win_rate=0, trade_count=0, metadata=None, is_active=True):
     now = datetime.now(timezone.utc).isoformat()
     meta_json = json.dumps(metadata or {})
-    active_int = 1 if is_active else 0
+    active_value = bool(is_active)
     with get_connection() as conn:
         conn.execute("""
             INSERT INTO traders (address, first_seen, last_updated, total_pnl,
@@ -265,15 +265,96 @@ def upsert_trader(address, total_pnl=0, roi_pct=0, account_value=0,
                 metadata = ?,
                 active = ?
         """, (address, now, now, total_pnl, roi_pct, account_value,
-              win_rate, trade_count, meta_json, active_int,
-              now, total_pnl, roi_pct, account_value, win_rate, trade_count, meta_json, active_int))
+              win_rate, trade_count, meta_json, active_value,
+              now, total_pnl, roi_pct, account_value, win_rate, trade_count, meta_json, active_value))
 
 
 def mark_trader_inactive(address):
     """Mark a trader as inactive (e.g. detected as bot)."""
     with get_connection() as conn:
-        conn.execute("UPDATE traders SET active = 0, last_updated = ? WHERE address = ?",
-                     (datetime.now(timezone.utc).isoformat(), address))
+        conn.execute("UPDATE traders SET active = ?, last_updated = ? WHERE address = ?",
+                     (False, datetime.now(timezone.utc).isoformat(), address))
+
+
+def _ensure_postgres_strategy_parent(strategy_id) -> None:
+    """Backfill a missing strategy row into Postgres during dual-write.
+
+    This protects child writes such as ``strategy_scores`` and ``paper_trades``
+    when dual-write is enabled on a deployment that already had SQLite data
+    before Postgres was connected.
+    """
+    if config.DB_BACKEND != "dualwrite" or strategy_id is None:
+        return
+
+    try:
+        from src.data.db.postgres import get_connection as get_pg_connection
+        from src.data.db.postgres import return_connection as return_pg_connection
+    except Exception:
+        return
+
+    with get_connection(for_read=True) as sqlite_conn:
+        strategy = sqlite_conn.execute(
+            "SELECT * FROM strategies WHERE id = ?",
+            (strategy_id,),
+        ).fetchone()
+
+    if not strategy:
+        return
+
+    pg_conn = get_pg_connection()
+    try:
+        cur = pg_conn.cursor()
+        cur.execute("SELECT 1 FROM strategies WHERE id = %s", (strategy_id,))
+        if cur.fetchone():
+            pg_conn.commit()
+            return
+
+        cur.execute(
+            """
+            INSERT INTO strategies
+            (id, name, description, strategy_type, parameters, discovered_at,
+             last_scored, current_score, total_pnl, trade_count, win_rate,
+             sharpe_ratio, active)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (id) DO UPDATE SET
+                name = EXCLUDED.name,
+                description = EXCLUDED.description,
+                strategy_type = EXCLUDED.strategy_type,
+                parameters = EXCLUDED.parameters,
+                discovered_at = EXCLUDED.discovered_at,
+                last_scored = EXCLUDED.last_scored,
+                current_score = EXCLUDED.current_score,
+                total_pnl = EXCLUDED.total_pnl,
+                trade_count = EXCLUDED.trade_count,
+                win_rate = EXCLUDED.win_rate,
+                sharpe_ratio = EXCLUDED.sharpe_ratio,
+                active = EXCLUDED.active
+            """,
+            (
+                strategy["id"],
+                strategy["name"],
+                strategy["description"],
+                strategy["strategy_type"],
+                strategy["parameters"],
+                strategy["discovered_at"],
+                strategy["last_scored"],
+                strategy["current_score"],
+                strategy["total_pnl"],
+                strategy["trade_count"],
+                strategy["win_rate"],
+                strategy["sharpe_ratio"],
+                bool(strategy["active"]),
+            ),
+        )
+        pg_conn.commit()
+    except Exception as exc:
+        try:
+            pg_conn.rollback()
+        except Exception:
+            pass
+        logger.debug("Could not backfill strategy %s into Postgres: %s", strategy_id, exc)
+    finally:
+        return_pg_connection(pg_conn)
 
 
 def get_active_traders():
@@ -397,6 +478,7 @@ def get_strategy(strategy_id):
 def save_strategy_score(strategy_id, score, pnl_score=0, win_rate_score=0,
                         sharpe_score=0, consistency_score=0, risk_adj_score=0, notes=""):
     now = datetime.now(timezone.utc).isoformat()
+    _ensure_postgres_strategy_parent(strategy_id)
     with get_connection() as conn:
         conn.execute("""
             INSERT INTO strategy_scores
@@ -453,6 +535,7 @@ def update_paper_account(balance, total_pnl, total_trades, winning_trades):
 def open_paper_trade(strategy_id, coin, side, entry_price, size, leverage=1,
                      stop_loss=None, take_profit=None, metadata=None):
     now = datetime.now(timezone.utc).isoformat()
+    _ensure_postgres_strategy_parent(strategy_id)
     with get_connection() as conn:
         return _insert_and_get_id(conn, """
             INSERT INTO paper_trades
