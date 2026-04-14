@@ -238,6 +238,15 @@ REQUEST_PRIORITIES = {
     "recentTrades": Priority.NORMAL,
 }
 
+# Request-type cooldowns for endpoints that can fail globally but are safe to
+# skip temporarily because the bot can continue from cached or stored data.
+REQUEST_TYPE_FAILURE_THRESHOLDS = {
+    "candleSnapshot": 2,
+}
+REQUEST_TYPE_COOLDOWNS = {
+    "candleSnapshot": 120.0,
+}
+
 
 # ─── Jittered Backoff ────────────────────────────────────────────
 def jittered_backoff(attempt: int, base: float = 2.0, cap: float = 60.0) -> float:
@@ -639,6 +648,40 @@ class APIManager:
         self._circuit_open_until = 0.0
         self._CIRCUIT_THRESHOLD = 10    # failures in window to trip
         self._CIRCUIT_COOLDOWN = 60.0   # seconds to wait when tripped
+        self._req_type_failures: Dict[str, int] = {}
+        self._req_type_cooldown_until: Dict[str, float] = {}
+
+    def _is_req_type_cooling_down(self, req_type: str, now: float) -> bool:
+        """Return True while a request type is in a temporary cooldown."""
+        if req_type not in self._req_type_cooldown_until:
+            return False
+        cooldown_until = self._req_type_cooldown_until.get(req_type, 0.0)
+        if cooldown_until <= now:
+            self._req_type_cooldown_until.pop(req_type, None)
+            self._req_type_failures.pop(req_type, None)
+            return False
+        return True
+
+    def _record_req_type_result(self, req_type: str, failure_kind: Optional[str]) -> None:
+        """Track request-type failures so noisy upstream outages cool down quickly."""
+        threshold = REQUEST_TYPE_FAILURE_THRESHOLDS.get(req_type)
+        if not threshold:
+            return
+        if failure_kind == "server_error":
+            failures = self._req_type_failures.get(req_type, 0) + 1
+            self._req_type_failures[req_type] = failures
+            if failures >= threshold:
+                cooldown = REQUEST_TYPE_COOLDOWNS.get(req_type, self._CIRCUIT_COOLDOWN)
+                self._req_type_cooldown_until[req_type] = time.monotonic() + cooldown
+                self._req_type_failures[req_type] = 0
+                logger.warning(
+                    "Request-type circuit OPEN for %s after repeated server errors - "
+                    "cooling down for %.0fs",
+                    req_type,
+                    cooldown,
+                )
+        elif failure_kind is None:
+            self._req_type_failures[req_type] = 0
 
     def start_websocket(self, coins: list = None):
         """Start the WebSocket feed for real-time data."""
@@ -707,6 +750,8 @@ class APIManager:
             remaining = round(self._circuit_open_until - now, 1)
             logger.debug(f"Circuit breaker OPEN — skipping {req_type} ({remaining}s remaining)")
             return None
+        if self._is_req_type_cooling_down(req_type, now) and priority > Priority.HIGH:
+            return None
 
         # Acquire token from bucket
         if not self.bucket.acquire(priority=priority, timeout=30):
@@ -719,7 +764,7 @@ class APIManager:
             self._rest_requests += 1
 
         try:
-            result = self._do_request(
+            result, failure_kind = self._do_request(
                 payload,
                 endpoint_url=endpoint_url,
                 req_type=req_type,
@@ -731,6 +776,7 @@ class APIManager:
             with self._lock:
                 self._recent_failures += 1
             raise
+        self._record_req_type_result(req_type, failure_kind)
 
         # Track failures for circuit breaker
         with self._lock:
@@ -762,7 +808,7 @@ class APIManager:
         retries: int = 3,
         timeout: int = 30,
         raise_on_timeout: bool = False,
-    ) -> Optional[Any]:
+    ) -> tuple[Optional[Any], Optional[str]]:
         """
         Execute the HTTP request with classified error handling.
 
@@ -775,6 +821,7 @@ class APIManager:
         - Network errors: retry with backoff — transient
         """
         req_type = req_type or payload.get("type", "unknown")
+        failure_kind: Optional[str] = None
 
         for attempt in range(retries):
             try:
@@ -802,7 +849,7 @@ class APIManager:
                         f"AUTH_ERROR {resp.status_code} type='{req_type}': "
                         f"check API credentials (not retrying)"
                     )
-                    return None
+                    return None, "auth_error"
 
                 # ── 422: Bad payload — NEVER retry ──
                 if resp.status_code == 422:
@@ -810,7 +857,7 @@ class APIManager:
                     logger.warning(
                         f"BAD_PAYLOAD 422 type='{req_type}': {body_preview} (not retrying)"
                     )
-                    return None
+                    return None, "client_error"
 
                 # ── Other 4xx: Client error — don't retry ──
                 if 400 <= resp.status_code < 500:
@@ -819,10 +866,11 @@ class APIManager:
                         f"CLIENT_ERROR {resp.status_code} type='{req_type}': "
                         f"{body_preview} (not retrying)"
                     )
-                    return None
+                    return None, "client_error"
 
                 # ── 5xx: Server error — retry with backoff ──
                 if resp.status_code >= 500:
+                    failure_kind = "server_error"
                     wait = jittered_backoff(attempt, base=3.0, cap=30.0)
                     logger.warning(
                         f"SERVER_ERROR {resp.status_code} type='{req_type}' — "
@@ -833,11 +881,12 @@ class APIManager:
 
                 resp.raise_for_status()
                 self.bucket.report_success()
-                return resp.json()
+                return resp.json(), None
 
             except requests.exceptions.Timeout:
                 if raise_on_timeout:
                     raise
+                failure_kind = "timeout"
                 wait = jittered_backoff(attempt, base=2.0, cap=20.0)
                 logger.warning(
                     f"TIMEOUT type='{req_type}' — retry in {wait:.1f}s "
@@ -846,6 +895,7 @@ class APIManager:
                 time.sleep(wait)
 
             except requests.exceptions.ConnectionError:
+                failure_kind = "connection_error"
                 wait = jittered_backoff(attempt, base=3.0, cap=30.0)
                 logger.warning(
                     f"CONNECTION_ERROR type='{req_type}' — retry in {wait:.1f}s "
@@ -854,6 +904,7 @@ class APIManager:
                 time.sleep(wait)
 
             except requests.exceptions.RequestException as e:
+                failure_kind = "request_error"
                 logger.warning(
                     f"REQUEST_ERROR type='{req_type}' "
                     f"(attempt {attempt+1}/{retries}): {e}"
@@ -862,7 +913,7 @@ class APIManager:
                     wait = jittered_backoff(attempt)
                     time.sleep(wait)
 
-        return None
+        return None, failure_kind
 
     def _cache_key(self, endpoint_url: str, payload: dict) -> str:
         """Generate a deterministic cache key from a payload."""
@@ -886,6 +937,11 @@ class APIManager:
                     "recent_failures": self._recent_failures,
                     "threshold": self._CIRCUIT_THRESHOLD,
                     "cooldown_remaining_s": max(0, round(self._circuit_open_until - now, 1)),
+                },
+                "request_type_cooldowns": {
+                    req_type: max(0, round(until - now, 1))
+                    for req_type, until in self._req_type_cooldown_until.items()
+                    if until > now
                 },
                 "bucket": self.bucket.get_stats(),
                 "cache": self.cache.get_stats(),
