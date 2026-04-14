@@ -2462,8 +2462,12 @@ def test_place_market_order_uses_wire_format_price_and_size(monkeypatch):
 
     result = trader.place_market_order("HYPE", "sell", 0.33580053448251734)
     assert result.get("status") == "ok"
-    assert len(captured_actions) == 1
-    order = captured_actions[0]["orders"][0]
+    assert len(captured_actions) == 2
+    assert captured_actions[0]["type"] == "updateLeverage"
+    assert captured_actions[0]["asset"] == 42
+    assert captured_actions[0]["isCross"] is True
+    assert captured_actions[0]["leverage"] == 1
+    order = captured_actions[1]["orders"][0]
     # Price must be canonical (5 sig figs, no trailing zeros).  Mid 33.95015
     # with 5% sell slippage = 32.2526425, rounds to 32.253 at 5 sig figs.
     assert order["p"] == "32.253", f"expected canonical price, got {order['p']!r}"
@@ -2514,6 +2518,37 @@ def test_place_market_order_reports_submitted_and_exchange_fill_size(monkeypatch
     assert result["submitted_notional"] <= 12.0
     assert result["exchange_reported_fill_size"] == 1.0
     assert result["wire_size"] == "371"
+
+
+def test_place_market_order_rejects_when_leverage_update_fails(monkeypatch):
+    class FakeFirewall:
+        def validate(self, signal, **kwargs):
+            return True, "ok"
+
+    captured_actions = []
+
+    def fake_post(self, action, dry_run_override=None):
+        captured_actions.append(action)
+        if action.get("type") == "updateLeverage":
+            return {"status": "error", "message": "boom"}
+        return {"status": "ok"}
+
+    monkeypatch.setattr(LiveTrader, "_load_credentials", _fake_live_credentials)
+    monkeypatch.setattr(LiveTrader, "_load_asset_index_map", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "reconcile_positions", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "_get_mid_price", lambda self, coin: 100.0)
+    monkeypatch.setattr(LiveTrader, "_post_order", fake_post)
+
+    trader = LiveTrader(firewall=FakeFirewall(), dry_run=False, max_order_usd=20.0)
+    trader.asset_index_map = {"BTC": 0}
+    trader.sz_decimals_map = {"BTC": 5}
+
+    result = trader.place_market_order("BTC", "buy", 0.12, leverage=3)
+
+    assert result["status"] == "rejected"
+    assert result["reason"] == "leverage_update_failed"
+    assert len(captured_actions) == 1
+    assert captured_actions[0]["type"] == "updateLeverage"
 
 
 def test_post_order_promotes_inner_error_to_rejection(monkeypatch):

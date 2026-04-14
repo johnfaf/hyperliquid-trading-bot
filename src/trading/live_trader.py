@@ -27,6 +27,7 @@ import time
 import json
 import hashlib
 import copy
+import math
 import random
 import threading
 from collections import defaultdict
@@ -507,6 +508,11 @@ class LiveTrader:
         self._HASH_CLEANUP_INTERVAL = 60.0  # periodic cleanup every 60s
         self._nonce_lock = threading.Lock()
         self._last_nonce = 0
+        self._exchange_leverage_cache: Dict[str, int] = {}
+        self._exchange_margin_mode_cache: Dict[str, bool] = {}
+        self._default_leverage_is_cross = os.environ.get(
+            "LIVE_LEVERAGE_IS_CROSS", "true"
+        ).strip().lower() in {"1", "true", "yes"}
 
         # Price sanity state (instance-level; class-level cache leaks across traders).
         self._price_history: Dict[str, float] = {}  # coin -> last known good mid
@@ -1022,8 +1028,20 @@ class LiveTrader:
         )
         if leverage <= 0:
             leverage = 1.0
+        leverage_info = pos_info.get("leverage", {})
+        is_cross = bool(getattr(self, "_default_leverage_is_cross", True))
+        if isinstance(leverage_info, dict):
+            leverage_type = str(leverage_info.get("type", "cross")).strip().lower()
+            if leverage_type:
+                is_cross = leverage_type != "isolated"
+        coin = str(pos_info.get("coin", "") or "")
+        leverage_cache = getattr(self, "_exchange_leverage_cache", None)
+        margin_mode_cache = getattr(self, "_exchange_margin_mode_cache", None)
+        if coin and isinstance(leverage_cache, dict) and isinstance(margin_mode_cache, dict):
+            leverage_cache[coin] = max(1, int(math.floor(leverage + 0.5)))
+            margin_mode_cache[coin] = bool(is_cross)
         return {
-            "coin": pos_info.get("coin", ""),
+            "coin": coin,
             "size": abs(size),
             "szi": size,
             "side": "long" if size > 0 else "short",
@@ -1032,6 +1050,7 @@ class LiveTrader:
             "unrealized_pnl": unrealized,
             "unrealizedPnl": unrealized,
             "leverage": leverage,
+            "is_cross": is_cross,
             "raw": pos,
         }
 
@@ -2031,6 +2050,89 @@ class LiveTrader:
             logger.error(f"Error posting order: {e}")
             return {"status": "error", "message": str(e)}
 
+    @staticmethod
+    def _coerce_exchange_leverage(leverage: float) -> int:
+        """Hyperliquid updateLeverage requires an integer leverage value."""
+        try:
+            leverage_value = float(leverage)
+        except (TypeError, ValueError):
+            leverage_value = 1.0
+        if not math.isfinite(leverage_value) or leverage_value <= 0:
+            leverage_value = 1.0
+        return max(1, int(math.floor(leverage_value + 0.5)))
+
+    def ensure_exchange_leverage(
+        self,
+        coin: str,
+        leverage: float,
+        *,
+        is_cross: Optional[bool] = None,
+    ) -> Dict[str, Any]:
+        """Ensure new entries use the leverage we sized against locally."""
+        target_leverage = self._coerce_exchange_leverage(leverage)
+        margin_is_cross = self._default_leverage_is_cross if is_cross is None else bool(is_cross)
+        cached_leverage = self._exchange_leverage_cache.get(coin)
+        cached_margin_mode = self._exchange_margin_mode_cache.get(coin)
+        if cached_leverage == target_leverage and (
+            cached_margin_mode is None or cached_margin_mode == margin_is_cross
+        ):
+            return {
+                "status": "success",
+                "cached": True,
+                "leverage": target_leverage,
+                "isCross": margin_is_cross,
+            }
+
+        asset_idx = self._get_asset_index(coin)
+        if asset_idx is None:
+            return {"status": "error", "message": f"Unknown coin: {coin}"}
+
+        if self.dry_run:
+            self._exchange_leverage_cache[coin] = target_leverage
+            self._exchange_margin_mode_cache[coin] = margin_is_cross
+            return {
+                "status": "simulated",
+                "leverage": target_leverage,
+                "isCross": margin_is_cross,
+            }
+
+        action = {
+            "type": "updateLeverage",
+            "asset": asset_idx,
+            "isCross": margin_is_cross,
+            "leverage": target_leverage,
+        }
+        logger.info(
+            "Setting %s leverage to %sx (%s)",
+            coin,
+            target_leverage,
+            "cross" if margin_is_cross else "isolated",
+        )
+        result = self._post_order(action)
+        if self._is_order_result_success(result):
+            self._exchange_leverage_cache[coin] = target_leverage
+            self._exchange_margin_mode_cache[coin] = margin_is_cross
+            return {
+                "status": "success",
+                "leverage": target_leverage,
+                "isCross": margin_is_cross,
+                "raw_result": result,
+            }
+        logger.error(
+            "Failed to set leverage for %s to %sx (%s): %s",
+            coin,
+            target_leverage,
+            "cross" if margin_is_cross else "isolated",
+            result,
+        )
+        return {
+            "status": "error",
+            "message": "leverage_update_failed",
+            "leverage": target_leverage,
+            "isCross": margin_is_cross,
+            "raw_result": result,
+        }
+
     def place_market_order(self, coin: str, side: str, size: float,
                            leverage: float = 1, reduce_only: bool = False) -> Dict:
         """
@@ -2155,6 +2257,17 @@ class LiveTrader:
                         "notional": round(notional, 4),
                         "min_notional": self.min_order_usd,
                     }
+
+            leverage_result = self.ensure_exchange_leverage(coin, leverage)
+            if leverage_result.get("status") not in {"success", "simulated"}:
+                self._entry_metrics["rejected_exchange"] += 1
+                return {
+                    "status": "rejected",
+                    "reason": "leverage_update_failed",
+                    "coin": coin,
+                    "leverage": self._coerce_exchange_leverage(leverage),
+                    "leverage_result": leverage_result,
+                }
 
         # Format price and size for Hyperliquid's strict wire protocol
         # (5 sig figs, (6 - szDecimals) decimals for perps, no trailing
@@ -2375,6 +2488,16 @@ class LiveTrader:
                     "reason": "below_exchange_minimum_notional",
                     "notional": round(notional, 4),
                     "min_notional": self.min_order_usd,
+                }
+
+            leverage_result = self.ensure_exchange_leverage(coin, leverage)
+            if leverage_result.get("status") not in {"success", "simulated"}:
+                return {
+                    "status": "rejected",
+                    "reason": "leverage_update_failed",
+                    "coin": coin,
+                    "leverage": self._coerce_exchange_leverage(leverage),
+                    "leverage_result": leverage_result,
                 }
 
         # Format for Hyperliquid wire protocol — see place_market_order
