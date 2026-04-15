@@ -259,20 +259,15 @@ def _get_dynamic_sizing(container, strategy_key: str, account_balance: float,
 
 
 def _train_rl_sizer_if_due(container):
+    """Fire-and-forget: RLPositionSizer.train() is non-blocking; it
+    spawns a daemon thread and logs completion from inside the thread."""
     rl_sizer = getattr(container, "rl_sizer", None)
     if not rl_sizer:
         return
     try:
-        metrics = rl_sizer.train()
-        if metrics:
-            logger.info(
-                "  RL sizer trained: reward=%.4f, trades=%d, epsilon=%.3f",
-                metrics.get("mean_reward", 0.0),
-                metrics.get("trade_returns_used", 0),
-                metrics.get("epsilon", 0.0),
-            )
+        rl_sizer.train()
     except Exception as exc:
-        logger.warning("  RL sizer training error: %s", exc)
+        logger.warning("  RL sizer training kickoff error: %s", exc)
 
 
 def _execute_signal_live(container, trade_signal, source_label: str, bypass_firewall: bool = True):

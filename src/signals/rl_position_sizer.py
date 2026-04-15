@@ -28,6 +28,7 @@ Requirements:
 """
 import logging
 import os
+import threading
 import time
 import numpy as np
 from typing import Dict, List, Optional, Tuple
@@ -339,6 +340,9 @@ class RLPositionSizer:
         self._initialized = False
         self._total_adjustments = 0
         self._fallback_count = 0
+        # Training runs in a daemon thread so the trading cycle is never
+        # blocked by the ~25k tensor ops per training run.
+        self._training_thread: Optional[threading.Thread] = None
 
         if _ensure_torch():
             self._dqn = DQNetwork()
@@ -412,81 +416,109 @@ class RLPositionSizer:
 
     def train(self, trade_returns: Optional[np.ndarray] = None) -> Optional[Dict]:
         """
-        Train the RL sizer on historical trade returns.
+        Kick off RL sizer training in a background thread.
+
+        Returns None immediately (never blocks the trading cycle). The
+        daemon thread logs its own completion metrics. If a training run
+        is already in flight, this is a no-op.
 
         Args:
-            trade_returns: Array of per-trade return fractions.
-                          If None, attempts to extract from Kelly's internal data.
-
-        Returns:
-            Training metrics or None if skipped.
+            trade_returns: Array of per-trade return fractions. If None,
+                the background thread will extract from Kelly's internal
+                data at the time it runs.
         """
         if self._dqn is None:
             return None
 
+        # Interval gate — avoid re-training too often even if called frequently.
         now = time.time()
         if self._initialized and (now - self._last_train_time) < self.retrain_interval:
             return None
 
-        # Extract returns from Kelly's data if not provided
-        if trade_returns is None:
-            all_returns = []
-            for outcomes in self.kelly._strategy_outcomes.values():
-                all_returns.extend([o["return_pct"] for o in outcomes])
-            if len(all_returns) < self.min_training_trades:
-                logger.info("RLSizer: not enough trade data (%d < %d)",
-                           len(all_returns), self.min_training_trades)
-                return None
-            trade_returns = np.array(all_returns, dtype=np.float32)
+        # Re-entrancy guard: if a previous training thread is still running,
+        # skip. retrain_interval+alive-check together cap concurrency at 1.
+        if self._training_thread is not None and self._training_thread.is_alive():
+            return None
 
-        logger.info("RLSizer: training on %d trade returns, %d episodes...",
-                    len(trade_returns), self.training_episodes)
-
-        env = SizingEnvironment(trade_returns, self.episode_length)
-        total_rewards = []
-        losses = []
-
-        for ep in range(self.training_episodes):
-            state = env.reset()
-            ep_reward = 0
-
-            for _ in range(env.episode_length):
-                action = self._dqn.select_action(state, explore=True)
-                next_state, reward, done = env.step(action)
-
-                self._dqn.store_transition(state, action, reward, next_state, float(done))
-                loss = self._dqn.train_step()
-                if loss is not None:
-                    losses.append(loss)
-
-                state = next_state
-                ep_reward += reward
-
-                if done:
-                    break
-
-            total_rewards.append(ep_reward)
-
-        self._dqn._trained = True
-        self._initialized = True
+        # Mark the start time now so rapid back-to-back calls don't all spawn
+        # threads before the first one updates _last_train_time on completion.
         self._last_train_time = now
 
-        # Save model
-        model_path = os.path.join(self.model_dir, "rl_sizer.pt")
-        self._dqn.save(model_path)
+        self._training_thread = threading.Thread(
+            target=self._train_blocking,
+            args=(trade_returns,),
+            daemon=True,
+            name="RLSizer-train",
+        )
+        self._training_thread.start()
+        return None
 
-        metrics = {
-            "episodes": self.training_episodes,
-            "mean_reward": float(np.mean(total_rewards[-50:])),
-            "mean_loss": float(np.mean(losses[-100:])) if losses else 0,
-            "epsilon": self._dqn.epsilon,
-            "trade_returns_used": len(trade_returns),
-        }
-        self._train_metrics = metrics
+    def _train_blocking(self, trade_returns: Optional[np.ndarray]) -> None:
+        """Synchronous training body — runs inside the daemon thread."""
+        try:
+            # Extract returns from Kelly's data if not provided
+            if trade_returns is None:
+                all_returns = []
+                for outcomes in self.kelly._strategy_outcomes.values():
+                    all_returns.extend([o["return_pct"] for o in outcomes])
+                if len(all_returns) < self.min_training_trades:
+                    logger.info(
+                        "RLSizer: not enough trade data (%d < %d), training skipped",
+                        len(all_returns), self.min_training_trades,
+                    )
+                    return
+                trade_returns = np.array(all_returns, dtype=np.float32)
 
-        logger.info("RLSizer trained: mean_reward=%.4f, epsilon=%.3f, trades=%d",
-                    metrics["mean_reward"], metrics["epsilon"], len(trade_returns))
-        return metrics
+            logger.info("RLSizer: training on %d trade returns, %d episodes (background)...",
+                        len(trade_returns), self.training_episodes)
+
+            env = SizingEnvironment(trade_returns, self.episode_length)
+            total_rewards = []
+            losses = []
+
+            for ep in range(self.training_episodes):
+                state = env.reset()
+                ep_reward = 0
+
+                for _ in range(env.episode_length):
+                    action = self._dqn.select_action(state, explore=True)
+                    next_state, reward, done = env.step(action)
+
+                    self._dqn.store_transition(state, action, reward, next_state, float(done))
+                    loss = self._dqn.train_step()
+                    if loss is not None:
+                        losses.append(loss)
+
+                    state = next_state
+                    ep_reward += reward
+
+                    if done:
+                        break
+
+                total_rewards.append(ep_reward)
+
+            self._dqn._trained = True
+            self._initialized = True
+
+            # Save model
+            model_path = os.path.join(self.model_dir, "rl_sizer.pt")
+            self._dqn.save(model_path)
+
+            metrics = {
+                "episodes": self.training_episodes,
+                "mean_reward": float(np.mean(total_rewards[-50:])),
+                "mean_loss": float(np.mean(losses[-100:])) if losses else 0,
+                "epsilon": self._dqn.epsilon,
+                "trade_returns_used": len(trade_returns),
+            }
+            self._train_metrics = metrics
+
+            logger.info(
+                "RLSizer trained: mean_reward=%.4f, epsilon=%.3f, trades=%d",
+                metrics["mean_reward"], metrics["epsilon"], len(trade_returns),
+            )
+        except Exception as exc:  # noqa: BLE001 — background thread must never escape
+            logger.warning("RLSizer background training failed: %s", exc)
 
     def get_stats(self) -> Dict:
         return {

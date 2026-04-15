@@ -561,7 +561,7 @@ def send_subsystem_failure_alert(subsystem_name: str, reason: str) -> bool:
         return False
 
     try:
-        ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
         text = (
             f"<b>SUBSYSTEM FAILED</b>\n"
             f"<b>Component:</b> {subsystem_name}\n"

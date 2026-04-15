@@ -20,6 +20,7 @@ Requirements:
 """
 import logging
 import os
+import threading
 import time
 import numpy as np
 from typing import Dict, List, Optional, Tuple
@@ -391,6 +392,9 @@ class LSTMAgent:
         self._last_train_time: float = 0
         self._train_metrics: Dict = {}
         self._initialized = False
+        # Training runs in a daemon thread so the trading cycle is never
+        # blocked by the LSTM epoch loop.
+        self._training_thread: Optional[threading.Thread] = None
 
         # Try to load existing model
         if _ensure_torch():
@@ -410,48 +414,69 @@ class LSTMAgent:
 
     def train(self, candles: List[Dict]) -> Optional[Dict]:
         """
-        Train or retrain the LSTM on candle data.
+        Kick off LSTM training in a background thread.
+
+        Returns None immediately (never blocks the trading cycle). The
+        daemon thread logs its own completion metrics. If a training run
+        is already in flight, this is a no-op.
 
         Args:
             candles: Historical OHLCV candles (chronological order)
-
-        Returns:
-            Training metrics or None if training skipped/failed
         """
         if self._model is None:
             return None
 
         if len(candles) < self.min_training_samples + self.sequence_length:
-            logger.info("LSTMAgent: not enough candles (%d < %d), skipping training",
-                       len(candles), self.min_training_samples + self.sequence_length)
+            logger.debug(
+                "LSTMAgent: not enough candles (%d < %d), skipping training",
+                len(candles), self.min_training_samples + self.sequence_length,
+            )
             return None
 
-        # Check retrain interval
+        # Interval gate
         now = time.time()
         if self._initialized and (now - self._last_train_time) < self.retrain_interval:
             return None
 
-        logger.info("LSTMAgent: training on %d candles...", len(candles))
-
-        features = extract_features_from_candles(candles)
-        labels = label_direction(candles, self.lookahead, self.direction_threshold)
-        X, y = create_sequences(features, labels, self.sequence_length)
-
-        if len(X) < self.min_training_samples:
-            logger.info("LSTMAgent: not enough valid sequences (%d)", len(X))
+        # Re-entrancy guard
+        if self._training_thread is not None and self._training_thread.is_alive():
             return None
 
-        metrics = self._model.train_model(X, y)
-        self._train_metrics = metrics
+        # Mark start time to prevent rapid back-to-back kickoffs
         self._last_train_time = now
-        self._initialized = True
 
-        # Save model
-        model_path = os.path.join(self.model_dir, "lstm_direction.pt")
-        self._model.save(model_path)
-        logger.info("LSTMAgent: model saved to %s", model_path)
+        self._training_thread = threading.Thread(
+            target=self._train_blocking,
+            args=(list(candles),),  # snapshot so caller can mutate safely
+            daemon=True,
+            name="LSTMAgent-train",
+        )
+        self._training_thread.start()
+        return None
 
-        return metrics
+    def _train_blocking(self, candles: List[Dict]) -> None:
+        """Synchronous training body — runs inside the daemon thread."""
+        try:
+            logger.info("LSTMAgent: training on %d candles (background)...", len(candles))
+
+            features = extract_features_from_candles(candles)
+            labels = label_direction(candles, self.lookahead, self.direction_threshold)
+            X, y = create_sequences(features, labels, self.sequence_length)
+
+            if len(X) < self.min_training_samples:
+                logger.info("LSTMAgent: not enough valid sequences (%d)", len(X))
+                return
+
+            metrics = self._model.train_model(X, y)
+            self._train_metrics = metrics
+            self._initialized = True
+
+            # Save model
+            model_path = os.path.join(self.model_dir, "lstm_direction.pt")
+            self._model.save(model_path)
+            logger.info("LSTMAgent: model saved to %s", model_path)
+        except Exception as exc:  # noqa: BLE001 — background thread must never escape
+            logger.warning("LSTMAgent background training failed: %s", exc)
 
     def generate_signal(self, candles: List[Dict]) -> Optional[Dict]:
         """
