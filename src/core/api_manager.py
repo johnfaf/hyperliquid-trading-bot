@@ -651,6 +651,10 @@ class APIManager:
         self._CIRCUIT_COOLDOWN = 60.0   # seconds to wait when tripped
         self._req_type_failures: Dict[str, int] = {}
         self._req_type_cooldown_until: Dict[str, float] = {}
+        # Track when we last logged a SERVER_ERROR warning per req_type so we
+        # can coalesce repeated failures instead of spamming the log.
+        self._req_type_last_warn_at: Dict[str, float] = {}
+        self._req_type_suppressed_warns: Dict[str, int] = {}
 
     def _is_req_type_cooling_down(self, req_type: str, now: float) -> bool:
         """Return True while a request type is in a temporary cooldown."""
@@ -675,14 +679,22 @@ class APIManager:
                 cooldown = REQUEST_TYPE_COOLDOWNS.get(req_type, self._CIRCUIT_COOLDOWN)
                 self._req_type_cooldown_until[req_type] = time.monotonic() + cooldown
                 self._req_type_failures[req_type] = 0
+                suppressed = self._req_type_suppressed_warns.pop(req_type, 0)
+                self._req_type_last_warn_at.pop(req_type, None)
                 logger.warning(
-                    "Request-type circuit OPEN for %s after repeated server errors - "
-                    "cooling down for %.0fs",
+                    "Request-type circuit OPEN for %s after %d server errors "
+                    "(%d warnings suppressed) - cooling down for %.0fs",
                     req_type,
+                    threshold,
+                    suppressed,
                     cooldown,
                 )
         elif failure_kind is None:
             self._req_type_failures[req_type] = 0
+            # Clear suppression state on successful call so the next outage
+            # gets its own fresh warning at the head of the window.
+            self._req_type_last_warn_at.pop(req_type, None)
+            self._req_type_suppressed_warns.pop(req_type, None)
 
     def start_websocket(self, coins: list = None):
         """Start the WebSocket feed for real-time data."""
@@ -873,11 +885,29 @@ class APIManager:
                 if resp.status_code >= 500:
                     failure_kind = "server_error"
                     if req_type in REQUEST_TYPE_FAIL_FAST_ON_SERVER_ERROR:
-                        logger.warning(
-                            "SERVER_ERROR %s type='%s' - fail-fast cooldown trigger",
-                            resp.status_code,
-                            req_type,
-                        )
+                        # Coalesce noisy repeats: only warn once per ~60s window
+                        # per req_type. Intermediate failures are counted and
+                        # rolled into the cooldown-open summary.
+                        now_m = time.monotonic()
+                        last_warn = self._req_type_last_warn_at.get(req_type, 0.0)
+                        if now_m - last_warn >= 60.0:
+                            logger.warning(
+                                "SERVER_ERROR %s type='%s' - fail-fast cooldown trigger",
+                                resp.status_code,
+                                req_type,
+                            )
+                            self._req_type_last_warn_at[req_type] = now_m
+                            self._req_type_suppressed_warns[req_type] = 0
+                        else:
+                            self._req_type_suppressed_warns[req_type] = (
+                                self._req_type_suppressed_warns.get(req_type, 0) + 1
+                            )
+                            logger.debug(
+                                "SERVER_ERROR %s type='%s' (suppressed, %d within window)",
+                                resp.status_code,
+                                req_type,
+                                self._req_type_suppressed_warns[req_type],
+                            )
                         return None, failure_kind
                     wait = jittered_backoff(attempt, base=3.0, cap=30.0)
                     logger.warning(

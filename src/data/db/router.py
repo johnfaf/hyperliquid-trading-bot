@@ -202,6 +202,58 @@ def is_dualwrite_active() -> bool:
     return config.DB_BACKEND == "dualwrite"
 
 
+def _quiet_postgres_server_logs() -> None:
+    """Silence noisy routine Postgres log output.
+
+    Railway's log ingestion tags anything Postgres writes to stderr as
+    'error' severity, so routine LOG-level messages (checkpoints every
+    5 minutes, every connection open/close) flood the Railway logs UI
+    as fake errors. Turning these off cuts noise without losing any
+    information that matters for debugging.
+
+    Wrapped in try/except: if the connecting role lacks privileges to
+    run ALTER SYSTEM (non-superuser), we silently skip. Only runs once
+    per process — check the flag below.
+    """
+    try:
+        from src.data.db.postgres import get_connection as get_pg_connection
+        from src.data.db.postgres import return_connection as return_pg_connection
+    except Exception:
+        return
+
+    conn = None
+    try:
+        conn = get_pg_connection()
+        with conn.cursor() as cur:
+            # Each is safe to run on every boot; ALTER SYSTEM is idempotent.
+            for stmt in (
+                "ALTER SYSTEM SET log_checkpoints = off",
+                "ALTER SYSTEM SET log_connections = off",
+                "ALTER SYSTEM SET log_disconnections = off",
+            ):
+                try:
+                    cur.execute(stmt)
+                except Exception as exc:
+                    # Permissions issue or unsupported option — not fatal.
+                    logger.debug("Postgres quiet-log skip: %s (%s)", stmt, exc)
+            try:
+                cur.execute("SELECT pg_reload_conf()")
+            except Exception as exc:
+                logger.debug("Postgres pg_reload_conf skip: %s", exc)
+        conn.commit()
+        logger.info("Postgres routine-log chatter silenced (checkpoints/connections)")
+    except Exception as exc:
+        # Typically "permission denied" on managed Postgres without super.
+        # Harmless — the logs stay noisy but nothing is broken.
+        logger.debug("Could not quiet Postgres server logs: %s", exc)
+    finally:
+        if conn is not None:
+            try:
+                return_pg_connection(conn)
+            except Exception:
+                pass
+
+
 def init_postgres_schema() -> None:
     """Run pending Postgres migrations if Postgres is in use."""
     if config.DB_BACKEND in ("postgres", "dualwrite"):
@@ -230,3 +282,7 @@ def init_postgres_schema() -> None:
                 return
         else:
             run_migrations()
+
+        # After migrations succeed, silence routine Postgres log chatter so
+        # Railway's log UI isn't flooded with checkpoint/connection noise.
+        _quiet_postgres_server_logs()
