@@ -167,9 +167,10 @@ def get_stats() -> Dict:
     """Get golden bridge stats for dashboard/logging."""
     try:
         with _get_db() as conn:
-            total = conn.execute("SELECT COUNT(*) FROM golden_wallets").fetchone()[0]
-            golden = conn.execute("SELECT COUNT(*) FROM golden_wallets WHERE is_golden = 1").fetchone()[0]
-            live = conn.execute("SELECT COUNT(*) FROM golden_wallets WHERE connected_to_live = 1").fetchone()[0]
+            # Named aliases so psycopg dict_row and sqlite3.Row both work.
+            total = conn.execute("SELECT COUNT(*) AS c FROM golden_wallets").fetchone()["c"]
+            golden = conn.execute("SELECT COUNT(*) AS c FROM golden_wallets WHERE is_golden = 1").fetchone()["c"]
+            live = conn.execute("SELECT COUNT(*) AS c FROM golden_wallets WHERE connected_to_live = 1").fetchone()["c"]
             return {
                 "total_evaluated": total,
                 "golden_wallets": golden,

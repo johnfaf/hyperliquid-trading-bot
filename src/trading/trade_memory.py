@@ -179,8 +179,10 @@ class TradeMemory:
     def _update_cache_count(self):
         try:
             with db.get_connection(for_read=True) as conn:
-                row = conn.execute("SELECT COUNT(*) FROM trade_memory").fetchone()
-            self._cache_count = row[0] if row else 0
+                row = conn.execute("SELECT COUNT(*) AS c FROM trade_memory").fetchone()
+            # psycopg dict_row returns a dict (no integer indexing);
+            # sqlite3.Row supports both. Use the named alias for parity.
+            self._cache_count = (row["c"] if row else 0) or 0
         except Exception:
             self._cache_count = 0
 
@@ -377,10 +379,11 @@ class TradeMemory:
         """Get memory statistics."""
         try:
             with db.get_connection(for_read=True) as conn:
-                total = conn.execute("SELECT COUNT(*) FROM trade_memory").fetchone()[0]
-                wins = conn.execute("SELECT COUNT(*) FROM trade_memory WHERE win = 1").fetchone()[0]
-                coins = conn.execute("SELECT COUNT(DISTINCT coin) FROM trade_memory").fetchone()[0]
-                strategies = conn.execute("SELECT COUNT(DISTINCT strategy_type) FROM trade_memory").fetchone()[0]
+                # Named aliases so psycopg dict_row and sqlite3.Row both work.
+                total = conn.execute("SELECT COUNT(*) AS c FROM trade_memory").fetchone()["c"]
+                wins = conn.execute("SELECT COUNT(*) AS c FROM trade_memory WHERE win = 1").fetchone()["c"]
+                coins = conn.execute("SELECT COUNT(DISTINCT coin) AS c FROM trade_memory").fetchone()["c"]
+                strategies = conn.execute("SELECT COUNT(DISTINCT strategy_type) AS c FROM trade_memory").fetchone()["c"]
             return {
                 "total_trades": total,
                 "win_rate": wins / total if total > 0 else 0,
