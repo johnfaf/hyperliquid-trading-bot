@@ -173,6 +173,26 @@ class ShadowTracker:
                 size = trade_dict.get("size", 1)
                 pnl_pct = (pnl / (entry * size)) * 100 if entry != 0 else 0
 
+            # Normalize timestamps. Postgres TIMESTAMPTZ rejects "" — callers sometimes
+            # pass empty-string defaults when the source dict lacks opened_at/closed_at,
+            # so we coerce empty/whitespace/None → sensible default (now for entry_ts,
+            # None for exit_ts since exit_ts is nullable in schema).
+            def _clean_ts(raw, default=None):
+                if raw is None:
+                    return default
+                if isinstance(raw, str) and not raw.strip():
+                    return default
+                return raw
+
+            now_iso = datetime.now(timezone.utc).isoformat()
+            entry_ts = _clean_ts(trade_dict.get("entry_ts"), default=now_iso)
+            exit_ts = _clean_ts(trade_dict.get("exit_ts"), default=None)
+
+            # Regime is a free-form text column; empty string is fine but None is cleaner.
+            regime = trade_dict.get("regime_at_entry")
+            if isinstance(regime, str) and not regime.strip():
+                regime = None
+
             with self._get_connection() as conn:
                 conn.execute("""
                     INSERT INTO shadow_trades
@@ -188,9 +208,9 @@ class ShadowTracker:
                     trade_dict["size"],
                     pnl or 0,
                     pnl_pct or 0,
-                    trade_dict.get("entry_ts", datetime.now(timezone.utc).isoformat()),
-                    trade_dict.get("exit_ts", datetime.now(timezone.utc).isoformat()),
-                    trade_dict.get("regime_at_entry"),
+                    entry_ts,
+                    exit_ts,
+                    regime,
                     trade_dict.get("confidence", 1.0),
                     json.dumps(trade_dict.get("metadata", {}))
                 ))

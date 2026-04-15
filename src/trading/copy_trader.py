@@ -971,11 +971,11 @@ class CopyTrader:
                         "entry_price": trade["entry_price"],
                         "exit_price": exit_price,
                         "size": trade["size"],
-                        "entry_ts": trade.get("opened_at", ""),
+                        "entry_ts": trade.get("opened_at") or None,
                         "exit_ts": datetime.now(timezone.utc).isoformat(),
                         "pnl": pnl,
                         "pnl_pct": return_pct * 100,
-                        "regime_at_entry": meta.get("regime", ""),
+                        "regime_at_entry": meta.get("regime") or None,
                         "confidence": meta.get("confidence", 0),
                         "metadata": {
                             "source_trader": meta.get("source_trader", ""),

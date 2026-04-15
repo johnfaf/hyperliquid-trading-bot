@@ -188,9 +188,9 @@ def _record_shadow_trade(container, closed_trade, pnl, return_pct, entry):
             "size": closed_trade.get("size", 0),
             "pnl": pnl,
             "pnl_pct": return_pct * 100,
-            "entry_ts": closed_trade.get("entry_ts", ""),
-            "exit_ts": closed_trade.get("exit_ts", ""),
-            "regime_at_entry": closed_trade.get("regime", ""),
+            "entry_ts": closed_trade.get("entry_ts") or None,
+            "exit_ts": closed_trade.get("exit_ts") or None,
+            "regime_at_entry": closed_trade.get("regime") or None,
             "confidence": float(meta.get("confidence", 0.5)),
         })
     except Exception as exc:

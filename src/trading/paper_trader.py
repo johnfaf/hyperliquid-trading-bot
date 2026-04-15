@@ -1416,11 +1416,11 @@ class PaperTrader:
                         "entry_price": trade["entry_price"],
                         "exit_price": slipped_exit,
                         "size": trade["size"],
-                        "entry_ts": trade.get("opened_at", ""),
+                        "entry_ts": trade.get("opened_at") or None,
                         "exit_ts": datetime.now(timezone.utc).isoformat(),
                         "pnl": pnl,
                         "pnl_pct": return_pct * 100,
-                        "regime_at_entry": trade_meta.get("regime", ""),
+                        "regime_at_entry": trade_meta.get("regime") or None,
                         "confidence": trade_meta.get("confidence", 0),
                         "metadata": {
                             "strategy_type": strategy_type,
