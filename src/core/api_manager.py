@@ -887,7 +887,7 @@ class APIManager:
                 # We categorize this as a client error to avoid tripping the fail-fast
                 # server-error circuit breaker.
                 if resp.status_code == 500 and resp.text and resp.text.strip() == "null":
-                    logger.warning(
+                    logger.debug(
                         f"CLIENT_ERROR {resp.status_code} (null payload) type='{req_type}': "
                         f"treated as invalid parameters/coin (not retrying)"
                     )
