@@ -612,6 +612,18 @@ class DecisionFirewall:
             size_mod = guidance.get("size_modifier", 1.0)
             signal.regime_size_modifier = size_mod
 
+            # Apply macro regime confidence drag (protective overlay)
+            macro_conf_drag = float(regime_data.get("macro_confidence_drag", 0.0) or 0.0)
+            if macro_conf_drag < 0 and signal.confidence > 0:
+                signal.confidence = max(0.05, signal.confidence + macro_conf_drag)
+
+            # Block new entries if macro regime says so
+            if regime_data.get("macro_block_new_entries"):
+                macro_reasons = regime_data.get("macro_reasons", [])
+                reason_str = macro_reasons[0] if macro_reasons else "extreme macro risk"
+                return _reject("rejected_macro_regime",
+                              f"Macro regime blocks new entries: {reason_str}")
+
         # 9. Source accuracy check (if we have history)
         if self.min_source_accuracy > 0 and signal.source_accuracy > 0:
             if signal.source_accuracy < self.min_source_accuracy:

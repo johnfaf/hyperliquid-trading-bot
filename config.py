@@ -110,6 +110,12 @@ RISK_POLICY_SOURCE_PROFILES_JSON = os.environ.get(
     "",
 ).strip()
 
+# ─── Macro Regime Overlay ────────────────────────────────────────
+# Protective regime that scrapes external macro sources and adjusts risk posture
+MACRO_REGIME_ENABLED = os.environ.get("MACRO_REGIME_ENABLED", "true").lower() in ("true", "1", "yes")
+MACRO_REGIME_REFRESH_SECONDS = int(os.environ.get("MACRO_REGIME_REFRESH_SECONDS", 900))
+MACRO_REGIME_BLOCK_AT_LEVEL = os.environ.get("MACRO_REGIME_BLOCK_AT_LEVEL", "extreme").strip()
+
 # ─── Trader Discovery ─────────────────────────────────────────
 # Minimum PnL (USD) to consider a trader "top"
 # Set low initially so seed addresses get picked up; raise once the bot is mature
@@ -675,6 +681,7 @@ def _validate_config_bounds() -> None:
         ("READINESS_ALERT_COOLDOWN_S", 30, 86_400, 900),
         ("RUNTIME_CONFIG_POLL_SECONDS", 1, 3_600, 10),
         ("VAULT_KV_VERSION", 1, 2, 2),
+        ("MACRO_REGIME_REFRESH_SECONDS", 60, 86_400, 900),
     ]
     for name, min_value, max_value, fallback in rules:
         _validate_numeric_bounds(name, min_value, max_value, fallback)

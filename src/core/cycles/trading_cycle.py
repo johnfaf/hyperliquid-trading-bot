@@ -144,6 +144,71 @@ def _reconcile_regimes(regime_data: dict, container) -> dict:
     return regime_data
 
 
+def _apply_macro_regime_overlay(container, regime_data: dict) -> dict:
+    """
+    Phase 3d3: Apply macro regime overlay as a protective posture adjustment.
+
+    This is NOT event-driven trading — it adjusts the regime_data dict so that
+    downstream risk policy, decision firewall, and position sizing all respond
+    to the external macro environment.
+
+    The macro scraper polls slowly (15-min cache) and the output is a risk
+    posture that modifies:
+      - strategy_guidance.size_modifier (multiplicative)
+      - regime_data.macro_* fields for risk_policy_engine to read
+      - strategy_guidance.pause (at extreme risk levels)
+    """
+    macro = getattr(container, "macro_regime", None)
+    if not macro:
+        return regime_data
+
+    try:
+        posture = macro.get_risk_posture()
+    except Exception as exc:
+        logger.debug("  Macro regime overlay error: %s", exc)
+        return regime_data
+
+    if not posture or posture.get("macro_risk_level") == "normal":
+        return regime_data
+
+    level = posture.get("macro_risk_level", "normal")
+    size_mod = posture.get("size_modifier", 1.0)
+    conf_drag = posture.get("confidence_drag", 0.0)
+    block = posture.get("block_new_entries", False)
+    reasons = posture.get("reasons", [])
+
+    # Stamp macro data onto regime_data so risk_policy + firewall can see it
+    regime_data["macro_risk_level"] = level
+    regime_data["macro_score"] = posture.get("macro_score", 0.0)
+    regime_data["macro_size_modifier"] = size_mod
+    regime_data["macro_confidence_drag"] = conf_drag
+    regime_data["macro_block_new_entries"] = block
+    regime_data["macro_reasons"] = reasons
+
+    # Apply size modifier to strategy guidance
+    guidance = regime_data.get("strategy_guidance", {})
+    current_size_mod = float(guidance.get("size_modifier", 1.0))
+    guidance["size_modifier"] = round(current_size_mod * size_mod, 3)
+    regime_data["strategy_guidance"] = guidance
+
+    # At extreme levels, pause all strategies
+    if block:
+        guidance["pause"] = list(set(guidance.get("pause", []) + ["all"]))
+        logger.warning(
+            "  MACRO REGIME: %s — blocking new entries (score=%.2f, reasons=%s)",
+            level.upper(), posture.get("macro_score", 0), reasons[:2],
+        )
+    elif level in ("high", "elevated"):
+        logger.info(
+            "  MACRO REGIME: %s — size_mod=%.2f, conf_drag=%.2f (reasons=%s)",
+            level, size_mod, conf_drag, reasons[:2],
+        )
+    else:
+        logger.debug("  Macro regime overlay: %s (no action)", level)
+
+    return regime_data
+
+
 def _run_hedger(container, regime_data):
     """Cross-venue hedging — auto-hedge on crash regime."""
     hedger = container.cross_venue_hedger
@@ -448,6 +513,9 @@ def run_trading_cycle(container, cycle_count: int) -> None:
         # Inject into forecaster and reconcile detector vs forecaster
         _inject_forecaster_signals(container, regime_data)
         regime_data = _reconcile_regimes(regime_data, container)
+
+        # ── Phase 3d3: Macro Regime Overlay ──
+        regime_data = _apply_macro_regime_overlay(container, regime_data)
 
         # Cross-venue hedging
         _run_hedger(container, regime_data)

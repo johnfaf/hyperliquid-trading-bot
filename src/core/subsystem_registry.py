@@ -44,7 +44,7 @@ FULL_PROFILE = FUNDABLE_CORE | {
     "alpha_arena", "position_monitor", "dashboard", "telegram",
     "cross_venue_hedger", "shadow_tracker", "adaptive_bot_detector",
     "regime_strategy_filter", "exchange_aggregator",
-    "lstm_agent", "rl_sizer",
+    "lstm_agent", "rl_sizer", "macro_regime",
 }
 
 
@@ -93,6 +93,7 @@ class SubsystemContainer:
     regime_strategy_filter: Any = None
     lstm_agent: Any = None
     rl_sizer: Any = None
+    macro_regime: Any = None
 
     # Infra
     cross_venue_hedger: Any = None
@@ -452,6 +453,16 @@ def build_subsystems(
             except Exception:
                 pass
 
+    # Macro regime overlay (external data → protective risk posture)
+    if "macro_regime" in profile and getattr(config, "MACRO_REGIME_ENABLED", True):
+        from src.data.macro_regime_scraper import MacroRegimeScraper
+        c.macro_regime = _safe_init(
+            "macro_regime",
+            MacroRegimeScraper,
+            health,
+            affects_trading=False,
+        )
+
     # ─── Copy trader ──────────────────────────────────────────
     if "copy_trader" in profile:
         from src.trading.copy_trader import CopyTrader
@@ -664,6 +675,7 @@ _FIELD_TO_HEALTH_NAME: dict = {
     "position_monitor":       "position_monitor",
     "lstm_agent":             "lstm_agent",
     "rl_sizer":               "rl_sizer",
+    "macro_regime":           "macro_regime",
 }
 
 
