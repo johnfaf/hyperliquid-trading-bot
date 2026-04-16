@@ -859,7 +859,10 @@ def _execute_lcrs_signals(container, lcrs_signals, regime_data):
         # BUG-2 FIX: load account BEFORE the loop so dynamic sizing
         # (Kelly/RL) is actually applied to LCRS trades.  Previously
         # `account` was None at the sizing check, making it dead code.
-        account = db.get_paper_account()
+        try:
+            account = db.get_paper_account()
+        except Exception:
+            account = None
 
         for sig in lcrs_signals:
             try:
@@ -1028,8 +1031,11 @@ def _execute_options_flow_trades(container, regime_data):
 
             sizing_balance = live_account_value if live_active and live_account_value else None
             if sizing_balance is None:
-                paper_account = db.get_paper_account()
-                sizing_balance = float(paper_account["balance"]) if paper_account else None
+                try:
+                    paper_account = db.get_paper_account()
+                    sizing_balance = float(paper_account["balance"]) if paper_account else None
+                except Exception:
+                    sizing_balance = None
             if sizing_balance and (getattr(container, "kelly_sizer", None) or getattr(container, "rl_sizer", None)):
                 try:
                     sizing = _get_dynamic_sizing(
