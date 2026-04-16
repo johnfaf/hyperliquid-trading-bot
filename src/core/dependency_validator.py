@@ -150,7 +150,8 @@ def validate_all(config_module=None) -> Dict[str, Dict]:
 def validate_or_fail(features: Optional[List[str]] = None,
                      config_module=None) -> None:
     """
-    Fail fast if any *enabled* feature is missing required packages.
+    Fail fast if any *enabled* CORE feature is missing required packages.
+    Optional features are warned but don't block startup (they gracefully degrade).
 
     Parameters
     ----------
@@ -163,32 +164,44 @@ def validate_or_fail(features: Optional[List[str]] = None,
     Raises
     ------
     RuntimeError
-        Human-readable message listing every enabled feature whose
-        dependencies are not satisfied.
+        Human-readable message if CORE dependencies are not satisfied.
+        Optional features are logged as warnings but don't fail startup.
     """
     report = validate_all(config_module)
 
     if features is not None:
         report = {k: v for k, v in report.items() if k in features}
 
-    failures: List[str] = []
+    # CORE is non-negotiable — bot will not start without it
+    core_failures = []
+    optional_warnings = []
+
     for feature, info in report.items():
         if info["enabled"] and not info["available"]:
-            failures.append(
-                f"  {feature}: missing {', '.join(info['missing'])}"
-            )
+            missing_str = f"{feature}: missing {', '.join(info['missing'])}"
+            if feature == "core":
+                core_failures.append(f"  {missing_str}")
+            else:
+                optional_warnings.append(missing_str)
 
-    if failures:
+    if core_failures:
         msg = (
-            "Boot-time dependency check FAILED.\n"
-            "The following enabled features have missing packages:\n"
-            + "\n".join(failures)
-            + "\n\nInstall them or disable the feature in config / env vars."
+            "Boot-time dependency check FAILED (CORE packages missing).\n"
+            "The following REQUIRED features have missing packages:\n"
+            + "\n".join(core_failures)
+            + "\n\nInstall them: pip install -r requirements.txt"
         )
         logger.critical(msg)
         raise RuntimeError(msg)
 
-    logger.info("Dependency validation passed - all enabled features have their packages.")
+    if optional_warnings:
+        logger.warning(
+            "Optional features disabled due to missing packages:\n  %s\n"
+            "These features will gracefully degrade. Install them for full functionality.",
+            "\n  ".join(optional_warnings),
+        )
+
+    logger.info("Dependency validation passed - core features have required packages.")
 
 
 def get_boot_report(config_module=None) -> str:
