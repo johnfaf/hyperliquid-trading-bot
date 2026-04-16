@@ -235,6 +235,85 @@ def download_fills_incremental(address: str, last_sync_time_ms: int) -> List[Dic
     return fills
 
 
+def _history_cutoff_ms() -> int:
+    return int((datetime.now(timezone.utc) - timedelta(days=LOOKBACK_DAYS)).timestamp() * 1000)
+
+
+def _fill_identity(fill: Dict) -> Tuple:
+    return (
+        str(fill.get("coin", "")),
+        str(fill.get("side", "")),
+        int(fill.get("time", fill.get("time_ms", 0)) or 0),
+        float(fill.get("price", fill.get("original_price", 0.0)) or 0.0),
+        float(fill.get("size", 0.0) or 0.0),
+        float(fill.get("closed_pnl", 0.0) or 0.0),
+        str(fill.get("direction", "")),
+        bool(fill.get("is_liquidation", False)),
+    )
+
+
+def _stored_fill_to_raw(row: Dict) -> Dict:
+    return {
+        "coin": row.get("coin", ""),
+        "side": row.get("side", ""),
+        "price": float(row.get("original_price", 0.0) or 0.0),
+        "size": float(row.get("size", 0.0) or 0.0),
+        "time": int(row.get("time_ms", 0) or 0),
+        "closed_pnl": float(row.get("closed_pnl", 0.0) or 0.0),
+        "fee": float(row.get("fee", 0.0) or 0.0),
+        "is_liquidation": bool(row.get("is_liquidation", False)),
+        "direction": row.get("direction", ""),
+    }
+
+
+def _stored_fill_to_penalised(row: Dict) -> PenalisedFill:
+    return PenalisedFill(
+        coin=row.get("coin", ""),
+        side=row.get("side", ""),
+        original_price=float(row.get("original_price", 0.0) or 0.0),
+        penalised_price=float(row.get("penalised_price", 0.0) or 0.0),
+        size=float(row.get("size", 0.0) or 0.0),
+        time_ms=int(row.get("time_ms", 0) or 0),
+        delayed_time_ms=int(row.get("delayed_time_ms", 0) or 0),
+        closed_pnl=float(row.get("closed_pnl", 0.0) or 0.0),
+        penalised_pnl=float(row.get("penalised_pnl", 0.0) or 0.0),
+        fee=float(row.get("fee", 0.0) or 0.0),
+        is_liquidation=bool(row.get("is_liquidation", False)),
+        direction=row.get("direction", ""),
+    )
+
+
+def _merge_fill_history(existing_fills: List[Dict], new_fills: List[Dict]) -> List[Dict]:
+    cutoff_ms = _history_cutoff_ms()
+    merged: Dict[Tuple, Dict] = {}
+    for fill in existing_fills or []:
+        if int(fill.get("time", fill.get("time_ms", 0)) or 0) >= cutoff_ms:
+            merged[_fill_identity(fill)] = dict(fill)
+    for fill in new_fills or []:
+        if int(fill.get("time", fill.get("time_ms", 0)) or 0) >= cutoff_ms:
+            merged[_fill_identity(fill)] = dict(fill)
+    history = list(merged.values())
+    history.sort(key=lambda f: int(f.get("time", f.get("time_ms", 0)) or 0))
+    return history
+
+
+def _merge_penalised_history(
+    existing_fills: List[PenalisedFill],
+    new_fills: List[PenalisedFill],
+) -> List[PenalisedFill]:
+    cutoff_ms = _history_cutoff_ms()
+    merged: Dict[Tuple, PenalisedFill] = {}
+    for fill in existing_fills or []:
+        if int(fill.time_ms) >= cutoff_ms:
+            merged[_fill_identity(fill.__dict__)] = fill
+    for fill in new_fills or []:
+        if int(fill.time_ms) >= cutoff_ms:
+            merged[_fill_identity(fill.__dict__)] = fill
+    history = list(merged.values())
+    history.sort(key=lambda f: int(f.time_ms))
+    return history
+
+
 def apply_execution_penalties(fills: List[Dict]) -> List[PenalisedFill]:
     """
     Apply realistic execution penalties to each fill:
@@ -458,7 +537,19 @@ def evaluate_wallet(address: str, bot_score: int = 0,
     persist fills without re-downloading them (fixes double-download bug).
     Returns None if wallet is skipped.
     """
-    fills = download_fills_incremental(address, last_sync_time_ms)
+    new_fills = download_fills_incremental(address, last_sync_time_ms)
+    new_penalised = apply_execution_penalties(new_fills)
+
+    if last_sync_time_ms > 0:
+        stored_rows = get_wallet_fills(address)
+        stored_fills = [_stored_fill_to_raw(row) for row in stored_rows]
+        stored_penalised = [_stored_fill_to_penalised(row) for row in stored_rows]
+        fills = _merge_fill_history(stored_fills, new_fills)
+        penalised = _merge_penalised_history(stored_penalised, new_penalised)
+    else:
+        fills = new_fills
+        penalised = new_penalised
+
     if len(fills) < MIN_FILLS_FOR_EVAL:
         logger.debug("Skipping %s: only %d fills (need %d)", address[:10], len(fills), MIN_FILLS_FOR_EVAL)
         return None
@@ -471,7 +562,6 @@ def evaluate_wallet(address: str, bot_score: int = 0,
         )
         return None
 
-    penalised = apply_execution_penalties(fills)
     raw_curve, pen_curve, timestamps = build_equity_curve(penalised)
 
     # Daily returns for Sharpe: computed from the equity curve, not raw PnL.

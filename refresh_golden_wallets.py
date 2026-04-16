@@ -8,8 +8,6 @@ Usage:
 """
 import os
 import sys
-import time
-import logging
 
 # Setup path
 sys.path.insert(0, os.path.dirname(__file__))
@@ -32,7 +30,7 @@ print("\n" + "="*70)
 print("GOLDEN WALLET REFRESH UTILITY")
 print("="*70)
 print(f"DB: {config.DB_PATH}")
-print(f"Profile: FULL_PROFILE")
+print("Profile: FULL_PROFILE")
 print("="*70 + "\n")
 
 # Boot sequence

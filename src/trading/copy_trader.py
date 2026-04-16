@@ -142,13 +142,14 @@ class CopyTrader:
     ) -> tuple[float, float, Dict[str, object]]:
         price = float(signal.get("price", 0.0) or 0.0)
         side = str(signal.get("side", "long") or "long")
+        source_trader = str(signal.get("source_trader", "") or "").strip().lower()
         trade_signal = TradeSignal(
             coin=str(signal.get("coin", "")),
             side=SignalSide(side),
             confidence=float(signal.get("confidence", 0.5) or 0.5),
             source=SignalSource.COPY_TRADE,
-            reason=f"Copy trade from {signal.get('source_trader', '?')}",
-            trader_address=str(signal.get("source_trader", "") or ""),
+            reason=f"Copy trade from {source_trader or '?'}",
+            trader_address=source_trader,
             entry_price=price,
             leverage=leverage,
             risk=RiskParams(stop_loss_pct=0.04, take_profit_pct=0.20, risk_basis="roe"),
@@ -342,6 +343,7 @@ class CopyTrader:
         new_coins = set(new_positions.keys())
 
         win_rate = trader.get("win_rate", 0)
+        normalized_address = str(address or "").strip().lower()
 
         # New positions opened by the trader
         for coin in new_coins - old_coins:
@@ -356,7 +358,7 @@ class CopyTrader:
                 "side": pos["side"],
                 "price": price,
                 "leverage": min(pos["leverage"], config.PAPER_TRADING_MAX_LEVERAGE),
-                "source_trader": address[:10],
+                "source_trader": normalized_address,
                 "source_pnl": trader.get("total_pnl", 0),
                 "confidence": self._calculate_signal_confidence("copy_open", win_rate),
             })
@@ -366,7 +368,7 @@ class CopyTrader:
             signals.append({
                 "type": "copy_close",
                 "coin": coin,
-                "source_trader": address[:10],
+                "source_trader": normalized_address,
             })
 
         # Significantly increased positions (scaling in)
@@ -384,7 +386,7 @@ class CopyTrader:
                     "side": pos["side"],
                     "price": price,
                     "leverage": min(pos["leverage"], config.PAPER_TRADING_MAX_LEVERAGE),
-                    "source_trader": address[:10],
+                    "source_trader": normalized_address,
                     "source_pnl": trader.get("total_pnl", 0),
                     "confidence": self._calculate_signal_confidence("copy_scale_in", win_rate),
                 })
@@ -402,7 +404,7 @@ class CopyTrader:
                     "side": pos["side"],
                     "price": price,
                     "leverage": min(pos["leverage"], config.PAPER_TRADING_MAX_LEVERAGE),
-                    "source_trader": address[:10],
+                    "source_trader": normalized_address,
                     "source_pnl": trader.get("total_pnl", 0),
                     "confidence": self._calculate_signal_confidence("copy_flip", win_rate),
                 })
@@ -773,7 +775,7 @@ class CopyTrader:
         """
         return {
             "type": signal["type"],
-            "source_trader": signal.get("source_trader", ""),
+            "source_trader": str(signal.get("source_trader", "") or "").strip().lower(),
             "confidence": signal.get("confidence", 0),
             "signal_id": signal.get("_signal_id", ""),
             "source_key": signal.get("_source_key", ""),
@@ -1087,7 +1089,8 @@ class CopyTrader:
 
             if (trade["coin"] == signal["coin"] and
                 meta.get("is_copy_trade") and
-                meta.get("source_trader") == signal.get("source_trader")):
+                str(meta.get("source_trader", "") or "").strip().lower()
+                == str(signal.get("source_trader", "") or "").strip().lower()):
 
                 current_price = float(mids.get(trade["coin"], 0))
                 if current_price <= 0:

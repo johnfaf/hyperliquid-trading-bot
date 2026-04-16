@@ -14,21 +14,18 @@ Covers:
 import math
 import sys
 import os
+from datetime import datetime, timedelta, timezone
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from src.discovery.golden_wallet import (
+    PenalisedFill,
+    evaluate_wallet,
     compute_sharpe,
     compute_avg_hold_time_hours,
     compute_max_drawdown,
     apply_execution_penalties,
-    build_equity_curve,
     _rate_limit_backoff,
-    MIN_FILLS_FOR_EVAL,
-    MAX_FILLS_FOR_EVAL,
     MAX_HUMAN_WIN_RATE,
-    MIN_HUMAN_DRAWDOWN,
-    GOLDEN_THRESHOLD,
-    FEE_SLIPPAGE_BPS,
 )
 
 
@@ -134,7 +131,6 @@ class TestApplyExecutionPenalties:
         """Buying costs more after penalty (worse fill)."""
         fill = _make_fill("BTC", closed_pnl=0.0, time_ms=1000, side="buy")
         fill["price"] = 50000.0
-        from src.discovery.golden_wallet import apply_execution_penalties
         penalised = apply_execution_penalties([fill])
         assert penalised[0].penalised_price > 50000.0
 
@@ -142,13 +138,11 @@ class TestApplyExecutionPenalties:
         """Selling receives less after penalty (worse fill)."""
         fill = _make_fill("BTC", closed_pnl=100.0, time_ms=1000, side="sell")
         fill["price"] = 50000.0
-        from src.discovery.golden_wallet import apply_execution_penalties
         penalised = apply_execution_penalties([fill])
         assert penalised[0].penalised_price < 50000.0
 
     def test_delay_applied(self):
         fill = _make_fill(time_ms=1_000_000)
-        from src.discovery.golden_wallet import apply_execution_penalties
         penalised = apply_execution_penalties([fill])
         assert penalised[0].delayed_time_ms == 1_000_100
 
@@ -157,7 +151,6 @@ class TestApplyExecutionPenalties:
         fill = _make_fill("BTC", closed_pnl=500.0, time_ms=0, side="sell")
         fill["price"] = 50000.0
         fill["size"] = 0.1
-        from src.discovery.golden_wallet import apply_execution_penalties
         penalised = apply_execution_penalties([fill])
         assert penalised[0].penalised_pnl < 500.0
 
@@ -166,7 +159,6 @@ class TestApplyExecutionPenalties:
         fill = _make_fill("BTC", closed_pnl=-200.0, time_ms=0, side="sell")
         fill["price"] = 50000.0
         fill["size"] = 0.05
-        from src.discovery.golden_wallet import apply_execution_penalties
         penalised = apply_execution_penalties([fill])
         assert penalised[0].penalised_pnl < -200.0
 
@@ -218,10 +210,6 @@ class TestEvaluateWalletSuperhuman:
 
     def test_high_win_rate_blocked(self):
         """A wallet with >MAX_HUMAN_WIN_RATE% win rate and substantial PnL is filtered out."""
-        from src.discovery.golden_wallet import (
-            apply_execution_penalties, build_equity_curve,
-            _equity_curve_to_daily_returns, compute_max_drawdown,
-        )
         # 50 winning closes, 0 losing (100% WR)
         fills = _generate_fills(50, win=True)
         penalised = apply_execution_penalties(fills)
@@ -241,7 +229,6 @@ class TestEvaluateWalletSuperhuman:
         """A normal wallet with ~65% WR is not superhuman."""
         fills = _generate_fills(30, win=True) + _generate_fills(16, win=False)
         fills.sort(key=lambda f: f["time"])
-        from src.discovery.golden_wallet import apply_execution_penalties
         penalised = apply_execution_penalties(fills)
         closing = [f for f in penalised if f.penalised_pnl != 0]
         wins = len([f for f in closing if f.penalised_pnl > 0])
@@ -278,6 +265,48 @@ class TestRateLimitBackoff:
         """Multiple calls with same attempt should not be identical (jitter active)."""
         results = {_rate_limit_backoff(2) for _ in range(20)}
         assert len(results) > 1, "Jitter should produce varying backoff durations"
+
+
+def _penalised_row(fill: PenalisedFill) -> dict:
+    return {
+        "wallet_address": "0xwallet",
+        "coin": fill.coin,
+        "side": fill.side,
+        "original_price": fill.original_price,
+        "penalised_price": fill.penalised_price,
+        "size": fill.size,
+        "time_ms": fill.time_ms,
+        "delayed_time_ms": fill.delayed_time_ms,
+        "closed_pnl": fill.closed_pnl,
+        "penalised_pnl": fill.penalised_pnl,
+        "fee": fill.fee,
+        "is_liquidation": fill.is_liquidation,
+        "direction": fill.direction,
+    }
+
+
+class TestIncrementalWalletMerging:
+    def test_evaluate_wallet_merges_stored_and_incremental_history(self, monkeypatch):
+        start_ms = int((datetime.now(timezone.utc) - timedelta(days=5)).timestamp() * 1000)
+        stored_fills = _generate_fills(15, win=True, start_ms=start_ms)
+        new_fills = _generate_fills(2, win=False, start_ms=stored_fills[-1]["time"] + 3_600_000)
+        stored_rows = [_penalised_row(fill) for fill in apply_execution_penalties(stored_fills)]
+
+        monkeypatch.setattr(
+            "src.discovery.golden_wallet.download_fills_incremental",
+            lambda address, last_sync_time_ms: list(new_fills),
+        )
+        monkeypatch.setattr(
+            "src.discovery.golden_wallet.get_wallet_fills",
+            lambda address: list(stored_rows),
+        )
+
+        result = evaluate_wallet("0xwallet", bot_score=0, last_sync_time_ms=stored_fills[-1]["time"])
+        assert result is not None
+        report, penalised = result
+        assert report.total_fills == len(stored_fills) + len(new_fills)
+        assert len(penalised) == len(stored_fills) + len(new_fills)
+        assert penalised[-1].time_ms == new_fills[-1]["time"]
 
 
 # ─── Leaderboard schema caching (trader_discovery) ───────────────

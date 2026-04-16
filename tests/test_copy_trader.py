@@ -295,6 +295,20 @@ class TestDetectPositionChanges:
         assert opens[0]["coin"] == "BTC"
         assert opens[0]["side"] == "long"
 
+    def test_full_source_trader_address_is_preserved(self):
+        ct = CopyTrader()
+        trader = self._make_trader()
+        mids = {"BTC": 50000.0}
+        address = "0x1234567890abcdef1234567890abcdef12345678"
+        signals = ct._detect_position_changes(
+            address,
+            {},
+            {"BTC": {"side": "long", "size": 1.0, "entry_price": 50000.0, "leverage": 2}},
+            trader,
+            mids,
+        )
+        assert signals[0]["source_trader"] == address
+
     def test_closed_position_generates_copy_close(self):
         ct = CopyTrader()
         trader = self._make_trader()

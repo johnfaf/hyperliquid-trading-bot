@@ -32,7 +32,7 @@ import sys
 import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from src.data import database as db
-from src.signals.signal_schema import TradeSignal
+from src.signals.signal_schema import RiskParams, SignalSide, SignalSource, TradeSignal
 
 logger = logging.getLogger(__name__)
 
@@ -691,9 +691,14 @@ class Backtester:
     - Results only counted on test periods
     """
 
-    def __init__(self, lstm_agent: Optional[object] = None):
+    def __init__(
+        self,
+        lstm_agent: Optional[object] = None,
+        risk_policy_engine: Optional[object] = None,
+    ):
         self.results: Dict[str, Dict] = {}  # agent_id → backtest results
         self.lstm_agent = lstm_agent
+        self.risk_policy_engine = risk_policy_engine
 
     def backtest_agent(self, agent: ArenaAgent,
                         historical_candles: List[Dict],
@@ -750,8 +755,9 @@ class Backtester:
                     # Simulate trade execution on NEXT bar (realistic)
                     if bar_idx + 1 < n:
                         next_bar = historical_candles[bar_idx + 1]
+                        future_bars = historical_candles[bar_idx + 1:]
                         trade_result = self._simulate_trade(
-                            agent, signal, current_bar, next_bar, bars_visible
+                            agent, signal, current_bar, next_bar, bars_visible, future_bars
                         )
                         if trade_result:
                             all_trades.append(trade_result)
@@ -920,44 +926,135 @@ class Backtester:
 
         return None
 
+    def _resolve_trade_signal(
+        self,
+        agent: ArenaAgent,
+        signal: Dict,
+        entry_price: float,
+    ) -> TradeSignal:
+        params = agent.params
+        trade_signal = TradeSignal(
+            coin="BTC",
+            side=SignalSide(signal["side"]),
+            confidence=float(signal.get("confidence", 0.5) or 0.5),
+            source=SignalSource.ARENA_CHAMPION,
+            reason=f"Arena backtest: {agent.strategy_type}",
+            strategy_type=agent.strategy_type,
+            entry_price=entry_price,
+            leverage=float(params.get("max_leverage", 2.0) or 2.0),
+            position_pct=float(params.get("position_pct", 0.05) or 0.05),
+            risk=RiskParams(
+                stop_loss_pct=float(params.get("stop_loss_pct", 0.05) or 0.05),
+                take_profit_pct=float(params.get("take_profit_pct", 0.10) or 0.10),
+                trailing_stop=True,
+                risk_basis=str(params.get("risk_basis", "price") or "price"),
+            ),
+            context={
+                "features": {},
+                "atr_pct": float(signal.get("atr_pct", 0.02) or 0.02),
+                "volatility": float(signal.get("atr_pct", 0.02) or 0.02),
+            },
+        )
+        if self.risk_policy_engine:
+            try:
+                adjusted = self.risk_policy_engine.apply(trade_signal)
+                if adjusted is not None:
+                    trade_signal = adjusted
+            except Exception as exc:
+                logger.debug("Arena risk policy apply failed: %s", exc)
+        return trade_signal
+
+    @staticmethod
+    def _r_multiple(
+        entry_price: float,
+        current_price: float,
+        side: str,
+        leverage: float,
+        stop_roe_pct: float,
+    ) -> float:
+        if entry_price <= 0 or current_price <= 0 or leverage <= 0 or stop_roe_pct <= 0:
+            return 0.0
+        direction = 1.0 if side == "long" else -1.0
+        move_pct = ((current_price - entry_price) / entry_price) * direction
+        return (move_pct * leverage) / stop_roe_pct
+
     def _simulate_trade(self, agent: ArenaAgent, signal: Dict,
                           entry_bar: Dict, exit_bar: Dict,
-                          history: List[Dict]) -> Optional[Dict]:
-        """Simulate a single trade with SL/TP."""
+                          history: List[Dict], future_bars: List[Dict]) -> Optional[Dict]:
+        """Simulate a trade using the same dynamic risk shape as live execution."""
         entry_price = exit_bar["open"]  # Enter at next bar's open (realistic)
-        params = agent.params
+        if entry_price <= 0 or not future_bars:
+            return None
 
-        sl_pct = params.get("stop_loss_pct", 0.05)
-        tp_pct = params.get("take_profit_pct", 0.10)
-        leverage = params.get("max_leverage", 2.0)
-        pos_pct = params.get("position_pct", 0.05)
-
+        trade_signal = self._resolve_trade_signal(agent, signal, entry_price)
+        leverage = max(float(trade_signal.leverage or 1.0), 1.0)
+        pos_pct = float(agent.params.get("position_pct", 0.05) or 0.05)
         size = agent.capital_allocated * pos_pct / entry_price
+        side = signal["side"]
 
-        if signal["side"] == "long":
-            sl = entry_price * (1 - sl_pct)
-            tp = entry_price * (1 + tp_pct)
-            # Check if SL or TP hit during the bar
-            if exit_bar["low"] <= sl:
-                exit_price = sl
-            elif exit_bar["high"] >= tp:
-                exit_price = tp
+        stop_price, take_profit_price = trade_signal.risk.resolve_trigger_prices(
+            entry_price,
+            side,
+            leverage,
+        )
+        stop_roe_pct = max(trade_signal.risk.resolve_roe_stop_loss_pct(leverage), 1e-9)
+        break_even_at_r = float(trade_signal.risk.break_even_at_r or 0.0)
+        break_even_buffer_pct = trade_signal.risk.resolve_price_break_even_buffer_pct(leverage)
+        trail_after_r = float(trade_signal.risk.trail_activate_at_r or 0.0)
+        trailing_distance_pct = trade_signal.risk.resolve_price_trailing_pct(leverage)
+        trailing_enabled = bool(trade_signal.risk.trailing_stop)
+        max_hold_bars = max(1, int(round(float(trade_signal.risk.time_limit_hours or 1.0))))
+
+        current_stop = stop_price
+        best_price = entry_price
+        exit_price = future_bars[min(len(future_bars), max_hold_bars) - 1]["close"]
+
+        for bar in future_bars[:max_hold_bars]:
+            high = float(bar["high"])
+            low = float(bar["low"])
+            close = float(bar["close"])
+
+            favorable_price = high if side == "long" else low
+            favorable_r = self._r_multiple(entry_price, favorable_price, side, leverage, stop_roe_pct)
+
+            if break_even_at_r > 0 and favorable_r >= break_even_at_r:
+                if side == "long":
+                    current_stop = max(current_stop, entry_price * (1 + break_even_buffer_pct))
+                else:
+                    current_stop = min(current_stop, entry_price * (1 - break_even_buffer_pct))
+
+            if trailing_enabled and trail_after_r > 0 and favorable_r >= trail_after_r:
+                if side == "long":
+                    best_price = max(best_price, high)
+                    current_stop = max(current_stop, best_price * (1 - trailing_distance_pct))
+                else:
+                    best_price = min(best_price, low)
+                    current_stop = min(current_stop, best_price * (1 + trailing_distance_pct))
+
+            if side == "long":
+                if low <= current_stop:
+                    exit_price = current_stop
+                    break
+                if high >= take_profit_price:
+                    exit_price = take_profit_price
+                    break
             else:
-                exit_price = exit_bar["close"]
+                if high >= current_stop:
+                    exit_price = current_stop
+                    break
+                if low <= take_profit_price:
+                    exit_price = take_profit_price
+                    break
+
+            exit_price = close
+
+        if side == "long":
             pnl = (exit_price - entry_price) * size * leverage
         else:
-            sl = entry_price * (1 + sl_pct)
-            tp = entry_price * (1 - tp_pct)
-            if exit_bar["high"] >= sl:
-                exit_price = sl
-            elif exit_bar["low"] <= tp:
-                exit_price = tp
-            else:
-                exit_price = exit_bar["close"]
             pnl = (entry_price - exit_price) * size * leverage
 
         return {
-            "side": signal["side"],
+            "side": side,
             "entry_price": entry_price,
             "exit_price": exit_price,
             "pnl": round(pnl, 4),
@@ -1038,14 +1135,22 @@ class AlphaArena:
     SPAWN_INTERVAL = 0           # Disabled — no new agents spawned
     SPAWN_COUNT = 0              # Disabled — only 9 seed agents
 
-    def __init__(self, lstm_agent: Optional[object] = None):
+    def __init__(
+        self,
+        lstm_agent: Optional[object] = None,
+        risk_policy_engine: Optional[object] = None,
+    ):
         self.agents: Dict[str, ArenaAgent] = {}
         self.tournament = TournamentEngine()
         self.allocator = CapitalAllocator()
         self.consensus = ConsensusEngine()
         self.spawner = AgentSpawner()
         self.lstm_agent = lstm_agent
-        self.backtester = Backtester(lstm_agent=lstm_agent)
+        self.risk_policy_engine = risk_policy_engine
+        self.backtester = Backtester(
+            lstm_agent=lstm_agent,
+            risk_policy_engine=risk_policy_engine,
+        )
         self.cycle_count = 0
 
         # Initialize with seed agents

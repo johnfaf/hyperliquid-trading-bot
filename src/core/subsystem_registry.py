@@ -395,7 +395,10 @@ def build_subsystems(
         from src.signals.alpha_arena import AlphaArena
         c.arena = _safe_init(
             "alpha_arena",
-            lambda: AlphaArena(lstm_agent=c.lstm_agent),
+            lambda: AlphaArena(
+                lstm_agent=c.lstm_agent,
+                risk_policy_engine=c.risk_policy_engine,
+            ),
             health,
             affects_trading=False,
         )

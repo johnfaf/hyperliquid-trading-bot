@@ -192,3 +192,58 @@ def test_alpha_arena_uses_lstm_agent_for_lstm_direction(monkeypatch):
     assert signal["confidence"] == pytest.approx(0.82)
     assert lstm.generate_calls == 1
     assert lstm.train_calls == 1
+
+
+def test_alpha_arena_backtester_uses_dynamic_risk_policy_across_future_bars(monkeypatch):
+    from src.signals.alpha_arena import AlphaArena, ArenaAgent, AgentStatus
+    from src.signals.signal_schema import RiskParams
+
+    class _FakeRiskEngine:
+        def apply(self, signal, regime_data=None, source_policy=None):
+            signal.risk = RiskParams(
+                stop_loss_pct=0.02,
+                take_profit_pct=0.04,
+                time_limit_hours=3.0,
+                trailing_stop=False,
+                risk_basis="price",
+                enforce_reward_to_risk=False,
+            )
+            return signal
+
+    monkeypatch.setattr(AlphaArena, "_init_db", lambda self: None)
+    monkeypatch.setattr(AlphaArena, "_load_agents", lambda self: None)
+    monkeypatch.setattr(AlphaArena, "_save_agents", lambda self: None)
+
+    arena = AlphaArena(risk_policy_engine=_FakeRiskEngine())
+    agent = ArenaAgent(
+        agent_id="seed_momentum_long",
+        name="Seed_momentum_long",
+        strategy_type="momentum_long",
+        status=AgentStatus.ACTIVE,
+        params={
+            "confidence_threshold": 0.5,
+            "stop_loss_pct": 0.20,
+            "take_profit_pct": 0.40,
+            "position_pct": 0.05,
+            "max_leverage": 2.0,
+        },
+    )
+    signal = {"side": "long", "confidence": 0.8, "atr_pct": 0.02}
+    entry_bar = {"open": 100.0, "high": 101.0, "low": 99.0, "close": 100.5, "volume": 1_000.0}
+    future_bars = [
+        {"open": 100.0, "high": 101.0, "low": 99.5, "close": 100.8, "volume": 1_000.0},
+        {"open": 100.8, "high": 105.5, "low": 100.6, "close": 104.8, "volume": 1_050.0},
+    ]
+
+    result = arena.backtester._simulate_trade(
+        agent,
+        signal,
+        entry_bar,
+        future_bars[0],
+        [entry_bar],
+        future_bars,
+    )
+
+    assert result is not None
+    assert result["exit_price"] == pytest.approx(104.0)
+    assert result["won"] is True
