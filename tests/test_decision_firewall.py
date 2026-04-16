@@ -193,6 +193,59 @@ def test_firewall_cooldown(mock_db):
 
 
 @patch("src.signals.decision_firewall.db")
+def test_firewall_same_side_cooldown_blocks_pyramiding(mock_db):
+    """Same-side re-entries on the same coin should respect the anti-pyramiding cooldown."""
+    mock_db.get_open_paper_trades.return_value = []
+    mock_db.get_paper_account.return_value = {"balance": 10000}
+    mock_db.audit_log = MagicMock()
+
+    from src.signals.decision_firewall import DecisionFirewall
+
+    fw = DecisionFirewall(
+        {
+            "cooldown_seconds": 0,
+            "same_side_cooldown_seconds": 900,
+            "enable_predictive_derisk": False,
+            "funding_risk_enabled": False,
+        }
+    )
+
+    passed1, _ = fw.validate(MockSignal(coin="BTC", side_val="short", confidence=0.7))
+    passed2, reason2 = fw.validate(MockSignal(coin="BTC", side_val="short", confidence=0.72))
+
+    assert passed1 is True
+    assert passed2 is False
+    assert "pyramiding" in reason2.lower()
+    assert fw.get_stats()["rejected_pyramiding"] == 1
+
+
+@patch("src.signals.decision_firewall.db")
+def test_firewall_same_side_position_limit_blocks_stacking(mock_db):
+    """The firewall should stop stacking beyond the same-side per-coin limit."""
+    mock_db.get_open_paper_trades.return_value = [
+        {"coin": "ETH", "side": "short", "size": 1, "entry_price": 2000, "leverage": 2},
+        {"coin": "ETH", "side": "short", "size": 1, "entry_price": 1990, "leverage": 2},
+    ]
+    mock_db.get_paper_account.return_value = {"balance": 10000}
+    mock_db.audit_log = MagicMock()
+
+    from src.signals.decision_firewall import DecisionFirewall
+
+    fw = DecisionFirewall(
+        {
+            "max_same_side_positions_per_coin": 2,
+            "enable_predictive_derisk": False,
+            "funding_risk_enabled": False,
+        }
+    )
+
+    passed, reason = fw.validate(MockSignal(coin="ETH", side_val="short", confidence=0.8))
+
+    assert passed is False
+    assert "pyramiding" in reason.lower()
+
+
+@patch("src.signals.decision_firewall.db")
 def test_firewall_stats(mock_db):
     """Stats should track rejections accurately."""
     mock_db.get_open_paper_trades.return_value = []

@@ -1069,6 +1069,12 @@ details[open] summary::after{content:'-'}
           </div>
           <div class="table-shell">
             <table>
+              <thead><tr><th>Coin / Side</th><th>Trades</th><th>Win Rate</th><th>Fees</th><th>Net PnL</th></tr></thead>
+              <tbody id="analytics-coin-sides"></tbody>
+            </table>
+          </div>
+          <div class="table-shell">
+            <table>
               <thead><tr><th>Live Metric</th><th>Value</th></tr></thead>
               <tbody id="analytics-live"></tbody>
             </table>
@@ -1355,11 +1361,13 @@ function renderTradeAnalytics(analytics, runtime){
   const summaryEl = document.getElementById('analytics-summary');
   const sidesEl = document.getElementById('analytics-sides');
   const sourcesEl = document.getElementById('analytics-sources');
+  const coinSidesEl = document.getElementById('analytics-coin-sides');
   const liveEl = document.getElementById('analytics-live');
   if(!analytics){
     summaryEl.textContent = 'Execution analytics not available yet.';
     sidesEl.innerHTML = '<tr><td colspan="5" class="empty-row">No side analytics</td></tr>';
     sourcesEl.innerHTML = '<tr><td colspan="5" class="empty-row">No source analytics</td></tr>';
+    coinSidesEl.innerHTML = '<tr><td colspan="5" class="empty-row">No coin-side analytics</td></tr>';
     liveEl.innerHTML = '<tr><td colspan="2" class="empty-row">No live analytics</td></tr>';
     return;
   }
@@ -1394,6 +1402,16 @@ function renderTradeAnalytics(analytics, runtime){
       <td class="red">${fmtUsd(-(row.fees || 0))}</td>
       <td class="${pnlClass(row.net_pnl || 0)}">${fmtUsd(row.net_pnl || 0)}</td>
     </tr>`).join('') : '<tr><td colspan="5" class="empty-row">No realized source results yet</td></tr>';
+
+  const coinSides = analytics.by_coin_side || [];
+  coinSidesEl.innerHTML = coinSides.length ? coinSides.map(row => `
+    <tr>
+      <td><code class="agent-key">${row.coin} ${String(row.side || '').toUpperCase()}</code></td>
+      <td>${row.count}</td>
+      <td>${((row.win_rate || 0) * 100).toFixed(1)}%</td>
+      <td class="red">${fmtUsd(-(row.fees || 0))}</td>
+      <td class="${pnlClass(row.net_pnl || 0)}">${fmtUsd(row.net_pnl || 0)}</td>
+    </tr>`).join('') : '<tr><td colspan="5" class="empty-row">No coin-side analytics yet</td></tr>';
 
   const entryMetrics = runtimeLive.entry_metrics || {};
   const attempted = Number(runtimeLive.attempted_entry_signals || 0);

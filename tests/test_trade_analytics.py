@@ -51,6 +51,9 @@ def test_compute_trade_analytics_groups_by_side_and_source():
     source_row = next(row for row in analytics["by_source"] if row["label"] == "copy_trade")
     assert source_row["count"] == 2
     assert source_row["net_pnl"] == -0.8
+    coin_side_row = next(row for row in analytics["by_coin_side"] if row["label"] == "UNKNOWN short")
+    assert coin_side_row["count"] == 2
+    assert coin_side_row["net_pnl"] == -0.8
 
 
 def test_evaluate_short_side_policy_blocks_bad_short_run():

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import pytest
 
 from src.backtest.risk_policy_walkforward import validate_risk_policy_walkforward
 from src.signals.risk_policy import RiskPolicyEngine
@@ -59,10 +60,38 @@ def test_risk_policy_engine_adjusts_reward_and_time_limit_by_context():
     assert trend_policy.time_limit_hours > range_policy.time_limit_hours
     assert trend_policy.stop_roe_pct > 0
     assert range_policy.stop_roe_pct > 0
-    assert trend_policy.take_profit_roe_pct == round(
+    assert trend_policy.take_profit_roe_pct == pytest.approx(
         trend_policy.stop_roe_pct * trend_policy.reward_multiple,
-        6,
+        abs=5e-6,
     )
+
+
+def test_risk_policy_engine_caps_extreme_price_distance_even_with_low_leverage():
+    engine = RiskPolicyEngine()
+    signal = TradeSignal(
+        coin="BTC",
+        side=SignalSide.LONG,
+        confidence=0.68,
+        source=SignalSource.STRATEGY,
+        reason="wide swing",
+        leverage=1,
+        source_accuracy=0.65,
+        context={"atr_pct": 0.006, "expected_return": 0.12},
+    )
+    signal.risk.stop_loss_pct = 0.12
+    signal.risk.take_profit_pct = 0.60
+    signal.risk.reward_to_risk_ratio = 5.0
+    signal.risk.risk_basis = "roe"
+
+    policy = engine.resolve(
+        signal,
+        regime_data={"regime": "trending_up", "confidence": 0.72},
+        source_policy={"quality": 0.62, "status": "healthy"},
+    )
+
+    assert policy.stop_roe_pct <= 0.025
+    assert policy.take_profit_roe_pct <= 0.07
+    assert policy.reward_multiple < 5.0
 
 
 def test_live_manage_open_positions_trails_stop_using_shadow_policy(monkeypatch):

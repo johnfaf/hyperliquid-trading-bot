@@ -58,20 +58,31 @@ class RiskPolicyEngine:
 
     def __init__(self, config: Optional[Dict[str, Any]] = None):
         cfg = dict(config or {})
-        self.default_reward_multiple = float(cfg.get("default_reward_multiple", 5.0))
-        self.min_reward_multiple = float(cfg.get("min_reward_multiple", 1.5))
-        self.max_reward_multiple = float(cfg.get("max_reward_multiple", 6.5))
-        self.atr_stop_multiplier = float(cfg.get("atr_stop_multiplier", 1.25))
+        self.default_reward_multiple = float(cfg.get("default_reward_multiple", 3.25))
+        self.min_reward_multiple = float(cfg.get("min_reward_multiple", 1.75))
+        self.max_reward_multiple = float(cfg.get("max_reward_multiple", 4.5))
+        self.atr_stop_multiplier = float(cfg.get("atr_stop_multiplier", 1.0))
         self.min_stop_roe_pct = float(cfg.get("min_stop_roe_pct", 0.01))
-        self.max_stop_roe_pct = float(cfg.get("max_stop_roe_pct", 0.35))
-        self.default_time_limit_hours = float(cfg.get("default_time_limit_hours", 24.0))
-        self.default_break_even_at_r = float(cfg.get("default_break_even_at_r", 1.0))
+        self.max_stop_roe_pct = float(cfg.get("max_stop_roe_pct", 0.15))
+        self.min_stop_price_pct = float(cfg.get("min_stop_price_pct", 0.004))
+        self.max_stop_price_pct = float(cfg.get("max_stop_price_pct", 0.025))
+        self.max_take_profit_price_pct = float(
+            cfg.get("max_take_profit_price_pct", 0.07)
+        )
+        self.stop_vol_cap_multiplier = float(
+            cfg.get("stop_vol_cap_multiplier", 2.5)
+        )
+        self.target_vol_cap_multiplier = float(
+            cfg.get("target_vol_cap_multiplier", 6.0)
+        )
+        self.default_time_limit_hours = float(cfg.get("default_time_limit_hours", 18.0))
+        self.default_break_even_at_r = float(cfg.get("default_break_even_at_r", 0.85))
         self.default_break_even_buffer_roe_pct = float(
             cfg.get("default_break_even_buffer_roe_pct", 0.005)
         )
-        self.default_trail_after_r = float(cfg.get("default_trail_after_r", 2.0))
+        self.default_trail_after_r = float(cfg.get("default_trail_after_r", 1.35))
         self.default_trailing_distance_ratio = float(
-            cfg.get("default_trailing_distance_ratio", 0.75)
+            cfg.get("default_trailing_distance_ratio", 0.65)
         )
         default_source_profiles: Dict[str, Dict[str, float]] = {
             "strategy": {"time_limit_hours": 24.0, "breakeven_at_r": 1.0, "trail_after_r": 2.0},
@@ -172,20 +183,64 @@ class RiskPolicyEngine:
         reward_multiple = min(max(reward_multiple, self.min_reward_multiple), self.max_reward_multiple)
         take_profit_roe_pct = stop_roe_pct * reward_multiple
 
+        stop_price_pct = stop_roe_pct / leverage
+        take_profit_price_pct = take_profit_roe_pct / leverage
+
+        dynamic_stop_cap = self.max_stop_price_pct
+        if volatility_pct > 0:
+            dynamic_stop_cap = min(
+                dynamic_stop_cap,
+                max(self.min_stop_price_pct, volatility_pct * self.stop_vol_cap_multiplier),
+            )
+        stop_price_pct = min(max(stop_price_pct, self.min_stop_price_pct), dynamic_stop_cap)
+
+        dynamic_target_cap = self.max_take_profit_price_pct
+        if volatility_pct > 0:
+            dynamic_target_cap = min(
+                dynamic_target_cap,
+                max(stop_price_pct * self.min_reward_multiple, volatility_pct * self.target_vol_cap_multiplier),
+            )
+        if expected_move_pct > 0:
+            dynamic_target_cap = min(
+                dynamic_target_cap,
+                max(stop_price_pct * self.min_reward_multiple, expected_move_pct * 1.15),
+            )
+        take_profit_price_pct = min(
+            max(take_profit_price_pct, stop_price_pct * self.min_reward_multiple),
+            dynamic_target_cap,
+        )
+
+        stop_roe_pct = min(
+            max(stop_price_pct * leverage, self.min_stop_roe_pct),
+            self.max_stop_roe_pct,
+        )
+        take_profit_roe_pct = take_profit_price_pct * leverage
+        reward_multiple = max(
+            1.0,
+            min(self.max_reward_multiple, take_profit_roe_pct / stop_roe_pct),
+        )
+
+        if stop_price_pct >= dynamic_stop_cap - 1e-9:
+            rationale.append(f"stop_cap={dynamic_stop_cap:.3%}")
+        if take_profit_price_pct >= dynamic_target_cap - 1e-9:
+            rationale.append(f"target_cap={dynamic_target_cap:.3%}")
+
         time_limit_hours = float(profile.get("time_limit_hours", self.default_time_limit_hours))
         if regime in {"crash", "volatile"}:
             time_limit_hours = max(2.0, time_limit_hours - 4.0)
         elif regime in {"trending_up", "trending_down", "bullish", "bearish"}:
             time_limit_hours = min(72.0, time_limit_hours + 4.0)
+        if stop_price_pct >= self.max_stop_price_pct * 0.9:
+            time_limit_hours = min(time_limit_hours, max(6.0, self.default_time_limit_hours))
 
         breakeven_at_r = float(profile.get("breakeven_at_r", self.default_break_even_at_r))
         if signal.confidence >= 0.80:
-            breakeven_at_r += 0.25
+            breakeven_at_r += 0.15
         elif regime in {"crash", "volatile"}:
             breakeven_at_r = max(0.5, breakeven_at_r - 0.25)
 
         trail_after_r = max(
-            breakeven_at_r + 0.25,
+            breakeven_at_r + 0.20,
             float(profile.get("trail_after_r", self.default_trail_after_r)),
         )
         trailing_distance_roe_pct = max(

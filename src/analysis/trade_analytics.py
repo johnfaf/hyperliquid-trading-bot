@@ -98,21 +98,24 @@ def compute_trade_analytics(
     trades: Iterable[Dict],
     *,
     source_limit: int = 12,
+    coin_side_limit: int = 12,
 ) -> Dict:
     summary = _new_bucket()
     by_side = defaultdict(_new_bucket)
     by_source = defaultdict(_new_bucket)
+    by_coin_side = defaultdict(_new_bucket)
 
     for trade in trades or []:
         pnl = _coerce_float(trade.get("pnl", 0.0))
         side = str(trade.get("side", "") or "unknown").strip().lower() or "unknown"
+        coin = str(trade.get("coin", "") or "unknown").strip().upper() or "UNKNOWN"
         meta = _trade_metadata(trade)
         fees = _coerce_float(meta.get("total_fees_paid", 0.0))
         slippage = _coerce_float(meta.get("total_slippage_cost", 0.0))
         gross_pnl = _coerce_float(meta.get("gross_pnl_before_fees", pnl + fees))
         source_key = _trade_source_label(trade)
 
-        for bucket in (summary, by_side[side], by_source[source_key]):
+        for bucket in (summary, by_side[side], by_source[source_key], by_coin_side[(coin, side)]):
             bucket["count"] += 1
             bucket["net_pnl"] += pnl
             bucket["gross_pnl"] += gross_pnl
@@ -134,6 +137,15 @@ def compute_trade_analytics(
         if bucket.get("count")
     ]
     source_rows.sort(key=lambda row: (row["net_pnl"], row["win_rate"], row["count"]), reverse=True)
+    coin_side_rows = []
+    for (coin, side), bucket in by_coin_side.items():
+        if not bucket.get("count"):
+            continue
+        row = _finalize_bucket(f"{coin} {side}", bucket)
+        row["coin"] = coin
+        row["side"] = side
+        coin_side_rows.append(row)
+    coin_side_rows.sort(key=lambda row: (row["net_pnl"], -row["count"], row["label"]))
 
     short_row = next((row for row in side_rows if row["label"] == "short"), None)
     long_row = next((row for row in side_rows if row["label"] == "long"), None)
@@ -142,6 +154,7 @@ def compute_trade_analytics(
         "summary": _finalize_bucket("all", summary),
         "by_side": side_rows,
         "by_source": source_rows[:source_limit],
+        "by_coin_side": coin_side_rows[:coin_side_limit],
         "short_vs_long": {
             "short_trades": int(short_row["count"]) if short_row else 0,
             "short_net_pnl": float(short_row["net_pnl"]) if short_row else 0.0,

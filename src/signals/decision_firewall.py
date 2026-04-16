@@ -71,25 +71,29 @@ class DecisionFirewall:
             1, int(cfg.get("short_hardening_min_closed_trades", 12))
         )
         self.short_hardening_degrade_win_rate = float(
-            cfg.get("short_hardening_degrade_win_rate", 0.45)
+            cfg.get("short_hardening_degrade_win_rate", 0.48)
         )
         self.short_hardening_block_win_rate = float(
-            cfg.get("short_hardening_block_win_rate", 0.35)
+            cfg.get("short_hardening_block_win_rate", 0.40)
         )
         self.short_hardening_block_net_pnl = float(
-            cfg.get("short_hardening_block_net_pnl", -1.0)
+            cfg.get("short_hardening_block_net_pnl", -0.5)
         )
         self.short_hardening_confidence_multiplier = float(
-            cfg.get("short_hardening_confidence_multiplier", 0.85)
+            cfg.get("short_hardening_confidence_multiplier", 0.80)
         )
         self.short_hardening_size_multiplier = float(
-            cfg.get("short_hardening_size_multiplier", 0.60)
+            cfg.get("short_hardening_size_multiplier", 0.50)
         )
         self.canary_mode = bool(cfg.get("canary_mode", False))
         self.canary_max_positions = max(1, int(cfg.get("canary_max_positions", 2)))
-        # Lowered from 300 → 60: 5-minute cooldown was blocking re-entries
-        # during paper trading when signals fire frequently on the same coin.
-        self.cooldown_seconds = cfg.get("cooldown_seconds", 60)
+        self.cooldown_seconds = int(cfg.get("cooldown_seconds", 180))
+        self.same_side_cooldown_seconds = int(
+            cfg.get("same_side_cooldown_seconds", 900)
+        )
+        self.max_same_side_positions_per_coin = max(
+            1, int(cfg.get("max_same_side_positions_per_coin", 2))
+        )
         self.daily_loss_limit_pct = cfg.get("daily_loss_limit_pct", 0.03)
         if self.canary_mode:
             self.max_positions = min(self.max_positions, self.canary_max_positions)
@@ -134,6 +138,7 @@ class DecisionFirewall:
         # State tracking (protected by _lock for thread safety)
         self._lock = threading.RLock()
         self._recent_trades: Dict[str, float] = {}  # coin -> last trade timestamp
+        self._recent_side_trades: Dict[Tuple[str, str], float] = {}
         self._daily_losses: float = 0.0
         self._daily_reset_date: str = ""
         self._source_signal_counts: Dict[str, int] = defaultdict(int)
@@ -150,6 +155,7 @@ class DecisionFirewall:
             "rejected_regime": 0,
             "rejected_conflict": 0,
             "rejected_cooldown": 0,
+            "rejected_pyramiding": 0,
             "rejected_accuracy": 0,
             "rejected_source_cap": 0,
             "rejected_source_policy": 0,
@@ -271,15 +277,35 @@ class DecisionFirewall:
                     self.short_hardening_size_multiplier,
                 )
             )
+            self.cooldown_seconds = int(
+                overrides.get("FIREWALL_COIN_COOLDOWN_SECONDS", self.cooldown_seconds)
+            )
+            self.same_side_cooldown_seconds = int(
+                overrides.get(
+                    "FIREWALL_SAME_SIDE_COOLDOWN_SECONDS",
+                    self.same_side_cooldown_seconds,
+                )
+            )
+            self.max_same_side_positions_per_coin = max(
+                1,
+                int(
+                    overrides.get(
+                        "FIREWALL_MAX_SAME_SIDE_POSITIONS_PER_COIN",
+                        self.max_same_side_positions_per_coin,
+                    )
+                ),
+            )
             self._side_policy_cache = {"ts": 0.0, "short": {}}
 
         logger.info(
             "DecisionFirewall runtime overrides applied: min_confidence=%s, source_cap=%s, "
-            "short_hardening=%s, event_risk=%s",
+            "short_hardening=%s, event_risk=%s, coin_cooldown=%ss, same_side_cooldown=%ss",
             f"{self.min_confidence:.0%}",
             self.max_signals_per_source_per_day,
             self.short_hardening_enabled,
             self.event_risk_enabled,
+            self.cooldown_seconds,
+            self.same_side_cooldown_seconds,
         )
 
     def _get_short_side_policy(self) -> Dict:
@@ -542,6 +568,10 @@ class DecisionFirewall:
             signal.leverage = self.max_leverage  # Clamp instead of reject
             logger.info(f"Clamped leverage to {self.max_leverage}x for {signal.coin}")
 
+        side_value = (
+            signal.side.value if hasattr(signal.side, "value") else str(signal.side)
+        ).strip().lower()
+
         # 4. Position limits
         positions = open_positions if open_positions is not None else db.get_open_paper_trades()
         if not ignore_position_limit and len(positions) >= self.max_positions:
@@ -553,6 +583,16 @@ class DecisionFirewall:
         if len(coin_positions) >= self.max_per_coin:
             return _reject("rejected_risk",
                           f"Max positions for {signal.coin} ({len(coin_positions)}/{self.max_per_coin})")
+        same_side_positions = [
+            p for p in coin_positions
+            if str(p.get("side", "") or "").strip().lower() == side_value
+        ]
+        if len(same_side_positions) >= self.max_same_side_positions_per_coin:
+            return _reject(
+                "rejected_pyramiding",
+                f"Pyramiding blocked: {signal.coin} already has "
+                f"{len(same_side_positions)} {side_value} positions",
+            )
 
         # 5b. Aggregate portfolio exposure — hard cap across ALL positions
         balance = account_balance
@@ -583,10 +623,10 @@ class DecisionFirewall:
 
         # 6. Conflict detection — no opposing positions on same coin
         for pos in coin_positions:
-            if pos.get("side") != signal.side.value:
+            if str(pos.get("side", "") or "").strip().lower() != side_value:
                 return _reject("rejected_conflict",
                               f"Conflict: have {pos.get('side')} {signal.coin}, "
-                              f"signal wants {signal.side.value}")
+                              f"signal wants {side_value}")
 
         # 7. Cooldown — prevent revenge trading
         now = time.time()
@@ -595,6 +635,13 @@ class DecisionFirewall:
             remaining = int(self.cooldown_seconds - (now - last_trade_ts))
             return _reject("rejected_cooldown",
                           f"Cooldown: {signal.coin} traded {remaining}s ago")
+        last_same_side_ts = self._recent_side_trades.get((signal.coin, side_value), 0)
+        if now - last_same_side_ts < self.same_side_cooldown_seconds:
+            remaining = int(self.same_side_cooldown_seconds - (now - last_same_side_ts))
+            return _reject(
+                "rejected_pyramiding",
+                f"Pyramiding cooldown: {signal.coin} {side_value} traded {remaining}s ago",
+            )
 
         # 8. Regime alignment check
         if regime_data:
@@ -685,6 +732,7 @@ class DecisionFirewall:
         if not dry_run:
             self.stats["passed"] += 1
             self._recent_trades[signal.coin] = now
+            self._recent_side_trades[(signal.coin, side_value)] = now
             if effective_source_cap > 0:
                 self._source_signal_counts[source_key] += 1
 
@@ -811,6 +859,9 @@ class DecisionFirewall:
                 key=lambda x: x[1], default=("none", 0)
             )[0],
             "canary_mode": self.canary_mode,
+            "coin_cooldown_seconds": int(self.cooldown_seconds),
+            "same_side_cooldown_seconds": int(self.same_side_cooldown_seconds),
+            "max_same_side_positions_per_coin": int(self.max_same_side_positions_per_coin),
             "max_signals_per_source_per_day": int(self.max_signals_per_source_per_day),
             "source_signal_counts": dict(self._source_signal_counts),
             "source_policies": self.agent_scorer.get_scorecard() if self.agent_scorer else [],

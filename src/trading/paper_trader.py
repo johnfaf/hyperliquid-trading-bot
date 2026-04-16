@@ -158,17 +158,17 @@ class PaperTrader:
         take_price_pct = abs(take_profit - entry_price) / entry_price if entry_price > 0 and take_profit > 0 else 0.0
         stop_roe_pct = stop_price_pct * leverage
         take_roe_pct = take_price_pct * leverage
-        reward_multiple = (take_roe_pct / stop_roe_pct) if stop_roe_pct > 0 and take_roe_pct > 0 else 5.0
+        reward_multiple = (take_roe_pct / stop_roe_pct) if stop_roe_pct > 0 and take_roe_pct > 0 else 3.0
         return {
             "stop_roe_pct": stop_roe_pct,
             "take_profit_roe_pct": take_roe_pct,
             "reward_multiple": reward_multiple,
-            "time_limit_hours": 24.0,
-            "breakeven_at_r": 1.0,
+            "time_limit_hours": 18.0,
+            "breakeven_at_r": 0.85,
             "breakeven_buffer_roe_pct": 0.005,
-            "trail_after_r": 2.0,
+            "trail_after_r": 1.35,
             "trailing_enabled": True,
-            "trailing_distance_roe_pct": max(stop_roe_pct * 0.75, 0.01),
+            "trailing_distance_roe_pct": max(stop_roe_pct * 0.65, 0.01),
         }
 
     def _resolve_trade_risk_policy(self, trade: Dict) -> Dict[str, float]:

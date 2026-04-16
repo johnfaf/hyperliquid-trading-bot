@@ -1504,24 +1504,98 @@ class LiveTrader:
         if entry_price > 0 and take_profit > 0:
             take_price_pct = abs(take_profit - entry_price) / entry_price
         else:
-            take_price_pct = stop_price_pct * 5.0
+            take_price_pct = stop_price_pct * 3.0
         stop_roe_pct = stop_price_pct * leverage
         take_roe_pct = take_price_pct * leverage
         reward_multiple = (
-            take_roe_pct / stop_roe_pct if stop_roe_pct > 0 and take_roe_pct > 0 else 5.0
+            take_roe_pct / stop_roe_pct if stop_roe_pct > 0 and take_roe_pct > 0 else 3.0
         )
-        return {
+        return self._normalize_shadow_risk_policy(
+            {
             "stop_roe_pct": stop_roe_pct,
             "take_profit_roe_pct": take_roe_pct,
             "reward_multiple": reward_multiple,
-            "time_limit_hours": 24.0,
-            "breakeven_at_r": 1.0,
+            "time_limit_hours": 18.0,
+            "breakeven_at_r": 0.85,
             "breakeven_buffer_roe_pct": 0.005,
-            "trail_after_r": 2.0,
+            "trail_after_r": 1.35,
             "trailing_enabled": True,
-            "trailing_distance_roe_pct": max(stop_roe_pct * 0.75, 0.01),
+            "trailing_distance_roe_pct": max(stop_roe_pct * 0.65, 0.01),
             "policy_version": "fallback_v1",
-        }
+            },
+            leverage=leverage,
+        )
+
+    def _normalize_shadow_risk_policy(
+        self,
+        policy: Dict[str, Any],
+        *,
+        leverage: float,
+    ) -> Dict[str, float]:
+        normalized = dict(policy or {})
+        leverage = max(self._coerce_float(leverage, 1.0), 1.0)
+        engine = self.risk_policy_engine
+        min_stop_price_pct = float(
+            getattr(engine, "min_stop_price_pct", config.RISK_POLICY_MIN_STOP_PRICE_PCT)
+        )
+        max_stop_price_pct = float(
+            getattr(engine, "max_stop_price_pct", config.RISK_POLICY_MAX_STOP_PRICE_PCT)
+        )
+        max_take_profit_price_pct = float(
+            getattr(
+                engine,
+                "max_take_profit_price_pct",
+                config.RISK_POLICY_MAX_TAKE_PROFIT_PRICE_PCT,
+            )
+        )
+        min_reward_multiple = float(
+            getattr(engine, "min_reward_multiple", config.RISK_POLICY_MIN_REWARD_MULTIPLE)
+        )
+
+        stop_roe_pct = max(self._coerce_float(normalized.get("stop_roe_pct"), 0.0), 0.0)
+        take_profit_roe_pct = max(
+            self._coerce_float(normalized.get("take_profit_roe_pct"), 0.0), 0.0
+        )
+        if stop_roe_pct <= 0:
+            stop_roe_pct = min_stop_price_pct * leverage
+
+        stop_price_pct = min(
+            max(stop_roe_pct / leverage, min_stop_price_pct),
+            max_stop_price_pct,
+        )
+        take_profit_price_pct = max(take_profit_roe_pct / leverage, 0.0)
+        take_profit_price_pct = min(
+            max(take_profit_price_pct, stop_price_pct * min_reward_multiple),
+            max_take_profit_price_pct,
+        )
+
+        normalized["stop_roe_pct"] = stop_price_pct * leverage
+        normalized["take_profit_roe_pct"] = take_profit_price_pct * leverage
+        normalized["reward_multiple"] = (
+            normalized["take_profit_roe_pct"] / normalized["stop_roe_pct"]
+            if normalized["stop_roe_pct"] > 0
+            else min_reward_multiple
+        )
+        normalized["time_limit_hours"] = min(
+            self._coerce_float(normalized.get("time_limit_hours"), 18.0) or 18.0,
+            18.0,
+        )
+        normalized["breakeven_at_r"] = min(
+            max(self._coerce_float(normalized.get("breakeven_at_r"), 0.85), 0.5),
+            1.0,
+        )
+        normalized["trail_after_r"] = min(
+            max(self._coerce_float(normalized.get("trail_after_r"), 1.35), 0.75),
+            1.75,
+        )
+        normalized["trailing_distance_roe_pct"] = min(
+            max(
+                self._coerce_float(normalized.get("trailing_distance_roe_pct"), 0.0),
+                normalized["stop_roe_pct"] * 0.5,
+            ),
+            normalized["stop_roe_pct"],
+        )
+        return normalized
 
     def _aggregate_shadow_risk_policy(
         self,
@@ -1554,6 +1628,14 @@ class LiveTrader:
             policy = metadata.get("risk_policy", {})
             if not isinstance(policy, dict) or not policy.get("stop_roe_pct"):
                 policy = self._fallback_shadow_risk_policy(trade, live_position=live_position)
+            else:
+                policy = self._normalize_shadow_risk_policy(
+                    policy,
+                    leverage=self._coerce_float(
+                        (live_position or {}).get("leverage", trade.get("leverage", 1)),
+                        1.0,
+                    ),
+                )
 
             weight = max(
                 self._coerce_float(trade.get("size"), 0.0)

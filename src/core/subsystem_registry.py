@@ -290,10 +290,17 @@ def build_subsystems(
                 getattr(_fw_cfg, "SHORT_HARDENING_BLOCK_NET_PNL", -1.0)
             ),
             "short_hardening_confidence_multiplier": float(
-                getattr(_fw_cfg, "SHORT_HARDENING_CONFIDENCE_MULTIPLIER", 0.85)
+                getattr(_fw_cfg, "SHORT_HARDENING_CONFIDENCE_MULTIPLIER", 0.80)
             ),
             "short_hardening_size_multiplier": float(
-                getattr(_fw_cfg, "SHORT_HARDENING_SIZE_MULTIPLIER", 0.60)
+                getattr(_fw_cfg, "SHORT_HARDENING_SIZE_MULTIPLIER", 0.50)
+            ),
+            "cooldown_seconds": int(getattr(_fw_cfg, "FIREWALL_COIN_COOLDOWN_SECONDS", 180)),
+            "same_side_cooldown_seconds": int(
+                getattr(_fw_cfg, "FIREWALL_SAME_SIDE_COOLDOWN_SECONDS", 900)
+            ),
+            "max_same_side_positions_per_coin": int(
+                getattr(_fw_cfg, "FIREWALL_MAX_SAME_SIDE_POSITIONS_PER_COIN", 2)
             ),
             "canary_mode": bool(getattr(_fw_cfg, "FIREWALL_CANARY_MODE", False)),
             "canary_max_positions": int(getattr(_fw_cfg, "FIREWALL_CANARY_MAX_POSITIONS", 2)),
@@ -371,6 +378,11 @@ def build_subsystems(
                     "atr_stop_multiplier": config.RISK_POLICY_ATR_STOP_MULTIPLIER,
                     "min_stop_roe_pct": config.RISK_POLICY_MIN_STOP_ROE_PCT,
                     "max_stop_roe_pct": config.RISK_POLICY_MAX_STOP_ROE_PCT,
+                    "min_stop_price_pct": config.RISK_POLICY_MIN_STOP_PRICE_PCT,
+                    "max_stop_price_pct": config.RISK_POLICY_MAX_STOP_PRICE_PCT,
+                    "max_take_profit_price_pct": config.RISK_POLICY_MAX_TAKE_PROFIT_PRICE_PCT,
+                    "stop_vol_cap_multiplier": config.RISK_POLICY_STOP_VOL_CAP_MULTIPLIER,
+                    "target_vol_cap_multiplier": config.RISK_POLICY_TARGET_VOL_CAP_MULTIPLIER,
                     "default_time_limit_hours": config.RISK_POLICY_DEFAULT_TIME_LIMIT_HOURS,
                     "default_break_even_at_r": config.RISK_POLICY_DEFAULT_BREAKEVEN_AT_R,
                     "default_break_even_buffer_roe_pct": config.RISK_POLICY_DEFAULT_BREAKEVEN_BUFFER_ROE_PCT,
