@@ -28,11 +28,10 @@ Design choices:
 from __future__ import annotations
 
 import logging
-import math
 import re
 import threading
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from html import unescape
 from typing import Any, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo

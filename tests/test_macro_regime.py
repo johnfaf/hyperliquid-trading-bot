@@ -1,9 +1,6 @@
 """Tests for the macro regime protective overlay."""
-import json
 import time
-from unittest.mock import patch, MagicMock
-
-import pytest
+from unittest.mock import MagicMock
 
 from src.data.macro_regime_scraper import (
     MacroRegimeScraper,
