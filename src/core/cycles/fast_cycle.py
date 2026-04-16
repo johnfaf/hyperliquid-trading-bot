@@ -192,21 +192,37 @@ def _scan_whale_trades(container) -> None:
                         # Convert signals back to dict format for signal processor
                         whale_signal_dicts = [
                             {
+                                "id": None,
+                                "name": f"whale_{sig.coin}_{sig.side.value}",
                                 "type": "whale_trade",
                                 "coin": sig.coin,
                                 "side": sig.side.value,
+                                "direction": sig.side.value,
                                 "confidence": sig.confidence,
                                 "strategy_type": "whale_detection",
                                 "current_score": sig.confidence,
+                                "source": "whale_trade",
                                 "reason": sig.reason,
-                                "notional": next(w["notional"] for w in whales if w["coin"] == sig.coin),
+                                "parameters": {
+                                    "coins": [sig.coin],
+                                },
+                                "metadata": {
+                                    "notional": next(
+                                        (w["notional"] for w in whales if w["coin"] == sig.coin), 0
+                                    ),
+                                },
                             }
                             for sig in whale_signals
                         ]
-                        # Note: signal_processor.process() expects strategy dicts
-                        # These whale dicts will be treated as low-priority signals
-                        # and may be culled if they don't meet the threshold
-                        logger.debug(f"[whale] Feeding {len(whale_signal_dicts)} whale signals to processor")
+                        # BUG-3 FIX: actually dispatch whale signals to the
+                        # processor.  Previously the dicts were built and logged
+                        # but never sent, making whale detection purely cosmetic.
+                        # Queue them for the next trading cycle via container
+                        # attribute so they get injected into top_strategies.
+                        if not hasattr(container, "_whale_strategy_queue"):
+                            container._whale_strategy_queue = []
+                        container._whale_strategy_queue.extend(whale_signal_dicts)
+                        logger.info(f"[whale] Queued {len(whale_signal_dicts)} whale signals for next trading cycle")
                     except Exception as e:
                         logger.debug(f"[whale] Could not feed signals to processor: {e}")
 

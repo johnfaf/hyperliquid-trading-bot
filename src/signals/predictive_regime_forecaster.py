@@ -35,9 +35,10 @@ import time
 import os
 from typing import Dict, Optional, Tuple
 from collections import deque
-
 import requests
 import numpy as np
+
+from src.core.api_manager import get_manager, Priority
 
 logger = logging.getLogger(__name__)
 
@@ -141,6 +142,8 @@ class PredictiveRegimeForecaster:
         self._options_ts: float = 0.0
         self._external_data_ttl = cfg.get("external_data_ttl", 600)  # 10 min staleness limit
         self._external_data_partial_ttl = cfg.get("external_data_partial_ttl", 1800)  # 30 min
+        
+        self.api_manager = get_manager()
 
         logger.info("PredictiveRegimeForecaster V2 initialized (5-input model)")
 
@@ -427,13 +430,12 @@ class PredictiveRegimeForecaster:
         Returns normalized value in [-1, +1].
         """
         try:
-            resp = requests.post(
-                self.hl_info_url,
-                json={"type": "metaAndAssetCtxs"},
+            resp = self.api_manager.post(
+                {"type": "metaAndAssetCtxs"},
+                priority=Priority.NORMAL,
                 timeout=5
             )
-            resp.raise_for_status()
-            data = resp.json()
+            data = resp
 
             # Find the coin's funding rate
             if len(data) >= 2:
@@ -475,13 +477,11 @@ class PredictiveRegimeForecaster:
           -1 = strongly ask-heavy (bearish)
         """
         try:
-            resp = requests.post(
-                self.hl_info_url,
-                json={"type": "l2Book", "coin": coin},
+            book = self.api_manager.post(
+                {"type": "l2Book", "coin": coin},
+                priority=Priority.NORMAL,
                 timeout=5
             )
-            resp.raise_for_status()
-            book = resp.json()
 
             levels = book.get("levels", [[], []])
             if len(levels) < 2:

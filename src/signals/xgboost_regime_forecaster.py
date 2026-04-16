@@ -46,6 +46,7 @@ except ImportError:
                 "pip install xgboost scikit-learn to enable.")
 
 from src.signals.predictive_regime_forecaster import PredictiveRegimeForecaster
+from src.core.api_manager import get_manager, Priority
 
 # Try importing crypto.com client for enhanced signals
 try:
@@ -304,14 +305,13 @@ class XGBoostRegimeForecaster:
     def _get_funding_rate(self, coin: str) -> float:
         """Get current funding rate from Hyperliquid."""
         try:
-            import requests
-            resp = requests.post(
-                self.fallback.hl_info_url,
-                json={"type": "metaAndAssetCtxs"},
+            resp = get_manager().post(
+                {"type": "metaAndAssetCtxs"},
+                priority=Priority.NORMAL,
                 timeout=5,
             )
-            if resp.ok:
-                data = resp.json()
+            if resp:
+                data = resp
                 if len(data) >= 2:
                     meta, asset_ctxs = data[0], data[1]
                     for i, asset in enumerate(meta.get("universe", [])):
@@ -327,11 +327,9 @@ class XGBoostRegimeForecaster:
         Returns normalized value in [0, 1] range.
         """
         try:
-            import requests
             now_ms = int(time.time() * 1000)
-            resp = requests.post(
-                self.fallback.hl_info_url,
-                json={
+            candles = get_manager().post(
+                {
                     "type": "candleSnapshot",
                     "req": {
                         "coin": coin,
@@ -340,10 +338,10 @@ class XGBoostRegimeForecaster:
                         "endTime": now_ms,
                     },
                 },
+                priority=Priority.NORMAL,
                 timeout=5,
             )
-            if resp.ok:
-                candles = resp.json()
+            if isinstance(candles, list):
                 if len(candles) >= 5:
                     closes = [float(c["c"]) for c in candles[-12:]]
                     if len(closes) >= 2:

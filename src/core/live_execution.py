@@ -175,7 +175,18 @@ def sync_shadow_book_to_live(container) -> List[Dict]:
             "reconciliation_exit_price": current_price,
         })
         db.update_paper_trade_metadata(trade_id, existing_meta)
-        if not db.close_paper_trade(trade_id, current_price, 0.0):
+        # BUG-4 FIX: calculate actual PnL instead of hardcoding 0.0.
+        # Without this, reconciled trades permanently lose their PnL
+        # in the DB, making forensic analysis impossible.
+        entry_price = float(trade.get("entry_price", 0) or 0)
+        trade_size = float(trade.get("size", 0) or 0)
+        trade_leverage = float(trade.get("leverage", 1) or 1)
+        if trade.get("side") == "long":
+            reconciled_pnl = (current_price - entry_price) * trade_size * trade_leverage
+        else:
+            reconciled_pnl = (entry_price - current_price) * trade_size * trade_leverage
+        reconciled_pnl = round(reconciled_pnl, 2)
+        if not db.close_paper_trade(trade_id, current_price, reconciled_pnl):
             continue
         _notify_manual_close_detected(
             {

@@ -749,30 +749,31 @@ class DecisionFirewall:
     def _get_funding_rate(self, coin: str) -> float:
         """
         Fetch current funding rate from Hyperliquid (cached).
-        Returns annualized rate approximation.
+        Returns per-8h rate (NOT annualized).
         """
         now = time.time()
         if now - self._funding_cache_ts < self._funding_cache_ttl and coin in self._funding_cache:
             return self._funding_cache[coin]
 
         try:
-            import requests
-            resp = requests.post(
-                "https://api.hyperliquid.xyz/info",
-                json={"type": "metaAndAssetCtxs"},
-                timeout=5
+            # BUG-5 FIX: route through the centralized APIManager instead of
+            # raw requests.post().  The old code bypassed rate limiting, TTL
+            # cache, and the circuit breaker, risking untracked 429 responses.
+            from src.core.api_manager import get_manager, Priority
+            data = get_manager().post(
+                payload={"type": "metaAndAssetCtxs"},
+                priority=Priority.NORMAL,
+                timeout=5,
             )
-            if resp.ok:
-                data = resp.json()
-                if len(data) >= 2:
-                    meta = data[0]
-                    asset_ctxs = data[1]
-                    for i, asset in enumerate(meta.get("universe", [])):
-                        if i < len(asset_ctxs):
-                            name = asset.get("name", "").upper()
-                            rate = float(asset_ctxs[i].get("funding", 0))
-                            self._funding_cache[name] = rate
-                    self._funding_cache_ts = now
+            if isinstance(data, list) and len(data) >= 2:
+                meta = data[0]
+                asset_ctxs = data[1]
+                for i, asset in enumerate(meta.get("universe", [])):
+                    if i < len(asset_ctxs):
+                        name = asset.get("name", "").upper()
+                        rate = float(asset_ctxs[i].get("funding", 0))
+                        self._funding_cache[name] = rate
+                self._funding_cache_ts = now
         except Exception as e:
             logger.debug(f"Funding rate fetch failed: {e}")
 

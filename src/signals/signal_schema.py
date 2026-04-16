@@ -225,7 +225,10 @@ class TradeSignal:
             return False
         if not 0.0 <= self.confidence <= 1.0:
             return False
-        if self.position_pct <= 0 or self.position_pct > 0.25:
+        # BUG-6 FIX: raised cap from 0.25 to 0.50 so Kelly/RL dynamic
+        # sizers don't get silently rejected. The firewall's own
+        # max-position-pct check (configurable) is the real guardrail.
+        if self.position_pct <= 0 or self.position_pct > 0.50:
             return False
         if self.leverage < 1 or self.leverage > 20:
             return False

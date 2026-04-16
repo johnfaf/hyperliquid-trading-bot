@@ -714,18 +714,16 @@ class LiveTrader:
         if not self.signer or not self.public_address:
             return
         try:
-            response = requests.post(
-                self.info_url,
-                json={"type": "extraAgents", "user": self.public_address},
+            data = self.api_manager.post(
+                {"type": "extraAgents", "user": self.public_address},
+                priority=Priority.NORMAL,
                 timeout=10,
             )
-            if response.status_code != 200:
+            if data is None:
                 logger.debug(
-                    "extraAgents check returned HTTP %s — skipping validation",
-                    response.status_code,
+                    "extraAgents check returned None — skipping validation",
                 )
                 return
-            data = response.json()
             agents = data if isinstance(data, list) else data.get("agents", []) if isinstance(data, dict) else []
             signer_addr = self.signer.address.lower()
             approved = [

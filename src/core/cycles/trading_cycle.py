@@ -556,6 +556,14 @@ def run_trading_cycle(container, cycle_count: int) -> None:
             except Exception as exc:
                 logger.warning("  Alpha pipeline signal generation error: %s", exc)
 
+        # BUG-3 FIX (consumption): drain any whale signals queued by fast_cycle
+        # into the trading pipeline so they actually influence decisions.
+        whale_queue = getattr(container, "_whale_strategy_queue", None)
+        if whale_queue:
+            top_strategies.extend(whale_queue)
+            logger.info("  Injected %d whale trade signals from fast cycle", len(whale_queue))
+            container._whale_strategy_queue = []
+
         # Keep the shadow ledger synced to exchange truth when live mode is active.
         if is_live_trading_active(container):
             closed = sync_shadow_book_to_live(container)
@@ -848,7 +856,10 @@ def _execute_lcrs_signals(container, lcrs_signals, regime_data):
         from src.signals.signal_schema import TradeSignal, SignalSide, SignalSource, RiskParams
         lcrs_executed = []
         open_trades = get_execution_open_positions(container)
-        account = None
+        # BUG-2 FIX: load account BEFORE the loop so dynamic sizing
+        # (Kelly/RL) is actually applied to LCRS trades.  Previously
+        # `account` was None at the sizing check, making it dead code.
+        account = db.get_paper_account()
 
         for sig in lcrs_signals:
             try:
@@ -1179,8 +1190,12 @@ def _process_closed_trades(container, closed):
             entry = c_trade.get("entry_price", 1)
             size = c_trade.get("size", 0)
             leverage = c_trade.get("leverage", 1)
-            notional = entry * max(size, 1e-8)
-            return_pct = pnl / max(notional, 1)
+            # BUG-1 FIX: include leverage in notional so return_pct
+            # matches how `pnl` was calculated (with leverage).  Without
+            # this, return_pct was inflated by the leverage factor,
+            # poisoning arena fitness scores and agent scorer weights.
+            notional = entry * max(size, 1e-8) * max(leverage, 1)
+            return_pct = pnl / max(notional, 1e-8)
 
             if container.arena:
                 container.arena.record_trade_for_strategy(stype, pnl, return_pct)
@@ -1339,9 +1354,11 @@ def _run_alpha_arena(container, regime_data):
                                         logger.debug("  Arena paper sizing failed: %s", exc)
                                 size_usd = account["balance"] * position_pct
                                 size = size_usd / price
+                                # SILENT-4 FIX: use risk-policy-adjusted leverage
+                                # instead of hardcoded 2x.
                                 db.open_paper_trade(
                                     strategy_id=None, coin=sig["coin"], side=side,
-                                    entry_price=price, size=size, leverage=2,
+                                    entry_price=price, size=size, leverage=live_signal.leverage,
                                     stop_loss=sl, take_profit=tp,
                                     metadata={
                                         "source": "arena_champion",
