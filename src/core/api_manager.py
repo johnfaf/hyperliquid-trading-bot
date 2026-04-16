@@ -881,6 +881,18 @@ class APIManager:
                     )
                     return None, "client_error"
 
+                # ── 500 + null text: Hyperliquid specific client error — don't retry ──
+                # Hyperliquid returns 500 with a body of literally "null" for some
+                # invalid payloads (e.g. candleSnapshot on an invalid/delisted coin).
+                # We categorize this as a client error to avoid tripping the fail-fast
+                # server-error circuit breaker.
+                if resp.status_code == 500 and resp.text and resp.text.strip() == "null":
+                    logger.warning(
+                        f"CLIENT_ERROR {resp.status_code} (null payload) type='{req_type}': "
+                        f"treated as invalid parameters/coin (not retrying)"
+                    )
+                    return None, "client_error"
+
                 # ── 5xx: Server error — retry with backoff ──
                 if resp.status_code >= 500:
                     failure_kind = "server_error"
