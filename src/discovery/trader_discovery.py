@@ -6,7 +6,7 @@ Analyzes their positions, trading patterns, and performance over time.
 import logging
 import time
 from datetime import datetime, timedelta, timezone
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 
 import sys
 import os
@@ -16,6 +16,48 @@ from src.data import hyperliquid_client as hl
 from src.data import database as db
 
 logger = logging.getLogger(__name__)
+
+# Cached leaderboard response schema key so we only probe all candidates once
+# and then use the known key on every subsequent call.
+_leaderboard_schema_key: Optional[str] = None
+
+
+def _detect_leaderboard_schema(data) -> Tuple[List, Optional[str]]:
+    """
+    Detect which key holds the list of trader entries in a leaderboard response.
+    Caches the discovered key in _leaderboard_schema_key so future calls can
+    skip the probe loop entirely.
+
+    Returns (entries_list, detected_key_or_None).
+    """
+    global _leaderboard_schema_key
+
+    if isinstance(data, list):
+        return data, None  # Response IS the list
+
+    if isinstance(data, dict):
+        # Use cached key if we've seen this API before
+        if _leaderboard_schema_key and _leaderboard_schema_key in data:
+            val = data[_leaderboard_schema_key]
+            if isinstance(val, list):
+                return val, _leaderboard_schema_key
+
+        # Probe known candidates
+        for key in ["leaderboardRows", "rows", "data", "traders", "leaderboard",
+                    "result", "results", "entries", "positions"]:
+            if key in data and isinstance(data[key], list):
+                _leaderboard_schema_key = key
+                logger.info("Leaderboard schema detected: key='%s' (%d entries)", key, len(data[key]))
+                return data[key], key
+
+        # Fallback: first list-valued key with content
+        for key, val in data.items():
+            if isinstance(val, list) and len(val) > 0:
+                _leaderboard_schema_key = key
+                logger.info("Leaderboard schema fallback: key='%s' (%d entries)", key, len(val))
+                return val, key
+
+    return [], None
 
 
 
@@ -145,37 +187,23 @@ class TraderDiscovery:
 
     def _parse_leaderboard(self, data) -> List[Dict]:
         """Parse leaderboard API response into trader dicts.
-        Handles multiple possible response formats flexibly."""
+        Handles multiple possible response formats flexibly.
+
+        Uses module-level schema detection/caching so the probe loop runs at
+        most once per process lifetime.  Subsequent calls skip straight to the
+        known key.
+        """
         traders = []
 
-        # Log the raw structure to help debug
-        if isinstance(data, dict):
-            logger.info(f"Leaderboard response keys: {list(data.keys())}")
-        elif isinstance(data, list):
-            logger.info(f"Leaderboard response is list of {len(data)} items")
-            if data and isinstance(data[0], dict):
-                logger.info(f"First entry keys: {list(data[0].keys())}")
+        entries, detected_key = _detect_leaderboard_schema(data)
 
-        # Flatten: find the actual list of entries regardless of nesting
-        entries = []
-        if isinstance(data, list):
-            entries = data
-        elif isinstance(data, dict):
-            # Try every common key pattern
-            for key in ["leaderboardRows", "rows", "data", "traders", "leaderboard",
-                        "result", "results", "entries", "positions"]:
-                if key in data and isinstance(data[key], list):
-                    entries = data[key]
-                    logger.info(f"Found entries under key '{key}': {len(entries)} items")
-                    break
-            if not entries:
-                # Maybe the dict itself is a single-entry or nested differently
-                # Try to find any list value
-                for key, val in data.items():
-                    if isinstance(val, list) and len(val) > 0:
-                        entries = val
-                        logger.info(f"Found list under key '{key}': {len(entries)} items")
-                        break
+        if not entries:
+            if isinstance(data, dict):
+                logger.info("Leaderboard response keys: %s", list(data.keys()))
+            logger.warning("Could not find entry list in leaderboard response")
+            return traders
+
+        logger.info("Leaderboard: %d entries (schema key=%s)", len(entries), detected_key or "root-list")
 
         for entry in entries:
             try:
@@ -635,6 +663,153 @@ class TraderDiscovery:
         span_days = max(span_ms / (1000 * 86400), 0.01)  # avoid div by zero
         return len(fills) / span_days
 
+    # ─── Bot detection helpers ────────────────────────────────────────────────
+
+    @staticmethod
+    def _detect_arb_pattern(fills: List[Dict]) -> bool:
+        """
+        Detect cross-exchange / funding arbitrage pattern.
+
+        Signal: same coin, opposite sides, <5 s apart, tiny closed PnL each leg.
+        This pattern is structurally impossible for a human trader to execute
+        manually at scale.
+        """
+        if len(fills) < 10:
+            return False
+
+        by_coin: Dict[str, List[Dict]] = {}
+        for f in fills:
+            by_coin.setdefault(f.get("coin", ""), []).append(f)
+
+        for coin, coin_fills in by_coin.items():
+            if len(coin_fills) < 10:
+                continue
+            for i in range(len(coin_fills) - 1):
+                f1 = coin_fills[i]
+                f2 = coin_fills[i + 1]
+                time_gap_ms = f2.get("time", 0) - f1.get("time", 0)
+                if time_gap_ms < 5_000:  # within 5 seconds
+                    if f1.get("side") != f2.get("side"):
+                        # Tiny PnL on a round-trip = arb
+                        if abs(f2.get("closed_pnl", 0)) < 10.0:
+                            return True
+        return False
+
+    def _apply_hard_cutoffs(
+        self,
+        fills: List[Dict],
+        trades_per_day: float,
+    ) -> Optional[int]:
+        """
+        Apply hard-cutoff rules that immediately classify an account as a bot.
+        Returns 10 (bot score) if any cutoff triggers, else None (keep going).
+        """
+        if trades_per_day > config.BOT_HARD_CUTOFF_TRADES:
+            logger.info(
+                "Bot INSTANT: %.0f trades/day (hard cutoff >%s)",
+                trades_per_day, config.BOT_HARD_CUTOFF_TRADES,
+            )
+            return 10
+
+        if trades_per_day > 50:
+            closed_pnls = sorted([f["closed_pnl"] for f in fills if f["closed_pnl"] != 0])
+            if closed_pnls:
+                median_pnl = closed_pnls[len(closed_pnls) // 2]
+                if abs(median_pnl) < 0.50:
+                    logger.info(
+                        "Bot INSTANT: spread/MM bot (median PnL=$%.2f, %.0f trades/day)",
+                        median_pnl, trades_per_day,
+                    )
+                    return 10
+
+        return None
+
+    def _score_bot_signals(
+        self,
+        fills: List[Dict],
+        positions: List[Dict],
+        trade_analysis: Dict,
+        trades_per_day: float,
+    ) -> int:
+        """
+        Signal-based bot scoring for borderline accounts.
+        Returns cumulative bot score (0 = clean human, ≥3 = bot).
+        """
+        total = len(fills)
+        avg_size = trade_analysis.get("avg_trade_size", 0)
+        pnl = trade_analysis.get("total_closed_pnl", 0)
+        liquidations = trade_analysis.get("liquidations", 0)
+        active_positions = [p for p in positions if p["size"] > 0]
+        bot_signals = 0
+
+        # Signal 1: Elevated frequency (50–100 trades/day)
+        if trades_per_day > config.BOT_ELEVATED_FREQ:
+            logger.info(
+                "Bot signal: %.0f trades/day (elevated >%s)",
+                trades_per_day, config.BOT_ELEVATED_FREQ,
+            )
+            bot_signals += 3
+
+        # Signal 2: Micro trade size at moderate frequency = market maker
+        if trades_per_day > 30 and avg_size < 50:
+            logger.info(
+                "Bot signal: tiny trades ($%.0f avg) at %.0f/day", avg_size, trades_per_day,
+            )
+            bot_signals += 3
+
+        # Signal 3: Near-zero PnL per trade with high volume = arb bot
+        if total > 50:
+            pnl_per_trade = abs(pnl) / total
+            if pnl_per_trade < 0.5 and avg_size > 1_000:
+                logger.info(
+                    "Bot signal: arb pattern ($%.2f/trade, $%.0f avg)", pnl_per_trade, avg_size,
+                )
+                bot_signals += 3
+
+        # Signal 4: Too many simultaneous positions = portfolio bot
+        if len(active_positions) > 15:
+            logger.info("Bot signal: %d simultaneous positions", len(active_positions))
+            bot_signals += 2
+
+        # Signal 5: Uniform trade sizes (low coefficient of variation = robotic)
+        if len(fills) > 20:
+            sizes = [f["size"] * f["price"] for f in fills[:50]]
+            if sizes:
+                try:
+                    import numpy as np
+                    mean_size = np.mean(sizes)
+                    std_size = np.std(sizes)
+                    cv = std_size / mean_size if mean_size > 0 else 0
+                    if cv < 0.05:
+                        logger.info("Bot signal: uniform trade sizes (CV=%.3f)", cv)
+                        bot_signals += 2
+                except ImportError:
+                    pass  # numpy optional for this signal
+
+        # Signal 6: High liquidation rate = reckless / poorly coded algo
+        if total > 10 and liquidations / total > 0.15:
+            logger.info("Bot signal: high liquidation rate (%d/%d)", liquidations, total)
+            bot_signals += 3
+
+        # Signal 7: Near-zero median PnL at moderate frequency = spread/funding bot
+        if trades_per_day > 20:
+            closed_pnls = sorted([f["closed_pnl"] for f in fills if f["closed_pnl"] != 0])
+            if closed_pnls:
+                median_pnl = closed_pnls[len(closed_pnls) // 2]
+                if abs(median_pnl) < 1.0:
+                    logger.info(
+                        "Bot signal: micro PnL (median=$%.2f, %.0f trades/day)",
+                        median_pnl, trades_per_day,
+                    )
+                    bot_signals += 3
+
+        # Signal 8: Cross-exchange / funding arb pattern
+        if self._detect_arb_pattern(fills):
+            logger.info("Bot signal: cross-exchange arb pattern detected")
+            bot_signals += 3
+
+        return bot_signals
+
     def _get_bot_score(self, fills: List[Dict], positions: List[Dict],
                        trade_analysis: Dict) -> int:
         """
@@ -648,118 +823,38 @@ class TraderDiscovery:
         Score of 3+ is considered a bot, but caller can use the score
         for ranking/fallback when too many get flagged.
 
-        Signals (each adds 1-2 points):
-        - Extremely high trade frequency (>300 trades/day by time span)
-        - Very small, uniform trade sizes (market making)
-        - Near-zero PnL per trade with huge volume (arb bots)
-        - Many simultaneous positions across many coins (>15 active)
-        - Uniform trade sizes (low coefficient of variation)
-        - High liquidation rate
-        - Spread bot: high frequency + near-zero median PnL per trade
+        Delegates to:
+          _apply_hard_cutoffs()  — instant bot classification
+          _score_bot_signals()   — signal accumulation for borderline cases
+          _detect_arb_pattern()  — cross-exchange arb detection
         """
         if not fills:
             return 0  # No data = can't determine, assume human
 
-        total = len(fills)
-        avg_size = trade_analysis.get("avg_trade_size", 0)
-        pnl = trade_analysis.get("total_closed_pnl", 0)
-        liquidations = trade_analysis.get("liquidations", 0)
-        active_positions = [p for p in positions if p["size"] > 0]
-
-        # Compute REAL frequency from timestamps (not raw count)
         trades_per_day = self._compute_trades_per_day(fills)
 
-        # ─── HARD CUTOFFS (instant bot, no signal counting needed) ────
-        # These override the signal-based scoring entirely.
-        # Evidence from logs: 115,043 trades/day classified "Human-like" is unacceptable.
+        # Fast path: hard cutoffs
+        hard_score = self._apply_hard_cutoffs(fills, trades_per_day)
+        if hard_score is not None:
+            return hard_score
 
-        # Hard cutoff 1: >100 trades/day = bot, period
-        # A very active human scalper might do 30-80, but >100 is automation
-        if trades_per_day > config.BOT_HARD_CUTOFF_TRADES:
-            logger.info(f"Bot INSTANT: {trades_per_day:.0f} trades/day (hard cutoff >{config.BOT_HARD_CUTOFF_TRADES})")
-            return 10  # Guaranteed bot score
+        # Signal accumulation
+        bot_signals = self._score_bot_signals(fills, positions, trade_analysis, trades_per_day)
 
-        # Hard cutoff 2: Spread bot — high frequency + micro PnL per trade
-        # Median PnL < $0.50 with >50 trades/day = market maker / funding farmer
-        if trades_per_day > 50:
-            closed_pnls = sorted([f["closed_pnl"] for f in fills if f["closed_pnl"] != 0])
-            if closed_pnls:
-                median_pnl = closed_pnls[len(closed_pnls) // 2]
-                if abs(median_pnl) < 0.50:
-                    logger.info(f"Bot INSTANT: spread/MM bot (median PnL=${median_pnl:.2f}, "
-                               f"{trades_per_day:.0f} trades/day)")
-                    return 10  # Guaranteed bot score
-
-        # ─── SIGNAL-BASED SCORING (for borderline cases) ─────────────
-        #
-        # Previous bug: signals were weighted too lightly. A wallet with an
-        # arb pattern (1 signal) or high liquidation rate (1 signal) would
-        # score only 1-2, below BOT_THRESHOLD=3, and pass as "Human-like".
-        #
-        # Fix: ANY single clear bot signal now scores >= 3 (instant reject).
-        # Weaker signals still accumulate and 2+ weak signals = bot.
-        #
-        bot_signals = 0
-
-        # Signal 1: Elevated frequency — 50-100 trades/day is suspicious
-        # This alone is strong evidence of automation
-        if trades_per_day > config.BOT_ELEVATED_FREQ:
-            logger.info(f"Bot signal: {trades_per_day:.0f} trades/day (elevated frequency >{config.BOT_ELEVATED_FREQ})")
-            bot_signals += 3  # Strong: 50+ trades/day alone = bot
-
-        # Signal 2: Very small avg trade size with moderate frequency = market maker
-        if trades_per_day > 30 and avg_size < 50:
-            logger.info(f"Bot signal: tiny trades (${avg_size:.0f} avg) at {trades_per_day:.0f}/day")
-            bot_signals += 3  # Strong: micro-size + frequency = MM bot
-
-        # Signal 3: Near-zero PnL per trade with high volume = arb bot
-        # This is DEFINITIVE: no human trades 50+ times making <$0.50 per trade
-        if total > 50:
-            pnl_per_trade = abs(pnl) / total if total else 0
-            if pnl_per_trade < 0.5 and avg_size > 1000:
-                logger.info(f"Bot signal: arb pattern (${pnl_per_trade:.2f}/trade, ${avg_size:.0f} avg)")
-                bot_signals += 3  # Strong: arb pattern alone = bot
-
-        # Signal 4: Too many simultaneous positions = portfolio bot
-        if len(active_positions) > 15:
-            logger.info(f"Bot signal: {len(active_positions)} simultaneous positions")
-            bot_signals += 2  # Medium: could be an active human, but suspicious
-
-        # Signal 5: Uniform trade sizes (low variance = bot)
-        if len(fills) > 20:
-            sizes = [f["size"] * f["price"] for f in fills[:50]]
-            if sizes:
-                import numpy as np
-                mean_size = np.mean(sizes)
-                std_size = np.std(sizes)
-                cv = std_size / mean_size if mean_size > 0 else 0
-                if cv < 0.05:  # coefficient of variation < 5% = robotic
-                    logger.info(f"Bot signal: uniform trade sizes (CV={cv:.3f})")
-                    bot_signals += 2  # Medium: very uniform = likely automated
-
-        # Signal 6: High liquidation rate = reckless bot or badly coded algo
-        if total > 10 and liquidations / total > 0.15:
-            logger.info(f"Bot signal: high liquidation rate ({liquidations}/{total})")
-            bot_signals += 3  # Strong: >15% liquidation rate = not a strategy worth copying
-
-        # Signal 7: Near-zero median PnL (even at moderate frequency) = spread/funding bot
-        if trades_per_day > 20:
-            closed_pnls = sorted([f["closed_pnl"] for f in fills if f["closed_pnl"] != 0])
-            if closed_pnls:
-                median_pnl = closed_pnls[len(closed_pnls) // 2]
-                if abs(median_pnl) < 1.0:
-                    logger.info(f"Bot signal: micro PnL (median=${median_pnl:.2f}, {trades_per_day:.0f} trades/day)")
-                    bot_signals += 3  # Strong: micro PnL + frequency = MM/funding bot
-
-        addr_short = fills[0].get('user', 'unknown')[:10] if fills else 'unknown'
+        addr_short = (fills[0].get("user", "unknown") or "unknown")[:10] if fills else "unknown"
         if bot_signals >= 3:
-            logger.info(f"Bot REJECTED ({bot_signals} signals, {trades_per_day:.0f} trades/day): "
-                       f"{addr_short}...")
+            logger.info(
+                "Bot REJECTED (%d signals, %.0f trades/day): %s...",
+                bot_signals, trades_per_day, addr_short,
+            )
         elif bot_signals > 0:
-            logger.info(f"Borderline ({bot_signals} signals, {trades_per_day:.0f} trades/day): "
-                       f"{addr_short}... — passed but flagged")
+            logger.info(
+                "Borderline (%d signals, %.0f trades/day): %s... — passed but flagged",
+                bot_signals, trades_per_day, addr_short,
+            )
         else:
-            logger.info(f"Human-like (clean, {trades_per_day:.0f} trades/day)")
+            logger.info("Human-like (clean, %.0f trades/day)", trades_per_day)
+
         return bot_signals
 
     def run_discovery_cycle(self) -> Dict:

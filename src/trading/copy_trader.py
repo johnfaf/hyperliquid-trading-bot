@@ -8,6 +8,7 @@ V2: Signals routed through DecisionFirewall and tracked by AgentScorer.
 """
 import logging
 import json
+import time
 from datetime import datetime, timezone
 from typing import List, Dict, Optional
 
@@ -33,6 +34,24 @@ _CRASH_COPY_CONFIDENCE_MULTIPLIER = 0.60
 _NEUTRAL_COPY_CONFIDENCE_MULTIPLIER = 0.70
 _BULLISH_COPY_CONFIDENCE_MULTIPLIER = 1.20
 
+# Signal confidence model — explicit baselines and caps per signal type.
+# Rationale:
+#   copy_open:    base 0.50 — new unconfirmed position, moderate conviction
+#   copy_scale_in: base 0.40 — adding to existing position is cautious (less info)
+#   copy_flip:    base 0.60 — reversal implies strong directional conviction
+#   golden_copy:  base 0.55 — golden wallet signal, slightly elevated base
+# Win-rate contribution: +0 to +0.50 depending on trader quality.
+_SIGNAL_CONFIDENCE_MODEL: Dict[str, Dict[str, float]] = {
+    "copy_open":    {"base": 0.50, "max": 0.90},
+    "copy_scale_in": {"base": 0.40, "max": 0.85},
+    "copy_flip":    {"base": 0.60, "max": 0.95},
+    "golden_copy":  {"base": 0.55, "max": 0.90},
+    "copy_close":   {"base": 1.00, "max": 1.00},   # Exit is always full conviction
+}
+
+# How long to keep cached positions for a trader that is no longer in the top N.
+_POSITION_CACHE_TTL_SECONDS = 3600  # 1 hour
+
 
 class CopyTrader:
     """Monitors top traders and mirrors their position changes."""
@@ -48,6 +67,8 @@ class CopyTrader:
                  shadow_tracker: Optional[object] = None):
         # Cache of last-known positions per trader: {address: {coin: position_dict}}
         self._position_cache: Dict[str, Dict[str, Dict]] = {}
+        # TTL tracking so stale entries for dropped traders don't accumulate forever
+        self._position_cache_ts: Dict[str, float] = {}
         self._copy_count = 0
         self.firewall = firewall
         self.agent_scorer = agent_scorer
@@ -97,6 +118,22 @@ class CopyTrader:
         trader = str(payload.get("source_trader", "") or "").strip().lower()
         return f"copy_trade:{trader}" if trader else "copy_trade"
 
+    @staticmethod
+    def _calculate_signal_confidence(signal_type: str, trader_win_rate: float) -> float:
+        """
+        Calculate copy signal confidence using the explicit model in
+        _SIGNAL_CONFIDENCE_MODEL.
+
+        The win-rate contribution is capped at 0.5 (a perfect trader at 100% WR
+        adds 0.5 to the base). This avoids inflating confidence to near-1.0 based
+        solely on historical data that may not generalise.
+        """
+        model = _SIGNAL_CONFIDENCE_MODEL.get(signal_type, {"base": 0.50, "max": 0.90})
+        base = model["base"]
+        cap = model["max"]
+        win_contribution = min(float(trader_win_rate), 1.0) * 0.5
+        return min(cap, base + win_contribution)
+
     def _resolve_copy_trade_risk(
         self,
         signal: Dict,
@@ -124,7 +161,14 @@ class CopyTrader:
             source_accuracy=float(signal.get("source_accuracy", 0.0) or 0.0),
         )
         if self.risk_policy_engine:
-            trade_signal = self.risk_policy_engine.apply(trade_signal, regime_data=regime_data)
+            try:
+                modified = self.risk_policy_engine.apply(trade_signal, regime_data=regime_data)
+                if modified is not None:
+                    trade_signal = modified
+                else:
+                    logger.warning("risk_policy_engine.apply() returned None; using original signal")
+            except Exception as e:
+                logger.warning("Risk policy apply failed (%s); proceeding with original signal", e)
         stop_loss, take_profit = trade_signal.risk.resolve_trigger_prices(price, side, leverage)
         return stop_loss, take_profit, dict((trade_signal.context or {}).get("risk_policy", {}) or {})
 
@@ -228,10 +272,27 @@ class CopyTrader:
         """
         Scan the top N traders by PnL, detect new/changed positions,
         and return copy-trade signals.
+
+        Stale position-cache entries for traders that have dropped out of the
+        top-N are evicted after _POSITION_CACHE_TTL_SECONDS so memory doesn't
+        grow unboundedly over long run times.
         """
         traders = db.get_active_traders()[:top_n]
         if not traders:
             return []
+
+        # Evict stale cache entries
+        now = time.time()
+        active_addrs = {t["address"] for t in traders}
+        stale = [
+            addr for addr, ts in self._position_cache_ts.items()
+            if now - ts > _POSITION_CACHE_TTL_SECONDS and addr not in active_addrs
+        ]
+        for addr in stale:
+            self._position_cache.pop(addr, None)
+            self._position_cache_ts.pop(addr, None)
+        if stale:
+            logger.debug("Evicted %d stale position-cache entries", len(stale))
 
         signals = []
         mids = hl.get_all_mids() or {}
@@ -255,8 +316,9 @@ class CopyTrader:
                 )
                 signals.extend(new_signals)
 
-                # Update cache
+                # Update cache + timestamp
                 self._position_cache[addr] = current_positions
+                self._position_cache_ts[addr] = now
 
             except Exception as e:
                 logger.debug(f"Error scanning trader {trader.get('address', '?')[:10]}: {e}")
@@ -279,6 +341,8 @@ class CopyTrader:
         old_coins = set(old_positions.keys())
         new_coins = set(new_positions.keys())
 
+        win_rate = trader.get("win_rate", 0)
+
         # New positions opened by the trader
         for coin in new_coins - old_coins:
             pos = new_positions[coin]
@@ -294,7 +358,7 @@ class CopyTrader:
                 "leverage": min(pos["leverage"], config.PAPER_TRADING_MAX_LEVERAGE),
                 "source_trader": address[:10],
                 "source_pnl": trader.get("total_pnl", 0),
-                "confidence": min(0.9, 0.5 + trader.get("win_rate", 0) * 0.5),
+                "confidence": self._calculate_signal_confidence("copy_open", win_rate),
             })
 
         # Positions closed by the trader (they exited)
@@ -322,7 +386,7 @@ class CopyTrader:
                     "leverage": min(pos["leverage"], config.PAPER_TRADING_MAX_LEVERAGE),
                     "source_trader": address[:10],
                     "source_pnl": trader.get("total_pnl", 0),
-                    "confidence": min(0.85, 0.4 + trader.get("win_rate", 0) * 0.5),
+                    "confidence": self._calculate_signal_confidence("copy_scale_in", win_rate),
                 })
 
         # Side flips (trader reversed position)
@@ -340,7 +404,7 @@ class CopyTrader:
                     "leverage": min(pos["leverage"], config.PAPER_TRADING_MAX_LEVERAGE),
                     "source_trader": address[:10],
                     "source_pnl": trader.get("total_pnl", 0),
-                    "confidence": min(0.95, 0.6 + trader.get("win_rate", 0) * 0.5),
+                    "confidence": self._calculate_signal_confidence("copy_flip", win_rate),
                 })
 
         return signals
@@ -697,6 +761,36 @@ class CopyTrader:
 
         return executed
 
+    @staticmethod
+    def _build_trade_metadata(signal: Dict, risk_policy: Dict, execution_role: str) -> Dict:
+        """
+        Build the trade metadata dict once.
+
+        Previously this was constructed twice inside _open_copy_trade (once for
+        the DB call and once for the returned dict), which was a maintenance
+        hazard — any new field had to be added in two places.  Now it's built
+        here and shared between both usages.
+        """
+        return {
+            "type": signal["type"],
+            "source_trader": signal.get("source_trader", ""),
+            "confidence": signal.get("confidence", 0),
+            "signal_id": signal.get("_signal_id", ""),
+            "source_key": signal.get("_source_key", ""),
+            "source_accuracy": signal.get("source_accuracy", 0),
+            "regime": signal.get("regime", ""),
+            "risk_policy": risk_policy,
+            "is_copy_trade": True,
+            "is_golden": signal.get("is_golden", False),
+            "golden_wallet": signal.get("is_golden", False),
+            "source": "copy_trade",
+            "execution_role": execution_role,
+            "maker_fee_bps": config.PAPER_TRADING_MAKER_FEE_BPS,
+            "taker_fee_bps": config.PAPER_TRADING_TAKER_FEE_BPS,
+            "intended_entry_price": signal.get("price", 0),
+            "entry_slipped_price": signal.get("price", 0),
+        }
+
     def _open_copy_trade(self, account: Dict, signal: Dict, open_trades: List) -> Optional[Dict]:
         """Open a paper trade based on a copy signal."""
         # Kelly-based position sizing if available, else default 5%
@@ -735,6 +829,9 @@ class CopyTrader:
 
         try:
             execution_role = signal.get("execution_role", config.PAPER_TRADING_DEFAULT_EXECUTION_ROLE)
+            # Build metadata once, reuse for both the DB record and the return value
+            metadata = self._build_trade_metadata(signal, risk_policy, execution_role)
+
             trade_id = db.open_paper_trade(
                 strategy_id=None,
                 coin=signal["coin"],
@@ -744,25 +841,7 @@ class CopyTrader:
                 leverage=leverage,
                 stop_loss=stop_loss,
                 take_profit=take_profit,
-                metadata={
-                    "type": signal["type"],
-                    "source_trader": signal.get("source_trader", ""),
-                    "confidence": signal.get("confidence", 0),
-                    "signal_id": signal.get("_signal_id", ""),
-                    "source_key": signal.get("_source_key", ""),
-                    "source_accuracy": signal.get("source_accuracy", 0),
-                    "regime": signal.get("regime", ""),
-                    "risk_policy": risk_policy,
-                    "is_copy_trade": True,
-                    "is_golden": signal.get("is_golden", False),
-                    "golden_wallet": signal.get("is_golden", False),
-                    "source": "copy_trade",
-                    "execution_role": execution_role,
-                    "maker_fee_bps": config.PAPER_TRADING_MAKER_FEE_BPS,
-                    "taker_fee_bps": config.PAPER_TRADING_TAKER_FEE_BPS,
-                    "intended_entry_price": price,
-                    "entry_slipped_price": price,
-                },
+                metadata=metadata,
             )
             logger.info(
                 f"Copy trade: {side.upper()} {signal['coin']} @ ${price:,.2f} "
@@ -783,25 +862,7 @@ class CopyTrader:
                 "trader_address": signal.get("source_trader", ""),
                 "source": "copy_trade",
                 "opened_at": datetime.now(timezone.utc).isoformat(),
-                "metadata": {
-                    "type": signal["type"],
-                    "source_trader": signal.get("source_trader", ""),
-                    "confidence": signal.get("confidence", 0),
-                    "signal_id": signal.get("_signal_id", ""),
-                    "source_key": signal.get("_source_key", ""),
-                    "source_accuracy": signal.get("source_accuracy", 0),
-                    "regime": signal.get("regime", ""),
-                    "risk_policy": risk_policy,
-                    "is_copy_trade": True,
-                    "is_golden": signal.get("is_golden", False),
-                    "golden_wallet": signal.get("is_golden", False),
-                    "source": "copy_trade",
-                    "execution_role": execution_role,
-                    "maker_fee_bps": config.PAPER_TRADING_MAKER_FEE_BPS,
-                    "taker_fee_bps": config.PAPER_TRADING_TAKER_FEE_BPS,
-                    "intended_entry_price": price,
-                    "entry_slipped_price": price,
-                },
+                "metadata": metadata,
             }
         except Exception as e:
             logger.error(f"Error opening copy trade: {e}")
