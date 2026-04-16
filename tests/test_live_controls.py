@@ -1268,6 +1268,56 @@ def test_run_alpha_arena_paper_trade_preserves_precise_stops(monkeypatch):
     assert abs(opened["take_profit"] - (price * 0.875)) < 1e-12
 
 
+def test_run_alpha_arena_passes_multi_coin_candle_map(monkeypatch):
+    seen = {}
+
+    class FakeArena:
+        def run_cycle(self, historical_candles=None):
+            seen["historical"] = historical_candles
+
+        def get_stats(self):
+            return {"active_agents": 1, "champions": 1, "total_arena_pnl": 0.0}
+
+        def get_champion_signals(self, **kwargs):
+            seen["current"] = kwargs.get("current_candles")
+            return []
+
+    container = type(
+        "Container",
+        (),
+        {
+            "arena": FakeArena(),
+            "live_trader": None,
+        },
+    )()
+
+    monkeypatch.setattr("src.core.cycles.trading_cycle._ARENA_COIN_UNIVERSE", ["BTC", "ETH"])
+    monkeypatch.setattr("src.core.cycles.trading_cycle._ARENA_MAX_COINS", 2)
+    monkeypatch.setattr("src.core.cycles.trading_cycle.is_live_trading_active", lambda container: False)
+
+    class FakeManager:
+        def post(self, payload=None, **kwargs):
+            coin = payload["req"]["coin"]
+            return [
+                {
+                    "o": "100.0",
+                    "h": "101.0",
+                    "l": "99.0",
+                    "c": "100.0",
+                    "v": "10",
+                    "t": 1_000 + idx,
+                }
+                for idx in range(60)
+            ] if coin in {"BTC", "ETH"} else []
+
+    monkeypatch.setattr("src.core.api_manager.get_manager", lambda: FakeManager())
+
+    _run_alpha_arena(container, {"overall_regime": "neutral"})
+
+    assert set(seen["historical"]) == {"BTC", "ETH"}
+    assert set(seen["current"]) == {"BTC", "ETH"}
+
+
 def test_execution_open_positions_prefer_live_state_when_deployable():
     class FakeLiveTrader:
         def is_live_enabled(self):

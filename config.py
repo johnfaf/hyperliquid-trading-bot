@@ -4,6 +4,14 @@ Configuration for the Hyperliquid Trading Research Bot.
 import os
 import math
 
+
+def _parse_coin_list(raw_value: str) -> list[str]:
+    return [
+        coin.strip().upper()
+        for coin in (raw_value or "").split(",")
+        if coin and coin.strip()
+    ]
+
 # ─── API Endpoints ─────────────────────────────────────────────
 HYPERLIQUID_API_URL = "https://api.hyperliquid.xyz"
 HYPERLIQUID_INFO_URL = f"{HYPERLIQUID_API_URL}/info"
@@ -428,6 +436,14 @@ ARKHAM_API_KEY = os.environ.get("ARKHAM_API_KEY")  # Optional: platform.arkhamin
 ARENA_CHAMPION_MIN_FITNESS = float(os.environ.get("ARENA_CHAMPION_MIN_FITNESS", 0.15))
 ARENA_CHAMPION_MIN_TRADES = int(os.environ.get("ARENA_CHAMPION_MIN_TRADES", 5))
 ARENA_CHAMPION_MIN_WIN_RATE = float(os.environ.get("ARENA_CHAMPION_MIN_WIN_RATE", 0.45))
+ARENA_COIN_UNIVERSE = _parse_coin_list(
+    os.environ.get("ARENA_COIN_UNIVERSE", "").strip() or FEATURE_STORE_COINS
+)
+if not ARENA_COIN_UNIVERSE:
+    ARENA_COIN_UNIVERSE = ["BTC", "ETH", "SOL"]
+ARENA_MAX_COINS = int(os.environ.get("ARENA_MAX_COINS", 3))
+ARENA_INTERVAL = os.environ.get("ARENA_INTERVAL", "1h").strip() or "1h"
+ARENA_LOOKBACK_HOURS = int(os.environ.get("ARENA_LOOKBACK_HOURS", 720))
 
 # Options-flow conviction gate (0-100).
 OPTIONS_FLOW_MIN_CONVICTION_PCT = float(
@@ -625,6 +641,8 @@ def _validate_config_bounds() -> None:
         ("ARENA_CHAMPION_MIN_FITNESS", 0.0, 1.0, 0.15),
         ("ARENA_CHAMPION_MIN_TRADES", 1, 500, 5),
         ("ARENA_CHAMPION_MIN_WIN_RATE", 0.0, 1.0, 0.45),
+        ("ARENA_MAX_COINS", 1, 100, 3),
+        ("ARENA_LOOKBACK_HOURS", 24, 8760, 720),
         ("OPTIONS_FLOW_MIN_CONVICTION_PCT", 0.0, 100.0, 30.0),
         ("XGBOOST_MIN_CONFIDENCE", 0.0, 1.0, 0.52),
         ("XGBOOST_RETRAIN_INTERVAL", 60, 2_592_000, 86400),

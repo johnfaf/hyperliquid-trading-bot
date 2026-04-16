@@ -34,6 +34,14 @@ _ARENA_CHAMPION_MIN_TRADES = int(
 _ARENA_CHAMPION_MIN_WIN_RATE = float(
     getattr(config, "ARENA_CHAMPION_MIN_WIN_RATE", 0.45)
 )
+_ARENA_COIN_UNIVERSE = [
+    str(coin).upper()
+    for coin in getattr(config, "ARENA_COIN_UNIVERSE", ["BTC", "ETH", "SOL"])
+    if str(coin).strip()
+]
+_ARENA_MAX_COINS = int(getattr(config, "ARENA_MAX_COINS", 3))
+_ARENA_INTERVAL = str(getattr(config, "ARENA_INTERVAL", "1h") or "1h").strip() or "1h"
+_ARENA_LOOKBACK_HOURS = int(getattr(config, "ARENA_LOOKBACK_HOURS", 720))
 
 
 def _apply_dynamic_risk_policy(container, trade_signal, regime_data=None, source_policy=None):
@@ -45,6 +53,55 @@ def _apply_dynamic_risk_policy(container, trade_signal, regime_data=None, source
     except Exception as exc:
         logger.debug("  Risk policy apply error for %s: %s", getattr(trade_signal, "coin", "?"), exc)
         return trade_signal
+
+
+def _get_arena_coin_universe():
+    coins = _ARENA_COIN_UNIVERSE or ["BTC"]
+    unique = []
+    for coin in coins:
+        norm = str(coin).upper().strip()
+        if not norm or norm in unique:
+            continue
+        unique.append(norm)
+    return unique[: max(1, _ARENA_MAX_COINS)]
+
+
+def _fetch_arena_candle_universe():
+    from src.core.api_manager import get_manager, Priority
+
+    manager = get_manager()
+    end_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    start_ms = int((datetime.now(timezone.utc).timestamp() - (_ARENA_LOOKBACK_HOURS * 3600)) * 1000)
+    candle_map = {}
+
+    for coin in _get_arena_coin_universe():
+        try:
+            payload = {
+                "type": "candleSnapshot",
+                "req": {
+                    "coin": coin,
+                    "interval": _ARENA_INTERVAL,
+                    "startTime": start_ms,
+                    "endTime": end_ms,
+                },
+            }
+            raw = manager.post(payload=payload, priority=Priority.LOW, timeout=15)
+            if not isinstance(raw, list) or len(raw) < 50:
+                continue
+            candle_map[coin] = [
+                {
+                    "open": float(c.get("o", 0)),
+                    "high": float(c.get("h", 0)),
+                    "low": float(c.get("l", 0)),
+                    "close": float(c.get("c", 0)),
+                    "volume": float(c.get("v", 0)),
+                    "timestamp": int(c.get("t", c.get("time", 0)) or 0),
+                }
+                for c in raw
+            ]
+        except Exception as exc:
+            logger.debug("  Arena candle fetch failed for %s: %s", coin, exc)
+    return candle_map
 
 
 # ---------------------------------------------------------------------------
@@ -1317,28 +1374,8 @@ def _run_alpha_arena(container, regime_data):
         return
     logger.info("Phase 5: Alpha Arena")
     try:
-        from src.core.api_manager import get_manager, Priority
-        arena_candles = None
-        try:
-            payload = {
-                "type": "candleSnapshot",
-                "req": {
-                    "coin": "BTC", "interval": "1h",
-                    "startTime": int((datetime.now(timezone.utc).timestamp() - 720 * 3600) * 1000),
-                    "endTime": int(datetime.now(timezone.utc).timestamp() * 1000),
-                },
-            }
-            raw = get_manager().post(payload=payload, priority=Priority.LOW, timeout=15)
-            if isinstance(raw, list) and len(raw) >= 50:
-                arena_candles = [
-                    {"open": float(c.get("o", 0)), "high": float(c.get("h", 0)),
-                     "low": float(c.get("l", 0)), "close": float(c.get("c", 0)),
-                     "volume": float(c.get("v", 0))} for c in raw
-                ]
-        except Exception:
-            pass
-
-        container.arena.run_cycle(historical_candles=arena_candles)
+        arena_candle_map = _fetch_arena_candle_universe()
+        container.arena.run_cycle(historical_candles=arena_candle_map)
         stats = container.arena.get_stats()
         logger.info(
             "  Arena: %d active, %d champions, PnL=$%.2f",
@@ -1346,11 +1383,16 @@ def _run_alpha_arena(container, regime_data):
         )
 
         # Champion signals → paper trading
-        if arena_candles and len(arena_candles) >= 30:
+        eligible_candles = {
+            coin: candles[-100:]
+            for coin, candles in (arena_candle_map or {}).items()
+            if len(candles) >= 30
+        }
+        if eligible_candles:
             try:
                 from src.signals.signal_schema import TradeSignal, SignalSide, SignalSource, RiskParams
                 champion_signals = container.arena.get_champion_signals(
-                    current_candles=arena_candles[-100:],
+                    current_candles=eligible_candles,
                     min_fitness=_ARENA_CHAMPION_MIN_FITNESS,
                     min_trades=_ARENA_CHAMPION_MIN_TRADES,
                     min_win_rate=_ARENA_CHAMPION_MIN_WIN_RATE,
@@ -1397,7 +1439,7 @@ def _run_alpha_arena(container, regime_data):
                                         account_balance,
                                         conf,
                                         regime_data=regime_data,
-                                        coin="BTC",
+                                        coin=sig["coin"],
                                         volatility=sig.get("atr_pct", 0.02),
                                     )
                                     if sizing:
@@ -1419,7 +1461,7 @@ def _run_alpha_arena(container, regime_data):
                                             account["balance"],
                                             conf,
                                             regime_data=regime_data,
-                                            coin="BTC",
+                                            coin=sig["coin"],
                                             volatility=sig.get("atr_pct", 0.02),
                                         )
                                         if sizing:

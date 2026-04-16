@@ -37,6 +37,30 @@ from src.signals.signal_schema import RiskParams, SignalSide, SignalSource, Trad
 logger = logging.getLogger(__name__)
 
 
+def _normalize_candle_universe(candles: Optional[Any]) -> Dict[str, List[Dict]]:
+    """Accept either a single candle series or a per-coin candle map."""
+    if candles is None:
+        return {}
+    if isinstance(candles, dict):
+        normalized: Dict[str, List[Dict]] = {}
+        for coin, series in candles.items():
+            if not isinstance(series, list) or not series:
+                continue
+            normalized[str(coin).upper()] = series
+        return normalized
+    if isinstance(candles, list) and candles:
+        return {"BTC": candles}
+    return {}
+
+
+def _select_primary_coin(candle_universe: Dict[str, List[Dict]]) -> Optional[str]:
+    if not candle_universe:
+        return None
+    if "BTC" in candle_universe:
+        return "BTC"
+    return max(candle_universe.items(), key=lambda item: len(item[1]))[0]
+
+
 # ═══════════════════════════════════════════════════════════════
 #  Data Models
 # ═══════════════════════════════════════════════════════════════
@@ -701,7 +725,7 @@ class Backtester:
         self.risk_policy_engine = risk_policy_engine
 
     def backtest_agent(self, agent: ArenaAgent,
-                        historical_candles: List[Dict],
+                        historical_candles: Any,
                         train_pct: float = 0.60,
                         test_windows: int = 5) -> Dict:
         """
@@ -715,58 +739,91 @@ class Backtester:
 
         Returns: Backtest result dict with PnL, Sharpe, win_rate, trades
         """
-        n = len(historical_candles)
-        if n < 50:
+        candle_universe = _normalize_candle_universe(historical_candles)
+        if not candle_universe:
             return {"error": "Insufficient data", "trades": 0}
 
-        if agent.strategy_type == "lstm_direction" and self.lstm_agent:
-            try:
-                self.lstm_agent.train(historical_candles)
-            except Exception as exc:
-                logger.debug("LSTM backtest train skipped: %s", exc)
-
-        # Walk-forward windows
-        train_end = int(n * train_pct)
-        test_size = (n - train_end) // test_windows
-
         all_trades = []
-        equity_curve = [agent.capital_allocated]
+        coin_results: Dict[str, Dict[str, float]] = {}
+        tested_coins = 0
 
-        for window in range(test_windows):
-            test_start = train_end + window * test_size
-            test_end = min(test_start + test_size, n)
+        for coin, coin_candles in candle_universe.items():
+            n = len(coin_candles)
+            if n < 50:
+                continue
 
-            if test_start >= n:
-                break
+            tested_coins += 1
 
-            # Simulate trading on test period, bar by bar
-            for bar_idx in range(test_start, test_end):
-                # Agent sees all bars UP TO AND INCLUDING current bar
-                # NEVER sees future bars — this is the critical no-leakage rule
-                bars_visible = historical_candles[:bar_idx + 1]
-                current_bar = historical_candles[bar_idx]
+            if agent.strategy_type == "lstm_direction" and self.lstm_agent:
+                try:
+                    self.lstm_agent.train(coin_candles)
+                except Exception as exc:
+                    logger.debug("LSTM backtest train skipped for %s: %s", coin, exc)
 
-                # Generate signal based on agent's strategy + params
-                signal = self._agent_generate_signal(
-                    agent, bars_visible, current_bar
-                )
+            train_end = int(n * train_pct)
+            test_size = max(1, (n - train_end) // max(test_windows, 1))
+            coin_trades = []
 
-                if signal:
-                    # Simulate trade execution on NEXT bar (realistic)
-                    if bar_idx + 1 < n:
-                        next_bar = historical_candles[bar_idx + 1]
-                        future_bars = historical_candles[bar_idx + 1:]
+            for window in range(test_windows):
+                test_start = train_end + window * test_size
+                test_end = min(test_start + test_size, n)
+
+                if test_start >= n:
+                    break
+
+                for bar_idx in range(test_start, test_end):
+                    bars_visible = coin_candles[:bar_idx + 1]
+                    current_bar = coin_candles[bar_idx]
+
+                    signal = self._agent_generate_signal(
+                        agent,
+                        bars_visible,
+                        current_bar,
+                        coin=coin,
+                    )
+
+                    if signal and bar_idx + 1 < n:
+                        next_bar = coin_candles[bar_idx + 1]
+                        future_bars = coin_candles[bar_idx + 1:]
                         trade_result = self._simulate_trade(
-                            agent, signal, current_bar, next_bar, bars_visible, future_bars
+                            agent,
+                            signal,
+                            current_bar,
+                            next_bar,
+                            bars_visible,
+                            future_bars,
+                            coin=coin,
+                            sort_key=(
+                                int(next_bar.get("timestamp", bar_idx + 1) or bar_idx + 1),
+                                coin,
+                            ),
                         )
                         if trade_result:
+                            coin_trades.append(trade_result)
                             all_trades.append(trade_result)
-                            equity_curve.append(
-                                equity_curve[-1] + trade_result["pnl"]
-                            )
+
+            if coin_trades:
+                coin_results[coin] = {
+                    "total_trades": len(coin_trades),
+                    "total_pnl": round(sum(t["pnl"] for t in coin_trades), 4),
+                    "win_rate": round(
+                        sum(1 for t in coin_trades if t["won"]) / len(coin_trades),
+                        4,
+                    ),
+                }
+
+        if tested_coins == 0:
+            return {"error": "Insufficient data", "trades": 0}
+
+        all_trades.sort(key=lambda trade: trade.get("_sort_key", (0, "")))
+        equity_curve = [agent.capital_allocated]
+        for trade in all_trades:
+            equity_curve.append(equity_curve[-1] + trade["pnl"])
 
         # Compute backtest metrics
         result = self._compute_backtest_metrics(agent, all_trades, equity_curve)
+        result["coins_tested"] = tested_coins
+        result["coin_results"] = coin_results
         self.results[agent.agent_id] = result
 
         # Store on agent
@@ -775,15 +832,22 @@ class Backtester:
         agent.backtest_trades = result.get("total_trades", 0)
         agent.backtest_win_rate = result.get("win_rate", 0)
 
-        logger.info(f"Backtest {agent.name}: {result['total_trades']} trades, "
-                   f"PnL=${result['total_pnl']:.2f}, Sharpe={result['sharpe']:.2f}, "
-                   f"WR={result['win_rate']:.0%}")
+        logger.info(
+            "Backtest %s across %d coin(s): %d trades, PnL=$%.2f, Sharpe=%.2f, WR=%.0f%%",
+            agent.name,
+            tested_coins,
+            result["total_trades"],
+            result["total_pnl"],
+            result["sharpe"],
+            result["win_rate"] * 100,
+        )
 
         return result
 
     def _agent_generate_signal(self, agent: ArenaAgent,
                                  bars: List[Dict],
-                                 current_bar: Dict) -> Optional[Dict]:
+                                 current_bar: Dict,
+                                 coin: str = "BTC") -> Optional[Dict]:
         """
         Agent generates a signal based on visible data.
         Uses agent's strategy_type and params to decide.
@@ -918,6 +982,7 @@ class Backtester:
         # Apply confidence threshold from agent params
         if side and confidence >= conf_threshold:
             return {
+                "coin": coin,
                 "side": side,
                 "confidence": confidence,
                 "price": current_price,
@@ -934,7 +999,7 @@ class Backtester:
     ) -> TradeSignal:
         params = agent.params
         trade_signal = TradeSignal(
-            coin="BTC",
+            coin=str(signal.get("coin", "BTC") or "BTC").upper(),
             side=SignalSide(signal["side"]),
             confidence=float(signal.get("confidence", 0.5) or 0.5),
             source=SignalSource.ARENA_CHAMPION,
@@ -980,7 +1045,9 @@ class Backtester:
 
     def _simulate_trade(self, agent: ArenaAgent, signal: Dict,
                           entry_bar: Dict, exit_bar: Dict,
-                          history: List[Dict], future_bars: List[Dict]) -> Optional[Dict]:
+                          history: List[Dict], future_bars: List[Dict],
+                          coin: str = "BTC",
+                          sort_key: Optional[Tuple[Any, ...]] = None) -> Optional[Dict]:
         """Simulate a trade using the same dynamic risk shape as live execution."""
         entry_price = exit_bar["open"]  # Enter at next bar's open (realistic)
         if entry_price <= 0 or not future_bars:
@@ -1054,12 +1121,14 @@ class Backtester:
             pnl = (entry_price - exit_price) * size * leverage
 
         return {
+            "coin": str(signal.get("coin", coin) or coin).upper(),
             "side": side,
             "entry_price": entry_price,
             "exit_price": exit_price,
             "pnl": round(pnl, 4),
             "return_pct": pnl / (entry_price * size * leverage) if entry_price > 0 else 0,
             "won": pnl > 0,
+            "_sort_key": sort_key or (0, str(signal.get("coin", coin) or coin).upper()),
         }
 
     def _compute_backtest_metrics(self, agent: ArenaAgent,
@@ -1458,7 +1527,7 @@ class AlphaArena:
         for agent in matched:
             self.record_trade_result(agent.agent_id, pnl, return_pct)
 
-    def run_cycle(self, historical_candles: Optional[List[Dict]] = None):
+    def run_cycle(self, historical_candles: Optional[Any] = None):
         """
         Run one arena cycle with 9 fixed agents:
         1. If tournament interval: run tournament round
@@ -1470,11 +1539,31 @@ class AlphaArena:
         """
         self.cycle_count += 1
 
-        if historical_candles and self.lstm_agent:
+        candle_universe = _normalize_candle_universe(historical_candles)
+        primary_coin = _select_primary_coin(candle_universe)
+
+        if primary_coin and self.lstm_agent:
             try:
-                self.lstm_agent.train(historical_candles)
+                self.lstm_agent.train(candle_universe[primary_coin])
             except Exception as exc:
                 logger.debug("Arena LSTM training skipped: %s", exc)
+
+        if candle_universe and self.cycle_count % self.TOURNAMENT_INTERVAL == 0:
+            tested_agents = 0
+            for agent in self.agents.values():
+                if agent.status == AgentStatus.ELIMINATED:
+                    continue
+                try:
+                    self.backtester.backtest_agent(agent, candle_universe)
+                    tested_agents += 1
+                except Exception as exc:
+                    logger.debug("Arena backtest skipped for %s: %s", agent.name, exc)
+            if tested_agents:
+                logger.info(
+                    "Arena refreshed multi-coin backtests for %d agents across %d coins",
+                    tested_agents,
+                    len(candle_universe),
+                )
 
         # Tournament
         if self.cycle_count % self.TOURNAMENT_INTERVAL == 0:
@@ -1550,7 +1639,7 @@ class AlphaArena:
 
     def get_champion_signals(
         self,
-        current_candles: Optional[List[Dict]] = None,
+        current_candles: Optional[Any] = None,
         min_fitness: float = 0.15,
         min_trades: int = 5,
         min_win_rate: float = 0.45,
@@ -1573,7 +1662,12 @@ class AlphaArena:
             [{"coin": "BTC", "side": "long", "confidence": 0.72,
               "source": "arena_champion", "agent_id": "...", ...}]
         """
-        if not current_candles or len(current_candles) < 30:
+        candle_universe = {
+            coin: candles[-100:]
+            for coin, candles in _normalize_candle_universe(current_candles).items()
+            if len(candles) >= 30
+        }
+        if not candle_universe:
             return []
 
         # Get qualified agents: champions + high-performing active agents
@@ -1591,32 +1685,43 @@ class AlphaArena:
         # Sort by fitness — best agents first
         qualified.sort(key=lambda a: a.fitness_score, reverse=True)
 
-        current_bar = current_candles[-1]
         signals = []
-        seen_agent_sides = set()  # Avoid duplicate strategy_type+side signals
+        seen_agent_sides = set()  # Avoid duplicate coin+strategy_type+side signals
 
         for agent in qualified[:10]:  # Top 10 qualified agents
             try:
-                signal = self.backtester._agent_generate_signal(
-                    agent, current_candles, current_bar
-                )
-                if not signal:
+                best_signal = None
+                for coin, coin_candles in candle_universe.items():
+                    signal = self.backtester._agent_generate_signal(
+                        agent,
+                        coin_candles,
+                        coin_candles[-1],
+                        coin=coin,
+                    )
+                    if signal and (
+                        best_signal is None
+                        or float(signal.get("confidence", 0.0) or 0.0)
+                        > float(best_signal.get("confidence", 0.0) or 0.0)
+                    ):
+                        best_signal = signal
+
+                if not best_signal:
                     continue
 
-                # Dedup on strategy_type+side so different strategies can both go long/short
-                sig_key = f"{agent.strategy_type}:{signal['side']}"
+                # Dedup on coin+strategy_type+side so different strategies and coins can coexist
+                sig_key = f"{best_signal['coin']}:{agent.strategy_type}:{best_signal['side']}"
                 if sig_key in seen_agent_sides:
                     continue
                 seen_agent_sides.add(sig_key)
 
                 # Weight confidence by agent fitness and track record
-                base_conf = signal["confidence"]
+                base_conf = best_signal["confidence"]
                 fitness_mult = min(1.0 + agent.fitness_score, 1.3)
                 adjusted_conf = min(base_conf * fitness_mult, 0.95)
 
                 signals.append({
-                    "coin": "BTC",  # Arena currently runs on BTC candles
-                    "side": signal["side"],
+                    "coin": best_signal["coin"],
+                    "side": best_signal["side"],
                     "confidence": round(adjusted_conf, 3),
                     "source": "arena_champion",
                     "strategy_type": agent.strategy_type,
@@ -1627,15 +1732,19 @@ class AlphaArena:
                     "agent_trades": agent.total_trades,
                     "agent_win_rate": round(agent.win_rate, 3),
                     "agent_sharpe": round(agent.sharpe_ratio, 3),
-                    "price": signal["price"],
-                    "atr_pct": signal.get("atr_pct", 0.02),
+                    "price": best_signal["price"],
+                    "atr_pct": best_signal.get("atr_pct", 0.02),
                 })
 
             except Exception as e:
                 logger.debug(f"Champion signal error for {agent.name}: {e}")
 
         if signals:
-            logger.info(f"Arena champions generated {len(signals)} live signals "
-                       f"from {len(qualified)} qualified agents")
+            logger.info(
+                "Arena champions generated %d live signals across %d coin(s) from %d qualified agents",
+                len(signals),
+                len(candle_universe),
+                len(qualified),
+            )
 
         return signals

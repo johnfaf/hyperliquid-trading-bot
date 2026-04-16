@@ -247,3 +247,152 @@ def test_alpha_arena_backtester_uses_dynamic_risk_policy_across_future_bars(monk
     assert result is not None
     assert result["exit_price"] == pytest.approx(104.0)
     assert result["won"] is True
+
+
+def test_alpha_arena_get_champion_signals_selects_best_coin(monkeypatch):
+    from src.signals.alpha_arena import AlphaArena, ArenaAgent, AgentStatus
+
+    def _bars(start: float, count: int = 40):
+        return [
+            {
+                "open": start + i,
+                "high": start + i + 0.8,
+                "low": start + i - 0.6,
+                "close": start + i + 0.4,
+                "volume": 1_000.0 + i,
+            }
+            for i in range(count)
+        ]
+
+    monkeypatch.setattr(AlphaArena, "_init_db", lambda self: None)
+    monkeypatch.setattr(AlphaArena, "_load_agents", lambda self: None)
+    monkeypatch.setattr(AlphaArena, "_save_agents", lambda self: None)
+
+    arena = AlphaArena()
+    arena.agents = {}
+    agent = ArenaAgent(
+        agent_id="seed_momentum_long",
+        name="Seed_momentum_long",
+        strategy_type="momentum_long",
+        status=AgentStatus.CHAMPION,
+        params={"confidence_threshold": 0.5},
+        total_trades=10,
+        winning_trades=7,
+        win_rate=0.7,
+        sharpe_ratio=1.4,
+        total_pnl=250.0,
+        capital_allocated=1_000.0,
+    )
+    arena.agents[agent.agent_id] = agent
+
+    def _fake_generate(agent_obj, bars, current_bar, coin="BTC"):
+        if coin == "ETH":
+            return {
+                "coin": coin,
+                "side": "long",
+                "confidence": 0.82,
+                "price": current_bar["close"],
+                "atr_pct": 0.02,
+            }
+        if coin == "BTC":
+            return {
+                "coin": coin,
+                "side": "long",
+                "confidence": 0.58,
+                "price": current_bar["close"],
+                "atr_pct": 0.02,
+            }
+        return None
+
+    monkeypatch.setattr(arena.backtester, "_agent_generate_signal", _fake_generate)
+
+    signals = arena.get_champion_signals(
+        current_candles={
+            "BTC": _bars(100.0),
+            "ETH": _bars(100.0),
+        },
+        min_fitness=0.15,
+        min_trades=5,
+        min_win_rate=0.45,
+    )
+
+    assert signals
+    assert signals[0]["coin"] == "ETH"
+    assert signals[0]["side"] == "long"
+
+
+def test_alpha_arena_backtest_agent_aggregates_multi_coin_histories(monkeypatch):
+    from src.signals.alpha_arena import AlphaArena, ArenaAgent, AgentStatus
+
+    bars = [
+        {
+            "open": 100.0 + i,
+            "high": 100.6 + i,
+            "low": 99.4 + i,
+            "close": 100.2 + i,
+            "volume": 1_000.0 + i,
+            "timestamp": i,
+        }
+        for i in range(70)
+    ]
+
+    monkeypatch.setattr(AlphaArena, "_init_db", lambda self: None)
+    monkeypatch.setattr(AlphaArena, "_load_agents", lambda self: None)
+    monkeypatch.setattr(AlphaArena, "_save_agents", lambda self: None)
+
+    arena = AlphaArena()
+    agent = ArenaAgent(
+        agent_id="seed_breakout",
+        name="Seed_breakout",
+        strategy_type="breakout",
+        status=AgentStatus.ACTIVE,
+        params={"confidence_threshold": 0.5},
+    )
+
+    seen_coins = set()
+
+    def _fake_generate(agent_obj, visible, current_bar, coin="BTC"):
+        seen_coins.add(coin)
+        return {
+            "coin": coin,
+            "side": "long",
+            "confidence": 0.7,
+            "price": current_bar["close"],
+            "atr_pct": 0.02,
+        }
+
+    def _fake_simulate(
+        agent_obj,
+        signal,
+        entry_bar,
+        exit_bar,
+        history,
+        future_bars,
+        coin="BTC",
+        sort_key=None,
+    ):
+        return {
+            "coin": coin,
+            "side": signal["side"],
+            "entry_price": exit_bar["open"],
+            "exit_price": exit_bar["close"],
+            "pnl": 1.0,
+            "return_pct": 0.01,
+            "won": True,
+            "_sort_key": sort_key or (0, coin),
+        }
+
+    monkeypatch.setattr(arena.backtester, "_agent_generate_signal", _fake_generate)
+    monkeypatch.setattr(arena.backtester, "_simulate_trade", _fake_simulate)
+
+    result = arena.backtester.backtest_agent(
+        agent,
+        {
+            "BTC": bars,
+            "ETH": bars,
+        },
+    )
+
+    assert result["coins_tested"] == 2
+    assert set(result["coin_results"]) == {"BTC", "ETH"}
+    assert seen_coins == {"BTC", "ETH"}
