@@ -183,6 +183,10 @@ class PositionMonitor:
             self._rest_fallback_interval_s,
             float(getattr(config, "POSITION_MONITOR_IDLE_REST_ONLY_S", 120.0)),
         )
+        self._inactive_rest_only_interval_s = max(
+            self._idle_rest_only_interval_s,
+            float(getattr(config, "POSITION_MONITOR_INACTIVE_REST_ONLY_S", 900.0)),
+        )
         self._rest_fallback_thread = None
         self._reconnect_delay_override_s: Optional[float] = None
         self._reconnect_reason: Optional[str] = None
@@ -421,6 +425,10 @@ class PositionMonitor:
             return False
         return any(marker in text for marker in cls._TRANSIENT_CLOSE_MARKERS)
 
+    @staticmethod
+    def _is_inactive_ws_close(error) -> bool:
+        return "inactive" in str(error or "").lower()
+
     def _note_disconnect(self, *, transient: bool) -> None:
         """Record disconnect state and preserve backoff on short-lived flaps."""
         with self._lock:
@@ -442,6 +450,22 @@ class PositionMonitor:
             self._reconnect_reason = reason
             self._reconnect_count = 0
         self._reconnect_wake_event.set()
+
+    def _schedule_idle_rest_only(self, reason: str, delay_s: Optional[float] = None) -> None:
+        """Pause websocket reconnect churn and rely on REST polling until woken."""
+        wait_s = (
+            self._inactive_rest_only_interval_s
+            if delay_s is None
+            else max(0.0, float(delay_s))
+        )
+        with self._lock:
+            self._subscribed_addresses.clear()
+        self._request_fast_reconnect(reason, delay_s=wait_s)
+        logger.info(
+            "PositionMonitor switching to REST-only mode for %.1fs: %s",
+            wait_s,
+            reason,
+        )
 
     def _enter_idle_rest_only_mode(self, reason: str) -> None:
         """Pause websocket churn when no tracked traders currently have positions.
@@ -659,9 +683,14 @@ class PositionMonitor:
         """Handle WebSocket errors."""
         error_text = str(error or "")
         transient = self._is_transient_ws_close_error(error_text)
+        inactive = self._is_inactive_ws_close(error_text)
         expired = "expired" in error_text.lower()
         if self._running:
-            if expired:
+            if inactive:
+                logger.info(
+                    "PositionMonitor inactive WebSocket stream detected; relying on REST fallback"
+                )
+            elif expired:
                 logger.info(
                     "PositionMonitor WebSocket session expired; refreshing subscription"
                 )
@@ -669,15 +698,18 @@ class PositionMonitor:
                 logger.info("PositionMonitor transient WebSocket close: %s", error)
             else:
                 logger.warning(f"PositionMonitor WebSocket error: {error}")
-        self._note_disconnect(transient=transient or expired)
+        self._note_disconnect(transient=transient or expired or inactive)
         if expired:
             self._request_fast_reconnect("expired WebSocket session")
+        elif inactive:
+            self._schedule_idle_rest_only("inactive userEvents stream")
 
     def _on_close(self, ws, close_status_code=None, close_msg=None) -> None:
         """Handle WebSocket closure."""
         close_text = " ".join(
             part for part in (str(close_status_code or ""), str(close_msg or "")) if part
         )
+        inactive = self._is_inactive_ws_close(close_text)
         expired = "expired" in close_text.lower()
         transient = self._is_transient_ws_close_error(close_text) or close_status_code in {
             None,
@@ -685,9 +717,11 @@ class PositionMonitor:
             1001,
             1006,
         }
-        self._note_disconnect(transient=transient or expired)
+        self._note_disconnect(transient=transient or expired or inactive)
         if expired:
             self._request_fast_reconnect("expired WebSocket session")
+        elif inactive:
+            self._schedule_idle_rest_only("inactive userEvents stream")
         if self._running:
             logger.info(f"PositionMonitor WebSocket closed (code={close_status_code})")
 

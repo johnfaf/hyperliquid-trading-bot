@@ -125,11 +125,15 @@ def test_transient_ws_close_error_detection_rejects_generic_error():
 def test_on_error_logs_info_for_transient_inactive_close(caplog):
     monitor = PositionMonitor()
     monitor._running = True
+    monitor._inactive_rest_only_interval_s = 123.0
 
     with caplog.at_level(logging.INFO):
         monitor._on_error(None, "fin=1 opcode=8 data=b'\\x03\\xe8Inactive' - goodbye")
 
-    assert "transient websocket close" in caplog.text.lower()
+    wait, reason = monitor._consume_reconnect_wait()
+    assert wait == 123.0
+    assert reason == "inactive userEvents stream"
+    assert "rest-only mode" in caplog.text.lower()
 
 
 def test_on_error_logs_warning_for_non_transient_error(caplog):
@@ -153,6 +157,22 @@ def test_on_error_expired_requests_fast_reconnect(caplog):
     assert wait == 1.0
     assert reason == "expired WebSocket session"
     assert "session expired" in caplog.text.lower()
+
+
+def test_on_close_inactive_requests_idle_rest_only_wait(caplog):
+    monitor = PositionMonitor()
+    monitor._running = True
+    monitor._inactive_rest_only_interval_s = 321.0
+    monitor._subscribed_addresses = {"0x" + "1" * 40}
+
+    with caplog.at_level(logging.INFO):
+        monitor._on_close(None, None, "Inactive")
+
+    wait, reason = monitor._consume_reconnect_wait()
+    assert wait == 321.0
+    assert reason == "inactive userEvents stream"
+    assert monitor._subscribed_addresses == set()
+    assert "rest-only mode" in caplog.text.lower()
 
 
 def test_note_disconnect_preserves_backoff_for_short_lived_flaps(monkeypatch):
