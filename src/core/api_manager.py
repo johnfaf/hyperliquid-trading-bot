@@ -22,7 +22,7 @@ import logging
 import hashlib
 import requests
 from typing import Optional, Dict, Any, Callable
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from enum import IntEnum
 
 try:
@@ -657,19 +657,56 @@ class APIManager:
         self._rest_requests = 0
         self._lock = threading.Lock()
 
-        # Failure circuit breaker: if we see too many errors in a window,
-        # pause non-critical requests to let the exchange recover.
-        # This prevents the bot from hammering a struggling API.
-        self._recent_failures = 0
+        # Failure circuit breaker: if we see too many transient errors in a
+        # rolling time window, pause non-critical requests to let the exchange
+        # recover.  Client errors (4xx) are NOT counted — they indicate a bad
+        # request, not a struggling exchange.
+        self._failure_timestamps: deque = deque()   # monotonic timestamps of recent transient failures
         self._circuit_open_until = 0.0
         self._CIRCUIT_THRESHOLD = 10    # failures in window to trip
-        self._CIRCUIT_COOLDOWN = 60.0   # seconds to wait when tripped
+        self._FAILURE_WINDOW_S = 60.0   # rolling window duration
+        self._CIRCUIT_COOLDOWN = 30.0   # seconds to pause non-critical traffic after trip
         self._req_type_failures: Dict[str, int] = {}
         self._req_type_cooldown_until: Dict[str, float] = {}
         # Track when we last logged a SERVER_ERROR warning per req_type so we
         # can coalesce repeated failures instead of spamming the log.
         self._req_type_last_warn_at: Dict[str, float] = {}
         self._req_type_suppressed_warns: Dict[str, int] = {}
+
+    # Failure kinds that genuinely indicate the exchange is struggling.
+    # client_error (4xx) and auth_error do NOT count — they're caller bugs.
+    _TRANSIENT_FAILURE_KINDS = frozenset({
+        "server_error", "timeout", "connection_error", "request_error",
+    })
+
+    def _record_transient_failure(self, now: float) -> int:
+        """
+        Append *now* to the sliding failure window and return the current
+        window count.  Automatically evicts timestamps outside the window.
+        Must be called with ``self._lock`` held.
+        """
+        self._failure_timestamps.append(now)
+        cutoff = now - self._FAILURE_WINDOW_S
+        while self._failure_timestamps and self._failure_timestamps[0] < cutoff:
+            self._failure_timestamps.popleft()
+        return len(self._failure_timestamps)
+
+    def _maybe_trip_circuit(self, n: int, now: float) -> None:
+        """
+        If the sliding-window failure count *n* has reached the threshold,
+        open the circuit breaker and clear the window.
+        Must be called with ``self._lock`` held.
+        """
+        if n >= self._CIRCUIT_THRESHOLD:
+            self._circuit_open_until = now + self._CIRCUIT_COOLDOWN
+            self._failure_timestamps.clear()
+            logger.warning(
+                "Circuit breaker TRIPPED after %d failures in %.0fs window — "
+                "pausing non-critical requests for %.0fs",
+                n,
+                self._FAILURE_WINDOW_S,
+                self._CIRCUIT_COOLDOWN,
+            )
 
     def _is_req_type_cooling_down(self, req_type: str, now: float) -> bool:
         """Return True while a request type is in a temporary cooldown."""
@@ -802,24 +839,24 @@ class APIManager:
             )
         except requests.exceptions.Timeout:
             with self._lock:
-                self._recent_failures += 1
+                n = self._record_transient_failure(time.monotonic())
+                self._maybe_trip_circuit(n, time.monotonic())
             raise
         self._record_req_type_result(req_type, failure_kind)
 
-        # Track failures for circuit breaker
+        # Track transient failures for circuit breaker (sliding window).
+        # Only server-side / network errors count — client errors (4xx) are
+        # the caller's fault and should not be charged against the exchange.
         with self._lock:
-            if result is None:
-                self._recent_failures += 1
-                if self._recent_failures >= self._CIRCUIT_THRESHOLD:
-                    self._circuit_open_until = time.monotonic() + self._CIRCUIT_COOLDOWN
-                    logger.warning(
-                        f"Circuit breaker TRIPPED after {self._recent_failures} failures — "
-                        f"pausing non-critical requests for {self._CIRCUIT_COOLDOWN}s"
-                    )
-                    self._recent_failures = 0  # Reset counter
-            else:
-                # Successful request: decay failure counter
-                self._recent_failures = max(0, self._recent_failures - 1)
+            if result is None and failure_kind in self._TRANSIENT_FAILURE_KINDS:
+                n = self._record_transient_failure(time.monotonic())
+                self._maybe_trip_circuit(n, time.monotonic())
+            elif result is not None:
+                # Success: evict stale timestamps from window (passive decay).
+                now_s = time.monotonic()
+                cutoff = now_s - self._FAILURE_WINDOW_S
+                while self._failure_timestamps and self._failure_timestamps[0] < cutoff:
+                    self._failure_timestamps.popleft()
 
         # Cache the result
         if cache_response and result is not None:
@@ -999,8 +1036,9 @@ class APIManager:
                 "ws_hit_pct": round(self._ws_served / total * 100, 1),
                 "circuit_breaker": {
                     "open": now < self._circuit_open_until,
-                    "recent_failures": self._recent_failures,
+                    "failures_in_window": len(self._failure_timestamps),
                     "threshold": self._CIRCUIT_THRESHOLD,
+                    "window_s": self._FAILURE_WINDOW_S,
                     "cooldown_remaining_s": max(0, round(self._circuit_open_until - now, 1)),
                 },
                 "request_type_cooldowns": {
