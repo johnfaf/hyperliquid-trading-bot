@@ -512,16 +512,46 @@ def mirror_executed_trades_to_live(
         if not candidates:
             return
 
-        live_balance = float(trader.get_account_value() or 0.0)
-        margin_budget = live_balance * 0.95 if live_balance > 0 else 0.0
+        # Prefer free/available margin (accountValue - totalMarginUsed) so the
+        # batch budget doesn't double-count margin already locked by open
+        # positions.  Falls back to total account value only if the trader
+        # doesn't expose a free-margin helper.
+        free_margin: Optional[float] = None
+        if hasattr(trader, "get_free_margin"):
+            try:
+                fm = trader.get_free_margin()
+                free_margin = float(fm) if fm is not None else None
+            except Exception as exc:
+                logger.debug("%s get_free_margin failed: %s", success_label, exc)
+                free_margin = None
+        if free_margin is None:
+            try:
+                free_margin = float(trader.get_account_value() or 0.0)
+            except Exception:
+                free_margin = 0.0
+
+        margin_budget = max(0.0, free_margin) * 0.95
         selected = []
         used_margin = 0.0
+
+        # Zero/negative budget means "no room to mirror anything" — reject
+        # all candidates rather than (accidentally) admitting them all.
+        if margin_budget <= 0.0:
+            logger.warning(
+                "%s skipped %d candidate(s): no free margin available "
+                "(free=$%.2f, budget=$%.2f)",
+                success_label,
+                len(candidates),
+                free_margin or 0.0,
+                margin_budget,
+            )
+            return
 
         # Keep the paper execution order to maximize live-vs-paper parity when
         # margin/canary caps force us to drop some mirrors.
         for item in candidates:
             projected = used_margin + item["margin"]
-            if margin_budget > 0 and projected > margin_budget:
+            if projected > margin_budget:
                 logger.warning(
                     "%s skipped %s %s: batch margin budget exceeded "
                     "(need $%.2f, used $%.2f, budget $%.2f)",

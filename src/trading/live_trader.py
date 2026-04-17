@@ -873,6 +873,40 @@ class LiveTrader:
         """Backward-compatible alias for callers expecting wallet balance API."""
         return self.get_account_value()
 
+    def get_free_margin(self) -> Optional[float]:
+        """
+        Return the free/available perps margin — i.e. how much USD the
+        exchange will let us post as margin on NEW positions right now.
+
+        Prefers Hyperliquid's top-level ``withdrawable`` field (authoritative
+        free margin after open positions).  Falls back to
+        ``accountValue - totalMarginUsed``.  Returns 0.0 when the account is
+        reachable but has no free margin, and ``None`` only when the API
+        lookup itself fails.
+        """
+        state = self.get_account_state()
+        if not isinstance(state, dict) or not state:
+            return None
+
+        # Primary: Hyperliquid exposes `withdrawable` at the top level — this
+        # is the true free margin (accountValue minus margin locked by open
+        # positions and open orders).
+        withdrawable = state.get("withdrawable")
+        try:
+            if withdrawable is not None:
+                return max(0.0, float(withdrawable))
+        except (TypeError, ValueError):
+            pass
+
+        # Fallback: compute from marginSummary.
+        margin_summary = state.get("marginSummary", {}) or {}
+        try:
+            acct = float(margin_summary.get("accountValue", 0) or 0)
+            used = float(margin_summary.get("totalMarginUsed", 0) or 0)
+            return max(0.0, acct - used)
+        except (TypeError, ValueError):
+            return None
+
     def _get_spot_usdc_balance(self) -> Optional[float]:
         """Fetch USDC balance from the spot wallet."""
         if not self.public_address:
