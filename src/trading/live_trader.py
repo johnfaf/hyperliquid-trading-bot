@@ -566,12 +566,20 @@ class LiveTrader:
         # Wallet balance tracking (last-known snapshots for dashboards/cycles).
         self._last_balance_snapshot: Dict[str, Optional[float]] = {
             "perps_margin": None,
+            "free_margin": None,
             "spot_usdc": None,
             "total": None,
             "timestamp": None,
         }
         self._balance_log_interval_s = 300  # log balance at most once per 5 min
         self._last_balance_log_ts: float = 0.0
+        self._last_known_free_margin: Optional[float] = None
+        self._free_margin_zero_since_ts: float = 0.0
+        self._last_free_margin_alert_ts: float = 0.0
+        self._free_margin_alert_cooldown_s = max(
+            60.0,
+            float(os.environ.get("LIVE_FREE_MARGIN_ALERT_COOLDOWN_S", "900")),
+        )
 
         logger.info(
             f"LiveTrader initialized: dry_run={dry_run}, "
@@ -873,24 +881,12 @@ class LiveTrader:
         """Backward-compatible alias for callers expecting wallet balance API."""
         return self.get_account_value()
 
-    def get_free_margin(self) -> Optional[float]:
-        """
-        Return the free/available perps margin — i.e. how much USD the
-        exchange will let us post as margin on NEW positions right now.
-
-        Prefers Hyperliquid's top-level ``withdrawable`` field (authoritative
-        free margin after open positions).  Falls back to
-        ``accountValue - totalMarginUsed``.  Returns 0.0 when the account is
-        reachable but has no free margin, and ``None`` only when the API
-        lookup itself fails.
-        """
-        state = self.get_account_state()
+    @staticmethod
+    def _extract_free_margin_from_state(state: Dict[str, Any]) -> Optional[float]:
+        """Extract free/available margin from a clearinghouse state payload."""
         if not isinstance(state, dict) or not state:
             return None
 
-        # Primary: Hyperliquid exposes `withdrawable` at the top level — this
-        # is the true free margin (accountValue minus margin locked by open
-        # positions and open orders).
         withdrawable = state.get("withdrawable")
         try:
             if withdrawable is not None:
@@ -898,7 +894,6 @@ class LiveTrader:
         except (TypeError, ValueError):
             pass
 
-        # Fallback: compute from marginSummary.
         margin_summary = state.get("marginSummary", {}) or {}
         try:
             acct = float(margin_summary.get("accountValue", 0) or 0)
@@ -906,6 +901,86 @@ class LiveTrader:
             return max(0.0, acct - used)
         except (TypeError, ValueError):
             return None
+
+    def get_free_margin(self) -> Optional[float]:
+        """
+        Return the free/available perps margin for NEW positions.
+        """
+        return self._extract_free_margin_from_state(self.get_account_state())
+
+    def _maybe_alert_zero_free_margin(
+        self,
+        *,
+        free_margin: Optional[float],
+        perps_margin: Optional[float],
+        spot_usdc: Optional[float],
+        now: float,
+    ) -> None:
+        """Emit persistent alerts while the live account has no free margin."""
+        self._last_known_free_margin = free_margin
+        if not self.live_requested or self.dry_run or not self.public_address:
+            return
+        if free_margin is None:
+            return
+
+        if free_margin <= 0.0:
+            if self._free_margin_zero_since_ts <= 0.0:
+                self._free_margin_zero_since_ts = now
+            if self.is_deployable() and not self.kill_switch_active:
+                self.status_reason = "no_free_margin_available"
+            if (now - self._last_free_margin_alert_ts) < self._free_margin_alert_cooldown_s:
+                return
+
+            zero_for_s = max(0.0, now - self._free_margin_zero_since_ts)
+            logger.warning(
+                "Live free margin is $0.00 - new live entries will be skipped "
+                "(perps=$%s, spot=$%s, canary_cap=$%.2f, zero_for=%.0fs).",
+                f"{perps_margin:.2f}" if perps_margin is not None else "n/a",
+                f"{spot_usdc:.2f}" if spot_usdc is not None else "n/a",
+                self.max_order_usd,
+                zero_for_s,
+            )
+            try:
+                from src.notifications import telegram_bot as tg
+
+                if tg.is_configured():
+                    tg.notify_live_margin_blocked(
+                        free_margin=free_margin,
+                        perps_margin=perps_margin,
+                        spot_usdc=spot_usdc,
+                        max_order_usd=self.max_order_usd,
+                        zero_for_seconds=zero_for_s,
+                    )
+            except Exception as exc:
+                logger.warning("Free-margin alert skipped: %s", exc)
+            self._last_free_margin_alert_ts = now
+            return
+
+        if self._free_margin_zero_since_ts > 0.0:
+            zero_for_s = max(0.0, now - self._free_margin_zero_since_ts)
+            logger.info(
+                "Live free margin restored to $%.2f after %.0fs - live mirroring can resume.",
+                free_margin,
+                zero_for_s,
+            )
+            try:
+                from src.notifications import telegram_bot as tg
+
+                if tg.is_configured():
+                    tg.notify_live_margin_blocked(
+                        free_margin=free_margin,
+                        perps_margin=perps_margin,
+                        spot_usdc=spot_usdc,
+                        max_order_usd=self.max_order_usd,
+                        zero_for_seconds=zero_for_s,
+                        resolved=True,
+                    )
+            except Exception as exc:
+                logger.warning("Free-margin recovery alert skipped: %s", exc)
+            self._free_margin_zero_since_ts = 0.0
+
+        if self.live_requested and self.is_deployable() and self.status_reason == "no_free_margin_available":
+            self.status_reason = "live_ready"
 
     def _get_spot_usdc_balance(self) -> Optional[float]:
         """Fetch USDC balance from the spot wallet."""
@@ -944,6 +1019,7 @@ class LiveTrader:
             Dict with keys: perps_margin, spot_usdc, total, timestamp.
         """
         perps = None
+        free_margin = None
         try:
             if self.public_address:
                 data = self.api_manager.post(
@@ -954,9 +1030,11 @@ class LiveTrader:
                 if isinstance(data, dict):
                     margin_summary = data.get("marginSummary", {}) or {}
                     perps = float(margin_summary.get("accountValue", 0) or 0)
+                    free_margin = self._extract_free_margin_from_state(data)
         except Exception as e:
             logger.debug("snapshot_balance: perps fetch error: %s", e)
             perps = None
+            free_margin = None
 
         spot = self._get_spot_usdc_balance()
         total: Optional[float]
@@ -968,16 +1046,24 @@ class LiveTrader:
         now = time.time()
         self._last_balance_snapshot = {
             "perps_margin": perps,
+            "free_margin": free_margin,
             "spot_usdc": spot,
             "total": total,
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
+        self._maybe_alert_zero_free_margin(
+            free_margin=free_margin,
+            perps_margin=perps,
+            spot_usdc=spot,
+            now=now,
+        )
 
         if log and (now - self._last_balance_log_ts) >= self._balance_log_interval_s:
             self._last_balance_log_ts = now
             logger.info(
-                "Wallet balance: perps=$%s, spot=$%s, total=$%s",
+                "Wallet balance: perps=$%s, free=$%s, spot=$%s, total=$%s",
                 f"{perps:.2f}" if perps is not None else "n/a",
+                f"{free_margin:.2f}" if free_margin is not None else "n/a",
                 f"{spot:.2f}" if spot is not None else "n/a",
                 f"{total:.2f}" if total is not None else "n/a",
             )
@@ -4165,6 +4251,12 @@ class LiveTrader:
                 self.min_order_usd / max(getattr(self.firewall, "crash_size_multiplier", 1.0), 1e-6),
                 2,
             ) if self.firewall and self.min_order_usd else None,
+            "free_margin": self._last_known_free_margin,
+            "free_margin_blocked_since": (
+                datetime.fromtimestamp(self._free_margin_zero_since_ts, timezone.utc).isoformat()
+                if self._free_margin_zero_since_ts > 0
+                else None
+            ),
             "wallet_balance": dict(self._last_balance_snapshot),
             "asset_indices_loaded": len(self.asset_index_map),
             "timestamp": datetime.now(timezone.utc).isoformat()

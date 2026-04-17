@@ -77,6 +77,32 @@ def test_evaluate_readiness_flags_live_deploy_blockers(monkeypatch):
     assert "kill_switch_active:manual_test" in snapshot["reasons"]
 
 
+def test_evaluate_readiness_flags_zero_free_margin(monkeypatch):
+    monkeypatch.setattr(readiness, "_probe_db_readable", lambda: (True, ""))
+    monkeypatch.setattr(readiness, "_probe_db_writable", lambda ttl_s=None: (True, ""))
+    monkeypatch.setattr(readiness.db, "get_db_path", lambda: "test.db")
+
+    snapshot = readiness.evaluate_readiness(
+        container=_FakeContainer(
+            {
+                "live_enabled": True,
+                "deployable": True,
+                "signer_available": True,
+                "kill_switch_active": False,
+                "status_reason": "no_free_margin_available",
+                "wallet_balance": {"free_margin": 0.0},
+            }
+        ),
+        health_registry=_healthy_registry(),
+        stale_seconds=600,
+    )
+
+    assert snapshot["ready"] is True
+    assert snapshot["live_ready"] is False
+    assert snapshot["checks"]["free_margin"] == 0.0
+    assert "live_free_margin_zero" in snapshot["reasons"]
+
+
 def test_evaluate_readiness_flags_stale_trading_heartbeat(monkeypatch):
     monkeypatch.setattr(readiness, "_probe_db_readable", lambda: (True, ""))
     monkeypatch.setattr(readiness, "_probe_db_writable", lambda ttl_s=None: (True, ""))

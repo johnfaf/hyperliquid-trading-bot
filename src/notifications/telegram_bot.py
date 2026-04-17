@@ -323,6 +323,39 @@ def notify_runtime_incident(snapshot: Dict, resolved: bool = False):
     _send_message(text)
 
 
+
+def notify_live_margin_blocked(
+    *,
+    free_margin: float,
+    perps_margin: float | None,
+    spot_usdc: float | None,
+    max_order_usd: float,
+    zero_for_seconds: float = 0.0,
+    resolved: bool = False,
+) -> None:
+    """Alert when live trading is quiet because free margin is exhausted."""
+    title = "LIVE FREE MARGIN RESTORED" if resolved else "LIVE FREE MARGIN BLOCKED"
+    emoji = "✅" if resolved else "🚫"
+    text = (
+        f"{emoji} <b>{title}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"<b>Free Margin:</b> ${float(free_margin or 0):,.2f}\n"
+        f"<b>Perps Margin:</b> "
+        f"{f'${float(perps_margin):,.2f}' if perps_margin is not None else 'n/a'}\n"
+        f"<b>Spot USDC:</b> "
+        f"{f'${float(spot_usdc):,.2f}' if spot_usdc is not None else 'n/a'}\n"
+        f"<b>Live Order Cap:</b> ${float(max_order_usd or 0):,.2f}\n"
+    )
+    if zero_for_seconds > 0:
+        text += f"<b>Zero Since:</b> {int(zero_for_seconds)}s\n"
+    if resolved:
+        text += "\nLive mirroring can resume.\n"
+    else:
+        text += "\nNew live entries will be skipped until free margin is available.\n"
+
+    text += f"\n⏰ {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}"
+    _send_message(text)
+
 def notify_manual_close_detected(trade: Dict, exit_price: float):
     """Alert when reconcile finds an exchange position disappeared unexpectedly."""
     text = (

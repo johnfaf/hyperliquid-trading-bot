@@ -22,6 +22,7 @@ Usage:
 import os
 import signal
 import sys
+import threading
 import time
 
 # Force unbuffered stdout/stderr for Docker/Railway log visibility
@@ -95,6 +96,9 @@ class HyperliquidResearchBot:
         self._cycle_count = 0
         self._fast_cycle_count = 0
         self._shutdown_orders_cancelled = False
+        self._discovery_thread = None
+        self._discovery_state_lock = threading.Lock()
+        self._discovery_retry_after_ts = 0.0
 
         # ── Boot sequence ──
         log_persistence_info(self.logger)
@@ -215,6 +219,76 @@ class HyperliquidResearchBot:
         self._last_discovery = time.time()
         self._save_last_discovery_time()
 
+    def _discovery_running(self) -> bool:
+        with self._discovery_state_lock:
+            return bool(self._discovery_thread and self._discovery_thread.is_alive())
+
+    def _start_discovery_async(self, reason: str) -> bool:
+        now = time.time()
+        with self._discovery_state_lock:
+            if self._discovery_thread and self._discovery_thread.is_alive():
+                self.logger.info(
+                    "Discovery already running in background — skipping %s request",
+                    reason,
+                )
+                return False
+            if now < self._discovery_retry_after_ts:
+                retry_in = max(0.0, self._discovery_retry_after_ts - now)
+                self.logger.info(
+                    "Discovery backoff active — next background retry in %.0fs (%s)",
+                    retry_in,
+                    reason,
+                )
+                return False
+
+            def _runner():
+                started = time.time()
+                failed = False
+                self.logger.info(
+                    "Starting background discovery (%s) — trading loop remains active",
+                    reason,
+                )
+                try:
+                    self._run_discovery()
+                except Exception as exc:
+                    failed = True
+                    backoff = min(900.0, max(60.0, config.FAST_CYCLE_INTERVAL * 5.0))
+                    with self._discovery_state_lock:
+                        self._discovery_retry_after_ts = time.time() + backoff
+                    self.logger.error(
+                        "Background discovery failed (%s): %s",
+                        reason,
+                        exc,
+                        exc_info=True,
+                    )
+                    try:
+                        self.runtime_monitor.evaluate_and_alert(
+                            container=self.container,
+                            health_registry=health_registry,
+                        )
+                    except Exception:
+                        pass
+                finally:
+                    elapsed = time.time() - started
+                    with self._discovery_state_lock:
+                        self._discovery_thread = None
+                        if not failed:
+                            self._discovery_retry_after_ts = 0.0
+                    if not failed:
+                        self.logger.info(
+                            "Background discovery complete (%.1fs, reason=%s)",
+                            elapsed,
+                            reason,
+                        )
+
+            self._discovery_thread = threading.Thread(
+                target=_runner,
+                daemon=True,
+                name=f"bg-discovery-{reason}",
+            )
+            self._discovery_thread.start()
+        return True
+
     def _run_trading_cycle(self):
         self.runtime_config.poll(self.container)
         self._cycle_count += 1
@@ -329,8 +403,11 @@ class HyperliquidResearchBot:
             pass
 
         if trader_count == 0:
-            self.logger.info("No traders in DB — running initial discovery…")
-            self._run_discovery()
+            self.logger.info(
+                "No traders in DB — scheduling initial discovery in background "
+                "so trading cycles can continue."
+            )
+            self._start_discovery_async("startup_empty_trader_pool")
         else:
             restored_ts = self._restore_last_discovery_time()
             if restored_ts and (time.time() - restored_ts) < config.DISCOVERY_CYCLE_INTERVAL:
@@ -349,8 +426,11 @@ class HyperliquidResearchBot:
             now = time.time()
             try:
                 # Tier 3: Discovery (daily)
-                if now - self._last_discovery >= config.DISCOVERY_CYCLE_INTERVAL:
-                    self._run_discovery()
+                if (
+                    not self._discovery_running()
+                    and now - self._last_discovery >= config.DISCOVERY_CYCLE_INTERVAL
+                ):
+                    self._start_discovery_async("scheduled_cycle")
 
                 # Tier 2: Trading (5 min)
                 if now - self._last_research >= config.TRADING_CYCLE_INTERVAL:
@@ -389,6 +469,10 @@ class HyperliquidResearchBot:
         # ── Shutdown ──
         self._cancel_live_orders_for_shutdown(reason="run_loop_exit")
         self.task_runner.stop_all(timeout=10)
+        if self._discovery_running():
+            self.logger.info(
+                "Background discovery is still running during shutdown — not waiting for completion."
+            )
         try:
             if getattr(self.container, "position_monitor", None):
                 self.container.position_monitor.stop()

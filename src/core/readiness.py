@@ -153,12 +153,23 @@ def evaluate_readiness(
     signer_available = bool(live_stats.get("signer_available", False))
     kill_switch_active = bool(live_stats.get("kill_switch_active", False))
     live_status_reason = str(live_stats.get("status_reason", "") or "")
+    wallet_balance = live_stats.get("wallet_balance", {}) if isinstance(live_stats, dict) else {}
+    free_margin = None
+    if isinstance(wallet_balance, dict):
+        free_margin = wallet_balance.get("free_margin")
+    if free_margin is None:
+        free_margin = live_stats.get("free_margin")
+    try:
+        free_margin = float(free_margin) if free_margin is not None else None
+    except (TypeError, ValueError):
+        free_margin = None
 
     checks["live_requested"] = live_requested
     checks["deployable"] = deployable
     checks["signer_available"] = signer_available
     checks["kill_switch_active"] = kill_switch_active
     checks["live_status_reason"] = live_status_reason or None
+    checks["free_margin"] = free_margin
 
     if live_requested:
         if not deployable:
@@ -168,6 +179,8 @@ def evaluate_readiness(
         if kill_switch_active:
             reason = str(live_stats.get("kill_switch_reason", "") or "active")
             reasons.append(f"kill_switch_active:{reason}")
+        if free_margin is not None and free_margin <= 0:
+            reasons.append("live_free_margin_zero")
 
     ready = bool(db_readable and db_writable and subsystem_safe and not stale_trading)
     live_ready = bool(
@@ -176,6 +189,7 @@ def evaluate_readiness(
         and deployable
         and signer_available
         and not kill_switch_active
+        and not (free_margin is not None and free_margin <= 0)
     )
 
     payload["ready"] = ready

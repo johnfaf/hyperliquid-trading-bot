@@ -1,3 +1,5 @@
+import threading
+import time
 from types import SimpleNamespace
 
 import main
@@ -5,14 +7,22 @@ import main
 
 class _FakeLogger:
     def __init__(self):
+        self.infos = []
         self.warnings = []
         self.criticals = []
+        self.errors = []
+
+    def info(self, msg, *args):
+        self.infos.append(msg % args if args else msg)
 
     def warning(self, msg, *args):
         self.warnings.append(msg % args if args else msg)
 
     def critical(self, msg, *args):
         self.criticals.append(msg % args if args else msg)
+
+    def error(self, msg, *args, **kwargs):
+        self.errors.append(msg % args if args else msg)
 
 
 def test_restore_last_discovery_time_logs_and_returns_zero_on_failure(monkeypatch):
@@ -66,3 +76,75 @@ def test_sleep_with_kill_switch_checks_survives_poll_and_check_errors(monkeypatc
     assert check_calls["count"] >= 1
     assert any("Runtime config poll failed during sleep window" in msg for msg in bot.logger.warnings)
     assert any("Kill-switch check failed during sleep window" in msg for msg in bot.logger.warnings)
+
+
+def test_start_discovery_async_runs_in_background(monkeypatch):
+    bot = main.HyperliquidResearchBot.__new__(main.HyperliquidResearchBot)
+    bot.logger = _FakeLogger()
+    bot.container = object()
+    bot.runtime_monitor = SimpleNamespace(evaluate_and_alert=lambda **kwargs: None)
+    bot._discovery_state_lock = threading.Lock()
+    bot._discovery_thread = None
+    bot._discovery_retry_after_ts = 0.0
+
+    started = threading.Event()
+    release = threading.Event()
+
+    def _run_discovery():
+        started.set()
+        release.wait(1.0)
+
+    bot._run_discovery = _run_discovery
+
+    assert bot._start_discovery_async("unit_test") is True
+    assert started.wait(1.0) is True
+    assert bot._discovery_running() is True
+
+    release.set()
+    deadline = time.time() + 1.0
+    while bot._discovery_running() and time.time() < deadline:
+        time.sleep(0.01)
+
+    assert bot._discovery_running() is False
+    assert any("Starting background discovery" in msg for msg in bot.logger.infos)
+
+
+def test_run_loop_schedules_initial_discovery_without_blocking_trading(monkeypatch):
+    bot = main.HyperliquidResearchBot.__new__(main.HyperliquidResearchBot)
+    bot.logger = _FakeLogger()
+    bot.container = SimpleNamespace(reporter=None, position_monitor=None, dashboard=None)
+    bot.runtime_config = SimpleNamespace(poll=lambda _container: None)
+    bot.runtime_monitor = SimpleNamespace(evaluate_and_alert=lambda **kwargs: None)
+    bot.task_runner = SimpleNamespace(start_all=lambda: None, stop_all=lambda timeout=10: None)
+    bot._last_research = 0.0
+    bot._last_discovery = 0.0
+    bot._last_report = 0.0
+    bot._cycle_count = 0
+    bot._fast_cycle_count = 0
+    bot._shutdown_orders_cancelled = False
+    bot._discovery_state_lock = threading.Lock()
+    bot._discovery_thread = None
+    bot._discovery_retry_after_ts = 0.0
+    bot._cancel_live_orders_for_shutdown = lambda reason: None
+
+    scheduled = []
+    monkeypatch.setattr(main.db, "get_active_traders", lambda: [])
+    def _start_discovery_async(reason):
+        scheduled.append(reason)
+        bot._discovery_thread = SimpleNamespace(is_alive=lambda: True)
+        return True
+
+    monkeypatch.setattr(bot, "_start_discovery_async", _start_discovery_async)
+    monkeypatch.setattr(bot, "_fast_cycle", lambda: None)
+    monkeypatch.setattr(bot, "_sleep_with_kill_switch_checks", lambda interval_s: None)
+    monkeypatch.setattr(main.signal, "signal", lambda *args, **kwargs: None)
+
+    def _run_trading_cycle():
+        bot.running = False
+
+    bot._run_trading_cycle = _run_trading_cycle
+
+    bot.run_loop()
+
+    assert scheduled == ["startup_empty_trader_pool"]
+    assert any("scheduling initial discovery in background" in msg for msg in bot.logger.infos)
