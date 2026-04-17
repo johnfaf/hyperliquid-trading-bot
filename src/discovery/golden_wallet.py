@@ -681,8 +681,8 @@ def evaluate_wallet(address: str, bot_score: int = 0,
     if pen_dd < MIN_HUMAN_DRAWDOWN and pen_total > 5000:
         superhuman = True
         logger.info(
-            "Superhuman filter: %s DD=%.1f%% (<%.1f%%) with $%+,.0f — likely bot/vault",
-            address[:10], pen_dd, MIN_HUMAN_DRAWDOWN, pen_total,
+            "Superhuman filter: %s DD=%.1f%% (<%.1f%%) with $%s — likely bot/vault",
+            address[:10], pen_dd, MIN_HUMAN_DRAWDOWN, f"{pen_total:+,.0f}",
         )
 
     # Golden = penalised equity still positive AND curve trending up
@@ -722,10 +722,10 @@ def evaluate_wallet(address: str, bot_score: int = 0,
 
     tag = "GOLDEN" if is_golden else "not golden"
     logger.info(
-        "%s %s: raw=$%+,.0f → penalised=$%+,.0f "
+        "%s %s: raw=$%s → penalised=$%s "
         "| DD=%.1f%% | Sharpe=%.2f | WR=%.0f%% | hold=%.1fh | %s",
         "★" if is_golden else "·", address[:10],
-        raw_total, pen_total,
+        f"{raw_total:+,.0f}", f"{pen_total:+,.0f}",
         report.penalised_max_drawdown_pct, report.sharpe_ratio,
         report.win_rate, avg_hold_hours, tag,
     )
@@ -763,8 +763,15 @@ def init_golden_tables():
                 penalised_equity_curve TEXT DEFAULT '[]',
                 equity_timestamps TEXT DEFAULT '[]',
                 evaluated_at TIMESTAMPTZ NOT NULL,
-                connected_to_live BOOLEAN DEFAULT FALSE
+                connected_to_live BOOLEAN DEFAULT FALSE,
+                avg_hold_time_hours DOUBLE PRECISION DEFAULT 0,
+                last_fill_sync_time BIGINT DEFAULT 0
             );
+            -- Migrate existing Postgres deployments that pre-date these columns.
+            ALTER TABLE golden_wallets
+                ADD COLUMN IF NOT EXISTS avg_hold_time_hours DOUBLE PRECISION DEFAULT 0;
+            ALTER TABLE golden_wallets
+                ADD COLUMN IF NOT EXISTS last_fill_sync_time BIGINT DEFAULT 0;
             CREATE TABLE IF NOT EXISTS wallet_fills (
                 id BIGSERIAL PRIMARY KEY,
                 wallet_address TEXT NOT NULL REFERENCES golden_wallets(address),
@@ -892,7 +899,7 @@ def save_wallet_report(report: WalletReport, last_fill_sync_time_ms: int = 0):
             report.raw_pnl, report.penalised_pnl,
             report.max_drawdown_pct, report.penalised_max_drawdown_pct,
             report.sharpe_ratio, report.win_rate, report.trades_per_day,
-            1 if report.is_golden else 0,
+            bool(report.is_golden),
             json.dumps(report.coins_traded), report.best_coin, report.worst_coin,
             json.dumps(report.raw_equity_curve[-500:]),  # cap storage
             json.dumps(report.penalised_equity_curve[-500:]),
@@ -918,7 +925,7 @@ def save_wallet_fills(address: str, penalised_fills: List[PenalisedFill]):
             """, (
                 address, f.coin, f.side, f.original_price, f.penalised_price,
                 f.size, f.time_ms, f.delayed_time_ms, f.closed_pnl,
-                f.penalised_pnl, f.fee, 1 if f.is_liquidation else 0,
+                f.penalised_pnl, f.fee, bool(f.is_liquidation),
                 f.direction,
             ))
         logger.debug(f"Saved {len(penalised_fills)} fills for {address[:10]}")
@@ -1109,8 +1116,8 @@ def run_golden_scan(max_wallets: int = 200) -> Dict:
     for r in results:
         if r.is_golden:
             logger.debug(
-                "  ★ %s: PnL=$%+,.0f Sharpe=%.2f DD=%.1f%% hold=%.1fh",
-                r.address[:10], r.penalised_pnl, r.sharpe_ratio,
+                "  ★ %s: PnL=$%s Sharpe=%.2f DD=%.1f%% hold=%.1fh",
+                r.address[:10], f"{r.penalised_pnl:+,.0f}", r.sharpe_ratio,
                 r.penalised_max_drawdown_pct, r.avg_hold_time_hours,
             )
 

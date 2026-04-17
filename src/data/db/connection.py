@@ -45,6 +45,42 @@ _INSERT_VALUES_RE = re.compile(
 _SQLITE_ONLY_PREFIXES = ("PRAGMA",)
 _DDL_PREFIXES = ("CREATE ", "ALTER ", "DROP ", "VACUUM", "REINDEX")
 
+# Columns that are BOOLEAN in Postgres but historically stored as 0/1 ints in
+# SQLite.  When dualwriting parameterised INSERTs we must coerce these values
+# to Python bool so psycopg binds them as the correct Postgres type.  Without
+# this, every INSERT into wallet_fills / golden_wallets fails with
+# "column is of type boolean but expression is of type smallint".
+_POSTGRES_BOOLEAN_COLUMNS = frozenset({
+    "active",
+    "is_golden",
+    "connected_to_live",
+    "is_liquidation",
+})
+
+
+def _coerce_bool_params(columns, params):
+    """Return a new params tuple with 0/1 ints in boolean columns cast to bool.
+
+    ``columns`` is expected to be a list of lowercased column names lined up
+    positionally with ``params``.  Values that are already ``None`` or ``bool``
+    pass through untouched.  If the lengths don't match we return ``params``
+    unchanged — that path is a caller bug, not something we should guess at.
+    """
+    if not params:
+        return params
+    params = tuple(params)
+    if len(columns) != len(params):
+        return params
+    out = list(params)
+    for i, col in enumerate(columns):
+        if col in _POSTGRES_BOOLEAN_COLUMNS:
+            v = out[i]
+            if v is None or isinstance(v, bool):
+                continue
+            if isinstance(v, (int, float)):
+                out[i] = bool(v)
+    return tuple(out)
+
 
 def _clean_identifier(raw: str) -> str:
     return raw.strip().strip("\"'`[]")
@@ -315,12 +351,13 @@ class DualWriteAdapter:
         table = _clean_identifier(insert_match.group("table"))
         columns_raw = insert_match.group("columns").strip()
         columns = [_clean_identifier(col).lower() for col in columns_raw.split(",")]
+        coerced_params = _coerce_bool_params(columns, tuple(params) if params else ())
         if "id" in columns:
-            return sql, tuple(params) if params else ()
+            return sql, coerced_params
 
         inserted_id = getattr(sqlite_result, "lastrowid", None)
         if not inserted_id or not self._sqlite_table_has_integer_id_pk(table):
-            return sql, tuple(params) if params else ()
+            return sql, coerced_params
 
         values_raw = insert_match.group("values").strip()
         suffix = insert_match.group("suffix") or ""
@@ -328,7 +365,7 @@ class DualWriteAdapter:
             f"INSERT INTO {insert_match.group('table')} (id, {columns_raw}) "
             f"VALUES (?, {values_raw}){suffix}"
         )
-        mirror_params = (inserted_id,) + tuple(params or ())
+        mirror_params = (inserted_id,) + coerced_params
         return mirror_sql, mirror_params
 
     def _mirror_to_pg(self, sql: str, params: Sequence = None, sqlite_result=None) -> None:
