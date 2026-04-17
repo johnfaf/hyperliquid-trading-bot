@@ -40,6 +40,10 @@ import config
 logger = logging.getLogger("api_manager")
 logger.addHandler(logging.NullHandler())
 
+_WS_GAP_WARN_THRESHOLD_MS_MIN = 5000.0
+_WS_GAP_WARN_COOLDOWN_S_MIN = 5.0
+_WS_GAP_WARN_COOLDOWN_S_MAX = 900.0
+
 
 # ─── Priority levels ─────────────────────────────────────────────
 class Priority(IntEnum):
@@ -322,12 +326,15 @@ class HyperliquidWebSocket:
         self._gap_count: int = 0       # Number of detected gaps
         self._max_gap_ms: float = 0.0  # Largest gap seen
         self._gap_warn_threshold_ms: float = max(
-            5000.0,
+            _WS_GAP_WARN_THRESHOLD_MS_MIN,
             float(getattr(config, "WS_FEED_GAP_WARN_MS", 30000.0)),
         )
-        self._gap_warn_cooldown_s: float = max(
-            5.0,
-            float(getattr(config, "WS_FEED_GAP_WARN_COOLDOWN_S", 60.0)),
+        self._gap_warn_cooldown_s: float = min(
+            _WS_GAP_WARN_COOLDOWN_S_MAX,
+            max(
+                _WS_GAP_WARN_COOLDOWN_S_MIN,
+                float(getattr(config, "WS_FEED_GAP_WARN_COOLDOWN_S", 60.0)),
+            ),
         )
         self._gap_warn_startup_grace_s: float = max(
             0.0,

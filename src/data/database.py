@@ -557,11 +557,13 @@ def get_paper_account():
 def update_paper_account(balance, total_pnl, total_trades, winning_trades):
     now = datetime.now(timezone.utc).isoformat()
     with get_connection() as conn:
-        conn.execute("""
+        cursor = conn.execute("""
             UPDATE paper_account
             SET balance = ?, total_pnl = ?, total_trades = ?, winning_trades = ?, last_updated = ?
             WHERE id = 1
         """, (balance, total_pnl, total_trades, winning_trades, now))
+        if cursor.rowcount == 0:
+            raise LookupError("paper_account singleton row (id=1) does not exist")
 
 
 def open_paper_trade(strategy_id, coin, side, entry_price, size, leverage=1,

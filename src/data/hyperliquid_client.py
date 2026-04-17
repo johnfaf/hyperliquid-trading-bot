@@ -27,6 +27,24 @@ logger = logging.getLogger(__name__)
 # pipeline occasionally inserts placeholder / truncated addresses into the
 # DB — filter them out here instead of spamming the log with 422 warnings.
 _ETH_ADDRESS_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
+_WARNED_INVALID_ADDRESSES: set[str] = set()
+
+
+def _warn_invalid_address_once(context: str, address: Optional[str]) -> None:
+    """Warn once per malformed address/context pair to avoid silent skips."""
+    if not isinstance(address, str):
+        key = f"{context}:<non-string>"
+        display = repr(address)
+    else:
+        normalized = address.strip()
+        key = f"{context}:{normalized.lower()}"
+        display = normalized if len(normalized) <= 18 else f"{normalized[:18]}..."
+
+    if key in _WARNED_INVALID_ADDRESSES:
+        return
+    if len(_WARNED_INVALID_ADDRESSES) < 2048:
+        _WARNED_INVALID_ADDRESSES.add(key)
+    logger.warning("%s: skipping malformed address %s", context, display)
 
 
 def _is_valid_eth_address(address: Optional[str]) -> bool:
@@ -78,7 +96,7 @@ def get_meta():
 
 def get_all_mids():
     """
-    Get mid-prices for all assets. Returns dict like {'BTC': '67432.5', ...}.
+    Get mid-prices for all assets. Returns dict like {'BTC': 67432.5, ...}.
     Served from WebSocket when available (zero REST cost).
     """
     data = _post({"type": "allMids"}, priority=Priority.HIGH)
@@ -93,7 +111,7 @@ def get_all_mids():
             continue
         if not math.isfinite(parsed):
             continue
-        sanitized[str(coin)] = price
+        sanitized[str(coin)] = parsed
     return sanitized
 
 
@@ -159,10 +177,7 @@ def get_user_state(address: str):
     This is the main endpoint for analyzing what a trader is doing.
     """
     if not _is_valid_eth_address(address):
-        logger.debug(
-            "get_user_state: skipping malformed address %r",
-            (address[:16] + "...") if isinstance(address, str) and len(address) > 16 else address,
-        )
+        _warn_invalid_address_once("get_user_state", address)
         return None
     data = _post({"type": "clearinghouseState", "user": address.strip()},
                  priority=Priority.HIGH)

@@ -8,7 +8,7 @@ import pytest
 
 from src.analysis import shadow_tracker as shadow_tracker_module
 from src.data import database as db
-from src.data.db.connection import DualWriteAdapter
+from src.data.db.connection import DualWriteAdapter, _translate_sql
 from src.data.db import migrations as migrations_module
 from src.data.db import postgres as postgres_module
 from src.data.db import router
@@ -64,6 +64,48 @@ class _RecordingPgConn:
 
     def commit(self):
         self.commit_calls += 1
+
+
+class _MigrationTransaction:
+    def __init__(self, conn):
+        self._conn = conn
+
+    def __enter__(self):
+        self._conn.transaction_entries += 1
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self._conn.transaction_exits += 1
+        return False
+
+
+class _MigrationCursor:
+    def __init__(self, conn):
+        self._conn = conn
+
+    def execute(self, sql, params=()):
+        self._conn.executed.append((sql, tuple(params or ())))
+
+
+class _MigrationConn:
+    def __init__(self):
+        self.executed = []
+        self.commit_calls = 0
+        self.rollback_calls = 0
+        self.transaction_entries = 0
+        self.transaction_exits = 0
+
+    def transaction(self):
+        return _MigrationTransaction(self)
+
+    def cursor(self):
+        return _MigrationCursor(self)
+
+    def commit(self):
+        self.commit_calls += 1
+
+    def rollback(self):
+        self.rollback_calls += 1
 
 
 def test_dualwrite_read_only_path_skips_postgres(monkeypatch):
@@ -168,6 +210,75 @@ def test_update_paper_trade_metadata_raises_when_trade_is_missing(monkeypatch):
 
     with pytest.raises(LookupError, match="does not exist"):
         db.update_paper_trade_metadata(123, {"foo": "bar"})
+
+
+def test_update_paper_account_raises_when_singleton_missing(monkeypatch):
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.execute(
+        """
+        CREATE TABLE paper_account (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            balance REAL NOT NULL,
+            total_pnl REAL DEFAULT 0,
+            total_trades INTEGER DEFAULT 0,
+            winning_trades INTEGER DEFAULT 0,
+            last_updated TEXT NOT NULL
+        )
+        """
+    )
+
+    @contextmanager
+    def _ctx(*, for_read: bool = False):
+        try:
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+
+    monkeypatch.setattr(db, "get_connection", _ctx)
+
+    with pytest.raises(LookupError, match="paper_account singleton"):
+        db.update_paper_account(1000.0, 0.0, 0, 0)
+
+
+def test_run_migrations_wraps_each_file_in_transaction(monkeypatch, tmp_path):
+    migration_file = tmp_path / "0001_test.sql"
+    migration_file.write_text("CREATE TABLE test_table (id INTEGER);", encoding="utf-8")
+    conn = _MigrationConn()
+
+    monkeypatch.setattr(migrations_module, "_ensure_schema_migrations_table", lambda _conn: None)
+    monkeypatch.setattr(migrations_module, "_applied_versions", lambda _conn: set())
+    monkeypatch.setattr(
+        migrations_module,
+        "_discover_migrations",
+        lambda: [("0001", migration_file.name, str(migration_file))],
+    )
+    monkeypatch.setattr("src.data.db.postgres.get_connection", lambda: conn)
+    monkeypatch.setattr("src.data.db.postgres.return_connection", lambda _conn: None)
+
+    applied = migrations_module.run_migrations()
+
+    assert applied == 1
+    assert conn.transaction_entries == 1
+    assert conn.transaction_exits == 1
+    assert conn.commit_calls == 1
+    assert conn.executed[0][0] == "CREATE TABLE test_table (id INTEGER);"
+    assert conn.executed[1][0].startswith("INSERT INTO schema_migrations")
+
+
+def test_translate_sql_only_rewrites_datetime_function_calls():
+    sql = (
+        "SELECT datetime('now') AS created_at, datetime('now', '-90 days') AS cutoff, "
+        "datetime_now_column FROM metrics"
+    )
+
+    translated = _translate_sql(sql, "postgres")
+
+    assert "CURRENT_TIMESTAMP AS created_at" in translated
+    assert "(now() - INTERVAL '90 days') AS cutoff" in translated
+    assert "datetime_now_column" in translated
 
 
 def test_localhost_postgres_dsn_is_allowed_for_local_development():

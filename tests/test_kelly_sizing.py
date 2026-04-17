@@ -100,3 +100,16 @@ def test_all_sizing_stats():
     assert "strat_a" in stats
     assert stats["strat_a"]["trades"] == 15
     assert 0 < stats["strat_a"]["win_rate"] < 1
+
+
+def test_kelly_logs_when_all_history_is_wins(caplog):
+    ks = KellySizer({"min_trades_for_kelly": 5, "vol_adjusted_kelly": False})
+    for _ in range(5):
+        ks.record_outcome("all_wins", pnl=100, entry_price=1000, size=1, leverage=1)
+
+    with caplog.at_level("INFO"):
+        result = ks.get_sizing("all_wins", account_balance=10000)
+
+    assert result.has_edge is False
+    assert result.reward_risk_ratio == 0.0
+    assert "no loss history yet" in caplog.text

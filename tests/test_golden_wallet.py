@@ -17,6 +17,7 @@ import os
 from datetime import datetime, timedelta, timezone
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+import src.discovery.golden_wallet as golden_wallet
 from src.discovery.golden_wallet import (
     PenalisedFill,
     evaluate_wallet,
@@ -128,6 +129,35 @@ class TestComputeAvgHoldTime:
         ]
         result = compute_avg_hold_time_hours(fills)
         assert result == 0.0
+
+    def test_same_timestamp_open_close_returns_zero_hold_time(self):
+        fills = [
+            {
+                "coin": "BTC",
+                "side": "buy",
+                "price": 50000.0,
+                "size": 1.0,
+                "time": 1_000,
+                "closed_pnl": 0.0,
+                "hash": "open",
+                "fee": 0.0,
+                "is_liquidation": False,
+                "direction": "Open Long",
+            },
+            {
+                "coin": "BTC",
+                "side": "sell",
+                "price": 50100.0,
+                "size": 1.0,
+                "time": 1_000,
+                "closed_pnl": 10.0,
+                "hash": "close",
+                "fee": 0.0,
+                "is_liquidation": False,
+                "direction": "Close Long",
+            },
+        ]
+        assert compute_avg_hold_time_hours(fills) == 0.0
 
     def test_partial_closes_only_record_hold_when_position_hits_zero(self):
         fills = [
@@ -317,6 +347,62 @@ class TestRateLimitBackoff:
     def test_backoff_never_shorter_than_base(self):
         backoff = _rate_limit_backoff(1)
         assert backoff >= 5.0
+
+
+def test_download_fills_incremental_falls_back_to_full_scan_on_retry_failure(monkeypatch):
+    calls = {"incremental": 0, "full": 0}
+
+    def _raise_rate_limit(*args, **kwargs):
+        calls["incremental"] += 1
+        raise RuntimeError("429 rate limited")
+
+    monkeypatch.setattr(golden_wallet.hl, "get_user_fills", _raise_rate_limit)
+    monkeypatch.setattr(golden_wallet.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(
+        golden_wallet,
+        "download_fills_90d",
+        lambda address: calls.__setitem__("full", calls["full"] + 1) or [{"hash": "full"}],
+    )
+
+    fills = golden_wallet.download_fills_incremental("0xabc", 123)
+
+    assert fills == [{"hash": "full"}]
+    assert calls["incremental"] == 2
+    assert calls["full"] == 1
+
+
+def test_evaluate_wallet_merges_stored_history_when_incremental_fetch_returns_empty(monkeypatch):
+    base_time = int(datetime.now(timezone.utc).timestamp() * 1000) - 10_000
+    stored_rows = []
+    for idx in range(30):
+        is_close = idx % 2 == 1
+        stored_rows.append(
+            {
+                "wallet_address": "0xabc",
+                "coin": "BTC",
+                "side": "buy" if not is_close else "sell",
+                "original_price": 50000.0,
+                "penalised_price": 50010.0,
+                "size": 0.01,
+                "time_ms": base_time + idx * 1_000,
+                "delayed_time_ms": base_time + idx * 1_000 + 100,
+                "closed_pnl": 25.0 if is_close else 0.0,
+                "penalised_pnl": 20.0 if is_close else 0.0,
+                "fee": 0.0,
+                "is_liquidation": False,
+                "direction": "Close Long" if is_close else "Open Long",
+            }
+        )
+
+    monkeypatch.setattr(golden_wallet, "download_fills_incremental", lambda address, last_sync_time_ms: [])
+    monkeypatch.setattr(golden_wallet, "get_wallet_fills", lambda address: stored_rows)
+
+    result = evaluate_wallet("0xabc", bot_score=0, last_sync_time_ms=123)
+
+    assert result is not None
+    report, penalised = result
+    assert report.total_fills == len(stored_rows)
+    assert len(penalised) == len(stored_rows)
 
 
 def _penalised_row(fill: PenalisedFill) -> dict:

@@ -66,6 +66,12 @@ def test_gap_under_default_threshold_does_not_warn(monkeypatch):
     assert warned == []
 
 
+def test_ws_gap_warn_cooldown_is_capped(monkeypatch):
+    monkeypatch.setattr(api_manager.config, "WS_FEED_GAP_WARN_COOLDOWN_S", 100000.0, raising=False)
+    ws = api_manager.HyperliquidWebSocket()
+    assert ws._gap_warn_cooldown_s == api_manager._WS_GAP_WARN_COOLDOWN_S_MAX
+
+
 def test_candle_snapshot_server_errors_open_request_type_cooldown(monkeypatch):
     mgr = api_manager.APIManager()
     api_calls = []

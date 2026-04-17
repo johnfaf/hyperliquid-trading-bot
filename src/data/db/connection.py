@@ -32,6 +32,11 @@ _BOOL_COLUMN_EQ_INT_RE = re.compile(
     r"\b(?P<column>active|is_golden|connected_to_live|is_liquidation)\s*=\s*(?P<value>[01])\b",
     re.IGNORECASE,
 )
+_DATETIME_NOW_MINUS_DAYS_RE = re.compile(
+    r"datetime\(\s*'now'\s*,\s*'-(?P<days>\d+)\s+days'\s*\)",
+    re.IGNORECASE,
+)
+_DATETIME_NOW_RE = re.compile(r"datetime\(\s*'now'\s*\)", re.IGNORECASE)
 _INSERT_VALUES_RE = re.compile(
     r"(?is)^\s*INSERT\s+(?:OR\s+(?:REPLACE|IGNORE)\s+)?INTO\s+"
     r"(?P<table>[\"`\w\.]+)\s*\((?P<columns>.*?)\)\s*VALUES\s*"
@@ -80,8 +85,11 @@ def _translate_sql(sql: str, backend: str) -> str:
         "SELECT table_name AS name FROM information_schema.tables "
         "WHERE table_schema='public' AND table_name=",
     )
-    translated = translated.replace("datetime('now', '-90 days')", "(now() - INTERVAL '90 days')")
-    translated = translated.replace("datetime('now')", "CURRENT_TIMESTAMP")
+    translated = _DATETIME_NOW_MINUS_DAYS_RE.sub(
+        lambda match: f"(now() - INTERVAL '{match.group('days')} days')",
+        translated,
+    )
+    translated = _DATETIME_NOW_RE.sub("CURRENT_TIMESTAMP", translated)
     translated = _BOOL_COLUMN_EQ_INT_RE.sub(_bool_literal_replacer, translated)
 
     return translated

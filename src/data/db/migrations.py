@@ -15,6 +15,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+from contextlib import nullcontext
 from typing import List
 
 logger = logging.getLogger(__name__)
@@ -60,6 +61,13 @@ def _discover_migrations() -> List[tuple]:
     return results
 
 
+def _migration_transaction(conn):
+    """Return a transaction context manager for the current connection."""
+    if hasattr(conn, "transaction"):
+        return conn.transaction()
+    return nullcontext()
+
+
 def run_migrations() -> int:
     """Apply all pending migrations. Returns count of newly applied migrations."""
     from src.data.db.postgres import get_connection, return_connection
@@ -83,15 +91,13 @@ def run_migrations() -> int:
             with open(path, "r") as f:
                 sql = f.read()
 
-            # Execute the migration
-            cur = conn.cursor()
-            cur.execute(sql)
-
-            # Record it
-            cur.execute(
-                "INSERT INTO schema_migrations (version, filename) VALUES (%s, %s)",
-                (version, fname),
-            )
+            with _migration_transaction(conn):
+                cur = conn.cursor()
+                cur.execute(sql)
+                cur.execute(
+                    "INSERT INTO schema_migrations (version, filename) VALUES (%s, %s)",
+                    (version, fname),
+                )
             conn.commit()
             logger.info("Migration %s applied successfully.", version)
 

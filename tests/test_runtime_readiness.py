@@ -174,6 +174,44 @@ def test_runtime_incident_monitor_alerts_on_resolution(monkeypatch):
     assert alerts == [("ready", True)]
 
 
+def test_runtime_incident_monitor_logs_warning_when_telegram_alert_fails(monkeypatch, caplog):
+    snapshots = iter(
+        [
+            {
+                "status": "not_ready",
+                "ready": False,
+                "live_ready": False,
+                "reasons": ["stale_trading_heartbeats"],
+                "checks": {"live_requested": False},
+            },
+            {
+                "status": "not_ready",
+                "ready": False,
+                "live_ready": False,
+                "reasons": ["db_write_failed:locked"],
+                "checks": {"live_requested": False},
+            },
+        ]
+    )
+    monkeypatch.setattr(readiness, "evaluate_readiness", lambda **kwargs: next(snapshots))
+
+    import src.notifications.telegram_bot as telegram_bot
+
+    monkeypatch.setattr(telegram_bot, "is_configured", lambda: True)
+    monkeypatch.setattr(
+        telegram_bot,
+        "notify_runtime_incident",
+        lambda snapshot, resolved=False: (_ for _ in ()).throw(RuntimeError("telegram down")),
+    )
+
+    monitor = readiness.RuntimeIncidentMonitor(cooldown_s=0)
+    monitor.evaluate_and_alert()
+    with caplog.at_level("WARNING", logger="src.core.readiness"):
+        monitor.evaluate_and_alert()
+
+    assert "Runtime incident alert skipped" in caplog.text
+
+
 def test_heartbeat_active_refreshes_telegram_when_configured(monkeypatch):
     import src.notifications.telegram_bot as telegram_bot
 

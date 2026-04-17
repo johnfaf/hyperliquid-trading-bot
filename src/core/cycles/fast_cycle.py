@@ -32,6 +32,27 @@ DEFAULT_KILL_SWITCH_FILE = "/data/KILL_SWITCH"
 _order_cancel_lock = threading.Lock()
 
 
+def _snapshot_state_lock(container) -> threading.Lock:
+    lock = getattr(container, "_snapshot_balance_lock", None)
+    if lock is None:
+        lock = threading.Lock()
+        setattr(container, "_snapshot_balance_lock", lock)
+    return lock
+
+
+def _get_snapshot_backoff_state(container) -> tuple[float, int]:
+    with _snapshot_state_lock(container):
+        next_try = float(getattr(container, "_snapshot_balance_next_try_ts", 0.0) or 0.0)
+        failures = int(getattr(container, "_snapshot_balance_failures", 0) or 0)
+        return next_try, failures
+
+
+def _set_snapshot_backoff_state(container, *, next_try: float, failures: int) -> None:
+    with _snapshot_state_lock(container):
+        container._snapshot_balance_next_try_ts = float(next_try)
+        container._snapshot_balance_failures = int(failures)
+
+
 def _mark_kill_switch_state(container, reason: str) -> bool:
     """Atomically set the sticky kill-switch flag on the container.
 
@@ -156,17 +177,19 @@ def run_fast_cycle(container, cycle_count: int) -> None:
             # dashboard and logs always see fresh numbers.  snapshot_balance
             # self-rate-limits INFO logs to once every 5 min to avoid spam.
             now_ts = time.time()
-            next_allowed = float(getattr(container, "_snapshot_balance_next_try_ts", 0.0) or 0.0)
+            next_allowed, prior_failures = _get_snapshot_backoff_state(container)
             if now_ts >= next_allowed:
                 try:
                     container.live_trader.snapshot_balance()
-                    container._snapshot_balance_failures = 0
-                    container._snapshot_balance_next_try_ts = 0.0
+                    _set_snapshot_backoff_state(container, next_try=0.0, failures=0)
                 except Exception as exc:
-                    failures = int(getattr(container, "_snapshot_balance_failures", 0) or 0) + 1
+                    failures = prior_failures + 1
                     backoff = min(300.0, float(2 ** min(failures, 8)))
-                    container._snapshot_balance_failures = failures
-                    container._snapshot_balance_next_try_ts = now_ts + backoff
+                    _set_snapshot_backoff_state(
+                        container,
+                        next_try=now_ts + backoff,
+                        failures=failures,
+                    )
                     logger.warning(
                         "[fast] snapshot_balance error (failure #%d): %s; backing off %.0fs",
                         failures,

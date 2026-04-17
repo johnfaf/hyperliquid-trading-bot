@@ -197,7 +197,8 @@ class HyperliquidResearchBot:
                     ("last_discovery_ts",),
                 ).fetchone()
             return float(row["value"]) if row else 0.0
-        except Exception:
+        except Exception as exc:
+            self.logger.warning("Could not restore last discovery timestamp: %s", exc)
             return 0.0
 
     # ── Scheduling loops ──────────────────────────────────────
@@ -255,11 +256,19 @@ class HyperliquidResearchBot:
     def _sleep_with_kill_switch_checks(self, interval_s: float) -> None:
         deadline = time.time() + max(0.0, float(interval_s))
         while self.running and time.time() < deadline:
-            self.runtime_config.poll(self.container)
-            if check_file_kill_switch(self.container):
-                self.logger.critical("KILL_SWITCH detected during sleep window")
-                self.running = False
-                return
+            try:
+                self.runtime_config.poll(self.container)
+            except Exception as exc:
+                self.logger.warning("Runtime config poll failed during sleep window: %s", exc)
+
+            try:
+                if check_file_kill_switch(self.container):
+                    self.logger.critical("KILL_SWITCH detected during sleep window")
+                    self.running = False
+                    return
+            except Exception as exc:
+                self.logger.warning("Kill-switch check failed during sleep window: %s", exc)
+
             remaining = deadline - time.time()
             time.sleep(min(1.0, max(0.0, remaining)))
 

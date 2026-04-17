@@ -4,6 +4,7 @@ Finds and tracks the most profitable traders on Hyperliquid.
 Analyzes their positions, trading patterns, and performance over time.
 """
 import logging
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Optional, Tuple
@@ -20,6 +21,7 @@ logger = logging.getLogger(__name__)
 # Cached leaderboard response schema key so we only probe all candidates once
 # and then use the known key on every subsequent call.
 _leaderboard_schema_key: Optional[str] = None
+_leaderboard_schema_lock = threading.Lock()
 ARB_PATTERN_MAX_GAP_MS = 5_000
 ARB_PATTERN_MAX_ABS_CLOSED_PNL = 10.0
 ARB_PATTERN_MIN_NOTIONAL_PER_LEG = 250.0
@@ -42,23 +44,27 @@ def _detect_leaderboard_schema(data) -> Tuple[List, Optional[str]]:
 
     if isinstance(data, dict):
         # Use cached key if we've seen this API before
-        if _leaderboard_schema_key and _leaderboard_schema_key in data:
-            val = data[_leaderboard_schema_key]
+        with _leaderboard_schema_lock:
+            cached_key = _leaderboard_schema_key
+        if cached_key and cached_key in data:
+            val = data[cached_key]
             if isinstance(val, list):
-                return val, _leaderboard_schema_key
+                return val, cached_key
 
         # Probe known candidates
         for key in ["leaderboardRows", "rows", "data", "traders", "leaderboard",
                     "result", "results", "entries", "positions"]:
             if key in data and isinstance(data[key], list):
-                _leaderboard_schema_key = key
+                with _leaderboard_schema_lock:
+                    _leaderboard_schema_key = key
                 logger.info("Leaderboard schema detected: key='%s' (%d entries)", key, len(data[key]))
                 return data[key], key
 
         # Fallback: first list-valued key with content
         for key, val in data.items():
             if isinstance(val, list) and len(val) > 0:
-                _leaderboard_schema_key = key
+                with _leaderboard_schema_lock:
+                    _leaderboard_schema_key = key
                 logger.info("Leaderboard schema fallback: key='%s' (%d entries)", key, len(val))
                 return val, key
 

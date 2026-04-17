@@ -239,7 +239,7 @@ class RuntimeIncidentMonitor:
                     tg.notify_runtime_incident(snapshot, resolved=resolved)
                     self._last_alert_ts = now
             except Exception as exc:
-                logger.debug("Runtime incident alert skipped: %s", exc)
+                logger.warning("Runtime incident alert skipped: %s", exc)
 
         self._last_state = state
         self._last_signature = signature

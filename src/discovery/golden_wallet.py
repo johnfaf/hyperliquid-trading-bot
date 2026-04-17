@@ -50,8 +50,8 @@ _RATE_LIMIT_BACKOFF_SEQ = [5, 8, 15, 30, 60, 90, 120]
 
 # Superhuman detection: no real human trader sustains these numbers
 # over 90 days.  Wallets hitting these thresholds are bots/vaults/arb.
-MAX_HUMAN_WIN_RATE = 92.0       # >92% WR over 90d = not human
-MIN_HUMAN_DRAWDOWN = 0.5        # <0.5% max DD with big PnL = not human
+MAX_HUMAN_WIN_RATE = float(os.environ.get("GOLDEN_WALLET_MAX_HUMAN_WIN_RATE", "92.0"))
+MIN_HUMAN_DRAWDOWN = float(os.environ.get("GOLDEN_WALLET_MIN_HUMAN_DRAWDOWN", "0.5"))
 SHARPE_RETURN_MIN = float(os.environ.get("GOLDEN_WALLET_SHARPE_RETURN_MIN", "-1.0"))
 SHARPE_RETURN_MAX = float(os.environ.get("GOLDEN_WALLET_SHARPE_RETURN_MAX", "10.0"))
 
