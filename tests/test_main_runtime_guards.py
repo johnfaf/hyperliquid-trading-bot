@@ -148,3 +148,23 @@ def test_run_loop_schedules_initial_discovery_without_blocking_trading(monkeypat
 
     assert scheduled == ["startup_empty_trader_pool"]
     assert any("scheduling initial discovery in background" in msg for msg in bot.logger.infos)
+
+
+def test_register_background_tasks_includes_heartbeat_supervisor(monkeypatch):
+    bot = main.HyperliquidResearchBot.__new__(main.HyperliquidResearchBot)
+    registered = []
+    bot.task_runner = SimpleNamespace(
+        register=lambda name, target, interval_seconds, max_retries=5: registered.append(
+            (name, interval_seconds, max_retries, target)
+        )
+    )
+    bot.container = SimpleNamespace(polymarket=None, options_scanner=None)
+
+    calls = []
+    monkeypatch.setattr(main.health_registry, "register", lambda name, affects_trading=False: calls.append((name, affects_trading)))
+
+    bot._register_background_tasks()
+
+    assert registered[0][0] == "bg-heartbeat"
+    assert registered[0][1] >= 15.0
+    assert calls[0] == ("bg-heartbeat", False)

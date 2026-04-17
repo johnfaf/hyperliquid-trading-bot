@@ -72,6 +72,7 @@ class PositionMonitor:
         "timed out",
         "ping/pong timed out",
         "no close frame",
+        "has no attribute 'sock'",
     )
     _websocket_filter_lock = threading.Lock()
     _websocket_filter_installed = False
@@ -443,13 +444,16 @@ class PositionMonitor:
             if connected_since > 0 and uptime_s >= self._stable_connection_reset_s:
                 self._reconnect_count = 0
 
-    def _request_fast_reconnect(self, reason: str, delay_s: float = 1.0) -> None:
+    def _request_fast_reconnect(
+        self, reason: str, delay_s: float = 1.0, *, wake: bool = True
+    ) -> None:
         """Override the next reconnect delay for session-expiry style refreshes."""
         with self._lock:
             self._reconnect_delay_override_s = max(0.0, float(delay_s))
             self._reconnect_reason = reason
             self._reconnect_count = 0
-        self._reconnect_wake_event.set()
+        if wake:
+            self._reconnect_wake_event.set()
 
     def _schedule_idle_rest_only(self, reason: str, delay_s: Optional[float] = None) -> None:
         """Pause websocket reconnect churn and rely on REST polling until woken."""
@@ -460,7 +464,7 @@ class PositionMonitor:
         )
         with self._lock:
             self._subscribed_addresses.clear()
-        self._request_fast_reconnect(reason, delay_s=wait_s)
+        self._request_fast_reconnect(reason, delay_s=wait_s, wake=False)
         logger.info(
             "PositionMonitor switching to REST-only mode for %.1fs: %s",
             wait_s,
@@ -473,7 +477,11 @@ class PositionMonitor:
         REST fallback remains active and can wake the websocket path early as
         soon as a watched trader opens a new position.
         """
-        self._request_fast_reconnect(reason, delay_s=self._idle_rest_only_interval_s)
+        self._request_fast_reconnect(
+            reason,
+            delay_s=self._idle_rest_only_interval_s,
+            wake=False,
+        )
         with self._lock:
             ws = self._ws
             self._subscribed_addresses.clear()

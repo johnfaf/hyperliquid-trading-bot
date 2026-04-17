@@ -172,6 +172,7 @@ def test_on_close_inactive_requests_idle_rest_only_wait(caplog):
     assert wait == 321.0
     assert reason == "inactive userEvents stream"
     assert monitor._subscribed_addresses == set()
+    assert monitor._reconnect_wake_event.is_set() is False
     assert "rest-only mode" in caplog.text.lower()
 
 

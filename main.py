@@ -147,6 +147,18 @@ class HyperliquidResearchBot:
 
     def _register_background_tasks(self):
         """Register background scanner tasks with the supervised runner."""
+        heartbeat_interval = max(
+            15.0,
+            min(60.0, float(getattr(config, "READINESS_STALE_SECONDS", 600)) / 4.0),
+        )
+        self.task_runner.register(
+            "bg-heartbeat",
+            self._background_heartbeat,
+            interval_seconds=heartbeat_interval,
+            max_retries=3,
+        )
+        health_registry.register("bg-heartbeat", affects_trading=False)
+
         if self.container.polymarket:
             self.task_runner.register(
                 "bg-polymarket",
@@ -171,6 +183,9 @@ class HyperliquidResearchBot:
 
     def _options_scan(self):
         self.container.options_scanner.scan_flow()
+
+    def _background_heartbeat(self):
+        heartbeat_active(self.container, health_registry)
 
     # ── Discovery timer persistence ───────────────────────────
 

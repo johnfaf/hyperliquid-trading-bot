@@ -124,6 +124,30 @@ def test_evaluate_readiness_flags_stale_trading_heartbeat(monkeypatch):
     assert "decision_firewall" in snapshot["checks"]["stale_trading_subsystems"]
 
 
+def test_health_registry_heartbeat_recovers_from_stale_degradation():
+    registry = SubsystemHealthRegistry()
+    registry.register("decision_firewall", affects_trading=True)
+    registry.set_status(
+        "decision_firewall",
+        SubsystemState.HEALTHY,
+        dependency_ready=True,
+        startup_status="READY",
+    )
+    registry.heartbeat("decision_firewall")
+    registry._subsystems["decision_firewall"].last_heartbeat = (
+        datetime.now(timezone.utc) - timedelta(seconds=901)
+    )
+
+    stale_map = registry.check_stale(timeout_seconds=600)
+    assert stale_map["decision_firewall"] is True
+    assert registry.get_status("decision_firewall").state == SubsystemState.DEGRADED
+
+    registry.heartbeat("decision_firewall")
+    recovered = registry.get_status("decision_firewall")
+    assert recovered.state == SubsystemState.HEALTHY
+    assert recovered.reason == ""
+
+
 def test_runtime_incident_monitor_alerts_on_blocker_change(monkeypatch):
     snapshots = iter(
         [

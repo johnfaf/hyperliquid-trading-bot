@@ -126,6 +126,12 @@ class SubsystemHealthRegistry:
                 logger.debug("heartbeat() for unknown subsystem '%s' — ignored", name)
                 return
             sub.last_heartbeat = datetime.now(timezone.utc)
+            if sub.state == SubsystemState.DEGRADED and (
+                sub.reason.startswith("No heartbeat")
+                or sub.reason.startswith("Stale heartbeat")
+            ):
+                sub.state = SubsystemState.HEALTHY
+                sub.reason = ""
 
     def set_status(
         self,
@@ -271,12 +277,18 @@ class SubsystemHealthRegistry:
                         now - status.registered_at
                     ).total_seconds()
                     if time_since_registration > timeout_seconds:
-                        self._subsystems[name].state = SubsystemState.DEGRADED
-                        self._subsystems[name].reason = f"No heartbeat for {timeout_seconds}s"
-                        degraded[name] = True
-                        logger.warning(
-                            f"Auto-degraded '{name}': no heartbeat received since registration"
+                        stale_reason = f"No heartbeat for {timeout_seconds}s"
+                        already_stale = (
+                            status.state == SubsystemState.DEGRADED
+                            and status.reason == stale_reason
                         )
+                        self._subsystems[name].state = SubsystemState.DEGRADED
+                        self._subsystems[name].reason = stale_reason
+                        degraded[name] = True
+                        if not already_stale:
+                            logger.warning(
+                                f"Auto-degraded '{name}': no heartbeat received since registration"
+                            )
                     else:
                         degraded[name] = False
                 else:
@@ -285,12 +297,18 @@ class SubsystemHealthRegistry:
                         now - status.last_heartbeat
                     ).total_seconds()
                     if time_since_heartbeat > timeout_seconds:
-                        self._subsystems[name].state = SubsystemState.DEGRADED
-                        self._subsystems[name].reason = f"Stale heartbeat ({time_since_heartbeat:.0f}s ago)"
-                        degraded[name] = True
-                        logger.warning(
-                            f"Auto-degraded '{name}': stale heartbeat ({time_since_heartbeat:.0f}s ago)"
+                        stale_reason = f"Stale heartbeat ({time_since_heartbeat:.0f}s ago)"
+                        already_stale = (
+                            status.state == SubsystemState.DEGRADED
+                            and status.reason.startswith("Stale heartbeat")
                         )
+                        self._subsystems[name].state = SubsystemState.DEGRADED
+                        self._subsystems[name].reason = stale_reason
+                        degraded[name] = True
+                        if not already_stale:
+                            logger.warning(
+                                f"Auto-degraded '{name}': stale heartbeat ({time_since_heartbeat:.0f}s ago)"
+                            )
                     else:
                         degraded[name] = False
 
