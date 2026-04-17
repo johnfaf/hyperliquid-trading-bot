@@ -205,9 +205,21 @@ def download_fills_incremental(address: str, last_sync_time_ms: int) -> List[Dic
     if last_sync_time_ms <= 0:
         return download_fills_90d(address)
 
+    # CRIT-FIX C3: Hyperliquid's `start_time` filter semantics are
+    # inconsistent across endpoints (some inclusive, some exclusive).  A fill
+    # with `time_ms == last_sync_time_ms` was being silently skipped when the
+    # API treated the bound as exclusive, creating gaps in wallet history.
+    #
+    # Fix: query with `start_time = last_sync_time_ms - 1` (ensures we never
+    # skip a boundary fill on inclusive endpoints) and then defensively
+    # filter out any fills we've already saved (`time <= last_sync_time_ms`)
+    # so we cannot double-count on inclusive endpoints either.  The ±1 ms
+    # window is cheap and makes the function correct for both API behaviours.
+    query_start = max(0, int(last_sync_time_ms) - 1)
+
     consecutive_errors = 0
     try:
-        fills = hl.get_user_fills(address, start_time=last_sync_time_ms)
+        fills = hl.get_user_fills(address, start_time=query_start)
         consecutive_errors = 0
     except Exception as e:
         consecutive_errors += 1
@@ -216,13 +228,23 @@ def download_fills_incremental(address: str, last_sync_time_ms: int) -> List[Dic
             backoff = _rate_limit_backoff(consecutive_errors, label=f" incremental fetch {address[:10]}")
             time.sleep(backoff)
             try:
-                fills = hl.get_user_fills(address, start_time=last_sync_time_ms)
+                fills = hl.get_user_fills(address, start_time=query_start)
             except Exception:
                 logger.error("Incremental fetch failed for %s; falling back to full 90d", address[:10])
                 return download_fills_90d(address)
         else:
             logger.error("Error in incremental fetch for %s: %s; falling back to full 90d", address[:10], e)
             return download_fills_90d(address)
+
+    if not fills:
+        return []
+
+    # Drop any fill at or before the last synced timestamp — these are already
+    # persisted; keeping them would double-count PnL on re-evaluation.
+    try:
+        fills = [f for f in fills if int(f.get("time", 0) or 0) > int(last_sync_time_ms)]
+    except Exception:
+        pass
 
     if not fills:
         return []

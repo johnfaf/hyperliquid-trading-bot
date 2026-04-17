@@ -551,22 +551,14 @@ def _close_paper_trade_at_market(trade_id: int) -> dict:
     existing_meta["close_source"] = "dashboard"
     db.update_paper_trade_metadata(trade_id, existing_meta)
 
-    # Close the paper trade in DB
-    if not db.close_paper_trade(trade_id, current_price, pnl):
-        return {"error": f"Failed to close trade {trade_id} in DB", "status": "error"}
-
-    # Update paper account balance
-    account = db.get_paper_account()
-    if not account:
-        # Account row missing - initialize with default balance
+    # Ensure paper_account singleton exists before the atomic close+credit,
+    # otherwise the combined function will roll back (account row required).
+    if not db.get_paper_account():
         db.init_paper_account(config.PAPER_TRADING_INITIAL_BALANCE)
-        account = db.get_paper_account()
-    if account:
-        new_balance = float(account.get("balance", 0) or 0) + pnl
-        total_pnl = float(account.get("total_pnl", 0) or 0) + pnl
-        total_trades = int(account.get("total_trades", 0) or 0) + 1
-        winning = int(account.get("winning_trades", 0) or 0) + (1 if pnl > 0 else 0)
-        db.update_paper_account(new_balance, total_pnl, total_trades, winning)
+
+    # CRIT-FIX C2: atomic close + account credit in one transaction.
+    if not db.close_paper_trade_and_credit_account(trade_id, current_price, pnl):
+        return {"error": f"Failed to close trade {trade_id} in DB", "status": "error"}
 
     # If live trading is active, also close the position on exchange
     live_close_result = None

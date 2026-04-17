@@ -693,6 +693,19 @@ class CopyTrader:
                     )
                     continue
 
+            # CRIT-FIX C4: propagate the firewall's regime_size_modifier onto
+            # the dict-shaped signal so _open_copy_trade can scale final size.
+            # Without this the crash/neutral-regime size reduction set on
+            # `trade_signal.regime_size_modifier` was silently dropped at
+            # execution time, letting full-size copies through in crash
+            # regimes despite the firewall correctly computing the modifier.
+            try:
+                signal["regime_size_modifier"] = float(
+                    getattr(trade_signal, "regime_size_modifier", 1.0) or 1.0
+                )
+            except (TypeError, ValueError):
+                signal["regime_size_modifier"] = 1.0
+
             if self.agent_scorer:
                 source_key = self._source_key(signal)
                 signal_id = self.agent_scorer.record_signal(source_key, {
@@ -804,8 +817,36 @@ class CopyTrader:
                 size_usd = account["balance"] * 0.05 * signal.get("confidence", 0.5)
         else:
             size_usd = account["balance"] * 0.05 * signal.get("confidence", 0.5)
+
+        # CRIT-FIX C4: apply the firewall's regime size modifier (e.g. 0.60x
+        # in crash regimes, 1.20x in bullish) to the final notional.  Neither
+        # the Kelly sizer nor the default 5% path is regime-aware, so without
+        # this multiplication the firewall's regime protection was effectively
+        # bypassed at execution time.  Clamp to [0, 2] to guard against a
+        # malformed upstream modifier inflating size uncontrollably.
+        regime_mod = float(signal.get("regime_size_modifier", 1.0) or 1.0)
+        if regime_mod < 0.0:
+            regime_mod = 0.0
+        elif regime_mod > 2.0:
+            regime_mod = 2.0
+        if regime_mod != 1.0:
+            logger.debug(
+                "Copy trade %s %s: applying regime_size_modifier=%.3f to size_usd $%.2f",
+                signal.get("side", "?"), signal.get("coin", "?"), regime_mod, size_usd,
+            )
+        size_usd = size_usd * regime_mod
+
         price = signal["price"]
         if price <= 0:
+            return None
+
+        if size_usd <= 0:
+            # Regime modifier can legitimately zero out sizing (e.g. extreme
+            # crash regime).  Skip silently rather than opening a $0 position.
+            logger.info(
+                "Copy trade %s %s skipped: regime modifier zeroed size",
+                signal.get("side", "?"), signal.get("coin", "?"),
+            )
             return None
 
         size = size_usd / price
@@ -938,16 +979,15 @@ class CopyTrader:
             }
         )
 
-        db.close_paper_trade(trade["id"], exit_price, pnl)
-
-        account = db.get_paper_account()
-        if account:
-            db.update_paper_account(
-                account["balance"] + pnl,
-                account["total_pnl"] + pnl,
-                account["total_trades"] + 1,
-                account["winning_trades"] + (1 if pnl > 0 else 0),
+        # CRIT-FIX C2: atomic close + account credit in one transaction
+        # (see src/data/database.py::close_paper_trade_and_credit_account).
+        if not db.close_paper_trade_and_credit_account(trade["id"], exit_price, pnl):
+            logger.error(
+                "Copy trade close failed for trade %s (%s %s) — "
+                "already closed or account row missing; no credit applied.",
+                trade["id"], trade.get("side", "?"), trade.get("coin", "?"),
             )
+            return None
 
         logger.info(
             "Copy trade closed (%s): %s %s entry=$%s exit=$%s gross=$%s fees=$%s net=$%s",

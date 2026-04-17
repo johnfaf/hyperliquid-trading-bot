@@ -88,30 +88,75 @@ def _translate_sql(sql: str, backend: str) -> str:
 
 
 class CursorAdapter:
-    """Wraps a Postgres cursor to expose sqlite3-compatible attributes."""
+    """Wraps a Postgres cursor to expose sqlite3-compatible attributes.
+
+    CRIT-FIX C1: the first row returned by the query is buffered so that
+    ``.lastrowid`` and ``.fetchone()`` can both be called without one draining
+    the other — a common pattern after ``INSERT ... RETURNING id``.  Previously
+    ``.lastrowid`` consumed the cursor, making every subsequent ``.fetchone()``
+    miss data.
+    """
 
     def __init__(self, pg_cursor):
         self._cur = pg_cursor
+        self._first_row_cached = False
+        self._first_row = None
+        self._lastrowid_value: Optional[int] = None
+
+    def _ensure_first_row_cached(self) -> None:
+        if self._first_row_cached:
+            return
+        self._first_row_cached = True
+        try:
+            self._first_row = self._cur.fetchone()
+        except Exception:
+            self._first_row = None
+            return
+        row = self._first_row
+        if row is None:
+            return
+        try:
+            if isinstance(row, (tuple, list)):
+                self._lastrowid_value = row[0]
+            elif hasattr(row, "get"):
+                self._lastrowid_value = row.get("id") or (
+                    next(iter(row.values())) if row else None
+                )
+            else:
+                try:
+                    self._lastrowid_value = row["id"]
+                except Exception:
+                    self._lastrowid_value = None
+        except Exception:
+            self._lastrowid_value = None
 
     @property
     def lastrowid(self) -> Optional[int]:
-        """Return the last inserted row ID when the query used RETURNING."""
-        try:
-            row = self._cur.fetchone()
-            if row:
-                return row[0] if isinstance(row, (tuple, list)) else row.get("id")
-        except Exception:
-            pass
-        return None
+        """Return the last inserted row ID when the query used RETURNING.
+
+        Buffers the first row on first access so subsequent ``fetchone()``
+        calls still return it (i.e. the accessor is non-destructive).
+        """
+        self._ensure_first_row_cached()
+        return self._lastrowid_value
 
     @property
     def rowcount(self) -> int:
         return self._cur.rowcount
 
     def fetchone(self):
+        if self._first_row_cached and self._first_row is not None:
+            row = self._first_row
+            self._first_row = None
+            return row
         return self._cur.fetchone()
 
     def fetchall(self):
+        if self._first_row_cached and self._first_row is not None:
+            remaining = self._cur.fetchall()
+            first = self._first_row
+            self._first_row = None
+            return [first] + list(remaining)
         return self._cur.fetchall()
 
 

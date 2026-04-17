@@ -609,6 +609,11 @@ def close_paper_trade(trade_id, exit_price, pnl) -> bool:
     CRIT-FIX CRIT-5: check rowcount — if the UPDATE matches 0 rows the trade was
     already closed or the ID is wrong.  The caller MUST check the return value and
     skip the account PnL credit to prevent phantom double-credit.
+
+    NOTE: Prefer :func:`close_paper_trade_and_credit_account` for the common
+    close+credit pattern — it performs both operations in a single transaction,
+    eliminating the race window where a crash between close and credit would
+    desync the account balance from the trades table.
     """
     now = datetime.now(timezone.utc).isoformat()
     with get_connection() as conn:
@@ -623,6 +628,94 @@ def close_paper_trade(trade_id, exit_price, pnl) -> bool:
                 trade_id,
             )
             return False
+    return True
+
+
+def close_paper_trade_and_credit_account(trade_id, exit_price, pnl) -> bool:
+    """Atomically close a paper trade AND credit the paper_account balance.
+
+    Runs both UPDATEs inside a single transaction.  If the trade is already
+    closed (rowcount == 0 on the first UPDATE) the transaction is rolled back
+    and the account is NOT credited — this is the key invariant that prevents
+    phantom double-credits on retries.
+
+    Returns True if both updates succeeded, False if the trade was already
+    closed / not found (in which case nothing was credited).
+
+    CRIT-FIX C2: replaces the prior two-statement pattern
+    ``close_paper_trade() -> update_paper_account()`` which was non-atomic —
+    a crash between the two calls could leave the account stale or, on retry
+    of the caller, double-credit the PnL.
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    with get_connection() as conn:
+        try:
+            cursor = conn.execute("""
+                UPDATE paper_trades SET closed_at = ?, exit_price = ?, pnl = ?, status = 'closed'
+                WHERE id = ? AND status = 'open'
+            """, (now, exit_price, pnl, trade_id))
+            if cursor.rowcount == 0:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                logger.error(
+                    "close_paper_trade_and_credit_account: trade_id=%s matched "
+                    "0 open rows — possible double-close. PnL NOT credited.",
+                    trade_id,
+                )
+                return False
+
+            row = conn.execute(
+                "SELECT balance, total_pnl, total_trades, winning_trades "
+                "FROM paper_account WHERE id = 1"
+            ).fetchone()
+            if not row:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                logger.error(
+                    "close_paper_trade_and_credit_account: paper_account row "
+                    "missing; rolling back close of trade_id=%s", trade_id,
+                )
+                return False
+
+            try:
+                balance = row["balance"]
+                total_pnl = row["total_pnl"]
+                total_trades = row["total_trades"]
+                winning_trades = row["winning_trades"]
+            except (KeyError, TypeError, IndexError):
+                balance, total_pnl, total_trades, winning_trades = row[0], row[1], row[2], row[3]
+
+            new_balance = float(balance or 0) + float(pnl)
+            new_total_pnl = float(total_pnl or 0) + float(pnl)
+            new_total_trades = int(total_trades or 0) + 1
+            new_winning = int(winning_trades or 0) + (1 if pnl > 0 else 0)
+
+            acct_cursor = conn.execute("""
+                UPDATE paper_account
+                SET balance = ?, total_pnl = ?, total_trades = ?, winning_trades = ?,
+                    last_updated = ?
+                WHERE id = 1
+            """, (new_balance, new_total_pnl, new_total_trades, new_winning, now))
+            if acct_cursor.rowcount == 0:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                logger.error(
+                    "close_paper_trade_and_credit_account: paper_account UPDATE "
+                    "matched 0 rows; rolling back trade_id=%s", trade_id,
+                )
+                return False
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            raise
     return True
 
 

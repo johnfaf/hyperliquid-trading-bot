@@ -62,7 +62,7 @@ from src.core.subsystem_registry import (
 )
 from src.core.cycles.research_cycle import run_discovery
 from src.core.cycles.trading_cycle import run_trading_cycle
-from src.core.cycles.fast_cycle import run_fast_cycle, check_file_kill_switch
+from src.core.cycles.fast_cycle import run_fast_cycle, check_file_kill_switch, cancel_live_orders_once
 from src.core.cycles.reporting_cycle import run_reporting
 from src.core.cycles.feature_cycle import run_feature_cycle, backfill_all as backfill_features, feature_store_is_empty
 from src.data import database as db
@@ -245,23 +245,12 @@ class HyperliquidResearchBot:
         )
 
     def _cancel_live_orders_for_shutdown(self, reason: str) -> None:
-        if self._shutdown_orders_cancelled:
-            return
-        live_trader = getattr(self.container, "live_trader", None)
-        if not live_trader or getattr(live_trader, "dry_run", True):
-            self._shutdown_orders_cancelled = True
-            return
-        try:
-            cancelled = live_trader.cancel_all_orders()
-            self.logger.warning(
-                "Cancelled %d live orders during shutdown (%s)",
-                cancelled,
-                reason,
-            )
-        except Exception as exc:
-            self.logger.error("Failed to cancel live orders during shutdown (%s): %s", reason, exc)
-        finally:
-            self._shutdown_orders_cancelled = True
+        # CRIT-FIX C5: delegate to the shared, lock-guarded single-shot helper
+        # in fast_cycle so the signal-handler path and the file-kill-switch
+        # path cannot both issue cancel_all_orders() concurrently.  The helper
+        # is idempotent — subsequent calls are no-ops.
+        cancel_live_orders_once(self.container, reason=reason)
+        self._shutdown_orders_cancelled = True
 
     def _sleep_with_kill_switch_checks(self, interval_s: float) -> None:
         deadline = time.time() + max(0.0, float(interval_s))

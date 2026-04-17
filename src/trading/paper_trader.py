@@ -1306,23 +1306,17 @@ class PaperTrader:
                 "exit_slipped_price": slipped_exit,
             }
         )
-        # CRIT-FIX CRIT-5: guard against phantom PnL credit on double-close or
-        # missing trade ID — close_paper_trade now returns False if 0 rows updated.
-        if not db.close_paper_trade(trade["id"], slipped_exit, pnl):
+        # CRIT-FIX C2: atomic close + account credit in one transaction
+        # (see src/data/database.py::close_paper_trade_and_credit_account).
+        # A crash between the close and the credit previously could desync
+        # the paper_account balance or, on retry, double-credit the PnL.
+        if not db.close_paper_trade_and_credit_account(trade["id"], slipped_exit, pnl):
             logger.error(
                 "_close_trade: DB close failed for trade %s (%s %s) — "
-                "skipping account PnL credit to prevent phantom balance inflation.",
+                "no account PnL credited (already closed or account missing).",
                 trade["id"], trade.get("side", "?"), trade.get("coin", "?"),
             )
             return None
-
-        account = db.get_paper_account()
-        if account:
-            new_balance = account["balance"] + pnl
-            new_total_pnl = account["total_pnl"] + pnl
-            new_total_trades = account["total_trades"] + 1
-            new_winning = account["winning_trades"] + (1 if pnl > 0 else 0)
-            db.update_paper_account(new_balance, new_total_pnl, new_total_trades, new_winning)
 
         logger.info(
             "Paper trade closed (%s): %s %s entry=$%s exit=$%s gross=$%s fees=$%s funding=$%s net=$%s",

@@ -8,6 +8,7 @@ Extracted from ``HyperliquidResearchBot._fast_cycle``.
 """
 import logging
 import os
+import threading
 import time
 
 from src.core.live_execution import (
@@ -22,22 +23,93 @@ logger.addHandler(logging.NullHandler())
 DEFAULT_KILL_SWITCH_FILE = "/data/KILL_SWITCH"
 
 
+# CRIT-FIX C5: module-level lock + flag used by BOTH the file-kill-switch
+# path (fast cycle thread) and the shutdown signal handler (main thread) so
+# that live-order cancellation is performed at most once, regardless of which
+# trigger fires first or whether they race.  Without this, SIGINT arriving at
+# the same moment as a KILL_SWITCH file appearing could schedule two parallel
+# `cancel_all_orders()` calls against the exchange.
+_order_cancel_lock = threading.Lock()
+
+
+def _mark_kill_switch_state(container, reason: str) -> bool:
+    """Atomically set the sticky kill-switch flag on the container.
+
+    Returns True the first time this is called for a given container (the
+    caller is then responsible for performing the cancellation work), and
+    False on every subsequent call.
+    """
+    with _order_cancel_lock:
+        if getattr(container, "_file_kill_switch_triggered", False):
+            return False
+        setattr(container, "_file_kill_switch_triggered", True)
+        setattr(container, "_stop_requested", True)
+        setattr(container, "_kill_switch_reason", reason)
+        return True
+
+
+def cancel_live_orders_once(container, reason: str, *, force: bool = False) -> bool:
+    """Cancel all live orders exactly once, serialised across threads.
+
+    Used both by the fast-cycle file-kill-switch path and by the main-thread
+    shutdown signal handler.  After the first call the container's
+    ``_shutdown_orders_cancelled`` flag is set and subsequent calls are
+    no-ops.
+
+    Parameters
+    ----------
+    force : bool
+        When True the dry-run guard is bypassed — used by the KILL_SWITCH
+        emergency path where we want to cancel regardless of the live_trader's
+        configured dry-run state.
+
+    Returns True if this call performed the cancellation, False if it was
+    skipped because another thread had already done it or the trader is
+    dry-run and force is False.
+    """
+    with _order_cancel_lock:
+        if getattr(container, "_shutdown_orders_cancelled", False):
+            return False
+        live_trader = getattr(container, "live_trader", None)
+        if not live_trader:
+            setattr(container, "_shutdown_orders_cancelled", True)
+            return False
+        if not force and getattr(live_trader, "dry_run", True):
+            setattr(container, "_shutdown_orders_cancelled", True)
+            return False
+        # Mark first, then execute: if cancel_all_orders raises we still want
+        # the flag set so a racing caller doesn't attempt it again.
+        setattr(container, "_shutdown_orders_cancelled", True)
+        try:
+            cancelled = live_trader.cancel_all_orders()
+            logger.critical(
+                "Cancelled %d live orders during shutdown (%s)", cancelled, reason,
+            )
+            return True
+        except Exception as exc:
+            logger.error(
+                "Failed to cancel live orders during shutdown (%s): %s", reason, exc,
+            )
+            return False
+
+
 def check_file_kill_switch(container) -> bool:
     """Emergency stop via file presence.
 
     If the configured kill-switch file exists, cancel all live orders, mark the
-    live trader as killed, and request the bot loop to stop. The trigger is
-    sticky for the current process lifetime.
+    live trader as killed, and request the bot loop to stop.  The check is
+    idempotent and thread-safe — the kill-switch flag is set atomically and
+    order cancellation is serialised with any concurrent shutdown signal.
     """
     path = os.environ.get("LIVE_EXTERNAL_KILL_SWITCH_FILE", "").strip() or DEFAULT_KILL_SWITCH_FILE
     if not path or not os.path.exists(path):
         return False
 
-    if getattr(container, "_file_kill_switch_triggered", False):
+    # Atomic check-and-set: only the first caller does the cancellation work.
+    first = _mark_kill_switch_state(container, reason=f"file:{path}")
+    if not first:
         return True
 
-    setattr(container, "_file_kill_switch_triggered", True)
-    setattr(container, "_stop_requested", True)
     logger.critical("[fast] KILL_SWITCH file detected at %s", path)
 
     live_trader = getattr(container, "live_trader", None)
@@ -48,11 +120,14 @@ def check_file_kill_switch(container) -> bool:
             live_trader.status_reason = "external_kill_switch"
         except Exception:
             pass
-        try:
-            cancelled = live_trader.cancel_all_orders()
-            logger.critical("[fast] Cancelled %d live orders due to KILL_SWITCH", cancelled)
-        except Exception as exc:
-            logger.error("[fast] Failed to cancel live orders for KILL_SWITCH: %s", exc)
+        # Serialised single-shot cancellation — if the SIGINT handler also
+        # fires, only one of the two will actually hit the exchange.  KILL
+        # SWITCH is an emergency path, so we force-cancel regardless of the
+        # live_trader's dry-run flag (the file being present is the operator's
+        # explicit signal to purge).
+        cancel_live_orders_once(
+            container, reason=f"kill_switch_file:{path}", force=True,
+        )
 
     return True
 
