@@ -16,6 +16,7 @@ already stored.  This reduces API calls by ~75% for already-evaluated wallets.
 """
 import logging
 import random
+import sqlite3
 import time
 import json
 import os
@@ -51,6 +52,8 @@ _RATE_LIMIT_BACKOFF_SEQ = [5, 8, 15, 30, 60, 90, 120]
 # over 90 days.  Wallets hitting these thresholds are bots/vaults/arb.
 MAX_HUMAN_WIN_RATE = 92.0       # >92% WR over 90d = not human
 MIN_HUMAN_DRAWDOWN = 0.5        # <0.5% max DD with big PnL = not human
+SHARPE_RETURN_MIN = float(os.environ.get("GOLDEN_WALLET_SHARPE_RETURN_MIN", "-1.0"))
+SHARPE_RETURN_MAX = float(os.environ.get("GOLDEN_WALLET_SHARPE_RETURN_MAX", "10.0"))
 
 
 def _rate_limit_backoff(attempt: int, label: str = "") -> float:
@@ -61,7 +64,7 @@ def _rate_limit_backoff(attempt: int, label: str = "") -> float:
     """
     idx = min(attempt - 1, len(_RATE_LIMIT_BACKOFF_SEQ) - 1)
     base = _RATE_LIMIT_BACKOFF_SEQ[idx]
-    jitter = base * random.uniform(-0.10, 0.10)
+    jitter = base * random.uniform(0.0, 0.10)
     duration = base + jitter
     logger.warning("Rate limited%s (attempt %d) — backing off %.1fs", label, attempt, duration)
     return duration
@@ -440,22 +443,34 @@ def compute_sharpe(daily_returns: List[float], periods_per_year: float = 365.0) 
     Annualised Sharpe ratio from a series of daily RETURNS (not raw PnL).
 
     Expects percentage returns (e.g. 0.02 for +2%), not dollar amounts.
-    Values outside [-1, 10] are treated as invalid and dropped (guards against
-    NaN / Inf values that can arise from equity-curve division at very small
-    equity bases).
+    Values outside the configured [min, max] range are treated as invalid and dropped.
 
     Returns 0.0 if fewer than 5 valid data points are available.
     """
     import math
 
-    # Sanitise: drop NaN, Inf, and extreme outliers
-    valid = [
-        r for r in daily_returns
-        if isinstance(r, (int, float))
-        and not math.isnan(r)
-        and not math.isinf(r)
-        and -1.0 <= r <= 10.0   # daily return outside [-100%, +1000%] is noise
-    ]
+    valid = []
+    dropped = 0
+    for value in daily_returns:
+        if not isinstance(value, (int, float)):
+            dropped += 1
+            continue
+        if math.isnan(value) or math.isinf(value):
+            dropped += 1
+            continue
+        if not (SHARPE_RETURN_MIN <= value <= SHARPE_RETURN_MAX):
+            dropped += 1
+            continue
+        valid.append(value)
+
+    if dropped:
+        logger.info(
+            "Sharpe filter dropped %d/%d daily returns outside configured bounds [%.2f, %.2f]",
+            dropped,
+            len(daily_returns),
+            SHARPE_RETURN_MIN,
+            SHARPE_RETURN_MAX,
+        )
 
     if len(valid) < 5:
         return 0.0
@@ -463,7 +478,7 @@ def compute_sharpe(daily_returns: List[float], periods_per_year: float = 365.0) 
     import statistics
     mean_r = statistics.mean(valid)
     std_r = statistics.stdev(valid)
-    if std_r < 1e-10:  # avoid division by near-zero (constant equity = no risk)
+    if std_r < 1e-10:
         return 0.0
     return round((mean_r / std_r) * (periods_per_year ** 0.5), 3)
 
@@ -500,37 +515,71 @@ def _equity_curve_to_daily_returns(equity_curve: List[float],
 
 def compute_avg_hold_time_hours(fills: List[Dict]) -> float:
     """
-    Estimate average hold time by pairing opening and closing fills per coin.
+    Estimate average hold time by tracking each coin's signed net position.
 
-    Approach: for each coin, zip open fills with their subsequent close fills
-    in chronological order.  The hold time for each round-trip is
-    (close_time - open_time).  Fills with closed_pnl == 0 are opening legs;
-    fills with closed_pnl != 0 are closing legs.
-
-    Returns 0.0 if there isn't enough data to compute a meaningful estimate.
+    A hold is only recorded when the running position returns to zero or flips
+    through zero. This avoids over-pairing partial closes against multiple
+    synthetic "open" fills.
     """
     if len(fills) < 2:
         return 0.0
 
-    from collections import defaultdict
-    opens: Dict[str, List[int]] = defaultdict(list)
+    position_by_coin: Dict[str, float] = {}
+    entry_ts_by_coin: Dict[str, int] = {}
     hold_times_ms: List[float] = []
 
-    for f in sorted(fills, key=lambda x: x.get("time", 0)):
-        coin = f.get("coin", "")
-        ts = f.get("time", 0)
-        closed_pnl = f.get("closed_pnl", 0)
+    for fill in sorted(fills, key=lambda x: x.get("time", 0)):
+        coin = str(fill.get("coin", "") or "")
+        ts = int(fill.get("time", 0) or 0)
+        size = abs(float(fill.get("size", 0) or 0))
+        if not coin or ts < 0 or size <= 0:
+            continue
 
-        if closed_pnl == 0:
-            # Opening leg
-            opens[coin].append(ts)
+        direction = str(fill.get("direction", "") or "").strip().lower()
+        side = str(fill.get("side", "") or "").strip().lower()
+        current_pos = float(position_by_coin.get(coin, 0.0) or 0.0)
+
+        if ">" in direction:
+            open_ts = entry_ts_by_coin.get(coin)
+            if current_pos != 0 and open_ts is not None and ts > open_ts:
+                hold_times_ms.append(ts - open_ts)
+            target_leg = direction.split(">")[-1].strip()
+            if "short" in target_leg:
+                position_by_coin[coin] = -size
+            elif "long" in target_leg:
+                position_by_coin[coin] = size
+            else:
+                position_by_coin[coin] = -size if side == "sell" else size
+            entry_ts_by_coin[coin] = ts
+            continue
+
+        if "open long" in direction or "close short" in direction:
+            delta = size
+        elif "open short" in direction or "close long" in direction:
+            delta = -size
+        elif fill.get("closed_pnl", 0) != 0 and abs(current_pos) >= 1e-12:
+            delta = -min(size, abs(current_pos)) if current_pos > 0 else min(size, abs(current_pos))
+        elif side == "buy":
+            delta = size
+        elif side == "sell":
+            delta = -size
         else:
-            # Closing leg — match with earliest open for this coin
-            if opens[coin]:
-                open_ts = opens[coin].pop(0)
-                hold_ms = ts - open_ts
-                if hold_ms > 0:
-                    hold_times_ms.append(hold_ms)
+            continue
+
+        new_pos = current_pos + delta
+        if abs(current_pos) < 1e-12 and abs(new_pos) >= 1e-12:
+            entry_ts_by_coin[coin] = ts
+        elif abs(current_pos) >= 1e-12 and abs(new_pos) < 1e-12:
+            open_ts = entry_ts_by_coin.pop(coin, None)
+            if open_ts is not None and ts > open_ts:
+                hold_times_ms.append(ts - open_ts)
+        elif current_pos * new_pos < 0:
+            open_ts = entry_ts_by_coin.get(coin)
+            if open_ts is not None and ts > open_ts:
+                hold_times_ms.append(ts - open_ts)
+            entry_ts_by_coin[coin] = ts
+
+        position_by_coin[coin] = new_pos
 
     if not hold_times_ms:
         return 0.0
@@ -795,8 +844,9 @@ def init_golden_tables():
                 conn.execute(
                     f"ALTER TABLE golden_wallets ADD COLUMN {col} {definition}"
                 )
-            except Exception:
-                pass  # Column already exists — safe to ignore
+            except sqlite3.OperationalError as exc:
+                if "duplicate column" not in str(exc).lower():
+                    raise
 
 
 def save_wallet_report(report: WalletReport, last_fill_sync_time_ms: int = 0):
@@ -1065,3 +1115,5 @@ def run_golden_scan(max_wallets: int = 200) -> Dict:
             )
 
     return summary
+
+

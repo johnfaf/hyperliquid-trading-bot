@@ -20,6 +20,11 @@ logger = logging.getLogger(__name__)
 # Cached leaderboard response schema key so we only probe all candidates once
 # and then use the known key on every subsequent call.
 _leaderboard_schema_key: Optional[str] = None
+ARB_PATTERN_MAX_GAP_MS = 5_000
+ARB_PATTERN_MAX_ABS_CLOSED_PNL = 10.0
+ARB_PATTERN_MIN_NOTIONAL_PER_LEG = 250.0
+ARB_PATTERN_MIN_MATCH_RATIO = 0.20
+ARB_PATTERN_MIN_MATCH_COUNT = 3
 
 
 def _detect_leaderboard_schema(data) -> Tuple[List, Optional[str]]:
@@ -684,15 +689,33 @@ class TraderDiscovery:
         for coin, coin_fills in by_coin.items():
             if len(coin_fills) < 10:
                 continue
+            candidate_pairs = 0
+            match_pairs = 0
             for i in range(len(coin_fills) - 1):
                 f1 = coin_fills[i]
                 f2 = coin_fills[i + 1]
                 time_gap_ms = f2.get("time", 0) - f1.get("time", 0)
-                if time_gap_ms < 5_000:  # within 5 seconds
-                    if f1.get("side") != f2.get("side"):
-                        # Tiny PnL on a round-trip = arb
-                        if abs(f2.get("closed_pnl", 0)) < 10.0:
-                            return True
+                if time_gap_ms >= ARB_PATTERN_MAX_GAP_MS:
+                    continue
+                if f1.get("side") == f2.get("side"):
+                    continue
+
+                notional_1 = abs(float(f1.get("price", 0) or 0)) * abs(float(f1.get("size", 0) or 0))
+                notional_2 = abs(float(f2.get("price", 0) or 0)) * abs(float(f2.get("size", 0) or 0))
+                if min(notional_1, notional_2) < ARB_PATTERN_MIN_NOTIONAL_PER_LEG:
+                    continue
+
+                candidate_pairs += 1
+                if abs(float(f2.get("closed_pnl", 0) or 0)) < ARB_PATTERN_MAX_ABS_CLOSED_PNL:
+                    match_pairs += 1
+
+            if candidate_pairs == 0:
+                continue
+            if (
+                match_pairs >= ARB_PATTERN_MIN_MATCH_COUNT
+                and (match_pairs / candidate_pairs) >= ARB_PATTERN_MIN_MATCH_RATIO
+            ):
+                return True
         return False
 
     def _apply_hard_cutoffs(

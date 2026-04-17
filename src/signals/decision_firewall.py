@@ -450,6 +450,36 @@ class DecisionFirewall:
 
         return True, "", policy
 
+    @staticmethod
+    def _resolve_signal_size_units(signal: TradeSignal, balance: Optional[float]) -> float:
+        """Resolve a signal's unit size from balance/position_pct when possible."""
+        current_size = float(getattr(signal, "size", 0.0) or 0.0)
+        if current_size > 0:
+            return current_size
+
+        entry_price = float(getattr(signal, "entry_price", 0.0) or 0.0)
+        position_pct = float(getattr(signal, "position_pct", 0.0) or 0.0)
+        if balance and balance > 0 and position_pct > 0 and entry_price > 0:
+            resolved_size = (balance * position_pct) / entry_price
+            if resolved_size > 0:
+                signal.size = resolved_size
+                return resolved_size
+        return 0.0
+
+    @classmethod
+    def _estimate_signal_notional(cls, signal: TradeSignal, balance: Optional[float]) -> float:
+        """Estimate a signal's leveraged notional exposure even before size is resolved."""
+        size = cls._resolve_signal_size_units(signal, balance)
+        entry_price = float(getattr(signal, "entry_price", 0.0) or 0.0)
+        leverage = max(float(getattr(signal, "leverage", 1.0) or 1.0), 1.0)
+        if size > 0 and entry_price > 0:
+            return abs(size * entry_price * leverage)
+
+        position_pct = float(getattr(signal, "position_pct", 0.0) or 0.0)
+        if balance and balance > 0 and position_pct > 0:
+            return abs(balance * position_pct * leverage)
+        return 0.0
+
     def validate(self, signal: TradeSignal, regime_data: Optional[Dict] = None,
                  open_positions: Optional[List[Dict]] = None,
                  ignore_position_limit: bool = False,
@@ -602,16 +632,21 @@ class DecisionFirewall:
         if balance:
             total_exposure = 0.0
             for pos in positions:
+                projected_notional = float(pos.get("projected_notional", 0) or 0)
+                if projected_notional > 0:
+                    total_exposure += abs(projected_notional)
+                    continue
                 pos_size = pos.get("size", 0)
                 pos_price = pos.get("entry_price", pos.get("entryPx", 0))
                 pos_leverage = pos.get("leverage", 1)
                 total_exposure += abs(pos_size * pos_price * pos_leverage)
 
-            new_notional = (
-                signal.size * signal.entry_price * signal.leverage
-                if signal.size and signal.entry_price
-                else balance * signal.position_pct * signal.leverage
-            )
+            new_notional = self._estimate_signal_notional(signal, balance)
+            if new_notional <= 0:
+                return _reject(
+                    "rejected_exposure",
+                    "Signal size unresolved; cannot validate aggregate exposure",
+                )
             projected_exposure = total_exposure + new_notional
             exposure_pct = projected_exposure / balance if balance > 0 else 1.0
 
@@ -764,13 +799,20 @@ class DecisionFirewall:
         """
         with self._lock:
             positions = db.get_open_paper_trades()
+            account = db.get_paper_account()
+            balance = account.get("balance", 10000) if account else None
 
             # Sort by confidence descending
             sorted_signals = sorted(signals, key=lambda s: s.confidence, reverse=True)
 
             results = []
             for signal in sorted_signals:
-                passed, reason = self._validate_locked(signal, regime_data, positions)
+                passed, reason = self._validate_locked(
+                    signal,
+                    regime_data,
+                    positions,
+                    account_balance=balance,
+                )
                 results.append((signal, passed, reason))
 
                 # If signal passed, add to positions for subsequent checks.
@@ -779,13 +821,15 @@ class DecisionFirewall:
                 # approvals — without these fields pos.get("size", 0) returns 0 and a burst
                 # of concurrent signals can all pass the exposure cap simultaneously.
                 if passed:
+                    resolved_size = self._resolve_signal_size_units(signal, balance)
                     positions.append({
                         "coin": signal.coin,
                         "side": signal.side.value,
                         "status": "open",
                         "entry_price": float(getattr(signal, "entry_price", 0) or 0),
-                        "size": float(getattr(signal, "size", 0) or 0),
+                        "size": float(resolved_size or 0),
                         "leverage": float(getattr(signal, "leverage", 1) or 1),
+                        "projected_notional": self._estimate_signal_notional(signal, balance),
                     })
 
             approved = sum(1 for _, p, _ in results if p)

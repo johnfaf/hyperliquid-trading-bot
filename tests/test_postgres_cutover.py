@@ -98,6 +98,7 @@ def test_dualwrite_insert_preserves_sqlite_generated_ids_in_postgres():
     assert cursor.lastrowid == 1
     assert pg_conn.executed[-1][0].startswith("INSERT INTO strategies (id, name) VALUES (%s, %s)")
     assert pg_conn.executed[-1][1] == (1, "momentum")
+    assert pg_conn.commit_calls == 1
 
 
 def test_dualwrite_skips_sqlite_only_pragmas_for_postgres():
@@ -112,6 +113,61 @@ def test_dualwrite_skips_sqlite_only_pragmas_for_postgres():
     adapter.execute("PRAGMA table_info(strategies)")
 
     assert pg_conn.executed == []
+
+
+def test_table_exists_uses_backend_agnostic_query(monkeypatch):
+    observed = {}
+
+    class _Conn:
+        def execute(self, sql, params=()):
+            observed["sql"] = sql
+            observed["params"] = params
+
+            class _Cursor:
+                @staticmethod
+                def fetchone():
+                    return {"name": "paper_trades"}
+
+            return _Cursor()
+
+    @contextmanager
+    def _ctx(*, for_read: bool = False):
+        observed["for_read"] = for_read
+        yield _Conn()
+
+    monkeypatch.setattr(db, "get_connection", _ctx)
+
+    assert db.table_exists("paper_trades") is True
+    assert observed["for_read"] is True
+    assert "sqlite_master" in observed["sql"]
+    assert observed["params"] == ("paper_trades",)
+
+
+def test_update_paper_trade_metadata_raises_when_trade_is_missing(monkeypatch):
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.execute(
+        """
+        CREATE TABLE paper_trades (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            metadata TEXT
+        )
+        """
+    )
+
+    @contextmanager
+    def _ctx(*, for_read: bool = False):
+        try:
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+
+    monkeypatch.setattr(db, "get_connection", _ctx)
+
+    with pytest.raises(LookupError, match="does not exist"):
+        db.update_paper_trade_metadata(123, {"foo": "bar"})
 
 
 def test_localhost_postgres_dsn_is_allowed_for_local_development():

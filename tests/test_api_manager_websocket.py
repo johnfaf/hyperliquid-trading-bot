@@ -154,3 +154,31 @@ def test_candle_snapshot_success_resets_request_type_failure_streak(monkeypatch)
     for _ in range(threshold):
         assert mgr.post(payload, priority=api_manager.Priority.LOW, cache_response=False) is None
     assert mgr._req_type_cooldown_until.get("candleSnapshot", 0.0) > 0.0
+
+
+def test_rate_limit_backoff_is_longer_than_server_error_backoff(monkeypatch):
+    mgr = api_manager.APIManager()
+    sleeps = []
+
+    class _Response429:
+        status_code = 429
+        text = "rate limited"
+
+    class _Response500:
+        status_code = 500
+        text = "boom"
+
+    monkeypatch.setattr(mgr.bucket, "acquire", lambda priority, timeout=30: True)
+    monkeypatch.setattr(api_manager.time, "sleep", lambda seconds: sleeps.append(seconds))
+
+    monkeypatch.setattr(api_manager.requests, "post", lambda *args, **kwargs: _Response429())
+    mgr._do_request({"type": "allMids"}, api_manager.config.HYPERLIQUID_INFO_URL, req_type="allMids", retries=1)
+    rate_limit_sleep = sleeps.pop()
+
+    monkeypatch.setattr(api_manager.requests, "post", lambda *args, **kwargs: _Response500())
+    mgr._do_request({"type": "allMids"}, api_manager.config.HYPERLIQUID_INFO_URL, req_type="allMids", retries=1)
+    server_error_sleep = sleeps.pop()
+
+    assert rate_limit_sleep >= 20.0
+    assert server_error_sleep <= 8.0
+    assert rate_limit_sleep > server_error_sleep

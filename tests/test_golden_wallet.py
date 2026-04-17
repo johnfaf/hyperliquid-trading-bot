@@ -75,6 +75,12 @@ class TestComputeSharpe:
         result = compute_sharpe(returns)
         assert result < 0.0
 
+    def test_logs_dropped_outlier_returns(self, caplog):
+        returns = [0.01, 0.02, 11.0, -0.01, 0.015, 0.005]
+        with caplog.at_level("INFO", logger="golden_wallet"):
+            compute_sharpe(returns)
+        assert "Sharpe filter dropped" in caplog.text
+
 
 # ─── compute_avg_hold_time_hours ─────────────────────────────────
 
@@ -122,6 +128,48 @@ class TestComputeAvgHoldTime:
         ]
         result = compute_avg_hold_time_hours(fills)
         assert result == 0.0
+
+    def test_partial_closes_only_record_hold_when_position_hits_zero(self):
+        fills = [
+            {
+                "coin": "BTC",
+                "side": "buy",
+                "price": 50000.0,
+                "size": 1.0,
+                "time": 1,
+                "closed_pnl": 0.0,
+                "hash": "open",
+                "fee": 0.0,
+                "is_liquidation": False,
+                "direction": "Open Long",
+            },
+            {
+                "coin": "BTC",
+                "side": "sell",
+                "price": 50500.0,
+                "size": 0.4,
+                "time": 3_600_001,
+                "closed_pnl": 50.0,
+                "hash": "partial-close",
+                "fee": 0.0,
+                "is_liquidation": False,
+                "direction": "Close Long",
+            },
+            {
+                "coin": "BTC",
+                "side": "sell",
+                "price": 51000.0,
+                "size": 0.6,
+                "time": 10_800_001,
+                "closed_pnl": 80.0,
+                "hash": "final-close",
+                "fee": 0.0,
+                "is_liquidation": False,
+                "direction": "Close Long",
+            },
+        ]
+        result = compute_avg_hold_time_hours(fills)
+        assert abs(result - 3.0) < 0.01
 
 
 # ─── apply_execution_penalties ───────────────────────────────────
@@ -265,6 +313,10 @@ class TestRateLimitBackoff:
         """Multiple calls with same attempt should not be identical (jitter active)."""
         results = {_rate_limit_backoff(2) for _ in range(20)}
         assert len(results) > 1, "Jitter should produce varying backoff durations"
+
+    def test_backoff_never_shorter_than_base(self):
+        backoff = _rate_limit_backoff(1)
+        assert backoff >= 5.0
 
 
 def _penalised_row(fill: PenalisedFill) -> dict:

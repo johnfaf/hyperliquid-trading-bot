@@ -136,6 +136,80 @@ def _safe_init(name: str, factory, health: SubsystemHealthRegistry,
         return None
 
 
+def _mark_degraded(
+    name: str,
+    reason: str,
+    health: SubsystemHealthRegistry,
+    *,
+    dependency_ready: bool = True,
+    startup_status: str = "DEGRADED",
+) -> None:
+    """Mark an already-initialized subsystem as degraded with a clear reason."""
+    health.set_status(
+        name,
+        SubsystemState.DEGRADED,
+        reason=str(reason)[:120],
+        dependency_ready=dependency_ready,
+        startup_status=startup_status,
+    )
+    logger.warning("  DEGRADED %s - %s", name, reason)
+
+
+def _load_json_override(name: str, raw_value: str) -> Any:
+    """Parse required JSON overrides and fail fast when malformed."""
+    if not raw_value:
+        return {}
+    try:
+        return json.loads(raw_value)
+    except Exception as exc:
+        raise ValueError(f"Invalid {name}: {exc}") from exc
+
+
+def _wire_kelly_sizer_from_agent_scorer(container: SubsystemContainer, health: SubsystemHealthRegistry) -> None:
+    """Load Kelly sizing priors and expose wiring failures as degraded health."""
+    if not container.kelly_sizer or not container.agent_scorer:
+        return
+    try:
+        container.kelly_sizer.load_from_agent_scorer(container.agent_scorer)
+    except Exception as exc:
+        _mark_degraded(
+            "kelly_sizer",
+            f"agent scorer wiring failed: {exc}",
+            health,
+        )
+
+
+def _wire_event_scanner(container: SubsystemContainer, health: SubsystemHealthRegistry) -> None:
+    """Attach the event scanner to the firewall and surface wiring failures."""
+    if not container.firewall or not container.event_scanner:
+        return
+    if not hasattr(container.firewall, "set_event_scanner"):
+        _mark_degraded(
+            "event_scanner",
+            "firewall does not expose set_event_scanner",
+            health,
+        )
+        _mark_degraded(
+            "decision_firewall",
+            "event scanner wiring unavailable",
+            health,
+        )
+        return
+    try:
+        container.firewall.set_event_scanner(container.event_scanner)
+    except Exception as exc:
+        _mark_degraded(
+            "event_scanner",
+            f"firewall wiring failed: {exc}",
+            health,
+        )
+        _mark_degraded(
+            "decision_firewall",
+            f"event scanner wiring failed: {exc}",
+            health,
+        )
+
+
 def build_subsystems(
     health: SubsystemHealthRegistry,
     profile: Optional[set] = None,
@@ -316,11 +390,7 @@ def build_subsystems(
     if "kelly_sizer" in profile:
         from src.signals.kelly_sizing import KellySizer
         c.kelly_sizer = _safe_init("kelly_sizer", KellySizer, health)
-        if c.kelly_sizer and c.agent_scorer:
-            try:
-                c.kelly_sizer.load_from_agent_scorer(c.agent_scorer)
-            except Exception:
-                pass
+        _wire_kelly_sizer_from_agent_scorer(c, health)
 
     if "lstm_agent" in profile and getattr(config, "ENABLE_LSTM_AGENT", False):
         from src.signals.lstm_agent import LSTMAgent
@@ -362,15 +432,13 @@ def build_subsystems(
 
     if "risk_policy_engine" in profile:
         from src.signals.risk_policy import RiskPolicyEngine
-        source_profiles = {}
-        if getattr(config, "RISK_POLICY_SOURCE_PROFILES_JSON", ""):
-            try:
-                source_profiles = json.loads(config.RISK_POLICY_SOURCE_PROFILES_JSON)
-            except Exception as exc:
-                logger.warning("Invalid RISK_POLICY_SOURCE_PROFILES_JSON override: %s", exc)
-        c.risk_policy_engine = _safe_init(
-            "risk_policy_engine",
-            lambda: RiskPolicyEngine(
+
+        def _build_risk_policy_engine():
+            source_profiles = _load_json_override(
+                "RISK_POLICY_SOURCE_PROFILES_JSON",
+                getattr(config, "RISK_POLICY_SOURCE_PROFILES_JSON", ""),
+            )
+            return RiskPolicyEngine(
                 {
                     "default_reward_multiple": config.RISK_POLICY_DEFAULT_REWARD_MULTIPLE,
                     "min_reward_multiple": config.RISK_POLICY_MIN_REWARD_MULTIPLE,
@@ -390,7 +458,11 @@ def build_subsystems(
                     "default_trailing_distance_ratio": config.RISK_POLICY_DEFAULT_TRAILING_DISTANCE_RATIO,
                     "source_profiles": source_profiles,
                 }
-            ),
+            )
+
+        c.risk_policy_engine = _safe_init(
+            "risk_policy_engine",
+            _build_risk_policy_engine,
             health,
         )
 
@@ -462,11 +534,7 @@ def build_subsystems(
             health,
             affects_trading=False,
         )
-        if c.firewall and c.event_scanner and hasattr(c.firewall, "set_event_scanner"):
-            try:
-                c.firewall.set_event_scanner(c.event_scanner)
-            except Exception:
-                pass
+        _wire_event_scanner(c, health)
 
     # Macro regime overlay (external data → protective risk posture)
     if "macro_regime" in profile and getattr(config, "MACRO_REGIME_ENABLED", True):

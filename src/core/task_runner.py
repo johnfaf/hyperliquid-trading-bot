@@ -225,11 +225,11 @@ class SupervisedTaskRunner:
             try:
                 task.target()
 
-                # ── success ──
-                task.last_success_ts = time.time()
-                task.consecutive_failures = 0
-                task.retry_count = 0
-                task.state = "running"
+                with self._lock:
+                    task.last_success_ts = time.time()
+                    task.consecutive_failures = 0
+                    task.retry_count = 0
+                    task.state = "running"
 
                 if self._health:
                     try:
@@ -238,16 +238,20 @@ class SupervisedTaskRunner:
                         pass  # registry may not have this subsystem registered
 
             except Exception as exc:
-                task.consecutive_failures += 1
-                task.retry_count += 1
-                task.last_error = str(exc)[:200]
+                with self._lock:
+                    task.consecutive_failures += 1
+                    task.retry_count += 1
+                    task.last_error = str(exc)[:200]
+                    retry_count = task.retry_count
+                    consecutive_failures = task.consecutive_failures
                 logger.warning(
                     "Task '%s' failed (attempt %d/%d): %s",
-                    task.name, task.retry_count, task.max_retries, exc,
+                    task.name, retry_count, task.max_retries, exc,
                 )
 
-                if task.retry_count >= task.max_retries:
-                    task.state = "failed"
+                if retry_count >= task.max_retries:
+                    with self._lock:
+                        task.state = "failed"
                     logger.error(
                         "Task '%s' reached max retries (%d).",
                         task.name, task.max_retries,
@@ -275,9 +279,10 @@ class SupervisedTaskRunner:
                     )
                     if task.stop_event.wait(cooldown):
                         break
-                    task.retry_count = 0
-                    task.consecutive_failures = 0
-                    task.state = "running"
+                    with self._lock:
+                        task.retry_count = 0
+                        task.consecutive_failures = 0
+                        task.state = "running"
                     if self._health:
                         try:
                             from src.core.health_registry import SubsystemState
@@ -291,15 +296,14 @@ class SupervisedTaskRunner:
                             pass
                     continue
 
-                # Exponential back-off: 2, 4, 8, 16, 32, 60, 60, …
-                task.state = "retrying"
-                backoff = min(2 ** task.consecutive_failures, 60)
+                with self._lock:
+                    task.state = "retrying"
+                backoff = min(2 ** consecutive_failures, 60)
                 logger.info("Task '%s' retrying in %ds", task.name, backoff)
                 if task.stop_event.wait(backoff):
                     break  # stop was requested during backoff
                 continue  # skip the normal interval wait
 
-            # ── normal interval sleep (interruptible) ──
             if task.stop_event.wait(task.interval_seconds):
                 break
 
@@ -310,3 +314,4 @@ class SupervisedTaskRunner:
 # Module-level singleton
 # ---------------------------------------------------------------------------
 runner = SupervisedTaskRunner()
+

@@ -131,29 +131,13 @@ def get_connection(*, for_read: bool = False):
             adapter = DualWriteAdapter(raw_sq, pg_raw)
             try:
                 yield adapter
-                raw_sq.commit()
-                try:
-                    pg_raw.commit()
-                except Exception as exc:
-                    logger.warning("Dualwrite Postgres commit failed: %s", exc)
-                    try:
-                        pg_raw.rollback()
-                    except Exception:
-                        pass
+                adapter.commit()
             except sqlite3.OperationalError as exc:
                 logger.warning("SQLite operational error: %s", exc)
-                raw_sq.rollback()
-                try:
-                    pg_raw.rollback()
-                except Exception:
-                    pass
+                adapter.rollback()
                 raise
             except Exception:
-                raw_sq.rollback()
-                try:
-                    pg_raw.rollback()
-                except Exception:
-                    pass
+                adapter.rollback()
                 raise
             finally:
                 raw_sq.close()

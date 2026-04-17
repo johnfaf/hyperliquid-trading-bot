@@ -79,18 +79,11 @@ def _insert_and_get_id(conn, sql: str, params):
 
 def table_exists(name: str) -> bool:
     """Check whether a table exists in the active backend."""
-    with get_connection() as conn:
-        if _is_pg():
-            row = conn.execute(
-                "SELECT table_name AS name FROM information_schema.tables "
-                "WHERE table_schema='public' AND table_name=?",
-                (name,),
-            ).fetchone()
-        else:
-            row = conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
-                (name,),
-            ).fetchone()
+    with get_connection(for_read=True) as conn:
+        row = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+            (name,),
+        ).fetchone()
         return row is not None
 
 
@@ -591,16 +584,20 @@ def update_paper_trade_metadata(trade_id: int, extra: dict):
         row = conn.execute(
             "SELECT metadata FROM paper_trades WHERE id = ?", (trade_id,)
         ).fetchone()
-        if row:
-            try:
-                existing = json.loads(row["metadata"] or "{}")
-            except Exception:
-                existing = {}
-            existing.update(extra)
-            conn.execute(
-                "UPDATE paper_trades SET metadata = ? WHERE id = ?",
-                (json.dumps(existing), trade_id)
-            )
+        if not row:
+            raise LookupError(f"Paper trade {trade_id} does not exist")
+
+        try:
+            existing = json.loads(row["metadata"] or "{}")
+        except Exception:
+            existing = {}
+        existing.update(extra)
+        cursor = conn.execute(
+            "UPDATE paper_trades SET metadata = ? WHERE id = ?",
+            (json.dumps(existing), trade_id)
+        )
+        if cursor.rowcount == 0:
+            raise LookupError(f"Paper trade {trade_id} does not exist")
 
 
 def close_paper_trade(trade_id, exit_price, pnl) -> bool:

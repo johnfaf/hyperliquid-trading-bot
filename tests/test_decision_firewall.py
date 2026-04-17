@@ -566,3 +566,44 @@ def test_firewall_derisks_shorts_when_recent_shorts_need_caution(mock_db):
     assert signal.confidence == pytest.approx(0.6)
     assert signal.size == 0.1
     assert signal.position_pct == 0.05
+
+
+@patch("src.signals.decision_firewall.db")
+def test_validate_batch_counts_projected_notional_for_signals_without_size(mock_db):
+    mock_db.get_open_paper_trades.return_value = []
+    mock_db.get_paper_account.return_value = {"balance": 1000}
+    mock_db.audit_log = MagicMock()
+
+    from src.signals.decision_firewall import DecisionFirewall
+
+    fw = DecisionFirewall(
+        {
+            "max_aggregate_exposure": 1.0,
+            "enable_predictive_derisk": False,
+            "funding_risk_enabled": False,
+        }
+    )
+
+    first = MockSignal(
+        coin="BTC",
+        confidence=0.8,
+        size=0.0,
+        entry_price=100.0,
+        leverage=2,
+        position_pct=0.30,
+    )
+    second = MockSignal(
+        coin="ETH",
+        confidence=0.7,
+        size=0.0,
+        entry_price=100.0,
+        leverage=2,
+        position_pct=0.30,
+    )
+
+    results = fw.validate_batch([first, second])
+
+    assert results[0][1] is True
+    assert first.size == pytest.approx(3.0)
+    assert results[1][1] is False
+    assert "aggregate exposure" in results[1][2].lower()

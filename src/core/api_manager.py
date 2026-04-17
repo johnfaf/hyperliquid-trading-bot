@@ -259,6 +259,14 @@ def jittered_backoff(attempt: int, base: float = 2.0, cap: float = 60.0) -> floa
     return random.uniform(0, exp)
 
 
+def ranged_backoff(min_wait: float, max_wait: float, attempt: int, growth: float) -> float:
+    """Backoff with a hard minimum and bounded widening as attempts increase."""
+    upper = min(max_wait, min_wait + growth * max(attempt + 1, 1))
+    if upper <= min_wait:
+        return min_wait
+    return min_wait + random.uniform(0, upper - min_wait)
+
+
 # ─── WebSocket Feed ──────────────────────────────────────────────
 class HyperliquidWebSocket:
     """
@@ -848,7 +856,7 @@ class APIManager:
                 # ── 429: Rate limited — always retry with hard backoff ──
                 if resp.status_code == 429:
                     self.bucket.report_429()
-                    wait = jittered_backoff(attempt, base=5.0, cap=60.0)
+                    wait = ranged_backoff(20.0, 60.0, attempt, growth=10.0)
                     logger.warning(
                         f"429 RATE_LIMITED type='{req_type}' — "
                         f"wait {wait:.1f}s (attempt {attempt+1}/{retries})"
@@ -921,7 +929,7 @@ class APIManager:
                                 self._req_type_suppressed_warns[req_type],
                             )
                         return None, failure_kind
-                    wait = jittered_backoff(attempt, base=3.0, cap=30.0)
+                    wait = ranged_backoff(2.0, 8.0, attempt, growth=2.0)
                     logger.warning(
                         f"SERVER_ERROR {resp.status_code} type='{req_type}' — "
                         f"retry in {wait:.1f}s (attempt {attempt+1}/{retries})"
