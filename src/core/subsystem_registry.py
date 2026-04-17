@@ -651,7 +651,13 @@ def build_subsystems(
     if "position_monitor" in profile:
         try:
             import src.data.database as db
-            top_traders = db.get_active_traders()[:20]
+            quarantined = db.quarantine_invalid_traders()
+            if quarantined:
+                logger.warning(
+                    "Position monitor skipped %d malformed trader row(s) from runtime DB",
+                    len(quarantined),
+                )
+            top_traders = db.get_active_traders(valid_only=True)[:20]
             if top_traders:
                 c.position_monitor = _safe_init(
                     "position_monitor",

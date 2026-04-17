@@ -99,6 +99,9 @@ class PositionMonitor:
         # Tracked addresses and subscriptions
         self._tracked_addresses: Set[str] = set()
         self._subscribed_addresses: Set[str] = set()
+        self._active_position_addresses: Set[str] = set()
+        self._quarantined_addresses: Dict[str, str] = {}
+        self._reconnect_wake_event = threading.Event()
 
         # Stats
         self._messages_received = 0
@@ -176,6 +179,10 @@ class PositionMonitor:
             5.0,
             float(getattr(config, "POSITION_MONITOR_REST_FALLBACK_INTERVAL_S", 20.0)),
         )
+        self._idle_rest_only_interval_s = max(
+            self._rest_fallback_interval_s,
+            float(getattr(config, "POSITION_MONITOR_IDLE_REST_ONLY_S", 120.0)),
+        )
         self._rest_fallback_thread = None
         self._reconnect_delay_override_s: Optional[float] = None
         self._reconnect_reason: Optional[str] = None
@@ -200,7 +207,18 @@ class PositionMonitor:
             logger.warning("PositionMonitor already running")
             return
 
-        self._tracked_addresses = set(addresses)
+        valid_addresses = []
+        for address in addresses:
+            normalized = self._normalize_address(address)
+            if not self._is_valid_tracked_address(normalized):
+                self._quarantine_address(normalized or str(address), "malformed_trader_address")
+                continue
+            valid_addresses.append(normalized)
+
+        self._tracked_addresses = set(valid_addresses)
+        if not self._tracked_addresses:
+            logger.warning("PositionMonitor start skipped: no valid trader addresses to monitor")
+            return
         self._running = True
         self._thread = threading.Thread(target=self._run_forever, daemon=True)
         self._thread.start()
@@ -210,11 +228,16 @@ class PositionMonitor:
         self._watchdog_thread.start()
         self._rest_fallback_thread = threading.Thread(target=self._rest_reconcile_loop, daemon=True)
         self._rest_fallback_thread.start()
-        logger.info(f"PositionMonitor starting with {len(addresses)} traders")
+        logger.info(
+            "PositionMonitor starting with %d valid traders (%d quarantined)",
+            len(self._tracked_addresses),
+            len(self._quarantined_addresses),
+        )
 
     def stop(self) -> None:
         """Stop the WebSocket connection and monitoring."""
         self._running = False
+        self._reconnect_wake_event.set()
         if self._ws:
             try:
                 self._ws.close()
@@ -229,12 +252,20 @@ class PositionMonitor:
         Args:
             address: Trader address to monitor
         """
+        normalized = self._normalize_address(address)
+        if not self._is_valid_tracked_address(normalized):
+            self._quarantine_address(normalized or str(address), "malformed_trader_address")
+            return
+
         with self._lock:
-            self._tracked_addresses.add(address)
-            # If connected, subscribe immediately
-            if self._ws and self._connected:
-                self._subscribe_to_address(address)
-                logger.info(f"Added trader {address[:10]} to live monitoring")
+            self._tracked_addresses.add(normalized)
+
+        positions = self._bootstrap_positions(normalized)
+        if positions and self._ws and self._connected:
+            self._subscribe_to_address(normalized)
+        elif positions:
+            self._request_fast_reconnect("active trader added via REST", delay_s=0.0)
+        logger.info(f"Added trader {normalized[:10]} to live monitoring")
 
     def remove_trader(self, address: str) -> None:
         """
@@ -243,10 +274,14 @@ class PositionMonitor:
         Args:
             address: Trader address to stop monitoring
         """
+        normalized = self._normalize_address(address)
         with self._lock:
-            self._tracked_addresses.discard(address)
-            self._position_cache.pop(address, None)
-            logger.info(f"Removed trader {address[:10]} from monitoring")
+            self._tracked_addresses.discard(normalized)
+            self._subscribed_addresses.discard(normalized)
+            self._active_position_addresses.discard(normalized)
+            self._position_cache.pop(normalized, None)
+            self._quarantined_addresses.pop(normalized, None)
+            logger.info(f"Removed trader {normalized[:10]} from monitoring")
 
     def drain_signals(self) -> List[Dict]:
         """
@@ -277,6 +312,8 @@ class PositionMonitor:
                 "running": self._running,
                 "tracked_addresses": len(self._tracked_addresses),
                 "subscribed_addresses": len(self._subscribed_addresses),
+                "active_position_addresses": len(self._active_position_addresses),
+                "quarantined_addresses": len(self._quarantined_addresses),
                 "cached_positions": sum(len(p) for p in self._position_cache.values()),
                 "pending_signals": len(self._signal_queue),
                 "messages_received": self._messages_received,
@@ -289,6 +326,41 @@ class PositionMonitor:
                 "gap_warn_threshold_s": round(self._gap_warn_threshold_s, 2),
                 "last_update": self._last_msg_time,
             }
+
+    @staticmethod
+    def _normalize_address(address: Optional[str]) -> str:
+        return str(address or "").strip().lower()
+
+    @staticmethod
+    def _is_valid_tracked_address(address: Optional[str]) -> bool:
+        return hl._is_valid_eth_address(address)
+
+    def _quarantine_address(self, address: str, reason: str) -> None:
+        normalized = self._normalize_address(address)
+        if not normalized:
+            return
+
+        already_quarantined = False
+        with self._lock:
+            already_quarantined = normalized in self._quarantined_addresses
+            self._quarantined_addresses[normalized] = reason
+            self._tracked_addresses.discard(normalized)
+            self._subscribed_addresses.discard(normalized)
+            self._active_position_addresses.discard(normalized)
+            self._position_cache.pop(normalized, None)
+
+        if not already_quarantined:
+            logger.warning(
+                "PositionMonitor quarantined trader %s (%s)",
+                normalized[:18] + "..." if len(normalized) > 18 else normalized,
+                reason,
+            )
+        try:
+            from src.data import database as db
+
+            db.quarantine_trader_address(normalized, reason=reason)
+        except Exception:
+            pass
 
     # ─── Private: WebSocket lifecycle ──────────────────────────────
 
@@ -324,7 +396,8 @@ class PositionMonitor:
                         f"PositionMonitor reconnecting in {wait:.1f}s "
                         f"(reconnect #{self._reconnect_count})"
                     )
-                time.sleep(wait)
+                self._reconnect_wake_event.wait(timeout=max(0.0, wait))
+                self._reconnect_wake_event.clear()
 
     @classmethod
     def _install_websocket_library_filter(cls) -> None:
@@ -368,6 +441,29 @@ class PositionMonitor:
             self._reconnect_delay_override_s = max(0.0, float(delay_s))
             self._reconnect_reason = reason
             self._reconnect_count = 0
+        self._reconnect_wake_event.set()
+
+    def _enter_idle_rest_only_mode(self, reason: str) -> None:
+        """Pause websocket churn when no tracked traders currently have positions.
+
+        REST fallback remains active and can wake the websocket path early as
+        soon as a watched trader opens a new position.
+        """
+        self._request_fast_reconnect(reason, delay_s=self._idle_rest_only_interval_s)
+        with self._lock:
+            ws = self._ws
+            self._subscribed_addresses.clear()
+            self._connected = False
+        logger.info(
+            "PositionMonitor switching to REST-only mode for %.1fs: %s",
+            self._idle_rest_only_interval_s,
+            reason,
+        )
+        try:
+            if ws:
+                ws.close()
+        except Exception as exc:
+            logger.debug("PositionMonitor idle-mode close error: %s", exc)
 
     def _consume_reconnect_wait(self) -> tuple[float, Optional[str]]:
         """Return the next reconnect wait and clear any one-shot override."""
@@ -414,6 +510,7 @@ class PositionMonitor:
             self._last_ws_activity_time = now
             self._watchdog_grace_until = now + self._watchdog_startup_grace_s
             tracked = list(self._tracked_addresses)
+            self._subscribed_addresses.clear()
 
         if was_reconnect:
             logger.info("PositionMonitor RECONNECTED — clearing stale cache")
@@ -440,8 +537,14 @@ class PositionMonitor:
             else:
                 self._consecutive_empty_reconnects += 1
 
+        if total_positions == 0:
+            self._enter_idle_rest_only_mode("no active tracked positions")
+            return
+
         # Subscribe to all tracked addresses
-        for address in tracked:
+        with self._lock:
+            active_addresses = list(self._active_position_addresses)
+        for address in active_addresses:
             self._subscribe_to_address(address)
 
     def _subscribe_to_address(self, address: str) -> None:
@@ -449,6 +552,9 @@ class PositionMonitor:
         Send subscription request for a single trader's userEvents.
         Must be called with lock held or from WebSocket thread.
         """
+        if not self._is_valid_tracked_address(address):
+            self._quarantine_address(address, "malformed_trader_address")
+            return
         if not self._ws or not self._connected:
             return
         try:
@@ -609,11 +715,15 @@ class PositionMonitor:
         user = event_data.get("user", "")
         if not user:
             return
+        user = self._normalize_address(user)
+        if not self._is_valid_tracked_address(user):
+            self._quarantine_address(user, "malformed_trader_address")
+            return
 
         # Parse positions from the event
-        positions_data = event_data.get("positions", [])
-        if not positions_data:
+        if "positions" not in event_data:
             return
+        positions_data = event_data.get("positions") or []
 
         # Build current positions dict
         current_positions = {}
@@ -659,12 +769,23 @@ class PositionMonitor:
         # Update cache
         with self._lock:
             self._position_cache[user] = current_positions
+            if current_positions:
+                self._active_position_addresses.add(user)
+                self._subscribed_addresses.add(user)
+            else:
+                self._active_position_addresses.discard(user)
+                self._subscribed_addresses.discard(user)
             for signal in signals:
                 self._signal_queue.append(signal)
                 self._signals_emitted += 1
 
         if signals:
             logger.debug(f"Detected {len(signals)} position changes for {user[:10]}")
+
+        with self._lock:
+            no_active_positions = self._connected and not self._subscribed_addresses and bool(self._tracked_addresses)
+        if no_active_positions:
+            self._enter_idle_rest_only_mode("all tracked positions are flat")
 
     def _detect_position_changes(
         self,
@@ -803,8 +924,9 @@ class PositionMonitor:
         """Reconcile tracked positions via REST when the WebSocket is unavailable."""
         with self._lock:
             if self._connected:
-                return 0
-            tracked = list(self._tracked_addresses)
+                tracked = list(self._tracked_addresses - self._subscribed_addresses)
+            else:
+                tracked = list(self._tracked_addresses)
 
         emitted = 0
         for address in tracked:
@@ -813,8 +935,18 @@ class PositionMonitor:
             fresh_positions = self._fetch_positions_snapshot(address)
             with self._lock:
                 self._position_cache[address] = fresh_positions
+                had_active_positions = address in self._active_position_addresses
+                if fresh_positions:
+                    self._active_position_addresses.add(address)
+                else:
+                    self._active_position_addresses.discard(address)
+                    self._subscribed_addresses.discard(address)
             signals = self._detect_position_changes(address, cached, fresh_positions)
             if not signals:
+                if self._connected and fresh_positions and address not in self._subscribed_addresses:
+                    self._subscribe_to_address(address)
+                if (not self._connected) and (not had_active_positions) and fresh_positions:
+                    self._request_fast_reconnect("active positions detected via REST", delay_s=0.0)
                 continue
             with self._lock:
                 for signal in signals:
@@ -826,9 +958,16 @@ class PositionMonitor:
                 len(signals),
                 address[:10],
             )
+            if self._connected and fresh_positions and address not in self._subscribed_addresses:
+                self._subscribe_to_address(address)
+            if (not self._connected) and (not had_active_positions) and fresh_positions:
+                self._request_fast_reconnect("active positions detected via REST", delay_s=0.0)
 
         with self._lock:
             self._rest_fallback_cycles += 1
+            no_active_positions = self._connected and not self._subscribed_addresses and bool(self._tracked_addresses)
+        if no_active_positions:
+            self._enter_idle_rest_only_mode("REST reconcile found no active positions")
         return emitted
 
     def _rest_reconcile_loop(self) -> None:
@@ -844,6 +983,10 @@ class PositionMonitor:
 
     def _fetch_positions_snapshot(self, address: str) -> Dict[str, Dict]:
         """Fetch current positions for a trader without mutating internal state."""
+        normalized = self._normalize_address(address)
+        if not self._is_valid_tracked_address(normalized):
+            self._quarantine_address(normalized or str(address), "malformed_trader_address")
+            return {}
         state = hl.get_user_state(address)
         if not state:
             return {}
@@ -876,6 +1019,10 @@ class PositionMonitor:
 
             with self._lock:
                 self._position_cache[address] = positions
+                if positions:
+                    self._active_position_addresses.add(address)
+                else:
+                    self._active_position_addresses.discard(address)
 
             logger.info(f"Bootstrapped {len(positions)} positions for {address[:10]}")
             return positions

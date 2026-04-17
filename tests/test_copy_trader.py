@@ -215,7 +215,7 @@ class TestPositionCacheTTL:
     def test_cache_timestamp_updated_on_scan(self):
         """After scanning a trader, their cache timestamp is updated."""
         trader = {
-            "address": "0xactive_trader",
+            "address": "0x" + "5" * 40,
             "win_rate": 0.6,
             "total_pnl": 10000,
         }
@@ -234,6 +234,39 @@ class TestPositionCacheTTL:
 
         ts = ct._position_cache_ts.get(trader["address"], 0)
         assert ts >= before, "Cache timestamp should be updated after scan"
+
+    def test_scan_top_traders_skips_invalid_addresses(self):
+        """Malformed trader rows should never be queried against Hyperliquid."""
+        ct = CopyTrader()
+        valid = "0x" + "4" * 40
+        invalid = "0xalpha_momentum_001"
+        traders = [
+            {"address": invalid, "win_rate": 0.8, "total_pnl": 1000},
+            {"address": valid, "win_rate": 0.6, "total_pnl": 5000},
+        ]
+        seen = []
+        mock_state = {
+            "positions": [
+                {
+                    "coin": "BTC",
+                    "size": 1.0,
+                    "side": "long",
+                    "entry_price": 50000.0,
+                    "leverage": 2,
+                }
+            ]
+        }
+
+        def _get_user_state(address):
+            seen.append(address)
+            return mock_state
+
+        with patch("src.trading.copy_trader.db.get_active_traders", return_value=traders), \
+             patch("src.trading.copy_trader.hl.get_all_mids", return_value={"BTC": 50000.0}), \
+             patch("src.trading.copy_trader.hl.get_user_state", side_effect=_get_user_state):
+            ct.scan_top_traders(top_n=5)
+
+        assert seen == [valid]
 
 
 # ─── Risk policy silent failure handling ─────────────────────────

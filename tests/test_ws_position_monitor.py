@@ -253,3 +253,77 @@ def test_websocket_library_filter_suppresses_transient_close_frame_errors():
 
     assert filt.filter(transient) is False
     assert filt.filter(non_transient) is True
+
+
+def test_on_open_without_active_positions_switches_to_rest_only_mode(monkeypatch):
+    monitor = PositionMonitor()
+    address = "0x" + "1" * 40
+    monitor._tracked_addresses = {address}
+
+    reasons = []
+    monkeypatch.setattr(monitor, "_bootstrap_positions", lambda _address: {})
+    monkeypatch.setattr(monitor, "_enter_idle_rest_only_mode", lambda reason: reasons.append(reason))
+
+    monitor._on_open(object())
+
+    assert reasons == ["no active tracked positions"]
+    assert monitor._subscribed_addresses == set()
+
+
+def test_rest_reconcile_subscribes_watch_only_trader_when_position_appears(monkeypatch):
+    monitor = PositionMonitor()
+    address = "0x" + "2" * 40
+    monitor._connected = True
+    monitor._tracked_addresses = {address}
+    monitor._subscribed_addresses = set()
+    monitor._mids_cache = {"BTC": 100.0}
+
+    subscribed = []
+    monkeypatch.setattr(
+        monitor,
+        "_fetch_positions_snapshot",
+        lambda _address: {
+            "BTC": {
+                "size": 1.0,
+                "side": "long",
+                "entry_price": 100.0,
+                "leverage": 2.0,
+                "unrealized_pnl": 0.0,
+            }
+        },
+    )
+    monkeypatch.setattr(monitor, "_subscribe_to_address", lambda addr: subscribed.append(addr))
+
+    emitted = monitor._rest_reconcile_once()
+
+    assert emitted == 1
+    assert subscribed == [address]
+
+
+def test_process_user_events_empty_positions_marks_trader_flat_and_idles(monkeypatch):
+    monitor = PositionMonitor()
+    address = "0x" + "3" * 40
+    monitor._connected = True
+    monitor._tracked_addresses = {address}
+    monitor._subscribed_addresses = {address}
+    monitor._active_position_addresses = {address}
+    monitor._position_cache = {
+        address: {
+            "BTC": {
+                "size": 1.0,
+                "side": "long",
+                "entry_price": 100.0,
+                "leverage": 2.0,
+                "unrealized_pnl": 0.0,
+            }
+        }
+    }
+
+    reasons = []
+    monkeypatch.setattr(monitor, "_enter_idle_rest_only_mode", lambda reason: reasons.append(reason))
+
+    monitor._process_user_events({"user": address, "positions": []})
+
+    assert address not in monitor._subscribed_addresses
+    assert address not in monitor._active_position_addresses
+    assert reasons == ["all tracked positions are flat"]

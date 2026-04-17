@@ -116,7 +116,7 @@ class TraderDiscovery:
 
     def _load_known_traders(self):
         """Load previously tracked traders from the database."""
-        traders = db.get_active_traders()
+        traders = db.get_active_traders(valid_only=True, quarantine_invalid=True)
         for t in traders:
             self.known_traders[t["address"]] = t
         logger.info(f"Loaded {len(self.known_traders)} known traders from database")

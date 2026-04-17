@@ -12,6 +12,7 @@ Public API is unchanged — callers keep using ``get_connection()``,
 """
 import json
 import os
+import re
 import shutil
 import logging
 import sqlite3
@@ -23,6 +24,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import config
 
 logger = logging.getLogger(__name__)
+_TRADER_ADDRESS_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
 
 # Resolved once at import — config.py already tested writability
 _DB_PATH = config.DB_PATH
@@ -39,6 +41,25 @@ from src.data.db.router import (                       # noqa: E402
 
 def get_db_path():
     return _DB_PATH
+
+
+def _is_valid_trader_address(address) -> bool:
+    if not isinstance(address, str):
+        return False
+    return bool(_TRADER_ADDRESS_RE.match(address.strip()))
+
+
+def _merge_quarantine_metadata(metadata, *, reason: str) -> dict:
+    if isinstance(metadata, str):
+        try:
+            metadata = json.loads(metadata or "{}")
+        except Exception:
+            metadata = {}
+    metadata = dict(metadata or {})
+    metadata["invalid_address_quarantined"] = True
+    metadata["invalid_address_reason"] = str(reason or "malformed_eth_address")
+    metadata["invalid_address_quarantined_at"] = datetime.now(timezone.utc).isoformat()
+    return metadata
 
 
 def _assert_db_disk_space() -> None:
@@ -242,8 +263,21 @@ def init_db():
 def upsert_trader(address, total_pnl=0, roi_pct=0, account_value=0,
                   win_rate=0, trade_count=0, metadata=None, is_active=True):
     now = datetime.now(timezone.utc).isoformat()
-    meta_json = json.dumps(metadata or {})
+    metadata_dict = dict(metadata or {})
     active_value = bool(is_active)
+    normalized_address = str(address or "").strip()
+    if not _is_valid_trader_address(normalized_address):
+        metadata_dict = _merge_quarantine_metadata(
+            metadata_dict,
+            reason="malformed_eth_address",
+        )
+        if active_value:
+            logger.warning(
+                "upsert_trader: quarantining malformed active trader address %s",
+                normalized_address[:18] + "..." if len(normalized_address) > 18 else normalized_address,
+            )
+        active_value = False
+    meta_json = json.dumps(metadata_dict)
     with get_connection() as conn:
         conn.execute("""
             INSERT INTO traders (address, first_seen, last_updated, total_pnl,
@@ -258,7 +292,7 @@ def upsert_trader(address, total_pnl=0, roi_pct=0, account_value=0,
                 trade_count = ?,
                 metadata = ?,
                 active = ?
-        """, (address, now, now, total_pnl, roi_pct, account_value,
+        """, (normalized_address, now, now, total_pnl, roi_pct, account_value,
               win_rate, trade_count, meta_json, active_value,
               now, total_pnl, roi_pct, account_value, win_rate, trade_count, meta_json, active_value))
 
@@ -268,6 +302,63 @@ def mark_trader_inactive(address):
     with get_connection() as conn:
         conn.execute("UPDATE traders SET active = ?, last_updated = ? WHERE address = ?",
                      (False, datetime.now(timezone.utc).isoformat(), address))
+
+
+def quarantine_trader_address(address, reason="malformed_eth_address"):
+    """Deactivate a trader row and annotate metadata with the quarantine reason."""
+    normalized_address = str(address or "").strip()
+    if not normalized_address:
+        return False
+
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT metadata FROM traders WHERE address = ?",
+            (normalized_address,),
+        ).fetchone()
+        if not row:
+            return False
+        metadata = _merge_quarantine_metadata(row["metadata"], reason=reason)
+        conn.execute(
+            "UPDATE traders SET active = ?, last_updated = ?, metadata = ? WHERE address = ?",
+            (
+                False,
+                datetime.now(timezone.utc).isoformat(),
+                json.dumps(metadata),
+                normalized_address,
+            ),
+        )
+    return True
+
+
+def quarantine_invalid_traders() -> list[str]:
+    """Deactivate malformed trader addresses persisted in the runtime DB."""
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT address, metadata, active FROM traders WHERE active = ?",
+            (True,),
+        ).fetchall()
+        invalid = []
+        now = datetime.now(timezone.utc).isoformat()
+        for row in rows:
+            address = str(row["address"] or "").strip()
+            if _is_valid_trader_address(address):
+                continue
+            metadata = _merge_quarantine_metadata(
+                row["metadata"],
+                reason="malformed_eth_address",
+            )
+            conn.execute(
+                "UPDATE traders SET active = ?, last_updated = ?, metadata = ? WHERE address = ?",
+                (False, now, json.dumps(metadata), address),
+            )
+            invalid.append(address)
+
+    if invalid:
+        logger.warning(
+            "Quarantined %d malformed trader address(es) from live runtime state",
+            len(invalid),
+        )
+    return invalid
 
 
 def _get_sqlite_strategy_row(strategy_id):
@@ -386,13 +477,18 @@ def _ensure_postgres_strategy_parent(strategy_id) -> None:
         return_pg_connection(pg_conn)
 
 
-def get_active_traders():
+def get_active_traders(*, valid_only: bool = False, quarantine_invalid: bool = False):
+    if quarantine_invalid:
+        quarantine_invalid_traders()
     with get_connection() as conn:
         rows = conn.execute(
             "SELECT * FROM traders WHERE active = ? ORDER BY total_pnl DESC",
             (True,),
         ).fetchall()
-    return [dict(r) for r in rows]
+    traders = [dict(r) for r in rows]
+    if valid_only:
+        traders = [t for t in traders if _is_valid_trader_address(t.get("address"))]
+    return traders
 
 
 def get_trader(address):

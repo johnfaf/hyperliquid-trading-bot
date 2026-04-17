@@ -278,7 +278,7 @@ class CopyTrader:
         top-N are evicted after _POSITION_CACHE_TTL_SECONDS so memory doesn't
         grow unboundedly over long run times.
         """
-        traders = db.get_active_traders()[:top_n]
+        traders = db.get_active_traders(valid_only=True, quarantine_invalid=True)[:top_n]
         if not traders:
             return []
 
@@ -301,6 +301,9 @@ class CopyTrader:
         for trader in traders:
             try:
                 addr = trader["address"]
+                if not hl._is_valid_eth_address(addr):
+                    logger.debug("CopyTrader skipping invalid trader address %s", addr)
+                    continue
                 state = hl.get_user_state(addr)
                 if not state:
                     continue
