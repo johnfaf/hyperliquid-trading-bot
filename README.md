@@ -40,6 +40,8 @@ The signal pipeline is deliberately aggressive: of the ~900 strategies generated
 ├── requirements.txt                 # Production dependencies
 ├── Dockerfile                       # Container image (Railway/Docker)
 ├── Procfile                         # Process definition
+├── docs/
+│   └── SCALING_RUNBOOK.md           # Live capital ramp checklist and tier ladder
 ├── fixtures/
 │   └── sample_data.json             # Reproducible sample dataset
 ├── scripts/
@@ -54,6 +56,7 @@ The signal pipeline is deliberately aggressive: of the ~900 strategies generated
 │   │   ├── health_registry.py       # Per-subsystem health tracking
 │   │   ├── health_reporter.py       # Health endpoint
 │   │   ├── dependency_validator.py  # Boot-time package check
+│   │   ├── env_utils.py             # Safe env-var parsing helpers
 │   │   ├── task_runner.py           # Background thread manager
 │   │   └── cycles/
 │   │       ├── fast_cycle.py        # Tier 1: SL/TP, copy scanning
@@ -97,6 +100,7 @@ The signal pipeline is deliberately aggressive: of the ~900 strategies generated
 │   │   ├── paper_trader.py          # Paper trading (firewall + slippage)
 │   │   ├── copy_trader.py           # Copy trading engine
 │   │   ├── live_trader.py           # Live execution (agent-wallet signing)
+│   │   ├── scaling_tiers.py         # T0-T4 live scaling ladder
 │   │   ├── cross_venue_hedger.py    # Multi-exchange hedging
 │   │   └── trade_memory.py          # Trade outcome memory
 │   ├── exchanges/
@@ -159,16 +163,47 @@ python scripts/run_rotation_shadow_mode.py     # 7-day rotation shadow mode
 ```
 
 
-## Live Safety Hardening
+## Live Safety And Scaling
 
-Recent live-readiness hardening adds explicit guardrails and observability:
+The live path is intentionally conservative. Real order submission requires explicit operator controls, sticky emergency stops, exchange-state reconciliation, and a graduated capital ramp. The detailed operator checklist lives in [docs/SCALING_RUNBOOK.md](docs/SCALING_RUNBOOK.md).
 
-- **Canary controls:** optional caps on order size and daily signal count before full rollout.
-- **Per-source/day throttles:** firewall approvals and live entries can be capped by source.
-- **External kill switch:** live entries can be blocked instantly by env flag or a watched file.
-- **Runtime health snapshot:** dashboard/API exposes subsystem health, stale heartbeats, firewall rejection summary, and live kill-switch state.
-- **Rotation telemetry depth:** replacement decisions now capture candidate/incumbent scores, reasons, and post-close outcomes.
+### Critical Live Guardrails
+
+- **Dual-control live enablement:** live orders require both `LIVE_TRADING_ENABLED=true` and `LIVE_TRADING_DUAL_CONTROL_CONFIRM=true`. Setting only one keeps live execution in dry-run/degraded mode.
+- **Sticky kill switch:** kill-switch activation persists to `LIVE_KILL_SWITCH_STATE_FILE` (default `/data/live_kill_switch_state.json`) so a restart cannot silently clear it.
+- **Emergency file stop:** creating `/data/KILL_SWITCH`, or the path in `LIVE_EXTERNAL_KILL_SWITCH_FILE`, requests shutdown, activates the kill switch, and cancels live orders.
+- **Trading-cycle precheck:** the kill-switch file is checked before the trading cycle begins, not only in fast-cycle management.
+- **Bounded shutdown:** SIGINT/SIGTERM order cancellation and DB backup are time-bounded so shutdown cannot hang forever.
+- **Protected entries:** fill verification compares the post-order position delta against the pre-entry baseline; existing positions cannot falsely verify a rejected entry.
+- **Naked-position defense:** SL/TP placement retries are bounded; if protective orders still fail, the bot retries an emergency close.
+- **Daily-loss fail-closed:** if live fill/PnL refresh fails, the kill switch activates instead of leaving the loss brake frozen.
+- **Free-margin sizing:** live mirroring scales against available/free margin and uses `accountValue - totalMarginUsed` before falling back to `withdrawable`.
+- **Dashboard write auth:** sensitive POST endpoints such as order placement, paper reset, and close-all require `DASHBOARD_AUTH_TOKEN`.
+- **Dual-write atomicity:** Postgres mirror writes no longer commit per statement; they commit through the owning DB transaction.
+
+### Scaling Tiers
+
+Set `LIVE_TIER` to climb capital exposure one rung at a time. Tiers are downward-only: they can tighten env-var limits, but they never expand beyond what the operator configured.
+
+| Tier | Label | Max order | Max daily loss | Max position | Signals/day | Kelly dampen | Min days |
+|------|-------|-----------|----------------|--------------|-------------|--------------|----------|
+| `T0` | canary | `$25` | `$50` | `$50` | `25` | `0.50` | `2` |
+| `T1` | seed | `$50` | `$100` | `$150` | `40` | `0.65` | `3` |
+| `T2` | growth | `$100` | `$250` | `$500` | `60` | `0.80` | `5` |
+| `T3` | scale | `$250` | `$600` | `$1,500` | `100` | `0.90` | `7` |
+| `T4` | full | env | env | env | env | `1.00` | manual |
+
+Use `/healthz` to confirm the resolved `active_tier`, `kelly_dampen`, `max_order_usd`, `max_position_size`, `daily_pnl_limit`, `kill_switch_active`, and `entry_metrics` after every deploy.
+
+### Operational Hardening
+
+- **Safe env parsing:** shared `safe_env_float`, `safe_env_int`, and `safe_env_bool` helpers clamp malformed or unsafe runtime settings instead of crashing or silently accepting bad values.
+- **Atomic backups:** DB JSON backups and feature-store pickle writes use temp-file + fsync + replace semantics to avoid corrupt restart files.
+- **Thread-safe metrics:** entry metrics and daily live state are guarded so the trading thread and dashboard thread cannot race.
+- **Runtime health snapshot:** dashboard/API exposes subsystem health, stale heartbeats, firewall rejection summary, live kill-switch state, active tier, and free-margin state.
+- **Rotation telemetry depth:** replacement decisions capture candidate/incumbent scores, reasons, and post-close outcomes.
 - **Decision replay harness:** `scripts/replay_decision_cycle.py` summarizes approval/rejection reasons and execution attribution by source/regime.
+
 ## Signal Pipeline
 
 Signals flow through 6 layers before execution. Each layer can reject:
@@ -252,12 +287,20 @@ DISCOVERY_CYCLE_INTERVAL = 86400     # 24h  (env: DISCOVERY_CYCLE_INTERVAL)
 | `LIGHTER_ENABLED` | `true` | Enable Lighter exchange adapter |
 | `ENABLE_PREDICTIVE_FORECASTER` | `true` | Enable regime forecaster |
 | `ENABLE_XGBOOST_FORECASTER` | `true` | Enable ML regime model |
-| `LIVE_TRADING_ENABLED` | `false` | Explicitly enable real order submission; otherwise the live trader stays disabled/dry-run |
-| `LIVE_CANARY_MODE` | `false` | Enable live canary rollout guardrails |
-| `LIVE_CANARY_MAX_ORDER_USD` | `25` | Max order notional when canary mode is enabled |
-| `LIVE_CANARY_MAX_SIGNALS_PER_DAY` | `25` | Daily live entry cap when canary mode is enabled |
+| `LIVE_TRADING_ENABLED` | `false` | First live-control switch; must be paired with `LIVE_TRADING_DUAL_CONTROL_CONFIRM=true` before real orders are allowed |
+| `LIVE_TRADING_DUAL_CONTROL_CONFIRM` | `false` | Second live-control switch; prevents a single env var from enabling real-money trading |
+| `LIVE_TIER` | _(none)_ | Optional scaling rung: `T0`, `T1`, `T2`, `T3`, or `T4`; see [docs/SCALING_RUNBOOK.md](docs/SCALING_RUNBOOK.md) |
+| `LIVE_MAX_ORDER_USD` | `100` | Operator per-order notional ceiling; tiers can only tighten this downward |
+| `LIVE_MAX_POSITION_SIZE_USD` | `LIVE_MAX_ORDER_USD` | Operator per-coin notional ceiling; also accepts legacy `HL_MAX_POSITION_SIZE` |
+| `LIVE_MAX_DAILY_LOSS_USD` | `100` | Config default for live daily loss limit |
+| `HL_MAX_DAILY_LOSS` | `LIVE_MAX_DAILY_LOSS_USD` | LiveTrader override for the daily loss kill-switch threshold |
+| `LIVE_CANARY_MODE` | `false` | Legacy live canary guardrail; ignored when `LIVE_TIER` is set |
+| `LIVE_CANARY_MAX_ORDER_USD` | `25` | Max order notional when legacy canary mode is enabled |
+| `LIVE_CANARY_MAX_SIGNALS_PER_DAY` | `25` | Daily live entry cap when legacy canary mode or tier caps are active |
 | `LIVE_MAX_ORDERS_PER_SOURCE_PER_DAY` | `0` | Per-source daily live entry cap (`0` disables cap) |
-| `LIVE_EXTERNAL_KILL_SWITCH_FILE` | _(none)_ | Optional file path; truthy/non-empty file activates kill switch |
+| `LIVE_EXTERNAL_KILL_SWITCH_FILE` | _(none)_ | Optional file path for external kill switch; fast cycle also defaults to `/data/KILL_SWITCH` |
+| `LIVE_KILL_SWITCH_STATE_FILE` | `/data/live_kill_switch_state.json` | Sticky kill-switch state restored on restart |
+| `DASHBOARD_AUTH_TOKEN` | _(none)_ | Required for dashboard write actions (`/api/order`, close, close-all, paper reset) |
 | `HL_WALLET_MODE` | `agent_only` | Wallet mode; only agent-wallet signing is permitted |
 | `HL_PUBLIC_ADDRESS` | _(none)_ | Trading account address (master/vault) |
 | `HL_AGENT_PRIVATE_KEY` | _(none)_ | Agent wallet private key (only for `SECRET_MANAGER_PROVIDER=none`) |
@@ -280,7 +323,11 @@ DISCOVERY_CYCLE_INTERVAL = 86400     # 24h  (env: DISCOVERY_CYCLE_INTERVAL)
 
 ### Live Mode Notes
 
-- `LIVE_TRADING_ENABLED=true` is required before any live orders can be submitted.
+- Real orders require both `LIVE_TRADING_ENABLED=true` and `LIVE_TRADING_DUAL_CONTROL_CONFIRM=true`.
+- Start with `LIVE_TIER=T0` or legacy canary mode, then advance one rung at a time only after the checklist in [docs/SCALING_RUNBOOK.md](docs/SCALING_RUNBOOK.md) passes.
+- `LIVE_TIER` caps are downward-only: raising `LIVE_TIER` alone cannot increase exposure if the operator env caps are lower.
+- Creating `/data/KILL_SWITCH` is the quickest file-based emergency stop; remove it only after investigating and intentionally clearing the persisted kill-switch state.
+- Set `DASHBOARD_AUTH_TOKEN` before exposing the dashboard or using dashboard write actions.
 - When live trading is deployable, exchange positions become the source of truth for exposure, decisioning, and health reporting.
 - The paper ledger remains as a shadow book for reporting and is reconciled back to exchange truth instead of driving live risk.
 - Paper-only paths such as standalone options-flow, liquidation-reversal, and arena champion execution are skipped while live trading is active so capital does not drift from the tracked book.
