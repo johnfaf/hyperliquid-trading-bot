@@ -390,6 +390,23 @@ class HyperliquidWebSocket:
     def is_connected(self) -> bool:
         return self._connected
 
+    def mids_are_fresh(self, max_age_s: float = 2.0) -> bool:
+        """
+        Return True only when the WS feed is connected AND has received a
+        message within ``max_age_s`` seconds.
+
+        A silent TCP stall (no FIN, no failed pong) leaves ``_connected=True``
+        while ``last_update`` grows stale.  Callers that use WS mids for
+        order sizing/slippage MUST gate on this helper, not on
+        ``is_connected`` alone — otherwise they'll size trades off prices
+        that are minutes old during a silent disconnect.
+        """
+        if not self._connected:
+            return False
+        if self.last_update <= 0:
+            return False
+        return (time.time() - self.last_update) <= max_age_s
+
     def _run_forever(self):
         """Main loop: connect, subscribe, handle messages, reconnect."""
         while self._running:
@@ -666,6 +683,9 @@ class APIManager:
         self._CIRCUIT_THRESHOLD = 10    # failures in window to trip
         self._FAILURE_WINDOW_S = 60.0   # rolling window duration
         self._CIRCUIT_COOLDOWN = 30.0   # seconds to pause non-critical traffic after trip
+        # Max age of WS mids before we stop serving them and fall back to REST.
+        # A silent TCP stall can leave is_connected=True with minutes-old data.
+        self._WS_MIDS_MAX_AGE_S = float(os.environ.get("WS_MIDS_MAX_AGE_S", "2.0"))
         self._req_type_failures: Dict[str, int] = {}
         self._req_type_cooldown_until: Dict[str, float] = {}
         # Track when we last logged a SERVER_ERROR warning per req_type so we
@@ -793,12 +813,16 @@ class APIManager:
                     self._cache_served += 1
                 return cached
 
-        # For allMids, try WebSocket first
+        # For allMids, try WebSocket first — but only if the feed is FRESH.
+        # ``is_connected()`` alone returns True during silent TCP stalls, which
+        # would serve price data that's minutes old.  ``mids_are_fresh`` also
+        # confirms we received a WS message recently.  On stale feeds we fall
+        # through to the REST path instead.
         if (
             cache_response
             and endpoint_url == config.HYPERLIQUID_INFO_URL
             and req_type == "allMids"
-            and self.ws.is_connected()
+            and self.ws.mids_are_fresh(max_age_s=self._WS_MIDS_MAX_AGE_S)
             and self.ws.mids
         ):
             # Convert back to string format like the REST API returns

@@ -1,3 +1,4 @@
+import threading
 from types import SimpleNamespace
 
 import src.notifications.telegram_bot as telegram_bot
@@ -26,6 +27,7 @@ def test_snapshot_balance_alerts_when_free_margin_stays_zero(monkeypatch, caplog
     trader._last_free_margin_alert_ts = 0.0
     trader._free_margin_alert_cooldown_s = 300.0
     trader._recent_order_hashes = {}
+    trader._order_dedup_lock = threading.Lock()
     trader._last_hash_cleanup_ts = 0.0
     trader._HASH_CLEANUP_INTERVAL = 60.0
     trader._ORDER_DEDUP_WINDOW = 30.0
@@ -90,6 +92,7 @@ def test_snapshot_balance_alerts_when_free_margin_recovers(monkeypatch):
     trader._last_free_margin_alert_ts = 0.0
     trader._free_margin_alert_cooldown_s = 0.0
     trader._recent_order_hashes = {}
+    trader._order_dedup_lock = threading.Lock()
     trader._last_hash_cleanup_ts = 0.0
     trader._HASH_CLEANUP_INTERVAL = 60.0
     trader._ORDER_DEDUP_WINDOW = 30.0

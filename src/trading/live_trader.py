@@ -520,6 +520,11 @@ class LiveTrader:
         # Order idempotency: prevent duplicate orders from timeout/retry
         # Maps action_hash -> (timestamp, result) for recent orders
         self._recent_order_hashes: Dict[str, Tuple[float, Dict]] = {}
+        # Dedicated lock — this dict is mutated from at least three paths
+        # (_post_order, the cleanup sweep, and retry handlers).  Mutating a
+        # plain dict concurrently can raise RuntimeError during iteration or
+        # silently lose keys, either of which can let a duplicate order ship.
+        self._order_dedup_lock = threading.Lock()
         self._ORDER_DEDUP_WINDOW = max(
             1.0,
             float(os.environ.get("LIVE_ORDER_DEDUP_WINDOW_S", "30")),
@@ -1168,10 +1173,11 @@ class LiveTrader:
         # when no orders trigger the at-order-time cleanup).
         if now - self._last_hash_cleanup_ts > self._HASH_CLEANUP_INTERVAL:
             self._last_hash_cleanup_ts = now
-            stale = [h for h, (ts, _) in self._recent_order_hashes.items()
-                     if now - ts > self._ORDER_DEDUP_WINDOW]
-            for h in stale:
-                del self._recent_order_hashes[h]
+            with self._order_dedup_lock:
+                stale = [h for h, (ts, _) in self._recent_order_hashes.items()
+                         if now - ts > self._ORDER_DEDUP_WINDOW]
+                for h in stale:
+                    self._recent_order_hashes.pop(h, None)
 
         return self._last_balance_snapshot
 
@@ -2674,30 +2680,46 @@ class LiveTrader:
             }
 
         # ── Idempotency check: reject duplicate orders within dedup window ──
+        # All read/mutate on _recent_order_hashes happens under _order_dedup_lock
+        # so concurrent posters can't both observe "no prior hash" and both ship
+        # the same order.
         now = time.time()
-        # Evict expired entries
-        expired = [h for h, (ts, _) in self._recent_order_hashes.items()
-                   if now - ts > self._ORDER_DEDUP_WINDOW]
-        for h in expired:
-            del self._recent_order_hashes[h]
+        with self._order_dedup_lock:
+            # Evict expired entries
+            expired = [h for h, (ts, _) in self._recent_order_hashes.items()
+                       if now - ts > self._ORDER_DEDUP_WINDOW]
+            for h in expired:
+                self._recent_order_hashes.pop(h, None)
 
-        if action_hash in self._recent_order_hashes:
-            prev_ts, prev_result = self._recent_order_hashes[action_hash]
-            age = now - prev_ts
-            logger.warning(
-                f"DUPLICATE ORDER blocked: action_hash={action_hash[:16]}... "
-                f"(identical order placed {age:.1f}s ago)"
-            )
-            return {
-                "status": "rejected",
-                "reason": "duplicate_order",
-                "original_result": prev_result,
-                "age_seconds": round(age, 1),
-            }
+            if action_hash in self._recent_order_hashes:
+                prev_ts, prev_result = self._recent_order_hashes[action_hash]
+                age = now - prev_ts
+                logger.warning(
+                    f"DUPLICATE ORDER blocked: action_hash={action_hash[:16]}... "
+                    f"(identical order placed {age:.1f}s ago)"
+                )
+                return {
+                    "status": "rejected",
+                    "reason": "duplicate_order",
+                    "original_result": prev_result,
+                    "age_seconds": round(age, 1),
+                }
+            # Claim the slot pre-emptively so a concurrent poster with the same
+            # action_hash sees "duplicate" and backs off.  We overwrite on
+            # success below with the real result.
+            self._recent_order_hashes[action_hash] = (now, {"status": "in_flight"})
 
+        # ``request_dispatched`` starts False and flips True just before we
+        # hand the payload off to api_manager.post().  If a generic exception
+        # fires after dispatch we MUST keep the dedup slot to block retries
+        # because the exchange may have already accepted the order.
+        request_dispatched = False
         try:
             if not self.signer:
                 logger.error("No signer available - cannot post order")
+                # Release the in-flight slot so future retries aren't blocked
+                with self._order_dedup_lock:
+                    self._recent_order_hashes.pop(action_hash, None)
                 return {"status": "error", "message": "No signer available"}
 
             # Vault vs agent-wallet master-account semantics:
@@ -2745,6 +2767,9 @@ class LiveTrader:
 
             logger.debug(f"Posting order to {self.exchange_url}: action_hash={action_hash}")
 
+            # Flag that the HTTP request is being dispatched — from this
+            # point on, a generic exception must keep the dedup slot.
+            request_dispatched = True
             result = self.api_manager.post(
                 payload,
                 priority=Priority.CRITICAL,
@@ -2757,6 +2782,10 @@ class LiveTrader:
             )
             if result is None:
                 logger.error("Exchange request failed for action_hash=%s", action_hash[:16])
+                # Release the in-flight slot — the request never reached the exchange,
+                # so future retries with the same hash must be allowed.
+                with self._order_dedup_lock:
+                    self._recent_order_hashes.pop(action_hash, None)
                 return {"status": "error", "message": "exchange request failed"}
 
             logger.info(f"Order posted: {json.dumps(result)}")
@@ -2789,18 +2818,23 @@ class LiveTrader:
                 # execute, so retries (e.g. from the next orphan-protection
                 # sweep after the caller has fixed the price) must be
                 # allowed to reach the exchange instead of being silently
-                # swallowed by the dedup cache.
+                # swallowed by the dedup cache.  Release the in-flight slot.
+                with self._order_dedup_lock:
+                    self._recent_order_hashes.pop(action_hash, None)
                 return rejection_payload
 
             # Only cache successfully accepted orders.  Rejected orders
             # are not "placed" and must remain retryable.
-            self._recent_order_hashes[action_hash] = (now, result)
+            with self._order_dedup_lock:
+                self._recent_order_hashes[action_hash] = (now, result)
             return result
 
         except requests.exceptions.Timeout:
             # CRITICAL: On timeout, the order may have been accepted on-chain.
-            # Record the hash to BLOCK retries — caller must verify via fills.
-            self._recent_order_hashes[action_hash] = (now, {"status": "timeout"})
+            # Overwrite the in-flight slot with a timeout marker to BLOCK
+            # retries — caller must verify via fills.
+            with self._order_dedup_lock:
+                self._recent_order_hashes[action_hash] = (now, {"status": "timeout"})
             logger.error(
                 f"Order TIMEOUT: action_hash={action_hash[:16]}... "
                 f"Order may have executed on-chain. Blocking retries. "
@@ -2810,6 +2844,24 @@ class LiveTrader:
 
         except Exception as e:
             logger.error(f"Error posting order: {e}")
+            now_err = time.time()
+            with self._order_dedup_lock:
+                if request_dispatched:
+                    # We handed the payload off to api_manager.post() before
+                    # the exception fired.  The exchange may have accepted it
+                    # even though our client-side processing blew up.  Keep
+                    # the dedup slot (convert to a failure marker) so a naïve
+                    # retry with the same action_hash is blocked and the
+                    # caller is forced to verify fills before resubmitting.
+                    self._recent_order_hashes[action_hash] = (
+                        now_err,
+                        {"status": "post_exception", "error": str(e)},
+                    )
+                else:
+                    # Pre-dispatch failure (signing / payload build) — the
+                    # exchange never saw anything, so release the slot so a
+                    # retry after fixing the underlying problem can proceed.
+                    self._recent_order_hashes.pop(action_hash, None)
             return {"status": "error", "message": str(e)}
 
     @staticmethod
