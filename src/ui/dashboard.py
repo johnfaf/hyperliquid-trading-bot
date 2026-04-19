@@ -39,6 +39,12 @@ _options_scanner = None
 # Paths that are always open (health probes, Railway readiness checks, login)
 _AUTH_EXEMPT_PATHS = {"/api/health", "/api/ready", "/api/live_ready", "/login", "/api/auth/login"}
 _AUTH_COOKIE_NAME = "dashboard_auth"
+_AUTH_REQUIRED_POST_PATHS = {
+    "/api/order",
+    "/api/paper/reset",
+    "/api/trade/close",
+    "/api/trade/close-all",
+}
 
 
 def _dashboard_auth_token() -> str:
@@ -1930,11 +1936,21 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def _check_auth(self) -> bool:
         """Return True if request is authenticated or auth is not required."""
         auth_token = _dashboard_auth_token()
-        if not auth_token:
-            return True  # Auth not configured - allow all
         parsed = urlparse(self.path)
         if parsed.path in _AUTH_EXEMPT_PATHS:
             return True  # Health probe - always open
+        if not auth_token:
+            if self.command == "POST" and parsed.path in _AUTH_REQUIRED_POST_PATHS:
+                self.send_response(403)
+                self.send_header("Content-Type", "application/json")
+                self._send_no_cache_headers()
+                self.end_headers()
+                self.wfile.write(
+                    b'{"error": "dashboard_write_auth_not_configured", '
+                    b'"hint": "Set DASHBOARD_AUTH_TOKEN before enabling dashboard write actions"}'
+                )
+                return False
+            return True  # Read-only dashboard remains open when auth is not configured.
         # Check Authorization header: "Bearer <token>"
         auth_header = self.headers.get("Authorization", "")
         if auth_header.startswith("Bearer ") and auth_header[7:].strip() == auth_token:

@@ -78,6 +78,40 @@ def test_sleep_with_kill_switch_checks_survives_poll_and_check_errors(monkeypatc
     assert any("Kill-switch check failed during sleep window" in msg for msg in bot.logger.warnings)
 
 
+def test_trading_cycle_checks_kill_switch_before_work(monkeypatch):
+    bot = main.HyperliquidResearchBot.__new__(main.HyperliquidResearchBot)
+    bot.logger = _FakeLogger()
+    bot.container = object()
+    bot.runtime_config = SimpleNamespace(poll=lambda _container: None)
+    bot.running = True
+    bot._cycle_count = 0
+
+    monkeypatch.setattr(main, "check_file_kill_switch", lambda _container: True)
+    monkeypatch.setattr(
+        main,
+        "run_feature_cycle",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("should not run")),
+    )
+
+    bot._run_trading_cycle()
+
+    assert bot.running is False
+    assert bot._cycle_count == 0
+    assert any("KILL_SWITCH triggered before trading cycle" in msg for msg in bot.logger.criticals)
+
+
+def test_run_with_timeout_continues_after_hung_shutdown_work():
+    bot = main.HyperliquidResearchBot.__new__(main.HyperliquidResearchBot)
+    bot.logger = _FakeLogger()
+    release = threading.Event()
+
+    ok = bot._run_with_timeout("hung_step", lambda: release.wait(1.0), timeout_s=0.01)
+
+    release.set()
+    assert ok is False
+    assert any("hung_step timed out" in msg for msg in bot.logger.errors)
+
+
 def test_start_discovery_async_runs_in_background(monkeypatch):
     bot = main.HyperliquidResearchBot.__new__(main.HyperliquidResearchBot)
     bot.logger = _FakeLogger()

@@ -213,6 +213,9 @@ PAPER_TRADING_FUNDING_ENABLED = os.environ.get(
 LIVE_TRADING_ENABLED = os.environ.get(
     "LIVE_TRADING_ENABLED", "false"
 ).lower() in ("true", "1", "yes")
+LIVE_TRADING_DUAL_CONTROL_CONFIRM = os.environ.get(
+    "LIVE_TRADING_DUAL_CONTROL_CONFIRM", "false"
+).lower() in ("true", "1", "yes")
 
 # ─── Live Order Caps (cautious bootstrap) ─────────────────────
 # Hyperliquid enforces a $10 minimum notional per order on both perps and
@@ -232,6 +235,12 @@ LIVE_MIN_ORDER_USD = float(os.environ.get("LIVE_MIN_ORDER_USD", 11.0))
 # NOTE: a value below LIVE_MIN_ORDER_USD is impossible to honor — the
 # LiveTrader will raise it to LIVE_MIN_ORDER_USD at startup with a warning.
 LIVE_MAX_ORDER_USD = float(os.environ.get("LIVE_MAX_ORDER_USD", 100.0))
+LIVE_MAX_POSITION_SIZE_USD = float(
+    os.environ.get(
+        "LIVE_MAX_POSITION_SIZE_USD",
+        os.environ.get("HL_MAX_POSITION_SIZE", str(LIVE_MAX_ORDER_USD)),
+    )
+)
 # Daily loss limit for the live account in USD (forwarded to LiveTrader).
 LIVE_MAX_DAILY_LOSS_USD = float(os.environ.get("LIVE_MAX_DAILY_LOSS_USD", 100.0))
 LIVE_CANARY_MODE = os.environ.get(
@@ -283,6 +292,7 @@ COPY_TRADER_AUTO_PAUSE_BLOCK_NET_PNL = float(
     os.environ.get("COPY_TRADER_AUTO_PAUSE_BLOCK_NET_PNL", -25.0)
 )
 LIVE_EXTERNAL_KILL_SWITCH_FILE = os.environ.get("LIVE_EXTERNAL_KILL_SWITCH_FILE", "").strip()
+LIVE_KILL_SWITCH_STATE_FILE = os.environ.get("LIVE_KILL_SWITCH_STATE_FILE", "/data/live_kill_switch_state.json").strip()
 RUNTIME_CONFIG_OVERRIDE_FILE = os.environ.get("RUNTIME_CONFIG_OVERRIDE_FILE", "/data/config.json").strip()
 RUNTIME_CONFIG_POLL_SECONDS = int(os.environ.get("RUNTIME_CONFIG_POLL_SECONDS", 10))
 HL_WALLET_MODE = os.environ.get("HL_WALLET_MODE", "agent_only").strip().lower()
@@ -619,6 +629,7 @@ def _validate_config_bounds() -> None:
         ("PAPER_TRADING_TAKE_PROFIT_PCT", 0.001, 5.0, 0.75),
         ("LIVE_MIN_ORDER_USD", 10.0, 1_000_000.0, 11.0),
         ("LIVE_MAX_ORDER_USD", 10.0, 1_000_000.0, 100.0),
+        ("LIVE_MAX_POSITION_SIZE_USD", 10.0, 10_000_000.0, 100.0),
         ("LIVE_MAX_DAILY_LOSS_USD", 1.0, 10_000_000.0, 100.0),
         ("PORTFOLIO_TARGET_POSITIONS", 1, 100, 8),
         ("PORTFOLIO_HARD_MAX_POSITIONS", 1, 200, 10),
@@ -755,6 +766,13 @@ def _validate_config_bounds() -> None:
             f"({LIVE_MIN_ORDER_USD}); raising max to min."
         )
         globals()["LIVE_MAX_ORDER_USD"] = float(LIVE_MIN_ORDER_USD)
+
+    if LIVE_MAX_POSITION_SIZE_USD < LIVE_MAX_ORDER_USD:
+        _warn_config(
+            "LIVE_MAX_POSITION_SIZE_USD is below LIVE_MAX_ORDER_USD; "
+            "raising position cap to order cap."
+        )
+        globals()["LIVE_MAX_POSITION_SIZE_USD"] = float(LIVE_MAX_ORDER_USD)
 
     if PORTFOLIO_HARD_MAX_POSITIONS < PORTFOLIO_TARGET_POSITIONS:
         _warn_config(

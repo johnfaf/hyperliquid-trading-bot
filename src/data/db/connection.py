@@ -378,7 +378,6 @@ class DualWriteAdapter:
             # Don't add RETURNING for mirror writes — we don't need lastrowid
             cur = self._pg.cursor()
             cur.execute(pg_sql, pg_params or ())
-            self._pg.commit()
             dualwrite_stats.record_ok()
         except Exception as exc:
             err_str = f"{type(exc).__name__}: {exc}"

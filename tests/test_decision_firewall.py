@@ -93,6 +93,36 @@ def test_firewall_rejects_low_confidence(mock_db):
 
 
 @patch("src.signals.decision_firewall.db")
+def test_regime_size_modifier_scales_size_and_position_pct(mock_db):
+    mock_db.get_open_paper_trades.return_value = []
+    mock_db.get_paper_account.return_value = {"balance": 1000000}
+    mock_db.audit_log = MagicMock()
+
+    from src.signals.decision_firewall import DecisionFirewall
+
+    fw = DecisionFirewall({
+        "enable_predictive_derisk": False,
+        "funding_risk_enabled": False,
+        "cooldown_seconds": 0,
+        "same_side_cooldown_seconds": 0,
+    })
+    signal = MockSignal(confidence=0.8, size=2.0, position_pct=0.10)
+
+    passed, reason = fw.validate(
+        signal,
+        regime_data={"strategy_guidance": {"size_modifier": 0.4}},
+        open_positions=[],
+        account_balance=1000000,
+    )
+
+    assert passed is True
+    assert reason == "approved"
+    assert signal.regime_size_modifier == 0.4
+    assert signal.size == 0.8
+    assert signal.position_pct == pytest.approx(0.04)
+
+
+@patch("src.signals.decision_firewall.db")
 def test_firewall_rejects_max_positions(mock_db):
     """Should reject when max positions reached."""
     mock_db.get_open_paper_trades.return_value = [

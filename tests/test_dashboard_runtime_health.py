@@ -152,6 +152,17 @@ def test_local_public_dashboard_can_warn_without_auth_token(monkeypatch):
     dashboard._validate_dashboard_auth_configuration("0.0.0.0")
 
 
+def test_dashboard_write_endpoints_require_configured_auth_token(monkeypatch):
+    monkeypatch.delenv("DASHBOARD_AUTH_TOKEN", raising=False)
+    handler = _make_dashboard_handler(path="/api/trade/close-all", command="POST")
+
+    allowed = handler._check_auth()
+
+    assert allowed is False
+    assert ("status", 403) in handler._responses
+    assert b"dashboard_write_auth_not_configured" in handler.wfile.getvalue()
+
+
 def _make_dashboard_handler(path="/", headers=None, command="GET"):
     handler = dashboard.DashboardHandler.__new__(dashboard.DashboardHandler)
     handler.path = path

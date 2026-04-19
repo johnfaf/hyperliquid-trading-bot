@@ -7,6 +7,8 @@ import types
 from contextlib import contextmanager
 from datetime import datetime, timezone
 
+import pytest
+
 import config
 import main
 from src.core import boot
@@ -41,6 +43,13 @@ from src.trading.live_trader import (
     _hl_format_size,
 )
 from src.trading.portfolio_rotation import PortfolioRotationManager, RotationDecision
+
+
+@pytest.fixture(autouse=True)
+def _isolate_live_kill_switch_state(tmp_path, monkeypatch):
+    state_file = tmp_path / "live_kill_switch_state.json"
+    monkeypatch.setenv("LIVE_KILL_SWITCH_STATE_FILE", str(state_file))
+    monkeypatch.setattr(config, "LIVE_KILL_SWITCH_STATE_FILE", str(state_file), raising=False)
 
 
 def _fake_live_credentials(self):
@@ -635,6 +644,60 @@ def test_verify_fill_waits_for_minimum_meaningful_fill(monkeypatch):
     assert result["partial_fill"] is True
     assert abs(result["size"] - 0.06) < 1e-12
     assert abs(result["position_size"] - 0.06) < 1e-12
+
+
+def test_verify_fill_uses_position_delta_not_total_position(monkeypatch):
+    class FakeFirewall:
+        def validate(self, signal, **kwargs):
+            return True, "ok"
+
+    monkeypatch.setattr(LiveTrader, "_load_credentials", _fake_live_credentials)
+    monkeypatch.setattr(LiveTrader, "_load_asset_index_map", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "reconcile_positions", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "get_positions", lambda self: [{"coin": "ETH", "szi": 0.5}])
+
+    trader = LiveTrader(firewall=FakeFirewall(), dry_run=False)
+
+    assert trader.verify_fill("ETH", "buy", 0.1, blocking=False, baseline_position_size=0.5) is None
+
+
+def test_cancel_all_orders_uses_hyperliquid_oid_fallback(monkeypatch):
+    class FakeFirewall:
+        def validate(self, signal, **kwargs):
+            return True, "ok"
+
+    cancelled = []
+    monkeypatch.setattr(LiveTrader, "_load_credentials", _fake_live_credentials)
+    monkeypatch.setattr(LiveTrader, "_load_asset_index_map", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "reconcile_positions", lambda self: None)
+    monkeypatch.setattr(
+        LiveTrader,
+        "get_open_orders",
+        lambda self: [
+            {"coin": "ETH", "oid": 111},
+            {"coin": "BTC", "order_id": 222},
+            {"coin": "SOL", "id": 333},
+        ],
+    )
+    monkeypatch.setattr(
+        LiveTrader,
+        "cancel_order",
+        lambda self, coin, order_id: cancelled.append((coin, order_id)) or True,
+    )
+
+    trader = LiveTrader(firewall=FakeFirewall(), dry_run=False)
+
+    assert trader.cancel_all_orders() == 3
+    assert cancelled == [("ETH", 111), ("BTC", 222), ("SOL", 333)]
+
+
+def test_free_margin_prefers_account_value_minus_used_margin_over_withdrawable():
+    state = {
+        "withdrawable": "25",
+        "marginSummary": {"accountValue": "1000", "totalMarginUsed": "150"},
+    }
+
+    assert LiveTrader._extract_free_margin_from_state(state) == 850.0
 
 
 def test_execute_lcrs_signals_live_path_executes_signal(monkeypatch):
@@ -1731,6 +1794,29 @@ def test_rescale_size_for_live_enforces_max_order_usd_cap(monkeypatch):
     )
     assert scaled is not None
     assert abs(scaled["size"] * 2000.0 - 3.0) < 1e-9
+
+
+def test_rescale_size_for_live_uses_free_margin_for_scale(monkeypatch):
+    class FakeTrader:
+        max_order_usd = 1_000.0
+        min_order_usd = 11.0
+
+        def get_account_value(self):
+            return 1_000.0
+
+        def get_free_margin(self):
+            return 50.0
+
+    monkeypatch.setattr("src.core.live_execution.db.get_paper_account", lambda: {"balance": 1_000.0})
+    monkeypatch.setattr("src.core.live_execution.get_all_mids", lambda: {"ETH": 100.0})
+
+    scaled = _rescale_size_for_live(
+        {"coin": "ETH", "size": 10.0, "entry_price": 100.0, "leverage": 5},
+        FakeTrader(),
+    )
+
+    assert scaled is not None
+    assert abs(scaled["size"] - 0.5) < 1e-12
 
 
 def test_rescale_size_for_live_floors_up_to_exchange_minimum(monkeypatch):
@@ -3089,6 +3175,53 @@ def test_live_trader_external_kill_switch_env_blocks_entries(monkeypatch):
     stats = trader.get_stats()
     assert stats["kill_switch_active"] is True
     assert stats["kill_switch_reason"] == "env:LIVE_EXTERNAL_KILL_SWITCH"
+
+
+def test_live_trader_persists_kill_switch_across_restart_and_daily_reset(tmp_path, monkeypatch):
+    class FakeFirewall:
+        def validate(self, signal, **kwargs):
+            return True, "ok"
+
+    state_file = tmp_path / "sticky_kill.json"
+    monkeypatch.setenv("LIVE_KILL_SWITCH_STATE_FILE", str(state_file))
+    monkeypatch.setattr(config, "LIVE_KILL_SWITCH_STATE_FILE", str(state_file), raising=False)
+    monkeypatch.setattr(LiveTrader, "_load_credentials", _fake_live_credentials)
+    monkeypatch.setattr(LiveTrader, "_load_asset_index_map", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "reconcile_positions", lambda self: None)
+
+    first = LiveTrader(firewall=FakeFirewall(), dry_run=False, max_order_usd=1_000_000)
+    first.activate_kill_switch("operator_test", status_reason="manual_kill_switch")
+    first.daily_reset_date = "2000-01-01"
+    first._check_daily_reset()
+
+    assert first.kill_switch_active is True
+    assert first._kill_switch_reason == "operator_test"
+
+    second = LiveTrader(firewall=FakeFirewall(), dry_run=False, max_order_usd=1_000_000)
+    stats = second.get_stats()
+    assert stats["kill_switch_active"] is True
+    assert stats["kill_switch_reason"] == "operator_test"
+
+
+def test_daily_pnl_refresh_failure_fails_closed(monkeypatch):
+    class FakeFirewall:
+        def validate(self, signal, **kwargs):
+            return True, "ok"
+
+    class BadApiManager:
+        def post(self, *args, **kwargs):
+            raise RuntimeError("api down")
+
+    monkeypatch.setattr(LiveTrader, "_load_credentials", _fake_live_credentials)
+    monkeypatch.setattr(LiveTrader, "_load_asset_index_map", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "reconcile_positions", lambda self: None)
+
+    trader = LiveTrader(firewall=FakeFirewall(), dry_run=False, max_order_usd=1_000_000)
+    trader.api_manager = BadApiManager()
+
+    assert trader.update_daily_pnl_from_fills() is False
+    assert trader.kill_switch_active is True
+    assert trader._kill_switch_reason == "daily_pnl_refresh_failed"
 
 
 def test_live_trader_source_day_cap_blocks_second_entry(monkeypatch):

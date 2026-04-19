@@ -297,7 +297,19 @@ def _rescale_size_for_live(trade: Dict, trader) -> Optional[Dict]:
     """
     paper_account = db.get_paper_account()
     paper_balance = float((paper_account or {}).get("balance", 0) or 0)
-    live_balance = trader.get_account_value()
+    live_equity = trader.get_account_value()
+    live_free_margin = None
+    if hasattr(trader, "get_free_margin"):
+        try:
+            live_free_margin = trader.get_free_margin()
+        except Exception as exc:
+            logger.warning(
+                "Cannot rescale %s: live free margin API call failed (%s). "
+                "Blocking trade to prevent oversizing.",
+                trade.get("coin", "?"),
+                exc,
+            )
+            return None
     if not paper_balance or paper_balance <= 0:
         logger.error(
             "Cannot rescale %s: paper account balance unavailable (%s). "
@@ -306,23 +318,26 @@ def _rescale_size_for_live(trade: Dict, trader) -> Optional[Dict]:
             paper_balance,
         )
         return None
-    if live_balance is None:
+    if live_equity is None:
         logger.error(
             "Cannot rescale %s: live account balance API call failed. "
             "Blocking trade to prevent wrong sizing.",
             trade.get("coin", "?"),
         )
         return None
-    if live_balance <= 0:
+    if live_free_margin is None:
+        live_free_margin = live_equity
+    live_free_margin = float(live_free_margin or 0.0)
+    if live_free_margin <= 0:
         logger.warning(
-            "Skipping live mirror for %s: perps margin is $%.2f. "
-            "Transfer USDC from Spot to Perps in the Hyperliquid UI "
-            "(Portfolio → Transfer → Spot to Perps).",
-            trade.get("coin", "?"), live_balance,
+            "Skipping live mirror for %s: free perps margin is $%.2f "
+            "(equity=$%.2f). Transfer USDC from Spot to Perps or free margin "
+            "before opening new positions.",
+            trade.get("coin", "?"), live_free_margin, float(live_equity or 0.0),
         )
         return None
 
-    scale = live_balance / paper_balance
+    scale = live_free_margin / paper_balance
     original_size = float(trade.get("size", 0) or 0)
     if original_size <= 0:
         return trade
@@ -331,12 +346,14 @@ def _rescale_size_for_live(trade: Dict, trader) -> Optional[Dict]:
     if abs(scale - 1.0) >= 0.01:
         scaled_trade["size"] = original_size * scale
         logger.info(
-            "Rescaled %s size for live: %.6f → %.6f (paper=$%.0f, live=$%.2f, scale=%.4f)",
+            "Rescaled %s size for live: %.6f → %.6f "
+            "(paper=$%.0f, free_margin=$%.2f, equity=$%.2f, scale=%.4f)",
             trade.get("coin", "?"),
             original_size,
             scaled_trade["size"],
             paper_balance,
-            live_balance,
+            live_free_margin,
+            float(live_equity or 0.0),
             scale,
         )
 
@@ -416,7 +433,7 @@ def _rescale_size_for_live(trade: Dict, trader) -> Optional[Dict]:
             # $11.40 notional (barely clearing the $11 minimum).  This
             # is the cap the check uses — NOT 80% of wallet, which
             # incorrectly blocked 1x trades on small wallets.
-            wallet_notional_budget = max(0.0, live_balance) * 0.95 * leverage
+            wallet_notional_budget = max(0.0, live_free_margin) * 0.95 * leverage
 
             # Target 1.10x the minimum so normal price drift, slippage,
             # and size rounding (szDecimals) don't slip us back under
@@ -438,7 +455,7 @@ def _rescale_size_for_live(trade: Dict, trader) -> Optional[Dict]:
                     "which is below the $%.2f exchange minimum.  Fund "
                     "the wallet or raise leverage for this asset.",
                     coin or "?",
-                    live_balance,
+                    live_free_margin,
                     leverage,
                     wallet_notional_budget,
                     min_order_usd,
@@ -464,7 +481,7 @@ def _rescale_size_for_live(trade: Dict, trader) -> Optional[Dict]:
                 entry_price,
                 "mid" if mid_price > 0 else "signal",
                 min_order_usd,
-                live_balance,
+                live_free_margin,
                 paper_balance,
             )
             scaled_trade["size"] = floored_size

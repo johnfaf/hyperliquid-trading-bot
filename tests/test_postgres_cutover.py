@@ -140,6 +140,8 @@ def test_dualwrite_insert_preserves_sqlite_generated_ids_in_postgres():
     assert cursor.lastrowid == 1
     assert pg_conn.executed[-1][0].startswith("INSERT INTO strategies (id, name) VALUES (%s, %s)")
     assert pg_conn.executed[-1][1] == (1, "momentum")
+    assert pg_conn.commit_calls == 0
+    adapter.commit()
     assert pg_conn.commit_calls == 1
 
 

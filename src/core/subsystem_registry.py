@@ -585,27 +585,40 @@ def build_subsystems(
     # ─── Live trader ──────────────────────────────────────────
     if "live_trader" in profile:
         from src.trading.live_trader import LiveTrader
+        live_requested = bool(getattr(config, "LIVE_TRADING_ENABLED", False))
+        live_confirmed = bool(getattr(config, "LIVE_TRADING_DUAL_CONTROL_CONFIRM", False))
+        live_effective = live_requested and live_confirmed
         c.live_trader = _safe_init(
             "live_trader",
             lambda: LiveTrader(
                 firewall=c.firewall,
-                dry_run=not getattr(config, "LIVE_TRADING_ENABLED", False),
+                dry_run=not live_effective,
                 max_daily_loss=float(getattr(config, "LIVE_MAX_DAILY_LOSS_USD", 100.0)),
+                max_position_size=float(getattr(config, "LIVE_MAX_POSITION_SIZE_USD", 100.0)),
                 max_order_usd=float(getattr(config, "LIVE_MAX_ORDER_USD", 100.0)),
                 regime_forecaster=c.predictive_forecaster,
                 risk_policy_engine=c.risk_policy_engine,
             ),
             health,
-            affects_trading=bool(getattr(config, "LIVE_TRADING_ENABLED", False)),
+            affects_trading=live_effective,
         )
         if c.live_trader:
-            if not getattr(config, "LIVE_TRADING_ENABLED", False):
+            if not live_requested:
                 health.set_status(
                     "live_trader",
                     SubsystemState.DISABLED,
                     reason="LIVE_TRADING_ENABLED=false",
                     dependency_ready=False,
                     startup_status="DISABLED",
+                )
+            elif not live_confirmed:
+                c.live_trader.status_reason = "dual_control_confirmation_missing"
+                health.set_status(
+                    "live_trader",
+                    SubsystemState.DEGRADED,
+                    reason="LIVE_TRADING_DUAL_CONTROL_CONFIRM=false",
+                    dependency_ready=False,
+                    startup_status="WAITING_FOR_OPERATOR_CONFIRMATION",
                 )
             elif not c.live_trader.is_deployable():
                 health.set_status(

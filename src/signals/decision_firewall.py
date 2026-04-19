@@ -691,8 +691,13 @@ class DecisionFirewall:
                               f"(regime={regime_data.get('overall_regime', '?')})")
 
             # Apply size modifier from regime
-            size_mod = guidance.get("size_modifier", 1.0)
+            size_mod = float(guidance.get("size_modifier", 1.0) or 1.0)
             signal.regime_size_modifier = size_mod
+            if size_mod != 1.0:
+                if getattr(signal, "size", None):
+                    signal.size *= size_mod
+                if getattr(signal, "position_pct", None):
+                    signal.position_pct *= size_mod
 
             # Apply macro regime confidence drag (protective overlay)
             macro_conf_drag = float(regime_data.get("macro_confidence_drag", 0.0) or 0.0)
@@ -754,7 +759,10 @@ class DecisionFirewall:
                 if (predictive_regime["regime"] == "crash" and
                         predictive_regime["confidence"] > self.crash_confidence_threshold):
                     # De-risk: cut position size dramatically
-                    signal.size *= self.crash_size_multiplier  # 80% reduction
+                    if getattr(signal, "size", None):
+                        signal.size *= self.crash_size_multiplier  # 80% reduction
+                    if getattr(signal, "position_pct", None):
+                        signal.position_pct *= self.crash_size_multiplier
                     logger.warning(
                         f"CRASH REGIME detected for {signal.coin} "
                         f"(conf={predictive_regime['confidence']:.2f}) — "

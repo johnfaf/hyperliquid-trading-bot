@@ -306,6 +306,13 @@ class HyperliquidResearchBot:
 
     def _run_trading_cycle(self):
         self.runtime_config.poll(self.container)
+        try:
+            if check_file_kill_switch(self.container):
+                self.logger.critical("KILL_SWITCH triggered before trading cycle execution")
+                self.running = False
+                return
+        except Exception as exc:
+            self.logger.warning("Kill-switch check failed before trading cycle: %s", exc)
         self._cycle_count += 1
         run_feature_cycle(self.container, tier="trading")
         run_trading_cycle(self.container, self._cycle_count)
@@ -341,6 +348,30 @@ class HyperliquidResearchBot:
         # is idempotent — subsequent calls are no-ops.
         cancel_live_orders_once(self.container, reason=reason)
         self._shutdown_orders_cancelled = True
+
+    def _run_with_timeout(self, name: str, func, timeout_s: float) -> bool:
+        """Run shutdown work with a hard wait bound so SIGTERM cannot hang forever."""
+        done = threading.Event()
+        errors = []
+
+        def _target():
+            try:
+                func()
+            except Exception as exc:  # pragma: no cover - defensive shutdown path
+                errors.append(exc)
+            finally:
+                done.set()
+
+        worker = threading.Thread(target=_target, daemon=True, name=f"shutdown-{name}")
+        worker.start()
+        worker.join(max(0.1, float(timeout_s)))
+        if not done.is_set():
+            self.logger.error("%s timed out after %.1fs during shutdown; continuing", name, timeout_s)
+            return False
+        if errors:
+            self.logger.error("%s failed during shutdown: %s", name, errors[0])
+            return False
+        return True
 
     def _sleep_with_kill_switch_checks(self, interval_s: float) -> None:
         deadline = time.time() + max(0.0, float(interval_s))
@@ -389,13 +420,18 @@ class HyperliquidResearchBot:
         # ── Graceful shutdown handler ──
         def signal_handler(sig, frame):
             self.logger.info("Shutdown signal received. Stopping background tasks…")
-            self._cancel_live_orders_for_shutdown(reason=f"signal:{sig}")
+            self._run_with_timeout(
+                "cancel_live_orders",
+                lambda: self._cancel_live_orders_for_shutdown(reason=f"signal:{sig}"),
+                float(os.environ.get("SHUTDOWN_CANCEL_TIMEOUT_S", "8")),
+            )
             self.task_runner.stop_all(timeout=10)
-            try:
-                backup_to_json()
+            if self._run_with_timeout(
+                "backup_to_json",
+                backup_to_json,
+                float(os.environ.get("SHUTDOWN_BACKUP_TIMEOUT_S", "15")),
+            ):
                 self.logger.info("DB backup complete.")
-            except Exception as exc:
-                self.logger.error("DB backup failed on shutdown: %s", exc)
             self.running = False
 
         signal.signal(signal.SIGINT, signal_handler)

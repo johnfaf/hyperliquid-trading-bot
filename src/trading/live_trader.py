@@ -384,7 +384,9 @@ class LiveTrader:
         self.live_requested = not dry_run
         self.dry_run = dry_run
         self.max_daily_loss = float(os.environ.get("HL_MAX_DAILY_LOSS", max_daily_loss))
-        self.max_position_size = float(os.environ.get("HL_MAX_POSITION_SIZE", max_position_size))
+        max_position_env = os.environ.get("LIVE_MAX_POSITION_SIZE_USD") or os.environ.get("HL_MAX_POSITION_SIZE")
+        self._max_position_size_configured = max_position_env is not None
+        self.max_position_size = float(max_position_env) if max_position_env is not None else float(max_position_size)
         # Exchange-enforced minimum notional per order.  Hyperliquid silently
         # drops any order below $10 — we keep a small buffer (default $11)
         # so rounding and price drift do not push us under the floor.
@@ -416,6 +418,16 @@ class LiveTrader:
                 self.min_order_usd,
             )
             self.max_order_usd = self.min_order_usd
+        if not self._max_position_size_configured and self.max_position_size < self.max_order_usd:
+            logger.warning(
+                "HL_MAX_POSITION_SIZE/LIVE_MAX_POSITION_SIZE_USD is not set and "
+                "the default cap $%.2f is below LIVE_MAX_ORDER_USD=$%.2f. "
+                "Raising max_position_size to the explicit order cap to avoid "
+                "silently rejecting scaled orders.",
+                self.max_position_size,
+                self.max_order_usd,
+            )
+            self.max_position_size = self.max_order_usd
 
         # Canary rollout guardrails for live deployment.
         self.canary_mode = bool(getattr(config, "LIVE_CANARY_MODE", False))
@@ -463,6 +475,9 @@ class LiveTrader:
             getattr(config, "LIVE_EXTERNAL_KILL_SWITCH_FILE", "")
         ).strip()
         self.external_kill_switch_env = "LIVE_EXTERNAL_KILL_SWITCH"
+        self.kill_switch_state_file = str(
+            getattr(config, "LIVE_KILL_SWITCH_STATE_FILE", "/data/live_kill_switch_state.json")
+        ).strip()
         self._kill_switch_reason: str = ""
         self.regime_forecaster = regime_forecaster
         self.risk_policy_engine = risk_policy_engine
@@ -488,6 +503,7 @@ class LiveTrader:
         self._load_asset_index_map()
 
         # State tracking
+        self._state_lock = threading.RLock()
         self.daily_pnl = 0.0
         self.daily_realized_pnl = 0.0
         self.daily_unrealized_pnl = 0.0
@@ -580,6 +596,7 @@ class LiveTrader:
             60.0,
             float(os.environ.get("LIVE_FREE_MARGIN_ALERT_COOLDOWN_S", "900")),
         )
+        self._load_persisted_kill_switch_state()
 
         logger.info(
             f"LiveTrader initialized: dry_run={dry_run}, "
@@ -591,7 +608,10 @@ class LiveTrader:
         if dry_run:
             logger.warning("DRY RUN MODE - No real trades will be executed")
 
-        if not self.signer:
+        if self._kill_switch_is_active():
+            # Preserve persisted/manual kill-switch status across startup checks.
+            self.status_reason = self.status_reason or "kill_switch_active"
+        elif not self.signer:
             logger.warning("No agent wallet signer configured - forcing dry_run mode")
             self.dry_run = True
             self.status_reason = "missing_agent_wallet_signer"
@@ -813,6 +833,79 @@ class LiveTrader:
         """Return True when the trader can actually submit live orders."""
         return bool(self.live_requested and not self.dry_run and self.signer and self.public_address)
 
+    def _persist_kill_switch_state(self, active: bool, reason: str) -> None:
+        """Persist sticky kill-switch state so restarts cannot clear it."""
+        path = self.kill_switch_state_file
+        if not path:
+            return
+        try:
+            directory = os.path.dirname(path)
+            if directory:
+                if not os.path.exists(directory) and "LIVE_KILL_SWITCH_STATE_FILE" not in os.environ:
+                    logger.warning(
+                        "Kill-switch state directory %s does not exist; skipping "
+                        "persistence until LIVE_KILL_SWITCH_STATE_FILE is explicitly set",
+                        directory,
+                    )
+                    return
+                os.makedirs(directory, exist_ok=True)
+            payload = {
+                "active": bool(active),
+                "reason": str(reason or ""),
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+            tmp_path = f"{path}.tmp"
+            with open(tmp_path, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, sort_keys=True)
+            os.replace(tmp_path, path)
+        except Exception as exc:
+            logger.warning("Failed to persist kill-switch state to %s: %s", path, exc)
+
+    def _load_persisted_kill_switch_state(self) -> None:
+        """Restore sticky kill-switch state from the previous process."""
+        path = self.kill_switch_state_file
+        if not path or not os.path.exists(path):
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+            if isinstance(payload, dict) and payload.get("active"):
+                reason = str(payload.get("reason") or f"persisted:{path}")
+                with self._state_lock:
+                    self.kill_switch_active = True
+                    self._kill_switch_reason = reason
+                    self.status_reason = "persisted_kill_switch"
+                logger.critical("Persisted kill switch restored (%s)", reason)
+        except Exception as exc:
+            logger.warning("Failed to load kill-switch state from %s: %s", path, exc)
+
+    def activate_kill_switch(
+        self,
+        reason: str,
+        *,
+        status_reason: str = "kill_switch_active",
+        persist: bool = True,
+    ) -> None:
+        """Set the sticky kill-switch flag and persist it by default."""
+        reason = str(reason or "unspecified")
+        changed = False
+        with self._state_lock:
+            changed = (not self.kill_switch_active) or self._kill_switch_reason != reason
+            self.kill_switch_active = True
+            self._kill_switch_reason = reason
+            self.status_reason = status_reason
+        if changed:
+            logger.critical("Kill switch ACTIVATED (%s)", reason)
+        if persist:
+            self._persist_kill_switch_state(True, reason)
+
+    def _kill_switch_is_active(self) -> bool:
+        lock = getattr(self, "_state_lock", None)
+        if lock is None:
+            return bool(getattr(self, "kill_switch_active", False))
+        with lock:
+            return bool(self.kill_switch_active)
+
     def _coerce_signal(self, signal: Union[TradeSignal, Dict[str, Any]]) -> TradeSignal:
         """Accept either TradeSignal or execution dict for safer live mirroring."""
         if isinstance(signal, TradeSignal):
@@ -887,20 +980,23 @@ class LiveTrader:
         if not isinstance(state, dict) or not state:
             return None
 
+        for key in ("marginSummary", "crossMarginSummary"):
+            margin_summary = state.get(key, {}) or {}
+            try:
+                acct = float(margin_summary.get("accountValue", 0) or 0)
+                used = float(margin_summary.get("totalMarginUsed", 0) or 0)
+                if acct > 0 or used > 0:
+                    return max(0.0, acct - used)
+            except (TypeError, ValueError):
+                continue
+
         withdrawable = state.get("withdrawable")
         try:
             if withdrawable is not None:
                 return max(0.0, float(withdrawable))
         except (TypeError, ValueError):
             pass
-
-        margin_summary = state.get("marginSummary", {}) or {}
-        try:
-            acct = float(margin_summary.get("accountValue", 0) or 0)
-            used = float(margin_summary.get("totalMarginUsed", 0) or 0)
-            return max(0.0, acct - used)
-        except (TypeError, ValueError):
-            return None
+        return None
 
     def get_free_margin(self) -> Optional[float]:
         """
@@ -926,7 +1022,7 @@ class LiveTrader:
         if free_margin <= 0.0:
             if self._free_margin_zero_since_ts <= 0.0:
                 self._free_margin_zero_since_ts = now
-            if self.is_deployable() and not self.kill_switch_active:
+            if self.is_deployable() and not self._kill_switch_is_active():
                 self.status_reason = "no_free_margin_available"
             if (now - self._last_free_margin_alert_ts) < self._free_margin_alert_cooldown_s:
                 return
@@ -1262,6 +1358,21 @@ class LiveTrader:
             return pos
         return None
 
+    def _signed_position_size_from_positions(
+        self,
+        coin: str,
+        positions: Optional[List[Dict[str, Any]]],
+    ) -> Optional[float]:
+        """Return signed szi for a coin from an exchange position snapshot."""
+        if positions is None:
+            return None
+        wanted = str(coin or "").upper()
+        for pos in positions:
+            if str(pos.get("coin", "") or "").upper() != wanted:
+                continue
+            return self._coerce_float(pos.get("szi", pos.get("size", 0)), 0.0)
+        return 0.0
+
     def _refresh_external_kill_switch(self) -> bool:
         """
         External kill-switch hook.
@@ -1291,11 +1402,7 @@ class LiveTrader:
                 )
 
         if reason:
-            if not self.kill_switch_active or self._kill_switch_reason != reason:
-                logger.critical("External kill switch ACTIVATED (%s)", reason)
-            self.kill_switch_active = True
-            self._kill_switch_reason = reason
-            self.status_reason = "external_kill_switch"
+            self.activate_kill_switch(reason, status_reason="external_kill_switch")
             return True
         return False
 
@@ -1303,18 +1410,17 @@ class LiveTrader:
         """Reset daily counters at midnight UTC."""
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         if today != self.daily_reset_date:
-            self.daily_reset_date = today
-            self.daily_pnl = 0.0
-            self.daily_realized_pnl = 0.0
-            self.daily_unrealized_pnl = 0.0
-            self.orders_today = 0
-            self.fills_today = 0
-            self._source_orders_today.clear()
-            self._entry_metrics.clear()
-            self.kill_switch_active = False
-            self._kill_switch_reason = ""
+            with self._state_lock:
+                self.daily_reset_date = today
+                self.daily_pnl = 0.0
+                self.daily_realized_pnl = 0.0
+                self.daily_unrealized_pnl = 0.0
+                self.orders_today = 0
+                self.fills_today = 0
+                self._source_orders_today.clear()
+                self._entry_metrics.clear()
             logger.info("Daily counters reset")
-            # Keep external kill-switch state sticky across day boundaries.
+            # Kill-switch state is sticky across day boundaries and restarts.
             self._refresh_external_kill_switch()
 
     def check_daily_loss(self, refresh_from_fills: bool = False) -> bool:
@@ -1333,10 +1439,17 @@ class LiveTrader:
             except TypeError:
                 # Backward compatibility for tests/monkeypatches using the old signature.
                 self.update_daily_pnl_from_fills()
+        if self._kill_switch_is_active():
+            return True
 
-        if self.daily_pnl < -self.max_daily_loss:
-            logger.warning(f"⚠️  Daily loss limit exceeded: ${abs(self.daily_pnl):.2f} > ${self.max_daily_loss:.2f}")
-            self.kill_switch_active = True
+        with self._state_lock:
+            daily_pnl = self.daily_pnl
+        if daily_pnl < -self.max_daily_loss:
+            logger.warning(f"⚠️  Daily loss limit exceeded: ${abs(daily_pnl):.2f} > ${self.max_daily_loss:.2f}")
+            self.activate_kill_switch(
+                f"daily_loss_limit:{abs(daily_pnl):.2f}>{self.max_daily_loss:.2f}",
+                status_reason="daily_loss_limit_exceeded",
+            )
             return True
 
         return False
@@ -2210,7 +2323,7 @@ class LiveTrader:
 
         try:
             if not self.public_address:
-                return
+                return False
 
             fills = self.api_manager.post(
                 {"type": "userFills", "user": self.public_address},
@@ -2218,7 +2331,7 @@ class LiveTrader:
                 timeout=10,
             )
             if not isinstance(fills, list):
-                return
+                raise RuntimeError(f"userFills returned {type(fills).__name__}, expected list")
 
             # Sum realized closed PnL from today's fills.
             today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -2256,30 +2369,41 @@ class LiveTrader:
 
             today_pnl = today_realized + unrealized
 
-            old_pnl = self.daily_pnl
-            self.daily_realized_pnl = today_realized
-            self.daily_unrealized_pnl = unrealized
-            self.daily_pnl = today_pnl
+            with self._state_lock:
+                old_pnl = self.daily_pnl
+                self.daily_realized_pnl = today_realized
+                self.daily_unrealized_pnl = unrealized
+                self.daily_pnl = today_pnl
+                current_daily_pnl = self.daily_pnl
+                current_realized = self.daily_realized_pnl
+                current_unrealized = self.daily_unrealized_pnl
 
-            if abs(self.daily_pnl) > 0 and abs(self.daily_pnl - old_pnl) > 0.01:
+            if abs(current_daily_pnl) > 0 and abs(current_daily_pnl - old_pnl) > 0.01:
                 logger.info(
                     "Daily PnL updated: total=%+.2f (realized=%+.2f, unrealized=%+.2f)",
-                    self.daily_pnl,
-                    self.daily_realized_pnl,
-                    self.daily_unrealized_pnl,
+                    current_daily_pnl,
+                    current_realized,
+                    current_unrealized,
                 )
 
             # Keep the firewall on the same realized-loss snapshot instead of
             # re-adding the full day's losses on every refresh.
             if hasattr(self.firewall, "set_daily_losses"):
-                self.firewall.set_daily_losses(abs(min(self.daily_pnl, 0.0)))
+                self.firewall.set_daily_losses(abs(min(current_daily_pnl, 0.0)))
 
             # Check if kill switch should trigger
             if trigger_check:
                 self.check_daily_loss(refresh_from_fills=False)
+            return True
 
         except Exception as e:
-            logger.error(f"Failed to update daily PnL from fills: {e}")
+            logger.error("Failed to update daily PnL from fills: %s", e, exc_info=True)
+            if self.live_requested and not self.dry_run:
+                self.activate_kill_switch(
+                    "daily_pnl_refresh_failed",
+                    status_reason="daily_pnl_unavailable",
+                )
+            return False
 
     def _get_mid_price(self, coin: str) -> Optional[float]:
         """Get mid price from Hyperliquid."""
@@ -2793,7 +2917,7 @@ class LiveTrader:
         # reduce_only orders MUST always go through so the bot can exit
         # positions during emergencies and when protective orders fail.
         if not reduce_only:
-            if self.kill_switch_active:
+            if self._kill_switch_is_active():
                 logger.warning(f"Kill switch active - rejecting market order {coin} {side}")
                 return {"status": "rejected", "reason": "kill_switch_active"}
 
@@ -2963,7 +3087,8 @@ class LiveTrader:
 
     def verify_fill(self, coin: str, expected_side: str, expected_size: float,
                     timeout: float = 10.0, poll_interval: float = 1.0,
-                    blocking: Optional[bool] = None) -> Optional[Dict]:
+                    blocking: Optional[bool] = None,
+                    baseline_position_size: float = 0.0) -> Optional[Dict]:
         """
         Verify an order fill against exchange positions.
 
@@ -2978,6 +3103,10 @@ class LiveTrader:
             timeout: Max seconds to wait
             poll_interval: Seconds between polls
             blocking: Override instance default verification mode
+            baseline_position_size: Signed position size before order submission.
+                Fill verification checks the delta from this baseline, not the
+                total position, so pre-existing positions cannot falsely verify
+                a rejected order.
 
         Returns:
             Position dict if verified, None if not found after timeout
@@ -2987,6 +3116,7 @@ class LiveTrader:
 
         expected_side = self._normalize_order_side(expected_side)
         blocking_mode = self._fill_verify_blocking if blocking is None else bool(blocking)
+        baseline_position_size = float(baseline_position_size or 0.0)
 
         def _poll_once(attempt: int) -> Optional[Dict]:
             positions = self.get_positions()
@@ -3005,10 +3135,13 @@ class LiveTrader:
                 if expected_side == "sell" and pos_size > 0:
                     continue
 
-                fill_size = abs(pos_size)
+                signed_delta = pos_size - baseline_position_size
+                fill_size = signed_delta if expected_side == "buy" else -signed_delta
+                if fill_size <= 0:
+                    continue
                 if fill_size < expected_size * 0.5:
                     logger.warning(
-                        f"Fill partial: {coin} got {abs(pos_size):.6f} "
+                        f"Fill partial: {coin} got delta {fill_size:.6f} "
                         f"vs expected {expected_size:.6f}"
                     )
                     continue
@@ -3029,6 +3162,8 @@ class LiveTrader:
                     "coin": coin,
                     "size": matched_size,
                     "position_size": pos_size,
+                    "position_delta": fill_size,
+                    "baseline_position_size": baseline_position_size,
                     "partial_fill": partial_fill,
                     "attempt": attempt,
                     "entry_price": position_entry_price if position_entry_price > 0 else None,
@@ -3084,7 +3219,7 @@ class LiveTrader:
         # Kill switch and position size limit only block NEW positions.
         # reduce_only orders MUST go through so the bot can exit positions.
         if not reduce_only:
-            if self.kill_switch_active:
+            if self._kill_switch_is_active():
                 logger.warning(f"Kill switch active - rejecting limit order {coin}")
                 return {"status": "rejected", "reason": "kill_switch_active"}
             if self.check_daily_loss(refresh_from_fills=True):
@@ -3399,7 +3534,11 @@ class LiveTrader:
 
             cancelled = 0
             for order in orders:
-                if self.cancel_order(order.get("coin"), order.get("id")):
+                order_id = order.get("oid") or order.get("order_id") or order.get("id")
+                if order_id is None:
+                    logger.warning("cancel_all_orders: open order missing oid/order_id/id: %s", order)
+                    continue
+                if self.cancel_order(order.get("coin"), order_id):
                     cancelled += 1
 
             if cancelled < len(orders):
@@ -3449,6 +3588,44 @@ class LiveTrader:
             logger.error(f"Error closing position on {coin}: {e}")
             return {"status": "error", "message": str(e)}
 
+    def _close_position_with_retries(self, coin: str, reason: str) -> Dict:
+        """Emergency close helper used when a fresh entry is unprotected."""
+        last_result: Dict[str, Any] = {"status": "error", "message": "not_attempted"}
+        for attempt in range(1, self._emergency_close_retries + 1):
+            last_result = self.close_position(coin)
+            if self._is_order_result_success(last_result):
+                logger.warning(
+                    "Closed %s after %s (attempt %d/%d)",
+                    coin,
+                    reason,
+                    attempt,
+                    self._emergency_close_retries,
+                )
+                return last_result
+            if attempt >= self._emergency_close_retries:
+                break
+            delay = (self._emergency_close_retry_delay_s * attempt) + random.uniform(
+                0.0,
+                self._protective_order_retry_jitter_s,
+            )
+            logger.error(
+                "Close retry for %s after %s failed on attempt %d/%d: %s. Retrying in %.2fs",
+                coin,
+                reason,
+                attempt,
+                self._emergency_close_retries,
+                last_result,
+                delay,
+            )
+            time.sleep(delay)
+        logger.critical(
+            "Failed to close %s after %s; position may remain open/unprotected: %s",
+            coin,
+            reason,
+            last_result,
+        )
+        return last_result
+
     def emergency_close_all(self) -> List[Dict]:
         """
         KILL SWITCH: Close all positions immediately and cancel all orders.
@@ -3457,7 +3634,7 @@ class LiveTrader:
             List of close results
         """
         logger.critical("🔴 EMERGENCY CLOSE ALL TRIGGERED")
-        self.kill_switch_active = True
+        self.activate_kill_switch("emergency_close_all", status_reason="emergency_close_all")
 
         results = []
 
@@ -3606,6 +3783,7 @@ class LiveTrader:
         # 1. CRASH regime: reduce size 60%, tighten stop loss to 3% ROE.
         if regime == "crash" and confidence > 0.4:
             adjusted.size = base_size * 0.4  # 60% reduction = multiply by 0.4
+            adjusted.position_pct *= 0.4
             adjusted.risk.stop_loss_pct = 0.03
             adjusted.risk.sync_reward_to_risk()
             logger.warning(
@@ -3616,6 +3794,7 @@ class LiveTrader:
         # 2. VOLATILE regime: reduce size 30%, widen stop loss to 8% ROE.
         elif regime == "volatile":
             adjusted.size = base_size * 0.7  # 30% reduction = multiply by 0.7
+            adjusted.position_pct *= 0.7
             adjusted.risk.stop_loss_pct = 0.08
             adjusted.risk.sync_reward_to_risk()
             logger.info(
@@ -3626,6 +3805,7 @@ class LiveTrader:
         # 3. BULLISH regime: allow full size, boost by 10%
         elif regime == "bullish" and confidence > 0.6:
             adjusted.size = base_size * 1.1  # 10% boost
+            adjusted.position_pct *= 1.1
             logger.info(
                 f"REGIME OVERLAY: bullish confirmed (conf={confidence:.2f}), "
                 f"boosting size 10% for {adjusted.coin}"
@@ -3841,7 +4021,7 @@ class LiveTrader:
             )
 
         # Check kill switch
-        if self.kill_switch_active:
+        if self._kill_switch_is_active():
             self._entry_metrics["rejected_kill_switch"] += 1
             logger.warning("Kill switch active - rejecting signal")
             return None
@@ -3927,6 +4107,22 @@ class LiveTrader:
                 logger.warning(f"Calculated size is 0 or negative for {coin} — skipping")
                 return None
 
+            baseline_position_size = 0.0
+            if not self.dry_run:
+                positions_before_entry = live_positions if live_positions is not None else self.get_positions()
+                if positions_before_entry is None:
+                    self._entry_metrics["rejected_positions_unavailable"] += 1
+                    logger.warning(
+                        "Live positions unavailable before %s entry - rejecting rather "
+                        "than verifying fill against an unknown baseline",
+                        coin,
+                    )
+                    return None
+                baseline_position_size = self._signed_position_size_from_positions(
+                    coin,
+                    positions_before_entry,
+                ) or 0.0
+
             logger.info(f"Executing signal: {coin} {signal_side} {size:.4f} "
                        f"(confidence={signal.confidence:.0%}, "
                        f"leverage={signal.leverage}x)")
@@ -3985,6 +4181,7 @@ class LiveTrader:
                         timeout=self._fill_verify_timeout_s,
                         poll_interval=self._fill_verify_poll_s,
                         blocking=self._execute_fill_verify_blocking,
+                        baseline_position_size=baseline_position_size,
                     )
                 except TypeError:
                     # Backward-compatibility for monkeypatched/tests that still
@@ -4026,7 +4223,7 @@ class LiveTrader:
                             coin,
                             fill_check,
                         )
-                        close_result = self.close_position(coin)
+                        close_result = self._close_position_with_retries(coin, "invalid_fill_size")
                         return {
                             "status": "error",
                             "message": "invalid_fill_size",
@@ -4062,7 +4259,7 @@ class LiveTrader:
                     expected_fill_size,
                     submitted_entry_size,
                 )
-                close_result = self.close_position(coin) if not self.dry_run else None
+                close_result = self._close_position_with_retries(coin, "invalid_protective_size") if not self.dry_run else None
                 return {
                     "status": "error",
                     "message": "invalid_protective_size",
@@ -4091,7 +4288,7 @@ class LiveTrader:
                     )
                     close_result = None
                     if not self.dry_run:
-                        close_result = self.close_position(coin)
+                        close_result = self._close_position_with_retries(coin, "missing_entry_price_for_protection")
                     return {
                         "status": "error",
                         "message": "entry_price_unavailable_for_sl_tp",
@@ -4125,7 +4322,7 @@ class LiveTrader:
                 logger.error("Protective order placement failed for %s after %d attempts", coin, protective_attempts)
                 close_result = None
                 if not self.dry_run:
-                    close_result = self.close_position(coin)
+                    close_result = self._close_position_with_retries(coin, "protective_order_failed")
                 return {
                     "status": "error",
                     "message": "protective_order_failed",
@@ -4191,6 +4388,20 @@ class LiveTrader:
             Stats dict with orders, fills, PnL, kill switch status
         """
         self._check_daily_reset()
+        with self._state_lock:
+            state_snapshot = {
+                "status_reason": self.status_reason,
+                "kill_switch_active": self.kill_switch_active,
+                "kill_switch_reason": self._kill_switch_reason or None,
+                "daily_pnl": round(self.daily_pnl, 2),
+                "daily_realized_pnl": round(self.daily_realized_pnl, 2),
+                "daily_unrealized_pnl": round(self.daily_unrealized_pnl, 2),
+                "orders_today": self.orders_today,
+                "fills_today": self.fills_today,
+                "source_orders_today": dict(self._source_orders_today),
+                "total_entry_signals_today": int(sum(self._source_orders_today.values())),
+                "entry_metrics": dict(self._entry_metrics),
+            }
 
         return {
             "live_enabled": self.live_requested,
@@ -4199,23 +4410,25 @@ class LiveTrader:
             "signer_available": self.signer is not None,
             "agent_wallet_address": self.agent_wallet_address,
             "public_address": self.public_address,
-            "status_reason": self.status_reason,
-            "kill_switch_active": self.kill_switch_active,
-            "kill_switch_reason": self._kill_switch_reason or None,
-            "daily_pnl": round(self.daily_pnl, 2),
-            "daily_realized_pnl": round(self.daily_realized_pnl, 2),
-            "daily_unrealized_pnl": round(self.daily_unrealized_pnl, 2),
+            "status_reason": state_snapshot["status_reason"],
+            "kill_switch_active": state_snapshot["kill_switch_active"],
+            "kill_switch_reason": state_snapshot["kill_switch_reason"],
+            "daily_pnl": state_snapshot["daily_pnl"],
+            "daily_realized_pnl": state_snapshot["daily_realized_pnl"],
+            "daily_unrealized_pnl": state_snapshot["daily_unrealized_pnl"],
             "daily_pnl_limit": self.max_daily_loss,
-            "orders_today": self.orders_today,
-            "fills_today": self.fills_today,
-            "source_orders_today": dict(self._source_orders_today),
-            "total_entry_signals_today": int(sum(self._source_orders_today.values())),
+            "orders_today": state_snapshot["orders_today"],
+            "fills_today": state_snapshot["fills_today"],
+            "source_orders_today": state_snapshot["source_orders_today"],
+            "total_entry_signals_today": state_snapshot["total_entry_signals_today"],
             "max_orders_per_source_per_day": self.max_orders_per_source_per_day,
             "canary_mode": self.canary_mode,
             "canary_max_order_usd": self.canary_max_order_usd,
             "canary_max_signals_per_day": self.canary_max_signals_per_day,
             "external_kill_switch_file": self.external_kill_switch_file or None,
+            "kill_switch_state_file": self.kill_switch_state_file or None,
             "max_position_size": self.max_position_size,
+            "max_position_size_configured": self._max_position_size_configured,
             "max_order_usd": self.max_order_usd,
             "order_dedup_window_s": self._ORDER_DEDUP_WINDOW,
             "fill_verify_blocking": self._fill_verify_blocking,
@@ -4230,20 +4443,20 @@ class LiveTrader:
                 if self.firewall and hasattr(self.firewall, "get_stats")
                 else {}
             ),
-            "entry_metrics": dict(self._entry_metrics),
-            "min_order_rejects_today": int(self._entry_metrics.get("rejected_below_min_notional", 0)),
-            "min_order_floorups_today": int(self._entry_metrics.get("min_notional_floorups", 0)),
+            "entry_metrics": state_snapshot["entry_metrics"],
+            "min_order_rejects_today": int(state_snapshot["entry_metrics"].get("rejected_below_min_notional", 0)),
+            "min_order_floorups_today": int(state_snapshot["entry_metrics"].get("min_notional_floorups", 0)),
             "min_order_top_tier_floorups_today": int(
-                self._entry_metrics.get("min_notional_top_tier_floorups", 0)
+                state_snapshot["entry_metrics"].get("min_notional_top_tier_floorups", 0)
             ),
             "min_order_same_side_merges_today": int(
-                self._entry_metrics.get("min_notional_same_side_merges", 0)
+                state_snapshot["entry_metrics"].get("min_notional_same_side_merges", 0)
             ),
             "approved_but_not_executable_today": int(
-                self._entry_metrics.get("approved_but_not_executable", 0)
+                state_snapshot["entry_metrics"].get("approved_but_not_executable", 0)
             ),
-            "attempted_entry_signals": int(self._entry_metrics.get("attempted_entry_signals", 0)),
-            "executed_entry_signals": int(self._entry_metrics.get("executed_entry_signals", 0)),
+            "attempted_entry_signals": int(state_snapshot["entry_metrics"].get("attempted_entry_signals", 0)),
+            "executed_entry_signals": int(state_snapshot["entry_metrics"].get("executed_entry_signals", 0)),
             "canary_headroom_ratio": round(
                 (self.max_order_usd / self.min_order_usd), 2
             ) if self.min_order_usd else None,

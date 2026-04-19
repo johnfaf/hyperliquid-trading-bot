@@ -136,9 +136,14 @@ def check_file_kill_switch(container) -> bool:
     live_trader = getattr(container, "live_trader", None)
     if live_trader:
         try:
-            live_trader.kill_switch_active = True
-            live_trader._kill_switch_reason = f"file:{path}"
-            live_trader.status_reason = "external_kill_switch"
+            reason = f"file:{path}"
+            activate = getattr(live_trader, "activate_kill_switch", None)
+            if callable(activate):
+                activate(reason, status_reason="external_kill_switch")
+            else:
+                live_trader.kill_switch_active = True
+                live_trader._kill_switch_reason = reason
+                live_trader.status_reason = "external_kill_switch"
         except Exception:
             pass
         # Serialised single-shot cancellation — if the SIGINT handler also
