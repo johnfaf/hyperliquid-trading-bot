@@ -193,8 +193,10 @@ class SupervisedTaskRunner:
                 self._health.set_status(
                     name, SubsystemState.FAILED, reason=str(reason)[:200],
                 )
-            except Exception:
-                pass
+            except Exception as exc:  # C9: do not silently swallow
+                logger.debug(
+                    "health registry set_status failed for '%s': %s", name, exc,
+                )
         return True
 
     # ── Query ─────────────────────────────────────────────────────
@@ -260,8 +262,11 @@ class SupervisedTaskRunner:
                 if self._health:
                     try:
                         self._health.heartbeat(task.name)
-                    except Exception:
-                        pass  # registry may not have this subsystem registered
+                    except Exception as exc:  # C9
+                        logger.debug(
+                            "health registry heartbeat failed for '%s': %s",
+                            task.name, exc,
+                        )
 
             except Exception as exc:
                 with self._lock:
@@ -289,8 +294,11 @@ class SupervisedTaskRunner:
                                 task.name, SubsystemState.FAILED,
                                 reason=f"max retries exceeded: {task.last_error}",
                             )
-                        except Exception:
-                            pass
+                        except Exception as exc:  # C9
+                            logger.debug(
+                                "health registry FAILED set_status failed for '%s': %s",
+                                task.name, exc,
+                            )
                     cooldown = max(0.0, float(task.auto_recover_cooldown_s))
                     if cooldown <= 0:
                         logger.error(
@@ -318,8 +326,11 @@ class SupervisedTaskRunner:
                                 reason="auto-recovered after max retries",
                                 dependency_ready=True,
                             )
-                        except Exception:
-                            pass
+                        except Exception as exc:  # C9
+                            logger.debug(
+                                "health registry DEGRADED set_status failed for '%s': %s",
+                                task.name, exc,
+                            )
                     continue
 
                 with self._lock:

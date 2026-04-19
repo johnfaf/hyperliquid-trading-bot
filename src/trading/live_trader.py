@@ -648,6 +648,12 @@ class LiveTrader:
         self._last_known_free_margin: Optional[float] = None
         self._free_margin_zero_since_ts: float = 0.0
         self._last_free_margin_alert_ts: float = 0.0
+        # C2: balance-snapshot / free-margin fields are touched from the fast
+        # cycle, the dashboard read path, and the alert emitter.  A dedicated
+        # lock prevents a torn read of _last_balance_snapshot and collapses
+        # the zero-margin alert race (two concurrent callers both past the
+        # cooldown check each emitting a Telegram).
+        self._balance_alert_lock = threading.Lock()
         self._free_margin_alert_cooldown_s = _safe_env_float(
             "LIVE_FREE_MARGIN_ALERT_COOLDOWN_S", 900.0, lo=60.0, hi=86_400.0,
         )
@@ -1303,22 +1309,57 @@ class LiveTrader:
         spot_usdc: Optional[float],
         now: float,
     ) -> None:
-        """Emit persistent alerts while the live account has no free margin."""
-        self._last_known_free_margin = free_margin
-        if not self.live_requested or self.dry_run or not self.public_address:
-            return
-        if free_margin is None:
-            return
+        """Emit persistent alerts while the live account has no free margin.
 
-        if free_margin <= 0.0:
-            if self._free_margin_zero_since_ts <= 0.0:
-                self._free_margin_zero_since_ts = now
-            if self.is_deployable() and not self._kill_switch_is_active():
-                self.status_reason = "no_free_margin_available"
-            if (now - self._last_free_margin_alert_ts) < self._free_margin_alert_cooldown_s:
+        All balance-alert state (``_last_known_free_margin``,
+        ``_free_margin_zero_since_ts``, ``_last_free_margin_alert_ts``) is
+        guarded by ``_balance_alert_lock`` so a dashboard read cannot see a
+        torn write and two concurrent callers cannot both pass the cooldown
+        check simultaneously.  C2.
+        """
+        lock = getattr(self, "_balance_alert_lock", None)
+        if lock is None:
+            # Backwards-compat for fake traders built via __new__ that
+            # predate C2 — tests patch the attribute dict directly.
+            lock = threading.Lock()
+            self._balance_alert_lock = lock
+        with lock:
+            self._last_known_free_margin = free_margin
+            if not self.live_requested or self.dry_run or not self.public_address:
+                return
+            if free_margin is None:
                 return
 
-            zero_for_s = max(0.0, now - self._free_margin_zero_since_ts)
+            if free_margin <= 0.0:
+                if self._free_margin_zero_since_ts <= 0.0:
+                    self._free_margin_zero_since_ts = now
+                if self.is_deployable() and not self._kill_switch_is_active():
+                    self.status_reason = "no_free_margin_available"
+                if (now - self._last_free_margin_alert_ts) < self._free_margin_alert_cooldown_s:
+                    return
+
+                zero_for_s = max(0.0, now - self._free_margin_zero_since_ts)
+                # Claim the alert slot before releasing the lock so concurrent
+                # callers fall into the cooldown branch immediately.
+                self._last_free_margin_alert_ts = now
+
+            elif self._free_margin_zero_since_ts > 0.0:
+                zero_for_s = max(0.0, now - self._free_margin_zero_since_ts)
+                self._free_margin_zero_since_ts = 0.0
+                if self.live_requested and self.is_deployable() and self.status_reason == "no_free_margin_available":
+                    self.status_reason = "live_ready"
+                # Fall through to emit the recovery alert below (outside the lock).
+                _emit = "recovered"
+            else:
+                if self.live_requested and self.is_deployable() and self.status_reason == "no_free_margin_available":
+                    self.status_reason = "live_ready"
+                return
+
+            if free_margin <= 0.0:
+                _emit = "blocked"
+            # fallthrough: release lock, do the I/O
+
+        if _emit == "blocked":
             logger.warning(
                 "Live free margin is $0.00 - new live entries will be skipped "
                 "(perps=$%s, spot=$%s, canary_cap=$%.2f, zero_for=%.0fs).",
@@ -1340,34 +1381,28 @@ class LiveTrader:
                     )
             except Exception as exc:
                 logger.warning("Free-margin alert skipped: %s", exc)
-            self._last_free_margin_alert_ts = now
             return
 
-        if self._free_margin_zero_since_ts > 0.0:
-            zero_for_s = max(0.0, now - self._free_margin_zero_since_ts)
-            logger.info(
-                "Live free margin restored to $%.2f after %.0fs - live mirroring can resume.",
-                free_margin,
-                zero_for_s,
-            )
-            try:
-                from src.notifications import telegram_bot as tg
+        # _emit == "recovered"
+        logger.info(
+            "Live free margin restored to $%.2f after %.0fs - live mirroring can resume.",
+            free_margin,
+            zero_for_s,
+        )
+        try:
+            from src.notifications import telegram_bot as tg
 
-                if tg.is_configured():
-                    tg.notify_live_margin_blocked(
-                        free_margin=free_margin,
-                        perps_margin=perps_margin,
-                        spot_usdc=spot_usdc,
-                        max_order_usd=self.max_order_usd,
-                        zero_for_seconds=zero_for_s,
-                        resolved=True,
-                    )
-            except Exception as exc:
-                logger.warning("Free-margin recovery alert skipped: %s", exc)
-            self._free_margin_zero_since_ts = 0.0
-
-        if self.live_requested and self.is_deployable() and self.status_reason == "no_free_margin_available":
-            self.status_reason = "live_ready"
+            if tg.is_configured():
+                tg.notify_live_margin_blocked(
+                    free_margin=free_margin,
+                    perps_margin=perps_margin,
+                    spot_usdc=spot_usdc,
+                    max_order_usd=self.max_order_usd,
+                    zero_for_seconds=zero_for_s,
+                    resolved=True,
+                )
+        except Exception as exc:
+            logger.warning("Free-margin recovery alert skipped: %s", exc)
 
     def _get_spot_usdc_balance(self) -> Optional[float]:
         """Fetch USDC balance from the spot wallet."""

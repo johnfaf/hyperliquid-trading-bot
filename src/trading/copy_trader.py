@@ -1025,16 +1025,20 @@ class CopyTrader:
         if not source_key:
             source_key = self._source_key(meta)
 
+        # C8: every post-close hook is best-effort but failures used to be
+        # swallowed silently; when the scorer or kelly sizer drifts into an
+        # unusable state the operator had no breadcrumb.  Log at warning level
+        # with the specific subsystem name so the root cause is greppable.
         if self.agent_scorer and meta.get("source_trader"):
             try:
                 self.agent_scorer.record_outcome(source_key, meta.get("signal_id", ""), pnl, return_pct)
-            except Exception:
-                pass
+            except Exception as hook_exc:
+                logger.warning("copy_trader post-close hook 'agent_scorer' failed: %s", hook_exc)
         if self.firewall:
             try:
                 self.firewall.record_trade_outcome(trade["coin"], pnl)
-            except Exception:
-                pass
+            except Exception as hook_exc:
+                logger.warning("copy_trader post-close hook 'firewall' failed: %s", hook_exc)
 
         if self.kelly_sizer:
             try:
@@ -1045,8 +1049,8 @@ class CopyTrader:
                     size=trade["size"],
                     leverage=trade.get("leverage", 1),
                 )
-            except Exception:
-                pass
+            except Exception as hook_exc:
+                logger.warning("copy_trader post-close hook 'kelly_sizer' failed: %s", hook_exc)
 
         if self.calibration:
             try:
@@ -1058,8 +1062,8 @@ class CopyTrader:
                     coin=trade["coin"],
                     side=trade.get("side", ""),
                 )
-            except Exception:
-                pass
+            except Exception as hook_exc:
+                logger.warning("copy_trader post-close hook 'calibration' failed: %s", hook_exc)
 
         if self.trade_memory:
             try:
@@ -1077,8 +1081,8 @@ class CopyTrader:
                     confidence=meta.get("confidence", 0),
                     source=source_key,
                 )
-            except Exception:
-                pass
+            except Exception as hook_exc:
+                logger.warning("copy_trader post-close hook 'trade_memory' failed: %s", hook_exc)
 
         if self.shadow_tracker:
             try:
@@ -1102,8 +1106,8 @@ class CopyTrader:
                         },
                     }
                 )
-            except Exception:
-                pass
+            except Exception as hook_exc:
+                logger.warning("copy_trader post-close hook 'shadow_tracker' failed: %s", hook_exc)
 
         closed_event = {
             "trade_id": trade["id"],
@@ -1127,8 +1131,8 @@ class CopyTrader:
         try:
             if self.rotation_manager:
                 self.rotation_manager.record_trade_close(closed_event)
-        except Exception:
-            pass
+        except Exception as hook_exc:
+            logger.warning("copy_trader post-close hook 'rotation_manager' failed: %s", hook_exc)
         self._closed_events.append(closed_event)
         return closed_event
 
