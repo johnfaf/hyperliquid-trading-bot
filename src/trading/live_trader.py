@@ -3618,12 +3618,31 @@ class LiveTrader:
                 delay,
             )
             time.sleep(delay)
+        # Terminal failure: naked live position cannot be left sitting open.
+        # Escalate to emergency_close_all() which will cancel every resting
+        # order AND activate the sticky kill switch so no further entries are
+        # placed until an operator resolves the incident manually.
         logger.critical(
-            "Failed to close %s after %s; position may remain open/unprotected: %s",
+            "Failed to close %s after %s (%d attempts); escalating to "
+            "emergency_close_all + kill switch: %s",
             coin,
             reason,
+            self._emergency_close_retries,
             last_result,
         )
+        try:
+            self.activate_kill_switch(
+                f"close_retry_exhausted:{coin}:{reason}",
+                status_reason="close_retry_exhausted",
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.critical("activate_kill_switch failed during escalation: %s", exc)
+        try:
+            self.emergency_close_all()
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.critical(
+                "emergency_close_all failed during %s escalation: %s", reason, exc
+            )
         return last_result
 
     def emergency_close_all(self) -> List[Dict]:

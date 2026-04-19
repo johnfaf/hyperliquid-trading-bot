@@ -6,6 +6,7 @@ Serves a unified web dashboard on port 8080 with:
 
 Both dashboards served from the same port for Railway compatibility.
 """
+import hmac
 import json
 import os
 import sys
@@ -50,6 +51,22 @@ _AUTH_REQUIRED_POST_PATHS = {
 def _dashboard_auth_token() -> str:
     """Read the dashboard auth token lazily so env changes apply immediately."""
     return os.environ.get("DASHBOARD_AUTH_TOKEN", "").strip()
+
+
+def _secure_token_eq(supplied: str, expected: str) -> bool:
+    """
+    Constant-time comparison of supplied token vs expected token.
+
+    Using `==` on the dashboard auth token leaks the token one byte at a
+    time to a remote attacker via CPU-timing side-channels.  hmac.compare_digest
+    runs in time proportional to the longer string regardless of match point.
+    """
+    if not supplied or not expected:
+        return False
+    try:
+        return hmac.compare_digest(str(supplied), str(expected))
+    except (TypeError, ValueError):
+        return False
 
 
 def _truthy_env(name: str, default: str = "false") -> bool:
@@ -1952,11 +1969,15 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 return False
             return True  # Read-only dashboard remains open when auth is not configured.
         # Check Authorization header: "Bearer <token>"
+        # Constant-time comparison defends against remote timing attacks that
+        # leak the token one byte at a time.
         auth_header = self.headers.get("Authorization", "")
-        if auth_header.startswith("Bearer ") and auth_header[7:].strip() == auth_token:
+        if auth_header.startswith("Bearer ") and _secure_token_eq(
+            auth_header[7:].strip(), auth_token
+        ):
             self._pending_auth_cookie = auth_token
             return True
-        if self._cookie_auth_token() == auth_token:
+        if _secure_token_eq(self._cookie_auth_token(), auth_token):
             return True
         if self.command == "GET" and not parsed.path.startswith("/api/"):
             next_path = parsed.path or "/"
@@ -1997,7 +2018,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if not auth_token:
             self._json_response({"error": "dashboard_auth_not_configured"}, code=503)
             return
-        if token != auth_token:
+        if not _secure_token_eq(token, auth_token):
             self._redirect(f"/login?error=invalid&next={quote(next_path, safe='/?=&')}")
             return
         self._pending_auth_cookie = auth_token

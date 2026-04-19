@@ -418,7 +418,23 @@ class HyperliquidResearchBot:
         sys.stdout.flush()
 
         # ── Graceful shutdown handler ──
+        # Second SIGINT/SIGTERM forces immediate exit so operators can never be
+        # held hostage by a hung shutdown path (exchange call wedged, etc.).
+        shutdown_in_progress = {"flag": False}
+
         def signal_handler(sig, frame):
+            if shutdown_in_progress["flag"]:
+                # Second signal → force exit immediately.
+                self.logger.critical(
+                    "Second shutdown signal received — forcing immediate exit."
+                )
+                os._exit(1)
+
+            shutdown_in_progress["flag"] = True
+            # CRITICAL: set self.running = False FIRST so the main loop and any
+            # worker threads observing it stop scheduling new work even if the
+            # cancel/backup calls below hang inside their watchdog windows.
+            self.running = False
             self.logger.info("Shutdown signal received. Stopping background tasks…")
             self._run_with_timeout(
                 "cancel_live_orders",
@@ -432,7 +448,6 @@ class HyperliquidResearchBot:
                 float(os.environ.get("SHUTDOWN_BACKUP_TIMEOUT_S", "15")),
             ):
                 self.logger.info("DB backup complete.")
-            self.running = False
 
         signal.signal(signal.SIGINT, signal_handler)
         signal.signal(signal.SIGTERM, signal_handler)
