@@ -1777,7 +1777,10 @@ def test_rescale_size_for_live_blocks_when_paper_balance_missing(monkeypatch):
 
 
 def test_rescale_size_for_live_enforces_max_order_usd_cap(monkeypatch):
-    """After rescaling, notional must never exceed trader.max_order_usd."""
+    """After rescaling, notional must never exceed trader.max_order_usd
+    EVEN when the fill slips to the SDK's default 5% market slippage (E6).
+    The cap is computed against the slipped reference price, so the final
+    mid-notional lands slightly under the cap — that's the point."""
     class FakeTrader:
         max_order_usd = 3.0
 
@@ -1786,14 +1789,21 @@ def test_rescale_size_for_live_enforces_max_order_usd_cap(monkeypatch):
 
     monkeypatch.setattr("src.core.live_execution.db.get_paper_account", lambda: {"balance": 10_000.0})
     monkeypatch.setattr("src.core.live_execution.get_all_mids", lambda: {"ETH": 2000.0})
+    monkeypatch.setenv("LIVE_MARKET_SLIPPAGE_PCT", "0.05")
 
-    # 0.5 ETH @ $2000 = $1000 notional, should be capped to $3 → 0.0015 ETH
+    # 0.5 ETH @ $2000 = $1000 notional. Cap=$3 with 5% buy-side slippage
+    # means size = 3 / (2000 * 1.05) ≈ 0.001428… ETH.  Notional at slipped
+    # price is $3 exactly; notional at mid is ≈ $2.857 (under the cap).
     scaled = _rescale_size_for_live(
-        {"coin": "ETH", "size": 0.5, "entry_price": 2000.0},
+        {"coin": "ETH", "size": 0.5, "side": "buy", "entry_price": 2000.0},
         FakeTrader(),
     )
     assert scaled is not None
-    assert abs(scaled["size"] * 2000.0 - 3.0) < 1e-9
+    slipped_notional = scaled["size"] * 2000.0 * 1.05
+    assert slipped_notional <= 3.0 + 1e-9
+    # And the mid-notional should not be dramatically under cap either —
+    # within one slippage-factor.
+    assert scaled["size"] * 2000.0 >= 3.0 / 1.05 - 1e-9
 
 
 def test_rescale_size_for_live_uses_free_margin_for_scale(monkeypatch):

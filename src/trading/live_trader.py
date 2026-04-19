@@ -30,10 +30,10 @@ import copy
 import math
 import random
 import threading
-from collections import defaultdict
+from collections import defaultdict, deque
 from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Deque, Dict, List, Optional, Tuple, Union
 from enum import Enum
 
 import requests
@@ -608,7 +608,35 @@ class LiveTrader:
             60.0,
             float(os.environ.get("LIVE_FREE_MARGIN_ALERT_COOLDOWN_S", "900")),
         )
+
+        # ── S3: rolling-24h drawdown + peak-equity drawdown cap ─────────
+        # LIVE_MAX_DRAWDOWN_USD: if set and > 0, enforce a kill switch trip
+        # when (peak_equity_in_window - current_equity) exceeds the cap.
+        # The peak is computed over a rolling window (default 24h); both the
+        # peak and the entry count are derived from equity samples recorded
+        # by snapshot_balance().  0 / unset disables the check.
+        try:
+            self._max_drawdown_usd = float(os.environ.get("LIVE_MAX_DRAWDOWN_USD", "0") or 0)
+        except (TypeError, ValueError):
+            self._max_drawdown_usd = 0.0
+        try:
+            self._drawdown_window_s = float(
+                os.environ.get("LIVE_DRAWDOWN_WINDOW_S", str(24 * 3600))
+            )
+        except (TypeError, ValueError):
+            self._drawdown_window_s = 24 * 3600.0
+        self._drawdown_window_s = max(300.0, self._drawdown_window_s)
+        self._equity_samples: Deque[Tuple[float, float]] = deque()  # (ts, equity)
+        self._equity_samples_lock = threading.Lock()
+        self._peak_equity_since_start: float = 0.0
+
         self._load_persisted_kill_switch_state()
+        # H5: restore the per-source canary counter from the DB so a restart
+        # inside the same UTC day cannot silently reset the daily order cap.
+        self._load_persisted_source_orders_today()
+        # E7: restore recent order-dedup hashes so a restart within the dedup
+        # window doesn't re-ship an order that may have already executed.
+        self._load_persisted_order_dedup_cache()
 
         logger.info(
             f"LiveTrader initialized: dry_run={dry_run}, "
@@ -891,6 +919,205 @@ class LiveTrader:
         except Exception as exc:
             logger.warning("Failed to load kill-switch state from %s: %s", path, exc)
 
+    # ── H5: persistent canary counters ──────────────────────────
+    _SOURCE_ORDERS_TODAY_KEY = "live_source_orders_today"
+
+    def _load_persisted_source_orders_today(self) -> None:
+        """Restore today's per-source entry counts from bot_state.
+
+        Only applies the persisted snapshot when its stored UTC date matches
+        today — a stale snapshot from a prior day is discarded and the
+        counter starts fresh (matching what _check_daily_reset would do at
+        midnight).  H5.
+        """
+        try:
+            snapshot = db.get_bot_state(self._SOURCE_ORDERS_TODAY_KEY)
+        except Exception as exc:
+            logger.debug("Failed to load persisted source_orders_today: %s", exc)
+            return
+        if not isinstance(snapshot, dict):
+            return
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        stored_date = snapshot.get("date")
+        counts = snapshot.get("counts") or {}
+        if stored_date != today or not isinstance(counts, dict):
+            return
+        restored = 0
+        with self._state_lock:
+            for key, value in counts.items():
+                try:
+                    ival = int(value)
+                except (TypeError, ValueError):
+                    continue
+                if ival > 0:
+                    self._source_orders_today[str(key)] = ival
+                    restored += ival
+            self.daily_reset_date = today
+        if restored:
+            logger.info(
+                "Restored persisted source_orders_today for %s (%d total entries)",
+                today,
+                restored,
+            )
+
+    def _persist_source_orders_today(self) -> None:
+        """Best-effort write of the current per-source counter to bot_state.
+
+        Called after every entry-signal increment and after the midnight
+        reset so a crash/restart cannot silently reclaim burned canary
+        budget within the same UTC day.  H5.
+        """
+        try:
+            with self._state_lock:
+                counts = {k: int(v) for k, v in self._source_orders_today.items() if v}
+                date = self.daily_reset_date or datetime.now(timezone.utc).strftime(
+                    "%Y-%m-%d"
+                )
+            db.set_bot_state(
+                self._SOURCE_ORDERS_TODAY_KEY,
+                {"date": date, "counts": counts},
+            )
+        except Exception as exc:
+            logger.debug("Failed to persist source_orders_today: %s", exc)
+
+    # ── E7: persistent order-dedup cache ───────────────────────
+    _ORDER_DEDUP_STATE_KEY = "live_order_dedup_cache"
+
+    def _load_persisted_order_dedup_cache(self) -> None:
+        """Restore recent order-dedup hashes from bot_state on startup.
+
+        Only entries still inside the dedup window are restored.  If any
+        ``in_flight`` or ``timeout`` markers are present we preserve them
+        AND log a critical warning — they indicate the previous process
+        crashed after sending an order but before confirming the result,
+        so the operator MUST run an orphan-fill reconcile before trading.
+        """
+        try:
+            snapshot = db.get_bot_state(self._ORDER_DEDUP_STATE_KEY)
+        except Exception as exc:
+            logger.debug("Failed to load persisted dedup cache: %s", exc)
+            return
+        if not isinstance(snapshot, dict):
+            return
+        now = time.time()
+        suspicious = 0
+        restored = 0
+        with self._order_dedup_lock:
+            for action_hash, entry in snapshot.items():
+                if not isinstance(entry, dict):
+                    continue
+                try:
+                    ts = float(entry.get("ts", 0) or 0)
+                except (TypeError, ValueError):
+                    continue
+                if ts <= 0 or now - ts > self._ORDER_DEDUP_WINDOW:
+                    continue
+                payload = entry.get("payload") or {"status": "restored"}
+                if isinstance(payload, dict) and payload.get("status") in {
+                    "in_flight",
+                    "timeout",
+                    "post_exception",
+                }:
+                    suspicious += 1
+                self._recent_order_hashes[str(action_hash)] = (ts, payload)
+                restored += 1
+        if restored:
+            logger.warning(
+                "Restored %d dedup hashes from prior run (%d unresolved "
+                "in-flight/timeout/exception markers)",
+                restored,
+                suspicious,
+            )
+        if suspicious:
+            logger.critical(
+                "%d order(s) from the prior run are in unresolved state "
+                "(in_flight/timeout/post_exception).  A reconcile_positions "
+                "sweep is required before new orders ship, and any orphaned "
+                "fills must be manually protected.",
+                suspicious,
+            )
+
+    def _persist_order_dedup_cache(self) -> None:
+        """Best-effort write of the current dedup cache to bot_state."""
+        try:
+            now = time.time()
+            with self._order_dedup_lock:
+                snapshot = {
+                    h: {"ts": ts, "payload": payload}
+                    for h, (ts, payload) in self._recent_order_hashes.items()
+                    if now - ts <= self._ORDER_DEDUP_WINDOW
+                }
+            db.set_bot_state(self._ORDER_DEDUP_STATE_KEY, snapshot)
+        except Exception as exc:
+            logger.debug("Failed to persist dedup cache: %s", exc)
+
+    # ── S3: rolling drawdown tracking ──────────────────────────
+    def _record_equity_sample(self, equity: Optional[float]) -> None:
+        """Append an equity reading to the rolling window and update peak.
+
+        Called from snapshot_balance().  Samples outside the window are
+        evicted on each call; peak-since-start is tracked independently so
+        a very long run doesn't lose its high water mark to window eviction.
+        """
+        if equity is None or self._max_drawdown_usd <= 0:
+            return
+        try:
+            equity_f = float(equity)
+        except (TypeError, ValueError):
+            return
+        if equity_f <= 0:
+            return
+        now = time.time()
+        cutoff = now - self._drawdown_window_s
+        with self._equity_samples_lock:
+            while self._equity_samples and self._equity_samples[0][0] < cutoff:
+                self._equity_samples.popleft()
+            self._equity_samples.append((now, equity_f))
+            if equity_f > self._peak_equity_since_start:
+                self._peak_equity_since_start = equity_f
+
+    def _current_drawdown_usd(self) -> Tuple[float, float, float]:
+        """Return (drawdown_usd, rolling_peak, current_equity).
+
+        ``drawdown_usd`` is positive when the rolling-window peak exceeds
+        the latest equity; 0 otherwise.  Returns zeros when no samples are
+        available.
+        """
+        with self._equity_samples_lock:
+            if not self._equity_samples:
+                return 0.0, 0.0, 0.0
+            rolling_peak = max(eq for _, eq in self._equity_samples)
+            current = self._equity_samples[-1][1]
+        # Use the greater of rolling peak and since-start peak as the
+        # reference — otherwise a gradual 30-hour slide would never trip
+        # the cap because each new sample slowly becomes the window peak.
+        peak = max(rolling_peak, self._peak_equity_since_start)
+        return max(0.0, peak - current), peak, current
+
+    def check_drawdown(self) -> bool:
+        """Trip kill switch if rolling-window drawdown exceeds the cap.  S3.
+
+        Returns True if the kill switch was activated (or was already
+        active).  Disabled when ``LIVE_MAX_DRAWDOWN_USD`` is 0 or unset.
+        """
+        if self._max_drawdown_usd <= 0:
+            return False
+        dd, peak, current = self._current_drawdown_usd()
+        if dd <= 0 or peak <= 0:
+            return False
+        if dd >= self._max_drawdown_usd:
+            logger.critical(
+                "Drawdown limit exceeded: $%.2f (peak=$%.2f, current=$%.2f) "
+                ">= cap $%.2f — tripping kill switch.",
+                dd, peak, current, self._max_drawdown_usd,
+            )
+            self.activate_kill_switch(
+                f"drawdown_limit:{dd:.2f}>={self._max_drawdown_usd:.2f}",
+                status_reason="drawdown_limit_exceeded",
+            )
+            return True
+        return False
+
     def activate_kill_switch(
         self,
         reason: str,
@@ -1166,6 +1393,18 @@ class LiveTrader:
             now=now,
         )
 
+        # S3: record equity and trip kill switch if rolling drawdown exceeds
+        # LIVE_MAX_DRAWDOWN_USD.  ``total`` is the right signal here (perps +
+        # spot) — an operator who drains perps to cover a loss should still
+        # see the aggregate drop reflected in the drawdown calc.  Guarded by
+        # the env var so dry-run/test setups without it configured are no-ops.
+        if total is not None and self._max_drawdown_usd > 0:
+            try:
+                self._record_equity_sample(total)
+                self.check_drawdown()
+            except Exception as dd_exc:
+                logger.debug("drawdown bookkeeping failed: %s", dd_exc)
+
         if log and (now - self._last_balance_log_ts) >= self._balance_log_interval_s:
             self._last_balance_log_ts = now
             logger.info(
@@ -1433,6 +1672,10 @@ class LiveTrader:
                 self._source_orders_today.clear()
                 self._entry_metrics.clear()
             logger.info("Daily counters reset")
+            # H5: overwrite the persisted snapshot with the fresh (empty)
+            # state so a restart right after midnight doesn't resurrect
+            # yesterday's counts.
+            self._persist_source_orders_today()
             # Kill-switch state is sticky across day boundaries and restarts.
             self._refresh_external_kill_switch()
 
@@ -2715,6 +2958,9 @@ class LiveTrader:
             # action_hash sees "duplicate" and backs off.  We overwrite on
             # success below with the real result.
             self._recent_order_hashes[action_hash] = (now, {"status": "in_flight"})
+        # E7: persist the dedup cache so a crash/restart inside the window
+        # doesn't re-ship an order that may have executed.
+        self._persist_order_dedup_cache()
 
         # ``request_dispatched`` starts False and flips True just before we
         # hand the payload off to api_manager.post().  If a generic exception
@@ -2727,6 +2973,7 @@ class LiveTrader:
                 # Release the in-flight slot so future retries aren't blocked
                 with self._order_dedup_lock:
                     self._recent_order_hashes.pop(action_hash, None)
+                self._persist_order_dedup_cache()
                 return {"status": "error", "message": "No signer available"}
 
             # Vault vs agent-wallet master-account semantics:
@@ -2793,6 +3040,7 @@ class LiveTrader:
                 # so future retries with the same hash must be allowed.
                 with self._order_dedup_lock:
                     self._recent_order_hashes.pop(action_hash, None)
+                self._persist_order_dedup_cache()
                 return {"status": "error", "message": "exchange request failed"}
 
             logger.info(f"Order posted: {json.dumps(result)}")
@@ -2828,12 +3076,14 @@ class LiveTrader:
                 # swallowed by the dedup cache.  Release the in-flight slot.
                 with self._order_dedup_lock:
                     self._recent_order_hashes.pop(action_hash, None)
+                self._persist_order_dedup_cache()
                 return rejection_payload
 
             # Only cache successfully accepted orders.  Rejected orders
             # are not "placed" and must remain retryable.
             with self._order_dedup_lock:
                 self._recent_order_hashes[action_hash] = (now, result)
+            self._persist_order_dedup_cache()
             return result
 
         except requests.exceptions.Timeout:
@@ -2842,6 +3092,7 @@ class LiveTrader:
             # retries — caller must verify via fills.
             with self._order_dedup_lock:
                 self._recent_order_hashes[action_hash] = (now, {"status": "timeout"})
+            self._persist_order_dedup_cache()
             logger.error(
                 f"Order TIMEOUT: action_hash={action_hash[:16]}... "
                 f"Order may have executed on-chain. Blocking retries. "
@@ -2869,6 +3120,7 @@ class LiveTrader:
                     # exchange never saw anything, so release the slot so a
                     # retry after fixing the underlying problem can proceed.
                     self._recent_order_hashes.pop(action_hash, None)
+            self._persist_order_dedup_cache()
             return {"status": "error", "message": str(e)}
 
     @staticmethod
@@ -4431,6 +4683,9 @@ class LiveTrader:
             if self._is_order_result_success(entry_result) and not self.dry_run:
                 self._source_orders_today[source_key] += 1
                 self._entry_metrics["executed_entry_signals"] += 1
+                # H5: persist so a restart inside this UTC day cannot silently
+                # reset canary budget that has already been consumed.
+                self._persist_source_orders_today()
             return {
                 "status": "success",
                 "coin": coin,

@@ -627,6 +627,60 @@ def get_strategy_score_history(strategy_id, limit=30):
     return [dict(r) for r in rows]
 
 
+# ─── Bot State (generic KV) ───────────────────────────────────
+
+def get_bot_state(key: str, default=None):
+    """Read a JSON-serialised value from the bot_state KV table.
+
+    Returns the decoded value, or ``default`` if the key is missing or the
+    stored payload cannot be decoded.  Safe to call before start-up
+    migrations have run — a missing table is treated as "no value".
+    """
+    try:
+        with get_connection() as conn:
+            row = conn.execute(
+                "SELECT value FROM bot_state WHERE key = ?", (str(key),)
+            ).fetchone()
+    except Exception as exc:
+        logger.debug("get_bot_state(%s): read failed: %s", key, exc)
+        return default
+    if not row:
+        return default
+    try:
+        raw = row["value"] if hasattr(row, "keys") else row[0]
+    except (KeyError, IndexError, TypeError):
+        return default
+    if raw is None:
+        return default
+    try:
+        return json.loads(raw)
+    except (ValueError, TypeError):
+        return default
+
+
+def set_bot_state(key: str, value) -> bool:
+    """Upsert a JSON-serialisable value into the bot_state KV table.
+
+    Returns True on success, False on any error (writes are best-effort and
+    must never break the hot path of the caller).
+    """
+    try:
+        payload = json.dumps(value)
+    except (TypeError, ValueError) as exc:
+        logger.warning("set_bot_state(%s): value not JSON-serialisable: %s", key, exc)
+        return False
+    try:
+        with get_connection() as conn:
+            conn.execute("""
+                INSERT INTO bot_state (key, value) VALUES (?, ?)
+                ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+            """, (str(key), payload))
+        return True
+    except Exception as exc:
+        logger.warning("set_bot_state(%s): write failed: %s", key, exc)
+        return False
+
+
 # ─── Paper Trading ─────────────────────────────────────────────
 
 def init_paper_account(balance):

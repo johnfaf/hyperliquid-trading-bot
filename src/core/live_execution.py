@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
@@ -338,6 +339,27 @@ def _rescale_size_for_live(trade: Dict, trader) -> Optional[Dict]:
         return None
 
     scale = live_free_margin / paper_balance
+    # H7: Clamp scale to 1.0 when live free margin exceeds the paper
+    # reference unless the operator explicitly opts in via
+    # LIVE_ALLOW_SCALE_ABOVE_PAPER=1.  The paper book is the source of our
+    # sizing edge (it's where Kelly/regime/confidence multipliers were
+    # calibrated); letting a larger live balance push scale > 1 would
+    # quietly 10x the position when operators topped-up their wallet
+    # without also bumping PAPER_TRADING_INITIAL_BALANCE.
+    allow_above = str(
+        os.environ.get("LIVE_ALLOW_SCALE_ABOVE_PAPER", "0")
+    ).strip().lower() in {"1", "true", "yes"}
+    if scale > 1.0 and not allow_above:
+        logger.info(
+            "Clamping live mirror scale for %s from %.4f to 1.0 "
+            "(live_free_margin=$%.2f > paper_balance=$%.0f). "
+            "Set LIVE_ALLOW_SCALE_ABOVE_PAPER=1 to opt out.",
+            trade.get("coin", "?"),
+            scale,
+            live_free_margin,
+            paper_balance,
+        )
+        scale = 1.0
     original_size = float(trade.get("size", 0) or 0)
     if original_size <= 0:
         return trade
@@ -383,20 +405,51 @@ def _rescale_size_for_live(trade: Dict, trader) -> Optional[Dict]:
             or 0
         )
 
-    if max_order_usd and max_order_usd > 0 and entry_price > 0:
+    # E6: cap using the *slipped* price that market orders actually trade at,
+    # not the raw mid.  Hyperliquid's SDK default slippage is 5%, so a buy
+    # order sized at mid against a $35 cap can blow past the cap to ~$36.75
+    # when the fill prints at mid*1.05.  Use the slipped price for the cap
+    # check and the floor-up check so the reference used for sizing matches
+    # the price the order actually executes at.
+    try:
+        slippage_pct = float(
+            os.environ.get("LIVE_MARKET_SLIPPAGE_PCT", "0.05")
+        )
+    except (TypeError, ValueError):
+        slippage_pct = 0.05
+    slippage_pct = max(0.0, min(0.5, slippage_pct))
+    side_raw = str(scaled_trade.get("side", "") or trade.get("side", "") or "").strip().lower()
+    if side_raw in {"buy", "long"}:
+        slipped_price = entry_price * (1.0 + slippage_pct) if entry_price > 0 else 0.0
+    elif side_raw in {"sell", "short"}:
+        slipped_price = entry_price * (1.0 - slippage_pct) if entry_price > 0 else 0.0
+    else:
+        # Unknown side — fall back to the more conservative (higher) buy-side
+        # slipped price so the cap still holds.
+        slipped_price = entry_price * (1.0 + slippage_pct) if entry_price > 0 else 0.0
+
+    # Reference price used for cap enforcement.  For BUYS the slipped price
+    # is higher than mid (shrinks size), for SELLS it is lower (also shrinks
+    # size when the proceeds must stay below the cap).
+    cap_reference_price = (
+        max(slipped_price, entry_price) if slipped_price > 0 else entry_price
+    )
+
+    if max_order_usd and max_order_usd > 0 and cap_reference_price > 0:
         current_size = float(scaled_trade.get("size", 0) or 0)
-        notional = current_size * entry_price
+        notional = current_size * cap_reference_price
         if notional > max_order_usd:
-            capped_size = max_order_usd / entry_price
+            capped_size = max_order_usd / cap_reference_price
             logger.info(
-                "Capping %s live mirror to $%.2f: %.6f → %.6f "
+                "Capping %s live mirror to $%.2f (slipped ref=%.6f): %.6f → %.6f "
                 "(notional $%.2f → $%.2f)",
                 coin or "?",
                 max_order_usd,
+                cap_reference_price,
                 current_size,
                 capped_size,
                 notional,
-                capped_size * entry_price,
+                capped_size * cap_reference_price,
             )
             scaled_trade["size"] = capped_size
 

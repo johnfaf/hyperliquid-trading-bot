@@ -31,6 +31,12 @@ def test_snapshot_balance_alerts_when_free_margin_stays_zero(monkeypatch, caplog
     trader._last_hash_cleanup_ts = 0.0
     trader._HASH_CLEANUP_INTERVAL = 60.0
     trader._ORDER_DEDUP_WINDOW = 30.0
+    # S3 drawdown tracker attrs — defaults disable the check.
+    trader._max_drawdown_usd = 0.0
+    trader._drawdown_window_s = 24 * 3600.0
+    trader._equity_samples = __import__("collections").deque()
+    trader._equity_samples_lock = threading.Lock()
+    trader._peak_equity_since_start = 0.0
     trader.is_deployable = lambda: True
 
     def _post(payload, **kwargs):
@@ -96,6 +102,12 @@ def test_snapshot_balance_alerts_when_free_margin_recovers(monkeypatch):
     trader._last_hash_cleanup_ts = 0.0
     trader._HASH_CLEANUP_INTERVAL = 60.0
     trader._ORDER_DEDUP_WINDOW = 30.0
+    # S3 drawdown tracker attrs — defaults disable the check.
+    trader._max_drawdown_usd = 0.0
+    trader._drawdown_window_s = 24 * 3600.0
+    trader._equity_samples = __import__("collections").deque()
+    trader._equity_samples_lock = threading.Lock()
+    trader._peak_equity_since_start = 0.0
     trader.is_deployable = lambda: True
 
     def _post(payload, **kwargs):
