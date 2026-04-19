@@ -78,6 +78,47 @@ from src.signals.signal_schema import TradeSignal, signal_from_execution_dict
 logger = logging.getLogger(__name__)
 
 
+def _safe_env_float(
+    name: str,
+    default: float,
+    *,
+    lo: Optional[float] = None,
+    hi: Optional[float] = None,
+) -> float:
+    """Parse a numeric env var with try/except + optional range clamp.  C6.
+
+    Trading-critical env vars (max_daily_loss, max_drawdown, slippage, cooldowns)
+    must never raise or silently accept an unreasonable value.  Unparseable
+    input logs a warning and falls back to ``default``.  Values outside
+    ``[lo, hi]`` are clamped and a warning is logged so operators learn
+    immediately instead of discovering it when a trade behaves unexpectedly.
+    """
+    raw = os.environ.get(name)
+    if raw is None or str(raw).strip() == "":
+        return float(default)
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        logger.warning(
+            "Env var %s=%r is not numeric; falling back to default %s",
+            name, raw, default,
+        )
+        return float(default)
+    if lo is not None and value < lo:
+        logger.warning(
+            "Env var %s=%s is below lower bound %s; clamping up.",
+            name, value, lo,
+        )
+        value = float(lo)
+    if hi is not None and value > hi:
+        logger.warning(
+            "Env var %s=%s exceeds upper bound %s; clamping down.",
+            name, value, hi,
+        )
+        value = float(hi)
+    return float(value)
+
+
 class OrderType(str, Enum):
     """Order types supported by Hyperliquid."""
     LIMIT_GTC = "Gtc"         # Good Till Canceled limit
@@ -383,7 +424,10 @@ class LiveTrader:
         self.firewall = firewall
         self.live_requested = not dry_run
         self.dry_run = dry_run
-        self.max_daily_loss = float(os.environ.get("HL_MAX_DAILY_LOSS", max_daily_loss))
+        # C6: guard against unparseable or absurd env input.
+        self.max_daily_loss = _safe_env_float(
+            "HL_MAX_DAILY_LOSS", max_daily_loss, lo=0.01, hi=1e7,
+        )
         max_position_env = os.environ.get("LIVE_MAX_POSITION_SIZE_USD") or os.environ.get("HL_MAX_POSITION_SIZE")
         self._max_position_size_configured = max_position_env is not None
         self.max_position_size = float(max_position_env) if max_position_env is not None else float(max_position_size)
@@ -604,9 +648,8 @@ class LiveTrader:
         self._last_known_free_margin: Optional[float] = None
         self._free_margin_zero_since_ts: float = 0.0
         self._last_free_margin_alert_ts: float = 0.0
-        self._free_margin_alert_cooldown_s = max(
-            60.0,
-            float(os.environ.get("LIVE_FREE_MARGIN_ALERT_COOLDOWN_S", "900")),
+        self._free_margin_alert_cooldown_s = _safe_env_float(
+            "LIVE_FREE_MARGIN_ALERT_COOLDOWN_S", 900.0, lo=60.0, hi=86_400.0,
         )
 
         # ── S3: rolling-24h drawdown + peak-equity drawdown cap ─────────
@@ -615,17 +658,14 @@ class LiveTrader:
         # The peak is computed over a rolling window (default 24h); both the
         # peak and the entry count are derived from equity samples recorded
         # by snapshot_balance().  0 / unset disables the check.
-        try:
-            self._max_drawdown_usd = float(os.environ.get("LIVE_MAX_DRAWDOWN_USD", "0") or 0)
-        except (TypeError, ValueError):
-            self._max_drawdown_usd = 0.0
-        try:
-            self._drawdown_window_s = float(
-                os.environ.get("LIVE_DRAWDOWN_WINDOW_S", str(24 * 3600))
-            )
-        except (TypeError, ValueError):
-            self._drawdown_window_s = 24 * 3600.0
-        self._drawdown_window_s = max(300.0, self._drawdown_window_s)
+        # C6: drawdown envs go through the same safe parser — bad input
+        # must fail closed (disable the check) rather than raise.
+        self._max_drawdown_usd = _safe_env_float(
+            "LIVE_MAX_DRAWDOWN_USD", 0.0, lo=0.0, hi=1e8,
+        )
+        self._drawdown_window_s = _safe_env_float(
+            "LIVE_DRAWDOWN_WINDOW_S", 24 * 3600.0, lo=300.0, hi=30 * 86_400.0,
+        )
         self._equity_samples: Deque[Tuple[float, float]] = deque()  # (ts, equity)
         self._equity_samples_lock = threading.Lock()
         self._peak_equity_since_start: float = 0.0
@@ -1125,7 +1165,14 @@ class LiveTrader:
         status_reason: str = "kill_switch_active",
         persist: bool = True,
     ) -> None:
-        """Set the sticky kill-switch flag and persist it by default."""
+        """Set the sticky kill-switch flag and persist it by default.
+
+        On the first state transition (``not kill_switch_active`` -> active)
+        we also fire a Telegram alert so operators see the event even if
+        they aren't tailing logs.  C1.  Alert failures are swallowed — the
+        kill switch must remain effective even when notifications are
+        misconfigured.
+        """
         reason = str(reason or "unspecified")
         changed = False
         with self._state_lock:
@@ -1135,6 +1182,11 @@ class LiveTrader:
             self.status_reason = status_reason
         if changed:
             logger.critical("Kill switch ACTIVATED (%s)", reason)
+            try:
+                from src.notifications import telegram_bot as tg
+                tg.notify_kill_switch_activated(reason, status_reason=status_reason)
+            except Exception as alert_exc:
+                logger.warning("Kill-switch Telegram alert skipped: %s", alert_exc)
         if persist:
             self._persist_kill_switch_state(True, reason)
 

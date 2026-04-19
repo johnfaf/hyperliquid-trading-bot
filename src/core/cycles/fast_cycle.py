@@ -153,8 +153,15 @@ def check_file_kill_switch(container) -> bool:
                 live_trader.kill_switch_active = True
                 live_trader._kill_switch_reason = reason
                 live_trader.status_reason = "external_kill_switch"
-        except Exception:
-            pass
+        except Exception as exc:
+            # Log but still fall through to cancel_live_orders_once below —
+            # a broken activate_kill_switch() must not block the emergency
+            # order-cancel path.  C10.
+            logger.error(
+                "[fast] Failed to flip sticky kill switch on live_trader (%s) — "
+                "continuing to cancel orders regardless",
+                exc,
+            )
         # Serialised single-shot cancellation — if the SIGINT handler also
         # fires, only one of the two will actually hit the exchange.  KILL
         # SWITCH is an emergency path, so we force-cancel regardless of the

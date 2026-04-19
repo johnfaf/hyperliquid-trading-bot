@@ -359,17 +359,39 @@ def notify_live_margin_blocked(
 def notify_manual_close_detected(trade: Dict, exit_price: float):
     """Alert when reconcile finds an exchange position disappeared unexpectedly."""
     text = (
-        f"âš ï¸ <b>MANUAL / EXTERNAL CLOSE DETECTED</b>\n"
-        f"â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”\n"
+        f"\u26A0\uFE0F <b>MANUAL / EXTERNAL CLOSE DETECTED</b>\n"
+        f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
         f"<b>Coin:</b> {trade.get('coin', '?')}\n"
         f"<b>Side:</b> {str(trade.get('side', '?')).upper()}\n"
         f"<b>Entry:</b> ${float(trade.get('entry_price', 0) or 0):,.4f}\n"
         f"<b>Exchange Exit:</b> ${float(exit_price or 0):,.4f}\n"
         f"<b>Paper Trade ID:</b> {trade.get('id', trade.get('trade_id', '?'))}\n"
         f"<b>Reason:</b> exchange position missing during reconcile\n"
-        f"\nâ° {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}"
+        f"\n\u23F0 {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}"
     )
     _send_message(text)
+
+
+def notify_kill_switch_activated(reason: str, *, status_reason: str = "kill_switch_active") -> None:
+    """Alert operators when the live kill switch trips.  C1.
+
+    Emitted from every path that activates the sticky kill switch: manual
+    invocation, rolling-window drawdown (S3), fast-cycle failure escalation
+    (S7), and the external KILL_SWITCH file.  Failures to send are swallowed
+    so the kill switch itself cannot be blocked by a misconfigured Telegram.
+    """
+    if not is_configured():
+        return
+    text = (
+        f"\U0001F6D1 <b>KILL SWITCH ACTIVATED</b>\n"
+        f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+        f"<b>Reason:</b> {str(reason or 'unspecified')[:180]}\n"
+        f"<b>Status:</b> {str(status_reason or 'kill_switch_active')[:80]}\n"
+        f"<b>Impact:</b> No new live orders will ship until the operator clears the sticky flag.\n"
+        f"\n\u23F0 {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}"
+    )
+    _send_message(text)
+
 
 
 def notify_strong_signal(coin: str, side: str, reasons: List[str], confidence: float):

@@ -411,13 +411,29 @@ def _rescale_size_for_live(trade: Dict, trader) -> Optional[Dict]:
     # when the fill prints at mid*1.05.  Use the slipped price for the cap
     # check and the floor-up check so the reference used for sizing matches
     # the price the order actually executes at.
+    # C6: safe parse with range clamp — slippage > 50% would effectively
+    # disable the cap, and negative input would cap *above* the raw mid.
+    raw_slip = os.environ.get("LIVE_MARKET_SLIPPAGE_PCT", "0.05")
     try:
-        slippage_pct = float(
-            os.environ.get("LIVE_MARKET_SLIPPAGE_PCT", "0.05")
-        )
+        slippage_pct = float(raw_slip)
     except (TypeError, ValueError):
+        logger.warning(
+            "LIVE_MARKET_SLIPPAGE_PCT=%r not numeric; using default 0.05",
+            raw_slip,
+        )
         slippage_pct = 0.05
-    slippage_pct = max(0.0, min(0.5, slippage_pct))
+    if slippage_pct < 0.0:
+        logger.warning(
+            "LIVE_MARKET_SLIPPAGE_PCT=%s is negative; clamping to 0.0",
+            slippage_pct,
+        )
+        slippage_pct = 0.0
+    elif slippage_pct > 0.5:
+        logger.warning(
+            "LIVE_MARKET_SLIPPAGE_PCT=%s > 0.5 (50%%); clamping to 0.5",
+            slippage_pct,
+        )
+        slippage_pct = 0.5
     side_raw = str(scaled_trade.get("side", "") or trade.get("side", "") or "").strip().lower()
     if side_raw in {"buy", "long"}:
         slipped_price = entry_price * (1.0 + slippage_pct) if entry_price > 0 else 0.0
