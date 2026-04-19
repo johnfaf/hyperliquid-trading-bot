@@ -1982,11 +1982,14 @@ def test_execute_signal_caps_notional_at_max_order_usd(monkeypatch):
 
 
 def test_live_trader_raises_cap_to_exchange_minimum(monkeypatch):
-    """Regression test: LIVE_MAX_ORDER_USD below Hyperliquid's $10 minimum
-    notional makes every live order silently fail (matching engine drops
-    it, then fill verification times out as "FILL NOT VERIFIED").  The
-    LiveTrader should raise the cap to the exchange minimum at startup
-    with a warning rather than allow the impossible state."""
+    """Regression test (H11): LIVE_MAX_ORDER_USD below Hyperliquid's $10
+    minimum notional is a FATAL startup misconfiguration in live mode —
+    silently raising the cap would let the operator deploy with a number
+    they didn't intend.  In live mode we now raise ValueError.  In dry-run
+    mode we still raise-to-min so backtests/simulations don't crash.
+    """
+    import pytest
+
     class FakeFirewall:
         def validate(self, signal, **kwargs):
             return True, "ok"
@@ -1994,9 +1997,12 @@ def test_live_trader_raises_cap_to_exchange_minimum(monkeypatch):
     monkeypatch.setattr(LiveTrader, "_load_credentials", _fake_live_credentials)
     monkeypatch.setattr(LiveTrader, "_load_asset_index_map", lambda self: None)
 
-    trader = LiveTrader(firewall=FakeFirewall(), dry_run=False, max_order_usd=3.0)
+    # Live mode: hard failure.
+    with pytest.raises(ValueError, match="below"):
+        LiveTrader(firewall=FakeFirewall(), dry_run=False, max_order_usd=3.0)
 
-    # Cap was below the $10 min — should have been raised to min (default 11)
+    # Dry-run mode: fall back to the old raise-to-min behaviour.
+    trader = LiveTrader(firewall=FakeFirewall(), dry_run=True, max_order_usd=3.0)
     assert trader.max_order_usd >= 10.0
     assert trader.max_order_usd == trader.min_order_usd
 

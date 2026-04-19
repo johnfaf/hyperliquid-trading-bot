@@ -98,8 +98,14 @@ def cancel_live_orders_once(container, reason: str, *, force: bool = False) -> b
         if not force and getattr(live_trader, "dry_run", True):
             setattr(container, "_shutdown_orders_cancelled", True)
             return False
-        # Mark first, then execute: if cancel_all_orders raises we still want
-        # the flag set so a racing caller doesn't attempt it again.
+        # Mark in-flight first so a concurrent caller inside the lock-free
+        # window (other threads entering this function while we hold the
+        # lock) doesn't re-attempt the cancellation when it wakes up.  On
+        # SUCCESS we leave the flag set.  On EXCEPTION we clear it so the
+        # next caller (typically the SIGINT handler if fast-cycle tripped
+        # the file kill switch first) can retry — an unprotected position
+        # with stale open orders is a far worse outcome than a duplicate
+        # cancel call.  S8.
         setattr(container, "_shutdown_orders_cancelled", True)
         try:
             cancelled = live_trader.cancel_all_orders()
@@ -109,8 +115,11 @@ def cancel_live_orders_once(container, reason: str, *, force: bool = False) -> b
             return True
         except Exception as exc:
             logger.error(
-                "Failed to cancel live orders during shutdown (%s): %s", reason, exc,
+                "Failed to cancel live orders during shutdown (%s): %s — "
+                "clearing shutdown_orders_cancelled flag so a retry can run",
+                reason, exc,
             )
+            setattr(container, "_shutdown_orders_cancelled", False)
             return False
 
 
@@ -156,6 +165,56 @@ def check_file_kill_switch(container) -> bool:
         )
 
     return True
+
+
+def _fast_cycle_failure_threshold() -> int:
+    """Consecutive fast-cycle failures before we force-kill live trading.  S7."""
+    try:
+        return max(1, int(os.environ.get("FAST_CYCLE_MAX_CONSECUTIVE_FAILURES", "5")))
+    except (TypeError, ValueError):
+        return 5
+
+
+def _record_fast_cycle_success(container) -> None:
+    setattr(container, "_fast_cycle_consecutive_failures", 0)
+
+
+def _record_fast_cycle_failure(container, exc: Exception) -> None:
+    """Bump the consecutive-failure counter; trip kill switch on threshold.  S7.
+
+    A fast cycle that keeps throwing means the bot cannot enforce SL/TP,
+    reconcile fills, or see the file kill switch — continuing to trade while
+    the risk loop is blind is exactly how a canary turns into a blow-up.
+    We escalate with both a task-runner FAILED flag (so the supervisor notices)
+    and the live-trader kill switch (so no new orders ship).
+    """
+    count = int(getattr(container, "_fast_cycle_consecutive_failures", 0) or 0) + 1
+    setattr(container, "_fast_cycle_consecutive_failures", count)
+    threshold = _fast_cycle_failure_threshold()
+    if count >= threshold:
+        logger.critical(
+            "[fast] %d consecutive fast-cycle failures (>= %d) — escalating: "
+            "marking bg-fast FAILED and activating live kill switch.  Last error: %s",
+            count, threshold, exc,
+        )
+        # Mark the task as FAILED so the supervisor / health checks surface it.
+        task_runner = getattr(container, "task_runner", None)
+        if task_runner is not None:
+            try:
+                task_runner.mark_failed("bg-fast", f"consecutive_failures={count}")
+            except Exception as mark_exc:
+                logger.error("[fast] mark_failed('bg-fast') failed: %s", mark_exc)
+        # Trip the live kill switch so no new orders ship while the risk
+        # loop is broken.  activate_kill_switch is idempotent.
+        live_trader = getattr(container, "live_trader", None)
+        if live_trader is not None:
+            try:
+                live_trader.activate_kill_switch(
+                    f"fast_cycle_consecutive_failures:{count}",
+                    status_reason="fast_cycle_failed",
+                )
+            except Exception as ks_exc:
+                logger.error("[fast] activate_kill_switch failed during escalation: %s", ks_exc)
 
 
 def run_fast_cycle(container, cycle_count: int) -> None:
@@ -229,8 +288,12 @@ def run_fast_cycle(container, cycle_count: int) -> None:
             logger.critical("[fast] Emergency stop requested after fast cycle work")
             return
 
+        # Clean pass — reset the consecutive-failure counter.
+        _record_fast_cycle_success(container)
+
     except Exception as exc:
         logger.error("Error in fast cycle: %s", exc)
+        _record_fast_cycle_failure(container, exc)
 
 
 def _scan_whale_trades(container) -> None:

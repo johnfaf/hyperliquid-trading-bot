@@ -855,10 +855,23 @@ class CopyTrader:
         size = size_usd / price
         leverage = signal.get("leverage", 2)
         side = signal["side"]
+        # Normalize both sides of the conflict comparison.  Upstream producers
+        # mix Enum, "LONG"/"long"/"Long" etc., and a case-sensitive "!=" would
+        # silently clear a real conflict (letting us open a short next to a
+        # long on the same coin).  H12.
+        side_norm = (
+            side.value if hasattr(side, "value") else str(side)
+        ).strip().lower()
 
         # CRITICAL: No conflicting sides on same asset
         for t in open_trades:
-            if t.get("coin") == signal["coin"] and t.get("side") != side:
+            if t.get("coin") != signal["coin"]:
+                continue
+            t_side = t.get("side")
+            t_side_norm = (
+                t_side.value if hasattr(t_side, "value") else str(t_side or "")
+            ).strip().lower()
+            if t_side_norm and t_side_norm != side_norm:
                 logger.debug(f"Copy skip: conflicting side for {signal['coin']}")
                 return None
 

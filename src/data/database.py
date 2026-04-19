@@ -761,40 +761,24 @@ def close_paper_trade_and_credit_account(trade_id, exit_price, pnl) -> bool:
                 )
                 return False
 
-            row = conn.execute(
-                "SELECT balance, total_pnl, total_trades, winning_trades "
-                "FROM paper_account WHERE id = 1"
-            ).fetchone()
-            if not row:
-                try:
-                    conn.rollback()
-                except Exception:
-                    pass
-                logger.error(
-                    "close_paper_trade_and_credit_account: paper_account row "
-                    "missing; rolling back close of trade_id=%s", trade_id,
-                )
-                return False
-
-            try:
-                balance = row["balance"]
-                total_pnl = row["total_pnl"]
-                total_trades = row["total_trades"]
-                winning_trades = row["winning_trades"]
-            except (KeyError, TypeError, IndexError):
-                balance, total_pnl, total_trades, winning_trades = row[0], row[1], row[2], row[3]
-
-            new_balance = float(balance or 0) + float(pnl)
-            new_total_pnl = float(total_pnl or 0) + float(pnl)
-            new_total_trades = int(total_trades or 0) + 1
-            new_winning = int(winning_trades or 0) + (1 if pnl > 0 else 0)
-
+            # D10: Use a single relative UPDATE instead of SELECT-then-UPDATE.
+            # Even inside a transaction the prior pattern left a read/modify/
+            # write sequence that any concurrent writer (dashboard admin
+            # console, reconciliation job) could interleave against.  An
+            # atomic "balance = balance + ?" form serialises cleanly and also
+            # means a failed commit never leaves stale absolute values that
+            # were computed from a now-outdated read.
+            pnl_delta = float(pnl)
+            win_delta = 1 if pnl_delta > 0 else 0
             acct_cursor = conn.execute("""
                 UPDATE paper_account
-                SET balance = ?, total_pnl = ?, total_trades = ?, winning_trades = ?,
+                SET balance = COALESCE(balance, 0) + ?,
+                    total_pnl = COALESCE(total_pnl, 0) + ?,
+                    total_trades = COALESCE(total_trades, 0) + 1,
+                    winning_trades = COALESCE(winning_trades, 0) + ?,
                     last_updated = ?
                 WHERE id = 1
-            """, (new_balance, new_total_pnl, new_total_trades, new_winning, now))
+            """, (pnl_delta, pnl_delta, win_delta, now))
             if acct_cursor.rowcount == 0:
                 try:
                     conn.rollback()

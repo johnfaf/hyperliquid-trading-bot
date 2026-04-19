@@ -406,16 +406,23 @@ class LiveTrader:
         # Guard: the exchange enforces a hard minimum notional, so any cap
         # below that would make live trading physically impossible (every
         # order would be dropped by the matching engine, then fail fill
-        # verification).  Raise the cap to the floor and warn loudly.
+        # verification).  In live mode this is a FATAL misconfiguration —
+        # silently raising the cap hides the operator's typo and makes real
+        # capital ride on a number they didn't intend.  H11.
         if self.max_order_usd < self.min_order_usd:
+            msg = (
+                f"LIVE_MAX_ORDER_USD=${self.max_order_usd:.2f} is below "
+                f"LIVE_MIN_ORDER_USD=${self.min_order_usd:.2f} (Hyperliquid's "
+                f"hard minimum).  With this config every order would be "
+                f"dropped by the matching engine.  Fix the env var before "
+                f"starting."
+            )
+            if not self.dry_run:
+                logger.critical(msg)
+                raise ValueError(msg)
             logger.warning(
-                "LIVE_MAX_ORDER_USD=$%.2f is below Hyperliquid's $%.2f minimum "
-                "notional per order.  Raising cap to $%.2f so orders can "
-                "actually execute.  Set LIVE_MAX_ORDER_USD to a higher value "
-                "on Railway to give the bot more headroom.",
-                self.max_order_usd,
-                self.min_order_usd,
-                self.min_order_usd,
+                "%s  (dry-run: raising cap to min for continued simulation)",
+                msg,
             )
             self.max_order_usd = self.min_order_usd
         if not self._max_position_size_configured and self.max_position_size < self.max_order_usd:

@@ -171,6 +171,32 @@ class SupervisedTaskRunner:
         time.sleep(0.1)
         self.start(name)
 
+    def mark_failed(self, name: str, reason: str) -> bool:
+        """Externally mark a task as failed.
+
+        Used by caller-side failure detectors (e.g. the fast-cycle
+        consecutive-failure counter, S7) that have their own domain-specific
+        definition of "this task is broken" beyond raw exception counts.
+        Transitions the task to ``failed`` and notifies the health registry.
+        Returns True if the task existed and was transitioned, False otherwise.
+        """
+        with self._lock:
+            task = self._tasks.get(name)
+            if task is None:
+                return False
+            task.state = "failed"
+            task.last_error = str(reason)[:200]
+        logger.error("Task '%s' externally marked failed: %s", name, reason)
+        if self._health:
+            try:
+                from src.core.health_registry import SubsystemState
+                self._health.set_status(
+                    name, SubsystemState.FAILED, reason=str(reason)[:200],
+                )
+            except Exception:
+                pass
+        return True
+
     # ── Query ─────────────────────────────────────────────────────
 
     def is_running(self, name: str) -> bool:
