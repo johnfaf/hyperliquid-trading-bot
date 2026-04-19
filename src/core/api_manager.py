@@ -36,6 +36,7 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import config
+from src.core.env_utils import safe_env_float
 
 logger = logging.getLogger("api_manager")
 logger.addHandler(logging.NullHandler())
@@ -685,7 +686,10 @@ class APIManager:
         self._CIRCUIT_COOLDOWN = 30.0   # seconds to pause non-critical traffic after trip
         # Max age of WS mids before we stop serving them and fall back to REST.
         # A silent TCP stall can leave is_connected=True with minutes-old data.
-        self._WS_MIDS_MAX_AGE_S = float(os.environ.get("WS_MIDS_MAX_AGE_S", "2.0"))
+        # C9: clamp to [0.1, 300]; lower = more fallback to REST, higher = stale data risk.
+        self._WS_MIDS_MAX_AGE_S = safe_env_float(
+            "WS_MIDS_MAX_AGE_S", 2.0, lo=0.1, hi=300.0,
+        )
         self._req_type_failures: Dict[str, int] = {}
         self._req_type_cooldown_until: Dict[str, float] = {}
         # Track when we last logged a SERVER_ERROR warning per req_type so we

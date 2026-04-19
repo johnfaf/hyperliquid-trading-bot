@@ -23,6 +23,7 @@ from contextlib import contextmanager
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 import config
 
+from src.core.env_utils import safe_env_float
 from src.data.db.connection import ConnectionAdapter, DualWriteAdapter
 
 logger = logging.getLogger(__name__)
@@ -36,7 +37,7 @@ def _sqlite_connect() -> sqlite3.Connection:
 
     db_path = config.DB_PATH
     db_dir = os.path.dirname(os.path.abspath(db_path))
-    min_free = max(1.0, float(os.environ.get("DB_MIN_FREE_MB", "100")))
+    min_free = safe_env_float("DB_MIN_FREE_MB", 100.0, lo=1.0, hi=100_000.0)
     usage = shutil.disk_usage(db_dir)
     free_mb = usage.free / (1024 * 1024)
     if free_mb < min_free:

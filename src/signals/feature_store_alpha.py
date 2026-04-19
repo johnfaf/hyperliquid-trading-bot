@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import os
 import pickle
 import time
 from dataclasses import dataclass
@@ -654,8 +655,17 @@ class FeatureStoreAlphaPipeline:
             "calibrator": self.calibrators.get(horizon),
             "metadata": self.model_metadata.get(horizon, {}),
         }
-        with path.open("wb") as fh:
+        # Atomic write: temp file + os.replace so a crash mid-write cannot
+        # corrupt the model artifact that _load_models() reads at startup.
+        tmp_path = path.with_suffix(path.suffix + ".tmp")
+        with tmp_path.open("wb") as fh:
             pickle.dump(payload, fh)
+            fh.flush()
+            try:
+                os.fsync(fh.fileno())
+            except OSError:
+                pass
+        os.replace(str(tmp_path), str(path))
 
     def _load_models(self) -> None:
         if not HAS_ALPHA_ML:

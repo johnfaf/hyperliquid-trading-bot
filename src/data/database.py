@@ -22,6 +22,7 @@ from contextlib import contextmanager
 import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import config
+from src.core.env_utils import safe_env_float
 
 logger = logging.getLogger(__name__)
 _TRADER_ADDRESS_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
@@ -29,7 +30,7 @@ _TRADER_ADDRESS_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
 # Resolved once at import — config.py already tested writability
 _DB_PATH = config.DB_PATH
 os.makedirs(os.path.dirname(os.path.abspath(_DB_PATH)), exist_ok=True)
-_DB_MIN_FREE_MB = max(1.0, float(os.environ.get("DB_MIN_FREE_MB", "100")))
+_DB_MIN_FREE_MB = safe_env_float("DB_MIN_FREE_MB", 100.0, lo=1.0, hi=100_000.0)
 
 # Import the router — it handles backend selection internally.
 from src.data.db.router import (                       # noqa: E402
@@ -1031,8 +1032,18 @@ def backup_to_json(filepath: str = None):
         except Exception as e:
             print(f"Warning: could not backup golden/calibration data: {e}")
 
-        with open(filepath, "w") as f:
+        # Atomic write: temp file + os.replace so a crash mid-write cannot
+        # corrupt the backup file that restore_from_json() reads on fresh
+        # deploys.  Truncated bot_backup.json has caused real data loss.
+        tmp_path = f"{filepath}.tmp"
+        with open(tmp_path, "w") as f:
             json.dump(data, f)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except OSError:
+                pass  # fsync not supported on some FS; best-effort only
+        os.replace(tmp_path, filepath)
 
         size_kb = os.path.getsize(filepath) / 1024
         counts = (f"{len(data.get('traders', []))} traders, "

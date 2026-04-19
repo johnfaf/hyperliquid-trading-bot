@@ -78,45 +78,13 @@ from src.signals.signal_schema import TradeSignal, signal_from_execution_dict
 logger = logging.getLogger(__name__)
 
 
-def _safe_env_float(
-    name: str,
-    default: float,
-    *,
-    lo: Optional[float] = None,
-    hi: Optional[float] = None,
-) -> float:
-    """Parse a numeric env var with try/except + optional range clamp.  C6.
-
-    Trading-critical env vars (max_daily_loss, max_drawdown, slippage, cooldowns)
-    must never raise or silently accept an unreasonable value.  Unparseable
-    input logs a warning and falls back to ``default``.  Values outside
-    ``[lo, hi]`` are clamped and a warning is logged so operators learn
-    immediately instead of discovering it when a trade behaves unexpectedly.
-    """
-    raw = os.environ.get(name)
-    if raw is None or str(raw).strip() == "":
-        return float(default)
-    try:
-        value = float(raw)
-    except (TypeError, ValueError):
-        logger.warning(
-            "Env var %s=%r is not numeric; falling back to default %s",
-            name, raw, default,
-        )
-        return float(default)
-    if lo is not None and value < lo:
-        logger.warning(
-            "Env var %s=%s is below lower bound %s; clamping up.",
-            name, value, lo,
-        )
-        value = float(lo)
-    if hi is not None and value > hi:
-        logger.warning(
-            "Env var %s=%s exceeds upper bound %s; clamping down.",
-            name, value, hi,
-        )
-        value = float(hi)
-    return float(value)
+from src.core.env_utils import safe_env_float as _safe_env_float  # C6/C9 shared helper
+from src.trading.scaling_tiers import (
+    ScalingTier,
+    apply_tier_caps,
+    resolve_tier,
+    summarize_tier,
+)
 
 
 class OrderType(str, Enum):
@@ -480,23 +448,77 @@ class LiveTrader:
             )
             self.max_position_size = self.max_order_usd
 
-        # Canary rollout guardrails for live deployment.
-        self.canary_mode = bool(getattr(config, "LIVE_CANARY_MODE", False))
-        self.canary_max_order_usd = float(
-            getattr(config, "LIVE_CANARY_MAX_ORDER_USD", self.max_order_usd)
-        )
-        self.canary_max_signals_per_day = int(
-            getattr(config, "LIVE_CANARY_MAX_SIGNALS_PER_DAY", 25)
-        )
-        if self.canary_mode and self.canary_max_order_usd > 0:
-            self.max_order_usd = max(
-                self.min_order_usd,
-                min(self.max_order_usd, self.canary_max_order_usd),
+        # ── Scaling tier / canary guardrails ─────────────────────────────
+        # Two mutually supportive mechanisms:
+        #   1. LIVE_TIER (T0..T4) — graduated ramp ladder from
+        #      ``src.trading.scaling_tiers``.  Tightens (downward-only)
+        #      max_order_usd, max_daily_loss, max_position_size, and
+        #      max_signals_per_day.  T4 = no tier override.
+        #   2. LIVE_CANARY_MODE — legacy single-flip canary.  Still
+        #      honoured when LIVE_TIER is unset, for backward compat.
+        # If both are set, LIVE_TIER wins and canary flags are derived
+        # from the tier's caps.
+        self.active_tier: Optional[ScalingTier] = None
+        self.kelly_dampen: float = 1.0
+        tier_env = os.environ.get("LIVE_TIER") or getattr(config, "LIVE_TIER", None)
+        self.active_tier = resolve_tier(tier_env)
+
+        if self.active_tier is not None:
+            caps = apply_tier_caps(
+                self.active_tier,
+                max_order_usd=self.max_order_usd,
+                max_daily_loss=self.max_daily_loss,
+                max_position_size=self.max_position_size,
+                max_signals_per_day=int(
+                    getattr(config, "LIVE_CANARY_MAX_SIGNALS_PER_DAY", 0) or 0
+                ),
+                min_order_usd=self.min_order_usd,
             )
+            self.max_order_usd = float(caps["max_order_usd"])
+            self.max_daily_loss = float(caps["max_daily_loss"])
+            self.max_position_size = float(caps["max_position_size"])
+            self.canary_max_signals_per_day = int(caps["max_signals_per_day"])
+            self.canary_max_order_usd = (
+                float(self.active_tier.max_order_usd)
+                if self.active_tier.max_order_usd is not None
+                else self.max_order_usd
+            )
+            # canary_mode stays True while the tier is NOT full-scale so
+            # that all existing canary-gated code paths (signal-per-day
+            # caps, tighter rejects) keep firing until the operator
+            # explicitly moves to T4.
+            self.canary_mode = self.active_tier.name != "T4"
+            self.kelly_dampen = float(self.active_tier.kelly_dampen)
             logger.warning(
-                "LIVE_CANARY_MODE enabled: max_order_usd tightened to $%.2f",
+                "LIVE_TIER=%s (%s) active: max_order_usd=$%.2f, "
+                "max_daily_loss=$%.2f, max_position_size=$%.2f, "
+                "max_signals_per_day=%s, kelly_dampen=%.2f",
+                self.active_tier.name,
+                self.active_tier.label,
                 self.max_order_usd,
+                self.max_daily_loss,
+                self.max_position_size,
+                self.canary_max_signals_per_day or "unlimited",
+                self.kelly_dampen,
             )
+        else:
+            # Legacy canary block (unchanged behaviour when no LIVE_TIER).
+            self.canary_mode = bool(getattr(config, "LIVE_CANARY_MODE", False))
+            self.canary_max_order_usd = float(
+                getattr(config, "LIVE_CANARY_MAX_ORDER_USD", self.max_order_usd)
+            )
+            self.canary_max_signals_per_day = int(
+                getattr(config, "LIVE_CANARY_MAX_SIGNALS_PER_DAY", 25)
+            )
+            if self.canary_mode and self.canary_max_order_usd > 0:
+                self.max_order_usd = max(
+                    self.min_order_usd,
+                    min(self.max_order_usd, self.canary_max_order_usd),
+                )
+                logger.warning(
+                    "LIVE_CANARY_MODE enabled: max_order_usd tightened to $%.2f",
+                    self.max_order_usd,
+                )
 
         # Optional per-source/day entry cap (0 disables this guardrail).
         self.max_orders_per_source_per_day = int(
@@ -563,6 +585,12 @@ class LiveTrader:
         self.orders_today = 0
         self.fills_today = 0
         self._source_orders_today: Dict[str, int] = defaultdict(int)
+        # C12: _entry_metrics is written from the trading-cycle thread and
+        # snapshotted by the HTTP dashboard thread (via _get_health_dict).
+        # Concurrent dict(d) during an add-key mutation can raise
+        # "RuntimeError: dictionary changed size during iteration".  All
+        # mutations go through _incr_entry_metric() below, which acquires
+        # _state_lock (the same lock the dashboard snapshot takes).
         self._entry_metrics: Dict[str, int] = defaultdict(int)
 
         # Track realized PnL from closed positions for daily loss enforcement
@@ -1744,6 +1772,17 @@ class LiveTrader:
             self.activate_kill_switch(reason, status_reason="external_kill_switch")
             return True
         return False
+
+    def _incr_entry_metric(self, key: str, n: int = 1) -> None:
+        """Thread-safe increment on ``_entry_metrics`` (C12).
+
+        The dashboard thread snapshots ``_entry_metrics`` via
+        ``_get_health_dict`` while holding ``_state_lock``.  This helper
+        takes the same lock on the write path so a concurrent snapshot
+        cannot see the dict while a new key is being inserted.
+        """
+        with self._state_lock:
+            self._entry_metrics[key] += n
 
     def _check_daily_reset(self):
         """Reset daily counters at midnight UTC."""
@@ -3391,7 +3430,7 @@ class LiveTrader:
                         and candidate_notional <= self.max_order_usd
                         and candidate_size <= size * 1.25
                     ):
-                        self._entry_metrics["min_notional_floorups"] += 1
+                        self._incr_entry_metric("min_notional_floorups")
                         logger.info(
                             "place_market_order: floor-up %s %s %.6f -> "
                             "%.6f (notional $%.2f -> $%.2f) to clear "
@@ -3403,7 +3442,7 @@ class LiveTrader:
                         notional = candidate_notional
                         bumped = True
                 if not bumped:
-                    self._entry_metrics["rejected_below_min_notional"] += 1
+                    self._incr_entry_metric("rejected_below_min_notional")
                     logger.warning(
                         "place_market_order: rejecting %s %s size %.6f -- "
                         "notional $%.2f is below Hyperliquid's $%.2f "
@@ -3420,7 +3459,7 @@ class LiveTrader:
 
             leverage_result = self.ensure_exchange_leverage(coin, leverage)
             if leverage_result.get("status") not in {"success", "simulated"}:
-                self._entry_metrics["rejected_exchange"] += 1
+                self._incr_entry_metric("rejected_exchange")
                 return {
                     "status": "rejected",
                     "reason": "leverage_update_failed",
@@ -4335,8 +4374,8 @@ class LiveTrader:
                     floor_metric = "min_notional_top_tier_floorups"
 
             if floor_reason and target_size > 0:
-                self._entry_metrics["min_notional_floorups"] += 1
-                self._entry_metrics[floor_metric] += 1
+                self._incr_entry_metric("min_notional_floorups")
+                self._incr_entry_metric(floor_metric)
                 logger.info(
                     "Flooring %s to exchange minimum via %s: %.6f -> %.6f "
                     "(notional $%.2f -> $%.2f, bump %.2fx)",
@@ -4351,8 +4390,8 @@ class LiveTrader:
                 signal.size = target_size
                 return signal
 
-            self._entry_metrics["rejected_below_min_notional"] += 1
-            self._entry_metrics["approved_but_not_executable"] += 1
+            self._incr_entry_metric("rejected_below_min_notional")
+            self._incr_entry_metric("approved_but_not_executable")
             logger.warning(
                 "Approved %s signal is not executable: notional $%.2f is below "
                 "Hyperliquid's $%.2f minimum and no safe floor-up path applied "
@@ -4400,14 +4439,14 @@ class LiveTrader:
         """
         signal = self._coerce_signal(signal)
         source_key = self._signal_source_key(signal)
-        self._entry_metrics["attempted_entry_signals"] += 1
+        self._incr_entry_metric("attempted_entry_signals")
         live_positions: Optional[List[Dict[str, Any]]] = None
         source_policy = self._get_source_policy(signal)
 
         # External kill-switch takes precedence over any other gate.
         self._refresh_external_kill_switch()
         if self.check_daily_loss(refresh_from_fills=True):
-            self._entry_metrics["rejected_daily_loss"] += 1
+            self._incr_entry_metric("rejected_daily_loss")
             logger.warning("Daily loss limit exceeded - rejecting signal")
             return None
 
@@ -4415,7 +4454,7 @@ class LiveTrader:
             live_positions = self.get_firewall_positions() if self.is_deployable() else None
             live_account_value = self.get_account_value() if self.is_deployable() else None
             if self.is_deployable() and live_positions is None:
-                self._entry_metrics["rejected_positions_unavailable"] += 1
+                self._incr_entry_metric("rejected_positions_unavailable")
                 logger.warning(
                     "Live positions unavailable - rejecting signal rather than trading blind"
                 )
@@ -4428,7 +4467,7 @@ class LiveTrader:
                 account_balance=live_account_value,
             )
             if not passed:
-                self._entry_metrics["rejected_firewall"] += 1
+                self._incr_entry_metric("rejected_firewall")
                 logger.info(f"Signal rejected by firewall: {reason}")
                 return None
         else:
@@ -4439,7 +4478,7 @@ class LiveTrader:
 
         # Check kill switch
         if self._kill_switch_is_active():
-            self._entry_metrics["rejected_kill_switch"] += 1
+            self._incr_entry_metric("rejected_kill_switch")
             logger.warning("Kill switch active - rejecting signal")
             return None
 
@@ -4447,7 +4486,7 @@ class LiveTrader:
         total_signals_today = sum(self._source_orders_today.values())
         if self.canary_mode and self.canary_max_signals_per_day > 0:
             if total_signals_today >= self.canary_max_signals_per_day:
-                self._entry_metrics["rejected_canary_cap"] += 1
+                self._incr_entry_metric("rejected_canary_cap")
                 logger.warning(
                     "Canary signal cap reached (%d/%d) - rejecting %s (source=%s)",
                     total_signals_today,
@@ -4459,7 +4498,7 @@ class LiveTrader:
         if self.max_orders_per_source_per_day > 0:
             used = self._source_orders_today.get(source_key, 0)
             if used >= self.max_orders_per_source_per_day:
-                self._entry_metrics["rejected_source_cap"] += 1
+                self._incr_entry_metric("rejected_source_cap")
                 logger.warning(
                     "Source/day cap reached for %s (%d/%d) - rejecting %s",
                     source_key,
@@ -4482,7 +4521,7 @@ class LiveTrader:
             # Compute coin quantity from USD notional: position_pct × max_position_size / mid
             mid = self._get_mid_price(coin)
             if not mid or mid <= 0:
-                self._entry_metrics["rejected_no_mid_price"] += 1
+                self._incr_entry_metric("rejected_no_mid_price")
                 logger.warning(
                     f"Cannot compute order size for {coin}: no mid price available -- skipping"
                 )
@@ -4520,7 +4559,7 @@ class LiveTrader:
             requested_entry_size = float(size)
 
             if not size or size <= 0:
-                self._entry_metrics["rejected_invalid_size"] += 1
+                self._incr_entry_metric("rejected_invalid_size")
                 logger.warning(f"Calculated size is 0 or negative for {coin} -- skipping")
                 return None
 
@@ -4528,7 +4567,7 @@ class LiveTrader:
             if not self.dry_run:
                 positions_before_entry = live_positions if live_positions is not None else self.get_positions()
                 if positions_before_entry is None:
-                    self._entry_metrics["rejected_positions_unavailable"] += 1
+                    self._incr_entry_metric("rejected_positions_unavailable")
                     logger.warning(
                         "Live positions unavailable before %s entry - rejecting rather "
                         "than verifying fill against an unknown baseline",
@@ -4553,7 +4592,7 @@ class LiveTrader:
 
             if not self._is_order_result_success(entry_result):
                 if self._is_insufficient_margin_rejection(entry_result):
-                    self._entry_metrics["rejected_insufficient_margin"] += 1
+                    self._incr_entry_metric("rejected_insufficient_margin")
                     logger.warning(
                         "Skipping %s %s entry due to insufficient margin: %s",
                         coin,
@@ -4565,7 +4604,7 @@ class LiveTrader:
                     if isinstance(entry_result, dict):
                         reason = str(entry_result.get("reason", "") or "")
                     if reason != "below_exchange_minimum_notional":
-                        self._entry_metrics["rejected_exchange"] += 1
+                        self._incr_entry_metric("rejected_exchange")
                     logger.error(f"Failed to place entry order: {entry_result}")
                 return entry_result
 
@@ -4769,7 +4808,7 @@ class LiveTrader:
             # Return summary
             if self._is_order_result_success(entry_result) and not self.dry_run:
                 self._source_orders_today[source_key] += 1
-                self._entry_metrics["executed_entry_signals"] += 1
+                self._incr_entry_metric("executed_entry_signals")
                 # H5: persist so a restart inside this UTC day cannot silently
                 # reset canary budget that has already been consumed.
                 self._persist_source_orders_today()
@@ -4845,6 +4884,10 @@ class LiveTrader:
             "canary_mode": self.canary_mode,
             "canary_max_order_usd": self.canary_max_order_usd,
             "canary_max_signals_per_day": self.canary_max_signals_per_day,
+            "active_tier": (
+                summarize_tier(self.active_tier) if self.active_tier is not None else None
+            ),
+            "kelly_dampen": self.kelly_dampen,
             "external_kill_switch_file": self.external_kill_switch_file or None,
             "kill_switch_state_file": self.kill_switch_state_file or None,
             "max_position_size": self.max_position_size,

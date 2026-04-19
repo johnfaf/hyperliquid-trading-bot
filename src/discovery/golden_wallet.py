@@ -26,6 +26,7 @@ from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Tuple
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+from src.core.env_utils import safe_env_float
 from src.data import database as db
 from src.data import hyperliquid_client as hl
 
@@ -50,10 +51,18 @@ _RATE_LIMIT_BACKOFF_SEQ = [5, 8, 15, 30, 60, 90, 120]
 
 # Superhuman detection: no real human trader sustains these numbers
 # over 90 days.  Wallets hitting these thresholds are bots/vaults/arb.
-MAX_HUMAN_WIN_RATE = float(os.environ.get("GOLDEN_WALLET_MAX_HUMAN_WIN_RATE", "92.0"))
-MIN_HUMAN_DRAWDOWN = float(os.environ.get("GOLDEN_WALLET_MIN_HUMAN_DRAWDOWN", "0.5"))
-SHARPE_RETURN_MIN = float(os.environ.get("GOLDEN_WALLET_SHARPE_RETURN_MIN", "-1.0"))
-SHARPE_RETURN_MAX = float(os.environ.get("GOLDEN_WALLET_SHARPE_RETURN_MAX", "10.0"))
+MAX_HUMAN_WIN_RATE = safe_env_float(
+    "GOLDEN_WALLET_MAX_HUMAN_WIN_RATE", 92.0, lo=0.0, hi=100.0,
+)
+MIN_HUMAN_DRAWDOWN = safe_env_float(
+    "GOLDEN_WALLET_MIN_HUMAN_DRAWDOWN", 0.5, lo=0.0, hi=1.0,
+)
+SHARPE_RETURN_MIN = safe_env_float(
+    "GOLDEN_WALLET_SHARPE_RETURN_MIN", -1.0, lo=-100.0, hi=100.0,
+)
+SHARPE_RETURN_MAX = safe_env_float(
+    "GOLDEN_WALLET_SHARPE_RETURN_MAX", 10.0, lo=-100.0, hi=100.0,
+)
 
 
 def _rate_limit_backoff(attempt: int, label: str = "") -> float:
