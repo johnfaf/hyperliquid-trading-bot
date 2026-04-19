@@ -53,6 +53,11 @@ class _FakeCopyTrader:
         }
 
 
+class _BrokenPipeWriter(BytesIO):
+    def write(self, data):
+        raise BrokenPipeError(32, "Broken pipe")
+
+
 def test_build_runtime_health_snapshot_includes_subsystems_and_safety(monkeypatch):
     registry = SubsystemHealthRegistry()
     registry.register("decision_firewall", affects_trading=True)
@@ -238,3 +243,25 @@ def test_dashboard_login_post_rejects_invalid_token(monkeypatch):
 
     assert ("status", 303) in handler._responses
     assert ("header", "Location", "/login?error=invalid&next=/") in handler._responses
+
+
+def test_dashboard_json_response_swallows_client_disconnect_on_body_write():
+    handler = _make_dashboard_handler(path="/api/data")
+    handler.wfile = _BrokenPipeWriter()
+
+    handler._json_response({"ok": True})
+
+    assert handler.close_connection is True
+
+
+def test_dashboard_json_response_swallows_client_disconnect_during_headers():
+    handler = _make_dashboard_handler(path="/api/data")
+
+    def _broken_end_headers():
+        raise BrokenPipeError(32, "Broken pipe")
+
+    handler.end_headers = _broken_end_headers
+
+    handler._json_response({"ok": True})
+
+    assert handler.close_connection is True

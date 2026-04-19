@@ -159,6 +159,25 @@ def test_dualwrite_skips_sqlite_only_pragmas_for_postgres():
     assert pg_conn.executed == []
 
 
+def test_dualwrite_skips_selects_for_postgres_mirror():
+    sqlite_conn = sqlite3.connect(":memory:")
+    sqlite_conn.row_factory = sqlite3.Row
+    sqlite_conn.execute(
+        "CREATE TABLE strategies (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL)"
+    )
+    sqlite_conn.execute("INSERT INTO strategies (name) VALUES (?)", ("momentum",))
+    pg_conn = _RecordingPgConn()
+    adapter = DualWriteAdapter(sqlite_conn, pg_conn)
+
+    rows = adapter.execute(
+        "SELECT * FROM strategies WHERE name = ?",
+        ("momentum",),
+    ).fetchall()
+
+    assert len(rows) == 1
+    assert pg_conn.executed == []
+
+
 def test_table_exists_uses_backend_agnostic_query(monkeypatch):
     observed = {}
 

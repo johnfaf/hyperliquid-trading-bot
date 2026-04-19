@@ -6,6 +6,7 @@ Serves a unified web dashboard on port 8080 with:
 
 Both dashboards served from the same port for Railway compatibility.
 """
+import errno
 import hmac
 import json
 import os
@@ -32,6 +33,12 @@ from src.data import database as db
 
 logger = logging.getLogger(__name__)
 logger.addHandler(logging.NullHandler())
+
+_CLIENT_DISCONNECT_ERRNOS = {
+    errno.EPIPE,
+    errno.ECONNRESET,
+    errno.ECONNABORTED,
+}
 
 # Module-level options scanner reference (set by set_options_scanner)
 _options_scanner = None
@@ -71,6 +78,13 @@ def _secure_token_eq(supplied: str, expected: str) -> bool:
 
 def _truthy_env(name: str, default: str = "false") -> bool:
     return os.environ.get(name, default).strip().lower() in {"1", "true", "yes"}
+
+
+def _is_client_disconnect(exc: BaseException) -> bool:
+    return isinstance(
+        exc,
+        (BrokenPipeError, ConnectionResetError, ConnectionAbortedError),
+    ) or (isinstance(exc, OSError) and getattr(exc, "errno", None) in _CLIENT_DISCONNECT_ERRNOS)
 
 
 def _is_hosted_dashboard_environment() -> bool:
@@ -1919,6 +1933,15 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass  # Suppress default logging
 
+    def _handle_client_disconnect(self, exc: BaseException) -> None:
+        logger.debug(
+            "Dashboard client disconnected before response completed: %s %s (%s)",
+            getattr(self, "command", "?"),
+            getattr(self, "path", "?"),
+            exc,
+        )
+        self.close_connection = True
+
     def _redirect(self, location: str, code: int = 303):
         self.send_response(code)
         self.send_header("Location", location)
@@ -2456,12 +2479,18 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._json_response({"error": str(e)}, code=500)
 
     def _json_response(self, data: dict, code: int = 200):
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self._send_no_cache_headers()
-        self.end_headers()
-        self.wfile.write(json.dumps(data, default=_safe_json).encode())
+        try:
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self._send_no_cache_headers()
+            self.end_headers()
+            self.wfile.write(json.dumps(data, default=_safe_json).encode())
+        except OSError as exc:
+            if _is_client_disconnect(exc):
+                self._handle_client_disconnect(exc)
+                return
+            raise
 
     def _serve_options_html(self):
         """Serve the options flow dashboard HTML."""

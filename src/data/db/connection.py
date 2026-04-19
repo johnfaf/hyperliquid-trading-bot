@@ -9,8 +9,8 @@ placeholders) against both backends.  The adapter translates:
   - Row access via dict-like interface
 
 The :class:`DualWriteAdapter` executes every statement on SQLite first
-(authoritative) and mirrors it to Postgres (best-effort).  Postgres
-failures are logged and counted but never surface to the caller.
+(authoritative) and mirrors write statements to Postgres (best-effort).
+Postgres failures are logged and counted but never surface to the caller.
 """
 from __future__ import annotations
 
@@ -44,6 +44,7 @@ _INSERT_VALUES_RE = re.compile(
 )
 _SQLITE_ONLY_PREFIXES = ("PRAGMA",)
 _DDL_PREFIXES = ("CREATE ", "ALTER ", "DROP ", "VACUUM", "REINDEX")
+_MIRRORED_WRITE_PREFIXES = ("INSERT", "UPDATE", "DELETE", "REPLACE")
 
 # Columns that are BOOLEAN in Postgres but historically stored as 0/1 ints in
 # SQLite.  When dualwriting parameterised INSERTs we must coerce these values
@@ -322,7 +323,14 @@ class DualWriteAdapter:
 
     def _should_skip_pg_mirror(self, sql: str) -> bool:
         stripped = (sql or "").lstrip().upper()
-        return stripped.startswith(_SQLITE_ONLY_PREFIXES) or stripped.startswith(_DDL_PREFIXES)
+        if not stripped:
+            return True
+        first_token = stripped.split(None, 1)[0].rstrip(";")
+        return (
+            stripped.startswith(_SQLITE_ONLY_PREFIXES)
+            or stripped.startswith(_DDL_PREFIXES)
+            or first_token not in _MIRRORED_WRITE_PREFIXES
+        )
 
     def _sqlite_table_has_integer_id_pk(self, table: str) -> bool:
         table = _clean_identifier(table).split(".")[-1]
