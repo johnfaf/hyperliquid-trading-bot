@@ -135,7 +135,7 @@ class TraderDiscovery:
         # Load known bots from DB — these persist across redeploys
         known_bots = db.get_known_bot_addresses()
         if known_bots:
-            logger.info(f"Loaded {len(known_bots)} known bots from DB — will skip these")
+            logger.info(f"Loaded {len(known_bots)} known bots from DB -- will skip these")
 
         discovered = []
 
@@ -878,7 +878,7 @@ class TraderDiscovery:
             )
         elif bot_signals > 0:
             logger.info(
-                "Borderline (%d signals, %.0f trades/day): %s... — passed but flagged",
+                "Borderline (%d signals, %.0f trades/day): %s... -- passed but flagged",
                 bot_signals, trades_per_day, addr_short,
             )
         else:
@@ -1043,7 +1043,7 @@ class TraderDiscovery:
             promoted = bots_sorted[:needed]
             profiles.extend(promoted)
             promoted_bots = len(promoted)
-            logger.info(f"Only {len(humans)} human traders found — promoted {promoted_bots} "
+            logger.info(f"Only {len(humans)} human traders found -- promoted {promoted_bots} "
                        f"least-bot-like accounts (scores: {[p.get('bot_score',0) for p in promoted]})")
 
         # Mark high-confidence bots as inactive (score 3+, and not promoted)

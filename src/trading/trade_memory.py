@@ -288,7 +288,7 @@ class TradeMemory:
             # setup are invisible.  Proceeding silently bypasses the memory system
             # entirely; "caution" passes control to the caller but flags the gap.
             logger.warning(
-                "Trade memory query error (defaulting to caution — loss patterns unavailable): %s", e
+                "Trade memory query error (defaulting to caution -- loss patterns unavailable): %s", e
             )
             return SimilarityResult(
                 similar_trades=[], total_found=0, win_rate=0, avg_pnl=0,

@@ -167,7 +167,7 @@ class DataFetcher:
             cached = self._get_cached(coin, timeframe, start_ms, end_ms)
             expected = (end_ms - start_ms) // TIMEFRAME_MS[timeframe]
             if cached and len(cached) >= expected * 0.95:  # 95% coverage = use cache
-                logger.info(f"Cache hit: {coin} {timeframe} — {len(cached)} candles")
+                logger.info(f"Cache hit: {coin} {timeframe} -- {len(cached)} candles")
                 return cached
 
         # Fetch from API in chunks

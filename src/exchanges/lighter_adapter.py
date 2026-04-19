@@ -177,7 +177,7 @@ class LighterAdapter(BaseExchangeAdapter):
         data = self._get("/orderBooks", quiet=True)
         if data is None:
             self.state = VenueState.DOWN
-            logger.warning(f"Lighter health check FAILED — venue is DOWN "
+            logger.warning(f"Lighter health check FAILED -- venue is DOWN "
                           f"(url={self.base_url}/orderBooks)")
             return False
 
@@ -201,7 +201,7 @@ class LighterAdapter(BaseExchangeAdapter):
 
         data = self._get("/orderBooks")
         if not data:
-            logger.warning("Lighter: could not load markets — API may be down")
+            logger.warning("Lighter: could not load markets -- API may be down")
             self.state = VenueState.DOWN
             return
 
@@ -329,7 +329,7 @@ class LighterAdapter(BaseExchangeAdapter):
         across all markets and identify high-volume, profitable addresses.
         """
         if self.state == VenueState.DOWN:
-            logger.debug("Lighter: skipping trader discovery — venue is DOWN")
+            logger.debug("Lighter: skipping trader discovery -- venue is DOWN")
             return []
 
         self._ensure_markets_loaded()

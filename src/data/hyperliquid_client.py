@@ -430,7 +430,7 @@ def get_api_stats() -> dict:
 if __name__ == "__main__":
     # Quick test
     logging.basicConfig(level=logging.INFO)
-    print("Testing Hyperliquid API client (V3 — via APIManager)...")
+    print("Testing Hyperliquid API client (V3 -- via APIManager)...")
 
     coins = get_all_coins()
     print(f"Available coins ({len(coins)}): {coins[:10]}...")

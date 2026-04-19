@@ -128,7 +128,7 @@ class AdaptiveBotDetector:
 
         logger.info(
             f"Bot detection for {addr_short}: "
-            f"prob={bot_probability:.2f} ({is_bot}), confidence={confidence:.2f} — {reason}"
+            f"prob={bot_probability:.2f} ({is_bot}), confidence={confidence:.2f} -- {reason}"
         )
 
         return BotResult(

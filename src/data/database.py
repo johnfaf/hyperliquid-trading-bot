@@ -209,6 +209,14 @@ def init_db():
             FOREIGN KEY (strategy_id) REFERENCES strategies(id)
         );
         CREATE INDEX IF NOT EXISTS idx_paper_trades_status ON paper_trades(status);
+        -- Partial index: hot dashboard/history query filters by
+        -- status='closed' and orders by closed_at DESC.  Mirrors the
+        -- Postgres migration 0007; on SQLite this is the WHERE clause
+        -- form of a partial index and avoids sorting every closed row
+        -- when the table grows past a few thousand entries.
+        CREATE INDEX IF NOT EXISTS idx_paper_trades_closed_recent
+            ON paper_trades(closed_at DESC)
+            WHERE status = 'closed';
 
         -- Paper trading account state
         CREATE TABLE IF NOT EXISTS paper_account (
@@ -772,7 +780,7 @@ def close_paper_trade(trade_id, exit_price, pnl) -> bool:
         """, (now, exit_price, pnl, trade_id))
         if cursor.rowcount == 0:
             logger.error(
-                "close_paper_trade: trade_id=%s matched 0 open rows — "
+                "close_paper_trade: trade_id=%s matched 0 open rows -- "
                 "possible double-close or missing record. PnL NOT credited.",
                 trade_id,
             )
@@ -810,7 +818,7 @@ def close_paper_trade_and_credit_account(trade_id, exit_price, pnl) -> bool:
                     pass
                 logger.error(
                     "close_paper_trade_and_credit_account: trade_id=%s matched "
-                    "0 open rows — possible double-close. PnL NOT credited.",
+                    "0 open rows -- possible double-close. PnL NOT credited.",
                     trade_id,
                 )
                 return False
@@ -1032,7 +1040,7 @@ def backup_to_json(filepath: str = None):
                   f"{len(data.get('strategies', []))} strategies, "
                   f"{len(data.get('golden_wallets', []))} golden wallets, "
                   f"{len(data.get('wallet_fills', []))} fills")
-        print(f"DB backup ({size_kb:.0f} KB): {counts} → {filepath}")
+        print(f"DB backup ({size_kb:.0f} KB): {counts} -> {filepath}")
     except Exception as e:
         print(f"Backup failed: {e}")
 

@@ -119,7 +119,7 @@ def _inject_forecaster_signals(container, regime_data):
         convictions = getattr(container.options_scanner, "top_convictions", None)
         if convictions:
             forecaster.update_options_flow(convictions)
-            logger.debug("  Forecaster ← %d options convictions", len(convictions))
+            logger.debug("  Forecaster <- %d options convictions", len(convictions))
     except Exception as exc:
         logger.debug("  Forecaster options injection error: %s", exc)
 
@@ -128,7 +128,7 @@ def _inject_forecaster_signals(container, regime_data):
         if container.polymarket:
             pm_sentiment = container.polymarket.get_market_sentiment()
             forecaster.update_polymarket_sentiment(pm_sentiment)
-            logger.debug("  Forecaster ← Polymarket sentiment: %s", pm_sentiment.get("sentiment", "?"))
+            logger.debug("  Forecaster <- Polymarket sentiment: %s", pm_sentiment.get("sentiment", "?"))
     except Exception as exc:
         logger.debug("  Forecaster polymarket injection error: %s", exc)
 
@@ -175,7 +175,7 @@ def _reconcile_regimes(regime_data: dict, container) -> dict:
         # Conservative policy: if forecaster says crash, override to crash-equivalent.
         if pred_regime == "crash" and pred_conf >= 0.6:
             logger.warning(
-                "  REGIME DISAGREEMENT: detector=%s (%.0f%%) vs forecaster=%s (%.0f%%) — "
+                "  REGIME DISAGREEMENT: detector=%s (%.0f%%) vs forecaster=%s (%.0f%%) -- "
                 "applying crash-protective override",
                 det_regime, det_conf * 100, pred_regime, pred_conf * 100,
             )
@@ -188,13 +188,13 @@ def _reconcile_regimes(regime_data: dict, container) -> dict:
             regime_data["strategy_guidance"] = guidance
         else:
             logger.info(
-                "  REGIME DISAGREEMENT: detector=%s (%.0f%%) vs forecaster=%s (%.0f%%) — "
+                "  REGIME DISAGREEMENT: detector=%s (%.0f%%) vs forecaster=%s (%.0f%%) -- "
                 "no crash override applied",
                 det_regime, det_conf * 100, pred_regime, pred_conf * 100,
             )
     elif agree:
         logger.debug(
-            "  Regime consensus: detector=%s ↔ forecaster=%s (both confident)",
+            "  Regime consensus: detector=%s <-> forecaster=%s (both confident)",
             det_regime, pred_regime,
         )
 
@@ -252,12 +252,12 @@ def _apply_macro_regime_overlay(container, regime_data: dict) -> dict:
     if block:
         guidance["pause"] = list(set(guidance.get("pause", []) + ["all"]))
         logger.warning(
-            "  MACRO REGIME: %s — blocking new entries (score=%.2f, reasons=%s)",
+            "  MACRO REGIME: %s -- blocking new entries (score=%.2f, reasons=%s)",
             level.upper(), posture.get("macro_score", 0), reasons[:2],
         )
     elif level in ("high", "elevated"):
         logger.info(
-            "  MACRO REGIME: %s — size_mod=%.2f, conf_drag=%.2f (reasons=%s)",
+            "  MACRO REGIME: %s -- size_mod=%.2f, conf_drag=%.2f (reasons=%s)",
             level, size_mod, conf_drag, reasons[:2],
         )
     else:
@@ -471,7 +471,7 @@ def run_trading_cycle(container, cycle_count: int) -> None:
     if container.live_trader and not container.live_trader.dry_run:
         container.live_trader.update_daily_pnl_from_fills()
         if container.live_trader.check_daily_loss():
-            logger.error("KILL SWITCH ACTIVE — daily loss limit hit, skipping live trades")
+            logger.error("KILL SWITCH ACTIVE -- daily loss limit hit, skipping live trades")
 
         # Sweep for orphaned positions (opened successfully but SL/TP
         # placement was skipped due to an upstream error like the
@@ -784,7 +784,7 @@ def _run_multi_exchange_scan(container):
             logger.info("  Venue health: %s", venue_health)
             common_markets = container.multi_scanner.get_common_markets()
             if common_markets:
-                logger.info("  Common markets: %s…", common_markets[:15])
+                logger.info("  Common markets: %s...", common_markets[:15])
             funding_arbs = container.multi_scanner.scan_funding_arb()
             if funding_arbs:
                 for arb in funding_arbs[:3]:

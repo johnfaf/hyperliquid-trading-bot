@@ -835,7 +835,7 @@ class LiveTrader:
             )
             if data is None:
                 logger.debug(
-                    "extraAgents check returned None — skipping validation",
+                    "extraAgents check returned None -- skipping validation",
                 )
                 return
             agents = data if isinstance(data, list) else data.get("agents", []) if isinstance(data, dict) else []
@@ -857,7 +857,7 @@ class LiveTrader:
                     "Could not confirm agent wallet registration (empty extraAgents "
                     "response). Signer=%s. Trading account=%s. If orders fail with "
                     "'User or API Wallet does not exist', approve the agent wallet "
-                    "in the Hyperliquid UI (Account → API → Generate/Approve).",
+                    "in the Hyperliquid UI (Account -> API -> Generate/Approve).",
                     self.signer.address,
                     self.public_address,
                 )
@@ -865,7 +865,7 @@ class LiveTrader:
             logger.error(
                 "AGENT WALLET NOT APPROVED: signer %s is NOT in the approved API "
                 "wallets for %s. Approved wallets: %s. Live trading DISABLED. "
-                "Approve the wallet in the Hyperliquid UI (Account → API → Approve) "
+                "Approve the wallet in the Hyperliquid UI (Account -> API -> Approve) "
                 "or update HL_AGENT_PRIVATE_KEY to one that IS approved.",
                 self.signer.address,
                 self.public_address,
@@ -874,7 +874,7 @@ class LiveTrader:
             self.signer = None
             self.status_reason = "agent_wallet_not_approved_on_exchange"
         except Exception as exc:
-            logger.debug("extraAgents check failed: %s — skipping validation", exc)
+            logger.debug("extraAgents check failed: %s -- skipping validation", exc)
 
     def _load_asset_index_map(self):
         """Load asset index and szDecimals mapping from Hyperliquid meta endpoint.
@@ -1154,7 +1154,7 @@ class LiveTrader:
         if dd >= self._max_drawdown_usd:
             logger.critical(
                 "Drawdown limit exceeded: $%.2f (peak=$%.2f, current=$%.2f) "
-                ">= cap $%.2f — tripping kill switch.",
+                ">= cap $%.2f -- tripping kill switch.",
                 dd, peak, current, self._max_drawdown_usd,
             )
             self.activate_kill_switch(
@@ -1258,7 +1258,7 @@ class LiveTrader:
             logger.warning(
                 "Perps margin is $0 but spot wallet has $%.2f USDC. "
                 "Transfer USDC from Spot to Perps in the Hyperliquid UI "
-                "(Portfolio → Transfer → Spot to Perps) to enable live trading.",
+                "(Portfolio -> Transfer -> Spot to Perps) to enable live trading.",
                 spot_usdc,
             )
             # Return 0.0 (not None) — the account exists, it's just unfunded for perps
@@ -1866,7 +1866,7 @@ class LiveTrader:
             logger.error(f"Position reconciliation failed: {e}")
             logger.warning(
                 "Could not verify exchange state on startup. "
-                "Proceeding with caution — monitor positions manually."
+                "Proceeding with caution -- monitor positions manually."
             )
 
     def protect_orphaned_positions(
@@ -1997,7 +1997,7 @@ class LiveTrader:
                 protect_side = "buy"
 
             logger.warning(
-                "UNPROTECTED POSITION: %s %s size=%.6f entry=$%.6f — "
+                "UNPROTECTED POSITION: %s %s size=%.6f entry=$%.6f -- "
                 "placing fallback 3%%/15%% SL/TP (SL=$%.6f TP=$%.6f)",
                 side.upper(), coin, size, entry_price, sl_price, tp_price,
             )
@@ -2020,7 +2020,7 @@ class LiveTrader:
             else:
                 failed += 1
                 logger.error(
-                    "Orphan protection FAILED for %s: sl=%s tp=%s — "
+                    "Orphan protection FAILED for %s: sl=%s tp=%s -- "
                     "position remains unprotected, MANUAL INTERVENTION REQUIRED",
                     coin, sl_result, tp_result,
                 )
@@ -2647,7 +2647,7 @@ class LiveTrader:
                 )
             else:
                 logger.error(
-                    "Deferred resize for %s FAILED: sl=%s tp=%s — position may be unprotected!",
+                    "Deferred resize for %s FAILED: sl=%s tp=%s -- position may be unprotected!",
                     coin, sl_result, tp_result,
                 )
 
@@ -2796,7 +2796,7 @@ class LiveTrader:
                 logger.error(
                     f"PRICE REJECTED: {coin} price=${price:,.2f} deviates "
                     f"{deviation:.1%} from last known ${last_good:,.2f}. "
-                    f"Possible corrupt data — blocking order."
+                    f"Possible corrupt data -- blocking order."
                 )
                 return False
             self._price_history[coin] = price
@@ -3354,7 +3354,7 @@ class LiveTrader:
             if self.max_order_usd and notional > self.max_order_usd:
                 capped_size = self.max_order_usd / price
                 logger.warning(
-                    "place_market_order: capping %s %s size %.6f → %.6f "
+                    "place_market_order: capping %s %s size %.6f -> %.6f "
                     "to honor LIVE_MAX_ORDER_USD=$%.2f (was $%.2f notional)",
                     coin, side, size, capped_size, self.max_order_usd, notional,
                 )
@@ -3393,8 +3393,8 @@ class LiveTrader:
                     ):
                         self._entry_metrics["min_notional_floorups"] += 1
                         logger.info(
-                            "place_market_order: floor-up %s %s %.6f → "
-                            "%.6f (notional $%.2f → $%.2f) to clear "
+                            "place_market_order: floor-up %s %s %.6f -> "
+                            "%.6f (notional $%.2f -> $%.2f) to clear "
                             "Hyperliquid's $%.2f minimum after price drift",
                             coin, side, size, candidate_size,
                             notional, candidate_notional, self.min_order_usd,
@@ -3405,7 +3405,7 @@ class LiveTrader:
                 if not bumped:
                     self._entry_metrics["rejected_below_min_notional"] += 1
                     logger.warning(
-                        "place_market_order: rejecting %s %s size %.6f — "
+                        "place_market_order: rejecting %s %s size %.6f -- "
                         "notional $%.2f is below Hyperliquid's $%.2f "
                         "minimum.  Raise LIVE_MAX_ORDER_USD or fund the "
                         "live wallet so rescaling produces a larger order.",
@@ -3638,7 +3638,7 @@ class LiveTrader:
             if self.max_order_usd and notional > self.max_order_usd:
                 capped_size = self.max_order_usd / price
                 logger.warning(
-                    "place_limit_order: capping %s %s size %.6f → %.6f "
+                    "place_limit_order: capping %s %s size %.6f -> %.6f "
                     "to honor LIVE_MAX_ORDER_USD=$%.2f (was $%.2f notional)",
                     coin, side, size, capped_size, self.max_order_usd, notional,
                 )
@@ -3650,7 +3650,7 @@ class LiveTrader:
             # drops orders below $10.  Reject here with a clear reason.
             if self.min_order_usd and notional < self.min_order_usd:
                 logger.warning(
-                    "place_limit_order: rejecting %s %s size %.6f — notional "
+                    "place_limit_order: rejecting %s %s size %.6f -- notional "
                     "$%.2f is below Hyperliquid's $%.2f minimum.",
                     coin, side, size, notional, self.min_order_usd,
                 )
@@ -3976,7 +3976,7 @@ class LiveTrader:
 
             size = abs(pos.get("size", 0))
             if size <= 0:
-                logger.warning("close_position(%s): position size is zero — may have been closed concurrently", coin)
+                logger.warning("close_position(%s): position size is zero -- may have been closed concurrently", coin)
                 return {"status": "error", "message": "Position size is zero (may have been closed by SL/TP)"}
             side = "sell" if pos.get("szi", 0) > 0 else "buy"
 
@@ -4192,7 +4192,7 @@ class LiveTrader:
         base_size = adjusted.size or 0.0
         if base_size <= 0:
             logger.error(
-                f"apply_regime_overlay: signal.size not set for {adjusted.coin} — "
+                f"apply_regime_overlay: signal.size not set for {adjusted.coin} -- "
                 f"skipping size adjustment (execute_signal should have computed it first)"
             )
             return adjusted
@@ -4266,7 +4266,7 @@ class LiveTrader:
         if not mid or mid <= 0:
             # Cannot evaluate notional — err on the side of caution and drop
             logger.warning(
-                "Cannot apply $%.2f cap to %s: mid price unavailable — dropping trade",
+                "Cannot apply $%.2f cap to %s: mid price unavailable -- dropping trade",
                 self.max_order_usd,
                 signal.coin,
             )
@@ -4277,7 +4277,7 @@ class LiveTrader:
             capped_size = self.max_order_usd / mid
             if capped_size <= 0:
                 logger.warning(
-                    "Order cap $%.2f produces zero size for %s @ $%.4f — dropping trade",
+                    "Order cap $%.2f produces zero size for %s @ $%.4f -- dropping trade",
                     self.max_order_usd,
                     signal.coin,
                     mid,
@@ -4286,7 +4286,7 @@ class LiveTrader:
 
             logger.info(
                 "Capping %s size to honor LIVE_MAX_ORDER_USD=$%.2f: "
-                "%.6f → %.6f (notional $%.2f → $%.2f)",
+                "%.6f -> %.6f (notional $%.2f -> $%.2f)",
                 signal.coin,
                 self.max_order_usd,
                 size,
@@ -4433,7 +4433,7 @@ class LiveTrader:
                 return None
         else:
             logger.debug(
-                "Firewall bypass active for %s (mirror path — paper trade already validated)",
+                "Firewall bypass active for %s (mirror path -- paper trade already validated)",
                 signal.coin,
             )
 
@@ -4484,7 +4484,7 @@ class LiveTrader:
             if not mid or mid <= 0:
                 self._entry_metrics["rejected_no_mid_price"] += 1
                 logger.warning(
-                    f"Cannot compute order size for {coin}: no mid price available — skipping"
+                    f"Cannot compute order size for {coin}: no mid price available -- skipping"
                 )
                 return None
             position_usd = signal.position_pct * self.max_position_size
@@ -4521,7 +4521,7 @@ class LiveTrader:
 
             if not size or size <= 0:
                 self._entry_metrics["rejected_invalid_size"] += 1
-                logger.warning(f"Calculated size is 0 or negative for {coin} — skipping")
+                logger.warning(f"Calculated size is 0 or negative for {coin} -- skipping")
                 return None
 
             baseline_position_size = 0.0
@@ -4613,7 +4613,7 @@ class LiveTrader:
                 if not fill_check:
                     if self._execute_fill_verify_blocking:
                         logger.error(
-                            f"FILL NOT VERIFIED for {coin} {side} {expected_fill_size} — "
+                            f"FILL NOT VERIFIED for {coin} {side} {expected_fill_size} -- "
                             f"skipping SL/TP placement. Manual intervention required."
                         )
                         return {
@@ -4700,7 +4700,7 @@ class LiveTrader:
                 if not mid:
                     logger.error(
                         "Cannot place SL/TP for %s: neither fill price nor mid price is available. "
-                        "Position is UNPROTECTED — closing immediately.",
+                        "Position is UNPROTECTED -- closing immediately.",
                         coin,
                     )
                     close_result = None

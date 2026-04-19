@@ -515,7 +515,7 @@ Examples:
 
     print()
     print("=" * 65)
-    print("  Hyperliquid Trading Bot — Stress Test Platform")
+    print("  Hyperliquid Trading Bot -- Stress Test Platform")
     print("=" * 65)
 
     # Load fills
@@ -596,7 +596,7 @@ def _print_summary(report: StressTestReport):
     grade = "RESILIENT" if score >= 70 else "MODERATE" if score >= 40 else "FRAGILE"
 
     print(f"\n{'='*65}")
-    print(f"  STRESS TEST RESULTS — Score: {score:.0f}/100 ({grade})")
+    print(f"  STRESS TEST RESULTS -- Score: {score:.0f}/100 ({grade})")
     print(f"{'='*65}")
     print(f"  Baseline: PnL=${report.baseline_pnl:+,.2f}  "
           f"DD={report.baseline_dd:.1f}%  Sharpe={report.baseline_sharpe:.3f}")

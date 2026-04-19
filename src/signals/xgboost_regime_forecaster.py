@@ -42,7 +42,7 @@ try:
     HAS_XGBOOST = True
 except ImportError:
     HAS_XGBOOST = False
-    logger.info("XGBoost not installed — ML forecaster disabled. "
+    logger.info("XGBoost not installed -- ML forecaster disabled. "
                 "pip install xgboost scikit-learn to enable.")
 
 from src.signals.predictive_regime_forecaster import PredictiveRegimeForecaster
@@ -237,7 +237,7 @@ class XGBoostRegimeForecaster:
                 self.prediction_cache[coin] = {"data": result, "ts": now}
 
                 logger.info(
-                    "XGBoost Forecaster %s → %s (conf=%.1f%%, signal=%.3f)",
+                    "XGBoost Forecaster %s -> %s (conf=%.1f%%, signal=%.3f)",
                     coin, regime, confidence * 100, result["signal"],
                 )
 
@@ -413,7 +413,7 @@ class XGBoostRegimeForecaster:
         Uses walk-forward: always trains on latest 90 days of data.
         """
         if not HAS_XGBOOST:
-            logger.warning("XGBoost not installed — cannot train")
+            logger.warning("XGBoost not installed -- cannot train")
             return None
 
         X, y = self._get_training_data()

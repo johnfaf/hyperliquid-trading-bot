@@ -112,7 +112,7 @@ class SignalProcessor:
         elif len(survivors) > before_conflict:
             # Safety check: if survivors increased, something went wrong
             logger.warning(f"SignalProcessor: conflict resolution increased strategies "
-                          f"({before_conflict} → {len(survivors)}), possible dedup/copy issue")
+                          f"({before_conflict} -> {len(survivors)}), possible dedup/copy issue")
 
         # Step 4: Compress — keep only top N
         before_compress = len(survivors)
@@ -125,7 +125,7 @@ class SignalProcessor:
 
         self.stats["total_out"] += len(survivors)
 
-        logger.info(f"SignalProcessor: {len(strategies)} in → {len(survivors)} out "
+        logger.info(f"SignalProcessor: {len(strategies)} in -> {len(survivors)} out "
                    f"(culled={culled_count}, deduped={dedup_count}, "
                    f"conflicts={conflict_count}, compressed={compressed_count})")
 
@@ -165,7 +165,7 @@ class SignalProcessor:
             # Kill strategies with enough history but poor performance
             if trade_count >= self.min_trades_for_cull and score < threshold:
                 logger.debug(f"Culled {strategy_type} (score={score:.2f}, "
-                           f"trades={trade_count}) — below threshold {threshold:.2f}")
+                           f"trades={trade_count}) -- below threshold {threshold:.2f}")
                 continue
 
             # concentrated_bet requires high conviction by definition
@@ -242,7 +242,7 @@ class SignalProcessor:
                 best["_dedup_boost"] = consensus_factor
 
                 logger.debug(f"Merged {len(group)} strategies for {key} "
-                           f"(score {original_score:.2f} → {best['current_score']:.2f})")
+                           f"(score {original_score:.2f} -> {best['current_score']:.2f})")
                 merged.append(best)
 
         return merged

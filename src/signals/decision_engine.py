@@ -376,12 +376,12 @@ class DecisionEngine:
             logger.info("  #%d %s %s composite=%.4f%s", i + 1, side.upper(), coin, composite, marker)
 
         if executions:
-            logger.info("→ EXECUTING %d trade(s) this cycle", len(executions))
+            logger.info("-> EXECUTING %d trade(s) this cycle", len(executions))
         else:
             reason = "no candidates" if not scored else \
                      "below threshold" if not [s for s in scored if s.get("_composite_score", 0) >= self.min_decision_score] else \
                      "no slots" if available_slots == 0 else "unknown"
-            logger.info("→ NO TRADE this cycle (%s)", reason)
+            logger.info("-> NO TRADE this cycle (%s)", reason)
 
     def get_stats(self) -> Dict:
         """Return decision engine statistics."""

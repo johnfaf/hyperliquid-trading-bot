@@ -65,7 +65,7 @@ def _pg_conn():
         conn = get_connection()
         return conn, return_connection
     except Exception as exc:
-        logger.debug("Feature store: Postgres unavailable — %s", exc)
+        logger.debug("Feature store: Postgres unavailable -- %s", exc)
         return None, None
 
 

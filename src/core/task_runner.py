@@ -76,7 +76,7 @@ class SupervisedTaskRunner:
         """Register a background task.  Does NOT start it yet."""
         with self._lock:
             if name in self._tasks:
-                logger.warning("Task '%s' already registered — overwriting", name)
+                logger.warning("Task '%s' already registered -- overwriting", name)
             self._tasks[name] = SupervisedTask(
                 name=name,
                 target=target,
@@ -101,7 +101,7 @@ class SupervisedTaskRunner:
             if task is None:
                 raise KeyError(f"Task '{name}' is not registered")
             if task.state == "running":
-                logger.info("Task '%s' already running — skipping start", name)
+                logger.info("Task '%s' already running -- skipping start", name)
                 return
             task.stop_event.clear()
             task.retry_count = 0

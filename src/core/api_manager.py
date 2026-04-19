@@ -116,7 +116,7 @@ class TokenBucket:
             # Drain tokens to force waiting
             self._tokens = 0
             logger.warning(
-                f"429 received — penalty {penalty}s "
+                f"429 received -- penalty {penalty}s "
                 f"(consecutive={self._consecutive_429s})"
             )
 
@@ -456,7 +456,7 @@ class HyperliquidWebSocket:
         self._gap_warn_grace_until = now + self._gap_warn_startup_grace_s
 
         if was_reconnect:
-            logger.info("WebSocket RECONNECTED — clearing stale local state")
+            logger.info("WebSocket RECONNECTED -- clearing stale local state")
             # Invalidate stale data so modules don't act on old prices
             with self._lock:
                 self.mids.clear()
@@ -721,7 +721,7 @@ class APIManager:
             self._circuit_open_until = now + self._CIRCUIT_COOLDOWN
             self._failure_timestamps.clear()
             logger.warning(
-                "Circuit breaker TRIPPED after %d failures in %.0fs window — "
+                "Circuit breaker TRIPPED after %d failures in %.0fs window -- "
                 "pausing non-critical requests for %.0fs",
                 n,
                 self._FAILURE_WINDOW_S,
@@ -837,7 +837,7 @@ class APIManager:
         now = time.monotonic()
         if now < self._circuit_open_until and priority > Priority.HIGH:
             remaining = round(self._circuit_open_until - now, 1)
-            logger.debug(f"Circuit breaker OPEN — skipping {req_type} ({remaining}s remaining)")
+            logger.debug(f"Circuit breaker OPEN -- skipping {req_type} ({remaining}s remaining)")
             return None
         if self._is_req_type_cooling_down(req_type, now) and priority > Priority.HIGH:
             return None
@@ -926,7 +926,7 @@ class APIManager:
                     self.bucket.report_429()
                     wait = ranged_backoff(20.0, 60.0, attempt, growth=10.0)
                     logger.warning(
-                        f"429 RATE_LIMITED type='{req_type}' — "
+                        f"429 RATE_LIMITED type='{req_type}' -- "
                         f"wait {wait:.1f}s (attempt {attempt+1}/{retries})"
                     )
                     time.sleep(wait)
@@ -999,7 +999,7 @@ class APIManager:
                         return None, failure_kind
                     wait = ranged_backoff(2.0, 8.0, attempt, growth=2.0)
                     logger.warning(
-                        f"SERVER_ERROR {resp.status_code} type='{req_type}' — "
+                        f"SERVER_ERROR {resp.status_code} type='{req_type}' -- "
                         f"retry in {wait:.1f}s (attempt {attempt+1}/{retries})"
                     )
                     time.sleep(wait)
@@ -1015,7 +1015,7 @@ class APIManager:
                 failure_kind = "timeout"
                 wait = jittered_backoff(attempt, base=2.0, cap=20.0)
                 logger.warning(
-                    f"TIMEOUT type='{req_type}' — retry in {wait:.1f}s "
+                    f"TIMEOUT type='{req_type}' -- retry in {wait:.1f}s "
                     f"(attempt {attempt+1}/{retries})"
                 )
                 time.sleep(wait)
@@ -1024,7 +1024,7 @@ class APIManager:
                 failure_kind = "connection_error"
                 wait = jittered_backoff(attempt, base=3.0, cap=30.0)
                 logger.warning(
-                    f"CONNECTION_ERROR type='{req_type}' — retry in {wait:.1f}s "
+                    f"CONNECTION_ERROR type='{req_type}' -- retry in {wait:.1f}s "
                     f"(attempt {attempt+1}/{retries})"
                 )
                 time.sleep(wait)

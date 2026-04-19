@@ -352,7 +352,7 @@ class CrossVenueHedger:
                 success = self._place_bybit_hedge(coin, close_side, original_size)
         except NotImplementedError:
             logger.warning(
-                "_close_hedge(%s, %s): live execution not implemented — removing stale tracking entry",
+                "_close_hedge(%s, %s): live execution not implemented -- removing stale tracking entry",
                 coin, venue,
             )
             # Remove tracking regardless: if execution isn't implemented,
@@ -370,7 +370,7 @@ class CrossVenueHedger:
             # Position may have been liquidated/closed by exchange.
             # Remove from tracking to avoid stale entries.
             logger.warning(
-                "_close_hedge(%s, %s): close order failed — position may have been "
+                "_close_hedge(%s, %s): close order failed -- position may have been "
                 "liquidated. Removing from tracking to prevent inconsistency.",
                 coin, venue,
             )

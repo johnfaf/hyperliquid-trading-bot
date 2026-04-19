@@ -228,7 +228,7 @@ def build_subsystems(
     c.data_source_registry = DataSourceRegistry()
     for source_name in ("polymarket", "options_flow", "deribit"):
         c.data_source_registry.register_source(source_name)
-    logger.info("Building subsystems (profile has %d features)…", len(profile))
+    logger.info("Building subsystems (profile has %d features)...", len(profile))
 
     # ─── Core ─────────────────────────────────────────────────
 

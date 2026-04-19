@@ -97,7 +97,7 @@ class KellySizer:
         # live trades in the current session.
         logger.debug(
             "KellySizer: call load_from_agent_scorer(agent_scorer) after init "
-            "to restore trade history from DB — otherwise all strategies start "
+            "to restore trade history from DB -- otherwise all strategies start "
             "with confidence='insufficient' sizing until live trades accumulate."
         )
 
@@ -222,7 +222,7 @@ class KellySizer:
         # wait for actual loss data before trusting the R:R estimate.
         if not losses:
             logger.info(
-                f"Kelly [{strategy_key}]: no loss history yet (all {n_trades} trades won) — "
+                f"Kelly [{strategy_key}]: no loss history yet (all {n_trades} trades won) -- "
                 f"using default sizing until loss data is available."
             )
             position_pct = self.default_position_pct * signal_confidence

@@ -122,7 +122,7 @@ def get_connection(*, for_read: bool = False):
             if not hasattr(get_connection, "_pg_warn_ts") or \
                (time.time() - get_connection._pg_warn_ts) > 300:
                 logger.warning(
-                    "Dualwrite: could not obtain Postgres connection (%s) — "
+                    "Dualwrite: could not obtain Postgres connection (%s) -- "
                     "falling back to SQLite-only.", exc,
                 )
                 get_connection._pg_warn_ts = time.time()

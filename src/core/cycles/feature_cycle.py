@@ -207,7 +207,7 @@ def run_feature_cycle(container=None, tier: str = "trading") -> Optional[dict]:
     if not getattr(config, "POSTGRES_DSN", ""):
         return None
     if not fs._pg_available():
-        logger.debug("Feature cycle skipped — Postgres unavailable")
+        logger.debug("Feature cycle skipped -- Postgres unavailable")
         return None
 
     coins = _get_watched_coins(container)
@@ -229,7 +229,7 @@ def run_feature_cycle(container=None, tier: str = "trading") -> Optional[dict]:
     elapsed = time.time() - t0
 
     logger.info(
-        "Feature cycle [%s]: %d coins × %d TFs → %d candles, %d features "
+        "Feature cycle [%s]: %d coins x %d TFs -> %d candles, %d features "
         "(%d errors) in %.1fs",
         tier, stats["coins"], len(timeframes),
         stats["candles_stored"], stats["features_stored"],
@@ -245,11 +245,11 @@ def backfill_all(container=None) -> dict:
     via ``python -m src.core.cycles.feature_cycle``.
     """
     if not fs._pg_available():
-        logger.warning("Cannot backfill — Postgres unavailable")
+        logger.warning("Cannot backfill -- Postgres unavailable")
         return {}
 
     coins = _get_watched_coins(container)
-    logger.info("Backfilling %d coins across all timeframes…", len(coins))
+    logger.info("Backfilling %d coins across all timeframes...", len(coins))
     t0 = time.time()
     stats = _collect_and_compute(coins, list(fs.TIMEFRAMES))
     elapsed = time.time() - t0

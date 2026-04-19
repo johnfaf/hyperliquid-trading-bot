@@ -545,7 +545,7 @@ class PositionMonitor:
             self._subscribed_addresses.clear()
 
         if was_reconnect:
-            logger.info("PositionMonitor RECONNECTED — clearing stale cache")
+            logger.info("PositionMonitor RECONNECTED -- clearing stale cache")
             with self._lock:
                 self._position_cache.clear()
                 self._subscribed_addresses.clear()

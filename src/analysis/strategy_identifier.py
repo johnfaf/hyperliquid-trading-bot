@@ -453,7 +453,7 @@ class StrategyIdentifier:
             stype = strat.get("type", "unknown")
 
             if conf < self.MIN_SAVE_CONFIDENCE:
-                logger.debug(f"Discarded {stype} from {addr}... — "
+                logger.debug(f"Discarded {stype} from {addr}... -- "
                            f"confidence too low ({conf:.2f} < {self.MIN_SAVE_CONFIDENCE})")
                 discarded += 1
                 continue
@@ -497,7 +497,7 @@ class StrategyIdentifier:
             return saved_ids
 
         except Exception as e:
-            logger.error(f"Batch save error: {e} — falling back to individual inserts")
+            logger.error(f"Batch save error: {e} -- falling back to individual inserts")
             # Fallback to one-by-one if batch fails
             saved_ids = []
             for strat in qualified:

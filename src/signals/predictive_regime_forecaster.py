@@ -316,7 +316,7 @@ class PredictiveRegimeForecaster:
             "source_registry_version": source_registry_version,
         }
         inputs_str = "/".join(k for k in components if components[k] != 0.0) or "funding+book"
-        logger.info(f"Forecaster {coin} → {regime} (signal={signal:.3f}, "
+        logger.info(f"Forecaster {coin} -> {regime} (signal={signal:.3f}, "
                     f"conf={confidence:.3f}, inputs={len(active_weights)}: {inputs_str})")
         return data
 

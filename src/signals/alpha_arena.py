@@ -226,7 +226,7 @@ class TournamentEngine:
             if agent.status != AgentStatus.CHAMPION:
                 agent.status = AgentStatus.CHAMPION
                 rnd.agents_promoted += 1
-                logger.info(f"Arena PROMOTE: {agent.name} → Champion "
+                logger.info(f"Arena PROMOTE: {agent.name} -> Champion "
                            f"(fitness={agent.fitness_score:.3f}, elo={agent.elo_rating:.0f})")
 
         # No elimination — all 9 agents compete permanently
@@ -236,7 +236,7 @@ class TournamentEngine:
         for agent in agents:
             if agent.status == AgentStatus.INCUBATING and agent.total_trades >= 5:
                 agent.status = AgentStatus.ACTIVE
-                logger.info(f"Arena GRADUATE: {agent.name} → Active")
+                logger.info(f"Arena GRADUATE: {agent.name} -> Active")
 
         rnd.best_agent = ranked[0].name if ranked else ""
         rnd.best_fitness = ranked[0].fitness_score if ranked else 0

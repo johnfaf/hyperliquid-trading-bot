@@ -531,7 +531,7 @@ class AgentScorer:
                 original = signal.confidence
                 signal.confidence = original * 0.6 + weight * 0.4
                 signal.source_accuracy = self.get_accuracy(source_key)
-                logger.debug(f"Weight adjust [{source_key}]: {original:.2f} → {signal.confidence:.2f} "
+                logger.debug(f"Weight adjust [{source_key}]: {original:.2f} -> {signal.confidence:.2f} "
                             f"(weight={weight:.2f})")
             elif isinstance(signal, dict):
                 original = signal.get("confidence", 0.5)

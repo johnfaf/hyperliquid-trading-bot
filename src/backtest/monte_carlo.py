@@ -142,7 +142,7 @@ class MonteCarloSimulator:
         trades_per_path = cfg.trades_per_path if cfg.trades_per_path > 0 else n
         n_paths = cfg.n_paths
 
-        logger.info(f"Monte-Carlo: {n_paths:,} paths × {trades_per_path} trades "
+        logger.info(f"Monte-Carlo: {n_paths:,} paths x {trades_per_path} trades "
                     f"(from {n} historical trades)")
 
         # Pre-allocate result arrays

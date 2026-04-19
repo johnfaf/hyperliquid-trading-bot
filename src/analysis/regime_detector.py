@@ -540,7 +540,7 @@ class RegimeDetector:
         # Re-sort by adjusted score
         filtered.sort(key=lambda s: s.get("current_score", 0), reverse=True)
 
-        logger.info(f"Regime filter: {len(strategies)} → {len(filtered)} strategies "
+        logger.info(f"Regime filter: {len(strategies)} -> {len(filtered)} strategies "
                     f"(regime={regime_data.get('overall_regime', '?')}, "
                     f"size_mod={size_mod:.0%})")
 

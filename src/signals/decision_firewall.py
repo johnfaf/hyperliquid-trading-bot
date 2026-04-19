@@ -765,7 +765,7 @@ class DecisionFirewall:
                         signal.position_pct *= self.crash_size_multiplier
                     logger.warning(
                         f"CRASH REGIME detected for {signal.coin} "
-                        f"(conf={predictive_regime['confidence']:.2f}) — "
+                        f"(conf={predictive_regime['confidence']:.2f}) -- "
                         f"de-risking: size *= {self.crash_size_multiplier}"
                     )
             except Exception as e:

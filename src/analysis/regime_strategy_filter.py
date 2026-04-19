@@ -380,4 +380,4 @@ if __name__ == "__main__":
 
     print("Filtered strategies (trending_up):")
     for s in filter.filter(sample_strategies, sample_regimes[0]):
-        print(f"  {s['type']}: base={s['score']:.2f} → adjusted={s['adjusted_score']:.2f}")
+        print(f"  {s['type']}: base={s['score']:.2f} -> adjusted={s['adjusted_score']:.2f}")

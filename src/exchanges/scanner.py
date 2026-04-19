@@ -134,9 +134,9 @@ class MultiExchangeScanner:
                 # Degraded = API is reachable but incomplete data
                 # Still include for cross-venue confirmation (partial is better than none)
                 healthy[name] = adapter
-                logger.debug(f"Including {name} (degraded) for cross-venue — partial data available")
+                logger.debug(f"Including {name} (degraded) for cross-venue -- partial data available")
             else:
-                logger.debug(f"Skipping {name} — state={state.value}")
+                logger.debug(f"Skipping {name} -- state={state.value}")
         return healthy
 
     # ─── Health Check ──────────────────────────────────────
@@ -224,7 +224,7 @@ class MultiExchangeScanner:
         Logs detailed observability: checked, boosted, downgraded counts.
         """
         if not self.cross_venue:
-            logger.info("CrossVenue: single venue mode — no confirmation possible")
+            logger.info("CrossVenue: single venue mode -- no confirmation possible")
             return [
                 CrossVenueSignal(
                     coin=s.get("coin", ""),
@@ -240,7 +240,7 @@ class MultiExchangeScanner:
         secondary_healthy = [n for n in healthy if n != primary_exchange]
         if not secondary_healthy:
             logger.info(f"CrossVenue: no healthy secondary venues "
-                       f"(states: {self.check_health()}) — skipping confirmation")
+                       f"(states: {self.check_health()}) -- skipping confirmation")
             return [
                 CrossVenueSignal(
                     coin=s.get("coin", ""),

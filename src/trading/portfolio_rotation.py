@@ -759,7 +759,7 @@ class PortfolioRotationManager:
                 # for this coin, which is a safety bypass that must be visible.
                 logger.warning(
                     "_guardrail_block_reason: could not parse forced-exit timestamp "
-                    "for %s (%r): %s — round-trip block bypassed for this signal",
+                    "for %s (%r): %s -- round-trip block bypassed for this signal",
                     coin, last_exit.get("at"), e,
                 )
         return False, ""

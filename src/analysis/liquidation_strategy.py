@@ -226,7 +226,7 @@ class LiquidationStrategy:
         expected_return = 0.01 + (raw_confidence - 0.35) * 0.05  # 1-3.5% expected
 
         self.setups_detected += 1
-        logger.debug(f"LCRS setup [{coin}]: {setup_type} → {trade_side.upper()} "
+        logger.debug(f"LCRS setup [{coin}]: {setup_type} -> {trade_side.upper()} "
                      f"(confidence={raw_confidence:.0%}, funding={funding:.4f}, "
                      f"OI_chg={oi_change:.1%}, exhaustion={exhaustion_score:.2f})")
 

@@ -24,7 +24,7 @@ def run_discovery(container) -> None:
         Holds all subsystem instances (.discovery, .identifier, etc.)
     """
     logger.info("=" * 60)
-    logger.info("DISCOVERY CYCLE — refreshing trader pool")
+    logger.info("DISCOVERY CYCLE -- refreshing trader pool")
     logger.info("=" * 60)
 
     try:
@@ -40,7 +40,7 @@ def run_discovery(container) -> None:
         # Phase 1: Discover and analyze traders
         logger.info("Phase 1: Trader Discovery")
         if container.discovery is None:
-            logger.warning("  Discovery subsystem not available — skipping")
+            logger.warning("  Discovery subsystem not available -- skipping")
             return
         discovery_result = container.discovery.run_discovery_cycle()
         logger.info("  Discovered: %d traders", discovery_result.get("traders_discovered", 0))

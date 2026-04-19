@@ -247,7 +247,7 @@ class LLMFilter:
             return False, confidence, f"Confidence too low after filters: {reason_str}"
 
         if reasons:
-            logger.debug(f"LLMFilter [{coin} {side}]: passed rules with adjustments — {', '.join(reasons)}")
+            logger.debug(f"LLMFilter [{coin} {side}]: passed rules with adjustments -- {', '.join(reasons)}")
 
         return True, confidence, "approved" + (f" ({', '.join(reasons)})" if reasons else "")
 
@@ -280,7 +280,7 @@ class LLMFilter:
 
         except Exception as e:
             self.stats["llm_errors"] += 1
-            logger.warning("LLMFilter Claude API error: %s — falling back to rules", e)
+            logger.warning("LLMFilter Claude API error: %s -- falling back to rules", e)
             self.stats["passed"] += 1
             return True, rule_confidence, rule_reason + " (LLM fallback)"
 

@@ -425,7 +425,7 @@ class PaperTrader:
                     if matching_trade:
                         _drop_counts["existing_position"] += 1
                         logger.info(
-                            "Skipping %s — already have matching open position",
+                            "Skipping %s -- already have matching open position",
                             strategy.get("name", "?"),
                         )
                         continue
@@ -599,7 +599,7 @@ class PaperTrader:
                         )
                         if abs(adjusted - trade_signal.confidence) > 0.05:
                             logger.debug(f"Calibration adjust {sig['coin']}: "
-                                       f"{trade_signal.confidence:.2f} → {adjusted:.2f}")
+                                       f"{trade_signal.confidence:.2f} -> {adjusted:.2f}")
                         trade_signal.confidence = adjusted
                     except Exception as e:
                         logger.debug(f"Calibration error: {e}")
@@ -843,7 +843,7 @@ class PaperTrader:
                 )
                 if not closed_victim:
                     logger.warning(
-                        "Rotation victim close failed for %s — skipping replacement with %s",
+                        "Rotation victim close failed for %s -- skipping replacement with %s",
                         victim.get("coin"), sig["coin"],
                     )
                     _drop_counts["rotation_victim_close_failed"] = _drop_counts.get("rotation_victim_close_failed", 0) + 1
@@ -886,7 +886,7 @@ class PaperTrader:
         # Summary of filtering pipeline
         total_dropped = sum(_drop_counts.values())
         if total_dropped > 0 or executed:
-            logger.info(f"Paper trade pipeline: {len(strategies)} strategies → {len(raw_signals)} signals → "
+            logger.info(f"Paper trade pipeline: {len(strategies)} strategies -> {len(raw_signals)} signals -> "
                         f"{len(executed)} executed | Drops: {dict((k,v) for k,v in _drop_counts.items() if v > 0)}")
 
         return executed
@@ -1148,7 +1148,7 @@ class PaperTrader:
         try:
             # Apply entry slippage — paper trades should reflect realistic fills
             slipped_price = self._apply_slippage(signal["price"], signal["side"], is_entry=True)
-            logger.debug(f"Slippage: {signal['coin']} entry {signal['price']:.2f} → {slipped_price:.2f} "
+            logger.debug(f"Slippage: {signal['coin']} entry {signal['price']:.2f} -> {slipped_price:.2f} "
                         f"({signal['side']})")
 
             trade_id = db.open_paper_trade(
@@ -1312,7 +1312,7 @@ class PaperTrader:
         # the paper_account balance or, on retry, double-credit the PnL.
         if not db.close_paper_trade_and_credit_account(trade["id"], slipped_exit, pnl):
             logger.error(
-                "_close_trade: DB close failed for trade %s (%s %s) — "
+                "_close_trade: DB close failed for trade %s (%s %s) -- "
                 "no account PnL credited (already closed or account missing).",
                 trade["id"], trade.get("side", "?"), trade.get("coin", "?"),
             )
@@ -1502,7 +1502,7 @@ class PaperTrader:
                 if fallback_price <= 0:
                     continue  # No price at all — skip entirely
                 logger.warning(
-                    "No market price for %s (trade %s) — using entry price $%.4f as fallback",
+                    "No market price for %s (trade %s) -- using entry price $%.4f as fallback",
                     trade["coin"], trade.get("id"), fallback_price,
                 )
                 current_price = fallback_price

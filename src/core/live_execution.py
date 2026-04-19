@@ -368,7 +368,7 @@ def _rescale_size_for_live(trade: Dict, trader) -> Optional[Dict]:
     if abs(scale - 1.0) >= 0.01:
         scaled_trade["size"] = original_size * scale
         logger.info(
-            "Rescaled %s size for live: %.6f → %.6f "
+            "Rescaled %s size for live: %.6f -> %.6f "
             "(paper=$%.0f, free_margin=$%.2f, equity=$%.2f, scale=%.4f)",
             trade.get("coin", "?"),
             original_size,
@@ -457,8 +457,8 @@ def _rescale_size_for_live(trade: Dict, trader) -> Optional[Dict]:
         if notional > max_order_usd:
             capped_size = max_order_usd / cap_reference_price
             logger.info(
-                "Capping %s live mirror to $%.2f (slipped ref=%.6f): %.6f → %.6f "
-                "(notional $%.2f → $%.2f)",
+                "Capping %s live mirror to $%.2f (slipped ref=%.6f): %.6f -> %.6f "
+                "(notional $%.2f -> $%.2f)",
                 coin or "?",
                 max_order_usd,
                 cap_reference_price,
@@ -535,7 +535,7 @@ def _rescale_size_for_live(trade: Dict, trader) -> Optional[Dict]:
             floored_size = target_notional / entry_price
             logger.info(
                 "Flooring %s live mirror UP to exchange minimum: "
-                "%.6f → %.6f (notional $%.2f → $%.2f, margin @ %.1fx = "
+                "%.6f -> %.6f (notional $%.2f -> $%.2f, margin @ %.1fx = "
                 "$%.2f, ref_price=$%.4f %s).  Proportional rescale from "
                 "paper was below $%.2f; this departs from strict "
                 "paper-proportional sizing, unavoidable given live "
@@ -687,7 +687,7 @@ def mirror_executed_trades_to_live(
                         )
                     else:
                         logger.error(
-                            "%s FAILED: %s %s %s — result: %s",
+                            "%s FAILED: %s %s %s -- result: %s",
                             success_label,
                             live_signal.coin,
                             live_signal.side.value,

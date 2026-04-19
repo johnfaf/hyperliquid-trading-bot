@@ -115,7 +115,7 @@ def cancel_live_orders_once(container, reason: str, *, force: bool = False) -> b
             return True
         except Exception as exc:
             logger.error(
-                "Failed to cancel live orders during shutdown (%s): %s — "
+                "Failed to cancel live orders during shutdown (%s): %s -- "
                 "clearing shutdown_orders_cancelled flag so a retry can run",
                 reason, exc,
             )
@@ -158,7 +158,7 @@ def check_file_kill_switch(container) -> bool:
             # a broken activate_kill_switch() must not block the emergency
             # order-cancel path.  C10.
             logger.error(
-                "[fast] Failed to flip sticky kill switch on live_trader (%s) — "
+                "[fast] Failed to flip sticky kill switch on live_trader (%s) -- "
                 "continuing to cancel orders regardless",
                 exc,
             )
@@ -200,7 +200,7 @@ def _record_fast_cycle_failure(container, exc: Exception) -> None:
     threshold = _fast_cycle_failure_threshold()
     if count >= threshold:
         logger.critical(
-            "[fast] %d consecutive fast-cycle failures (>= %d) — escalating: "
+            "[fast] %d consecutive fast-cycle failures (>= %d) -- escalating: "
             "marking bg-fast FAILED and activating live kill switch.  Last error: %s",
             count, threshold, exc,
         )

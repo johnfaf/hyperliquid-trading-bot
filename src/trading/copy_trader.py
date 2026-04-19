@@ -447,14 +447,14 @@ class CopyTrader:
             adjusted_confidence = original_confidence * _CRASH_COPY_CONFIDENCE_MULTIPLIER
             logger.info(
                 f"REGIME WEIGHT: crash detected for {coin}, "
-                f"reducing copy confidence {original_confidence:.2f} → {adjusted_confidence:.2f}"
+                f"reducing copy confidence {original_confidence:.2f} -> {adjusted_confidence:.2f}"
             )
         elif regime == "neutral":
             # Slightly reduce during neutral regimes.
             adjusted_confidence = original_confidence * _NEUTRAL_COPY_CONFIDENCE_MULTIPLIER
             logger.debug(
                 f"REGIME WEIGHT: neutral regime for {coin}, "
-                f"reducing copy confidence {original_confidence:.2f} → {adjusted_confidence:.2f}"
+                f"reducing copy confidence {original_confidence:.2f} -> {adjusted_confidence:.2f}"
             )
         elif regime == "bullish":
             # Increase aggressiveness during bullish regimes, capped at 1.0.
@@ -465,7 +465,7 @@ class CopyTrader:
             if adjusted_confidence > original_confidence:
                 logger.info(
                     f"REGIME WEIGHT: bullish detected for {coin}, "
-                    f"boosting copy confidence {original_confidence:.2f} → {adjusted_confidence:.2f}"
+                    f"boosting copy confidence {original_confidence:.2f} -> {adjusted_confidence:.2f}"
                 )
         else:
             adjusted_confidence = original_confidence
@@ -999,7 +999,7 @@ class CopyTrader:
         # (see src/data/database.py::close_paper_trade_and_credit_account).
         if not db.close_paper_trade_and_credit_account(trade["id"], exit_price, pnl):
             logger.error(
-                "Copy trade close failed for trade %s (%s %s) — "
+                "Copy trade close failed for trade %s (%s %s) -- "
                 "already closed or account row missing; no credit applied.",
                 trade["id"], trade.get("side", "?"), trade.get("coin", "?"),
             )

@@ -59,7 +59,7 @@ class StrategyScorer:
             # New: 5 trades = 0.50x, 3 trades = 0.30x, 8 trades = 0.80x
             sample_penalty = (trade_count / 10) ** 1.0
             composite *= sample_penalty
-            logger.debug(f"Sample-size penalty: {trade_count} trades → {sample_penalty:.2f}x")
+            logger.debug(f"Sample-size penalty: {trade_count} trades -> {sample_penalty:.2f}x")
 
         # Apply time decay based on when strategy was last scored
         last_scored = strategy.get("last_scored")

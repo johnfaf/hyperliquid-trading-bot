@@ -66,7 +66,7 @@ def _rate_limit_backoff(attempt: int, label: str = "") -> float:
     base = _RATE_LIMIT_BACKOFF_SEQ[idx]
     jitter = base * random.uniform(0.0, 0.10)
     duration = base + jitter
-    logger.warning("Rate limited%s (attempt %d) — backing off %.1fs", label, attempt, duration)
+    logger.warning("Rate limited%s (attempt %d) -- backing off %.1fs", label, attempt, duration)
     return duration
 
 
@@ -675,13 +675,13 @@ def evaluate_wallet(address: str, bot_score: int = 0,
     if win_rate > MAX_HUMAN_WIN_RATE and abs(pen_total) > 1000:
         superhuman = True
         logger.info(
-            "Superhuman filter: %s WR=%.0f%% (>%.0f%%) — likely bot/vault",
+            "Superhuman filter: %s WR=%.0f%% (>%.0f%%) -- likely bot/vault",
             address[:10], win_rate, MAX_HUMAN_WIN_RATE,
         )
     if pen_dd < MIN_HUMAN_DRAWDOWN and pen_total > 5000:
         superhuman = True
         logger.info(
-            "Superhuman filter: %s DD=%.1f%% (<%.1f%%) with $%s — likely bot/vault",
+            "Superhuman filter: %s DD=%.1f%% (<%.1f%%) with $%s -- likely bot/vault",
             address[:10], pen_dd, MIN_HUMAN_DRAWDOWN, f"{pen_total:+,.0f}",
         )
 
@@ -722,9 +722,9 @@ def evaluate_wallet(address: str, bot_score: int = 0,
 
     tag = "GOLDEN" if is_golden else "not golden"
     logger.info(
-        "%s %s: raw=$%s → penalised=$%s "
+        "%s %s: raw=$%s -> penalised=$%s "
         "| DD=%.1f%% | Sharpe=%.2f | WR=%.0f%% | hold=%.1fh | %s",
-        "★" if is_golden else "·", address[:10],
+        "*" if is_golden else "·", address[:10],
         f"{raw_total:+,.0f}", f"{pen_total:+,.0f}",
         report.penalised_max_drawdown_pct, report.sharpe_ratio,
         report.win_rate, avg_hold_hours, tag,
@@ -1116,7 +1116,7 @@ def run_golden_scan(max_wallets: int = 200) -> Dict:
     for r in results:
         if r.is_golden:
             logger.debug(
-                "  ★ %s: PnL=$%s Sharpe=%.2f DD=%.1f%% hold=%.1fh",
+                "  * %s: PnL=$%s Sharpe=%.2f DD=%.1f%% hold=%.1fh",
                 r.address[:10], f"{r.penalised_pnl:+,.0f}", r.sharpe_ratio,
                 r.penalised_max_drawdown_pct, r.avg_hold_time_hours,
             )

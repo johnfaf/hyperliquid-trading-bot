@@ -123,7 +123,7 @@ class SubsystemHealthRegistry:
         with self._lock:
             sub = self._subsystems.get(name)
             if sub is None:
-                logger.debug("heartbeat() for unknown subsystem '%s' — ignored", name)
+                logger.debug("heartbeat() for unknown subsystem '%s' -- ignored", name)
                 return
             sub.last_heartbeat = datetime.now(timezone.utc)
             if sub.state == SubsystemState.DEGRADED and (
@@ -155,7 +155,7 @@ class SubsystemHealthRegistry:
         with self._lock:
             sub = self._subsystems.get(name)
             if sub is None:
-                logger.debug("set_status() for unknown subsystem '%s' — ignored", name)
+                logger.debug("set_status() for unknown subsystem '%s' -- ignored", name)
                 return
 
             old_state = sub.state
