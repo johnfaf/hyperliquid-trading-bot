@@ -560,3 +560,265 @@ def test_shadow_tracker_uses_shared_runtime_database(monkeypatch, tmp_path):
         assert row[0] == 1
     finally:
         conn.close()
+
+
+# ─── H4 (audit): dualwrite readiness / health surface ──────────────
+
+
+class _FlakyPgCursor:
+    """Postgres cursor that raises on every ``execute`` — simulates outage."""
+
+    def __init__(self, conn):
+        self._conn = conn
+
+    def execute(self, sql, params=()):
+        self._conn.execute_calls += 1
+        raise RuntimeError("postgres-down")
+
+
+class _FlakyPgConn:
+    def __init__(self):
+        self.execute_calls = 0
+        self.rollback_calls = 0
+        self.commit_calls = 0
+
+    def cursor(self):
+        return _FlakyPgCursor(self)
+
+    def rollback(self):
+        self.rollback_calls += 1
+
+    def commit(self):
+        self.commit_calls += 1
+
+
+def test_dualwrite_stats_records_failures_into_rolling_window():
+    from src.data.db.connection import _DualWriteStats
+
+    stats = _DualWriteStats()
+    assert stats.is_healthy()
+
+    for _ in range(3):
+        stats.record_fail("outage")
+    assert stats.recent_failures(window_s=60) == 3
+    assert stats.is_healthy(window_s=60, max_failures=5)
+
+    for _ in range(5):
+        stats.record_fail("outage")
+    assert stats.recent_failures(window_s=60) == 8
+    assert not stats.is_healthy(window_s=60, max_failures=5)
+
+    snap = stats.snapshot()
+    assert snap["pg_writes_failed"] == 8
+    assert snap["recent_failures_5m"] == 8
+
+
+def test_dualwrite_adapter_mirror_failure_feeds_health_counters():
+    from src.data.db.connection import dualwrite_stats
+
+    dualwrite_stats._recent_failures.clear()
+    before = dualwrite_stats.snapshot()
+    before_failed = before["pg_writes_failed"]
+
+    sqlite_conn = sqlite3.connect(":memory:")
+    sqlite_conn.row_factory = sqlite3.Row
+    sqlite_conn.execute(
+        "CREATE TABLE strategies (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL)"
+    )
+    pg_conn = _FlakyPgConn()
+    adapter = DualWriteAdapter(sqlite_conn, pg_conn)
+
+    for i in range(6):
+        adapter.execute(
+            "INSERT INTO strategies (name) VALUES (?)",
+            (f"strat-{i}",),
+        )
+
+    after = dualwrite_stats.snapshot()
+    assert after["pg_writes_failed"] - before_failed >= 6
+    assert pg_conn.rollback_calls >= 6
+    assert not dualwrite_stats.is_healthy(window_s=60, max_failures=5)
+
+
+def test_database_dualwrite_is_healthy_wrapper_respects_backend(monkeypatch):
+    from src.data import database as db_module
+    from src.data.db.connection import dualwrite_stats
+
+    dualwrite_stats._recent_failures.clear()
+    # Non-dualwrite backends short-circuit to True even if the shared
+    # counter has stale failures.
+    monkeypatch.setattr(db_module.config, "DB_BACKEND", "sqlite")
+    for _ in range(50):
+        dualwrite_stats.record_fail("irrelevant")
+    assert db_module.dualwrite_is_healthy() is True
+
+    # Switching the active backend surfaces the recorded failures.
+    monkeypatch.setattr(db_module.config, "DB_BACKEND", "dualwrite")
+    assert not db_module.dualwrite_is_healthy(window_s=60, max_failures=5)
+
+
+def test_live_trader_trips_kill_switch_on_unhealthy_dualwrite(monkeypatch, tmp_path):
+    from src.data import database as db_module
+    from src.data.db.connection import dualwrite_stats
+    from src.trading import live_trader as live_trader_module
+    from src.trading.live_trader import LiveTrader
+
+    class _AllowAllFirewall:
+        def validate(self, signal, **kw):
+            return True, "ok"
+
+    def _fake_credentials(self):
+        self.signer = type("Signer", (), {"address": "0x" + "1" * 40})()
+        self.agent_wallet_address = self.signer.address
+        self.public_address = "0x" + "2" * 40
+        self.status_reason = "credentials_loaded"
+
+    monkeypatch.setattr(LiveTrader, "_load_credentials", _fake_credentials)
+    monkeypatch.setattr(LiveTrader, "_load_asset_index_map", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "reconcile_positions", lambda self: None)
+    # Run in dry_run=False to enable the live-only health trip while
+    # bypassing the H3 downgrade guard (dualwrite backend, no DSN required
+    # for this unit-level check).
+    monkeypatch.setattr(db_module.config, "DB_BACKEND", "dualwrite")
+    monkeypatch.setattr(
+        db_module.config, "DB_BACKEND_DOWNGRADED", False, raising=False,
+    )
+    # Redirect the persisted kill-switch state file to an isolated tmp
+    # path so any residual file from a prior run in this repo cannot
+    # flip the fresh trader into kill-switch-on before the test starts.
+    ks_file = tmp_path / "ks_state.json"
+    monkeypatch.setattr(
+        live_trader_module.config,
+        "LIVE_KILL_SWITCH_STATE_FILE",
+        str(ks_file),
+        raising=False,
+    )
+
+    trader = LiveTrader(
+        firewall=_AllowAllFirewall(),
+        dry_run=False,
+        max_order_usd=1_000_000,
+    )
+
+    # Clean slate, then load 20 failures into the rolling window.
+    dualwrite_stats._recent_failures.clear()
+    for _ in range(20):
+        dualwrite_stats.record_fail("pg-down")
+
+    assert not trader._kill_switch_is_active()
+    tripped = trader._check_dualwrite_health()
+    assert tripped is True
+    assert trader._kill_switch_is_active()
+    assert trader._dualwrite_unhealthy_tripped is True
+    # Second call in the same unhealthy episode must not double-fire.
+    assert trader._check_dualwrite_health() is False
+
+
+# ─── H5 (audit): paper_trades idempotency key ──────────────────────
+
+
+def test_open_paper_trade_idempotency_key_deduplicates(monkeypatch, tmp_path):
+    """Re-running open_paper_trade with the same key must return the same id."""
+    from src.data import database as db_module
+
+    db_file = tmp_path / "h5.db"
+    monkeypatch.setattr(db_module.config, "DB_BACKEND", "sqlite")
+    monkeypatch.setattr(db_module.config, "DB_PATH", str(db_file), raising=False)
+    monkeypatch.setattr(db_module, "_RESOLVED_DB_PATH", str(db_file), raising=False)
+
+    db_module.init_db()
+
+    tid1 = db_module.open_paper_trade(
+        None, "ETH", "long", 100.0, 1.0, idempotency_key="signal:abc",
+    )
+    tid2 = db_module.open_paper_trade(
+        None, "ETH", "long", 100.0, 1.0, idempotency_key="signal:abc",
+    )
+    assert tid1 == tid2, (tid1, tid2)
+
+    tid3 = db_module.open_paper_trade(
+        None, "ETH", "long", 100.0, 1.0, idempotency_key="signal:xyz",
+    )
+    assert tid3 != tid1
+
+    # No key at all -> legacy "always insert" behavior preserved.
+    tid_a = db_module.open_paper_trade(None, "ETH", "long", 100.0, 1.0)
+    tid_b = db_module.open_paper_trade(None, "ETH", "long", 100.0, 1.0)
+    assert tid_a != tid_b
+
+    # Empty / whitespace-only keys are normalized to None and therefore
+    # always insert (do NOT collide with each other on the empty string).
+    tid_x = db_module.open_paper_trade(
+        None, "ETH", "long", 100.0, 1.0, idempotency_key="",
+    )
+    tid_y = db_module.open_paper_trade(
+        None, "ETH", "long", 100.0, 1.0, idempotency_key="   ",
+    )
+    assert tid_x != tid_y
+
+
+def test_open_paper_trade_idempotency_key_schema_migration(monkeypatch, tmp_path):
+    """An existing SQLite DB without client_order_id must migrate cleanly."""
+    import sqlite3 as _sqlite3
+
+    from src.data import database as db_module
+
+    db_file = tmp_path / "legacy.db"
+
+    # Build a legacy schema: paper_trades WITHOUT client_order_id.
+    conn = _sqlite3.connect(str(db_file))
+    conn.executescript(
+        """
+        CREATE TABLE paper_trades (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            strategy_id INTEGER,
+            opened_at TEXT NOT NULL,
+            closed_at TEXT,
+            coin TEXT NOT NULL,
+            side TEXT NOT NULL,
+            entry_price REAL NOT NULL,
+            exit_price REAL,
+            size REAL NOT NULL,
+            leverage REAL DEFAULT 1,
+            pnl REAL DEFAULT 0,
+            status TEXT DEFAULT 'open',
+            stop_loss REAL,
+            take_profit REAL,
+            metadata TEXT DEFAULT '{}'
+        );
+        INSERT INTO paper_trades
+            (strategy_id, opened_at, coin, side, entry_price, size, leverage)
+        VALUES (NULL, '2026-04-01T00:00:00+00:00', 'BTC', 'long', 50000, 0.1, 1);
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    monkeypatch.setattr(db_module.config, "DB_BACKEND", "sqlite")
+    monkeypatch.setattr(db_module.config, "DB_PATH", str(db_file), raising=False)
+    monkeypatch.setattr(db_module, "_RESOLVED_DB_PATH", str(db_file), raising=False)
+
+    # Must not raise — the new init_db pre-migrates the column before
+    # CREATE UNIQUE INDEX references it.
+    db_module.init_db()
+
+    # Column present and legacy row preserved with NULL client_order_id.
+    raw = _sqlite3.connect(str(db_file))
+    raw.row_factory = _sqlite3.Row
+    cols = [r["name"] for r in raw.execute("PRAGMA table_info(paper_trades)")]
+    assert "client_order_id" in cols
+    row = raw.execute(
+        "SELECT coin, client_order_id FROM paper_trades WHERE id=1"
+    ).fetchone()
+    assert row["coin"] == "BTC"
+    assert row["client_order_id"] is None
+    raw.close()
+
+    # New inserts with a key still deduplicate.
+    tid1 = db_module.open_paper_trade(
+        None, "ETH", "long", 100.0, 1.0, idempotency_key="k1",
+    )
+    tid2 = db_module.open_paper_trade(
+        None, "ETH", "long", 100.0, 1.0, idempotency_key="k1",
+    )
+    assert tid1 == tid2

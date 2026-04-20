@@ -1151,6 +1151,12 @@ class PaperTrader:
             logger.debug(f"Slippage: {signal['coin']} entry {signal['price']:.2f} -> {slipped_price:.2f} "
                         f"({signal['side']})")
 
+            # H5 (audit): use the signal's stable id (when the signal
+            # pipeline supplies one) as the paper-trade idempotency key
+            # so a crash-retry or re-delivery of the same signal does
+            # not open two logical paper trades.
+            signal_id = str(signal.get("signal_id") or "").strip()
+            idem_key = f"paper:{signal_id}" if signal_id else None
             trade_id = db.open_paper_trade(
                 strategy_id=strategy.get("id"),
                 coin=signal["coin"],
@@ -1178,6 +1184,7 @@ class PaperTrader:
                     "options_flow_aligned": signal.get("options_flow_aligned"),
                     "volume_confirmed": signal.get("volume_confirmed"),
                 },
+                idempotency_key=idem_key,
             )
 
             logger.info(

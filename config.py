@@ -61,9 +61,23 @@ _HAS_PERSISTENT_VOLUME = DB_PATH.startswith("/data")
 _raw_db_backend = os.environ.get("DB_BACKEND", "sqlite").strip().lower()
 POSTGRES_DSN = os.environ.get("POSTGRES_DSN", "").strip()
 # Auto-downgrade to sqlite if Postgres backends are requested but no DSN is set.
-# This prevents spamming warnings on deployments that don't have Postgres yet.
+# H3 (audit): we still downgrade so dev environments boot, but we record
+# the downgrade and emit a visible warning.  When live trading is enabled,
+# live_trader's init raises on this flag so the operator can't scale
+# capital believing Postgres is the ledger while SQLite is actually active.
+DB_BACKEND_DOWNGRADED = False
+_DB_BACKEND_REQUESTED = _raw_db_backend
 if _raw_db_backend in ("dualwrite", "postgres") and not POSTGRES_DSN:
     DB_BACKEND = "sqlite"
+    DB_BACKEND_DOWNGRADED = True
+    import sys as _sys
+    print(
+        f"[config] WARNING: DB_BACKEND={_raw_db_backend!r} requested but "
+        f"POSTGRES_DSN is empty -- downgrading to sqlite.  Live trading "
+        f"will REFUSE to start in this state (set POSTGRES_DSN or "
+        f"DB_BACKEND=sqlite).",
+        file=_sys.stderr,
+    )
 else:
     DB_BACKEND = _raw_db_backend
 POSTGRES_POOL_MIN = int(os.environ.get("POSTGRES_POOL_MIN", 2))
@@ -132,6 +146,32 @@ RISK_POLICY_SOURCE_PROFILES_JSON = os.environ.get(
     "RISK_POLICY_SOURCE_PROFILES_JSON",
     "",
 ).strip()
+
+# H11 (audit): explicit reward/risk mode selector.  Surfaces the policy
+# to operators so it's configurable per tier instead of an implicit
+# dynamic adjustment.  Valid values:
+#   - fixed_5r        (TP target = fixed 5R of the stop, skip dynamic
+#                      regime/confidence adjustments — predictable for
+#                      canary/T0 tiers where we're still calibrating)
+#   - dynamic_bounded (legacy behavior — adjust R based on regime,
+#                      confidence, source quality, expected move; bounded
+#                      by min_reward_multiple/max_reward_multiple)
+#   - hybrid_min_5r   (run dynamic adjustments but floor the final R at
+#                      hybrid_min_r_floor — best of both worlds for
+#                      advanced tiers with stable edge)
+RISK_POLICY_RR_MODE = os.environ.get("RISK_POLICY_RR_MODE", "dynamic_bounded").strip().lower()
+if RISK_POLICY_RR_MODE not in {"fixed_5r", "dynamic_bounded", "hybrid_min_5r"}:
+    # Fail loud at import time — don't silently run with a broken mode.
+    raise ValueError(
+        f"RISK_POLICY_RR_MODE={RISK_POLICY_RR_MODE!r} is not a valid mode. "
+        f"Expected one of: fixed_5r, dynamic_bounded, hybrid_min_5r"
+    )
+RISK_POLICY_FIXED_R_TARGET = float(
+    os.environ.get("RISK_POLICY_FIXED_R_TARGET", 5.0)
+)
+RISK_POLICY_HYBRID_MIN_R_FLOOR = float(
+    os.environ.get("RISK_POLICY_HYBRID_MIN_R_FLOOR", 5.0)
+)
 
 # ─── Macro Regime Overlay ────────────────────────────────────────
 # Protective regime that scrapes external macro sources and adjusts risk posture
@@ -224,7 +264,16 @@ LIVE_TRADING_DUAL_CONTROL_CONFIRM = os.environ.get(
 # notice because fill-verification times out with "FILL NOT VERIFIED".
 # This floor is PHYSICALLY enforced by the exchange and cannot be lowered
 # by config.
-LIVE_MIN_ORDER_USD = float(os.environ.get("LIVE_MIN_ORDER_USD", 11.0))
+# H8 (audit): route live-capital-critical env vars through safe_env_*
+# so a typo at redeploy can't crash boot and leave positions unmanaged.
+# The helper logs a warning and falls back to the module default rather
+# than raising ValueError at import time.
+from src.core.env_utils import (  # noqa: E402 -- must follow sys.path setup above
+    safe_env_float as _safe_env_float,
+    safe_env_int as _safe_env_int,
+)
+
+LIVE_MIN_ORDER_USD = _safe_env_float("LIVE_MIN_ORDER_USD", 11.0, lo=1.0, hi=10_000.0)
 
 # Hard ceiling on the notional ($ USDC) of any single live order.  This is a
 # safety net while the bot is ramping on a small live balance — even if paper
@@ -234,20 +283,39 @@ LIVE_MIN_ORDER_USD = float(os.environ.get("LIVE_MIN_ORDER_USD", 11.0))
 # can actually execute; set a higher value via env var as confidence grows.
 # NOTE: a value below LIVE_MIN_ORDER_USD is impossible to honor — the
 # LiveTrader will raise it to LIVE_MIN_ORDER_USD at startup with a warning.
-LIVE_MAX_ORDER_USD = float(os.environ.get("LIVE_MAX_ORDER_USD", 100.0))
-LIVE_MAX_POSITION_SIZE_USD = float(
-    os.environ.get(
-        "LIVE_MAX_POSITION_SIZE_USD",
-        os.environ.get("HL_MAX_POSITION_SIZE", str(LIVE_MAX_ORDER_USD)),
-    )
+LIVE_MAX_ORDER_USD = _safe_env_float("LIVE_MAX_ORDER_USD", 100.0, lo=1.0, hi=1_000_000.0)
+_live_max_position_default = os.environ.get(
+    "HL_MAX_POSITION_SIZE", str(LIVE_MAX_ORDER_USD)
 )
+_raw_live_max_position = os.environ.get("LIVE_MAX_POSITION_SIZE_USD", _live_max_position_default)
+try:
+    LIVE_MAX_POSITION_SIZE_USD = float(_raw_live_max_position)
+    if LIVE_MAX_POSITION_SIZE_USD < 1.0:
+        raise ValueError("below floor")
+    if LIVE_MAX_POSITION_SIZE_USD > 10_000_000.0:
+        raise ValueError("above ceiling")
+except (TypeError, ValueError):
+    import sys as _sys
+    print(
+        f"[config] WARNING: LIVE_MAX_POSITION_SIZE_USD={_raw_live_max_position!r} "
+        f"out of [1,1e7] range or non-numeric; falling back to "
+        f"LIVE_MAX_ORDER_USD=${LIVE_MAX_ORDER_USD}.",
+        file=_sys.stderr,
+    )
+    LIVE_MAX_POSITION_SIZE_USD = float(LIVE_MAX_ORDER_USD)
 # Daily loss limit for the live account in USD (forwarded to LiveTrader).
-LIVE_MAX_DAILY_LOSS_USD = float(os.environ.get("LIVE_MAX_DAILY_LOSS_USD", 100.0))
+LIVE_MAX_DAILY_LOSS_USD = _safe_env_float(
+    "LIVE_MAX_DAILY_LOSS_USD", 100.0, lo=0.01, hi=10_000_000.0,
+)
 LIVE_CANARY_MODE = os.environ.get(
     "LIVE_CANARY_MODE", "false"
 ).lower() in ("true", "1", "yes")
-LIVE_CANARY_MAX_ORDER_USD = float(os.environ.get("LIVE_CANARY_MAX_ORDER_USD", 25.0))
-LIVE_CANARY_MAX_SIGNALS_PER_DAY = int(os.environ.get("LIVE_CANARY_MAX_SIGNALS_PER_DAY", 25))
+LIVE_CANARY_MAX_ORDER_USD = _safe_env_float(
+    "LIVE_CANARY_MAX_ORDER_USD", 25.0, lo=1.0, hi=1_000_000.0,
+)
+LIVE_CANARY_MAX_SIGNALS_PER_DAY = _safe_env_int(
+    "LIVE_CANARY_MAX_SIGNALS_PER_DAY", 25, lo=0, hi=100_000,
+)
 LIVE_MAX_ORDERS_PER_SOURCE_PER_DAY = int(
     os.environ.get("LIVE_MAX_ORDERS_PER_SOURCE_PER_DAY", 0)
 )
@@ -396,6 +464,21 @@ FIREWALL_CANARY_MODE = os.environ.get(
 ).lower() in ("true", "1", "yes")
 FIREWALL_CANARY_MAX_POSITIONS = int(
     os.environ.get("FIREWALL_CANARY_MAX_POSITIONS", 2)
+)
+# AUDIT M1 — aggregate exposure caps (two independent metrics).
+# FIREWALL_MAX_AGGREGATE_EXPOSURE caps *leveraged notional* (sum of
+# size × price × leverage) against balance.  Default 1.50 lets ~4-5
+# concurrent 5x leveraged paper positions co-exist for strategy
+# evaluation; drop to 0.60-0.80 for live.
+FIREWALL_MAX_AGGREGATE_EXPOSURE = float(
+    os.environ.get("FIREWALL_MAX_AGGREGATE_EXPOSURE", 1.50)
+)
+# FIREWALL_MAX_AGGREGATE_MARGIN_PCT caps sum of *margin actually
+# locked* (notional / leverage).  Leverage-agnostic capital-at-risk
+# view.  Default 0.60 = "no more than 60% of equity locked across all
+# positions at once".  Set to 0 to disable.
+FIREWALL_MAX_AGGREGATE_MARGIN_PCT = float(
+    os.environ.get("FIREWALL_MAX_AGGREGATE_MARGIN_PCT", 0.60)
 )
 
 # Per-source capital allocator / throttling.
@@ -648,6 +731,9 @@ def _validate_config_bounds() -> None:
         ("FIREWALL_SAME_SIDE_COOLDOWN_SECONDS", 0, 86_400, 900),
         ("FIREWALL_MAX_SAME_SIDE_POSITIONS_PER_COIN", 1, 20, 2),
         ("FIREWALL_CANARY_MAX_POSITIONS", 1, 100, 2),
+        # AUDIT M1 — leveraged notional and margin caps
+        ("FIREWALL_MAX_AGGREGATE_EXPOSURE", 0.0, 20.0, 1.50),
+        ("FIREWALL_MAX_AGGREGATE_MARGIN_PCT", 0.0, 5.0, 0.60),
         ("SOURCE_POLICY_MIN_CLOSED_TRADES", 1, 1000, 3),
         ("SOURCE_POLICY_KEEP_TOP_N", 1, 1000, 5),
         ("SOURCE_POLICY_PAUSE_WEIGHT", 0.0, 1.0, 0.12),

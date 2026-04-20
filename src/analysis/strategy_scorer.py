@@ -33,6 +33,34 @@ class StrategyScorer:
         """
         Compute a composite score for a strategy across multiple dimensions.
         Returns a score breakdown dict.
+
+        AUDIT M4 — alpha significance (RESEARCH ITEM, not yet wired):
+        -----------------------------------------------------------
+        The ``trade_count < 10`` branch below applies only a *soft
+        multiplicative sample-size penalty* ``(trade_count / 10) ** 1.0``.
+        This is **not** a statistical significance test.  A strategy
+        with 12 trades at 83% win rate (which has a real p-value of
+        ~0.015 against a 50% null) and a strategy with 12 trades at 58%
+        win rate (p ~ 0.39, not significant) both receive the same
+        0.12-multiplier sample penalty — their ranks then depend
+        entirely on the raw win-rate / PnL / Sharpe numerics rather
+        than on whether those numerics are distinguishable from noise.
+
+        The project *already ships* an exact-binomial p-value helper
+        at ``src.signals.feature_store_alpha._exact_binomial_pvalue``
+        and a t-test in ``src.backtest.risk_policy_walkforward`` — but
+        neither is wired into strategy ranking here.  A proper fix
+        would gate ``composite`` on either:
+          * a binomial-test p-value against a neutral-edge null
+            (e.g. p < 0.10 to remain eligible at bootstrap, p < 0.05
+            once ``trade_count >= 30``), or
+          * a Wilson lower-confidence-bound on win-rate used in place
+            of the point estimate inside ``_score_win_rate``.
+
+        Tracked as a research item so the scoring cycle is not
+        silently reshuffled mid-canary — implementing this should be
+        a dedicated PR with historical rescoring and a backtest of
+        the new activation policy.
         """
         # Individual dimension scores (each 0-1)
         pnl_score = self._score_pnl(strategy)
@@ -100,7 +128,24 @@ class StrategyScorer:
         return float(1 / (1 + np.exp(x)))
 
     def _score_win_rate(self, strategy: Dict) -> float:
-        """Score based on win rate. Minimum trades required for reliability."""
+        """Score based on win rate. Minimum trades required for reliability.
+
+        AUDIT M4 — the ``trade_count < MIN_TRADES_FOR_STRATEGY`` guard
+        below is a *quadratic sample penalty*, not a significance
+        test.  It shrinks the score for thin data but does not check
+        whether the observed win-rate is distinguishable from a
+        neutral-edge null.  A win-rate point estimate without a
+        confidence interval can rank a lucky 4-out-of-5 strategy (WR
+        = 0.80, p ~ 0.19 vs 50%) above a well-sampled 55-out-of-100
+        strategy (WR = 0.55, p ~ 0.18 vs 50%) despite the latter
+        being meaningfully more reliable.
+
+        Future work: replace the raw ``win_rate`` feed with a Wilson
+        lower-confidence-bound (see the binomial helper already
+        present at ``src.signals.feature_store_alpha``) so the score
+        reflects *conservative* performance estimates rather than
+        point estimates.
+        """
         win_rate = strategy.get("win_rate", 0)
         trade_count = strategy.get("trade_count", 0)
 

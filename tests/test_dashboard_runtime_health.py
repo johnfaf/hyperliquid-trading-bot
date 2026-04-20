@@ -168,6 +168,64 @@ def test_dashboard_write_endpoints_require_configured_auth_token(monkeypatch):
     assert b"dashboard_write_auth_not_configured" in handler.wfile.getvalue()
 
 
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/api/order",
+        "/api/paper/reset",
+        "/api/trade/close",
+        "/api/trade/close-all",
+        # H9 (audit): compute-intensive, destructive, and external-API
+        # POST endpoints must also be gated when auth is not configured.
+        "/api/backtest/run",
+        "/api/candle-backtest/run",
+        "/api/candle-backtest/fetch",
+        "/api/candle-backtest/cache/clear",
+        "/api/stress/run",
+    ],
+)
+def test_dashboard_all_mutating_post_endpoints_require_auth_token(monkeypatch, path):
+    """H9: every mutating / compute-intensive / destructive POST endpoint
+    must refuse to execute when DASHBOARD_AUTH_TOKEN is unset, not just
+    the finance endpoints.  Without this gate, a Railway-hosted dashboard
+    with auth disabled exposes backtest spinners, cache wipes, and
+    exchange-API fetch loops to the public internet."""
+    monkeypatch.delenv("DASHBOARD_AUTH_TOKEN", raising=False)
+    handler = _make_dashboard_handler(path=path, command="POST")
+
+    allowed = handler._check_auth()
+
+    assert allowed is False, (
+        f"{path} must be gated when DASHBOARD_AUTH_TOKEN is unset"
+    )
+    assert ("status", 403) in handler._responses
+    assert b"dashboard_write_auth_not_configured" in handler.wfile.getvalue()
+
+
+def test_dashboard_all_mutating_post_endpoints_accept_valid_bearer(monkeypatch):
+    """H9: when DASHBOARD_AUTH_TOKEN is set, all gated POST endpoints must
+    still accept a valid Bearer token — the expanded gate should not break
+    authenticated operators."""
+    monkeypatch.setenv("DASHBOARD_AUTH_TOKEN", "secret-token")
+    for path in (
+        "/api/order",
+        "/api/paper/reset",
+        "/api/backtest/run",
+        "/api/candle-backtest/run",
+        "/api/candle-backtest/fetch",
+        "/api/candle-backtest/cache/clear",
+        "/api/stress/run",
+    ):
+        handler = _make_dashboard_handler(
+            path=path,
+            headers={"Authorization": "Bearer secret-token"},
+            command="POST",
+        )
+        assert handler._check_auth() is True, (
+            f"{path} should authorize with valid Bearer token"
+        )
+
+
 def _make_dashboard_handler(path="/", headers=None, command="GET"):
     handler = dashboard.DashboardHandler.__new__(dashboard.DashboardHandler)
     handler.path = path

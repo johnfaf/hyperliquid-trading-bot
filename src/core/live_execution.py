@@ -256,6 +256,15 @@ def sync_shadow_book_to_live(container) -> List[Dict]:
                 "leverage": leverage,
             },
         }
+        # H5 (audit): a crash mid-reconciliation must not spawn a second
+        # shadow record for the *same* orphan.  The exchange-level
+        # identity (coin + side + entry + size + leverage) is stable
+        # enough to serve as the idempotency key here — a repeated
+        # reconciliation run sees the existing shadow row instead of
+        # inserting a duplicate.
+        orphan_key = (
+            f"orphan:{coin}:{side}:{entry_price:.10g}:{size:.10g}:{leverage:.4g}"
+        )
         trade_id = db.open_paper_trade(
             None,
             coin,
@@ -264,6 +273,7 @@ def sync_shadow_book_to_live(container) -> List[Dict]:
             size,
             leverage=leverage,
             metadata=metadata,
+            idempotency_key=orphan_key,
         )
         db.audit_log(
             action="orphan_found",
@@ -285,6 +295,40 @@ def sync_shadow_book_to_live(container) -> List[Dict]:
     return closed
 
 
+def _paper_open_margin_used() -> float:
+    """Return the total notional margin the paper book currently has locked.
+
+    H6 (audit): paper-to-live mirror sizing uses ``paper_balance`` (the
+    paper account's *cash* balance) as the denominator while the live
+    side correctly deducts ``totalMarginUsed`` to compute
+    ``live_free_margin``.  That asymmetry silently oversizes live when
+    the paper book has open exposure, because the denominator stays at
+    the full cash balance even though paper would block a new trade
+    with the same constraint.  This helper produces the paper-side
+    equivalent so the scale ratio compares "new-trade capacity" on
+    both sides.  Open paper trades without a ``leverage`` field fall
+    back to 1x — the most conservative assumption.
+    """
+    try:
+        open_trades = db.get_open_paper_trades() or []
+    except Exception as exc:
+        logger.debug("Cannot compute paper open margin used: %s", exc)
+        return 0.0
+    total = 0.0
+    for t in open_trades:
+        try:
+            size = float(t.get("size", 0) or 0)
+            entry_price = float(t.get("entry_price", 0) or 0)
+            lev = float(t.get("leverage", 0) or 0) or 1.0
+            if size <= 0 or entry_price <= 0:
+                continue
+            notional = size * entry_price
+            total += notional / max(lev, 1.0)
+        except Exception:
+            continue
+    return max(0.0, total)
+
+
 def _rescale_size_for_live(trade: Dict, trader) -> Optional[Dict]:
     """
     Rescale paper trade size proportionally to the live account balance.
@@ -298,6 +342,14 @@ def _rescale_size_for_live(trade: Dict, trader) -> Optional[Dict]:
     """
     paper_account = db.get_paper_account()
     paper_balance = float((paper_account or {}).get("balance", 0) or 0)
+    # H6 (audit): compute a *free* paper balance that deducts margin
+    # already locked up by open paper trades.  Without this deduction
+    # the scale ratio ``live_free_margin / paper_balance`` is
+    # asymmetric: live correctly excludes locked margin while paper
+    # effectively double-counts any open-position margin as available,
+    # which scales the live order larger than intended.
+    paper_margin_used = _paper_open_margin_used()
+    paper_free_balance = max(0.0, paper_balance - paper_margin_used)
     live_equity = trader.get_account_value()
     live_free_margin = None
     if hasattr(trader, "get_free_margin"):
@@ -337,8 +389,19 @@ def _rescale_size_for_live(trade: Dict, trader) -> Optional[Dict]:
             trade.get("coin", "?"), live_free_margin, float(live_equity or 0.0),
         )
         return None
+    if paper_free_balance <= 0:
+        logger.warning(
+            "Skipping live mirror for %s: paper account has no free balance "
+            "(balance=$%.2f, margin_used=$%.2f).  Close or shrink paper "
+            "exposure before mirroring new live trades.",
+            trade.get("coin", "?"),
+            paper_balance,
+            paper_margin_used,
+        )
+        return None
 
-    scale = live_free_margin / paper_balance
+    # H6: scale on symmetric "new-trade capacity" on both sides.
+    scale = live_free_margin / paper_free_balance
     # H7: Clamp scale to 1.0 when live free margin exceeds the paper
     # reference unless the operator explicitly opts in via
     # LIVE_ALLOW_SCALE_ABOVE_PAPER=1.  The paper book is the source of our
@@ -352,12 +415,15 @@ def _rescale_size_for_live(trade: Dict, trader) -> Optional[Dict]:
     if scale > 1.0 and not allow_above:
         logger.info(
             "Clamping live mirror scale for %s from %.4f to 1.0 "
-            "(live_free_margin=$%.2f > paper_balance=$%.0f). "
+            "(live_free_margin=$%.2f > paper_free_balance=$%.2f, "
+            "paper_balance=$%.0f, paper_margin_used=$%.2f). "
             "Set LIVE_ALLOW_SCALE_ABOVE_PAPER=1 to opt out.",
             trade.get("coin", "?"),
             scale,
             live_free_margin,
+            paper_free_balance,
             paper_balance,
+            paper_margin_used,
         )
         scale = 1.0
     original_size = float(trade.get("size", 0) or 0)
@@ -369,11 +435,14 @@ def _rescale_size_for_live(trade: Dict, trader) -> Optional[Dict]:
         scaled_trade["size"] = original_size * scale
         logger.info(
             "Rescaled %s size for live: %.6f -> %.6f "
-            "(paper=$%.0f, free_margin=$%.2f, equity=$%.2f, scale=%.4f)",
+            "(paper=$%.0f [free=$%.2f, margin_used=$%.2f], "
+            "free_margin=$%.2f, equity=$%.2f, scale=%.4f)",
             trade.get("coin", "?"),
             original_size,
             scaled_trade["size"],
             paper_balance,
+            paper_free_balance,
+            paper_margin_used,
             live_free_margin,
             float(live_equity or 0.0),
             scale,

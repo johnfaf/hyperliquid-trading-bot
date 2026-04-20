@@ -637,3 +637,196 @@ def test_validate_batch_counts_projected_notional_for_signals_without_size(mock_
     assert first.size == pytest.approx(3.0)
     assert results[1][1] is False
     assert "aggregate exposure" in results[1][2].lower()
+
+
+# ─────────────────────────────────────────────────────────────────
+# AUDIT M1 — aggregate margin cap is an independent, leverage-agnostic
+# capital-at-risk check that runs alongside the legacy leveraged-notional
+# exposure cap.  These tests cover:
+#   - margin cap rejects when exposure cap would allow
+#   - exposure cap rejects when margin cap would allow
+#   - disabling margin cap (<=0) reverts to legacy-only behavior
+#   - both caps approved = signal approved
+# ─────────────────────────────────────────────────────────────────
+
+
+@patch("src.signals.decision_firewall.db")
+def test_firewall_margin_cap_rejects_when_notional_cap_allows(mock_db):
+    """High-leverage signal: notional cap passes, margin cap blocks."""
+    mock_db.get_open_paper_trades.return_value = []
+    mock_db.get_paper_account.return_value = {"balance": 1000}
+    mock_db.audit_log = MagicMock()
+
+    from src.signals.decision_firewall import DecisionFirewall
+
+    # Generous notional cap (200%), strict margin cap (10%).
+    # Signal with size=7, price=$100, leverage=5:
+    #   - leveraged notional = 7 × 100 × 5 = 3500 → 350% → blows notional cap
+    # So instead pick size=3 at 5x leverage:
+    #   - leveraged notional = 3 × 100 × 5 = 1500 → 150% (fits 200% cap)
+    #   - margin            = 3 × 100 / 5 = 60    →  6% (fits 10% cap)
+    # Then size=6 at 5x leverage:
+    #   - leveraged notional = 6 × 100 × 5 = 3000 → 300% (fails 200%)
+    # To isolate margin cap we need exposure cap forgiving AND margin cap tight.
+    fw = DecisionFirewall(
+        {
+            "max_aggregate_exposure": 10.0,      # effectively disabled
+            "max_aggregate_margin_pct": 0.10,    # 10% margin cap
+            "enable_predictive_derisk": False,
+            "funding_risk_enabled": False,
+            "min_confidence": 0.2,
+        }
+    )
+
+    # Size=3 @ $100 @ 5x lev → notional=300, margin=60 → 60/1000 = 6% (passes)
+    ok_signal = MockSignal(
+        coin="BTC", confidence=0.8,
+        size=3.0, entry_price=100.0, leverage=5, position_pct=0.0,
+    )
+    passed, reason = fw.validate(ok_signal)
+    assert passed is True, f"Expected approval, got: {reason}"
+
+    # Size=6 @ $100 @ 5x lev → notional=600, margin=120 → 120/1000 = 12% (fails 10%)
+    # With NO existing positions to add to.  Exposure = 600/1000 = 60% (fits 1000% cap).
+    mock_db.get_open_paper_trades.return_value = []  # reset — no persisted positions
+    big_signal = MockSignal(
+        coin="ETH", confidence=0.8,
+        size=6.0, entry_price=100.0, leverage=5, position_pct=0.0,
+    )
+    passed, reason = fw.validate(big_signal)
+    assert passed is False
+    assert "aggregate margin" in reason.lower()
+
+
+@patch("src.signals.decision_firewall.db")
+def test_firewall_notional_cap_still_rejects_when_margin_cap_allows(mock_db):
+    """Low-leverage high-notional signal: margin cap passes, notional cap blocks."""
+    mock_db.get_open_paper_trades.return_value = []
+    mock_db.get_paper_account.return_value = {"balance": 1000}
+    mock_db.audit_log = MagicMock()
+
+    from src.signals.decision_firewall import DecisionFirewall
+
+    # Tight notional cap (50% leveraged), generous margin cap (80%).
+    # Size=7 @ $100 @ 1x lev → notional (leveraged) = 700, margin = 700
+    #   700/1000 = 70% → fails 50% exposure cap
+    #   700/1000 = 70% → fits 80% margin cap
+    fw = DecisionFirewall(
+        {
+            "max_aggregate_exposure": 0.50,
+            "max_aggregate_margin_pct": 0.80,
+            "enable_predictive_derisk": False,
+            "funding_risk_enabled": False,
+            "min_confidence": 0.2,
+        }
+    )
+    signal = MockSignal(
+        coin="BTC", confidence=0.8,
+        size=7.0, entry_price=100.0, leverage=1, position_pct=0.0,
+    )
+    passed, reason = fw.validate(signal)
+    assert passed is False
+    assert "aggregate exposure" in reason.lower()
+    # The margin-cap branch should NOT appear in the rejection reason.
+    assert "aggregate margin" not in reason.lower()
+
+
+@patch("src.signals.decision_firewall.db")
+def test_firewall_margin_cap_disabled_when_nonpositive(mock_db):
+    """max_aggregate_margin_pct <= 0 turns off the margin cap entirely."""
+    mock_db.get_open_paper_trades.return_value = []
+    mock_db.get_paper_account.return_value = {"balance": 1000}
+    mock_db.audit_log = MagicMock()
+
+    from src.signals.decision_firewall import DecisionFirewall
+
+    fw = DecisionFirewall(
+        {
+            "max_aggregate_exposure": 10.0,      # effectively disabled
+            "max_aggregate_margin_pct": 0.0,     # disabled via 0
+            "enable_predictive_derisk": False,
+            "funding_risk_enabled": False,
+            "min_confidence": 0.2,
+        }
+    )
+    # size=9 @ $100 @ 5x lev → margin 180 (18% of balance).  With cap=0, allowed.
+    signal = MockSignal(
+        coin="BTC", confidence=0.8,
+        size=9.0, entry_price=100.0, leverage=5, position_pct=0.0,
+    )
+    passed, reason = fw.validate(signal)
+    assert passed is True, f"Expected approval with margin cap disabled, got: {reason}"
+
+
+@patch("src.signals.decision_firewall.db")
+def test_firewall_both_caps_approve_signal(mock_db):
+    """Both caps satisfied → signal is approved."""
+    mock_db.get_open_paper_trades.return_value = []
+    mock_db.get_paper_account.return_value = {"balance": 1000}
+    mock_db.audit_log = MagicMock()
+
+    from src.signals.decision_firewall import DecisionFirewall
+
+    fw = DecisionFirewall(
+        {
+            "max_aggregate_exposure": 1.50,
+            "max_aggregate_margin_pct": 0.60,
+            "enable_predictive_derisk": False,
+            "funding_risk_enabled": False,
+            "min_confidence": 0.2,
+        }
+    )
+    # size=2 @ $100 @ 3x lev → notional 600 (60% of balance), margin 67 (6.7%)
+    signal = MockSignal(
+        coin="BTC", confidence=0.8,
+        size=2.0, entry_price=100.0, leverage=3, position_pct=0.0,
+    )
+    passed, reason = fw.validate(signal)
+    assert passed is True, f"Expected approval, got: {reason}"
+
+
+@patch("src.signals.decision_firewall.db")
+def test_firewall_margin_cap_aggregates_over_existing_positions(mock_db):
+    """Margin cap must sum across already-open positions (per-position margin)."""
+    mock_db.get_paper_account.return_value = {"balance": 1000}
+    mock_db.audit_log = MagicMock()
+
+    from src.signals.decision_firewall import DecisionFirewall
+
+    # Three existing 5x-leveraged positions, each with margin = 20 (= 2%),
+    # leveraged notional = 500 each → total leveraged notional = 1500.
+    # Margin cap = 40% → total margin budget = 400.
+    mock_db.get_open_paper_trades.return_value = [
+        {"coin": "BTC", "side": "long", "size": 1, "entry_price": 100, "leverage": 5},
+        {"coin": "ETH", "side": "long", "size": 1, "entry_price": 100, "leverage": 5},
+        {"coin": "SOL", "side": "long", "size": 1, "entry_price": 100, "leverage": 5},
+    ]
+
+    # Exposure cap set very loose (100.0 = 10000% of balance) so the leveraged-
+    # notional guard won't fire — we isolate the margin-cap behavior.
+    fw = DecisionFirewall(
+        {
+            "max_aggregate_exposure": 100.0,      # effectively disabled
+            "max_aggregate_margin_pct": 0.40,
+            "max_positions": 8,
+            "enable_predictive_derisk": False,
+            "funding_risk_enabled": False,
+            "min_confidence": 0.2,
+        }
+    )
+    # Candidate 1: size=2.5 @ 5x → margin 50 (5%).  Total projected = 60 + 50 = 110 (11%) → passes 40%.
+    small = MockSignal(
+        coin="DOGE", confidence=0.8,
+        size=2.5, entry_price=100.0, leverage=5, position_pct=0.0,
+    )
+    passed, reason = fw.validate(small)
+    assert passed is True, f"Expected approval, got: {reason}"
+
+    # Candidate 2: size=20 @ 5x → margin 400 (40%).  Total projected = 60 + 400 = 460 (46%) → fails 40%.
+    big = MockSignal(
+        coin="AVAX", confidence=0.8,
+        size=20.0, entry_price=100.0, leverage=5, position_pct=0.0,
+    )
+    passed, reason = fw.validate(big)
+    assert passed is False
+    assert "aggregate margin" in reason.lower()

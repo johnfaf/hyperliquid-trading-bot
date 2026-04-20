@@ -30,6 +30,7 @@ class ResolvedRiskPolicy:
     regime: str = "unknown"
     regime_confidence: float = 0.0
     source_quality: float = 0.5
+    rr_mode: str = "dynamic_bounded"  # H11: surface the active rr_mode
     rationale: list[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -56,8 +57,32 @@ class ResolvedRiskPolicy:
 class RiskPolicyEngine:
     """Resolve dynamic risk controls from regime, volatility, and source edge."""
 
+    # H11 (audit): Explicit R-multiple modes make the reward/risk policy
+    # auditable and deployable per tier.  Prior behavior was a single
+    # dynamic adjustment with hidden bounds (min 1.75R, max 4.5R); this
+    # named-mode selector surfaces the choice to the operator.
+    #
+    #   fixed_5r        - hard set reward_multiple = 5.0; skip dynamic
+    #                     adjustments (predictable, conservative TP/SL
+    #                     for early tiers — bootstrap phase)
+    #   dynamic_bounded - current legacy behavior (min 1.75, max 4.5);
+    #                     the dynamic adjustments from regime/confidence
+    #                     still apply (advanced tiers with stable edge)
+    #   hybrid_min_5r   - use dynamic adjustments but floor the final R
+    #                     at 5.0 (takes dynamic upside but keeps the
+    #                     fixed_5r floor for consistency)
+    RR_MODES = {"fixed_5r", "dynamic_bounded", "hybrid_min_5r"}
+
     def __init__(self, config: Optional[Dict[str, Any]] = None):
         cfg = dict(config or {})
+        raw_mode = str(cfg.get("rr_mode", "dynamic_bounded") or "dynamic_bounded").strip().lower()
+        if raw_mode not in self.RR_MODES:
+            raise ValueError(
+                f"Invalid rr_mode={raw_mode!r}.  Expected one of {sorted(self.RR_MODES)}."
+            )
+        self.rr_mode = raw_mode
+        self.fixed_r_target = float(cfg.get("fixed_r_target", 5.0))
+        self.hybrid_min_r_floor = float(cfg.get("hybrid_min_r_floor", 5.0))
         self.default_reward_multiple = float(cfg.get("default_reward_multiple", 3.25))
         self.min_reward_multiple = float(cfg.get("min_reward_multiple", 1.75))
         self.max_reward_multiple = float(cfg.get("max_reward_multiple", 4.5))
@@ -143,45 +168,80 @@ class RiskPolicyEngine:
         stop_roe_pct = max(base_stop_roe_pct * stop_multiplier, atr_stop_roe_pct)
         stop_roe_pct = min(max(stop_roe_pct, self.min_stop_roe_pct), self.max_stop_roe_pct)
 
-        reward_multiple = self.default_reward_multiple
-        if regime in {"trending_up", "trending_down", "bullish", "bearish"}:
-            reward_multiple += 0.75
-            rationale.append("trend regime: larger target")
-        elif regime in {"ranging"}:
-            reward_multiple -= 1.75
-            rationale.append("range regime: smaller target")
-        elif regime in {"crash", "volatile"}:
-            reward_multiple -= 1.25
-            rationale.append("chaotic regime: reduce target")
+        # H11: reward_multiple derivation depends on the configured rr_mode.
+        # ``fixed_5r`` short-circuits all dynamic adjustments for predictable
+        # TP/SL; ``dynamic_bounded`` preserves legacy behavior; ``hybrid_min_5r``
+        # runs the dynamic path but floors the final R at hybrid_min_r_floor.
+        if self.rr_mode == "fixed_5r":
+            reward_multiple = self.fixed_r_target
+            rationale.append(f"rr_mode=fixed_5r:target={self.fixed_r_target:.2f}R")
+        else:
+            reward_multiple = self.default_reward_multiple
+            if regime in {"trending_up", "trending_down", "bullish", "bearish"}:
+                reward_multiple += 0.75
+                rationale.append("trend regime: larger target")
+            elif regime in {"ranging"}:
+                reward_multiple -= 1.75
+                rationale.append("range regime: smaller target")
+            elif regime in {"crash", "volatile"}:
+                reward_multiple -= 1.25
+                rationale.append("chaotic regime: reduce target")
 
-        if source_quality >= 0.60:
-            reward_multiple += 0.5
-            rationale.append("strong source quality")
-        elif source_quality <= 0.45:
-            reward_multiple -= 0.75
-            rationale.append("weak source quality")
+            if source_quality >= 0.60:
+                reward_multiple += 0.5
+                rationale.append("strong source quality")
+            elif source_quality <= 0.45:
+                reward_multiple -= 0.75
+                rationale.append("weak source quality")
 
-        if signal.confidence >= 0.75:
-            reward_multiple += 0.5
-        elif signal.confidence <= 0.45:
-            reward_multiple -= 0.75
+            if signal.confidence >= 0.75:
+                reward_multiple += 0.5
+            elif signal.confidence <= 0.45:
+                reward_multiple -= 0.75
 
-        if isinstance(source_policy, dict):
-            status = str(source_policy.get("status", "") or "").lower()
-            if status == "degraded":
-                reward_multiple -= 0.5
-                rationale.append("source degraded")
-            elif status == "paused":
-                reward_multiple = min(reward_multiple, 2.0)
-                rationale.append("source paused: capped target")
+            if isinstance(source_policy, dict):
+                status = str(source_policy.get("status", "") or "").lower()
+                if status == "degraded":
+                    reward_multiple -= 0.5
+                    rationale.append("source degraded")
+                elif status == "paused":
+                    reward_multiple = min(reward_multiple, 2.0)
+                    rationale.append("source paused: capped target")
 
-        if expected_move_pct > 0 and stop_roe_pct > 0:
-            expected_rr = (expected_move_pct * leverage) / stop_roe_pct
-            reward_multiple = min(reward_multiple, max(self.min_reward_multiple, expected_rr * 1.25))
-            rationale.append(f"expected_move_cap={expected_rr:.2f}R")
+            if expected_move_pct > 0 and stop_roe_pct > 0:
+                expected_rr = (expected_move_pct * leverage) / stop_roe_pct
+                reward_multiple = min(reward_multiple, max(self.min_reward_multiple, expected_rr * 1.25))
+                rationale.append(f"expected_move_cap={expected_rr:.2f}R")
 
-        reward_multiple = min(max(reward_multiple, self.min_reward_multiple), self.max_reward_multiple)
+            reward_multiple = min(max(reward_multiple, self.min_reward_multiple), self.max_reward_multiple)
+
+            if self.rr_mode == "hybrid_min_5r":
+                # Floor the dynamic result at hybrid_min_r_floor so the
+                # mixed mode never under-targets below the fixed baseline.
+                if reward_multiple < self.hybrid_min_r_floor:
+                    rationale.append(
+                        f"rr_mode=hybrid_min_5r:floored_from={reward_multiple:.2f}R"
+                        f"_to={self.hybrid_min_r_floor:.2f}R"
+                    )
+                    reward_multiple = self.hybrid_min_r_floor
+                else:
+                    rationale.append(
+                        f"rr_mode=hybrid_min_5r:dynamic={reward_multiple:.2f}R"
+                    )
         take_profit_roe_pct = stop_roe_pct * reward_multiple
+
+        # H11: effective min/max R bounds depend on rr_mode.  fixed_5r and
+        # hybrid_min_5r may require R above max_reward_multiple (which was
+        # set for the legacy dynamic_bounded mode).
+        if self.rr_mode == "fixed_5r":
+            effective_min_rr = self.fixed_r_target
+            effective_max_rr = max(self.fixed_r_target, self.max_reward_multiple)
+        elif self.rr_mode == "hybrid_min_5r":
+            effective_min_rr = self.hybrid_min_r_floor
+            effective_max_rr = max(self.hybrid_min_r_floor, self.max_reward_multiple)
+        else:
+            effective_min_rr = self.min_reward_multiple
+            effective_max_rr = self.max_reward_multiple
 
         stop_price_pct = stop_roe_pct / leverage
         take_profit_price_pct = take_profit_roe_pct / leverage
@@ -194,19 +254,27 @@ class RiskPolicyEngine:
             )
         stop_price_pct = min(max(stop_price_pct, self.min_stop_price_pct), dynamic_stop_cap)
 
-        dynamic_target_cap = self.max_take_profit_price_pct
+        # H11: target price cap must honor the effective min/max R.  For
+        # fixed_5r we also widen max_take_profit_price_pct to
+        # stop_price_pct * fixed_r_target so the cap doesn't truncate the
+        # fixed target back to a smaller effective R.
+        tp_price_cap_base = max(
+            self.max_take_profit_price_pct,
+            stop_price_pct * effective_max_rr,
+        )
+        dynamic_target_cap = tp_price_cap_base
         if volatility_pct > 0:
             dynamic_target_cap = min(
                 dynamic_target_cap,
-                max(stop_price_pct * self.min_reward_multiple, volatility_pct * self.target_vol_cap_multiplier),
+                max(stop_price_pct * effective_min_rr, volatility_pct * self.target_vol_cap_multiplier),
             )
         if expected_move_pct > 0:
             dynamic_target_cap = min(
                 dynamic_target_cap,
-                max(stop_price_pct * self.min_reward_multiple, expected_move_pct * 1.15),
+                max(stop_price_pct * effective_min_rr, expected_move_pct * 1.15),
             )
         take_profit_price_pct = min(
-            max(take_profit_price_pct, stop_price_pct * self.min_reward_multiple),
+            max(take_profit_price_pct, stop_price_pct * effective_min_rr),
             dynamic_target_cap,
         )
 
@@ -217,7 +285,7 @@ class RiskPolicyEngine:
         take_profit_roe_pct = take_profit_price_pct * leverage
         reward_multiple = max(
             1.0,
-            min(self.max_reward_multiple, take_profit_roe_pct / stop_roe_pct),
+            min(effective_max_rr, take_profit_roe_pct / stop_roe_pct),
         )
 
         if stop_price_pct >= dynamic_stop_cap - 1e-9:
@@ -269,6 +337,7 @@ class RiskPolicyEngine:
             regime=regime,
             regime_confidence=round(regime_confidence, 4),
             source_quality=round(source_quality, 4),
+            rr_mode=self.rr_mode,
             rationale=rationale,
         )
 

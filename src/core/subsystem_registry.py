@@ -378,6 +378,13 @@ def build_subsystems(
             ),
             "canary_mode": bool(getattr(_fw_cfg, "FIREWALL_CANARY_MODE", False)),
             "canary_max_positions": int(getattr(_fw_cfg, "FIREWALL_CANARY_MAX_POSITIONS", 2)),
+            # AUDIT M1 — leveraged-notional cap + margin cap are independent
+            "max_aggregate_exposure": float(
+                getattr(_fw_cfg, "FIREWALL_MAX_AGGREGATE_EXPOSURE", 1.50)
+            ),
+            "max_aggregate_margin_pct": float(
+                getattr(_fw_cfg, "FIREWALL_MAX_AGGREGATE_MARGIN_PCT", 0.60)
+            ),
         }),
         health,
     )
@@ -440,6 +447,18 @@ def build_subsystems(
             )
             return RiskPolicyEngine(
                 {
+                    # H11: explicit rr_mode selector — surfaces TP/SL policy
+                    # to operators via config so the dynamic adjustments
+                    # are no longer an implicit hidden default.
+                    "rr_mode": getattr(
+                        config, "RISK_POLICY_RR_MODE", "dynamic_bounded"
+                    ),
+                    "fixed_r_target": getattr(
+                        config, "RISK_POLICY_FIXED_R_TARGET", 5.0
+                    ),
+                    "hybrid_min_r_floor": getattr(
+                        config, "RISK_POLICY_HYBRID_MIN_R_FLOOR", 5.0
+                    ),
                     "default_reward_multiple": config.RISK_POLICY_DEFAULT_REWARD_MULTIPLE,
                     "min_reward_multiple": config.RISK_POLICY_MIN_REWARD_MULTIPLE,
                     "max_reward_multiple": config.RISK_POLICY_MAX_REWARD_MULTIPLE,

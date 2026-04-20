@@ -107,7 +107,29 @@ class DecisionFirewall:
         # with 5x leverage means only ~2 positions can co-exist. 1.50 allows
         # up to ~4-5 concurrent leveraged paper positions for better strategy
         # evaluation.  Reduce to 0.60-0.80 for live trading.
+        #
+        # AUDIT M1 — This cap is measured in *leveraged notional* because
+        # _estimate_signal_notional() returns ``size × price × leverage``.
+        # Conceptually this is "market exposure × leverage": a $200 margin
+        # trade at 5x counts as $1000 against this cap.  The cap therefore
+        # intentionally tightens with leverage — it's a circuit breaker on
+        # both face value AND embedded leverage risk, not a pure
+        # capital-at-risk limit.  For the capital-at-risk view we expose
+        # ``max_aggregate_margin_pct`` separately below, so a trade must pass
+        # BOTH caps to be approved.
         self.max_aggregate_exposure_pct = cfg.get("max_aggregate_exposure", 1.50)
+
+        # AUDIT M1 — Aggregate margin cap (capital actually locked up).
+        # This is the cleaner "how much of my balance is reserved as margin
+        # across all open positions" view, independent of leverage math.
+        # A single 5x-leveraged $200 margin trade counts as $200 here (not
+        # $1000).  Default 0.60 = "never lock more than 60% of equity as
+        # margin across all positions" — safer reading than the leveraged
+        # exposure cap when leverage is high.  Set to 0 (or negative) to
+        # disable this cap; both caps default to ON.
+        self.max_aggregate_margin_pct = float(
+            cfg.get("max_aggregate_margin_pct", 0.60)
+        )
 
         # Predictive regime forecaster for dynamic de-risking
         self.enable_predictive_derisk = cfg.get("enable_predictive_derisk", True)
@@ -468,7 +490,17 @@ class DecisionFirewall:
 
     @classmethod
     def _estimate_signal_notional(cls, signal: TradeSignal, balance: Optional[float]) -> float:
-        """Estimate a signal's leveraged notional exposure even before size is resolved."""
+        """
+        Estimate a signal's *leveraged* notional exposure even before size is resolved.
+
+        AUDIT M1 — Despite the name, this returns ``size × price × leverage``
+        rather than pure notional (``size × price``).  The firewall's
+        ``max_aggregate_exposure_pct`` cap has historically been measured
+        against this leveraged-notional metric (it's effectively "market
+        exposure × leverage"), and changing the metric here would silently
+        loosen that cap.  For capital-at-risk (pure margin) math use
+        :meth:`_estimate_signal_margin`.
+        """
         size = cls._resolve_signal_size_units(signal, balance)
         entry_price = float(getattr(signal, "entry_price", 0.0) or 0.0)
         leverage = max(float(getattr(signal, "leverage", 1.0) or 1.0), 1.0)
@@ -479,6 +511,50 @@ class DecisionFirewall:
         if balance and balance > 0 and position_pct > 0:
             return abs(balance * position_pct * leverage)
         return 0.0
+
+    @classmethod
+    def _estimate_signal_margin(cls, signal: TradeSignal, balance: Optional[float]) -> float:
+        """
+        Estimate a signal's *margin requirement* — the capital actually locked
+        up by the position (``notional / leverage``).
+
+        AUDIT M1 — added as a leverage-agnostic companion to
+        :meth:`_estimate_signal_notional`.  The margin cap check uses this so
+        a 5x-leveraged trade with $200 margin counts as $200 against the
+        margin budget (not $1000 the way leveraged-notional would count it).
+        """
+        size = cls._resolve_signal_size_units(signal, balance)
+        entry_price = float(getattr(signal, "entry_price", 0.0) or 0.0)
+        leverage = max(float(getattr(signal, "leverage", 1.0) or 1.0), 1.0)
+        if size > 0 and entry_price > 0:
+            return abs(size * entry_price) / leverage
+
+        # Fallback: position_pct is the fraction of balance earmarked as
+        # margin for the trade, so ``balance × position_pct`` is margin.
+        position_pct = float(getattr(signal, "position_pct", 0.0) or 0.0)
+        if balance and balance > 0 and position_pct > 0:
+            return abs(balance * position_pct)
+        return 0.0
+
+    @staticmethod
+    def _position_margin(pos: Dict) -> float:
+        """Extract/estimate margin for an open position for margin-cap aggregation."""
+        try:
+            projected_margin = float(pos.get("projected_margin", 0) or 0)
+        except (TypeError, ValueError):
+            projected_margin = 0.0
+        if projected_margin > 0:
+            return projected_margin
+
+        try:
+            size = float(pos.get("size", 0) or 0)
+            price = float(pos.get("entry_price", pos.get("entryPx", 0)) or 0)
+            leverage = float(pos.get("leverage", 1) or 1) or 1.0
+        except (TypeError, ValueError):
+            return 0.0
+        if size <= 0 or price <= 0:
+            return 0.0
+        return abs(size * price) / max(leverage, 1.0)
 
     def validate(self, signal: TradeSignal, regime_data: Optional[Dict] = None,
                  open_positions: Optional[List[Dict]] = None,
@@ -625,21 +701,31 @@ class DecisionFirewall:
             )
 
         # 5b. Aggregate portfolio exposure — hard cap across ALL positions
+        # AUDIT M1 — two independent caps apply:
+        #   (1) max_aggregate_exposure_pct against *leveraged notional*
+        #       (historical behavior — scales up with leverage so it doubles
+        #       as a soft leverage-concentration guard).
+        #   (2) max_aggregate_margin_pct against *margin actually locked*
+        #       (leverage-agnostic capital-at-risk view).
+        # A signal must pass BOTH to be approved.
         balance = account_balance
         if balance is None:
             account = db.get_paper_account()
             balance = account.get("balance", 10000) if account else None
         if balance:
             total_exposure = 0.0
+            total_margin = 0.0
             for pos in positions:
                 projected_notional = float(pos.get("projected_notional", 0) or 0)
                 if projected_notional > 0:
                     total_exposure += abs(projected_notional)
-                    continue
-                pos_size = pos.get("size", 0)
-                pos_price = pos.get("entry_price", pos.get("entryPx", 0))
-                pos_leverage = pos.get("leverage", 1)
-                total_exposure += abs(pos_size * pos_price * pos_leverage)
+                else:
+                    pos_size = pos.get("size", 0)
+                    pos_price = pos.get("entry_price", pos.get("entryPx", 0))
+                    pos_leverage = pos.get("leverage", 1)
+                    total_exposure += abs(pos_size * pos_price * pos_leverage)
+
+                total_margin += self._position_margin(pos)
 
             new_notional = self._estimate_signal_notional(signal, balance)
             if new_notional <= 0:
@@ -647,6 +733,8 @@ class DecisionFirewall:
                     "rejected_exposure",
                     "Signal size unresolved; cannot validate aggregate exposure",
                 )
+            new_margin = self._estimate_signal_margin(signal, balance)
+
             projected_exposure = total_exposure + new_notional
             exposure_pct = projected_exposure / balance if balance > 0 else 1.0
 
@@ -655,6 +743,19 @@ class DecisionFirewall:
                               f"Aggregate exposure {exposure_pct:.0%} would exceed "
                               f"{self.max_aggregate_exposure_pct:.0%} limit "
                               f"(${projected_exposure:,.0f}/${balance:,.0f})")
+
+            # Separate margin-based cap (AUDIT M1).  Disabled when
+            # max_aggregate_margin_pct <= 0 so operators can opt out.
+            if self.max_aggregate_margin_pct > 0:
+                projected_margin = total_margin + new_margin
+                margin_pct = projected_margin / balance if balance > 0 else 1.0
+                if margin_pct > self.max_aggregate_margin_pct:
+                    return _reject(
+                        "rejected_exposure",
+                        f"Aggregate margin {margin_pct:.0%} would exceed "
+                        f"{self.max_aggregate_margin_pct:.0%} limit "
+                        f"(${projected_margin:,.0f}/${balance:,.0f})",
+                    )
 
         # 6. Conflict detection — no opposing positions on same coin
         for pos in coin_positions:
@@ -838,6 +939,10 @@ class DecisionFirewall:
                         "size": float(resolved_size or 0),
                         "leverage": float(getattr(signal, "leverage", 1) or 1),
                         "projected_notional": self._estimate_signal_notional(signal, balance),
+                        # AUDIT M1 — carry projected_margin too so the
+                        # margin-based cap sees within-batch accumulated
+                        # margin for burst signal sequences.
+                        "projected_margin": self._estimate_signal_margin(signal, balance),
                     })
 
             approved = sum(1 for _, p, _ in results if p)

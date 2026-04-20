@@ -18,6 +18,7 @@ import logging
 import re
 import threading
 import time
+from collections import deque
 from typing import Optional, Sequence
 
 logger = logging.getLogger(__name__)
@@ -269,7 +270,21 @@ class ConnectionAdapter:
 # ─── Dual-write health counters (process-wide) ─────────────────
 
 class _DualWriteStats:
-    """Thread-safe counters for dual-write health monitoring."""
+    """Thread-safe counters for dual-write health monitoring.
+
+    H4 (audit): dualwrite silently logging Postgres mirror failures means
+    the operator can think they have a resilient audit ledger while every
+    mirror write has been failing for hours.  This class now also tracks
+    a rolling deque of recent failure timestamps so ``is_healthy()`` can
+    answer *is Postgres currently keeping up?* as opposed to the
+    cumulative ``pg_writes_failed`` counter which never shrinks and can't
+    tell a healed outage from an ongoing one.
+    """
+
+    # Cap the failure-timestamp deque so a long outage cannot grow the
+    # memory footprint without bound.  Any value here above the
+    # ``max_failures`` threshold is sufficient for the health check.
+    _MAX_FAILURE_TIMESTAMPS: int = 1024
 
     def __init__(self):
         self._lock = threading.Lock()
@@ -277,16 +292,42 @@ class _DualWriteStats:
         self.pg_writes_failed: int = 0
         self.pg_last_error: str = ""
         self.pg_last_error_ts: float = 0.0
+        self._recent_failures: deque[float] = deque(
+            maxlen=self._MAX_FAILURE_TIMESTAMPS
+        )
 
     def record_ok(self):
         with self._lock:
             self.pg_writes_ok += 1
 
     def record_fail(self, err: str):
+        now = time.time()
         with self._lock:
             self.pg_writes_failed += 1
             self.pg_last_error = err[:200]
-            self.pg_last_error_ts = time.time()
+            self.pg_last_error_ts = now
+            self._recent_failures.append(now)
+
+    def recent_failures(self, window_s: float) -> int:
+        """Return the number of mirror failures seen in the last ``window_s`` seconds.
+
+        Counts non-destructively so concurrent callers using different
+        windows don't steal each other's history — the deque's
+        ``maxlen`` already bounds memory on a long outage.
+        """
+        cutoff = time.time() - float(window_s)
+        with self._lock:
+            return sum(1 for ts in self._recent_failures if ts >= cutoff)
+
+    def is_healthy(self, *, window_s: float = 300.0, max_failures: int = 5) -> bool:
+        """Return True if recent Postgres mirror failures stay under threshold.
+
+        ``window_s``: size of the rolling window in seconds (default 5 min).
+        ``max_failures``: strict upper bound on failures allowed in the
+        window before the backend is considered unhealthy.  A single
+        transient error does not trip the guard; a sustained outage does.
+        """
+        return self.recent_failures(window_s) <= int(max_failures)
 
     def snapshot(self) -> dict:
         with self._lock:
@@ -295,10 +336,28 @@ class _DualWriteStats:
                 "pg_writes_failed": self.pg_writes_failed,
                 "pg_last_error": self.pg_last_error,
                 "pg_last_error_ts": self.pg_last_error_ts,
+                "recent_failures_5m": sum(
+                    1 for ts in self._recent_failures
+                    if ts >= time.time() - 300.0
+                ),
             }
 
 
 dualwrite_stats = _DualWriteStats()
+
+
+def dualwrite_is_healthy(*, window_s: float = 300.0, max_failures: int = 5) -> bool:
+    """Module-level convenience wrapper around :meth:`_DualWriteStats.is_healthy`.
+
+    Callers that do not want to import the private ``dualwrite_stats``
+    instance directly can use this helper.  Returns ``True`` when the
+    rolling failure window is clean; ``False`` when Postgres mirroring
+    has been failing often enough that scaled live trading should stop
+    treating the Postgres ledger as reliable.
+    """
+    return dualwrite_stats.is_healthy(
+        window_s=window_s, max_failures=max_failures,
+    )
 
 
 class DualWriteAdapter:

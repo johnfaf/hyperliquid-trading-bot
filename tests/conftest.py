@@ -13,7 +13,7 @@ if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
 
-import pytest
+import pytest  # noqa: E402  -- must follow the sys.path shim above
 
 
 @pytest.fixture(autouse=True)

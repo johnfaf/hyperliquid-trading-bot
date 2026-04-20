@@ -16,8 +16,11 @@ import re
 import shutil
 import logging
 import sqlite3
+import threading
+import time
 from datetime import datetime, timezone
 from contextlib import contextmanager
+from typing import Dict, Optional
 
 import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -123,6 +126,27 @@ def init_db():
     if _is_pg():
         return
 
+    # H5 (audit): pre-migrate an existing SQLite database to add the
+    # ``client_order_id`` column before the main DDL runs.  The
+    # ``CREATE UNIQUE INDEX ... ON paper_trades(client_order_id)``
+    # statement inside the executescript would otherwise fail on a
+    # long-lived DB because ``CREATE TABLE IF NOT EXISTS`` leaves the
+    # old (column-less) paper_trades table untouched, and then the
+    # index build references a non-existent column.  Running the
+    # ALTER first means the index build always sees the new column.
+    try:
+        with get_connection() as conn:
+            if table_exists("paper_trades"):
+                try:
+                    conn.execute(
+                        "ALTER TABLE paper_trades ADD COLUMN client_order_id TEXT"
+                    )
+                except Exception:
+                    # Column already exists — harmless.
+                    pass
+    except Exception as exc:
+        logger.debug("paper_trades pre-migration skipped: %s", exc)
+
     with get_connection() as conn:
         conn.executescript("""
         -- Top traders we're tracking
@@ -206,6 +230,13 @@ def init_db():
             status TEXT DEFAULT 'open',
             stop_loss REAL,
             take_profit REAL,
+            -- H5 (audit): idempotency key supplied by the caller so
+            -- crash-retry and pipeline-level re-delivery cannot insert
+            -- the same logical paper trade twice.  NULL = caller did
+            -- not supply a key (always-insert legacy behavior).  The
+            -- partial unique index below enforces dedup only for rows
+            -- that opt in.
+            client_order_id TEXT,
             metadata TEXT DEFAULT '{}',
             FOREIGN KEY (strategy_id) REFERENCES strategies(id)
         );
@@ -218,6 +249,13 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_paper_trades_closed_recent
             ON paper_trades(closed_at DESC)
             WHERE status = 'closed';
+        -- H5: partial unique index on the idempotency key.  Existing
+        -- rows with NULL client_order_id are unaffected; only opt-in
+        -- keyed rows compete for uniqueness.  Mirrors the Postgres
+        -- migration 0008.
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_paper_trades_client_order_id
+            ON paper_trades(client_order_id)
+            WHERE client_order_id IS NOT NULL;
 
         -- Paper trading account state
         CREATE TABLE IF NOT EXISTS paper_account (
@@ -726,39 +764,184 @@ def update_paper_account(balance, total_pnl, total_trades, winning_trades):
 
 
 def open_paper_trade(strategy_id, coin, side, entry_price, size, leverage=1,
-                     stop_loss=None, take_profit=None, metadata=None):
+                     stop_loss=None, take_profit=None, metadata=None,
+                     idempotency_key: Optional[str] = None):
+    """Insert a paper trade row and return the row id.
+
+    H5 (audit): when ``idempotency_key`` is supplied, we first look up
+    an existing row by ``client_order_id``.  If one is found (e.g. the
+    caller is retrying after a crash/network blip) we return the
+    existing id instead of inserting a duplicate.  The unique partial
+    index on ``client_order_id`` is the authoritative backstop — a
+    concurrent racer that slipped past our SELECT still raises, and we
+    translate that into a re-lookup so the caller never sees a phantom
+    duplicate.
+
+    When ``idempotency_key`` is None, behavior is unchanged: every call
+    inserts a new row (legacy caller contract preserved).
+    """
     now = datetime.now(timezone.utc).isoformat()
     _ensure_postgres_strategy_parent(strategy_id)
-    with get_connection() as conn:
-        return _insert_and_get_id(conn, """
-            INSERT INTO paper_trades
-            (strategy_id, opened_at, coin, side, entry_price, size, leverage,
-             stop_loss, take_profit, status, metadata)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?)
-        """, (strategy_id, now, coin, side, entry_price, size, leverage,
-              stop_loss, take_profit, json.dumps(metadata or {})))
 
+    key = None
+    if idempotency_key is not None:
+        # Normalize to a non-empty string.  Empty / whitespace-only
+        # values are treated as "no key supplied" so callers that build
+        # keys from optional metadata can't accidentally collide every
+        # row on the empty string.
+        key = str(idempotency_key).strip() or None
 
-def update_paper_trade_metadata(trade_id: int, extra: dict):
-    """Merge extra keys into a paper trade's metadata JSON blob."""
     with get_connection() as conn:
-        row = conn.execute(
-            "SELECT metadata FROM paper_trades WHERE id = ?", (trade_id,)
-        ).fetchone()
-        if not row:
-            raise LookupError(f"Paper trade {trade_id} does not exist")
+        if key is not None:
+            existing = conn.execute(
+                "SELECT id FROM paper_trades WHERE client_order_id = ?",
+                (key,),
+            ).fetchone()
+            if existing is not None:
+                logger.info(
+                    "open_paper_trade: idempotent replay for key=%s -> trade_id=%s",
+                    key[:40], existing["id"],
+                )
+                return int(existing["id"])
 
         try:
-            existing = json.loads(row["metadata"] or "{}")
+            return _insert_and_get_id(conn, """
+                INSERT INTO paper_trades
+                (strategy_id, opened_at, coin, side, entry_price, size, leverage,
+                 stop_loss, take_profit, status, client_order_id, metadata)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?)
+            """, (strategy_id, now, coin, side, entry_price, size, leverage,
+                  stop_loss, take_profit, key, json.dumps(metadata or {})))
         except Exception:
-            existing = {}
-        existing.update(extra)
-        cursor = conn.execute(
-            "UPDATE paper_trades SET metadata = ? WHERE id = ?",
-            (json.dumps(existing), trade_id)
+            if key is None:
+                raise
+            # H5: when the unique-partial-index races us, re-lookup and
+            # return the winner's id.  ``IntegrityError`` / psycopg
+            # ``UniqueViolation`` both surface as generic Exception from
+            # the adapter, so we narrow by retrying the select.
+            existing = conn.execute(
+                "SELECT id FROM paper_trades WHERE client_order_id = ?",
+                (key,),
+            ).fetchone()
+            if existing is not None:
+                logger.info(
+                    "open_paper_trade: insert race resolved by key=%s -> trade_id=%s",
+                    key[:40], existing["id"],
+                )
+                return int(existing["id"])
+            raise
+
+
+# ─────────────────────────────────────────────────────────────────
+# AUDIT M3 — optimistic locking for paper_trade metadata RMW.
+#
+# Previously ``update_paper_trade_metadata`` did a plain SELECT-merge-UPDATE
+# sequence, which loses writes under concurrent callers (e.g. a funding
+# accrual thread and a close handler racing on the same trade id).
+#
+# Fix is two-layered:
+#   (1) A per-trade-id process-local lock serializes RMW within a single
+#       Python process — covers the common "multiple trading-cycle
+#       threads" case without schema changes.
+#   (2) A compare-and-swap on the raw metadata column catches races from
+#       a second process that talks to the same DB (e.g. a stress-test
+#       worker, the dashboard, dualwrite mirror).  The UPDATE only
+#       commits when the stored metadata still matches what we SELECT-ed;
+#       on miss we re-read, re-merge and retry up to ``max_retries``.
+#
+# Cross-process safety still depends on the underlying engine honoring
+# row-level visibility:
+#   - SQLite:   the journal/WAL serializes writers, so a concurrent
+#               writer's commit is visible to the next SELECT.
+#   - Postgres: JSONB stringifies deterministically for equality against
+#               a TEXT parameter because we compare via ``::text``; in
+#               dualwrite both backends see the same update path.
+# ─────────────────────────────────────────────────────────────────
+
+_PAPER_TRADE_METADATA_LOCKS: Dict[int, threading.Lock] = {}
+_PAPER_TRADE_METADATA_LOCKS_GUARD = threading.Lock()
+
+
+def _get_paper_trade_metadata_lock(trade_id: int) -> threading.Lock:
+    """Return the per-trade-id lock used to serialize in-process RMW."""
+    with _PAPER_TRADE_METADATA_LOCKS_GUARD:
+        lock = _PAPER_TRADE_METADATA_LOCKS.get(trade_id)
+        if lock is None:
+            lock = threading.Lock()
+            _PAPER_TRADE_METADATA_LOCKS[trade_id] = lock
+        return lock
+
+
+def update_paper_trade_metadata(
+    trade_id: int, extra: dict, *, max_retries: int = 5
+) -> None:
+    """Merge ``extra`` keys into a paper trade's metadata JSON blob.
+
+    AUDIT M3 — race-safe version.  The old implementation did a plain
+    SELECT-then-UPDATE which lost writes under concurrent callers.  The
+    merged value is now committed with compare-and-swap semantics: if
+    another writer has changed the metadata between our SELECT and our
+    UPDATE, the UPDATE matches zero rows and we re-read/re-merge up to
+    ``max_retries`` times before raising :class:`RuntimeError`.
+
+    Additionally a process-local per-trade lock serializes RMW within
+    this Python process so concurrent threads do not stampede the CAS.
+    """
+    lock = _get_paper_trade_metadata_lock(trade_id)
+    with lock:
+        last_seen: Optional[str] = None
+        for attempt in range(max_retries):
+            with get_connection() as conn:
+                row = conn.execute(
+                    "SELECT metadata FROM paper_trades WHERE id = ?", (trade_id,)
+                ).fetchone()
+                if not row:
+                    raise LookupError(f"Paper trade {trade_id} does not exist")
+
+                raw_metadata = row["metadata"]
+                # Normalize to a string for the CAS predicate.  ``row``
+                # may surface JSONB objects as dict on postgres; cast to
+                # the same on-wire form we'll write back.
+                if isinstance(raw_metadata, (dict, list)):
+                    cas_current = json.dumps(raw_metadata)
+                elif raw_metadata is None:
+                    cas_current = ""
+                else:
+                    cas_current = str(raw_metadata)
+
+                try:
+                    existing = json.loads(cas_current or "{}")
+                except Exception:
+                    existing = {}
+                existing.update(extra)
+                new_metadata_str = json.dumps(existing)
+
+                # CAS predicate works on both sqlite (metadata is TEXT)
+                # and postgres (cast metadata::text for comparison).  The
+                # COALESCE guards the NULL/empty-string boundary.
+                backend = getattr(conn, "backend", "sqlite")
+                if backend == "postgres":
+                    cursor = conn.execute(
+                        "UPDATE paper_trades SET metadata = ?::jsonb "
+                        "WHERE id = ? AND COALESCE(metadata::text, '') = COALESCE(?, '')",
+                        (new_metadata_str, trade_id, cas_current),
+                    )
+                else:
+                    cursor = conn.execute(
+                        "UPDATE paper_trades SET metadata = ? "
+                        "WHERE id = ? AND COALESCE(metadata, '') = COALESCE(?, '')",
+                        (new_metadata_str, trade_id, cas_current),
+                    )
+                if cursor.rowcount == 1:
+                    return
+            # CAS failed — another writer raced us.  Short exponential
+            # backoff before retrying the read-merge-CAS cycle.
+            last_seen = cas_current
+            time.sleep(0.001 * (2 ** attempt))
+        raise RuntimeError(
+            f"update_paper_trade_metadata(trade_id={trade_id}) CAS failed after "
+            f"{max_retries} retries; last seen metadata: {last_seen!r}"
         )
-        if cursor.rowcount == 0:
-            raise LookupError(f"Paper trade {trade_id} does not exist")
 
 
 def close_paper_trade(trade_id, exit_price, pnl) -> bool:
@@ -1261,6 +1444,7 @@ def get_dualwrite_stats() -> dict:
       - ``pg_writes_failed``  — failed Postgres mirror writes
       - ``pg_last_error``     — last error message (truncated)
       - ``pg_last_error_ts``  — timestamp of last error
+      - ``recent_failures_5m`` — failures observed in the last 5 minutes
 
     Returns an empty dict if dual-write is not active.
     """
@@ -1268,6 +1452,25 @@ def get_dualwrite_stats() -> dict:
         return {}
     from src.data.db.connection import dualwrite_stats
     return dualwrite_stats.snapshot()
+
+
+def dualwrite_is_healthy(
+    *, window_s: float = 300.0, max_failures: int = 5,
+) -> bool:
+    """Return True when the dualwrite Postgres mirror is keeping up.
+
+    H4 (audit): readiness checks must surface sustained Postgres mirror
+    failures to the live trader so scaling decisions don't ride on a
+    silently-broken audit ledger.  This wrapper is backend-aware: for
+    any backend other than ``dualwrite`` it short-circuits to True, so
+    SQLite-only and pure-Postgres deployments are unaffected.
+
+    Arguments match :func:`src.data.db.connection.dualwrite_is_healthy`.
+    """
+    if config.DB_BACKEND != "dualwrite":
+        return True
+    from src.data.db.connection import dualwrite_is_healthy as _dw_healthy
+    return _dw_healthy(window_s=window_s, max_failures=max_failures)
 
 
 if __name__ == "__main__":

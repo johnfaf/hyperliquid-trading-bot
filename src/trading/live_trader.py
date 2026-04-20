@@ -74,10 +74,6 @@ from src.core.secret_manager import SecretManagerError, load_agent_private_key
 from src.signals.decision_firewall import DecisionFirewall
 from src.signals.risk_policy import RiskPolicyEngine
 from src.signals.signal_schema import TradeSignal, signal_from_execution_dict
-
-logger = logging.getLogger(__name__)
-
-
 from src.core.env_utils import safe_env_float as _safe_env_float  # C6/C9 shared helper
 from src.trading.scaling_tiers import (
     ScalingTier,
@@ -85,6 +81,8 @@ from src.trading.scaling_tiers import (
     resolve_tier,
     summarize_tier,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class OrderType(str, Enum):
@@ -392,6 +390,40 @@ class LiveTrader:
         self.firewall = firewall
         self.live_requested = not dry_run
         self.dry_run = dry_run
+        # H3 (audit): refuse to bring up a live trader when DB_BACKEND was
+        # requested as postgres/dualwrite but silently downgraded to sqlite
+        # (missing POSTGRES_DSN).  An operator scaling capital believing
+        # Postgres is the audit ledger while SQLite is actually active is a
+        # material misconfiguration.  Tests + dry-run deploys are
+        # unaffected — this only fires when live execution was requested.
+        if self.live_requested and bool(getattr(config, "DB_BACKEND_DOWNGRADED", False)):
+            requested = getattr(config, "_DB_BACKEND_REQUESTED", "unknown")
+            raise RuntimeError(
+                f"DB_BACKEND={requested!r} requested but POSTGRES_DSN is "
+                f"empty -- runtime downgraded to SQLite.  Refusing to enable "
+                f"live trading on SQLite-only in this state.  Either set "
+                f"POSTGRES_DSN (preferred for scaled live trading) or "
+                f"explicitly set DB_BACKEND=sqlite to acknowledge the "
+                f"SQLite-only ledger."
+            )
+        # H4 (audit): dualwrite silently logs every Postgres mirror failure
+        # but never surfaces the resulting loss of ledger durability to the
+        # trading loop.  Capture configurable bounds here so the readiness
+        # guard + periodic in-loop check can trip the kill switch when
+        # Postgres mirroring is sustained-failing.  Defaults (5 failures in
+        # a 5-minute window) tolerate transient blips while catching real
+        # outages well within the 48-72h soak horizon the audit requires
+        # before scaling past T0.
+        self._dualwrite_health_window_s = _safe_env_float(
+            "DUALWRITE_HEALTH_WINDOW_S", 300.0, lo=30.0, hi=3600.0,
+        )
+        self._dualwrite_health_max_failures = int(_safe_env_float(
+            "DUALWRITE_HEALTH_MAX_FAILURES", 5.0, lo=1.0, hi=1000.0,
+        ))
+        # Flag so we only fire the kill-switch trip once per unhealthy
+        # window (the kill switch itself is sticky, but this keeps the
+        # log noise bounded to a single CRITICAL line per event).
+        self._dualwrite_unhealthy_tripped: bool = False
         # C6: guard against unparseable or absurd env input.
         self.max_daily_loss = _safe_env_float(
             "HL_MAX_DAILY_LOSS", max_daily_loss, lo=0.01, hi=1e7,
@@ -1054,6 +1086,50 @@ class LiveTrader:
         except Exception as exc:
             logger.debug("Failed to persist source_orders_today: %s", exc)
 
+    # ── H10: atomic cap check-and-reserve ───────────────────────────────
+    # The old "check now, increment on success" pattern had a TOCTOU race:
+    # under concurrent signals, multiple threads could all read count=N and
+    # all pass max=M — then all increment at commit, overshooting the cap.
+    # ``_reserve_entry_slot`` bundles the read/compare/increment under a
+    # single ``_state_lock`` acquisition, and ``_release_entry_slot`` is
+    # called on any failure path between reservation and commit.
+    def _reserve_entry_slot(self, source_key: str):
+        """Atomically check canary + per-source caps and reserve a slot.
+
+        Returns a tuple (reserved: bool, reason: str).  When ``reserved`` is
+        True the counter has been incremented *on behalf of* this signal
+        and the caller MUST call ``_release_entry_slot(source_key)`` on any
+        failure path that returns before commit (order confirmed success).
+        """
+        with self._state_lock:
+            total = sum(self._source_orders_today.values())
+            if self.canary_mode and self.canary_max_signals_per_day > 0:
+                if total >= self.canary_max_signals_per_day:
+                    self._incr_entry_metric("rejected_canary_cap")
+                    return False, (
+                        f"canary_cap:{total}/{self.canary_max_signals_per_day}"
+                    )
+            if self.max_orders_per_source_per_day > 0:
+                used = self._source_orders_today.get(source_key, 0)
+                if used >= self.max_orders_per_source_per_day:
+                    self._incr_entry_metric("rejected_source_cap")
+                    return False, (
+                        f"source_cap:{used}/{self.max_orders_per_source_per_day}"
+                    )
+            # Reserve: bump counter under the lock so the next concurrent
+            # signal sees the reserved slot and cannot race past the cap.
+            self._source_orders_today[source_key] += 1
+            return True, "reserved"
+
+    def _release_entry_slot(self, source_key: str) -> None:
+        """Release a previously reserved slot (entry failed / rejected)."""
+        with self._state_lock:
+            current = self._source_orders_today.get(source_key, 0)
+            if current <= 1:
+                self._source_orders_today.pop(source_key, None)
+            else:
+                self._source_orders_today[source_key] = current - 1
+
     # ── E7: persistent order-dedup cache ───────────────────────
     _ORDER_DEDUP_STATE_KEY = "live_order_dedup_cache"
 
@@ -1239,8 +1315,18 @@ class LiveTrader:
             return signal_from_execution_dict(signal)
         raise TypeError(f"Unsupported signal type for live execution: {type(signal)}")
 
-    def get_account_state(self) -> Dict[str, Any]:
-        """Fetch raw clearinghouse state for the trading account."""
+    def get_account_state(self, *, force_fresh: bool = False) -> Dict[str, Any]:
+        """Fetch raw clearinghouse state for the trading account.
+
+        Parameters
+        ----------
+        force_fresh : bool
+            P0-3 (audit).  Pass True from safety-critical callers
+            (fill verification, emergency close, cap/risk checks that
+            must see the exchange state AFTER the triggering event).
+            The default is False so the dashboard and logging hot path
+            keep benefiting from the 10s clearinghouseState TTL.
+        """
         if not self.public_address:
             return {}
         try:
@@ -1248,6 +1334,7 @@ class LiveTrader:
                 {"type": "clearinghouseState", "user": self.public_address},
                 priority=Priority.HIGH,
                 timeout=10,
+                force_fresh=force_fresh,
             )
             return data if isinstance(data, dict) else {}
         except Exception as e:
@@ -1784,6 +1871,38 @@ class LiveTrader:
         with self._state_lock:
             self._entry_metrics[key] += n
 
+    @staticmethod
+    def _make_cloid(*salt_parts: Any) -> str:
+        """Produce an exchange-level client order ID.
+
+        H1 (audit): Hyperliquid supports a ``c`` field on each order,
+        a 128-bit hex string.  When present, the exchange rejects a
+        *resubmission* of the same cloid as a duplicate — this is the
+        authoritative idempotency guarantee.  Our local ``_post_order``
+        dedup cache is client-side only; it cannot help when our process
+        crashes and restarts between signing and fill.  The cloid fills
+        that gap.
+
+        We derive the cloid from a keccak hash of the caller-supplied
+        salt parts (coin, side, size, price, intent, time-bucket) so
+        retries of the *same logical order* produce the same cloid and
+        benefit from exchange dedup, while genuinely-different orders
+        get unique cloids.
+
+        Returns a lowercase hex string of the form ``0x`` + 32 hex chars
+        as required by the exchange.
+        """
+        # Hash the salt parts deterministically.  ``str()`` is enough
+        # because every caller converts numeric fields to the same
+        # canonical form (wire size/price) before hashing.
+        payload = "|".join(str(p) for p in salt_parts)
+        # 32 hex chars = 128 bits.  Take the first 16 bytes of keccak256.
+        if HAS_KECCAK:
+            digest = _keccak(payload.encode("utf-8"))[:16]
+        else:
+            digest = hashlib.sha256(payload.encode("utf-8")).digest()[:16]
+        return "0x" + digest.hex()
+
     def _check_daily_reset(self):
         """Reset daily counters at midnight UTC."""
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -1805,6 +1924,77 @@ class LiveTrader:
             # Kill-switch state is sticky across day boundaries and restarts.
             self._refresh_external_kill_switch()
 
+    def _check_dualwrite_health(self) -> bool:
+        """Trip the kill switch when dualwrite Postgres mirroring falls behind.
+
+        H4 (audit): ``DualWriteAdapter`` swallows Postgres mirror
+        failures to keep SQLite-authoritative writes going through.
+        That silence is fine for a single blip, dangerous across a
+        sustained outage — the operator thinks they have an audit
+        ledger on Postgres while it's been drifting for hours.  This
+        check converts the rolling failure window into an explicit
+        kill-switch trip so scaled live trading halts instead of
+        accumulating unreplicated writes.
+
+        Returns ``True`` when the guard fired (kill switch activated)
+        this call.  Returns ``False`` when the backend is healthy, when
+        dualwrite isn't the active backend, or when we've already
+        tripped once for the current unhealthy episode.
+        """
+        # Only meaningful when live execution is enabled on dualwrite.
+        if not self.live_requested or self.dry_run:
+            return False
+        try:
+            if db.get_backend_name() != "dualwrite":
+                return False
+        except Exception:
+            # If the backend can't be introspected we don't want the
+            # check itself to crash the trading loop — fail open.
+            return False
+        try:
+            healthy = db.dualwrite_is_healthy(
+                window_s=self._dualwrite_health_window_s,
+                max_failures=self._dualwrite_health_max_failures,
+            )
+        except Exception as exc:
+            logger.warning("dualwrite health probe failed: %s", exc)
+            return False
+        if healthy:
+            # Reset the one-shot flag so a fresh outage trips again.
+            self._dualwrite_unhealthy_tripped = False
+            return False
+        if self._dualwrite_unhealthy_tripped:
+            return False
+        self._dualwrite_unhealthy_tripped = True
+        stats: dict = {}
+        try:
+            stats = db.get_dualwrite_stats() or {}
+        except Exception:
+            pass
+        reason = (
+            f"dualwrite_unhealthy:recent_failures="
+            f"{stats.get('recent_failures_5m', '?')}:"
+            f"total_failed={stats.get('pg_writes_failed', '?')}"
+        )
+        logger.critical(
+            "H4 GATE: dualwrite Postgres mirror unhealthy (%s failures in %.0fs, "
+            "threshold=%d).  Last error: %s.  Activating kill switch.",
+            stats.get("recent_failures_5m", "?"),
+            self._dualwrite_health_window_s,
+            self._dualwrite_health_max_failures,
+            (stats.get("pg_last_error") or "(unknown)")[:160],
+        )
+        try:
+            self.activate_kill_switch(
+                reason,
+                status_reason="dualwrite_unhealthy",
+            )
+        except Exception as exc:
+            logger.critical(
+                "activate_kill_switch failed during dualwrite health trip: %s", exc,
+            )
+        return True
+
     def check_daily_loss(self, refresh_from_fills: bool = False) -> bool:
         """
         Check if daily loss limit exceeded.
@@ -1815,6 +2005,11 @@ class LiveTrader:
         self._check_daily_reset()
         if self._refresh_external_kill_switch():
             return True
+        # H4 (audit): surface sustained dualwrite mirror failure to the
+        # same safety cadence as the daily-loss circuit breaker.  A trip
+        # here activates the kill switch directly; the rest of the
+        # function will then see ``_kill_switch_is_active`` and bail.
+        self._check_dualwrite_health()
         if refresh_from_fills:
             try:
                 self.update_daily_pnl_from_fills(trigger_check=False)
@@ -1930,7 +2125,11 @@ class LiveTrader:
             return {"status": "skipped", "reason": "dry_run"}
 
         if positions is None:
-            positions = self.get_positions()
+            # P0-3: orphan protection decides whether to *place SL/TP orders*
+            # based on which positions lack them.  A cached positions view
+            # could hide a freshly-opened position and lead us to skip
+            # protecting it.  Always force fresh.
+            positions = self.get_positions(force_fresh=True)
 
         if positions is None:
             logger.warning(
@@ -1948,7 +2147,10 @@ class LiveTrader:
             return {"status": "ok", "protected": 0, "skipped": 0, "failed": 0}
 
         # One fetch of open orders, then index by coin for O(1) lookup.
-        open_orders = self.get_open_orders()
+        # P0-3: orphan protection also reasons about WHICH legs (SL vs TP)
+        # are already resting; a stale openOrders could claim a position
+        # is protected when the order was cancelled seconds ago.
+        open_orders = self.get_open_orders(force_fresh=True)
         if open_orders is None:
             logger.warning(
                 "protect_orphaned_positions: open-orders unavailable - aborting protection sweep"
@@ -1961,48 +2163,32 @@ class LiveTrader:
                 "failed": 0,
             }
 
-        # Index protective orders by coin. Track order IDs for stale cleanup.
-        _MAX_PROTECTIVE_ORDERS_PER_COIN = 2  # 1 SL + 1 TP expected
-        protected_coins: Dict[str, List[str]] = {}
-        protective_order_ids: Dict[str, List[int]] = {}  # coin → [oid, ...]
+        # P0-4 (audit): per-leg validation.  The legacy index treated
+        # "this coin has *some* reduce-only order" as fully protected, so
+        # a lone SL (or a wrong-side / wrong-direction / stale order)
+        # could make us leave a live position unprotected on the TP side.
+        # We now classify every open order into an SL leg and/or a TP
+        # leg, validated against the specific position's side, trigger
+        # direction, and size, and only treat the position as protected
+        # when BOTH legs check out.  If only one leg is present we
+        # place the missing one without cancelling the valid one.
+        _MAX_PROTECTIVE_ORDERS_PER_LEG = 1  # 1 SL + 1 TP per coin
+        # coin → {"sl": [ClassifiedLeg, ...], "tp": [ClassifiedLeg, ...]}
+        legs_by_coin: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
         for order in open_orders:
-            if not isinstance(order, dict):
+            classified = self._classify_protective_leg(order)
+            if classified is None:
                 continue
-            coin = order.get("coin", "")
-            if not coin:
-                continue
-            reduce_only = bool(order.get("reduceOnly") or order.get("reduce_only"))
-            order_type_raw = order.get("orderType") or order.get("type") or ""
-            order_type = str(order_type_raw).lower()
-            # Trigger orders from place_trigger_order show up with
-            # orderType containing "stop" or "take" — both protect the
-            # position even without an explicit reduceOnly flag.
-            if reduce_only or "stop" in order_type or "take" in order_type or "trigger" in order_type:
-                protected_coins.setdefault(coin, []).append(order_type or "reduce_only")
-                oid = order.get("oid") or order.get("order_id") or order.get("id")
-                if oid is not None:
-                    protective_order_ids.setdefault(coin, []).append(int(oid))
-
-        # Clean up stale protective orders: if a coin has >2 reduce_only orders,
-        # cancel the oldest extras to prevent accumulation over position changes.
-        stale_cancelled = 0
-        for coin, oids in protective_order_ids.items():
-            if len(oids) > _MAX_PROTECTIVE_ORDERS_PER_COIN:
-                excess = sorted(oids)[:-_MAX_PROTECTIVE_ORDERS_PER_COIN]  # Keep newest 2
-                logger.warning(
-                    "Cleaning %d stale protective orders for %s (had %d, keeping %d)",
-                    len(excess), coin, len(oids), _MAX_PROTECTIVE_ORDERS_PER_COIN,
-                )
-                for oid in excess:
-                    try:
-                        if self.cancel_order(coin, oid):
-                            stale_cancelled += 1
-                    except Exception as exc:
-                        logger.debug("Failed to cancel stale order %s/%s: %s", coin, oid, exc)
+            coin = classified["coin"]
+            legs_by_coin.setdefault(coin, {"sl": [], "tp": []})
+            legs_by_coin[coin][classified["leg"]].append(classified)
 
         protected = 0
         skipped = 0
         failed = 0
+        stale_cancelled = 0
+        placed_sl_only = 0
+        placed_tp_only = 0
         for pos in positions:
             coin = pos.get("coin", "")
             size = abs(self._coerce_float(pos.get("size", pos.get("szi", 0))))
@@ -2013,55 +2199,141 @@ class LiveTrader:
             if not coin or size <= 0 or entry_price <= 0:
                 continue
 
-            if coin in protected_coins:
-                logger.info(
-                    "protect_orphaned_positions: %s already has protective "
-                    "orders (%s), skipping",
-                    coin, protected_coins[coin],
-                )
-                skipped += 1
-                continue
-
             side = "long" if szi > 0 else "short"
+            protect_side = "sell" if side == "long" else "buy"
             # Conservative fallback defaults when only the raw position survives.
             sl_pct = 0.03
             tp_pct = sl_pct * 5.0
             if side == "long":
                 sl_price = entry_price * (1 - sl_pct)
                 tp_price = entry_price * (1 + tp_pct)
-                protect_side = "sell"
             else:
                 sl_price = entry_price * (1 + sl_pct)
                 tp_price = entry_price * (1 - tp_pct)
-                protect_side = "buy"
 
-            logger.warning(
-                "UNPROTECTED POSITION: %s %s size=%.6f entry=$%.6f -- "
-                "placing fallback 3%%/15%% SL/TP (SL=$%.6f TP=$%.6f)",
-                side.upper(), coin, size, entry_price, sl_price, tp_price,
+            coin_legs = legs_by_coin.get(coin, {"sl": [], "tp": []})
+            valid_sl, invalid_sl = self._split_valid_legs(
+                coin_legs["sl"],
+                leg_kind="sl",
+                position_side=side,
+                protect_side=protect_side,
+                entry_price=entry_price,
+                position_size=size,
+            )
+            valid_tp, invalid_tp = self._split_valid_legs(
+                coin_legs["tp"],
+                leg_kind="tp",
+                position_side=side,
+                protect_side=protect_side,
+                entry_price=entry_price,
+                position_size=size,
             )
 
-            sl_result = self.place_trigger_order(
-                coin, protect_side, size, sl_price, tp_or_sl="sl"
-            )
-            tp_result = self.place_trigger_order(
-                coin, protect_side, size, tp_price, tp_or_sl="tp"
-            )
+            # Cancel wrong-side / wrong-direction / undersized legs.
+            for bad in invalid_sl + invalid_tp:
+                oid = bad.get("oid")
+                if oid is None:
+                    continue
+                try:
+                    if self.cancel_order(coin, int(oid)):
+                        stale_cancelled += 1
+                        logger.warning(
+                            "Cancelled invalid protective leg on %s: "
+                            "kind=%s reason=%s oid=%s",
+                            coin, bad.get("leg"), bad.get("invalid_reason"), oid,
+                        )
+                except Exception as exc:
+                    logger.debug(
+                        "Failed to cancel invalid protective leg %s/%s: %s",
+                        coin, oid, exc,
+                    )
+
+            # Cancel duplicates beyond the first valid leg in each bucket.
+            for bucket in (valid_sl, valid_tp):
+                if len(bucket) > _MAX_PROTECTIVE_ORDERS_PER_LEG:
+                    # Keep the newest (highest oid) as canonical, cancel the rest.
+                    bucket.sort(key=lambda leg: int(leg.get("oid", 0)))
+                    excess = bucket[:-_MAX_PROTECTIVE_ORDERS_PER_LEG]
+                    for dup in excess:
+                        oid = dup.get("oid")
+                        if oid is None:
+                            continue
+                        try:
+                            if self.cancel_order(coin, int(oid)):
+                                stale_cancelled += 1
+                        except Exception as exc:
+                            logger.debug(
+                                "Failed to cancel duplicate protective leg %s/%s: %s",
+                                coin, oid, exc,
+                            )
+                    del bucket[:-_MAX_PROTECTIVE_ORDERS_PER_LEG]
+
+            has_sl = bool(valid_sl)
+            has_tp = bool(valid_tp)
+
+            if has_sl and has_tp:
+                logger.info(
+                    "protect_orphaned_positions: %s already has valid SL + TP "
+                    "(sl_oid=%s tp_oid=%s), skipping",
+                    coin,
+                    valid_sl[0].get("oid"),
+                    valid_tp[0].get("oid"),
+                )
+                skipped += 1
+                continue
+
+            sl_result: Dict[str, Any] = {"status": "verified", "pre_existing": True}
+            tp_result: Dict[str, Any] = {"status": "verified", "pre_existing": True}
+            need_sl = not has_sl
+            need_tp = not has_tp
+
+            if need_sl and need_tp:
+                logger.warning(
+                    "UNPROTECTED POSITION: %s %s size=%.6f entry=$%.6f -- "
+                    "placing fallback 3%%/15%% SL/TP (SL=$%.6f TP=$%.6f)",
+                    side.upper(), coin, size, entry_price, sl_price, tp_price,
+                )
+            elif need_sl:
+                placed_sl_only += 1
+                logger.warning(
+                    "PARTIAL PROTECTION: %s %s has TP but missing SL -- "
+                    "placing 3%% SL at $%.6f",
+                    side.upper(), coin, sl_price,
+                )
+            elif need_tp:
+                placed_tp_only += 1
+                logger.warning(
+                    "PARTIAL PROTECTION: %s %s has SL but missing TP -- "
+                    "placing 15%% TP at $%.6f",
+                    side.upper(), coin, tp_price,
+                )
+
+            if need_sl:
+                sl_result = self.place_trigger_order(
+                    coin, protect_side, size, sl_price, tp_or_sl="sl"
+                )
+            if need_tp:
+                tp_result = self.place_trigger_order(
+                    coin, protect_side, size, tp_price, tp_or_sl="tp"
+                )
 
             sl_ok = self._is_order_result_success(sl_result)
             tp_ok = self._is_order_result_success(tp_result)
             if sl_ok and tp_ok:
                 protected += 1
                 logger.info(
-                    "Orphan protection placed for %s: SL=$%.6f TP=$%.6f",
-                    coin, sl_price, tp_price,
+                    "Orphan protection complete for %s: "
+                    "SL_placed=%s TP_placed=%s (SL=$%.6f TP=$%.6f)",
+                    coin, need_sl, need_tp, sl_price, tp_price,
                 )
             else:
                 failed += 1
                 logger.error(
-                    "Orphan protection FAILED for %s: sl=%s tp=%s -- "
-                    "position remains unprotected, MANUAL INTERVENTION REQUIRED",
-                    coin, sl_result, tp_result,
+                    "Orphan protection FAILED for %s: "
+                    "needed_sl=%s needed_tp=%s sl_result=%s tp_result=%s -- "
+                    "position remains partially or fully unprotected, "
+                    "MANUAL INTERVENTION REQUIRED",
+                    coin, need_sl, need_tp, sl_result, tp_result,
                 )
 
         summary = {
@@ -2070,8 +2342,10 @@ class LiveTrader:
             "skipped": skipped,
             "failed": failed,
             "stale_cancelled": stale_cancelled,
+            "placed_sl_only": placed_sl_only,
+            "placed_tp_only": placed_tp_only,
         }
-        if protected or failed or stale_cancelled:
+        if protected or failed or stale_cancelled or placed_sl_only or placed_tp_only:
             logger.warning("Orphan protection summary: %s", summary)
         return summary
 
@@ -2333,8 +2607,168 @@ class LiveTrader:
         order_type = str(order.get("orderType") or order.get("type") or "").lower()
         return bool(reduce_only or "stop" in order_type or "take" in order_type or "trigger" in order_type)
 
+    @classmethod
+    def _classify_protective_leg(cls, order: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Classify a single openOrders entry as an SL or TP leg.
+
+        P0-4 (audit): per-leg validation for ``protect_orphaned_positions``.
+        Returns a dict with ``coin``, ``leg`` ("sl"/"tp"), ``side`` ("buy"/
+        "sell"), ``trigger_px`` (float or None), ``size`` (float),
+        ``reduce_only`` (bool), and ``oid``.  Returns None for orders that
+        are NOT protective (entries, non-trigger limit orders, etc.).
+
+        Hyperliquid represents trigger orders with:
+        * ``t.trigger.tpsl`` = ``"sl"`` or ``"tp"`` (authoritative), or
+        * ``orderType`` containing "stop" / "take" when the nested form
+          is absent (older Info responses).
+        """
+        if not isinstance(order, dict):
+            return None
+        coin = str(order.get("coin", "") or "")
+        if not coin:
+            return None
+        reduce_only = bool(order.get("reduceOnly") or order.get("reduce_only"))
+        order_type = str(order.get("orderType") or order.get("type") or "").lower()
+
+        leg: Optional[str] = None
+        trigger_px_raw: Any = None
+        trigger_nested = order.get("t")
+        if isinstance(trigger_nested, dict):
+            trig = trigger_nested.get("trigger")
+            if isinstance(trig, dict):
+                tpsl = str(trig.get("tpsl", "") or "").lower()
+                if tpsl in ("sl", "tp"):
+                    leg = tpsl
+                trigger_px_raw = trig.get("triggerPx")
+        # Top-level triggerPx (some response shapes)
+        if trigger_px_raw is None:
+            trigger_px_raw = order.get("triggerPx") or order.get("trigger_px")
+
+        if leg is None:
+            # Fall back to orderType keyword parsing
+            if "stop" in order_type:
+                leg = "sl"
+            elif "take" in order_type or "profit" in order_type:
+                leg = "tp"
+
+        if leg is None:
+            # Not a recognised protective leg.  reduce-only alone isn't
+            # enough to treat as an SL or TP: a plain reduce-only limit
+            # won't fire automatically on adverse moves.
+            return None
+
+        # Side: prefer boolean "b" (our wire format), fall back to "side" string.
+        side = None
+        if "b" in order and isinstance(order.get("b"), bool):
+            side = "buy" if order["b"] else "sell"
+        elif isinstance(order.get("side"), str):
+            raw_side = order["side"].strip().lower()
+            if raw_side in ("buy", "b", "bid"):
+                side = "buy"
+            elif raw_side in ("sell", "s", "a", "ask"):
+                side = "sell"
+
+        size_raw = order.get("sz") or order.get("s") or order.get("size")
+        try:
+            size_val = abs(float(size_raw)) if size_raw not in (None, "") else 0.0
+        except (TypeError, ValueError):
+            size_val = 0.0
+        try:
+            trigger_px_val = float(trigger_px_raw) if trigger_px_raw not in (None, "") else None
+        except (TypeError, ValueError):
+            trigger_px_val = None
+
+        oid = order.get("oid") or order.get("order_id") or order.get("id")
+        try:
+            oid_val = int(oid) if oid is not None else None
+        except (TypeError, ValueError):
+            oid_val = None
+
+        return {
+            "coin": coin,
+            "leg": leg,
+            "side": side,
+            "trigger_px": trigger_px_val,
+            "size": size_val,
+            "reduce_only": reduce_only,
+            "oid": oid_val,
+            "order_type": order_type,
+        }
+
+    @staticmethod
+    def _split_valid_legs(
+        legs: List[Dict[str, Any]],
+        *,
+        leg_kind: str,
+        position_side: str,
+        protect_side: str,
+        entry_price: float,
+        position_size: float,
+    ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        """Partition classified legs into (valid, invalid) for one position.
+
+        P0-4 (audit): a leg is only accepted as protecting the position if
+        ALL of these hold:
+
+        * ``leg`` matches ``leg_kind`` (sl vs tp)
+        * ``reduce_only`` is True — otherwise it could add exposure
+        * ``side`` equals ``protect_side`` (long positions need sell-side
+          protectors; short positions need buy-side)
+        * ``trigger_px`` is on the correct side of entry:
+            SL long  → trigger_px < entry
+            SL short → trigger_px > entry
+            TP long  → trigger_px > entry
+            TP short → trigger_px < entry
+          (If trigger_px cannot be parsed we mark the leg invalid rather
+          than silently accept.)
+        * ``size`` covers ≥ 90% of the position (partial protection is
+          accepted down to 90% to tolerate rounding; below that the leg
+          is treated as a stale under-sized remnant to clear).
+
+        Returns ``(valid_list, invalid_list)`` where each invalid entry
+        has an ``invalid_reason`` string attached for logging.
+        """
+        valid: List[Dict[str, Any]] = []
+        invalid: List[Dict[str, Any]] = []
+        min_coverage = max(position_size * 0.9, 0.0)
+        for leg in legs:
+            reasons: List[str] = []
+            if leg.get("leg") != leg_kind:
+                reasons.append(f"leg_mismatch:{leg.get('leg')}")
+            if not leg.get("reduce_only"):
+                reasons.append("not_reduce_only")
+            if leg.get("side") != protect_side:
+                reasons.append(f"wrong_side:{leg.get('side')}")
+            trigger_px = leg.get("trigger_px")
+            if trigger_px is None:
+                reasons.append("no_trigger_px")
+            else:
+                if leg_kind == "sl":
+                    if position_side == "long" and trigger_px >= entry_price:
+                        reasons.append("sl_above_entry_on_long")
+                    elif position_side == "short" and trigger_px <= entry_price:
+                        reasons.append("sl_below_entry_on_short")
+                elif leg_kind == "tp":
+                    if position_side == "long" and trigger_px <= entry_price:
+                        reasons.append("tp_below_entry_on_long")
+                    elif position_side == "short" and trigger_px >= entry_price:
+                        reasons.append("tp_above_entry_on_short")
+            if leg.get("size", 0.0) < min_coverage:
+                reasons.append(
+                    f"undersized:{leg.get('size'):.6f}<{min_coverage:.6f}"
+                )
+            if reasons:
+                leg["invalid_reason"] = ",".join(reasons)
+                invalid.append(leg)
+            else:
+                valid.append(leg)
+        return valid, invalid
+
     def _cancel_protective_orders(self, coin: str) -> int:
-        open_orders = self.get_open_orders()
+        # P0-3: the caller (protective-retry flow) needs to see all live
+        # protective orders right now, including any just placed by
+        # another retry thread.  The 2 s openOrders TTL could hide them.
+        open_orders = self.get_open_orders(force_fresh=True)
         if open_orders is None:
             raise RuntimeError("open_orders_unavailable")
         cancelled = 0
@@ -2613,8 +3047,11 @@ class LiveTrader:
         try:
             time.sleep(self._PROTECTIVE_RESIZE_DELAY_S)
 
-            # Check actual position size
-            positions = self.get_positions()
+            # Check actual position size.
+            # P0-3: this decides whether to cancel + re-place protective
+            # orders; a cached position could make us re-size against a
+            # stale picture and leave the position under- or over-hedged.
+            positions = self.get_positions(force_fresh=True)
             if positions is None:
                 logger.warning(
                     "Deferred resize for %s skipped: positions unavailable during verification",
@@ -2649,9 +3086,11 @@ class LiveTrader:
                 (original_protective_size / actual_size - 1) * 100,
             )
 
-            # Cancel all existing protective orders for this coin
+            # Cancel all existing protective orders for this coin.
+            # P0-3: force fresh so we don't miss orders placed in the
+            # last 2 s by another worker.
             try:
-                open_orders = self.get_open_orders()
+                open_orders = self.get_open_orders(force_fresh=True)
                 if open_orders is None:
                     logger.warning(
                         "Deferred resize cancel phase skipped for %s: open orders unavailable",
@@ -2707,10 +3146,16 @@ class LiveTrader:
             if not self.public_address:
                 return False
 
+            # P0-3 / H7: userFills drives the daily-loss circuit breaker.
+            # A 30 s cached response can show "$0 realized" for the entire
+            # window after a loss, suppressing the daily-loss guard.  Force
+            # fresh so every check sees the newest exchange-acknowledged
+            # fill set.
             fills = self.api_manager.post(
                 {"type": "userFills", "user": self.public_address},
                 priority=Priority.NORMAL,
                 timeout=10,
+                force_fresh=True,
             )
             if not isinstance(fills, list):
                 raise RuntimeError(f"userFills returned {type(fills).__name__}, expected list")
@@ -3485,14 +3930,28 @@ class LiveTrader:
             )
             return {"status": "rejected", "reason": "size_rounds_to_zero"}
 
-        # Build order
+        # Build order.
+        # H1 (audit): attach an exchange-level ``cloid`` derived
+        # deterministically from the order's canonical wire form.  Retries
+        # of the same logical order reproduce the same cloid and benefit
+        # from Hyperliquid's server-side dedup, but genuinely-different
+        # orders get distinct cloids.  The time-bucket salt (1 s) keeps
+        # the cloid stable across retry jitter while guaranteeing a new
+        # cloid if the caller intentionally re-submits the exact same
+        # order ~seconds apart.
+        time_bucket = int(time.time())
+        cloid = self._make_cloid(
+            "market", coin, side.lower(), wire_size, wire_price,
+            bool(reduce_only), time_bucket,
+        )
         order = {
             "a": asset_idx,
             "b": side.lower() == "buy",
             "p": wire_price,
             "s": wire_size,
             "r": reduce_only,
-            "t": {"limit": {"tif": OrderType.LIMIT_IOC.value}}
+            "t": {"limit": {"tif": OrderType.LIMIT_IOC.value}},
+            "c": cloid,
         }
 
         action = {
@@ -3501,7 +3960,7 @@ class LiveTrader:
             "grouping": "na"
         }
 
-        logger.info(f"Placing market order: {coin} {side} {size} @ ${price:.2f} (notional: ${notional:.2f})")
+        logger.info(f"Placing market order: {coin} {side} {size} @ ${price:.2f} (notional: ${notional:.2f}) cloid={cloid[:10]}…")
         result = self._post_order(action)
         if isinstance(result, dict):
             result = dict(result)
@@ -3556,7 +4015,11 @@ class LiveTrader:
         baseline_position_size = float(baseline_position_size or 0.0)
 
         def _poll_once(attempt: int) -> Optional[Dict]:
-            positions = self.get_positions()
+            # P0-3: fill verification MUST see fresh exchange state.  The
+            # cached clearinghouseState TTL is 10 s — long enough to accept
+            # a position that never actually filled if a previous tick
+            # was cached right before our order was placed.
+            positions = self.get_positions(force_fresh=True)
             if positions is None:
                 raise RuntimeError("positions_unavailable")
             for pos in positions:
@@ -3725,13 +4188,20 @@ class LiveTrader:
             )
             return {"status": "rejected", "reason": "size_rounds_to_zero"}
 
+        # H1: exchange-level cloid for retry idempotency.
+        time_bucket = int(time.time())
+        cloid = self._make_cloid(
+            "limit", coin, side.lower(), wire_size, wire_price,
+            bool(reduce_only), OrderType.LIMIT_GTC.value, time_bucket,
+        )
         order = {
             "a": asset_idx,
             "b": side.lower() == "buy",
             "p": wire_price,
             "s": wire_size,
             "r": reduce_only,
-            "t": {"limit": {"tif": OrderType.LIMIT_GTC.value}}
+            "t": {"limit": {"tif": OrderType.LIMIT_GTC.value}},
+            "c": cloid,
         }
 
         action = {
@@ -3740,7 +4210,7 @@ class LiveTrader:
             "grouping": "na"
         }
 
-        logger.info(f"Placing limit order: {coin} {side} {size} @ ${price:.2f} (notional: ${notional:.2f})")
+        logger.info(f"Placing limit order: {coin} {side} {size} @ ${price:.2f} (notional: ${notional:.2f}) cloid={cloid[:10]}…")
         result = self._post_order(action)
 
         if self._is_order_result_success(result) and not self.dry_run:
@@ -3814,6 +4284,16 @@ class LiveTrader:
                 "reason": "price_rounds_to_zero",
             }
 
+        # H1: exchange-level cloid for retry idempotency.  Trigger orders
+        # get re-placed when protective-update cycles run, so a stable
+        # cloid per (coin, leg, trigger) tuple lets the exchange reject
+        # a redundant second submission instead of letting us stack
+        # duplicate SL/TP legs.
+        time_bucket = int(time.time())
+        cloid = self._make_cloid(
+            "trigger", tp_or_sl, coin, side.lower(), wire_size,
+            wire_trigger_px, wire_limit_px, time_bucket,
+        )
         order = {
             "a": asset_idx,
             "b": side.lower() == "buy",
@@ -3826,7 +4306,8 @@ class LiveTrader:
                     "triggerPx": wire_trigger_px,
                     "tpsl": tp_or_sl,
                 }
-            }
+            },
+            "c": cloid,
         }
 
         action = {
@@ -3836,8 +4317,9 @@ class LiveTrader:
         }
 
         logger.info(
-            "Placing %s trigger: %s %s size=%s trigger=%s limit=%s",
+            "Placing %s trigger: %s %s size=%s trigger=%s limit=%s cloid=%s",
             tp_or_sl, coin, side, wire_size, wire_trigger_px, wire_limit_px,
+            cloid[:10] + "…",
         )
         result = self._post_order(action)
 
@@ -3851,34 +4333,65 @@ class LiveTrader:
         sl_price: float,
         tp_price: float,
     ) -> Tuple[Dict[str, Any], Dict[str, Any], int]:
-        """Place SL/TP with bounded retries and cleanup between attempts."""
+        """
+        Place SL/TP with bounded retries.
+
+        AUDIT M2 — selective leg retry.  Previously, ANY per-attempt
+        failure triggered ``cancel_all_orders(coin=coin)`` which wiped
+        BOTH legs even when one succeeded — leaving the position
+        completely unprotected in the retry window and wasting the good
+        leg's slippage cost.  Now we:
+          * Track per-leg success across attempts.
+          * Only re-place legs that haven't yet succeeded (cloid
+            idempotency from H1 prevents accidental duplicate placement
+            if a previous request silently made it through).
+          * Do NOT cancel the successful leg between retries — it stays
+            live and provides partial protection.
+        """
         sl_result: Dict[str, Any] = {"status": "error", "message": "not_attempted"}
         tp_result: Dict[str, Any] = {"status": "error", "message": "not_attempted"}
+        sl_ok = False
+        tp_ok = False
 
         for attempt in range(1, self._protective_order_retries + 1):
-            sl_result = self.place_trigger_order(
-                coin,
-                close_side,
-                size,
-                sl_price,
-                tp_or_sl="sl",
-            )
-            tp_result = self.place_trigger_order(
-                coin,
-                close_side,
-                size,
-                tp_price,
-                tp_or_sl="tp",
-            )
+            if not sl_ok:
+                sl_result = self.place_trigger_order(
+                    coin,
+                    close_side,
+                    size,
+                    sl_price,
+                    tp_or_sl="sl",
+                )
+                sl_ok = self._is_order_result_success(sl_result)
 
-            if self._is_order_result_success(sl_result) and self._is_order_result_success(tp_result):
+            if not tp_ok:
+                tp_result = self.place_trigger_order(
+                    coin,
+                    close_side,
+                    size,
+                    tp_price,
+                    tp_or_sl="tp",
+                )
+                tp_ok = self._is_order_result_success(tp_result)
+
+            if sl_ok and tp_ok:
                 return sl_result, tp_result, attempt
 
+            # Which specific leg(s) still need to retry?  Log precisely so
+            # on-call can tell whether the position is partially protected
+            # during the backoff window.
+            missing = []
+            if not sl_ok:
+                missing.append("sl")
+            if not tp_ok:
+                missing.append("tp")
             logger.error(
-                "Protective order placement failed for %s on attempt %d/%d: sl=%s tp=%s",
+                "Protective order placement incomplete for %s on attempt %d/%d: "
+                "missing=%s sl=%s tp=%s",
                 coin,
                 attempt,
                 self._protective_order_retries,
+                ",".join(missing) or "none",
                 sl_result,
                 tp_result,
             )
@@ -3886,27 +4399,25 @@ class LiveTrader:
             if attempt >= self._protective_order_retries:
                 break
 
-            try:
-                self.cancel_all_orders(coin=coin)
-            except Exception as exc:
-                logger.warning(
-                    "Failed to clear partial protective orders for %s before retry %d/%d: %s",
-                    coin,
-                    attempt + 1,
-                    self._protective_order_retries,
-                    exc,
-                )
+            # AUDIT M2 — do NOT call ``cancel_all_orders`` here.  The old
+            # code wiped the good leg (if any) before retrying, creating
+            # an unprotected window.  The failed leg produced no resting
+            # order (it failed placement), so there is nothing to cancel;
+            # and the good leg is already protecting the position and
+            # must stay live across the retry delay.
 
             delay = (self._protective_order_retry_delay_s * attempt) + random.uniform(
                 0.0,
                 self._protective_order_retry_jitter_s,
             )
             logger.warning(
-                "Retrying protective orders for %s in %.2fs (attempt %d/%d)",
+                "Retrying protective orders for %s in %.2fs (attempt %d/%d, "
+                "still needed: %s)",
                 coin,
                 delay,
                 attempt + 1,
                 self._protective_order_retries,
+                ",".join(missing) or "none",
             )
             time.sleep(delay)
 
@@ -3948,35 +4459,79 @@ class LiveTrader:
         """
         Cancel all open orders (optionally for a specific coin).
 
-        Args:
-            coin: Specific coin (optional). If None, cancel all.
+        Returns the count of confirmed cancellations.  Prefer
+        :meth:`cancel_all_orders_detailed` (P0-2) when the caller needs to
+        distinguish "fetch failed" from "fetched and found zero orders".
+        """
+        result = self.cancel_all_orders_detailed(coin=coin)
+        return int(result.get("cancelled_count", 0))
 
-        Returns:
-            Number of orders cancelled
+    def cancel_all_orders_detailed(self, coin: Optional[str] = None) -> Dict[str, Any]:
+        """Cancel all open orders and return a structured result.
+
+        P0-2 (audit): the legacy ``cancel_all_orders()`` returns ``0`` on BOTH
+        "fetch failed" and "no open orders" — so shutdown code was marking
+        cancellation complete even when exchange state was unknown.  This
+        variant separates those cases so the emergency path can tell the
+        difference and retry on failure.
+
+        Returns
+        -------
+        dict with keys:
+            ``success``         : True iff open-order fetch succeeded AND
+                                  every attempt returned an exchange ack
+            ``fetch_succeeded`` : True iff ``get_open_orders()`` returned a
+                                  list (possibly empty)
+            ``open_orders_seen``: int count from the fetch (0 if fetch_failed)
+            ``cancelled_count`` : confirmed cancellations
+            ``failed_count``    : attempts that did not return success
+            ``reason``          : human-readable short tag
         """
         logger.info(f"Cancelling all orders{f' for {coin}' if coin else ''}")
 
         try:
-            orders = self.get_open_orders()
+            # P0-3: a cancel-all sweep MUST NOT be satisfied by a cached
+            # openOrders response.  If the cache is stale it could miss
+            # an order that was placed in the last 2 s and we would mark
+            # shutdown_orders_cancelled=True while that order stays live.
+            orders = self.get_open_orders(force_fresh=True)
             if orders is None:
                 logger.warning(
                     "cancel_all_orders: open orders unavailable - refusing to assume there are none"
                 )
-                return 0
+                return {
+                    "success": False,
+                    "fetch_succeeded": False,
+                    "open_orders_seen": 0,
+                    "cancelled_count": 0,
+                    "failed_count": 0,
+                    "reason": "fetch_failed",
+                }
             if not orders:
-                return 0
+                return {
+                    "success": True,
+                    "fetch_succeeded": True,
+                    "open_orders_seen": 0,
+                    "cancelled_count": 0,
+                    "failed_count": 0,
+                    "reason": "no_open_orders",
+                }
 
             if coin:
                 orders = [o for o in orders if o.get("coin") == coin]
 
             cancelled = 0
+            failed = 0
             for order in orders:
                 order_id = order.get("oid") or order.get("order_id") or order.get("id")
                 if order_id is None:
                     logger.warning("cancel_all_orders: open order missing oid/order_id/id: %s", order)
+                    failed += 1
                     continue
                 if self.cancel_order(order.get("coin"), order_id):
                     cancelled += 1
+                else:
+                    failed += 1
 
             if cancelled < len(orders):
                 logger.warning(
@@ -3985,10 +4540,24 @@ class LiveTrader:
                     len(orders),
                     f" for {coin}" if coin else "",
                 )
-            return cancelled
+            return {
+                "success": failed == 0,
+                "fetch_succeeded": True,
+                "open_orders_seen": len(orders),
+                "cancelled_count": cancelled,
+                "failed_count": failed,
+                "reason": "ok" if failed == 0 else "partial_cancel",
+            }
         except Exception as e:
             logger.error(f"Error cancelling orders: {e}")
-            return 0
+            return {
+                "success": False,
+                "fetch_succeeded": False,
+                "open_orders_seen": 0,
+                "cancelled_count": 0,
+                "failed_count": 0,
+                "reason": f"exception:{type(e).__name__}",
+            }
 
     def close_position(self, coin: str) -> Dict:
         """
@@ -4003,7 +4572,10 @@ class LiveTrader:
         logger.info(f"Closing position on {coin}")
 
         try:
-            positions = self.get_positions()
+            # P0-3: closing a position is a safety decision; the cached
+            # 10-s clearinghouseState could claim size=0 for a position we
+            # just opened, making this a silent no-op.  Force fresh.
+            positions = self.get_positions(force_fresh=True)
             if positions is None:
                 logger.warning("close_position(%s): positions unavailable", coin)
                 return {"status": "error", "message": "Positions unavailable"}
@@ -4099,8 +4671,11 @@ class LiveTrader:
             cancelled = self.cancel_all_orders()
             logger.warning(f"Cancelled {cancelled} open orders")
 
-            # Close all positions
-            positions = self.get_positions()
+            # Close all positions.
+            # P0-3: emergency close MUST see the exchange-truth position
+            # set — not a 10 s cached snapshot that could omit a fresh
+            # position opened right before the emergency trigger.
+            positions = self.get_positions(force_fresh=True)
             if positions is None:
                 logger.error("Emergency close aborted: positions unavailable")
                 return results
@@ -4144,9 +4719,17 @@ class LiveTrader:
 
         return results
 
-    def get_positions(self) -> Optional[List[Dict]]:
+    def get_positions(self, *, force_fresh: bool = False) -> Optional[List[Dict]]:
         """
         Get current open positions from exchange.
+
+        Parameters
+        ----------
+        force_fresh : bool
+            P0-3 (audit).  When True the clearinghouseState request bypasses
+            the 10s TTL cache so safety-critical callers (fill verification,
+            emergency close, orphan-protection sweeps) see the exchange
+            state as it is NOW rather than up to 10 s stale.
 
         Returns:
             List of position dicts, or None when exchange state is unavailable
@@ -4156,7 +4739,7 @@ class LiveTrader:
                 logger.warning("No public address configured")
                 return None
 
-            data = self.get_account_state()
+            data = self.get_account_state(force_fresh=force_fresh)
             positions = data.get("assetPositions", []) if isinstance(data, dict) else []
             normalized = [self._normalize_position(pos) for pos in positions]
             return [pos for pos in normalized if pos.get("coin")]
@@ -4165,9 +4748,17 @@ class LiveTrader:
             logger.error(f"Error getting positions: {e}")
             return None
 
-    def get_open_orders(self) -> Optional[List[Dict]]:
+    def get_open_orders(self, *, force_fresh: bool = False) -> Optional[List[Dict]]:
         """
         Get current open orders from exchange.
+
+        Parameters
+        ----------
+        force_fresh : bool
+            P0-3 (audit).  When True the openOrders request bypasses the
+            cache so safety-critical callers (cancel-all sweeps,
+            orphan-protection legs, emergency close) see every order the
+            exchange thinks is live — NOT a value up to 2 s old.
 
         Returns:
             List of open order dicts, or None when exchange state is unavailable
@@ -4181,6 +4772,7 @@ class LiveTrader:
                 {"type": "openOrders", "user": self.public_address},
                 priority=Priority.HIGH,
                 timeout=10,
+                force_fresh=force_fresh,
             )
 
             orders = data.get("orders", []) if isinstance(data, dict) else data
@@ -4482,79 +5074,98 @@ class LiveTrader:
             logger.warning("Kill switch active - rejecting signal")
             return None
 
-        # Canary/source caps apply to NEW live entries only.
-        total_signals_today = sum(self._source_orders_today.values())
-        if self.canary_mode and self.canary_max_signals_per_day > 0:
-            if total_signals_today >= self.canary_max_signals_per_day:
-                self._incr_entry_metric("rejected_canary_cap")
+        # H10 (audit): Canary/source caps apply to NEW live entries only.
+        # The read-compare-increment sequence is executed atomically in
+        # ``_reserve_entry_slot`` so concurrent signals cannot race past
+        # the cap.  Dry-run signals never consume real budget — matching
+        # the prior behavior where only successful live entries counted.
+        # The outer try/finally below guarantees the reservation is
+        # released on any non-commit exit path (early return, exception,
+        # order rejection) — the commit flips ``_slot_reserved`` to False
+        # at the success point to keep the counter incremented.
+        _slot_reserved = False
+        if not self.dry_run:
+            reserved, reserve_reason = self._reserve_entry_slot(source_key)
+            if not reserved:
                 logger.warning(
-                    "Canary signal cap reached (%d/%d) - rejecting %s (source=%s)",
-                    total_signals_today,
-                    self.canary_max_signals_per_day,
+                    "Entry cap reached (%s) - rejecting %s (source=%s)",
+                    reserve_reason,
                     signal.coin,
                     source_key,
                 )
                 return None
-        if self.max_orders_per_source_per_day > 0:
-            used = self._source_orders_today.get(source_key, 0)
-            if used >= self.max_orders_per_source_per_day:
-                self._incr_entry_metric("rejected_source_cap")
-                logger.warning(
-                    "Source/day cap reached for %s (%d/%d) - rejecting %s",
-                    source_key,
-                    used,
-                    self.max_orders_per_source_per_day,
-                    signal.coin,
-                )
-                return None
-
-        # CRIT-FIX CRIT-4: resolve canonical coin quantity BEFORE the regime overlay
-        # so the overlay can apply a correct proportional multiplier.  The original
-        # fallback `position_pct * effective_size` = `position_pct²` which produced
-        # micro-orders (~0.48% of intended size) silently posted to the exchange.
-        coin = signal.coin
-        signal_side = signal.side.value.lower()
-        entry_side = self._normalize_order_side(signal_side)
-        side = entry_side
-
-        if not (signal.size and signal.size > 0):
-            # Compute coin quantity from USD notional: position_pct × max_position_size / mid
-            mid = self._get_mid_price(coin)
-            if not mid or mid <= 0:
-                self._incr_entry_metric("rejected_no_mid_price")
-                logger.warning(
-                    f"Cannot compute order size for {coin}: no mid price available -- skipping"
-                )
-                return None
-            position_usd = signal.position_pct * self.max_position_size
-            import copy as _copy
-            signal = _copy.deepcopy(signal)  # Avoid mutating caller's reference
-            signal.size = position_usd / mid
-            logger.debug(
-                f"Computed size for {coin}: ${position_usd:.2f} / ${mid:.4f} = {signal.size:.6f} coins"
-            )
-
-        # Apply regime overlay for dynamic position sizing (signal.size is now set)
-        signal = self.apply_regime_overlay(signal)
-        if self.risk_policy_engine and not dict((signal.context or {}).get("risk_policy", {}) or {}):
-            signal = self.risk_policy_engine.apply(
-                signal,
-                regime_data={"regime": signal.regime} if signal.regime else None,
-                source_policy=source_policy,
-            )
-
-        # Hard per-order $ cap — applied AFTER regime overlay and any paper→live
-        # rescaling so nothing above max_order_usd ever hits the exchange.
-        capped_signal = self._apply_order_usd_cap(
-            signal,
-            open_positions=live_positions,
-            source_policy=source_policy,
-        )
-        if capped_signal is None:
-            return None
-        signal = capped_signal
+            _slot_reserved = True
 
         try:
+            # CRIT-FIX CRIT-4: resolve canonical coin quantity BEFORE the regime overlay
+            # so the overlay can apply a correct proportional multiplier.  The original
+            # fallback `position_pct * effective_size` = `position_pct²` which produced
+            # micro-orders (~0.48% of intended size) silently posted to the exchange.
+            coin = signal.coin
+            signal_side = signal.side.value.lower()
+            entry_side = self._normalize_order_side(signal_side)
+            side = entry_side
+
+            if not (signal.size and signal.size > 0):
+                # Compute coin quantity from USD notional: position_pct × max_position_size / mid
+                mid = self._get_mid_price(coin)
+                if not mid or mid <= 0:
+                    self._incr_entry_metric("rejected_no_mid_price")
+                    logger.warning(
+                        f"Cannot compute order size for {coin}: no mid price available -- skipping"
+                    )
+                    return None
+                position_usd = signal.position_pct * self.max_position_size
+                import copy as _copy
+                signal = _copy.deepcopy(signal)  # Avoid mutating caller's reference
+                signal.size = position_usd / mid
+                logger.debug(
+                    f"Computed size for {coin}: ${position_usd:.2f} / ${mid:.4f} = {signal.size:.6f} coins"
+                )
+
+            # Tier soft-sizing dampener (H2): ScalingTier.kelly_dampen tightens
+            # position_pct + size inside the tier's hard caps so each rung is
+            # not only smaller-capped but also less aggressive at the same cap.
+            # Applied BEFORE regime overlay so regime modifiers compose on top of
+            # the dampened base, and BEFORE the hard $-cap so the floor-up logic
+            # in _apply_order_usd_cap can still salvage viable orders.
+            if self.kelly_dampen and self.kelly_dampen < 1.0 and signal.size and signal.size > 0:
+                pre_pct = float(signal.position_pct or 0.0)
+                pre_size = float(signal.size)
+                signal.position_pct = pre_pct * self.kelly_dampen
+                signal.size = pre_size * self.kelly_dampen
+                self._incr_entry_metric("kelly_dampen_applied")
+                logger.debug(
+                    "Tier %s kelly_dampen=%.2f applied to %s: position_pct %.4f -> %.4f, size %.6f -> %.6f",
+                    self.active_tier.name if self.active_tier else "(no tier)",
+                    self.kelly_dampen,
+                    coin,
+                    pre_pct,
+                    signal.position_pct,
+                    pre_size,
+                    signal.size,
+                )
+
+            # Apply regime overlay for dynamic position sizing (signal.size is now set)
+            signal = self.apply_regime_overlay(signal)
+            if self.risk_policy_engine and not dict((signal.context or {}).get("risk_policy", {}) or {}):
+                signal = self.risk_policy_engine.apply(
+                    signal,
+                    regime_data={"regime": signal.regime} if signal.regime else None,
+                    source_policy=source_policy,
+                )
+
+            # Hard per-order $ cap — applied AFTER regime overlay and any paper→live
+            # rescaling so nothing above max_order_usd ever hits the exchange.
+            capped_signal = self._apply_order_usd_cap(
+                signal,
+                open_positions=live_positions,
+                source_policy=source_policy,
+            )
+            if capped_signal is None:
+                return None
+            signal = capped_signal
+
             size = signal.size
             requested_entry_size = float(size)
 
@@ -4663,10 +5274,82 @@ class LiveTrader:
                             "submitted_size": submitted_entry_size,
                             "entry_result": entry_result,
                         }
+                    # P0-5 (audit): in non-blocking mode the legacy path
+                    # went on to place reduce-only SL/TP orders using the
+                    # *intended* size even though neither the fill poll
+                    # nor the exchange response confirmed a position.
+                    # A silently-rejected or 0-fill entry would leave
+                    # naked reduce-only orders that (a) wait as ghosts
+                    # until triggered by a later fill on the same coin,
+                    # or (b) close an unrelated later position.  Before
+                    # committing protective orders we do a *single* fresh
+                    # position snapshot as a gate — if it still doesn't
+                    # confirm the position we skip SL/TP and return a
+                    # pending status so the caller / next cycle can
+                    # reconcile properly.
+                    gated_ok = False
+                    gate_position_size = 0.0
+                    gate_entry_price = 0.0
+                    if exchange_reported_fill_size > 0:
+                        gated_ok = True
+                        gate_position_size = exchange_reported_fill_size
+                        gate_entry_price = exchange_reported_fill_price
+                    else:
+                        try:
+                            fresh_positions = self.get_positions(force_fresh=True)
+                        except Exception as exc:
+                            logger.warning(
+                                "Fresh position gate fetch failed for %s: %s",
+                                coin, exc,
+                            )
+                            fresh_positions = None
+                        if fresh_positions:
+                            for pos in fresh_positions:
+                                if pos.get("coin") != coin:
+                                    continue
+                                raw_size = self._coerce_float(
+                                    pos.get("size", pos.get("szi", 0)), 0.0
+                                )
+                                signed_delta = raw_size - baseline_position_size
+                                delta_in_side = (
+                                    signed_delta if entry_side == "buy" else -signed_delta
+                                )
+                                if delta_in_side > 0:
+                                    gated_ok = True
+                                    gate_position_size = abs(delta_in_side)
+                                    gate_entry_price = self._coerce_float(
+                                        pos.get("entry_price", pos.get("entryPx", 0)),
+                                        0.0,
+                                    )
+                                    break
+
+                    if not gated_ok:
+                        logger.critical(
+                            "P0-5 GATE: %s %s fill unconfirmed after entry "
+                            "(exchange_reported=0, fresh position unchanged). "
+                            "Skipping SL/TP placement so no naked reduce-only "
+                            "orders are left behind.  Reconciliation sweep "
+                            "will re-evaluate on the next cycle.",
+                            coin, side,
+                        )
+                        self._incr_entry_metric("p0_5_gate_fill_unconfirmed")
+                        return {
+                            "status": "pending_fill",
+                            "message": "fill_unconfirmed_sltp_deferred",
+                            "coin": coin,
+                            "expected_fill_size": expected_fill_size,
+                            "submitted_size": submitted_entry_size,
+                            "entry_result": entry_result,
+                        }
+                    actual_fill_size = gate_position_size
+                    if gate_entry_price > 0 and verified_fill_price <= 0:
+                        verified_fill_price = gate_entry_price
                     logger.info(
-                        "Fill verification pending for %s (non-blocking mode). "
-                        "Proceeding with conservative protection sizing.",
-                        coin,
+                        "Fill gated via %s for %s: confirmed size=%.6f; "
+                        "proceeding with protective placement.",
+                        ("exchange_reported" if exchange_reported_fill_size > 0
+                         else "fresh_positions_gate"),
+                        coin, actual_fill_size,
                     )
                 else:
                     actual_fill_size = float(
@@ -4774,16 +5457,63 @@ class LiveTrader:
                 tp_price,
             )
 
-            if not self._is_order_result_success(sl_result) or not self._is_order_result_success(tp_result):
-                logger.error("Protective order placement failed for %s after %d attempts", coin, protective_attempts)
+            sl_ok_final = self._is_order_result_success(sl_result)
+            tp_ok_final = self._is_order_result_success(tp_result)
+            if not sl_ok_final or not tp_ok_final:
+                # AUDIT M2 — per-leg reporting + orphan cleanup.
+                # With selective retry (see _place_protective_orders_with_retries)
+                # we may reach this branch with ONE leg resting on the exchange
+                # (e.g. SL succeeded, TP failed).  If we simply close the
+                # position with a reduce-only market order the surviving
+                # trigger will fire later against empty inventory and open a
+                # brand-new (orphan) position on the opposite side.  Cancel
+                # every resting order on the coin FIRST so the subsequent
+                # close leaves no protective tripwire behind.
+                missing_legs = []
+                surviving_legs = []
+                if sl_ok_final:
+                    surviving_legs.append("sl")
+                else:
+                    missing_legs.append("sl")
+                if tp_ok_final:
+                    surviving_legs.append("tp")
+                else:
+                    missing_legs.append("tp")
+                logger.error(
+                    "Protective order placement failed for %s after %d attempts "
+                    "(missing=%s, surviving=%s)",
+                    coin,
+                    protective_attempts,
+                    ",".join(missing_legs) or "none",
+                    ",".join(surviving_legs) or "none",
+                )
                 close_result = None
                 if not self.dry_run:
+                    if surviving_legs:
+                        try:
+                            self.cancel_all_orders(coin=coin)
+                            logger.warning(
+                                "Cancelled surviving protective leg(s) for %s "
+                                "before emergency close: %s",
+                                coin,
+                                ",".join(surviving_legs),
+                            )
+                        except Exception as exc:
+                            logger.error(
+                                "Failed to cancel surviving protective legs for "
+                                "%s before close (%s): %s",
+                                coin,
+                                ",".join(surviving_legs),
+                                exc,
+                            )
                     close_result = self._close_position_with_retries(coin, "protective_order_failed")
                 return {
                     "status": "error",
                     "message": "protective_order_failed",
                     "coin": coin,
                     "protective_order_attempts": protective_attempts,
+                    "protective_legs_missing": missing_legs,
+                    "protective_legs_surviving": surviving_legs,
                     "entry_result": entry_result,
                     "stop_loss_result": sl_result,
                     "take_profit_result": tp_result,
@@ -4807,7 +5537,10 @@ class LiveTrader:
 
             # Return summary
             if self._is_order_result_success(entry_result) and not self.dry_run:
-                self._source_orders_today[source_key] += 1
+                # H10: the slot was already reserved atomically at the top
+                # of this function; commit it by clearing the release flag.
+                # The counter stays at its reserved value.
+                _slot_reserved = False
                 self._incr_entry_metric("executed_entry_signals")
                 # H5: persist so a restart inside this UTC day cannot silently
                 # reset canary budget that has already been consumed.
@@ -4838,6 +5571,13 @@ class LiveTrader:
         except Exception as e:
             logger.error(f"Error executing signal: {e}")
             return {"status": "error", "message": str(e)}
+        finally:
+            # H10: release the reservation on any non-commit exit path
+            # (early returns, exception, order rejection).  If _slot_reserved
+            # was set back to False at the success point, the counter stays
+            # incremented and the budget tracks committed entries only.
+            if _slot_reserved:
+                self._release_entry_slot(source_key)
 
     def get_stats(self) -> Dict:
         """
@@ -4935,5 +5675,40 @@ class LiveTrader:
             ),
             "wallet_balance": dict(self._last_balance_snapshot),
             "asset_indices_loaded": len(self.asset_index_map),
+            # H4 (audit): surface dualwrite mirror health alongside the
+            # other liveness signals so the dashboard / readiness probe
+            # can react to a degraded Postgres audit ledger before the
+            # next safety cycle trips the kill switch.
+            "db_backend": self._safe_db_backend_name(),
+            "dualwrite_health": self._dualwrite_health_snapshot(),
             "timestamp": datetime.now(timezone.utc).isoformat()
         }
+
+    def _safe_db_backend_name(self) -> str:
+        try:
+            return db.get_backend_name()
+        except Exception:
+            return "unknown"
+
+    def _dualwrite_health_snapshot(self) -> dict:
+        """Return a dashboard-friendly view of dualwrite mirror health."""
+        try:
+            stats = db.get_dualwrite_stats() or {}
+        except Exception:
+            stats = {}
+        try:
+            healthy = db.dualwrite_is_healthy(
+                window_s=self._dualwrite_health_window_s,
+                max_failures=self._dualwrite_health_max_failures,
+            )
+        except Exception:
+            healthy = True
+        snapshot = {
+            "healthy": bool(healthy),
+            "window_s": float(self._dualwrite_health_window_s),
+            "max_failures": int(self._dualwrite_health_max_failures),
+            "unhealthy_kill_switch_tripped": bool(self._dualwrite_unhealthy_tripped),
+        }
+        if stats:
+            snapshot.update(stats)
+        return snapshot

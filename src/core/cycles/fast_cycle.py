@@ -32,6 +32,76 @@ DEFAULT_KILL_SWITCH_FILE = "/data/KILL_SWITCH"
 _order_cancel_lock = threading.Lock()
 
 
+# P0-1 (audit): independent watchdog thread.  The legacy design only checked
+# the kill-switch file at fast-cycle boundaries and inside
+# ``_sleep_with_kill_switch_checks`` — which meant a long trading cycle
+# (scoring + options + arena + API calls) could run for minutes after the
+# operator dropped the file, with resting orders still live.  The watchdog
+# runs at its own 1s cadence regardless of what the main loop is doing.
+_watchdog_thread: threading.Thread | None = None
+_watchdog_stop_event = threading.Event()
+
+
+def _kill_switch_watchdog_loop(container, interval_s: float) -> None:
+    """Poll the kill-switch file on an independent cadence.
+
+    Uses ``check_file_kill_switch`` directly — that already serialises with
+    the SIGINT shutdown handler via ``_order_cancel_lock``, and the
+    P0-2 structured-cancel semantics ensure a fetch failure doesn't
+    mark cancellation complete.
+    """
+    while not _watchdog_stop_event.is_set():
+        try:
+            check_file_kill_switch(container)
+        except Exception as exc:
+            # The watchdog MUST keep polling even after exceptions — the
+            # whole point is a runaway trading cycle can't suppress it.
+            logger.error("[kill-switch watchdog] poll failed: %s", exc)
+        # Use Event.wait so we exit promptly when stop_kill_switch_watchdog()
+        # is called during shutdown (no 1s tail-latency).
+        if _watchdog_stop_event.wait(timeout=max(0.1, interval_s)):
+            break
+    logger.info("[kill-switch watchdog] stopped")
+
+
+def start_kill_switch_watchdog(container, interval_s: float = 1.0) -> bool:
+    """Start the independent kill-switch watchdog thread.
+
+    Idempotent: repeated calls are no-ops.  Returns True if this call
+    started the thread, False if one was already running.
+    """
+    global _watchdog_thread
+    if _watchdog_thread is not None and _watchdog_thread.is_alive():
+        return False
+    _watchdog_stop_event.clear()
+    _watchdog_thread = threading.Thread(
+        target=_kill_switch_watchdog_loop,
+        args=(container, interval_s),
+        name="kill-switch-watchdog",
+        daemon=True,
+    )
+    _watchdog_thread.start()
+    logger.info(
+        "[kill-switch watchdog] started (interval=%.1fs)", interval_s,
+    )
+    return True
+
+
+def stop_kill_switch_watchdog(timeout: float = 2.0) -> None:
+    """Signal the watchdog to stop and join briefly.
+
+    Called from the shutdown path.  Never blocks the shutdown flow for
+    more than ``timeout`` seconds — the thread is daemon so the process
+    can exit even if the join times out.
+    """
+    global _watchdog_thread
+    _watchdog_stop_event.set()
+    thread = _watchdog_thread
+    if thread is not None and thread.is_alive():
+        thread.join(timeout=timeout)
+    _watchdog_thread = None
+
+
 def _snapshot_state_lock(container) -> threading.Lock:
     lock = getattr(container, "_snapshot_balance_lock", None)
     if lock is None:
@@ -98,25 +168,53 @@ def cancel_live_orders_once(container, reason: str, *, force: bool = False) -> b
         if not force and getattr(live_trader, "dry_run", True):
             setattr(container, "_shutdown_orders_cancelled", True)
             return False
-        # Mark in-flight first so a concurrent caller inside the lock-free
-        # window (other threads entering this function while we hold the
-        # lock) doesn't re-attempt the cancellation when it wakes up.  On
-        # SUCCESS we leave the flag set.  On EXCEPTION we clear it so the
-        # next caller (typically the SIGINT handler if fast-cycle tripped
-        # the file kill switch first) can retry — an unprotected position
-        # with stale open orders is a far worse outcome than a duplicate
-        # cancel call.  S8.
-        setattr(container, "_shutdown_orders_cancelled", True)
+        # P0-2 (audit): do NOT flip _shutdown_orders_cancelled pre-emptively.
+        # Only mark cancellation done when cancel_all_orders_detailed()
+        # confirms that open-order fetch succeeded AND every cancel attempt
+        # returned success.  Otherwise we could log "Cancelled 0 live orders"
+        # on a fetch failure and block any further retries while resting
+        # orders stay live.  An un-cancelled order during a kill-switch
+        # event is a much worse outcome than a duplicate cancel call.
         try:
+            detail_fn = getattr(live_trader, "cancel_all_orders_detailed", None)
+            if callable(detail_fn):
+                result = detail_fn()
+                cancelled = int(result.get("cancelled_count", 0))
+                success = bool(result.get("success"))
+                fetch_ok = bool(result.get("fetch_succeeded"))
+                seen = int(result.get("open_orders_seen", 0))
+                logger.critical(
+                    "Cancel sweep (%s): fetch=%s, seen=%d, cancelled=%d, "
+                    "failed=%d, reason=%s",
+                    reason,
+                    "ok" if fetch_ok else "FAILED",
+                    seen,
+                    cancelled,
+                    int(result.get("failed_count", 0)),
+                    result.get("reason"),
+                )
+                if success:
+                    setattr(container, "_shutdown_orders_cancelled", True)
+                    return True
+                # Fetch failed or partial cancel: leave the flag False so
+                # the SIGINT handler / watchdog / next loop iteration can
+                # retry.  The caller decides whether to escalate.
+                return False
+            # Fallback for older live_trader shims that only expose the
+            # legacy int-returning cancel_all_orders(): we still have no
+            # structured signal, so we leave the pre-P0-2 behaviour
+            # (set-then-attempt) rather than leaking half-cancelled state.
+            setattr(container, "_shutdown_orders_cancelled", True)
             cancelled = live_trader.cancel_all_orders()
             logger.critical(
-                "Cancelled %d live orders during shutdown (%s)", cancelled, reason,
+                "Cancelled %d live orders during shutdown (%s) [legacy path]",
+                cancelled, reason,
             )
             return True
         except Exception as exc:
             logger.error(
                 "Failed to cancel live orders during shutdown (%s): %s -- "
-                "clearing shutdown_orders_cancelled flag so a retry can run",
+                "leaving shutdown_orders_cancelled=False so a retry can run",
                 reason, exc,
             )
             setattr(container, "_shutdown_orders_cancelled", False)

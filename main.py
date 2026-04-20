@@ -63,7 +63,13 @@ from src.core.subsystem_registry import (
 )
 from src.core.cycles.research_cycle import run_discovery
 from src.core.cycles.trading_cycle import run_trading_cycle
-from src.core.cycles.fast_cycle import run_fast_cycle, check_file_kill_switch, cancel_live_orders_once
+from src.core.cycles.fast_cycle import (
+    run_fast_cycle,
+    check_file_kill_switch,
+    cancel_live_orders_once,
+    start_kill_switch_watchdog,
+    stop_kill_switch_watchdog,
+)
 from src.core.cycles.reporting_cycle import run_reporting
 from src.core.cycles.feature_cycle import run_feature_cycle, backfill_all as backfill_features, feature_store_is_empty
 from src.data import database as db
@@ -436,6 +442,13 @@ class HyperliquidResearchBot:
             # cancel/backup calls below hang inside their watchdog windows.
             self.running = False
             self.logger.info("Shutdown signal received. Stopping background tasks…")
+            # Stop the independent kill-switch watchdog BEFORE the synchronous
+            # shutdown cancel — otherwise the watchdog thread could race with
+            # our cancel call and double-dispatch cancellations.
+            try:
+                stop_kill_switch_watchdog(timeout=2.0)
+            except Exception as exc:
+                self.logger.warning("stop_kill_switch_watchdog failed: %s", exc)
             self._run_with_timeout(
                 "cancel_live_orders",
                 lambda: self._cancel_live_orders_for_shutdown(reason=f"signal:{sig}"),
@@ -487,6 +500,18 @@ class HyperliquidResearchBot:
                     trader_count, config.DISCOVERY_CYCLE_INTERVAL / 3600,
                 )
 
+        # ── Independent kill-switch watchdog (P0-1) ──
+        # Polls /data/KILL_SWITCH on a 1s cadence regardless of what the
+        # main loop is doing.  Catches the case where a long trading cycle
+        # is mid-flight when the operator drops the file.
+        try:
+            watchdog_interval_s = float(
+                os.environ.get("LIVE_KILL_SWITCH_WATCHDOG_INTERVAL_S", "1.0")
+            )
+        except (TypeError, ValueError):
+            watchdog_interval_s = 1.0
+        start_kill_switch_watchdog(self.container, interval_s=watchdog_interval_s)
+
         # ── Main loop ──
         while self.running:
             now = time.time()
@@ -533,6 +558,12 @@ class HyperliquidResearchBot:
                 self._sleep_with_kill_switch_checks(config.FAST_CYCLE_INTERVAL)
 
         # ── Shutdown ──
+        # Stop the watchdog BEFORE the shutdown cancel path so only one thread
+        # is driving the exchange cancel RPC.
+        try:
+            stop_kill_switch_watchdog(timeout=2.0)
+        except Exception as exc:
+            self.logger.warning("stop_kill_switch_watchdog failed: %s", exc)
         self._cancel_live_orders_for_shutdown(reason="run_loop_exit")
         self.task_runner.stop_all(timeout=10)
         if self._discovery_running():

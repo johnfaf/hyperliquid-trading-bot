@@ -794,10 +794,23 @@ class APIManager:
         req_type: Optional[str] = None,
         timeout: int = 30,
         raise_on_timeout: bool = False,
+        force_fresh: bool = False,
     ) -> Optional[Any]:
         """
         Central API call with rate limiting + caching.
         All modules should use this instead of direct requests.post().
+
+        Parameters
+        ----------
+        force_fresh : bool
+            P0-3 (audit).  Bypasses the TTL cache AND the WebSocket fast path
+            so a *freshly fetched* REST response is returned to the caller.
+            The fetched value still overwrites the cache so normal callers
+            benefit on subsequent reads.  Use this on safety-critical reads:
+            fill verification, emergency close decisions, realised-PnL
+            computations off ``userFills``, and any cap/risk check that
+            must not be satisfied by a stale snapshot older than the
+            request that made the trade.
         """
         req_type = req_type or payload.get("type", "unknown")
         endpoint_url = endpoint_url or config.HYPERLIQUID_INFO_URL
@@ -809,8 +822,18 @@ class APIManager:
         # Build cache key from payload
         cache_key = self._cache_key(endpoint_url, payload)
 
-        # Check cache first
-        if cache_response:
+        # P0-3: when force_fresh is set, pre-emptively evict the cache entry
+        # so other threads cannot read the about-to-be-replaced stale value
+        # while this request is in flight.  Short window, but the whole point
+        # of this path is that staleness is unsafe.
+        if force_fresh:
+            try:
+                self.cache.invalidate(cache_key)
+            except Exception:
+                pass
+
+        # Check cache first (unless force_fresh)
+        if cache_response and not force_fresh:
             cached = self.cache.get(cache_key)
             if cached is not None:
                 with self._lock:
@@ -822,8 +845,13 @@ class APIManager:
         # would serve price data that's minutes old.  ``mids_are_fresh`` also
         # confirms we received a WS message recently.  On stale feeds we fall
         # through to the REST path instead.
+        #
+        # force_fresh also bypasses the WS shortcut — caller is explicitly
+        # asking for a round-trip to the exchange, not a cached or streamed
+        # value from a separate pipeline.
         if (
             cache_response
+            and not force_fresh
             and endpoint_url == config.HYPERLIQUID_INFO_URL
             and req_type == "allMids"
             and self.ws.mids_are_fresh(max_age_s=self._WS_MIDS_MAX_AGE_S)

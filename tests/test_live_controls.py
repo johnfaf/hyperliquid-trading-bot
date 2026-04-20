@@ -543,20 +543,21 @@ def test_execute_signal_uses_exchange_reported_fill_size_for_verification(monkey
 
 
 def test_live_trader_closes_position_when_protection_fails(monkeypatch):
+    """AUDIT M2 — SL succeeds, TP permanently fails.  Selective retry keeps
+    the good SL across attempts; the caller cancels the surviving SL once
+    before the emergency close so no orphan trigger is left resting."""
+
     class FakeFirewall:
         def validate(self, signal, **kwargs):
             return True, "ok"
 
-    trigger_results = iter(
-        [
-            {"status": "success"},
-            {"status": "error", "message": "tp rejected"},
-            {"status": "success"},
-            {"status": "error", "message": "tp rejected"},
-            {"status": "success"},
-            {"status": "error", "message": "tp rejected"},
-        ]
-    )
+    # Dispatch by leg so the new "only-retry-the-failed-leg" flow has the
+    # right per-leg semantics (SL always ok, TP always rejected).
+    def _fake_trigger(self, coin, side, size, trigger_price, tp_or_sl="sl"):
+        if tp_or_sl == "sl":
+            return {"status": "success"}
+        return {"status": "error", "message": "tp rejected"}
+
     close_calls = []
     cancel_calls = []
 
@@ -569,7 +570,7 @@ def test_live_trader_closes_position_when_protection_fails(monkeypatch):
     monkeypatch.setattr(LiveTrader, "update_daily_pnl_from_fills", lambda self: None)
     monkeypatch.setattr(LiveTrader, "verify_fill", lambda self, *args, **kwargs: {"status": "verified"})
     monkeypatch.setattr(LiveTrader, "_get_mid_price", lambda self, coin: 2000.0)
-    monkeypatch.setattr(LiveTrader, "place_trigger_order", lambda self, *args, **kwargs: next(trigger_results))
+    monkeypatch.setattr(LiveTrader, "place_trigger_order", _fake_trigger)
     monkeypatch.setattr(
         LiveTrader,
         "cancel_all_orders",
@@ -602,8 +603,14 @@ def test_live_trader_closes_position_when_protection_fails(monkeypatch):
     assert result["status"] == "error"
     assert result["message"] == "protective_order_failed"
     assert result["protective_order_attempts"] == 3
+    assert result["protective_legs_surviving"] == ["sl"]
+    assert result["protective_legs_missing"] == ["tp"]
     assert close_calls == ["ETH"]
-    assert cancel_calls == ["ETH", "ETH"]
+    # AUDIT M2: exactly ONE cancel_all_orders call — from the caller's
+    # pre-close orphan cleanup (removing the surviving SL).  NO
+    # between-retry cancels that would wipe the good SL during the
+    # retry window.
+    assert cancel_calls == ["ETH"]
 
 
 def test_verify_fill_waits_for_minimum_meaningful_fill(monkeypatch):
@@ -632,7 +639,7 @@ def test_verify_fill_waits_for_minimum_meaningful_fill(monkeypatch):
     monkeypatch.setattr(LiveTrader, "_load_credentials", _fake_live_credentials)
     monkeypatch.setattr(LiveTrader, "_load_asset_index_map", lambda self: None)
     monkeypatch.setattr(LiveTrader, "reconcile_positions", lambda self: None)
-    monkeypatch.setattr(LiveTrader, "get_positions", lambda self: next(positions))
+    monkeypatch.setattr(LiveTrader, "get_positions", lambda self, **kw: next(positions))
     monkeypatch.setattr("src.trading.live_trader.time.time", clock.time)
     monkeypatch.setattr("src.trading.live_trader.time.sleep", clock.sleep)
 
@@ -654,7 +661,7 @@ def test_verify_fill_uses_position_delta_not_total_position(monkeypatch):
     monkeypatch.setattr(LiveTrader, "_load_credentials", _fake_live_credentials)
     monkeypatch.setattr(LiveTrader, "_load_asset_index_map", lambda self: None)
     monkeypatch.setattr(LiveTrader, "reconcile_positions", lambda self: None)
-    monkeypatch.setattr(LiveTrader, "get_positions", lambda self: [{"coin": "ETH", "szi": 0.5}])
+    monkeypatch.setattr(LiveTrader, "get_positions", lambda self, **kw: [{"coin": "ETH", "szi": 0.5}])
 
     trader = LiveTrader(firewall=FakeFirewall(), dry_run=False)
 
@@ -673,7 +680,7 @@ def test_cancel_all_orders_uses_hyperliquid_oid_fallback(monkeypatch):
     monkeypatch.setattr(
         LiveTrader,
         "get_open_orders",
-        lambda self: [
+        lambda self, **kw: [
             {"coin": "ETH", "oid": 111},
             {"coin": "BTC", "order_id": 222},
             {"coin": "SOL", "id": 333},
@@ -1491,7 +1498,8 @@ def test_sync_shadow_book_creates_synthetic_trade_for_orphan_live_position(monke
     monkeypatch.setattr("src.core.live_execution.get_all_mids", lambda: {})
     monkeypatch.setattr(
         "src.core.live_execution.db.open_paper_trade",
-        lambda strategy_id, coin, side, entry_price, size, leverage=1, stop_loss=None, take_profit=None, metadata=None:
+        lambda strategy_id, coin, side, entry_price, size, leverage=1,
+               stop_loss=None, take_profit=None, metadata=None, **kw:
             opened.append(
                 {
                     "strategy_id": strategy_id,
@@ -1501,6 +1509,7 @@ def test_sync_shadow_book_creates_synthetic_trade_for_orphan_live_position(monke
                     "size": size,
                     "leverage": leverage,
                     "metadata": metadata,
+                    "idempotency_key": kw.get("idempotency_key"),
                 }
             ) or 99,
     )
@@ -1770,6 +1779,7 @@ def test_rescale_size_for_live_blocks_when_paper_balance_missing(monkeypatch):
             return 2500.0
 
     monkeypatch.setattr("src.core.live_execution.db.get_paper_account", lambda: {"balance": 0})
+    monkeypatch.setattr("src.core.live_execution.db.get_open_paper_trades", lambda: [])
 
     scaled = _rescale_size_for_live({"coin": "ETH", "size": 0.2}, FakeTrader())
 
@@ -1788,6 +1798,7 @@ def test_rescale_size_for_live_enforces_max_order_usd_cap(monkeypatch):
             return 10_000.0  # equal to paper — scale = 1.0
 
     monkeypatch.setattr("src.core.live_execution.db.get_paper_account", lambda: {"balance": 10_000.0})
+    monkeypatch.setattr("src.core.live_execution.db.get_open_paper_trades", lambda: [])
     monkeypatch.setattr("src.core.live_execution.get_all_mids", lambda: {"ETH": 2000.0})
     monkeypatch.setenv("LIVE_MARKET_SLIPPAGE_PCT", "0.05")
 
@@ -1818,6 +1829,7 @@ def test_rescale_size_for_live_uses_free_margin_for_scale(monkeypatch):
             return 50.0
 
     monkeypatch.setattr("src.core.live_execution.db.get_paper_account", lambda: {"balance": 1_000.0})
+    monkeypatch.setattr("src.core.live_execution.db.get_open_paper_trades", lambda: [])
     monkeypatch.setattr("src.core.live_execution.get_all_mids", lambda: {"ETH": 100.0})
 
     scaled = _rescale_size_for_live(
@@ -1827,6 +1839,109 @@ def test_rescale_size_for_live_uses_free_margin_for_scale(monkeypatch):
 
     assert scaled is not None
     assert abs(scaled["size"] - 0.5) < 1e-12
+
+
+def test_rescale_size_for_live_deducts_paper_open_margin(monkeypatch):
+    """H6: paper-to-live mirror must use paper *free* balance
+    (= paper_balance - paper_margin_used) as the denominator, not the
+    raw paper balance.  Without this deduction, live sizing silently
+    oversizes by ``paper_balance / paper_free_balance`` whenever the
+    paper book has open exposure — because ``live_free_margin`` on the
+    live side already excludes locked margin.
+
+    Setup: paper_balance=$10_000 with one open paper trade at
+    size=100 @ $50 @ 5x leverage → notional=$5_000, margin=$1_000.
+    paper_free_balance should be $10_000 - $1_000 = $9_000.
+    live_free_margin=$9_000 → scale = 9000/9000 = 1.0, so a 1 ETH
+    paper signal maps to 1 ETH live.  Without the deduction, scale
+    would be 9000/10000 = 0.9 and we'd size to 0.9 ETH.
+    """
+    from src.core.live_execution import _rescale_size_for_live
+
+    class FakeTrader:
+        max_order_usd = 1_000_000.0  # out of the way
+        min_order_usd = 1.0
+
+        def get_account_value(self):
+            return 9_000.0
+
+        def get_free_margin(self):
+            return 9_000.0
+
+    monkeypatch.setattr("src.core.live_execution.db.get_paper_account",
+                        lambda: {"balance": 10_000.0})
+    monkeypatch.setattr(
+        "src.core.live_execution.db.get_open_paper_trades",
+        lambda: [
+            {
+                "id": 1,
+                "coin": "BTC",
+                "side": "long",
+                "entry_price": 50.0,
+                "size": 100.0,
+                "leverage": 5,
+            }
+        ],
+    )
+    monkeypatch.setattr("src.core.live_execution.get_all_mids",
+                        lambda: {"ETH": 3000.0})
+
+    scaled = _rescale_size_for_live(
+        {"coin": "ETH", "size": 1.0, "entry_price": 3000.0, "leverage": 5},
+        FakeTrader(),
+    )
+    assert scaled is not None
+    # scale = live_free_margin($9000) / paper_free_balance($9000) = 1.0
+    assert abs(scaled["size"] - 1.0) < 1e-9, (
+        f"expected size ≈ 1.0 with symmetric free-margin scaling, "
+        f"got {scaled['size']}"
+    )
+
+
+def test_rescale_size_for_live_skips_when_paper_fully_levered(monkeypatch):
+    """H6: when open paper exposure has locked up the entire paper
+    balance, paper_free_balance is 0 and mirroring any *new* live trade
+    would be a category error — the paper book has no free capacity
+    to scale from.  Must skip."""
+    from src.core.live_execution import _rescale_size_for_live
+
+    class FakeTrader:
+        max_order_usd = 1_000.0
+        min_order_usd = 1.0
+
+        def get_account_value(self):
+            return 1_000.0
+
+        def get_free_margin(self):
+            return 1_000.0
+
+    monkeypatch.setattr("src.core.live_execution.db.get_paper_account",
+                        lambda: {"balance": 1_000.0})
+    # Single paper trade locks up the entire balance as margin:
+    # size=1000 * price=$5 / leverage=5 = $1000 margin.
+    monkeypatch.setattr(
+        "src.core.live_execution.db.get_open_paper_trades",
+        lambda: [
+            {
+                "id": 1,
+                "coin": "SOL",
+                "side": "long",
+                "entry_price": 5.0,
+                "size": 1000.0,
+                "leverage": 5,
+            }
+        ],
+    )
+    monkeypatch.setattr("src.core.live_execution.get_all_mids",
+                        lambda: {"ETH": 3000.0})
+
+    scaled = _rescale_size_for_live(
+        {"coin": "ETH", "size": 1.0, "entry_price": 3000.0, "leverage": 5},
+        FakeTrader(),
+    )
+    assert scaled is None, (
+        "paper book fully-levered → no free capacity to scale from; must skip"
+    )
 
 
 def test_rescale_size_for_live_floors_up_to_exchange_minimum(monkeypatch):
@@ -1845,6 +1960,7 @@ def test_rescale_size_for_live_floors_up_to_exchange_minimum(monkeypatch):
 
     monkeypatch.setattr("src.core.live_execution.db.get_paper_account",
                         lambda: {"balance": 10_041.0})
+    monkeypatch.setattr("src.core.live_execution.db.get_open_paper_trades", lambda: [])
     monkeypatch.setattr("src.core.live_execution.get_all_mids",
                         lambda: {"XRP": 1.24})
 
@@ -1873,6 +1989,7 @@ def test_rescale_size_for_live_skips_when_margin_exceeds_wallet_headroom(monkeyp
 
     monkeypatch.setattr("src.core.live_execution.db.get_paper_account",
                         lambda: {"balance": 10_000.0})
+    monkeypatch.setattr("src.core.live_execution.db.get_open_paper_trades", lambda: [])
     monkeypatch.setattr("src.core.live_execution.get_all_mids",
                         lambda: {"BTC": 50_000.0})
 
@@ -1989,6 +2106,109 @@ def test_execute_signal_caps_notional_at_max_order_usd(monkeypatch):
     assert result["status"] == "success"
     assert len(placed_sizes) == 1
     assert abs(placed_sizes[0] * 2000.0 - 15.0) < 1e-9
+
+
+def test_execute_signal_applies_kelly_dampen(monkeypatch):
+    """H2 regression: ScalingTier.kelly_dampen must shrink both size AND
+    position_pct before regime overlay + hard cap, otherwise the tier's
+    soft-sizing dampener is dead code (exactly what the external audit
+    caught on the first cut).
+    """
+    placed_sizes = []
+
+    class FakeFirewall:
+        def validate(self, signal, **kwargs):
+            return True, "ok"
+
+    monkeypatch.setattr(LiveTrader, "_load_credentials", _fake_live_credentials)
+    monkeypatch.setattr(LiveTrader, "_load_asset_index_map", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "reconcile_positions", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "get_firewall_positions", lambda self: [])
+    monkeypatch.setattr(LiveTrader, "get_account_value", lambda self: 2500.0)
+    monkeypatch.setattr(
+        LiveTrader,
+        "place_market_order",
+        lambda self, coin, side, size, leverage=1, reduce_only=False: (
+            placed_sizes.append(size) or {"status": "success"}
+        ),
+    )
+    monkeypatch.setattr(LiveTrader, "update_daily_pnl_from_fills", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "verify_fill", lambda self, *args, **kwargs: {"status": "verified"})
+    monkeypatch.setattr(LiveTrader, "_get_mid_price", lambda self, coin: 2000.0)
+    monkeypatch.setattr(LiveTrader, "place_trigger_order", lambda self, *args, **kwargs: {"status": "success"})
+
+    # T2 has kelly_dampen=0.8. Cap high enough not to interfere:
+    # $40 raw notional * 0.8 = $32, below the $200 max_order_usd.
+    monkeypatch.setenv("LIVE_TIER", "T2")
+    trader = LiveTrader(firewall=FakeFirewall(), dry_run=False, max_order_usd=200.0)
+    assert trader.active_tier is not None
+    assert trader.active_tier.name == "T2"
+    assert trader.kelly_dampen == 0.8
+
+    trader.execute_signal(
+        {
+            "coin": "ETH",
+            "side": "long",
+            "confidence": 0.8,
+            "entry_price": 2000.0,
+            "position_pct": 0.05,
+            "leverage": 1,
+            "size": 0.02,  # $40 notional raw
+            "strategy_type": "momentum_long",
+        }
+    )
+
+    # Expect 0.02 * 0.8 = 0.016 ETH placed.
+    assert len(placed_sizes) == 1
+    assert abs(placed_sizes[0] - 0.016) < 1e-9, (
+        f"Expected 0.016 ETH after 0.8 dampening, got {placed_sizes[0]}"
+    )
+
+
+def test_execute_signal_skips_kelly_dampen_at_t4(monkeypatch):
+    """T4 has kelly_dampen=1.0 — size must NOT be dampened."""
+    placed_sizes = []
+
+    class FakeFirewall:
+        def validate(self, signal, **kwargs):
+            return True, "ok"
+
+    monkeypatch.setattr(LiveTrader, "_load_credentials", _fake_live_credentials)
+    monkeypatch.setattr(LiveTrader, "_load_asset_index_map", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "reconcile_positions", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "get_firewall_positions", lambda self: [])
+    monkeypatch.setattr(LiveTrader, "get_account_value", lambda self: 2500.0)
+    monkeypatch.setattr(
+        LiveTrader,
+        "place_market_order",
+        lambda self, coin, side, size, leverage=1, reduce_only=False: (
+            placed_sizes.append(size) or {"status": "success"}
+        ),
+    )
+    monkeypatch.setattr(LiveTrader, "update_daily_pnl_from_fills", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "verify_fill", lambda self, *args, **kwargs: {"status": "verified"})
+    monkeypatch.setattr(LiveTrader, "_get_mid_price", lambda self, coin: 2000.0)
+    monkeypatch.setattr(LiveTrader, "place_trigger_order", lambda self, *args, **kwargs: {"status": "success"})
+
+    monkeypatch.setenv("LIVE_TIER", "T4")
+    trader = LiveTrader(firewall=FakeFirewall(), dry_run=False, max_order_usd=200.0)
+    assert trader.active_tier.name == "T4"
+    assert trader.kelly_dampen == 1.0
+
+    trader.execute_signal(
+        {
+            "coin": "ETH",
+            "side": "long",
+            "confidence": 0.8,
+            "entry_price": 2000.0,
+            "position_pct": 0.05,
+            "leverage": 1,
+            "size": 0.02,
+            "strategy_type": "momentum_long",
+        }
+    )
+    assert len(placed_sizes) == 1
+    assert abs(placed_sizes[0] - 0.02) < 1e-9
 
 
 def test_live_trader_raises_cap_to_exchange_minimum(monkeypatch):
@@ -2216,6 +2436,10 @@ def test_execute_signal_tracks_approved_but_not_executable(monkeypatch):
 
 
 def test_execute_signal_retries_protective_orders_before_succeeding(monkeypatch):
+    """AUDIT M2 — both legs fail attempt 1, both succeed attempt 2.  No
+    between-retry cancel_all_orders is expected anymore: the failed legs
+    have no resting orders to wipe and the retry re-places just those
+    legs on the next iteration."""
     placed_sizes = []
     cancel_calls = []
     trigger_results = iter(
@@ -2272,7 +2496,10 @@ def test_execute_signal_retries_protective_orders_before_succeeding(monkeypatch)
     assert result is not None
     assert result["status"] == "success"
     assert result["protective_order_attempts"] == 2
-    assert cancel_calls == ["ETH"]
+    # AUDIT M2: no between-retry cancel_all_orders call.  Both legs failed
+    # on attempt 1 (no resting orders to wipe) and both succeeded on
+    # attempt 2 so no caller-side orphan cleanup was needed either.
+    assert cancel_calls == []
 
 
 def test_execute_signal_closes_position_after_protective_retries_exhausted(monkeypatch):
@@ -2333,7 +2560,11 @@ def test_execute_signal_closes_position_after_protective_retries_exhausted(monke
     assert result["message"] == "protective_order_failed"
     assert result["protective_order_attempts"] == 3
     assert close_calls == ["ETH"]
-    assert cancel_calls == ["ETH", "ETH"]
+    # AUDIT M2: both legs failed every attempt, so nothing to cancel
+    # between retries and no surviving leg to cancel pre-close.
+    assert cancel_calls == []
+    assert result["protective_legs_surviving"] == []
+    assert set(result["protective_legs_missing"]) == {"sl", "tp"}
 
 
 def test_copy_trade_preserves_precise_stops_for_low_priced_assets(monkeypatch):
@@ -2768,6 +2999,7 @@ def test_rescale_size_for_live_uses_mid_price_not_signal_entry(monkeypatch):
 
     monkeypatch.setattr("src.core.live_execution.db.get_paper_account",
                         lambda: {"balance": 10_041.0})
+    monkeypatch.setattr("src.core.live_execution.db.get_open_paper_trades", lambda: [])
     # Mid price is noticeably LOWER than signal entry
     monkeypatch.setattr("src.core.live_execution.get_all_mids",
                         lambda: {"BTC": 64152.0})
@@ -2858,12 +3090,12 @@ def test_protect_orphaned_positions_places_sl_tp_for_unprotected(monkeypatch):
     monkeypatch.setattr(
         LiveTrader,
         "get_positions",
-        lambda self: [
+        lambda self, **kw: [
             {"coin": "ETH", "size": 0.0058, "szi": -0.0058, "side": "short", "entry_price": 2064.9, "entryPx": 2064.9},
             {"coin": "BTC", "size": 0.00018, "szi": -0.00018, "side": "short", "entry_price": 67401.0, "entryPx": 67401.0},
         ],
     )
-    monkeypatch.setattr(LiveTrader, "get_open_orders", lambda self: [])  # no protection
+    monkeypatch.setattr(LiveTrader, "get_open_orders", lambda self, **kw: [])  # no protection
     monkeypatch.setattr(
         LiveTrader,
         "place_trigger_order",
@@ -2911,16 +3143,27 @@ def test_protect_orphaned_positions_skips_already_protected(monkeypatch):
     monkeypatch.setattr(
         LiveTrader,
         "get_positions",
-        lambda self: [
+        lambda self, **kw: [
             {"coin": "ETH", "size": 0.0058, "szi": -0.0058, "side": "short", "entry_price": 2064.9, "entryPx": 2064.9},
         ],
     )
+    # P0-4: valid legs require side + triggerPx + adequate size, on the
+    # correct side of entry for the position (short ETH → buy-side
+    # protectors; SL above entry; TP below entry).
     monkeypatch.setattr(
         LiveTrader,
         "get_open_orders",
-        lambda self: [
-            {"coin": "ETH", "reduceOnly": True, "orderType": "Stop Market"},
-            {"coin": "ETH", "reduceOnly": True, "orderType": "Take Profit Market"},
+        lambda self, **kw: [
+            {
+                "coin": "ETH", "reduceOnly": True, "orderType": "Stop Market",
+                "side": "buy", "sz": 0.0058, "oid": 11,
+                "t": {"trigger": {"tpsl": "sl", "triggerPx": "2126.8", "isMarket": True}},
+            },
+            {
+                "coin": "ETH", "reduceOnly": True, "orderType": "Take Profit Market",
+                "side": "buy", "sz": 0.0058, "oid": 12,
+                "t": {"trigger": {"tpsl": "tp", "triggerPx": "1755.2", "isMarket": True}},
+            },
         ],
     )
     monkeypatch.setattr(
@@ -2957,6 +3200,7 @@ def test_rescale_size_for_live_allows_1x_leverage_on_tight_wallet(monkeypatch):
 
     monkeypatch.setattr("src.core.live_execution.db.get_paper_account",
                         lambda: {"balance": 10_041.0})
+    monkeypatch.setattr("src.core.live_execution.db.get_open_paper_trades", lambda: [])
     monkeypatch.setattr("src.core.live_execution.get_all_mids",
                         lambda: {"KAS": 0.1025})
 
@@ -3111,6 +3355,7 @@ def test_rescale_size_for_live_skips_when_wallet_cannot_fit_minimum(monkeypatch)
 
     monkeypatch.setattr("src.core.live_execution.db.get_paper_account",
                         lambda: {"balance": 10_041.0})
+    monkeypatch.setattr("src.core.live_execution.db.get_open_paper_trades", lambda: [])
     monkeypatch.setattr("src.core.live_execution.get_all_mids",
                         lambda: {"KAS": 0.1025})
 
@@ -3296,6 +3541,165 @@ def test_live_trader_source_day_cap_blocks_second_entry(monkeypatch):
     assert stats["max_orders_per_source_per_day"] == 1
 
 
+def test_live_trader_source_cap_atomic_check_reserve_is_race_free(monkeypatch):
+    """H10 (audit): the canary/source-cap check and the counter increment
+    must happen atomically under ``_state_lock``.  Before H10, the old
+    "check now, increment on success" pattern let N concurrent signals
+    all read count=0 under max=1, all pass the cap check, and all place
+    orders — overshooting the cap by the concurrency factor.
+
+    This test exercises the reservation helper directly so it's
+    deterministic (no cross-thread ordering assumptions): repeatedly
+    reserving with max=3 should yield exactly 3 True followed by False.
+    """
+    monkeypatch.delenv("LIVE_EXTERNAL_KILL_SWITCH", raising=False)
+    monkeypatch.setattr(config, "LIVE_MAX_ORDERS_PER_SOURCE_PER_DAY", 3)
+    monkeypatch.setattr(config, "LIVE_CANARY_MODE", False)
+    monkeypatch.setattr(LiveTrader, "_load_credentials", _fake_live_credentials)
+    monkeypatch.setattr(LiveTrader, "_load_asset_index_map", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "reconcile_positions", lambda self: None)
+
+    trader = LiveTrader(firewall=None, dry_run=False, max_order_usd=1_000)
+
+    results = [trader._reserve_entry_slot("copy_trade") for _ in range(5)]
+    assert [r[0] for r in results] == [True, True, True, False, False], (
+        f"expected 3 reservations then 2 rejections, got {results}"
+    )
+    # Reserved slots must show in the counter
+    assert trader._source_orders_today["copy_trade"] == 3
+    # Releasing rolls back the reservation
+    trader._release_entry_slot("copy_trade")
+    assert trader._source_orders_today["copy_trade"] == 2
+    # Further releases remove the key entirely when it hits zero
+    trader._release_entry_slot("copy_trade")
+    trader._release_entry_slot("copy_trade")
+    assert "copy_trade" not in trader._source_orders_today
+
+
+def test_live_trader_source_cap_releases_reservation_on_entry_failure(monkeypatch):
+    """H10: when place_market_order fails after the slot has been
+    reserved, the counter must be released so the failed attempt does
+    not permanently consume budget."""
+    class FakeFirewall:
+        def validate(self, signal, **kwargs):
+            return True, "ok"
+
+    monkeypatch.delenv("LIVE_EXTERNAL_KILL_SWITCH", raising=False)
+    monkeypatch.setattr(config, "LIVE_MAX_ORDERS_PER_SOURCE_PER_DAY", 1)
+    monkeypatch.setattr(config, "LIVE_CANARY_MODE", False)
+    monkeypatch.setattr(LiveTrader, "_load_credentials", _fake_live_credentials)
+    monkeypatch.setattr(LiveTrader, "_load_asset_index_map", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "reconcile_positions", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "get_firewall_positions", lambda self: [])
+    monkeypatch.setattr(LiveTrader, "get_account_value", lambda self: 2500.0)
+    # Simulate exchange rejection - "insufficient margin" style failure
+    monkeypatch.setattr(
+        LiveTrader,
+        "place_market_order",
+        lambda self, *args, **kwargs: {"status": "rejected", "reason": "exchange_error"},
+    )
+    monkeypatch.setattr(LiveTrader, "update_daily_pnl_from_fills", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "_get_mid_price", lambda self, coin: 2000.0)
+
+    trader = LiveTrader(firewall=FakeFirewall(), dry_run=False, max_order_usd=1_000)
+
+    # First attempt fails → slot should be released
+    first = trader.execute_signal(
+        {
+            "coin": "ETH",
+            "side": "long",
+            "confidence": 0.8,
+            "entry_price": 2000.0,
+            "position_pct": 0.05,
+            "leverage": 2,
+            "size": 0.1,
+            "source": "copy_trade",
+        }
+    )
+    # Returns the (rejected) order_result, not None
+    assert first is not None
+    assert first.get("status") == "rejected"
+    # Critical: counter must have been released (budget intact)
+    assert trader._source_orders_today.get("copy_trade", 0) == 0, (
+        "failed entry must not permanently consume source-cap budget"
+    )
+
+
+def test_live_trader_source_cap_concurrent_signals_stay_within_cap(monkeypatch):
+    """H10: fire 20 concurrent signals against a cap of 5 and verify
+    that *at most* 5 succeed.  Without the atomic reserve, several
+    threads can all pass the check and several orders can be placed
+    past the cap.
+    """
+    import threading as _threading
+
+    class FakeFirewall:
+        def validate(self, signal, **kwargs):
+            return True, "ok"
+
+    monkeypatch.delenv("LIVE_EXTERNAL_KILL_SWITCH", raising=False)
+    monkeypatch.setattr(config, "LIVE_MAX_ORDERS_PER_SOURCE_PER_DAY", 5)
+    monkeypatch.setattr(config, "LIVE_CANARY_MODE", False)
+    monkeypatch.setattr(LiveTrader, "_load_credentials", _fake_live_credentials)
+    monkeypatch.setattr(LiveTrader, "_load_asset_index_map", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "reconcile_positions", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "get_firewall_positions", lambda self: [])
+    monkeypatch.setattr(LiveTrader, "get_account_value", lambda self: 2500.0)
+    monkeypatch.setattr(
+        LiveTrader,
+        "place_market_order",
+        lambda self, *args, **kwargs: {"status": "success"},
+    )
+    monkeypatch.setattr(LiveTrader, "update_daily_pnl_from_fills", lambda self: None)
+    monkeypatch.setattr(
+        LiveTrader,
+        "verify_fill",
+        lambda self, *args, **kwargs: {"status": "verified", "size": 0.1},
+    )
+    monkeypatch.setattr(LiveTrader, "_get_mid_price", lambda self, coin: 2000.0)
+    monkeypatch.setattr(LiveTrader, "place_trigger_order", lambda self, *args, **kwargs: {"status": "success"})
+
+    trader = LiveTrader(firewall=FakeFirewall(), dry_run=False, max_order_usd=1_000_000)
+
+    results = []
+    results_lock = _threading.Lock()
+    start_barrier = _threading.Barrier(20)
+
+    def _fire():
+        start_barrier.wait()
+        r = trader.execute_signal(
+            {
+                "coin": "ETH",
+                "side": "long",
+                "confidence": 0.8,
+                "entry_price": 2000.0,
+                "position_pct": 0.05,
+                "leverage": 2,
+                "size": 0.1,
+                "source": "copy_trade",
+            }
+        )
+        with results_lock:
+            results.append(r)
+
+    threads = [_threading.Thread(target=_fire) for _ in range(20)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    successes = [r for r in results if isinstance(r, dict) and r.get("status") == "success"]
+    assert len(successes) <= 5, (
+        f"H10 race guard: at most 5 of 20 concurrent signals should succeed, "
+        f"got {len(successes)}"
+    )
+    # And the counter should match the number of successes exactly
+    assert trader._source_orders_today.get("copy_trade", 0) == len(successes), (
+        f"counter {trader._source_orders_today.get('copy_trade', 0)} must match "
+        f"successes {len(successes)}"
+    )
+
+
 def test_live_trader_source_day_cap_scopes_copy_trades_per_trader(monkeypatch):
     class FakeFirewall:
         def validate(self, signal, **kwargs):
@@ -3463,7 +3867,7 @@ def test_protect_orphaned_positions_aborts_when_open_orders_unavailable(monkeypa
     monkeypatch.setattr(
         LiveTrader,
         "get_positions",
-        lambda self: [
+        lambda self, **kw: [
             {
                 "coin": "ETH",
                 "size": 0.1,
@@ -3474,7 +3878,7 @@ def test_protect_orphaned_positions_aborts_when_open_orders_unavailable(monkeypa
             }
         ],
     )
-    monkeypatch.setattr(LiveTrader, "get_open_orders", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "get_open_orders", lambda self, **kw: None)
     monkeypatch.setattr(
         LiveTrader,
         "place_trigger_order",
@@ -3564,3 +3968,195 @@ def test_execute_signal_refreshes_daily_pnl_before_firewall(monkeypatch):
     assert result is None
     assert firewall.calls == 0
     assert trader.kill_switch_active is True
+
+
+# ─────────────────────────────────────────────────────────────────
+# AUDIT M2 — selective protective-leg retry.  Previously, any single-
+# leg failure caused ``cancel_all_orders`` to wipe BOTH legs before
+# retrying.  The new logic re-places only the failed leg and leaves
+# the good leg resting on the exchange across the retry window.
+# ─────────────────────────────────────────────────────────────────
+
+
+class _FakeFirewall:
+    def validate(self, signal, **kwargs):
+        return True, "ok"
+
+
+def _build_trader_for_protective_tests(monkeypatch):
+    monkeypatch.setattr(LiveTrader, "_load_credentials", _fake_live_credentials)
+    monkeypatch.setattr(LiveTrader, "_load_asset_index_map", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "reconcile_positions", lambda self: None)
+    trader = LiveTrader(firewall=_FakeFirewall(), dry_run=False, max_order_usd=1_000_000)
+    # Tighten retries so tests execute quickly regardless of env defaults.
+    trader._protective_order_retries = 3
+    trader._protective_order_retry_delay_s = 0.0
+    trader._protective_order_retry_jitter_s = 0.0
+    return trader
+
+
+def test_protective_retry_reuses_successful_sl_when_tp_fails_first(monkeypatch):
+    """AUDIT M2: SL succeeds on attempt 1, TP fails; retry must NOT re-place SL."""
+    trader = _build_trader_for_protective_tests(monkeypatch)
+
+    tp_call_count = {"n": 0}
+    sl_call_count = {"n": 0}
+
+    def _fake_trigger(self, coin, side, size, trigger_price, tp_or_sl="sl"):
+        if tp_or_sl == "sl":
+            sl_call_count["n"] += 1
+            return {"status": "success", "which": "sl"}
+        # TP: fail first attempt, succeed second
+        tp_call_count["n"] += 1
+        if tp_call_count["n"] == 1:
+            return {"status": "error", "message": "tp placement rejected"}
+        return {"status": "success", "which": "tp"}
+
+    cancel_calls = []
+
+    def _fake_cancel_all(self, coin=None):
+        cancel_calls.append(coin)
+        return 0
+
+    monkeypatch.setattr(LiveTrader, "place_trigger_order", _fake_trigger)
+    monkeypatch.setattr(LiveTrader, "cancel_all_orders", _fake_cancel_all)
+
+    sl_result, tp_result, attempts = trader._place_protective_orders_with_retries(
+        coin="ETH",
+        close_side="sell",
+        size=0.1,
+        sl_price=1900.0,
+        tp_price=2100.0,
+    )
+
+    # SL should have been placed exactly ONCE (first attempt, succeeded).
+    assert sl_call_count["n"] == 1, (
+        f"SL was re-placed after success (saw {sl_call_count['n']} calls)"
+    )
+    # TP should have been placed TWICE (failed then succeeded).
+    assert tp_call_count["n"] == 2
+    assert trader._is_order_result_success(sl_result)
+    assert trader._is_order_result_success(tp_result)
+    assert attempts == 2
+    # The between-retry cancel_all_orders must NOT have been called — it
+    # would have wiped the good SL.
+    assert cancel_calls == [], (
+        f"Retry loop called cancel_all_orders (wipes good SL): {cancel_calls}"
+    )
+
+
+def test_protective_retry_reuses_successful_tp_when_sl_fails_first(monkeypatch):
+    """AUDIT M2: TP succeeds on attempt 1, SL fails; retry must NOT re-place TP."""
+    trader = _build_trader_for_protective_tests(monkeypatch)
+
+    sl_call_count = {"n": 0}
+    tp_call_count = {"n": 0}
+
+    def _fake_trigger(self, coin, side, size, trigger_price, tp_or_sl="sl"):
+        if tp_or_sl == "tp":
+            tp_call_count["n"] += 1
+            return {"status": "success", "which": "tp"}
+        sl_call_count["n"] += 1
+        if sl_call_count["n"] == 1:
+            return {"status": "error", "message": "sl placement rejected"}
+        return {"status": "success", "which": "sl"}
+
+    cancel_calls = []
+
+    def _fake_cancel_all(self, coin=None):
+        cancel_calls.append(coin)
+        return 0
+
+    monkeypatch.setattr(LiveTrader, "place_trigger_order", _fake_trigger)
+    monkeypatch.setattr(LiveTrader, "cancel_all_orders", _fake_cancel_all)
+
+    sl_result, tp_result, attempts = trader._place_protective_orders_with_retries(
+        coin="ETH",
+        close_side="sell",
+        size=0.1,
+        sl_price=1900.0,
+        tp_price=2100.0,
+    )
+
+    assert tp_call_count["n"] == 1
+    assert sl_call_count["n"] == 2
+    assert trader._is_order_result_success(sl_result)
+    assert trader._is_order_result_success(tp_result)
+    assert attempts == 2
+    assert cancel_calls == []
+
+
+def test_protective_retry_returns_immediately_when_both_succeed(monkeypatch):
+    """Both legs succeed on attempt 1 → attempts=1, no cancel call."""
+    trader = _build_trader_for_protective_tests(monkeypatch)
+
+    place_calls = []
+    cancel_calls = []
+
+    def _fake_trigger(self, coin, side, size, trigger_price, tp_or_sl="sl"):
+        place_calls.append(tp_or_sl)
+        return {"status": "success"}
+
+    monkeypatch.setattr(LiveTrader, "place_trigger_order", _fake_trigger)
+    monkeypatch.setattr(
+        LiveTrader,
+        "cancel_all_orders",
+        lambda self, coin=None: cancel_calls.append(coin) or 0,
+    )
+
+    sl_result, tp_result, attempts = trader._place_protective_orders_with_retries(
+        coin="ETH",
+        close_side="sell",
+        size=0.1,
+        sl_price=1900.0,
+        tp_price=2100.0,
+    )
+
+    assert place_calls == ["sl", "tp"]
+    assert attempts == 1
+    assert cancel_calls == []
+    assert trader._is_order_result_success(sl_result)
+    assert trader._is_order_result_success(tp_result)
+
+
+def test_protective_retry_exhausts_when_one_leg_never_succeeds(monkeypatch):
+    """AUDIT M2: one leg permanently broken → returns last result, attempts==max,
+    surviving leg is NOT re-placed after its first success."""
+    trader = _build_trader_for_protective_tests(monkeypatch)
+    trader._protective_order_retries = 3
+
+    sl_call_count = {"n": 0}
+    tp_call_count = {"n": 0}
+
+    def _fake_trigger(self, coin, side, size, trigger_price, tp_or_sl="sl"):
+        if tp_or_sl == "sl":
+            sl_call_count["n"] += 1
+            return {"status": "success", "which": "sl"}
+        tp_call_count["n"] += 1
+        return {"status": "error", "message": "tp always fails"}
+
+    cancel_calls = []
+    monkeypatch.setattr(LiveTrader, "place_trigger_order", _fake_trigger)
+    monkeypatch.setattr(
+        LiveTrader,
+        "cancel_all_orders",
+        lambda self, coin=None: cancel_calls.append(coin) or 0,
+    )
+
+    sl_result, tp_result, attempts = trader._place_protective_orders_with_retries(
+        coin="ETH",
+        close_side="sell",
+        size=0.1,
+        sl_price=1900.0,
+        tp_price=2100.0,
+    )
+
+    # SL placed once, kept for all attempts.
+    assert sl_call_count["n"] == 1
+    # TP attempted once per iteration (3 iterations).
+    assert tp_call_count["n"] == 3
+    assert attempts == 3
+    assert trader._is_order_result_success(sl_result)
+    assert not trader._is_order_result_success(tp_result)
+    # Still no between-retry cancel — SL survives.
+    assert cancel_calls == []

@@ -47,11 +47,26 @@ _options_scanner = None
 # Paths that are always open (health probes, Railway readiness checks, login)
 _AUTH_EXEMPT_PATHS = {"/api/health", "/api/ready", "/api/live_ready", "/login", "/api/auth/login"}
 _AUTH_COOKIE_NAME = "dashboard_auth"
+# H9 (audit): every mutating / compute-intensive POST endpoint must require
+# auth when DASHBOARD_AUTH_TOKEN is set.  When the token is not set and the
+# dashboard is bound publicly (e.g., Railway), any path in this set returns
+# 403 with a configuration hint instead of executing — this prevents
+# unauthenticated CPU/IO exhaustion, destructive cache clears, and external
+# API rate-limit abuse on the exchange's behalf.
 _AUTH_REQUIRED_POST_PATHS = {
+    # Finance / paper-book mutations
     "/api/order",
     "/api/paper/reset",
     "/api/trade/close",
     "/api/trade/close-all",
+    # Compute-intensive background jobs (DoS surface)
+    "/api/backtest/run",
+    "/api/candle-backtest/run",
+    "/api/stress/run",
+    # External API fetch (exchange rate-limit abuse surface)
+    "/api/candle-backtest/fetch",
+    # Destructive cache operations
+    "/api/candle-backtest/cache/clear",
 }
 
 
