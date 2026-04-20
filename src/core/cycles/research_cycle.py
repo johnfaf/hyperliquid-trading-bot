@@ -51,14 +51,17 @@ def run_discovery(container) -> None:
         if container.identifier:
             from src.data.database import get_active_traders
             from src.data import hyperliquid_client as hl
-            traders = get_active_traders()
+            traders = get_active_traders(valid_only=True, quarantine_invalid=True)
             all_strategies = []
 
             for trader in traders:
-                state = hl.get_user_state(trader["address"])
+                address = str(trader["address"] or "").strip().lower()
+                if not hl._is_valid_eth_address(address):
+                    continue
+                state = hl.get_user_state(address)
                 if state:
                     profile = {
-                        "address": trader["address"],
+                        "address": address,
                         "positions": state["positions"],
                         "position_analysis": container.discovery._analyze_positions(state["positions"]),
                         "trade_analysis": {

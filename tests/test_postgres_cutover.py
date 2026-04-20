@@ -145,6 +145,31 @@ def test_dualwrite_insert_preserves_sqlite_generated_ids_in_postgres():
     assert pg_conn.commit_calls == 1
 
 
+def test_dualwrite_metadata_cas_uses_jsonb_predicate_for_postgres():
+    sqlite_conn = sqlite3.connect(":memory:")
+    sqlite_conn.row_factory = sqlite3.Row
+    sqlite_conn.execute(
+        "CREATE TABLE paper_trades (id INTEGER PRIMARY KEY AUTOINCREMENT, metadata TEXT)"
+    )
+    sqlite_conn.execute("INSERT INTO paper_trades (metadata) VALUES (?)", ("",))
+    pg_conn = _RecordingPgConn()
+    adapter = DualWriteAdapter(sqlite_conn, pg_conn)
+
+    adapter.execute(
+        "UPDATE paper_trades SET metadata = ? "
+        "WHERE id = ? AND COALESCE(metadata, '') = COALESCE(?, '')",
+        ('{"guard": true}', 1, ""),
+    )
+
+    sql, params = pg_conn.executed[-1]
+    assert sql == (
+        "UPDATE paper_trades SET metadata = %s::jsonb "
+        "WHERE id = %s AND COALESCE(metadata, '{}'::jsonb) = "
+        "COALESCE(%s::jsonb, '{}'::jsonb)"
+    )
+    assert params == ('{"guard": true}', 1, "{}")
+
+
 def test_dualwrite_skips_sqlite_only_pragmas_for_postgres():
     sqlite_conn = sqlite3.connect(":memory:")
     sqlite_conn.row_factory = sqlite3.Row
@@ -300,6 +325,21 @@ def test_translate_sql_only_rewrites_datetime_function_calls():
     assert "CURRENT_TIMESTAMP AS created_at" in translated
     assert "(now() - INTERVAL '90 days') AS cutoff" in translated
     assert "datetime_now_column" in translated
+
+
+def test_translate_sql_rewrites_paper_trade_metadata_cas_for_jsonb():
+    sql = (
+        "UPDATE paper_trades SET metadata = ? "
+        "WHERE id = ? AND COALESCE(metadata, '') = COALESCE(?, '')"
+    )
+
+    translated = _translate_sql(sql, "postgres")
+
+    assert translated == (
+        "UPDATE paper_trades SET metadata = %s::jsonb "
+        "WHERE id = %s AND COALESCE(metadata, '{}'::jsonb) = "
+        "COALESCE(%s::jsonb, '{}'::jsonb)"
+    )
 
 
 def test_localhost_postgres_dsn_is_allowed_for_local_development():

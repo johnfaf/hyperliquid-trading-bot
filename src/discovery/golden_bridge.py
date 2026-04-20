@@ -36,12 +36,19 @@ def _get_db():
     return db.get_connection(for_read=True)
 
 
+def _normalise_valid_address(address: str) -> Optional[str]:
+    addr = str(address or "").strip().lower()
+    if not hl._is_valid_eth_address(addr):
+        return None
+    return addr
+
+
 def get_live_golden_wallets() -> List[Dict]:
     """
     Get golden wallets that are connected to live execution.
     Returns list of dicts with address, sharpe, penalised_pnl, etc.
     """
-    with _get_db() as conn:
+    with db.get_connection() as conn:
         rows = conn.execute(
             "SELECT address, sharpe_ratio, penalised_pnl, win_rate, "
             "penalised_max_drawdown_pct, trades_per_day, best_coin, coins_traded "
@@ -50,13 +57,30 @@ def get_live_golden_wallets() -> List[Dict]:
             "ORDER BY penalised_pnl DESC"
         ).fetchall()
         results = []
+        malformed = []
         for r in rows:
             d = dict(r)
+            original_address = d.get("address")
+            normalised_address = _normalise_valid_address(original_address)
+            if not normalised_address:
+                malformed.append(original_address)
+                continue
+            d["address"] = normalised_address
             try:
                 d["coins_traded"] = json.loads(d.get("coins_traded", "[]"))
             except Exception:
                 d["coins_traded"] = []
             results.append(d)
+        for address in malformed:
+            conn.execute(
+                "UPDATE golden_wallets SET connected_to_live = 0 WHERE address = ?",
+                (address,),
+            )
+        if malformed:
+            logger.info(
+                "Golden bridge disconnected %d malformed connected wallet rows",
+                len(malformed),
+            )
         return results
 
 
@@ -77,6 +101,10 @@ def auto_connect_golden_wallets() -> int:
 
         connected = 0
         for r in rows:
+            address = _normalise_valid_address(r["address"])
+            if not address:
+                logger.debug("Golden bridge skip auto-connect malformed wallet %s", r["address"])
+                continue
             conn.execute(
                 "UPDATE golden_wallets SET connected_to_live = 1 WHERE address = ?",
                 (r["address"],)
@@ -118,7 +146,10 @@ def get_golden_copy_signals(mids: Optional[Dict] = None) -> List[Dict]:
     signals = []
     for wallet in golden:
         try:
-            state = hl.get_user_state(wallet["address"])
+            address = _normalise_valid_address(wallet["address"])
+            if not address:
+                continue
+            state = hl.get_user_state(address)
             if not state:
                 continue
 
@@ -141,7 +172,7 @@ def get_golden_copy_signals(mids: Optional[Dict] = None) -> List[Dict]:
                     "side": pos["side"],
                     "price": price,
                     "leverage": min(pos["leverage"], config.PAPER_TRADING_MAX_LEVERAGE),
-                    "source_trader": wallet["address"][:10],
+                    "source_trader": address[:10],
                     "source_pnl": wallet.get("penalised_pnl", 0),
                     "confidence": boosted_conf,
                     "sharpe": wallet.get("sharpe_ratio", 0),

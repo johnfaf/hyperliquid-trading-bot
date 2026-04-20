@@ -43,6 +43,21 @@ _INSERT_VALUES_RE = re.compile(
     r"(?P<table>[\"`\w\.]+)\s*\((?P<columns>.*?)\)\s*VALUES\s*"
     r"\((?P<values>.*?)\)(?P<suffix>\s*.*)$"
 )
+_PAPER_TRADES_METADATA_CAS_QMARK_RE = re.compile(
+    r"(?is)^\s*UPDATE\s+paper_trades\s+SET\s+metadata\s*=\s*\?\s+"
+    r"WHERE\s+id\s*=\s*\?\s+AND\s+COALESCE\(\s*metadata\s*,\s*''\s*\)\s*=\s*"
+    r"COALESCE\(\s*\?\s*,\s*''\s*\)\s*$"
+)
+_PAPER_TRADES_METADATA_CAS_PERCENT_RE = re.compile(
+    r"(?is)^\s*UPDATE\s+paper_trades\s+SET\s+metadata\s*=\s*%s\s+"
+    r"WHERE\s+id\s*=\s*%s\s+AND\s+COALESCE\(\s*metadata\s*,\s*''\s*\)\s*=\s*"
+    r"COALESCE\(\s*%s\s*,\s*''\s*\)\s*$"
+)
+_PAPER_TRADES_METADATA_CAS_JSONB_SQL = (
+    "UPDATE paper_trades SET metadata = %s::jsonb "
+    "WHERE id = %s AND COALESCE(metadata, '{}'::jsonb) = "
+    "COALESCE(%s::jsonb, '{}'::jsonb)"
+)
 _SQLITE_ONLY_PREFIXES = ("PRAGMA",)
 _DDL_PREFIXES = ("CREATE ", "ALTER ", "DROP ", "VACUUM", "REINDEX")
 _MIRRORED_WRITE_PREFIXES = ("INSERT", "UPDATE", "DELETE", "REPLACE")
@@ -81,6 +96,19 @@ def _coerce_bool_params(columns, params):
                 continue
             if isinstance(v, (int, float)):
                 out[i] = bool(v)
+    return tuple(out)
+
+
+def _coerce_paper_metadata_cas_params(params):
+    """Normalize empty SQLite metadata CAS values into valid JSON for Postgres."""
+    if not params:
+        return ()
+    out = list(tuple(params))
+    if len(out) >= 3:
+        if out[0] in (None, ""):
+            out[0] = "{}"
+        if out[2] in (None, ""):
+            out[2] = "{}"
     return tuple(out)
 
 
@@ -129,6 +157,11 @@ def _translate_sql(sql: str, backend: str) -> str:
     )
     translated = _DATETIME_NOW_RE.sub("CURRENT_TIMESTAMP", translated)
     translated = _BOOL_COLUMN_EQ_INT_RE.sub(_bool_literal_replacer, translated)
+    if _PAPER_TRADES_METADATA_CAS_PERCENT_RE.match(translated):
+        # SQLite stores paper trade metadata as TEXT.  Postgres stores the same
+        # column as JSONB, so the mirrored compare-and-swap predicate must avoid
+        # COALESCE(metadata, '') because '' is not valid JSON.
+        return _PAPER_TRADES_METADATA_CAS_JSONB_SQL
 
     return translated
 
@@ -410,6 +443,9 @@ class DualWriteAdapter:
     def _prepare_pg_mirror(self, sql: str, params: Sequence = None, sqlite_result=None):
         if self._should_skip_pg_mirror(sql):
             return None, None
+
+        if _PAPER_TRADES_METADATA_CAS_QMARK_RE.match(sql or ""):
+            return sql, _coerce_paper_metadata_cas_params(params)
 
         insert_match = _INSERT_VALUES_RE.match(sql)
         if not insert_match:

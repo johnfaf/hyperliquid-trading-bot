@@ -916,15 +916,18 @@ def update_paper_trade_metadata(
                 existing.update(extra)
                 new_metadata_str = json.dumps(existing)
 
-                # CAS predicate works on both sqlite (metadata is TEXT)
-                # and postgres (cast metadata::text for comparison).  The
-                # COALESCE guards the NULL/empty-string boundary.
+                # CAS predicate works on both sqlite (metadata is TEXT) and
+                # postgres (metadata is JSONB).  Keep the Postgres comparison
+                # in JSONB space so canonicalization/key order does not break
+                # equality and empty strings are never cast as JSON.
                 backend = getattr(conn, "backend", "sqlite")
                 if backend == "postgres":
+                    cas_param = cas_current or "{}"
                     cursor = conn.execute(
                         "UPDATE paper_trades SET metadata = ?::jsonb "
-                        "WHERE id = ? AND COALESCE(metadata::text, '') = COALESCE(?, '')",
-                        (new_metadata_str, trade_id, cas_current),
+                        "WHERE id = ? AND COALESCE(metadata, '{}'::jsonb) = "
+                        "COALESCE(?::jsonb, '{}'::jsonb)",
+                        (new_metadata_str, trade_id, cas_param),
                     )
                 else:
                     cursor = conn.execute(
