@@ -4893,6 +4893,7 @@ class LiveTrader:
         signal: TradeSignal,
         open_positions: Optional[List[Dict[str, Any]]] = None,
         source_policy: Optional[Dict[str, Any]] = None,
+        allow_live_mirror_floorup: bool = False,
     ) -> Optional[TradeSignal]:
         """
         Clamp signal.size so its notional never exceeds self.max_order_usd.
@@ -4991,6 +4992,9 @@ class LiveTrader:
                         f"source status {policy_status})"
                     )
                     floor_metric = "min_notional_top_tier_floorups"
+                elif allow_live_mirror_floorup:
+                    floor_reason = "paper-to-live mirror final minimum floor"
+                    floor_metric = "min_notional_mirror_floorups"
 
             if floor_reason and target_size > 0:
                 self._incr_entry_metric("min_notional_floorups")
@@ -5184,10 +5188,14 @@ class LiveTrader:
 
             # Hard per-order $ cap — applied AFTER regime overlay and any paper→live
             # rescaling so nothing above max_order_usd ever hits the exchange.
+            signal_context = signal.context if isinstance(signal.context, dict) else {}
             capped_signal = self._apply_order_usd_cap(
                 signal,
                 open_positions=live_positions,
                 source_policy=source_policy,
+                allow_live_mirror_floorup=bool(
+                    bypass_firewall and signal_context.get("live_mirror")
+                ),
             )
             if capped_signal is None:
                 return None
@@ -5681,6 +5689,9 @@ class LiveTrader:
             ),
             "min_order_same_side_merges_today": int(
                 state_snapshot["entry_metrics"].get("min_notional_same_side_merges", 0)
+            ),
+            "min_order_mirror_floorups_today": int(
+                state_snapshot["entry_metrics"].get("min_notional_mirror_floorups", 0)
             ),
             "approved_but_not_executable_today": int(
                 state_snapshot["entry_metrics"].get("approved_but_not_executable", 0)

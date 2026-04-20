@@ -2435,6 +2435,58 @@ def test_execute_signal_tracks_approved_but_not_executable(monkeypatch):
     assert stats["min_order_floorups_today"] == 0
 
 
+def test_execute_signal_live_mirror_refloors_after_tier_dampen(monkeypatch):
+    """Paper-to-live mirrors can be shrunk below the exchange minimum by final
+    live-only tier/regime modifiers.  Re-floor them at the last sizing gate so
+    an already-approved mirror does not become approved-but-not-executable."""
+    placed_sizes = []
+
+    class FakeFirewall:
+        def validate(self, signal, **kwargs):
+            return True, "ok"
+
+    monkeypatch.setattr(LiveTrader, "_load_credentials", _fake_live_credentials)
+    monkeypatch.setattr(LiveTrader, "_load_asset_index_map", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "reconcile_positions", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "get_positions", lambda self: [])
+    monkeypatch.setattr(LiveTrader, "get_account_value", lambda self: 2500.0)
+    monkeypatch.setattr(
+        LiveTrader,
+        "place_market_order",
+        lambda self, coin, side, size, leverage=1, reduce_only=False: (
+            placed_sizes.append(size) or {"status": "success"}
+        ),
+    )
+    monkeypatch.setattr(LiveTrader, "update_daily_pnl_from_fills", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "verify_fill", lambda self, *args, **kwargs: {"status": "verified"})
+    monkeypatch.setattr(LiveTrader, "_get_mid_price", lambda self, coin: 2000.0)
+    monkeypatch.setattr(LiveTrader, "place_trigger_order", lambda self, *args, **kwargs: {"status": "success"})
+
+    trader = LiveTrader(firewall=FakeFirewall(), dry_run=False, max_order_usd=15.0)
+    trader.kelly_dampen = 0.65
+    signal = TradeSignal(
+        coin="ETH",
+        side=SignalSide.LONG,
+        confidence=0.51,
+        source=SignalSource.COPY_TRADE,
+        reason="paper mirror",
+        entry_price=2000.0,
+        leverage=5,
+        size=0.0056,  # $11.20 before T1 dampen, $7.28 after dampen
+        context={"live_mirror": True},
+    )
+
+    result = trader.execute_signal(signal, bypass_firewall=True)
+
+    assert result is not None
+    assert result["status"] == "success"
+    assert len(placed_sizes) == 1
+    assert placed_sizes[0] * 2000.0 >= trader.min_order_usd
+    stats = trader.get_stats()
+    assert stats["min_order_mirror_floorups_today"] == 1
+    assert stats["approved_but_not_executable_today"] == 0
+
+
 def test_execute_signal_retries_protective_orders_before_succeeding(monkeypatch):
     """AUDIT M2 — both legs fail attempt 1, both succeed attempt 2.  No
     between-retry cancel_all_orders is expected anymore: the failed legs

@@ -647,6 +647,13 @@ def mirror_executed_trades_to_live(
                 if scaled_trade is None:
                     continue  # blocked by rescale — already logged
                 live_signal = signal_from_execution_dict(scaled_trade) if isinstance(scaled_trade, dict) else scaled_trade
+                if hasattr(live_signal, "context"):
+                    live_context = dict(getattr(live_signal, "context", {}) or {})
+                    live_context.update({
+                        "live_mirror": True,
+                        "live_mirror_rescaled": isinstance(scaled_trade, dict),
+                    })
+                    live_signal.context = live_context
                 entry_price = float(
                     getattr(live_signal, "entry_price", 0)
                     or (scaled_trade.get("entry_price", scaled_trade.get("price", 0)) if isinstance(scaled_trade, dict) else 0)
