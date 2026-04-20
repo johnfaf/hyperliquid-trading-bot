@@ -142,7 +142,7 @@ class PredictiveRegimeForecaster:
         self._options_ts: float = 0.0
         self._external_data_ttl = cfg.get("external_data_ttl", 600)  # 10 min staleness limit
         self._external_data_partial_ttl = cfg.get("external_data_partial_ttl", 1800)  # 30 min
-        
+
         self.api_manager = get_manager()
 
         logger.info("PredictiveRegimeForecaster V2 initialized (5-input model)")
