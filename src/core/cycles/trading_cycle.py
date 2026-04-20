@@ -173,7 +173,13 @@ def _reconcile_regimes(regime_data: dict, container) -> dict:
 
     if not agree and min(pred_conf, det_conf) >= 0.5:
         # Conservative policy: if forecaster says crash, override to crash-equivalent.
-        if pred_regime == "crash" and pred_conf >= 0.6:
+        # Threshold raised from 0.60 -> 0.75: observed in production the
+        # XGBoost forecaster would sit at 63–68% "crash" for hours while
+        # the detector reported "trending_up", flipping regime to "volatile"
+        # and dragging every signal's confidence -0.07 via macro overlay.
+        # A 75% bar requires the forecaster to be meaningfully confident
+        # before it can veto the consensus detector read.
+        if pred_regime == "crash" and pred_conf >= 0.75:
             logger.warning(
                 "  REGIME DISAGREEMENT: detector=%s (%.0f%%) vs forecaster=%s (%.0f%%) -- "
                 "applying crash-protective override",

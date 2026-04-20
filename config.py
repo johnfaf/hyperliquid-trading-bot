@@ -437,8 +437,13 @@ ROTATION_REQUIRE_EXPLICIT_THRESHOLDS = os.environ.get(
 # ─── Decision Firewall ─────────────────────────────────────────
 # Minimum signal confidence to pass the firewall.
 # 0.15 (15%) is far too permissive — nearly any signal passes.
-# Raise to 0.45+ to ensure only well-confirmed signals are traded.
-FIREWALL_MIN_CONFIDENCE = float(os.environ.get("FIREWALL_MIN_CONFIDENCE", 0.45))
+# 0.45 turned out to be TOO strict in canary: observed log shows
+# copy/options signals landing at 41–43% conviction, consistently
+# just below the gate, so nothing ever reaches live.  0.40 still
+# rejects low-quality signals while letting well-formed, macro-drag-
+# adjusted signals through.  Raise back to 0.45+ once we have
+# meaningful live-trade history to score sources against.
+FIREWALL_MIN_CONFIDENCE = float(os.environ.get("FIREWALL_MIN_CONFIDENCE", 0.40))
 FIREWALL_MAX_SIGNALS_PER_SOURCE_PER_DAY = int(
     os.environ.get("FIREWALL_MAX_SIGNALS_PER_SOURCE_PER_DAY", 0)
 )
@@ -725,7 +730,7 @@ def _validate_config_bounds() -> None:
         ("PORTFOLIO_MAX_COIN_EXPOSURE_PCT", 0.0, 1.0, 0.45),
         ("PORTFOLIO_MAX_SIDE_EXPOSURE_PCT", 0.0, 1.0, 0.65),
         ("PORTFOLIO_MAX_CLUSTER_EXPOSURE_PCT", 0.0, 1.0, 0.55),
-        ("FIREWALL_MIN_CONFIDENCE", 0.0, 1.0, 0.45),
+        ("FIREWALL_MIN_CONFIDENCE", 0.0, 1.0, 0.40),
         ("FIREWALL_MAX_SIGNALS_PER_SOURCE_PER_DAY", 0, 100_000, 0),
         ("FIREWALL_COIN_COOLDOWN_SECONDS", 0, 86_400, 180),
         ("FIREWALL_SAME_SIDE_COOLDOWN_SECONDS", 0, 86_400, 900),

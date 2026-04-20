@@ -70,11 +70,19 @@ class AgentScorer:
         self.policy_keep_top_n = int(cfg.get("policy_keep_top_n", 5))
         self.policy_pause_weight = float(cfg.get("policy_pause_weight", 0.12))
         self.policy_degrade_weight = float(cfg.get("policy_degrade_weight", 0.32))
+        # Warmup/degraded per-day signal caps.  Previously 1/1 each, which
+        # meant a single rejected signal burned the whole day's budget for
+        # that source (observed in production: `options_flow (1/1)` hit on
+        # the first signal of the day, so every subsequent options-flow
+        # candidate was rejected with `rejected_source_cap`).  Raised to
+        # 3 (warmup) / 2 (degraded) so a source in evaluation can still
+        # place a handful of canary-sized trades per day and build the
+        # history that eventually promotes it to "active".
         self.policy_warmup_max_signals_per_day = int(
-            cfg.get("policy_warmup_max_signals_per_day", 1)
+            cfg.get("policy_warmup_max_signals_per_day", 3)
         )
         self.policy_degraded_max_signals_per_day = int(
-            cfg.get("policy_degraded_max_signals_per_day", 1)
+            cfg.get("policy_degraded_max_signals_per_day", 2)
         )
         self.policy_warmup_size_multiplier = float(
             cfg.get("policy_warmup_size_multiplier", 0.75)

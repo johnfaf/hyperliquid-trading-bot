@@ -751,8 +751,35 @@ class LiveTrader:
             f"max_order_usd=${self.max_order_usd:.2f}"
         )
 
-        if dry_run:
-            logger.warning("DRY RUN MODE - No real trades will be executed")
+        # Prominent, easy-to-grep banner covering every effective-state
+        # combination.  Operators should be able to tail production logs
+        # and immediately answer "is this bot actually live?" — previously
+        # the only signal was a single `dry_run=True` token inside a config
+        # dump, which made misconfigured deploys (e.g. LIVE_TRADING_ENABLED
+        # set but LIVE_TRADING_DUAL_CONTROL_CONFIRM missing) hard to spot.
+        live_requested_flag = bool(getattr(config, "LIVE_TRADING_ENABLED", False))
+        dual_control_flag = bool(getattr(config, "LIVE_TRADING_DUAL_CONTROL_CONFIRM", False))
+        if not dry_run:
+            logger.info("=" * 60)
+            logger.info("LIVE TRADING MODE ACTIVE — real orders will be sent to Hyperliquid")
+            logger.info("=" * 60)
+        elif live_requested_flag and not dual_control_flag:
+            logger.warning(
+                "LIVE_TRADING_ENABLED=true but LIVE_TRADING_DUAL_CONTROL_CONFIRM=false — "
+                "dual-control gate blocks live orders; running in DRY RUN"
+            )
+        elif live_requested_flag and dual_control_flag:
+            logger.warning(
+                "LIVE_TRADING_ENABLED=true and LIVE_TRADING_DUAL_CONTROL_CONFIRM=true "
+                "but trader still in DRY RUN — check signer/public-address setup"
+            )
+        else:
+            logger.warning(
+                "DRY RUN MODE — LIVE_TRADING_ENABLED=%s, LIVE_TRADING_DUAL_CONTROL_CONFIRM=%s; "
+                "no real orders will be sent",
+                live_requested_flag,
+                dual_control_flag,
+            )
 
         if self._kill_switch_is_active():
             # Preserve persisted/manual kill-switch status across startup checks.

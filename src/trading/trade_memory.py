@@ -433,7 +433,17 @@ class TradeMemory:
 
     def _generate_recommendation(self, win_rate: float, avg_pnl: float,
                                    avg_return: float, n_trades: int) -> Tuple[str, str]:
-        """Generate a recommendation based on similar trade statistics."""
+        """Generate a recommendation based on similar trade statistics.
+
+        The "avoid" verdict is a hard block — the caller (paper_trader) drops
+        the signal entirely, which means 3 unlucky losing trades used to
+        permanently blacklist a setup (observed in production: WR=0% n=3
+        "short BTC" blocked every cycle for hours).  We now require ``n >= 10``
+        similar trades before the memory is allowed to veto.  Below that
+        threshold the worst recommendation is "caution" (size × 0.8 in the
+        paper trader), which still reflects the bad history but lets the
+        signal through so the sample grows.
+        """
         if n_trades < 3:
             return "proceed", f"Only {n_trades} similar trades found — insufficient data"
 
@@ -443,9 +453,13 @@ class TradeMemory:
         elif win_rate >= 0.45 and avg_pnl > 0:
             return "proceed", (f"Similar setups slightly profitable "
                               f"(WR={win_rate:.0%}, avg PnL ${avg_pnl:.2f})")
-        elif win_rate >= 0.35:
+        elif win_rate >= 0.35 or n_trades < 10:
+            # Below 35% WR OR thin sample (<10): downweight via "caution"
+            # rather than block.  Keeps the bot from over-reacting to a
+            # 3-trade unlucky streak while still shrinking position size.
             return "caution", (f"Similar setups have mixed results "
-                              f"(WR={win_rate:.0%}, avg PnL ${avg_pnl:.2f})")
+                              f"(WR={win_rate:.0%}, avg PnL ${avg_pnl:.2f}, n={n_trades})")
         else:
+            # n_trades >= 10 AND WR < 35%: enough data to call it a bad setup.
             return "avoid", (f"Similar setups mostly lost money "
                             f"(WR={win_rate:.0%}, avg PnL ${avg_pnl:.2f}, n={n_trades})")

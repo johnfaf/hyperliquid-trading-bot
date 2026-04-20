@@ -334,7 +334,10 @@ def build_subsystems(
         )
 
     # Firewall — needs forecaster injected
-    # min_confidence is env-tunable via FIREWALL_MIN_CONFIDENCE (default 0.45)
+    # min_confidence is env-tunable via FIREWALL_MIN_CONFIDENCE (default 0.40).
+    # Previously 0.45; lowered because macro conf_drag (-0.07) + source
+    # warmup weighting were consistently pushing well-formed signals to
+    # 41–43% — just below the gate, so nothing ever reached live.
     import config as _fw_cfg
     c.firewall = _safe_init(
         "decision_firewall",
@@ -343,7 +346,7 @@ def build_subsystems(
             "agent_scorer": c.agent_scorer,
             "event_scanner": c.event_scanner,
             "event_risk_enabled": bool(getattr(_fw_cfg, "EVENT_RISK_ENABLED", True)),
-            "min_confidence": getattr(_fw_cfg, "FIREWALL_MIN_CONFIDENCE", 0.45),
+            "min_confidence": getattr(_fw_cfg, "FIREWALL_MIN_CONFIDENCE", 0.40),
             "max_signals_per_source_per_day": getattr(
                 _fw_cfg, "FIREWALL_MAX_SIGNALS_PER_SOURCE_PER_DAY", 0
             ),
