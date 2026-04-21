@@ -642,6 +642,8 @@ class LiveTrader:
         )
         self._last_hash_cleanup_ts = 0.0
         self._HASH_CLEANUP_INTERVAL = 60.0  # periodic cleanup every 60s
+        self._order_dedup_reconcile_required = False
+        self._order_dedup_unresolved_restored = 0
         self._nonce_lock = threading.Lock()
         self._last_nonce = 0
         self._exchange_leverage_cache: Dict[str, int] = {}
@@ -1267,13 +1269,23 @@ class LiveTrader:
                 suspicious,
             )
         if suspicious:
-            logger.critical(
+            self._order_dedup_reconcile_required = True
+            self._order_dedup_unresolved_restored = suspicious
+            logger.warning(
                 "%d order(s) from the prior run are in unresolved state "
-                "(in_flight/timeout/post_exception).  A reconcile_positions "
-                "sweep is required before new orders ship, and any orphaned "
-                "fills must be manually protected.",
+                "(in_flight/timeout/post_exception). New entries will remain "
+                "blocked until startup reconciliation confirms positions and "
+                "open orders are safe.",
                 suspicious,
             )
+
+    @staticmethod
+    def _is_unresolved_dedup_payload(payload: Any) -> bool:
+        return isinstance(payload, dict) and payload.get("status") in {
+            "in_flight",
+            "timeout",
+            "post_exception",
+        }
 
     def _persist_order_dedup_cache(self) -> None:
         """Best-effort write of the current dedup cache to bot_state."""
@@ -1288,6 +1300,75 @@ class LiveTrader:
             db.set_bot_state(self._ORDER_DEDUP_STATE_KEY, snapshot)
         except Exception as exc:
             logger.debug("Failed to persist dedup cache: %s", exc)
+
+    def _resolve_startup_order_dedup_reconcile(
+        self,
+        *,
+        positions: Optional[List[Dict[str, Any]]],
+        protection_summary: Optional[Dict[str, Any]],
+    ) -> None:
+        """Clear restored unresolved order markers after a safe startup sweep."""
+        if not self._order_dedup_reconcile_required:
+            return
+
+        summary = dict(protection_summary or {})
+        if summary and (
+            summary.get("status") != "ok"
+            or int(summary.get("failed", 0) or 0) > 0
+            or int(summary.get("cancel_failed", 0) or 0) > 0
+            or int(summary.get("churn_blocked", 0) or 0) > 0
+        ):
+            logger.critical(
+                "Startup order-dedup reconcile remains blocked: orphan "
+                "protection summary is not clean: %s",
+                summary,
+            )
+            return
+
+        open_orders = self.get_open_orders(force_fresh=True)
+        if open_orders is None:
+            logger.critical(
+                "Startup order-dedup reconcile remains blocked: open orders "
+                "are unavailable after position reconciliation."
+            )
+            return
+
+        unknown_open_orders = []
+        for order in open_orders:
+            if not isinstance(order, dict):
+                continue
+            if self._classify_protective_leg(order) is None:
+                unknown_open_orders.append(order)
+
+        if unknown_open_orders:
+            logger.critical(
+                "Startup order-dedup reconcile remains blocked: %d non-protective "
+                "open order(s) are still resting on the exchange.",
+                len(unknown_open_orders),
+            )
+            return
+
+        cleared = 0
+        with self._order_dedup_lock:
+            unresolved_hashes = [
+                action_hash
+                for action_hash, (_ts, payload) in self._recent_order_hashes.items()
+                if self._is_unresolved_dedup_payload(payload)
+            ]
+            for action_hash in unresolved_hashes:
+                self._recent_order_hashes.pop(action_hash, None)
+                cleared += 1
+
+        self._persist_order_dedup_cache()
+        self._order_dedup_reconcile_required = False
+        self._order_dedup_unresolved_restored = 0
+        logger.info(
+            "Startup reconciliation cleared %d unresolved restored order dedup "
+            "marker(s); positions=%d open_orders=%d.",
+            cleared,
+            len(positions or []),
+            len(open_orders),
+        )
 
     # ── S3: rolling drawdown tracking ──────────────────────────
     def _record_equity_sample(self, equity: Optional[float]) -> None:
@@ -2171,6 +2252,7 @@ class LiveTrader:
                 return
             active_coins = []
             unprotected = []
+            protection_summary: Optional[Dict[str, Any]] = None
 
             for pos in exchange_positions:
                 coin = pos.get("coin", "")
@@ -2211,9 +2293,15 @@ class LiveTrader:
                 # of bugs where verify_fill crashed (float(dict) leverage)
                 # and SL/TP placement was skipped — leaving real money
                 # on the exchange with no downside protection.
-                self.protect_orphaned_positions(unprotected)
+                protection_summary = self.protect_orphaned_positions(unprotected)
             else:
                 logger.info("Reconciliation: no open positions on exchange (clean state)")
+                protection_summary = {"status": "ok", "protected": 0, "skipped": 0, "failed": 0}
+
+            self._resolve_startup_order_dedup_reconcile(
+                positions=exchange_positions,
+                protection_summary=protection_summary,
+            )
 
         except Exception as e:
             logger.error(f"Position reconciliation failed: {e}")
@@ -5492,6 +5580,17 @@ class LiveTrader:
             else:
                 self._incr_entry_metric("rejected_kill_switch")
             logger.warning("Live safety stop (%s) - rejecting signal", reason)
+            return None
+
+        if not self.dry_run and self._order_dedup_reconcile_required:
+            self._incr_entry_metric("rejected_order_dedup_reconcile_required")
+            logger.critical(
+                "Startup order-dedup reconcile is still required (%d unresolved "
+                "marker(s)); rejecting new live entry for %s until exchange "
+                "positions/open orders are reconciled.",
+                self._order_dedup_unresolved_restored,
+                signal.coin,
+            )
             return None
 
         if not bypass_firewall:

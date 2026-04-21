@@ -3782,6 +3782,111 @@ def test_protective_churn_guard_persists_across_restart(monkeypatch):
     assert second_trader.status_reason == "protective_order_churn"
 
 
+def test_startup_reconcile_clears_restored_unresolved_dedup_markers(monkeypatch):
+    now = datetime.now(timezone.utc).timestamp()
+    bot_state = {
+        LiveTrader._ORDER_DEDUP_STATE_KEY: {
+            "h_timeout": {"ts": now, "payload": {"status": "timeout"}},
+            "h_success": {"ts": now, "payload": {"status": "ok"}},
+        }
+    }
+
+    class FakeFirewall:
+        def validate(self, signal, **kwargs):
+            return True, "ok"
+
+    def _get_state(key, default=None):
+        return bot_state.get(key, default)
+
+    def _set_state(key, value):
+        bot_state[key] = value
+        return True
+
+    monkeypatch.setattr("src.trading.live_trader.db.get_bot_state", _get_state)
+    monkeypatch.setattr("src.trading.live_trader.db.set_bot_state", _set_state)
+    monkeypatch.setattr(LiveTrader, "_load_credentials", _fake_live_credentials)
+    monkeypatch.setattr(LiveTrader, "_load_asset_index_map", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "get_positions", lambda self, **kw: [])
+    monkeypatch.setattr(LiveTrader, "get_open_orders", lambda self, **kw: [])
+
+    trader = LiveTrader(firewall=FakeFirewall(), dry_run=False, max_order_usd=15.0)
+
+    assert trader._order_dedup_reconcile_required is False
+    assert trader._order_dedup_unresolved_restored == 0
+    assert "h_timeout" not in trader._recent_order_hashes
+    assert "h_success" in trader._recent_order_hashes
+    assert "h_timeout" not in bot_state[LiveTrader._ORDER_DEDUP_STATE_KEY]
+    assert "h_success" in bot_state[LiveTrader._ORDER_DEDUP_STATE_KEY]
+
+
+def test_unresolved_dedup_marker_blocks_entries_until_safe_reconcile(monkeypatch):
+    now = datetime.now(timezone.utc).timestamp()
+    bot_state = {
+        LiveTrader._ORDER_DEDUP_STATE_KEY: {
+            "h_timeout": {"ts": now, "payload": {"status": "timeout"}},
+        }
+    }
+    placed = []
+
+    class FakeFirewall:
+        def validate(self, signal, **kwargs):
+            raise AssertionError("firewall should not run before dedup reconcile clears")
+
+    def _get_state(key, default=None):
+        return bot_state.get(key, default)
+
+    def _set_state(key, value):
+        bot_state[key] = value
+        return True
+
+    monkeypatch.setattr("src.trading.live_trader.db.get_bot_state", _get_state)
+    monkeypatch.setattr("src.trading.live_trader.db.set_bot_state", _set_state)
+    monkeypatch.setattr(LiveTrader, "_load_credentials", _fake_live_credentials)
+    monkeypatch.setattr(LiveTrader, "_load_asset_index_map", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "get_positions", lambda self, **kw: [])
+    monkeypatch.setattr(
+        LiveTrader,
+        "get_open_orders",
+        lambda self, **kw: [
+            {
+                "coin": "BTC",
+                "oid": 123,
+                "orderType": "Limit",
+                "side": "buy",
+                "sz": "0.001",
+            }
+        ],
+    )
+    monkeypatch.setattr(LiveTrader, "update_daily_pnl_from_fills", lambda self, **kw: None)
+    monkeypatch.setattr(
+        LiveTrader,
+        "place_market_order",
+        lambda self, *args, **kwargs: placed.append(args) or {"status": "success"},
+    )
+
+    trader = LiveTrader(firewall=FakeFirewall(), dry_run=False, max_order_usd=1_000_000)
+    result = trader.execute_signal(
+        {
+            "coin": "BTC",
+            "side": "long",
+            "confidence": 0.8,
+            "entry_price": 76000.0,
+            "position_pct": 0.05,
+            "leverage": 2,
+            "size": 0.001,
+            "strategy_type": "momentum_long",
+        }
+    )
+
+    assert result is None
+    assert trader._order_dedup_reconcile_required is True
+    assert placed == []
+    assert (
+        trader.get_stats()["entry_metrics"]["rejected_order_dedup_reconcile_required"]
+        == 1
+    )
+
+
 def test_classify_protective_leg_handles_close_long_short_side_strings():
     close_long = LiveTrader._classify_protective_leg(
         {
