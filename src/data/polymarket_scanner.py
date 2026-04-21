@@ -158,6 +158,8 @@ class PolymarketScanner:
     def __init__(self, config: Optional[Dict] = None):
         self.config = config or {}
         self.source_registry = self.config.get("source_registry")
+        self.market_provider = self.config.get("market_provider")
+        self.replay_as_of_ms = self.config.get("replay_as_of_ms")
 
         # Cache configuration
         self.cache_ttl_minutes = self.config.get("cache_ttl_minutes", 5)
@@ -209,6 +211,10 @@ class PolymarketScanner:
 
         logger.info(f"PolymarketScanner initialized with cache TTL={self.cache_ttl_minutes}min, "
                    f"rate_limit={self.rate_limit_delay}s")
+
+    def set_replay_time(self, as_of_ms: Optional[int]) -> None:
+        """Switch provider-backed scans to a point-in-time replay timestamp."""
+        self.replay_as_of_ms = int(as_of_ms) if as_of_ms is not None else None
 
     def _rate_limit(self, url: str):
         """Enforce per-host rate limiting for Polymarket endpoints."""
@@ -277,6 +283,43 @@ class PolymarketScanner:
         indexed volume/liquidity and uses `limit` + `offset` pagination.
         Falls back to the CLOB listing endpoint if Gamma returns nothing.
         """
+        if self.market_provider is not None:
+            try:
+                try:
+                    markets = self.market_provider.fetch_markets(
+                        limit=self.max_markets_per_scan,
+                        active_only=True,
+                        as_of_ms=self.replay_as_of_ms,
+                    )
+                except TypeError:
+                    markets = self.market_provider.fetch_markets(
+                        limit=self.max_markets_per_scan,
+                        active_only=True,
+                    )
+                if markets:
+                    if self.source_registry:
+                        self.source_registry.mark_up(
+                            "polymarket",
+                            reason="provider fetch ok",
+                            metadata={"provider": type(self.market_provider).__name__},
+                        )
+                    return list(markets)
+                if self.source_registry:
+                    self.source_registry.mark_degraded(
+                        "polymarket",
+                        reason="provider returned no markets",
+                        metadata={"provider": type(self.market_provider).__name__},
+                    )
+            except Exception as exc:
+                if self.source_registry:
+                    self.source_registry.mark_down(
+                        "polymarket",
+                        reason=f"provider fetch failed: {exc}",
+                        metadata={"provider": type(self.market_provider).__name__},
+                    )
+                logger.warning("Polymarket provider fetch failed: %s", exc)
+                return []
+
         raw_markets = []
 
         # --- Primary: Gamma paginated endpoint ---

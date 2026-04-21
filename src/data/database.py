@@ -112,6 +112,18 @@ def table_exists(name: str) -> bool:
         return row is not None
 
 
+def _seed_continuous_learning_defaults() -> None:
+    """Seed Phase 0 policy and source inventory without blocking startup."""
+    try:
+        from src.learning.policy_registry import ensure_champion_policy
+        from src.learning.source_inventory import seed_source_inventory
+
+        ensure_champion_policy()
+        seed_source_inventory()
+    except Exception as exc:
+        logger.debug("Continuous-learning default seed skipped: %s", exc)
+
+
 def init_db():
     """Create all tables if they don't exist.
 
@@ -124,6 +136,7 @@ def init_db():
         init_postgres_schema()
 
     if _is_pg():
+        _seed_continuous_learning_defaults()
         return
 
     # H5 (audit): pre-migrate an existing SQLite database to add the
@@ -303,6 +316,14 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_audit_action ON audit_trail(action);
         CREATE INDEX IF NOT EXISTS idx_audit_coin ON audit_trail(coin);
         """)
+        try:
+            from src.learning.schema import ensure_sqlite_schema
+
+            ensure_sqlite_schema(conn)
+        except Exception as exc:
+            logger.debug("Continuous-learning SQLite schema skipped: %s", exc)
+
+    _seed_continuous_learning_defaults()
 
 
 # ─── Trader CRUD ───────────────────────────────────────────────

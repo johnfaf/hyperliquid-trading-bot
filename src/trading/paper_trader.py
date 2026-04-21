@@ -20,6 +20,7 @@ import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import config
 from src.data import database as db
+from src.data import decision_journal
 from src.data import hyperliquid_client as hl
 from src.signals.signal_schema import TradeSignal, SignalSide, SignalSource, RiskParams
 from src.signals.decision_firewall import DecisionFirewall
@@ -531,6 +532,18 @@ class PaperTrader:
                     sig=sig,
                     regime_data=regime_data,
                 )
+                sig["decision_id"] = trade_signal.signal_id
+                if isinstance(trade_signal.context, dict):
+                    trade_signal.context["decision_id"] = trade_signal.signal_id
+                decision_journal.record_decision_snapshot(
+                    trade_signal,
+                    raw_signal=sig,
+                    regime_data=regime_data,
+                    account_balance=account.get("balance"),
+                    final_status="candidate",
+                    firewall_decision="pending",
+                    metadata={"stage": "paper_trader_candidate"},
+                )
                 trade_signals.append((trade_signal, sig))
             except Exception as e:
                 _drop_counts["schema_error"] += 1
@@ -826,7 +839,8 @@ class PaperTrader:
                     if hasattr(trade_signal.source, "value")
                     else str(trade_signal.source)
                 )
-            sig["signal_id"] = signal_id
+            sig["decision_id"] = sig.get("decision_id") or trade_signal.signal_id
+            sig["signal_id"] = signal_id or sig["decision_id"]
 
             # CRIT-FIX CRIT-6: close victim BEFORE opening replacement.
             # Original order (open → close) left both positions alive simultaneously
@@ -855,7 +869,8 @@ class PaperTrader:
 
             trade = self._execute_paper_trade(account, sig["strategy"], sig)
             if trade:
-                trade["signal_id"] = signal_id
+                trade["signal_id"] = sig.get("signal_id", signal_id)
+                trade["decision_id"] = sig.get("decision_id", "")
                 trade["strategy_type"] = sig.get("strategy_type", "")
                 executed.append(trade)
                 self._annotate_open_trades([trade], mids)
@@ -1155,7 +1170,8 @@ class PaperTrader:
             # pipeline supplies one) as the paper-trade idempotency key
             # so a crash-retry or re-delivery of the same signal does
             # not open two logical paper trades.
-            signal_id = str(signal.get("signal_id") or "").strip()
+            signal_id = str(signal.get("signal_id") or signal.get("decision_id") or "").strip()
+            decision_id = str(signal.get("decision_id") or signal_id or "").strip()
             idem_key = f"paper:{signal_id}" if signal_id else None
             trade_id = db.open_paper_trade(
                 strategy_id=strategy.get("id"),
@@ -1172,6 +1188,7 @@ class PaperTrader:
                     "source_key": signal.get("source_key", ""),
                     "confidence": signal.get("confidence", 0),
                     "signal_id": signal.get("signal_id", ""),
+                    "decision_id": decision_id,
                     "execution_role": signal.get("execution_role", config.PAPER_TRADING_DEFAULT_EXECUTION_ROLE),
                     "maker_fee_bps": config.PAPER_TRADING_MAKER_FEE_BPS,
                     "taker_fee_bps": config.PAPER_TRADING_TAKER_FEE_BPS,
@@ -1186,6 +1203,15 @@ class PaperTrader:
                 },
                 idempotency_key=idem_key,
             )
+            if decision_id:
+                decision_journal.link_paper_trade(
+                    decision_id,
+                    trade_id,
+                    metadata={
+                        "paper_trade_opened": True,
+                        "paper_trade_signal_id": signal_id,
+                    },
+                )
 
             logger.info(
                 f"Paper trade opened: {signal['side'].upper()} {signal['coin']} "
@@ -1214,6 +1240,7 @@ class PaperTrader:
                     "source_key": signal.get("source_key", ""),
                     "confidence": signal.get("confidence", 0),
                     "signal_id": signal.get("signal_id", ""),
+                    "decision_id": decision_id,
                     "execution_role": signal.get("execution_role", config.PAPER_TRADING_DEFAULT_EXECUTION_ROLE),
                     "maker_fee_bps": config.PAPER_TRADING_MAKER_FEE_BPS,
                     "taker_fee_bps": config.PAPER_TRADING_TAKER_FEE_BPS,

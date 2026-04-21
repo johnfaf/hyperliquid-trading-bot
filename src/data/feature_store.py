@@ -40,17 +40,28 @@ _PERIODS_PER_YEAR = {
 
 # All features this module produces
 FEATURE_NAMES = [
-    # Volatility (5)
+    # Volatility (8)
     "realized_vol_20", "realized_vol_50", "atr_14", "atr_ratio", "vol_regime",
-    # Momentum (7)
-    "return_1", "return_5", "return_20", "rsi_14",
-    "macd_histogram", "roc_10", "price_vs_sma50",
-    # Volume (3)
-    "volume_ratio_20", "volume_sma_ratio", "vwap_distance",
-    # Funding & OI (3)
-    "funding_rate", "funding_annualised", "oi_change_pct",
+    "volatility_rank_100", "bb_width_20", "bb_position_20",
+    # Momentum (10)
+    "return_1", "return_3", "return_5", "return_12", "return_20", "rsi_14",
+    "macd_histogram", "roc_10", "price_vs_sma50", "momentum_consistency_20",
+    # Volume (4)
+    "volume_ratio_20", "volume_sma_ratio", "vwap_distance", "volume_zscore_20",
+    # Funding & OI (6)
+    "funding_rate", "funding_annualised", "funding_slope",
+    "funding_percentile", "oi_change_pct", "oi_price_divergence",
     # Cross-asset (4)
     "btc_corr_20", "eth_corr_20", "btc_rel_strength", "eth_rel_strength",
+    # Microstructure (3)
+    "spread_bps", "book_imbalance", "estimated_slippage_bps",
+    # Prediction market (3)
+    "polymarket_probability", "polymarket_probability_delta_1h",
+    "polymarket_volume_delta_24h",
+    # Options flow (3)
+    "options_iv_rank", "options_skew", "options_flow_direction",
+    # Source quality (2)
+    "source_missing_ratio", "max_source_age_seconds",
 ]
 
 # ─── Postgres helpers (reuses the existing pool) ──────────────────
@@ -248,6 +259,15 @@ def _pearson(x: np.ndarray, y: np.ndarray) -> float:
     return float(np.corrcoef(x, y)[0, 1])
 
 
+def _percentile_rank(values: np.ndarray, current: float) -> float:
+    """Empirical percentile rank for a scalar against finite historical values."""
+    values = np.asarray(values, dtype=float)
+    values = values[np.isfinite(values)]
+    if len(values) == 0:
+        return 0.5
+    return float(np.mean(values <= current))
+
+
 def compute_features(
     coin: str,
     timeframe: str,
@@ -257,6 +277,14 @@ def compute_features(
     prev_open_interest: float = 0.0,
     btc_candles: List[dict] = None,
     eth_candles: List[dict] = None,
+    prev_funding_rate: float = 0.0,
+    funding_history: Optional[List[float]] = None,
+    spread_bps: float = 0.0,
+    book_imbalance: float = 0.0,
+    estimated_slippage_bps: float = 0.0,
+    polymarket_features: Optional[Dict[str, float]] = None,
+    options_features: Optional[Dict[str, float]] = None,
+    source_quality: Optional[Dict[str, float]] = None,
 ) -> Dict[str, float]:
     """Compute all features from a candle array.
 
@@ -288,14 +316,49 @@ def compute_features(
     if "realized_vol_20" in result and "realized_vol_50" in result:
         rv50 = result["realized_vol_50"]
         result["vol_regime"] = result["realized_vol_20"] / rv50 if rv50 > 1e-12 else 1.0
+    if "realized_vol_20" in result and len(lr) >= 40:
+        rolling_vols = []
+        start = max(20, len(lr) - 100)
+        for end in range(start, len(lr) + 1):
+            window = lr[max(0, end - 20):end]
+            if len(window) >= 20:
+                rolling_vols.append(float(np.std(window) * math.sqrt(ppy)))
+        if rolling_vols:
+            result["volatility_rank_100"] = _percentile_rank(
+                np.array(rolling_vols),
+                result["realized_vol_20"],
+            )
+    if n >= 20:
+        mid = float(np.mean(closes[-20:]))
+        band_std = float(np.std(closes[-20:]))
+        upper = mid + 2.0 * band_std
+        lower = mid - 2.0 * band_std
+        result["bb_width_20"] = (upper - lower) / mid if mid > 0 else 0.0
+        result["bb_position_20"] = (
+            (closes[-1] - lower) / (upper - lower)
+            if (upper - lower) > 1e-12
+            else 0.5
+        )
 
     # ── Momentum ──────────────────────────────────────────────
     if n >= 2:
         result["return_1"] = float(lr[-1])
+    if n >= 4:
+        result["return_3"] = float(np.sum(lr[-3:]))
     if n >= 6:
         result["return_5"] = float(np.sum(lr[-5:]))
+    if n >= 13:
+        result["return_12"] = float(np.sum(lr[-12:]))
     if n >= 21:
         result["return_20"] = float(np.sum(lr[-20:]))
+        recent = lr[-20:]
+        direction = 1.0 if np.sum(recent) >= 0 else -1.0
+        non_zero = recent[np.abs(recent) > 1e-12]
+        result["momentum_consistency_20"] = (
+            float(np.mean(np.sign(non_zero) == direction))
+            if len(non_zero) > 0
+            else 0.5
+        )
 
     result["rsi_14"] = _rsi(closes, 14)
 
@@ -321,6 +384,12 @@ def compute_features(
     if n >= 21 and np.sum(volumes[-21:-1]) > 0:
         avg_vol = np.mean(volumes[-21:-1])
         result["volume_ratio_20"] = float(volumes[-1] / avg_vol) if avg_vol > 0 else 1.0
+        vol_std = float(np.std(volumes[-21:-1]))
+        result["volume_zscore_20"] = (
+            float((volumes[-1] - avg_vol) / vol_std)
+            if vol_std > 1e-12
+            else 0.0
+        )
     if n >= 20:
         short_v = np.mean(volumes[-5:]) if n >= 5 else volumes[-1]
         long_v = np.mean(volumes[-20:])
@@ -332,10 +401,15 @@ def compute_features(
     # ── Funding & OI ──────────────────────────────────────────
     result["funding_rate"] = funding_rate
     result["funding_annualised"] = funding_rate * 3 * 365  # 8h periods/year
+    result["funding_slope"] = float(funding_rate - prev_funding_rate)
+    if funding_history:
+        funding_values = np.array([float(v or 0.0) for v in funding_history], dtype=float)
+        result["funding_percentile"] = _percentile_rank(funding_values, funding_rate)
     if prev_open_interest > 0:
         result["oi_change_pct"] = (open_interest - prev_open_interest) / prev_open_interest
     else:
         result["oi_change_pct"] = 0.0
+    result["oi_price_divergence"] = result["oi_change_pct"] - float(result.get("return_20", 0.0))
 
     # ── Cross-asset correlation ───────────────────────────────
     if btc_candles and len(btc_candles) >= 21:
@@ -359,6 +433,57 @@ def compute_features(
             result["eth_corr_20"] = _pearson(lr[-minlen:], eth_lr[-minlen:])
         if "return_20" in result and len(eth_lr) >= 20:
             result["eth_rel_strength"] = result["return_20"] - float(np.sum(eth_lr[-20:]))
+
+    # Injected external-source features. These default to neutral zeros so a
+    # missing optional source is explicit in the feature vector, not invisible.
+    passthrough = {
+        "spread_bps": spread_bps,
+        "book_imbalance": book_imbalance,
+        "estimated_slippage_bps": estimated_slippage_bps,
+    }
+    for name, value in passthrough.items():
+        try:
+            result[name] = float(value or 0.0)
+        except (TypeError, ValueError):
+            result[name] = 0.0
+
+    polymarket_features = polymarket_features or {}
+    polymarket_map = {
+        "polymarket_probability": ("polymarket_probability", "probability"),
+        "polymarket_probability_delta_1h": ("polymarket_probability_delta_1h", "probability_delta_1h"),
+        "polymarket_volume_delta_24h": ("polymarket_volume_delta_24h", "volume_delta_24h"),
+    }
+    for target, keys in polymarket_map.items():
+        for key in keys:
+            if key in polymarket_features:
+                try:
+                    result[target] = float(polymarket_features[key] or 0.0)
+                except (TypeError, ValueError):
+                    result[target] = 0.0
+                break
+
+    options_features = options_features or {}
+    options_map = {
+        "options_iv_rank": ("options_iv_rank", "iv_rank", "iv_percentile"),
+        "options_skew": ("options_skew", "skew"),
+        "options_flow_direction": ("options_flow_direction", "flow_direction_score", "direction_score"),
+    }
+    for target, keys in options_map.items():
+        for key in keys:
+            if key in options_features:
+                try:
+                    result[target] = float(options_features[key] or 0.0)
+                except (TypeError, ValueError):
+                    result[target] = 0.0
+                break
+
+    source_quality = source_quality or {}
+    for target in ("source_missing_ratio", "max_source_age_seconds"):
+        if target in source_quality:
+            try:
+                result[target] = float(source_quality[target] or 0.0)
+            except (TypeError, ValueError):
+                result[target] = 0.0
 
     return result
 
