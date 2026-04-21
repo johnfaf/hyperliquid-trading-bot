@@ -2949,6 +2949,9 @@ class LiveTrader:
         is_position_tpsl = bool(order.get("isPositionTpsl") or order.get("is_position_tpsl"))
         reduce_only = bool(order.get("reduceOnly") or order.get("reduce_only") or is_position_tpsl)
         order_type = str(order.get("orderType") or order.get("type") or "").lower()
+        trigger_condition = str(
+            order.get("triggerCondition") or order.get("trigger_condition") or ""
+        ).lower()
 
         leg: Optional[str] = None
         trigger_px_raw: Any = None
@@ -2971,12 +2974,6 @@ class LiveTrader:
             elif "take" in order_type or "profit" in order_type:
                 leg = "tp"
 
-        if leg is None:
-            # Not a recognised protective leg.  reduce-only alone isn't
-            # enough to treat as an SL or TP: a plain reduce-only limit
-            # won't fire automatically on adverse moves.
-            return None
-
         # Side: prefer boolean "b" (our wire format), fall back to "side" string.
         side = None
         if "b" in order and isinstance(order.get("b"), bool):
@@ -2992,6 +2989,29 @@ class LiveTrader:
                 if raw_side in ("sell", "s", "a", "ask") or "close long" in raw_side:
                     side = "sell"
                     break
+
+        if leg is None and trigger_condition:
+            # Some Hyperliquid order views omit ``t.trigger.tpsl`` and expose
+            # only "Close Long/Short" plus "Price above/below".  Infer leg
+            # from close side + trigger direction:
+            #   close long  (sell): below=SL, above=TP
+            #   close short (buy):  above=SL, below=TP
+            if side == "sell":
+                if "price below" in trigger_condition:
+                    leg = "sl"
+                elif "price above" in trigger_condition:
+                    leg = "tp"
+            elif side == "buy":
+                if "price above" in trigger_condition:
+                    leg = "sl"
+                elif "price below" in trigger_condition:
+                    leg = "tp"
+
+        if leg is None:
+            # Not a recognised protective leg.  reduce-only alone isn't
+            # enough to treat as an SL or TP: a plain reduce-only limit
+            # won't fire automatically on adverse moves.
+            return None
 
         size_raw = order.get("sz")
         try:
@@ -5850,6 +5870,40 @@ class LiveTrader:
                     actual_fill_size,
                     protective_size,
                 )
+                if observed_position_size > actual_fill_size * 1.01 and not self.dry_run:
+                    try:
+                        cancelled_existing = self._cancel_protective_orders(coin)
+                    except Exception as exc:
+                        cancelled_existing = 0
+                        logger.warning(
+                            "Could not cancel existing protective orders for %s before "
+                            "same-side protection refresh (%s). Placing protection "
+                            "only for the new fill size %.6f to avoid over-covering.",
+                            coin,
+                            exc,
+                            actual_fill_size,
+                        )
+                        protective_size = actual_fill_size
+                    else:
+                        if cancelled_existing > 0:
+                            logger.warning(
+                                "Cancelled %d existing protective order(s) for %s "
+                                "before replacing with total-position protection "
+                                "size %.6f.",
+                                cancelled_existing,
+                                coin,
+                                protective_size,
+                            )
+                        else:
+                            logger.warning(
+                                "No existing protective orders for %s were visible "
+                                "before same-side protection refresh. Placing "
+                                "protection only for the new fill size %.6f to "
+                                "avoid over-covering.",
+                                coin,
+                                actual_fill_size,
+                            )
+                            protective_size = actual_fill_size
 
             # 2. Calculate stop loss and take profit prices from actual fill price when available.
             entry_anchor_price = exchange_reported_fill_price or verified_fill_price

@@ -432,6 +432,143 @@ def test_live_trader_uses_verified_fill_size_for_protection(monkeypatch):
     assert [call[2] for call in trigger_calls] == [0.06, 0.06]
 
 
+def test_execute_signal_replaces_existing_protection_before_total_position_bracket(monkeypatch):
+    class FakeFirewall:
+        def validate(self, signal, **kwargs):
+            return True, "ok"
+
+    events = []
+    trigger_sizes = []
+    existing_positions = [
+        {
+            "coin": "ETH",
+            "side": "long",
+            "size": 0.005,
+            "entry_price": 1900.0,
+            "leverage": 2,
+        }
+    ]
+
+    monkeypatch.setattr(LiveTrader, "_load_credentials", _fake_live_credentials)
+    monkeypatch.setattr(LiveTrader, "_load_asset_index_map", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "reconcile_positions", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "get_firewall_positions", lambda self: list(existing_positions))
+    monkeypatch.setattr(LiveTrader, "get_account_value", lambda self: 2500.0)
+    monkeypatch.setattr(LiveTrader, "place_market_order", lambda self, *args, **kwargs: {"status": "success"})
+    monkeypatch.setattr(LiveTrader, "update_daily_pnl_from_fills", lambda self: None)
+    monkeypatch.setattr(
+        LiveTrader,
+        "verify_fill",
+        lambda self, *args, **kwargs: {
+            "status": "verified",
+            "size": 0.1,
+            "position_size": 0.105,
+            "entry_price": 2000.0,
+        },
+    )
+    monkeypatch.setattr(LiveTrader, "_get_mid_price", lambda self, coin: 2000.0)
+    monkeypatch.setattr(
+        LiveTrader,
+        "_cancel_protective_orders",
+        lambda self, coin: events.append(("cancel", coin)) or 2,
+    )
+    monkeypatch.setattr(
+        LiveTrader,
+        "place_trigger_order",
+        lambda self, coin, side, size, trigger_price, tp_or_sl="sl": (
+            events.append(("trigger", tp_or_sl, size))
+            or trigger_sizes.append(size)
+            or {"status": "success"}
+        ),
+    )
+    monkeypatch.setattr(config, "LIVE_CANARY_MODE", False)
+
+    trader = LiveTrader(firewall=FakeFirewall(), dry_run=False, max_order_usd=1_000_000)
+    result = trader.execute_signal(
+        {
+            "coin": "ETH",
+            "side": "long",
+            "confidence": 0.8,
+            "entry_price": 2000.0,
+            "position_pct": 0.05,
+            "leverage": 2,
+            "size": 0.1,
+            "strategy_type": "momentum_long",
+        }
+    )
+
+    assert result is not None
+    assert result["status"] == "success"
+    assert events[0] == ("cancel", "ETH")
+    assert [event[0] for event in events[1:]] == ["trigger", "trigger"]
+    assert trigger_sizes == [0.105, 0.105]
+    assert result["protected_size"] == 0.105
+
+
+def test_execute_signal_protects_only_new_fill_when_existing_protection_not_visible(monkeypatch):
+    class FakeFirewall:
+        def validate(self, signal, **kwargs):
+            return True, "ok"
+
+    trigger_sizes = []
+    existing_positions = [
+        {
+            "coin": "ETH",
+            "side": "long",
+            "size": 0.005,
+            "entry_price": 1900.0,
+            "leverage": 2,
+        }
+    ]
+
+    monkeypatch.setattr(LiveTrader, "_load_credentials", _fake_live_credentials)
+    monkeypatch.setattr(LiveTrader, "_load_asset_index_map", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "reconcile_positions", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "get_firewall_positions", lambda self: list(existing_positions))
+    monkeypatch.setattr(LiveTrader, "get_account_value", lambda self: 2500.0)
+    monkeypatch.setattr(LiveTrader, "place_market_order", lambda self, *args, **kwargs: {"status": "success"})
+    monkeypatch.setattr(LiveTrader, "update_daily_pnl_from_fills", lambda self: None)
+    monkeypatch.setattr(
+        LiveTrader,
+        "verify_fill",
+        lambda self, *args, **kwargs: {
+            "status": "verified",
+            "size": 0.1,
+            "position_size": 0.105,
+            "entry_price": 2000.0,
+        },
+    )
+    monkeypatch.setattr(LiveTrader, "_get_mid_price", lambda self, coin: 2000.0)
+    monkeypatch.setattr(LiveTrader, "_cancel_protective_orders", lambda self, coin: 0)
+    monkeypatch.setattr(
+        LiveTrader,
+        "place_trigger_order",
+        lambda self, coin, side, size, trigger_price, tp_or_sl="sl": (
+            trigger_sizes.append(size) or {"status": "success"}
+        ),
+    )
+    monkeypatch.setattr(config, "LIVE_CANARY_MODE", False)
+
+    trader = LiveTrader(firewall=FakeFirewall(), dry_run=False, max_order_usd=1_000_000)
+    result = trader.execute_signal(
+        {
+            "coin": "ETH",
+            "side": "long",
+            "confidence": 0.8,
+            "entry_price": 2000.0,
+            "position_pct": 0.05,
+            "leverage": 2,
+            "size": 0.1,
+            "strategy_type": "momentum_long",
+        }
+    )
+
+    assert result is not None
+    assert result["status"] == "success"
+    assert trigger_sizes == [0.1, 0.1]
+    assert result["protected_size"] == 0.1
+
+
 def test_execute_signal_uses_submitted_entry_size_for_fill_verification(monkeypatch):
     class FakeFirewall:
         def validate(self, signal, **kwargs):
@@ -1536,6 +1673,7 @@ def test_sync_shadow_book_creates_synthetic_trade_for_orphan_live_position(monke
 
     monkeypatch.setattr("src.core.live_execution.db.get_open_paper_trades", lambda: [])
     monkeypatch.setattr("src.core.live_execution.get_all_mids", lambda: {})
+    monkeypatch.setattr("src.core.live_execution._paper_trade_id_for_client_order_id", lambda key: None)
     monkeypatch.setattr(
         "src.core.live_execution.db.open_paper_trade",
         lambda strategy_id, coin, side, entry_price, size, leverage=1,
@@ -1568,6 +1706,62 @@ def test_sync_shadow_book_creates_synthetic_trade_for_orphan_live_position(monke
     assert opened[0]["metadata"]["reconciliation_reason"] == "orphan_found"
     assert opened[0]["metadata"]["source"] == "live_orphan"
     assert audits[0]["action"] == "orphan_found"
+
+
+def test_sync_shadow_book_logs_idempotent_orphan_replay_as_info(monkeypatch, caplog):
+    opened = []
+    audits = []
+
+    class FakeLiveTrader:
+        def is_live_enabled(self):
+            return True
+
+        def is_deployable(self):
+            return True
+
+        def get_positions(self):
+            return [
+                {
+                    "coin": "BTC",
+                    "side": "long",
+                    "size": 0.15,
+                    "szi": 0.15,
+                    "entry_price": 64000.0,
+                    "leverage": 3,
+                }
+            ]
+
+        def get_account_value(self):
+            return 500.0
+
+    container = type(
+        "Container",
+        (),
+        {"live_trader": FakeLiveTrader(), "paper_trader": object()},
+    )()
+
+    monkeypatch.setattr("src.core.live_execution.db.get_open_paper_trades", lambda: [])
+    monkeypatch.setattr("src.core.live_execution.get_all_mids", lambda: {})
+    monkeypatch.setattr("src.core.live_execution._paper_trade_id_for_client_order_id", lambda key: 99)
+    monkeypatch.setattr(
+        "src.core.live_execution.db.open_paper_trade",
+        lambda strategy_id, coin, side, entry_price, size, leverage=1,
+               stop_loss=None, take_profit=None, metadata=None, **kw:
+            opened.append(kw.get("idempotency_key")) or 99,
+    )
+    monkeypatch.setattr(
+        "src.core.live_execution.db.audit_log",
+        lambda **kwargs: audits.append(kwargs),
+    )
+
+    caplog.set_level(logging.INFO, logger="src.core.live_execution")
+    reconciled = sync_shadow_book_to_live(container)
+
+    assert reconciled == []
+    assert opened == ["orphan:BTC:long:64000:0.15:3"]
+    assert audits[0]["details"]["trade_id"] == 99
+    assert "Synthetic paper trade already tracks orphan live position" in caplog.text
+    assert "Created synthetic paper trade for orphan live position" not in caplog.text
 
 
 def test_process_closed_trades_skips_synthetic_reconciliation():
@@ -3620,6 +3814,66 @@ def test_classify_protective_leg_handles_close_long_short_side_strings():
     assert close_long["leg"] == "sl"
     assert close_short["side"] == "buy"
     assert close_short["leg"] == "tp"
+
+
+def test_classify_protective_leg_infers_leg_from_trigger_condition():
+    long_sl = LiveTrader._classify_protective_leg(
+        {
+            "coin": "BTC",
+            "isTrigger": True,
+            "isPositionTpsl": True,
+            "reduceOnly": True,
+            "side": "Close Long",
+            "triggerCondition": "Price below 73979",
+            "origSz": "0.00015",
+            "triggerPx": "73979",
+            "oid": 201,
+        }
+    )
+    long_tp = LiveTrader._classify_protective_leg(
+        {
+            "coin": "BTC",
+            "isTrigger": True,
+            "isPositionTpsl": True,
+            "reduceOnly": True,
+            "side": "Close Long",
+            "triggerCondition": "Price above 87707",
+            "origSz": "0.00015",
+            "triggerPx": "87707",
+            "oid": 202,
+        }
+    )
+    short_sl = LiveTrader._classify_protective_leg(
+        {
+            "coin": "ETH",
+            "isTrigger": True,
+            "isPositionTpsl": True,
+            "reduceOnly": True,
+            "direction": "Close Short",
+            "triggerCondition": "Price above 2100",
+            "origSz": "0.01",
+            "triggerPx": "2100",
+            "oid": 203,
+        }
+    )
+    short_tp = LiveTrader._classify_protective_leg(
+        {
+            "coin": "ETH",
+            "isTrigger": True,
+            "isPositionTpsl": True,
+            "reduceOnly": True,
+            "direction": "Close Short",
+            "triggerCondition": "Price below 1800",
+            "origSz": "0.01",
+            "triggerPx": "1800",
+            "oid": 204,
+        }
+    )
+
+    assert (long_sl["side"], long_sl["leg"]) == ("sell", "sl")
+    assert (long_tp["side"], long_tp["leg"]) == ("sell", "tp")
+    assert (short_sl["side"], short_sl["leg"]) == ("buy", "sl")
+    assert (short_tp["side"], short_tp["leg"]) == ("buy", "tp")
 
 
 def test_get_open_orders_uses_plain_open_orders_fallback_when_frontend_empty():

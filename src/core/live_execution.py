@@ -64,6 +64,27 @@ def _is_insufficient_margin_rejection(result) -> bool:
     return any("insufficient margin" in msg.lower() for msg in messages)
 
 
+def _paper_trade_id_for_client_order_id(client_order_id: str) -> Optional[int]:
+    """Return an existing paper trade id for an idempotency key, if present."""
+    if not client_order_id:
+        return None
+    try:
+        with db.get_connection(for_read=True) as conn:
+            row = conn.execute(
+                "SELECT id FROM paper_trades WHERE client_order_id = ?",
+                (client_order_id,),
+            ).fetchone()
+    except Exception as exc:
+        logger.debug("paper trade idempotency lookup failed: %s", exc)
+        return None
+    if not row:
+        return None
+    try:
+        return int(row["id"] if hasattr(row, "keys") else row[0])
+    except Exception:
+        return None
+
+
 def get_live_trader(container):
     """Return the attached live trader, if any."""
     return getattr(container, "live_trader", None)
@@ -265,6 +286,7 @@ def sync_shadow_book_to_live(container) -> List[Dict]:
         orphan_key = (
             f"orphan:{coin}:{side}:{entry_price:.10g}:{size:.10g}:{leverage:.4g}"
         )
+        existing_orphan_trade_id = _paper_trade_id_for_client_order_id(orphan_key)
         trade_id = db.open_paper_trade(
             None,
             coin,
@@ -284,13 +306,26 @@ def sync_shadow_book_to_live(container) -> List[Dict]:
             source="live_execution",
             details={"trade_id": trade_id, "metadata": metadata},
         )
-        logger.warning(
-            "Created synthetic paper trade for orphan live position: %s %s size=%.6f entry=%.6f",
-            side.upper(),
-            coin,
-            size,
-            entry_price,
-        )
+        if existing_orphan_trade_id is not None:
+            logger.info(
+                "Synthetic paper trade already tracks orphan live position: %s %s "
+                "trade_id=%s size=%.6f entry=%.6f",
+                side.upper(),
+                coin,
+                trade_id,
+                size,
+                entry_price,
+            )
+        else:
+            logger.warning(
+                "Created synthetic paper trade for orphan live position: %s %s "
+                "trade_id=%s size=%.6f entry=%.6f",
+                side.upper(),
+                coin,
+                trade_id,
+                size,
+                entry_price,
+            )
 
     return closed
 
