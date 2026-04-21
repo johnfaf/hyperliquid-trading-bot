@@ -163,3 +163,23 @@ def test_decision_journal_records_updates_and_links_paper_trade(monkeypatch):
     assert row["paper_trade_id"] == 123
     assert row["proposed_size_usd"] == 200.0
     assert row["proposed_tp_roe"] == 0.25
+
+
+def test_decision_journal_skips_when_schema_bootstrap_fails(monkeypatch):
+    signal = TradeSignal(
+        coin="BTC",
+        side=SignalSide.LONG,
+        confidence=0.64,
+        source=SignalSource.STRATEGY,
+        reason="test",
+        entry_price=100.0,
+    )
+    monkeypatch.setattr(decision_journal, "ensure_schema_ready", lambda force=False: False)
+    monkeypatch.setattr(
+        "src.data.database.get_connection",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("db write should be skipped")),
+    )
+
+    assert decision_journal.record_decision_snapshot(signal) is None
+    assert decision_journal.update_decision_status(signal.signal_id, final_status="approved") is False
+    assert decision_journal.link_paper_trade(signal.signal_id, 1) is False

@@ -10,12 +10,62 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
+import config
 from src.learning.policy_registry import CHAMPION_POLICY_ID
 
 logger = logging.getLogger(__name__)
+_SCHEMA_LOCK = threading.Lock()
+_SCHEMA_READY = False
+_SCHEMA_WARNED = False
+
+
+POSTGRES_DECISION_SNAPSHOT_DDL = """
+CREATE TABLE IF NOT EXISTS decision_snapshots (
+    decision_id TEXT PRIMARY KEY,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    signal_timestamp TIMESTAMPTZ,
+    policy_id TEXT,
+    model_version TEXT,
+    coin TEXT,
+    side TEXT,
+    source TEXT,
+    source_key TEXT,
+    strategy_type TEXT,
+    strategy_id TEXT,
+    signal_id TEXT,
+    raw_confidence DOUBLE PRECISION,
+    calibrated_confidence DOUBLE PRECISION,
+    firewall_decision TEXT,
+    final_status TEXT NOT NULL DEFAULT 'candidate',
+    rejection_reason TEXT,
+    entry_price DOUBLE PRECISION,
+    proposed_size_usd DOUBLE PRECISION,
+    proposed_position_pct DOUBLE PRECISION,
+    proposed_leverage DOUBLE PRECISION,
+    proposed_sl_roe DOUBLE PRECISION,
+    proposed_tp_roe DOUBLE PRECISION,
+    proposed_sl_price DOUBLE PRECISION,
+    proposed_tp_price DOUBLE PRECISION,
+    paper_trade_id BIGINT,
+    live_order_id TEXT,
+    features JSONB NOT NULL DEFAULT '{}'::jsonb,
+    source_health JSONB NOT NULL DEFAULT '{}'::jsonb,
+    regime JSONB NOT NULL DEFAULT '{}'::jsonb,
+    raw_signal JSONB NOT NULL DEFAULT '{}'::jsonb,
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb
+);
+CREATE INDEX IF NOT EXISTS idx_decision_snapshots_recent
+    ON decision_snapshots (created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_decision_snapshots_status
+    ON decision_snapshots (final_status, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_decision_snapshots_trade
+    ON decision_snapshots (paper_trade_id);
+"""
 
 
 def _enabled() -> bool:
@@ -25,6 +75,69 @@ def _enabled() -> bool:
         "no",
         "off",
     }
+
+
+def ensure_schema_ready(force: bool = False) -> bool:
+    """Ensure the journal table exists on the active mirror before writing.
+
+    Live log 2026-04-21 showed the dual-write safety gate tripping because
+    Postgres was missing ``decision_snapshots`` while SQLite already had it.
+    This best-effort bootstrap prevents an observability table from poisoning
+    the dual-write health window.
+    """
+    global _SCHEMA_READY
+    if _SCHEMA_READY and not force:
+        return True
+    with _SCHEMA_LOCK:
+        if _SCHEMA_READY and not force:
+            return True
+        try:
+            from src.data import database as db
+            from src.learning.schema import ensure_sqlite_schema
+
+            if config.DB_BACKEND in ("sqlite", "dualwrite"):
+                try:
+                    with db.get_connection() as conn:
+                        ensure_sqlite_schema(conn)
+                except Exception as exc:
+                    logger.debug("Decision journal SQLite schema ensure skipped: %s", exc)
+
+            if config.DB_BACKEND in ("postgres", "dualwrite"):
+                from src.data.db.postgres import get_connection, return_connection
+
+                pg_conn = get_connection()
+                try:
+                    cur = pg_conn.cursor()
+                    for stmt in [s.strip() for s in POSTGRES_DECISION_SNAPSHOT_DDL.split(";") if s.strip()]:
+                        cur.execute(stmt)
+                    pg_conn.commit()
+                except Exception:
+                    try:
+                        pg_conn.rollback()
+                    except Exception:
+                        pass
+                    raise
+                finally:
+                    return_connection(pg_conn)
+            _SCHEMA_READY = True
+            return True
+        except Exception as exc:
+            logger.debug("Decision journal schema ensure failed: %s", exc)
+            return False
+
+
+def _schema_or_skip() -> bool:
+    """Return True when journal writes are safe; warn once when disabled."""
+    global _SCHEMA_WARNED
+    if ensure_schema_ready():
+        return True
+    if not _SCHEMA_WARNED:
+        logger.warning(
+            "Decision journal writes disabled because schema bootstrap failed; "
+            "trading continues without optional decision snapshots."
+        )
+        _SCHEMA_WARNED = True
+    return False
 
 
 def _now() -> str:
@@ -148,6 +261,8 @@ def record_decision_snapshot(
     """Insert/update a decision snapshot for a TradeSignal-like object."""
     if not _enabled():
         return None
+    if not _schema_or_skip():
+        return None
     try:
         from src.data import database as db
 
@@ -267,6 +382,8 @@ def update_decision_status(
     """Update the terminal/current status for a decision snapshot."""
     if not _enabled() or not decision_id:
         return False
+    if not _schema_or_skip():
+        return False
     try:
         from src.data import database as db
 
@@ -328,6 +445,8 @@ def link_paper_trade(
 ) -> bool:
     """Attach the opened paper trade id to an existing decision snapshot."""
     if not _enabled() or not decision_id or paper_trade_id is None:
+        return False
+    if not _schema_or_skip():
         return False
     try:
         from src.data import database as db

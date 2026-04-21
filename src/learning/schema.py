@@ -205,6 +205,98 @@ CREATE INDEX IF NOT EXISTS idx_decision_snapshots_status
     ON decision_snapshots (final_status, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_decision_snapshots_trade
     ON decision_snapshots (paper_trade_id);
+
+CREATE TABLE IF NOT EXISTS learning_datasets (
+    dataset_id TEXT PRIMARY KEY,
+    created_at TEXT NOT NULL,
+    source_policy_id TEXT,
+    start_ts TEXT,
+    end_ts TEXT,
+    row_count INTEGER NOT NULL DEFAULT 0,
+    positive_labels INTEGER NOT NULL DEFAULT 0,
+    executed_count INTEGER NOT NULL DEFAULT 0,
+    feature_names TEXT NOT NULL DEFAULT '[]',
+    label_definition TEXT NOT NULL DEFAULT '{}',
+    quality_report TEXT NOT NULL DEFAULT '{}',
+    metadata TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_learning_datasets_recent
+    ON learning_datasets (created_at DESC);
+
+CREATE TABLE IF NOT EXISTS learning_backtest_runs (
+    run_id TEXT PRIMARY KEY,
+    created_at TEXT NOT NULL,
+    dataset_id TEXT,
+    policy_id TEXT,
+    candidate_policy_id TEXT,
+    backtest_type TEXT NOT NULL DEFAULT 'decision_replay',
+    start_ts TEXT,
+    end_ts TEXT,
+    trade_count INTEGER NOT NULL DEFAULT 0,
+    win_rate REAL,
+    total_pnl REAL,
+    avg_pnl REAL,
+    max_drawdown REAL,
+    profit_factor REAL,
+    sharpe_like REAL,
+    metrics TEXT NOT NULL DEFAULT '{}',
+    parameters TEXT NOT NULL DEFAULT '{}',
+    passed INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_learning_backtest_runs_recent
+    ON learning_backtest_runs (created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_learning_backtest_runs_dataset
+    ON learning_backtest_runs (dataset_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS learning_shadow_evaluations (
+    evaluation_id TEXT PRIMARY KEY,
+    created_at TEXT NOT NULL,
+    champion_policy_id TEXT NOT NULL,
+    challenger_policy_id TEXT NOT NULL,
+    dataset_id TEXT,
+    champion_run_id TEXT,
+    challenger_run_id TEXT,
+    verdict TEXT NOT NULL,
+    gates_passed INTEGER NOT NULL DEFAULT 0,
+    gate_results TEXT NOT NULL DEFAULT '{}',
+    metrics_delta TEXT NOT NULL DEFAULT '{}',
+    notes TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_learning_shadow_recent
+    ON learning_shadow_evaluations (created_at DESC);
+
+CREATE TABLE IF NOT EXISTS learning_improvement_runs (
+    improvement_id TEXT PRIMARY KEY,
+    created_at TEXT NOT NULL,
+    dataset_id TEXT,
+    best_candidate_policy_id TEXT,
+    mode TEXT NOT NULL DEFAULT 'offline',
+    status TEXT NOT NULL DEFAULT 'completed',
+    search_space TEXT NOT NULL DEFAULT '{}',
+    candidate_results TEXT NOT NULL DEFAULT '[]',
+    selected_metrics TEXT NOT NULL DEFAULT '{}',
+    next_action TEXT NOT NULL DEFAULT 'manual_review',
+    metadata TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_learning_improvement_recent
+    ON learning_improvement_runs (created_at DESC);
+
+CREATE TABLE IF NOT EXISTS learning_promotion_decisions (
+    decision_id TEXT PRIMARY KEY,
+    created_at TEXT NOT NULL,
+    candidate_policy_id TEXT NOT NULL,
+    target_policy_id TEXT,
+    requested_by TEXT NOT NULL DEFAULT 'codex',
+    decision TEXT NOT NULL,
+    approved INTEGER NOT NULL DEFAULT 0,
+    requires_manual_approval INTEGER NOT NULL DEFAULT 1,
+    shadow_evaluation_id TEXT,
+    rollback_policy_id TEXT,
+    reason TEXT NOT NULL DEFAULT '',
+    metadata TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_learning_promotion_recent
+    ON learning_promotion_decisions (created_at DESC);
 """
 
 
