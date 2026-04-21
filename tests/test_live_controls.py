@@ -1,4 +1,5 @@
 import logging
+import json
 import os
 import sqlite3
 import sys
@@ -1742,6 +1743,74 @@ def test_live_safety_stop_keeps_daily_loss_rejection_code():
         "kill_switch_active:daily_loss_limit:125.00>100.00"
     )
     assert trader._safety_stop_rejection_code() == "daily_loss_exceeded"
+
+
+def test_stale_dualwrite_kill_switch_auto_clears_when_healthy(monkeypatch, tmp_path):
+    state_file = tmp_path / "kill_state.json"
+    state_file.write_text(
+        '{"active": true, "reason": "dualwrite_unhealthy:recent_failures=11:total_failed=11"}',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "src.trading.live_trader.db.get_backend_name",
+        lambda: "dualwrite",
+    )
+    monkeypatch.setattr(
+        "src.trading.live_trader.db.dualwrite_is_healthy",
+        lambda **kwargs: True,
+    )
+    monkeypatch.setattr(
+        "src.data.db.postgres.check_health",
+        lambda: True,
+    )
+
+    trader = LiveTrader.__new__(LiveTrader)
+    trader.kill_switch_state_file = str(state_file)
+    trader._state_lock = threading.Lock()
+    trader.kill_switch_active = False
+    trader._kill_switch_reason = ""
+    trader.status_reason = ""
+    trader._dualwrite_health_window_s = 300.0
+    trader._dualwrite_health_max_failures = 5
+
+    trader._load_persisted_kill_switch_state()
+
+    assert trader.kill_switch_active is False
+    payload = json.loads(state_file.read_text(encoding="utf-8"))
+    assert payload["active"] is False
+    assert payload["reason"].startswith("auto_cleared:dualwrite_unhealthy")
+
+
+def test_non_dualwrite_kill_switch_remains_sticky(monkeypatch, tmp_path):
+    state_file = tmp_path / "kill_state.json"
+    state_file.write_text(
+        '{"active": true, "reason": "daily_loss_limit:125.00>100.00"}',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "src.trading.live_trader.db.get_backend_name",
+        lambda: "dualwrite",
+    )
+    monkeypatch.setattr(
+        "src.trading.live_trader.db.dualwrite_is_healthy",
+        lambda **kwargs: True,
+    )
+
+    trader = LiveTrader.__new__(LiveTrader)
+    trader.kill_switch_state_file = str(state_file)
+    trader._state_lock = threading.Lock()
+    trader.kill_switch_active = False
+    trader._kill_switch_reason = ""
+    trader.status_reason = ""
+    trader._dualwrite_health_window_s = 300.0
+    trader._dualwrite_health_max_failures = 5
+
+    trader._load_persisted_kill_switch_state()
+
+    assert trader.kill_switch_active is True
+    assert trader._kill_switch_reason == "daily_loss_limit:125.00>100.00"
+    payload = json.loads(state_file.read_text(encoding="utf-8"))
+    assert payload["active"] is True
 
 
 def test_hyperliquid_signer_zero_pads_signature_components(monkeypatch):

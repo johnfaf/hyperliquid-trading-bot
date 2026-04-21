@@ -1064,6 +1064,14 @@ class LiveTrader:
                 payload = json.load(handle)
             if isinstance(payload, dict) and payload.get("active"):
                 reason = str(payload.get("reason") or f"persisted:{path}")
+                if self._should_auto_clear_persisted_kill_switch(reason):
+                    logger.warning(
+                        "Auto-clearing stale persisted kill switch (%s): "
+                        "dualwrite is healthy in this process.",
+                        reason,
+                    )
+                    self._persist_kill_switch_state(False, f"auto_cleared:{reason}")
+                    return
                 with self._state_lock:
                     self.kill_switch_active = True
                     self._kill_switch_reason = reason
@@ -1075,6 +1083,35 @@ class LiveTrader:
                 )
         except Exception as exc:
             logger.warning("Failed to load kill-switch state from %s: %s", path, exc)
+
+    def _should_auto_clear_persisted_kill_switch(self, reason: str) -> bool:
+        """Return True for healed, machine-detectable persisted kill switches.
+
+        Only the stale ``dualwrite_unhealthy`` case can clear itself. Manual,
+        external-file, daily-loss and protective-order kill switches stay
+        sticky until an operator clears them.
+        """
+        reason = str(reason or "")
+        if not reason.startswith("dualwrite_unhealthy:"):
+            return False
+        try:
+            if db.get_backend_name() != "dualwrite":
+                return False
+            if not db.dualwrite_is_healthy(
+                window_s=self._dualwrite_health_window_s,
+                max_failures=self._dualwrite_health_max_failures,
+            ):
+                return False
+            from src.data.db.postgres import check_health as pg_check_health
+
+            return bool(pg_check_health())
+        except Exception as exc:
+            logger.warning(
+                "Could not verify stale dualwrite kill switch is healed; "
+                "keeping persisted kill switch active: %s",
+                exc,
+            )
+            return False
 
     # ── H5: persistent canary counters ──────────────────────────
     _SOURCE_ORDERS_TODAY_KEY = "live_source_orders_today"
