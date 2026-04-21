@@ -297,6 +297,133 @@ CREATE TABLE IF NOT EXISTS learning_promotion_decisions (
 );
 CREATE INDEX IF NOT EXISTS idx_learning_promotion_recent
     ON learning_promotion_decisions (created_at DESC);
+
+CREATE TABLE IF NOT EXISTS learning_data_quality_reports (
+    report_id TEXT PRIMARY KEY,
+    created_at TEXT NOT NULL,
+    dataset_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    checks TEXT NOT NULL DEFAULT '{}',
+    summary TEXT NOT NULL DEFAULT '{}',
+    blocks_training INTEGER NOT NULL DEFAULT 0,
+    metadata TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_learning_quality_dataset
+    ON learning_data_quality_reports (dataset_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS learning_policy_candidates (
+    candidate_policy_id TEXT PRIMARY KEY,
+    created_at TEXT NOT NULL,
+    parent_policy_id TEXT NOT NULL,
+    source_improvement_id TEXT,
+    status TEXT NOT NULL DEFAULT 'candidate',
+    trainable_parameters TEXT NOT NULL DEFAULT '{}',
+    non_trainable_limits_snapshot TEXT NOT NULL DEFAULT '{}',
+    metrics TEXT NOT NULL DEFAULT '{}',
+    safety_report TEXT NOT NULL DEFAULT '{}',
+    notes TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_learning_candidates_recent
+    ON learning_policy_candidates (created_at DESC);
+
+CREATE TABLE IF NOT EXISTS learning_feature_attributions (
+    attribution_id TEXT PRIMARY KEY,
+    created_at TEXT NOT NULL,
+    dataset_id TEXT NOT NULL,
+    candidate_policy_id TEXT,
+    method TEXT NOT NULL DEFAULT 'win_loss_mean_delta',
+    feature_scores TEXT NOT NULL DEFAULT '[]',
+    top_features TEXT NOT NULL DEFAULT '[]',
+    metadata TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_learning_attribution_dataset
+    ON learning_feature_attributions (dataset_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS learning_drift_reports (
+    drift_id TEXT PRIMARY KEY,
+    created_at TEXT NOT NULL,
+    baseline_dataset_id TEXT NOT NULL,
+    current_dataset_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    feature_drift TEXT NOT NULL DEFAULT '[]',
+    summary TEXT NOT NULL DEFAULT '{}',
+    blocks_promotion INTEGER NOT NULL DEFAULT 0,
+    metadata TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_learning_drift_recent
+    ON learning_drift_reports (created_at DESC);
+
+CREATE TABLE IF NOT EXISTS learning_shadow_periods (
+    shadow_id TEXT PRIMARY KEY,
+    created_at TEXT NOT NULL,
+    candidate_policy_id TEXT NOT NULL,
+    champion_policy_id TEXT NOT NULL,
+    started_at TEXT,
+    ended_at TEXT,
+    min_shadow_days INTEGER NOT NULL DEFAULT 7,
+    status TEXT NOT NULL DEFAULT 'planned',
+    metrics TEXT NOT NULL DEFAULT '{}',
+    notes TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_learning_shadow_periods_recent
+    ON learning_shadow_periods (created_at DESC);
+
+CREATE TABLE IF NOT EXISTS learning_rollback_checks (
+    rollback_check_id TEXT PRIMARY KEY,
+    created_at TEXT NOT NULL,
+    candidate_policy_id TEXT NOT NULL,
+    rollback_policy_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    checks TEXT NOT NULL DEFAULT '{}',
+    metadata TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_learning_rollback_recent
+    ON learning_rollback_checks (created_at DESC);
+
+CREATE TABLE IF NOT EXISTS learning_promotion_packages (
+    package_id TEXT PRIMARY KEY,
+    created_at TEXT NOT NULL,
+    candidate_policy_id TEXT NOT NULL,
+    dataset_id TEXT,
+    shadow_evaluation_id TEXT,
+    promotion_decision_id TEXT,
+    readiness TEXT NOT NULL,
+    evidence TEXT NOT NULL DEFAULT '{}',
+    operator_summary TEXT NOT NULL DEFAULT '',
+    requires_manual_approval INTEGER NOT NULL DEFAULT 1,
+    metadata TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_learning_packages_recent
+    ON learning_promotion_packages (created_at DESC);
+
+CREATE TABLE IF NOT EXISTS learning_scheduler_runs (
+    schedule_run_id TEXT PRIMARY KEY,
+    created_at TEXT NOT NULL,
+    run_type TEXT NOT NULL,
+    status TEXT NOT NULL,
+    dataset_id TEXT,
+    improvement_id TEXT,
+    package_id TEXT,
+    started_at TEXT,
+    finished_at TEXT,
+    metrics TEXT NOT NULL DEFAULT '{}',
+    errors TEXT NOT NULL DEFAULT '[]',
+    metadata TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_learning_scheduler_recent
+    ON learning_scheduler_runs (created_at DESC);
+
+CREATE TABLE IF NOT EXISTS learning_operator_reports (
+    report_id TEXT PRIMARY KEY,
+    created_at TEXT NOT NULL,
+    package_id TEXT,
+    report_type TEXT NOT NULL DEFAULT 'promotion_readiness',
+    title TEXT NOT NULL,
+    body TEXT NOT NULL,
+    metadata TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_learning_operator_reports_recent
+    ON learning_operator_reports (created_at DESC);
 """
 
 
