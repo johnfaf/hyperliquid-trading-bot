@@ -1,4 +1,5 @@
 import contextlib
+import logging
 import sqlite3
 
 from src.data import database as db
@@ -42,6 +43,32 @@ def test_phase0_seeds_champion_policy_and_source_inventory(monkeypatch):
     sources = conn.execute("SELECT source_name FROM source_inventory").fetchall()
     source_names = {row["source_name"] for row in sources}
     assert {"polymarket", "feature_store", "decision_journal"}.issubset(source_names)
+
+
+def test_learning_seed_uses_sqlite_only_when_dualwrite_schema_missing(monkeypatch, caplog):
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    ensure_sqlite_schema(conn)
+    for_read_calls = []
+
+    @contextlib.contextmanager
+    def _ctx(*, for_read: bool = False):
+        for_read_calls.append(for_read)
+        yield conn
+        conn.commit()
+
+    monkeypatch.setattr(db.config, "DB_BACKEND", "dualwrite")
+    monkeypatch.setattr(db, "_postgres_learning_seed_schema_ready", lambda: False)
+    monkeypatch.setattr(db, "get_connection", _ctx)
+
+    with caplog.at_level(logging.WARNING):
+        db._seed_continuous_learning_defaults()
+
+    assert for_read_calls
+    assert all(for_read_calls)
+    assert "seeding SQLite only" in caplog.text
+    assert conn.execute("SELECT COUNT(*) FROM continuous_learning_policies").fetchone()[0] == 1
+    assert conn.execute("SELECT COUNT(*) FROM source_inventory").fetchone()[0] >= 5
 
 
 def test_polymarket_historical_provider_is_point_in_time(monkeypatch):

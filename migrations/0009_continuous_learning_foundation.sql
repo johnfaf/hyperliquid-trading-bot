@@ -1,4 +1,4 @@
-﻿-- Continuous learning foundation: safety policies, historical inputs, replay, and decision snapshots.
+-- Continuous learning foundation: safety policies, historical inputs, replay, and decision snapshots.
 
 CREATE TABLE IF NOT EXISTS continuous_learning_policies (
     policy_id TEXT PRIMARY KEY,

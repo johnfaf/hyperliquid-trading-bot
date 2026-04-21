@@ -29,6 +29,10 @@ from src.core.env_utils import safe_env_float
 
 logger = logging.getLogger(__name__)
 _TRADER_ADDRESS_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
+_LEARNING_SEED_TABLES = frozenset({
+    "continuous_learning_policies",
+    "source_inventory",
+})
 
 # Resolved once at import — config.py already tested writability
 _DB_PATH = config.DB_PATH
@@ -112,14 +116,75 @@ def table_exists(name: str) -> bool:
         return row is not None
 
 
+def _postgres_learning_seed_schema_ready() -> bool:
+    """Return True when Postgres has the tables needed by startup seeding."""
+    if config.DB_BACKEND not in ("postgres", "dualwrite"):
+        return True
+
+    conn = None
+    try:
+        from src.data.db.postgres import (
+            get_connection as get_pg_connection,
+            get_postgres_config_error,
+            return_connection as return_pg_connection,
+        )
+
+        config_error = get_postgres_config_error(config.DB_BACKEND, config.POSTGRES_DSN)
+        if config_error:
+            logger.debug("Continuous-learning Postgres schema check skipped: %s", config_error)
+            return False
+
+        table_names = tuple(sorted(_LEARNING_SEED_TABLES))
+        placeholders = ", ".join(["%s"] * len(table_names))
+        conn = get_pg_connection()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT table_name FROM information_schema.tables "
+            "WHERE table_schema = 'public' "
+            f"AND table_name IN ({placeholders})",
+            table_names,
+        )
+        rows = cur.fetchall()
+        existing = {
+            (row.get("table_name") if hasattr(row, "get") else row[0])
+            for row in rows
+        }
+        return _LEARNING_SEED_TABLES.issubset(existing)
+    except Exception as exc:
+        logger.debug("Continuous-learning Postgres schema check failed: %s", exc)
+        return False
+    finally:
+        if conn is not None:
+            try:
+                return_pg_connection(conn)
+            except Exception:
+                pass
+
+
 def _seed_continuous_learning_defaults() -> None:
     """Seed Phase 0 policy and source inventory without blocking startup."""
     try:
         from src.learning.policy_registry import ensure_champion_policy
         from src.learning.source_inventory import seed_source_inventory
 
-        ensure_champion_policy()
-        seed_source_inventory()
+        mirror_to_postgres = True
+        if config.DB_BACKEND in ("postgres", "dualwrite"):
+            schema_ready = _postgres_learning_seed_schema_ready()
+            if config.DB_BACKEND == "postgres" and not schema_ready:
+                logger.warning(
+                    "Continuous-learning default seed skipped: Postgres learning "
+                    "schema is missing. Check pending migrations before trading."
+                )
+                return
+            if config.DB_BACKEND == "dualwrite" and not schema_ready:
+                mirror_to_postgres = False
+                logger.warning(
+                    "Continuous-learning Postgres schema unavailable; seeding "
+                    "SQLite only until migrations succeed."
+                )
+
+        ensure_champion_policy(mirror_to_postgres=mirror_to_postgres)
+        seed_source_inventory(mirror_to_postgres=mirror_to_postgres)
     except Exception as exc:
         logger.debug("Continuous-learning default seed skipped: %s", exc)
 

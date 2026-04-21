@@ -92,12 +92,16 @@ def default_reporting_contract() -> Dict[str, Any]:
     }
 
 
-def ensure_champion_policy(policy_id: str = CHAMPION_POLICY_ID) -> str:
+def ensure_champion_policy(
+    policy_id: str = CHAMPION_POLICY_ID,
+    *,
+    mirror_to_postgres: bool = True,
+) -> str:
     """Create or refresh the champion policy definition."""
     from src.data import database as db
 
     now = _now()
-    with db.get_connection() as conn:
+    with db.get_connection(for_read=not mirror_to_postgres) as conn:
         row = conn.execute(
             "SELECT policy_id FROM continuous_learning_policies WHERE policy_id = ?",
             (policy_id,),

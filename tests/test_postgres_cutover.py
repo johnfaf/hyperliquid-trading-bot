@@ -314,6 +314,16 @@ def test_run_migrations_wraps_each_file_in_transaction(monkeypatch, tmp_path):
     assert conn.executed[1][0].startswith("INSERT INTO schema_migrations")
 
 
+def test_migration_reader_strips_utf8_bom(tmp_path):
+    migration_file = tmp_path / "0009_test.sql"
+    migration_file.write_bytes(b"\xef\xbb\xbf-- comment\nCREATE TABLE t (id INTEGER);")
+
+    sql = migrations_module._read_migration_sql(str(migration_file))
+
+    assert sql.startswith("-- comment")
+    assert "\ufeff" not in sql
+
+
 def test_translate_sql_only_rewrites_datetime_function_calls():
     sql = (
         "SELECT datetime('now') AS created_at, datetime('now', '-90 days') AS cutoff, "

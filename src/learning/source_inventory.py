@@ -129,13 +129,17 @@ def _json(value: Dict[str, Any]) -> str:
     return json.dumps(value or {}, sort_keys=True, separators=(",", ":"))
 
 
-def seed_source_inventory(rows: Iterable[Dict[str, Any]] = DEFAULT_SOURCE_INVENTORY) -> int:
+def seed_source_inventory(
+    rows: Iterable[Dict[str, Any]] = DEFAULT_SOURCE_INVENTORY,
+    *,
+    mirror_to_postgres: bool = True,
+) -> int:
     """Upsert the static inventory of learning data sources."""
     from src.data import database as db
 
     now = _now()
     count = 0
-    with db.get_connection() as conn:
+    with db.get_connection(for_read=not mirror_to_postgres) as conn:
         for row in rows:
             conn.execute(
                 """
@@ -177,7 +181,7 @@ def seed_source_inventory(rows: Iterable[Dict[str, Any]] = DEFAULT_SOURCE_INVENT
     return count
 
 
-def record_source_health_snapshot(registry) -> int:
+def record_source_health_snapshot(registry, *, mirror_to_postgres: bool = True) -> int:
     """Persist a point-in-time health snapshot from DataSourceRegistry."""
     if registry is None or not hasattr(registry, "snapshot"):
         return 0
@@ -186,7 +190,7 @@ def record_source_health_snapshot(registry) -> int:
     observed_at = _now()
     now_ts = time.time()
     snapshot = registry.snapshot()
-    with db.get_connection() as conn:
+    with db.get_connection(for_read=not mirror_to_postgres) as conn:
         for name, state in snapshot.items():
             last_success = float(state.get("last_success_at", 0.0) or 0.0)
             freshness = max(0.0, now_ts - last_success) if last_success > 0 else None
