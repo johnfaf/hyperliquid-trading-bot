@@ -3,6 +3,7 @@ import os
 import sqlite3
 import sys
 import tempfile
+import threading
 import types
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -696,6 +697,43 @@ def test_cancel_all_orders_uses_hyperliquid_oid_fallback(monkeypatch):
 
     assert trader.cancel_all_orders() == 3
     assert cancelled == [("ETH", 111), ("BTC", 222), ("SOL", 333)]
+
+
+def test_get_open_orders_uses_frontend_open_orders(monkeypatch):
+    class FakeManager:
+        def __init__(self):
+            self.calls = []
+
+        def post(self, payload, **kwargs):
+            self.calls.append((payload, kwargs))
+            return [
+                {
+                    "coin": "ETH",
+                    "isTrigger": True,
+                    "isPositionTpsl": True,
+                    "orderType": "Stop Market",
+                    "triggerPx": "2407.8",
+                    "reduceOnly": True,
+                    "side": "B",
+                    "sz": "0.0051",
+                    "oid": 123,
+                }
+            ]
+
+    trader = LiveTrader.__new__(LiveTrader)
+    trader.public_address = "0x2222222222222222222222222222222222222222"
+    trader.api_manager = FakeManager()
+    trader._state_lock = threading.RLock()
+    trader._last_order_visibility_status = {}
+
+    orders = trader.get_open_orders(force_fresh=True)
+
+    assert orders and orders[0]["oid"] == 123
+    payload, kwargs = trader.api_manager.calls[0]
+    assert payload["type"] == "frontendOpenOrders"
+    assert kwargs["force_fresh"] is True
+    assert trader._last_order_visibility_status["ok"] is True
+    assert trader._last_order_visibility_status["order_count"] == 1
 
 
 def test_free_margin_prefers_account_value_minus_used_margin_over_withdrawable():
@@ -3207,14 +3245,29 @@ def test_protect_orphaned_positions_skips_already_protected(monkeypatch):
         "get_open_orders",
         lambda self, **kw: [
             {
-                "coin": "ETH", "reduceOnly": True, "orderType": "Stop Market",
-                "side": "buy", "sz": 0.0058, "oid": 11,
-                "t": {"trigger": {"tpsl": "sl", "triggerPx": "2126.8", "isMarket": True}},
+                "coin": "ETH",
+                "isTrigger": True,
+                "isPositionTpsl": True,
+                "reduceOnly": True,
+                "orderType": "Stop Market",
+                "side": "B",
+                "sz": "0",
+                "origSz": "0.0058",
+                "triggerPx": "2126.8",
+                "triggerCondition": "Price above 2126.8",
+                "oid": 11,
             },
             {
-                "coin": "ETH", "reduceOnly": True, "orderType": "Take Profit Market",
-                "side": "buy", "sz": 0.0058, "oid": 12,
-                "t": {"trigger": {"tpsl": "tp", "triggerPx": "1755.2", "isMarket": True}},
+                "coin": "ETH",
+                "isTrigger": True,
+                "isPositionTpsl": True,
+                "reduceOnly": True,
+                "orderType": "Take Profit Market",
+                "side": "B",
+                "sz": "0.0058",
+                "triggerPx": "1755.2",
+                "triggerCondition": "Price below 1755.2",
+                "oid": 12,
             },
         ],
     )
@@ -3231,6 +3284,149 @@ def test_protect_orphaned_positions_skips_already_protected(monkeypatch):
     assert summary["skipped"] == 1
     assert summary["failed"] == 0
     assert len(placed_triggers) == 0  # nothing placed because already protected
+
+
+def test_protect_orphaned_positions_cancels_duplicate_frontend_tpsl_orders(monkeypatch):
+    placed_triggers = []
+    cancelled = []
+
+    class FakeFirewall:
+        def validate(self, signal, **kwargs):
+            return True, "ok"
+
+    monkeypatch.setattr(LiveTrader, "_load_credentials", _fake_live_credentials)
+    monkeypatch.setattr(LiveTrader, "_load_asset_index_map", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "reconcile_positions", lambda self: None)
+    monkeypatch.setattr(
+        LiveTrader,
+        "get_positions",
+        lambda self, **kw: [
+            {
+                "coin": "ETH",
+                "size": 0.0058,
+                "szi": -0.0058,
+                "side": "short",
+                "entry_price": 2064.9,
+                "entryPx": 2064.9,
+            },
+        ],
+    )
+    monkeypatch.setattr(
+        LiveTrader,
+        "get_open_orders",
+        lambda self, **kw: [
+            {
+                "coin": "ETH",
+                "isTrigger": True,
+                "isPositionTpsl": True,
+                "reduceOnly": True,
+                "orderType": "Stop Market",
+                "side": "B",
+                "sz": "0.0058",
+                "triggerPx": "2126.8",
+                "oid": 11,
+            },
+            {
+                "coin": "ETH",
+                "isTrigger": True,
+                "isPositionTpsl": True,
+                "reduceOnly": True,
+                "orderType": "Stop Market",
+                "side": "B",
+                "sz": "0.0058",
+                "triggerPx": "2126.8",
+                "oid": 13,
+            },
+            {
+                "coin": "ETH",
+                "isTrigger": True,
+                "isPositionTpsl": True,
+                "reduceOnly": True,
+                "orderType": "Take Profit Market",
+                "side": "B",
+                "sz": "0.0058",
+                "triggerPx": "1755.2",
+                "oid": 12,
+            },
+            {
+                "coin": "ETH",
+                "isTrigger": True,
+                "isPositionTpsl": True,
+                "reduceOnly": True,
+                "orderType": "Take Profit Market",
+                "side": "B",
+                "sz": "0.0058",
+                "triggerPx": "1755.2",
+                "oid": 14,
+            },
+        ],
+    )
+    monkeypatch.setattr(
+        LiveTrader,
+        "cancel_order",
+        lambda self, coin, oid: cancelled.append((coin, oid)) or True,
+    )
+    monkeypatch.setattr(
+        LiveTrader,
+        "place_trigger_order",
+        lambda self, *a, **kw: placed_triggers.append(a) or {"status": "ok"},
+    )
+
+    trader = LiveTrader(firewall=FakeFirewall(), dry_run=False, max_order_usd=15.0)
+    summary = trader.protect_orphaned_positions()
+
+    assert summary["protected"] == 0
+    assert summary["skipped"] == 1
+    assert summary["stale_cancelled"] == 2
+    assert cancelled == [("ETH", 11), ("ETH", 12)]
+    assert placed_triggers == []
+
+
+def test_protect_orphaned_positions_churn_guard_blocks_repeated_brackets(monkeypatch):
+    placed_triggers = []
+
+    class FakeFirewall:
+        def validate(self, signal, **kwargs):
+            return True, "ok"
+
+    monkeypatch.setattr(LiveTrader, "_load_credentials", _fake_live_credentials)
+    monkeypatch.setattr(LiveTrader, "_load_asset_index_map", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "reconcile_positions", lambda self: None)
+    monkeypatch.setattr(
+        LiveTrader,
+        "get_positions",
+        lambda self, **kw: [
+            {
+                "coin": "SOL",
+                "size": 0.13,
+                "szi": 0.13,
+                "side": "long",
+                "entry_price": 85.947,
+                "entryPx": 85.947,
+            },
+        ],
+    )
+    monkeypatch.setattr(LiveTrader, "get_open_orders", lambda self, **kw: [])
+    monkeypatch.setattr(
+        LiveTrader,
+        "place_trigger_order",
+        lambda self, coin, side, size, trigger_price, tp_or_sl="sl": (
+            placed_triggers.append((coin, side, size, trigger_price, tp_or_sl))
+            or {"status": "ok", "response": {"type": "order", "data": {"statuses": [{"resting": {"oid": len(placed_triggers)}}]}}}
+        ),
+    )
+
+    trader = LiveTrader(firewall=FakeFirewall(), dry_run=False, max_order_usd=15.0)
+    first = trader.protect_orphaned_positions()
+    second = trader.protect_orphaned_positions()
+
+    assert first["protected"] == 1
+    assert second["protected"] == 0
+    assert second["failed"] == 1
+    assert second["churn_blocked"] == 1
+    assert len(placed_triggers) == 2
+    assert trader.kill_switch_active is True
+    assert trader.status_reason == "protective_order_churn"
 
 
 def test_rescale_size_for_live_allows_1x_leverage_on_tight_wallet(monkeypatch):

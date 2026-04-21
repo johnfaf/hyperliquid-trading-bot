@@ -90,6 +90,9 @@ class MultiExchangeScanner:
         self._last_scan: Optional[ScanResult] = None
         self._trader_cache: Dict[str, NormalizedTrader] = {}
         self._scan_count = 0
+        self._health_check_count = 0
+        self._common_markets_checks = 0
+        self._funding_scan_count = 0
 
         logger.info(f"MultiExchangeScanner initialized with {len(self.adapters)} venues: "
                     f"{list(self.adapters.keys())}")
@@ -147,6 +150,7 @@ class MultiExchangeScanner:
         Three states: 'healthy', 'degraded', 'down' (plus 'initialized' before first check).
         Only healthy venues count toward confirmation scoring.
         """
+        self._health_check_count += 1
         health = {}
         for name, adapter in self.adapters.items():
             try:
@@ -273,6 +277,7 @@ class MultiExchangeScanner:
 
     def scan_funding_arb(self) -> List[FundingArbitrageOpportunity]:
         """Scan for funding rate arbitrage across healthy venues."""
+        self._funding_scan_count += 1
         if not self.cross_venue:
             return []
 
@@ -306,6 +311,7 @@ class MultiExchangeScanner:
 
     def get_common_markets(self) -> List[str]:
         """Get coins listed on ALL connected HEALTHY venues."""
+        self._common_markets_checks += 1
         healthy = self._get_healthy_adapters()
         if len(healthy) < 2:
             return []
@@ -390,6 +396,9 @@ class MultiExchangeScanner:
             "venues": list(self.adapters.keys()),
             "venue_count": len(self.adapters),
             "scan_count": self._scan_count,
+            "health_check_count": self._health_check_count,
+            "common_markets_checks": self._common_markets_checks,
+            "funding_scan_count": self._funding_scan_count,
             "cached_traders": len(self._trader_cache),
         }
 

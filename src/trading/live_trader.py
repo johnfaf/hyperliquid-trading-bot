@@ -694,6 +694,22 @@ class LiveTrader:
             0.0,
             float(os.environ.get("LIVE_PROTECTIVE_ORDER_RETRY_JITTER_S", "0.35")),
         )
+        self._protective_repeat_window_s = _safe_env_float(
+            "LIVE_PROTECTIVE_REPEAT_WINDOW_S", 900.0, lo=30.0, hi=86_400.0,
+        )
+        self._protective_repeat_max = int(_safe_env_float(
+            "LIVE_PROTECTIVE_REPEAT_MAX", 1.0, lo=1.0, hi=20.0,
+        ))
+        self._protective_attempt_history: Dict[str, Deque[float]] = defaultdict(deque)
+        self._protective_churn_trips = 0
+        self._last_orphan_protection_summary: Dict[str, Any] = {}
+        self._last_order_visibility_status: Dict[str, Any] = {
+            "source": "frontendOpenOrders",
+            "ok": None,
+            "order_count": None,
+            "reason": "not_checked",
+            "timestamp": None,
+        }
 
         # Wallet balance tracking (last-known snapshots for dashboards/cycles).
         self._last_balance_snapshot: Dict[str, Optional[float]] = {
@@ -2130,6 +2146,60 @@ class LiveTrader:
                 "Proceeding with caution -- monitor positions manually."
             )
 
+    def _store_orphan_protection_summary(self, summary: Dict[str, Any]) -> Dict[str, Any]:
+        summary = dict(summary)
+        summary.setdefault("timestamp", datetime.now(timezone.utc).isoformat())
+        with self._state_lock:
+            self._last_orphan_protection_summary = summary
+        return summary
+
+    def _protective_attempt_key(
+        self,
+        coin: str,
+        side: str,
+        entry_price: float,
+        size: float,
+    ) -> str:
+        return f"{str(coin).upper()}:{side}:{entry_price:.8g}:{size:.8g}"
+
+    def _protective_repeat_blocked(self, key: str) -> bool:
+        now = time.time()
+        cutoff = now - self._protective_repeat_window_s
+        with self._state_lock:
+            history = self._protective_attempt_history[key]
+            while history and history[0] < cutoff:
+                history.popleft()
+            return len(history) >= self._protective_repeat_max
+
+    def _record_protective_attempt(self, key: str) -> None:
+        now = time.time()
+        cutoff = now - self._protective_repeat_window_s
+        with self._state_lock:
+            history = self._protective_attempt_history[key]
+            while history and history[0] < cutoff:
+                history.popleft()
+            history.append(now)
+
+    def _trip_protective_churn_guard(self, coin: str, key: str) -> None:
+        with self._state_lock:
+            self._protective_churn_trips += 1
+        logger.critical(
+            "PROTECTIVE ORDER CHURN GUARD: %s still appears unprotected after "
+            "%d fallback placement(s) in %.0fs (key=%s). Refusing to stack "
+            "another SL/TP pair and activating kill switch.",
+            coin,
+            self._protective_repeat_max,
+            self._protective_repeat_window_s,
+            key,
+        )
+        try:
+            self.activate_kill_switch(
+                f"protective_order_churn:{coin}",
+                status_reason="protective_order_churn",
+            )
+        except Exception as exc:
+            logger.critical("activate_kill_switch failed during protective churn guard: %s", exc)
+
     def protect_orphaned_positions(
         self,
         positions: Optional[List[Dict[str, Any]]] = None,
@@ -2149,7 +2219,9 @@ class LiveTrader:
             Summary dict with counts of protected / skipped / failed.
         """
         if self.dry_run:
-            return {"status": "skipped", "reason": "dry_run"}
+            return self._store_orphan_protection_summary(
+                {"status": "skipped", "reason": "dry_run"}
+            )
 
         if positions is None:
             # P0-3: orphan protection decides whether to *place SL/TP orders*
@@ -2162,33 +2234,35 @@ class LiveTrader:
             logger.warning(
                 "protect_orphaned_positions: positions unavailable - aborting protection sweep"
             )
-            return {
+            return self._store_orphan_protection_summary({
                 "status": "degraded",
                 "reason": "positions_unavailable",
                 "protected": 0,
                 "skipped": 0,
                 "failed": 0,
-            }
+            })
 
         if not positions:
-            return {"status": "ok", "protected": 0, "skipped": 0, "failed": 0}
+            return self._store_orphan_protection_summary(
+                {"status": "ok", "protected": 0, "skipped": 0, "failed": 0}
+            )
 
         # One fetch of open orders, then index by coin for O(1) lookup.
         # P0-3: orphan protection also reasons about WHICH legs (SL vs TP)
-        # are already resting; a stale openOrders could claim a position
+        # are already resting; a stale open-order snapshot could claim a position
         # is protected when the order was cancelled seconds ago.
         open_orders = self.get_open_orders(force_fresh=True)
         if open_orders is None:
             logger.warning(
                 "protect_orphaned_positions: open-orders unavailable - aborting protection sweep"
             )
-            return {
+            return self._store_orphan_protection_summary({
                 "status": "degraded",
                 "reason": "open_orders_unavailable",
                 "protected": 0,
                 "skipped": 0,
                 "failed": 0,
-            }
+            })
 
         # P0-4 (audit): per-leg validation.  The legacy index treated
         # "this coin has *some* reduce-only order" as fully protected, so
@@ -2214,8 +2288,10 @@ class LiveTrader:
         skipped = 0
         failed = 0
         stale_cancelled = 0
+        cancel_failed = 0
         placed_sl_only = 0
         placed_tp_only = 0
+        churn_blocked = 0
         for pos in positions:
             coin = pos.get("coin", "")
             size = abs(self._coerce_float(pos.get("size", pos.get("szi", 0))))
@@ -2269,8 +2345,16 @@ class LiveTrader:
                             "kind=%s reason=%s oid=%s",
                             coin, bad.get("leg"), bad.get("invalid_reason"), oid,
                         )
+                    else:
+                        cancel_failed += 1
+                        logger.warning(
+                            "Failed to cancel invalid protective leg on %s: "
+                            "kind=%s reason=%s oid=%s",
+                            coin, bad.get("leg"), bad.get("invalid_reason"), oid,
+                        )
                 except Exception as exc:
-                    logger.debug(
+                    cancel_failed += 1
+                    logger.warning(
                         "Failed to cancel invalid protective leg %s/%s: %s",
                         coin, oid, exc,
                     )
@@ -2288,8 +2372,15 @@ class LiveTrader:
                         try:
                             if self.cancel_order(coin, int(oid)):
                                 stale_cancelled += 1
+                            else:
+                                cancel_failed += 1
+                                logger.warning(
+                                    "Failed to cancel duplicate protective leg %s/%s",
+                                    coin, oid,
+                                )
                         except Exception as exc:
-                            logger.debug(
+                            cancel_failed += 1
+                            logger.warning(
                                 "Failed to cancel duplicate protective leg %s/%s: %s",
                                 coin, oid, exc,
                             )
@@ -2313,14 +2404,29 @@ class LiveTrader:
             tp_result: Dict[str, Any] = {"status": "verified", "pre_existing": True}
             need_sl = not has_sl
             need_tp = not has_tp
+            protective_record_key: Optional[str] = None
 
             if need_sl and need_tp:
+                attempt_key = self._protective_attempt_key(coin, side, entry_price, size)
+                if self._protective_repeat_blocked(attempt_key):
+                    churn_blocked += 1
+                    failed += 1
+                    self._trip_protective_churn_guard(coin, attempt_key)
+                    continue
+                protective_record_key = attempt_key
                 logger.warning(
                     "UNPROTECTED POSITION: %s %s size=%.6f entry=$%.6f -- "
                     "placing fallback 3%%/15%% SL/TP (SL=$%.6f TP=$%.6f)",
                     side.upper(), coin, size, entry_price, sl_price, tp_price,
                 )
             elif need_sl:
+                attempt_key = self._protective_attempt_key(coin, side, entry_price, size)
+                if self._protective_repeat_blocked(f"{attempt_key}:sl"):
+                    churn_blocked += 1
+                    failed += 1
+                    self._trip_protective_churn_guard(coin, f"{attempt_key}:sl")
+                    continue
+                protective_record_key = f"{attempt_key}:sl"
                 placed_sl_only += 1
                 logger.warning(
                     "PARTIAL PROTECTION: %s %s has TP but missing SL -- "
@@ -2328,6 +2434,13 @@ class LiveTrader:
                     side.upper(), coin, sl_price,
                 )
             elif need_tp:
+                attempt_key = self._protective_attempt_key(coin, side, entry_price, size)
+                if self._protective_repeat_blocked(f"{attempt_key}:tp"):
+                    churn_blocked += 1
+                    failed += 1
+                    self._trip_protective_churn_guard(coin, f"{attempt_key}:tp")
+                    continue
+                protective_record_key = f"{attempt_key}:tp"
                 placed_tp_only += 1
                 logger.warning(
                     "PARTIAL PROTECTION: %s %s has SL but missing TP -- "
@@ -2346,6 +2459,8 @@ class LiveTrader:
 
             sl_ok = self._is_order_result_success(sl_result)
             tp_ok = self._is_order_result_success(tp_result)
+            if protective_record_key and (sl_ok or tp_ok):
+                self._record_protective_attempt(protective_record_key)
             if sl_ok and tp_ok:
                 protected += 1
                 logger.info(
@@ -2364,17 +2479,22 @@ class LiveTrader:
                 )
 
         summary = {
-            "status": "ok",
+            "status": "degraded" if cancel_failed else "ok",
             "protected": protected,
             "skipped": skipped,
             "failed": failed,
             "stale_cancelled": stale_cancelled,
+            "cancel_failed": cancel_failed,
             "placed_sl_only": placed_sl_only,
             "placed_tp_only": placed_tp_only,
+            "churn_blocked": churn_blocked,
         }
-        if protected or failed or stale_cancelled or placed_sl_only or placed_tp_only:
+        if (
+            protected or failed or stale_cancelled or cancel_failed
+            or placed_sl_only or placed_tp_only or churn_blocked
+        ):
             logger.warning("Orphan protection summary: %s", summary)
-        return summary
+        return self._store_orphan_protection_summary(summary)
 
     @staticmethod
     def _shadow_trade_metadata(trade: Dict[str, Any]) -> Dict[str, Any]:
@@ -2631,12 +2751,28 @@ class LiveTrader:
         if coin and str(order.get("coin", "") or "").upper() != str(coin).upper():
             return False
         reduce_only = bool(order.get("reduceOnly") or order.get("reduce_only"))
+        is_trigger = bool(order.get("isTrigger") or order.get("is_trigger"))
+        is_position_tpsl = bool(order.get("isPositionTpsl") or order.get("is_position_tpsl"))
         order_type = str(order.get("orderType") or order.get("type") or "").lower()
-        return bool(reduce_only or "stop" in order_type or "take" in order_type or "trigger" in order_type)
+        trigger_condition = str(order.get("triggerCondition") or "").lower()
+        trigger_px = order.get("triggerPx") or order.get("trigger_px")
+        has_trigger_px = trigger_px not in (None, "", "0", "0.0", 0, 0.0)
+        return bool(
+            reduce_only
+            or is_trigger
+            or is_position_tpsl
+            or "stop" in order_type
+            or "take" in order_type
+            or "profit" in order_type
+            or "trigger" in order_type
+            or "price above" in trigger_condition
+            or "price below" in trigger_condition
+            or has_trigger_px
+        )
 
     @classmethod
     def _classify_protective_leg(cls, order: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """Classify a single openOrders entry as an SL or TP leg.
+        """Classify a single frontend/open-order entry as an SL or TP leg.
 
         P0-4 (audit): per-leg validation for ``protect_orphaned_positions``.
         Returns a dict with ``coin``, ``leg`` ("sl"/"tp"), ``side`` ("buy"/
@@ -2654,7 +2790,8 @@ class LiveTrader:
         coin = str(order.get("coin", "") or "")
         if not coin:
             return None
-        reduce_only = bool(order.get("reduceOnly") or order.get("reduce_only"))
+        is_position_tpsl = bool(order.get("isPositionTpsl") or order.get("is_position_tpsl"))
+        reduce_only = bool(order.get("reduceOnly") or order.get("reduce_only") or is_position_tpsl)
         order_type = str(order.get("orderType") or order.get("type") or "").lower()
 
         leg: Optional[str] = None
@@ -2695,7 +2832,13 @@ class LiveTrader:
             elif raw_side in ("sell", "s", "a", "ask"):
                 side = "sell"
 
-        size_raw = order.get("sz") or order.get("s") or order.get("size")
+        size_raw = order.get("sz")
+        try:
+            parsed_size_raw = float(size_raw) if size_raw not in (None, "") else 0.0
+        except (TypeError, ValueError):
+            parsed_size_raw = 0.0
+        if parsed_size_raw <= 0:
+            size_raw = order.get("origSz") or order.get("orig_sz") or order.get("s") or order.get("size")
         try:
             size_val = abs(float(size_raw)) if size_raw not in (None, "") else 0.0
         except (TypeError, ValueError):
@@ -2794,7 +2937,7 @@ class LiveTrader:
     def _cancel_protective_orders(self, coin: str) -> int:
         # P0-3: the caller (protective-retry flow) needs to see all live
         # protective orders right now, including any just placed by
-        # another retry thread.  The 2 s openOrders TTL could hide them.
+        # another retry thread.  The 2 s open-order TTL could hide them.
         open_orders = self.get_open_orders(force_fresh=True)
         if open_orders is None:
             raise RuntimeError("open_orders_unavailable")
@@ -3129,9 +3272,7 @@ class LiveTrader:
                         continue
                     if order.get("coin") != coin:
                         continue
-                    reduce_only = bool(order.get("reduceOnly") or order.get("reduce_only"))
-                    otype = str(order.get("orderType") or order.get("type") or "").lower()
-                    if reduce_only or "stop" in otype or "take" in otype or "trigger" in otype:
+                    if self._is_protective_order(order, coin=coin):
                         oid = order.get("oid") or order.get("order_id") or order.get("id")
                         if oid is not None:
                             self.cancel_order(coin, int(oid))
@@ -4518,7 +4659,7 @@ class LiveTrader:
 
         try:
             # P0-3: a cancel-all sweep MUST NOT be satisfied by a cached
-            # openOrders response.  If the cache is stale it could miss
+            # open-order response.  If the cache is stale it could miss
             # an order that was placed in the last 2 s and we would mark
             # shutdown_orders_cancelled=True while that order stays live.
             orders = self.get_open_orders(force_fresh=True)
@@ -4545,7 +4686,11 @@ class LiveTrader:
                 }
 
             if coin:
-                orders = [o for o in orders if o.get("coin") == coin]
+                wanted_coin = str(coin).upper()
+                orders = [
+                    o for o in orders
+                    if str(o.get("coin", "") or "").upper() == wanted_coin
+                ]
 
             cancelled = 0
             failed = 0
@@ -4775,40 +4920,101 @@ class LiveTrader:
             logger.error(f"Error getting positions: {e}")
             return None
 
+    @staticmethod
+    def _extract_open_orders_response(data: Any) -> Optional[List[Dict[str, Any]]]:
+        """Normalize Hyperliquid open-order responses to a list of dicts."""
+        if data is None:
+            return None
+        if isinstance(data, list):
+            return [dict(order) for order in data if isinstance(order, dict)]
+        if isinstance(data, dict):
+            if data.get("error"):
+                return None
+            for key in ("orders", "data", "result", "response"):
+                value = data.get(key)
+                if isinstance(value, list):
+                    return [dict(order) for order in value if isinstance(order, dict)]
+                if isinstance(value, dict):
+                    nested = LiveTrader._extract_open_orders_response(value)
+                    if nested is not None:
+                        return nested
+        return None
+
+    def _record_order_visibility_status(
+        self,
+        *,
+        ok: bool,
+        order_count: Optional[int],
+        reason: str,
+    ) -> None:
+        status = {
+            "source": "frontendOpenOrders",
+            "ok": bool(ok),
+            "order_count": order_count,
+            "reason": reason,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        with self._state_lock:
+            self._last_order_visibility_status = status
+
     def get_open_orders(self, *, force_fresh: bool = False) -> Optional[List[Dict]]:
         """
-        Get current open orders from exchange.
+        Get current open orders from exchange, including trigger TP/SL orders.
 
         Parameters
         ----------
         force_fresh : bool
-            P0-3 (audit).  When True the openOrders request bypasses the
+            P0-3 (audit). When True the frontendOpenOrders request bypasses
             cache so safety-critical callers (cancel-all sweeps,
             orphan-protection legs, emergency close) see every order the
-            exchange thinks is live — NOT a value up to 2 s old.
+            exchange thinks is live, not a stale cached value.
 
         Returns:
-            List of open order dicts, or None when exchange state is unavailable
+            List of open order dicts, or None when exchange state is unavailable.
         """
         try:
             if not self.public_address:
                 logger.warning("No public address configured")
                 return None
 
+            # Plain openOrders can omit frontend trigger metadata. The
+            # frontendOpenOrders endpoint includes the fields needed to
+            # recognize TP/SL legs and cancel duplicates safely.
             data = self.api_manager.post(
-                {"type": "openOrders", "user": self.public_address},
+                {"type": "frontendOpenOrders", "user": self.public_address},
                 priority=Priority.HIGH,
                 timeout=10,
                 force_fresh=force_fresh,
             )
 
-            orders = data.get("orders", []) if isinstance(data, dict) else data
-            return orders if isinstance(orders, list) else []
+            orders = self._extract_open_orders_response(data)
+            if orders is None:
+                self._record_order_visibility_status(
+                    ok=False,
+                    order_count=None,
+                    reason="malformed_or_unavailable",
+                )
+                logger.error(
+                    "Error getting open orders: frontendOpenOrders returned "
+                    "unusable response type=%s",
+                    type(data).__name__,
+                )
+                return None
+            self._record_order_visibility_status(
+                ok=True,
+                order_count=len(orders),
+                reason="ok",
+            )
+            return orders
 
         except Exception as e:
+            self._record_order_visibility_status(
+                ok=False,
+                order_count=None,
+                reason=f"exception:{type(e).__name__}",
+            )
             logger.error(f"Error getting open orders: {e}")
             return None
-
     def apply_regime_overlay(self, signal: TradeSignal, regime_data: Optional[Dict] = None) -> TradeSignal:
         """
         Apply regime-based position sizing and risk adjustments to a signal.
@@ -5635,6 +5841,9 @@ class LiveTrader:
                 "source_orders_today": dict(self._source_orders_today),
                 "total_entry_signals_today": int(sum(self._source_orders_today.values())),
                 "entry_metrics": dict(self._entry_metrics),
+                "orphan_protection": dict(self._last_orphan_protection_summary),
+                "order_visibility": dict(self._last_order_visibility_status),
+                "protective_churn_trips": self._protective_churn_trips,
             }
 
         return {
@@ -5669,6 +5878,11 @@ class LiveTrader:
             "max_position_size_configured": self._max_position_size_configured,
             "max_order_usd": self.max_order_usd,
             "order_dedup_window_s": self._ORDER_DEDUP_WINDOW,
+            "order_visibility": state_snapshot["order_visibility"],
+            "orphan_protection": state_snapshot["orphan_protection"],
+            "protective_churn_trips": int(state_snapshot["protective_churn_trips"]),
+            "protective_repeat_window_s": self._protective_repeat_window_s,
+            "protective_repeat_max": self._protective_repeat_max,
             "fill_verify_blocking": self._fill_verify_blocking,
             "execute_fill_verify_blocking": self._execute_fill_verify_blocking,
             "source_policies": (

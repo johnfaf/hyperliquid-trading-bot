@@ -117,6 +117,9 @@ class PositionMonitor:
         self._last_gap_warn_time = 0.0
         self._transient_disconnects = 0
         self._rest_fallback_cycles = 0
+        self._transport_mode = "stopped"
+        self._transport_reason = ""
+        self._rest_only_until_ts = 0.0
 
         # Mid-price cache is refreshed by a dedicated REST thread so the
         # WebSocket message handler never blocks on external HTTP calls.
@@ -243,6 +246,10 @@ class PositionMonitor:
         """Stop the WebSocket connection and monitoring."""
         self._running = False
         self._reconnect_wake_event.set()
+        with self._lock:
+            self._transport_mode = "stopped"
+            self._transport_reason = "stopped"
+            self._rest_only_until_ts = 0.0
         if self._ws:
             try:
                 self._ws.close()
@@ -312,9 +319,14 @@ class PositionMonitor:
             Dict with connection status, message counts, etc.
         """
         with self._lock:
+            rest_only_remaining_s = max(0.0, self._rest_only_until_ts - time.time())
             return {
                 "connected": self._connected,
                 "running": self._running,
+                "transport_mode": self._transport_mode,
+                "transport_reason": self._transport_reason,
+                "rest_only_until": self._rest_only_until_ts,
+                "rest_only_remaining_s": round(rest_only_remaining_s, 1),
                 "tracked_addresses": len(self._tracked_addresses),
                 "subscribed_addresses": len(self._subscribed_addresses),
                 "active_position_addresses": len(self._active_position_addresses),
@@ -462,8 +474,12 @@ class PositionMonitor:
             if delay_s is None
             else max(0.0, float(delay_s))
         )
+        now = time.time()
         with self._lock:
             self._subscribed_addresses.clear()
+            self._transport_mode = "rest_only"
+            self._transport_reason = reason
+            self._rest_only_until_ts = now + wait_s
         self._request_fast_reconnect(reason, delay_s=wait_s, wake=False)
         logger.info(
             "PositionMonitor switching to REST-only mode for %.1fs: %s",
@@ -482,10 +498,14 @@ class PositionMonitor:
             delay_s=self._idle_rest_only_interval_s,
             wake=False,
         )
+        now = time.time()
         with self._lock:
             ws = self._ws
             self._subscribed_addresses.clear()
             self._connected = False
+            self._transport_mode = "rest_only"
+            self._transport_reason = reason
+            self._rest_only_until_ts = now + self._idle_rest_only_interval_s
         logger.info(
             "PositionMonitor switching to REST-only mode for %.1fs: %s",
             self._idle_rest_only_interval_s,
@@ -541,6 +561,9 @@ class PositionMonitor:
             self._last_msg_time = now
             self._last_ws_activity_time = now
             self._watchdog_grace_until = now + self._watchdog_startup_grace_s
+            self._transport_mode = "websocket"
+            self._transport_reason = "connected"
+            self._rest_only_until_ts = 0.0
             tracked = list(self._tracked_addresses)
             self._subscribed_addresses.clear()
 

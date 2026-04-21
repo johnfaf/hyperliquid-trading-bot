@@ -238,5 +238,7 @@ def _fmt_calibration(cal):
 def _fmt_multi(stats):
     return (
         f"{stats['venue_count']} venues ({', '.join(stats['venues'])}), "
-        f"{stats['scan_count']} scans, {stats['cached_traders']} cached"
+        f"{stats.get('health_check_count', 0)} health checks, "
+        f"{stats.get('funding_scan_count', 0)} funding scans, "
+        f"{stats['scan_count']} discovery scans, {stats['cached_traders']} cached"
     )

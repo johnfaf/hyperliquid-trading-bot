@@ -157,6 +157,7 @@ def write_health_report(
         "cycle": cycle_count,
         "version": "1.0",
     }
+    warnings = []
 
     try:
         live_active = is_live_trading_active(container)
@@ -308,6 +309,19 @@ def write_health_report(
         if getattr(container, "live_trader", None):
             live_stats = container.live_trader.get_stats()
             report["live_trading"] = live_stats
+            order_visibility = live_stats.get("order_visibility", {}) or {}
+            orphan_protection = live_stats.get("orphan_protection", {}) or {}
+            if live_active and order_visibility.get("ok") is False:
+                warnings.append(
+                    "live_order_visibility_degraded:"
+                    f"{order_visibility.get('reason', 'unknown')}"
+                )
+            if int(live_stats.get("protective_churn_trips", 0) or 0) > 0:
+                warnings.append("protective_order_churn_guard_tripped")
+            if int(orphan_protection.get("churn_blocked", 0) or 0) > 0:
+                warnings.append("orphan_protection_churn_blocked")
+            if int(orphan_protection.get("cancel_failed", 0) or 0) > 0:
+                warnings.append("orphan_protection_cancel_failed")
             report["canary"] = {
                 "mode": bool(live_stats.get("canary_mode", False)),
                 "attempted_entries": int(live_stats.get("attempted_entry_signals", 0) or 0),
@@ -316,6 +330,22 @@ def write_health_report(
                 "min_order_floorups": int(live_stats.get("min_order_floorups_today", 0) or 0),
                 "crash_safe_canary_order_usd": live_stats.get("crash_safe_canary_order_usd"),
             }
+    except Exception:
+        pass
+
+    try:
+        monitor = getattr(container, "position_monitor", None)
+        if monitor and hasattr(monitor, "get_stats"):
+            monitor_stats = monitor.get_stats()
+            report["position_monitor"] = monitor_stats
+            if (
+                monitor_stats.get("running")
+                and monitor_stats.get("transport_mode") == "rest_only"
+            ):
+                warnings.append(
+                    "position_monitor_rest_only:"
+                    f"{monitor_stats.get('transport_reason', 'unknown')}"
+                )
     except Exception:
         pass
 
@@ -330,6 +360,8 @@ def write_health_report(
         pass
 
     report["errors"] = list(_error_buffer[-20:])
+    if warnings:
+        report["warnings"] = sorted(set(str(w) for w in warnings if w))
 
     try:
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
