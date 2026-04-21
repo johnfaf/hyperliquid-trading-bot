@@ -759,6 +759,10 @@ class LiveTrader:
         # E7: restore recent order-dedup hashes so a restart within the dedup
         # window doesn't re-ship an order that may have already executed.
         self._load_persisted_order_dedup_cache()
+        # Restore fallback-protection attempts too.  Without this, every
+        # redeploy forgets that it already placed a rescue SL/TP bracket for
+        # the same position and can stack duplicate protective orders.
+        self._load_persisted_protective_attempt_history()
 
         logger.info(
             f"LiveTrader initialized: dry_run={dry_run}, "
@@ -2197,6 +2201,85 @@ class LiveTrader:
     ) -> str:
         return f"{str(coin).upper()}:{side}:{entry_price:.8g}:{size:.8g}"
 
+    _PROTECTIVE_ATTEMPT_STATE_KEY = "live_protective_attempt_history"
+
+    def _load_persisted_protective_attempt_history(self) -> None:
+        """Restore recent fallback SL/TP attempts from bot_state.
+
+        This is the restart-safe half of the protective churn guard.  If a
+        fresh process cannot classify existing exchange orders, it must not
+        blindly stack another fallback bracket for the same unchanged position.
+        """
+        try:
+            snapshot = db.get_bot_state(self._PROTECTIVE_ATTEMPT_STATE_KEY)
+        except Exception as exc:
+            logger.debug("Failed to load protective attempt history: %s", exc)
+            return
+        if not isinstance(snapshot, dict):
+            return
+
+        raw_attempts = snapshot.get("attempts", snapshot)
+        if not isinstance(raw_attempts, dict):
+            return
+
+        now = time.time()
+        cutoff = now - self._protective_repeat_window_s
+        restored_keys = 0
+        restored_attempts = 0
+        with self._state_lock:
+            for key, values in raw_attempts.items():
+                if not isinstance(key, str):
+                    continue
+                if isinstance(values, dict):
+                    values = values.get("timestamps", [])
+                if not isinstance(values, list):
+                    continue
+                filtered: List[float] = []
+                for value in values:
+                    try:
+                        ts = float(value)
+                    except (TypeError, ValueError):
+                        continue
+                    # Keep only plausible timestamps inside the current guard
+                    # window.  A small future allowance tolerates clock skew.
+                    if cutoff <= ts <= now + 60.0:
+                        filtered.append(ts)
+                if not filtered:
+                    continue
+                self._protective_attempt_history[key] = deque(sorted(filtered))
+                restored_keys += 1
+                restored_attempts += len(filtered)
+        if restored_attempts:
+            logger.warning(
+                "Restored %d recent protective fallback attempt(s) across %d "
+                "position key(s); duplicate fallback brackets will be blocked.",
+                restored_attempts,
+                restored_keys,
+            )
+
+    def _persist_protective_attempt_history(self) -> None:
+        """Best-effort persistence for restart-safe protective churn guard."""
+        try:
+            now = time.time()
+            cutoff = now - self._protective_repeat_window_s
+            with self._state_lock:
+                attempts = {
+                    key: [float(ts) for ts in history if ts >= cutoff]
+                    for key, history in self._protective_attempt_history.items()
+                    if any(ts >= cutoff for ts in history)
+                }
+            db.set_bot_state(
+                self._PROTECTIVE_ATTEMPT_STATE_KEY,
+                {
+                    "window_s": self._protective_repeat_window_s,
+                    "max_attempts": self._protective_repeat_max,
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                    "attempts": attempts,
+                },
+            )
+        except Exception as exc:
+            logger.debug("Failed to persist protective attempt history: %s", exc)
+
     def _protective_repeat_blocked(self, key: str) -> bool:
         now = time.time()
         cutoff = now - self._protective_repeat_window_s
@@ -2214,6 +2297,7 @@ class LiveTrader:
             while history and history[0] < cutoff:
                 history.popleft()
             history.append(now)
+        self._persist_protective_attempt_history()
 
     def _trip_protective_churn_guard(self, coin: str, key: str) -> None:
         with self._state_lock:
@@ -2860,12 +2944,17 @@ class LiveTrader:
         side = None
         if "b" in order and isinstance(order.get("b"), bool):
             side = "buy" if order["b"] else "sell"
-        elif isinstance(order.get("side"), str):
-            raw_side = order["side"].strip().lower()
-            if raw_side in ("buy", "b", "bid"):
-                side = "buy"
-            elif raw_side in ("sell", "s", "a", "ask"):
-                side = "sell"
+        else:
+            for side_key in ("side", "direction", "action"):
+                if not isinstance(order.get(side_key), str):
+                    continue
+                raw_side = order[side_key].strip().lower()
+                if raw_side in ("buy", "b", "bid") or "close short" in raw_side:
+                    side = "buy"
+                    break
+                if raw_side in ("sell", "s", "a", "ask") or "close long" in raw_side:
+                    side = "sell"
+                    break
 
         size_raw = order.get("sz")
         try:
@@ -5047,6 +5136,24 @@ class LiveTrader:
                     type(data).__name__,
                 )
                 return None
+            if not orders:
+                try:
+                    fallback_data = self.api_manager.post(
+                        {"type": "openOrders", "user": self.public_address},
+                        priority=Priority.HIGH,
+                        timeout=10,
+                        force_fresh=force_fresh,
+                    )
+                    fallback_orders = self._extract_open_orders_response(fallback_data)
+                    if fallback_orders:
+                        logger.warning(
+                            "frontendOpenOrders returned 0 orders but openOrders "
+                            "returned %d; using fallback order view for safety.",
+                            len(fallback_orders),
+                        )
+                        orders = fallback_orders
+                except Exception as exc:
+                    logger.debug("openOrders fallback after empty frontend view failed: %s", exc)
             self._record_order_visibility_status(
                 ok=True,
                 order_count=len(orders),

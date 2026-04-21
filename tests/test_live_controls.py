@@ -3461,6 +3461,134 @@ def test_protect_orphaned_positions_churn_guard_blocks_repeated_brackets(monkeyp
     assert trader.status_reason == "protective_order_churn"
 
 
+def test_protective_churn_guard_persists_across_restart(monkeypatch):
+    placed_triggers = []
+    bot_state = {}
+
+    class FakeFirewall:
+        def validate(self, signal, **kwargs):
+            return True, "ok"
+
+    def _get_state(key, default=None):
+        return bot_state.get(key, default)
+
+    def _set_state(key, value):
+        bot_state[key] = value
+        return True
+
+    monkeypatch.setattr("src.trading.live_trader.db.get_bot_state", _get_state)
+    monkeypatch.setattr("src.trading.live_trader.db.set_bot_state", _set_state)
+    monkeypatch.setattr(LiveTrader, "_load_credentials", _fake_live_credentials)
+    monkeypatch.setattr(LiveTrader, "_load_asset_index_map", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "reconcile_positions", lambda self: None)
+    monkeypatch.setattr(
+        LiveTrader,
+        "get_positions",
+        lambda self, **kw: [
+            {
+                "coin": "SOL",
+                "size": 0.13,
+                "szi": 0.13,
+                "side": "long",
+                "entry_price": 85.947,
+                "entryPx": 85.947,
+            },
+        ],
+    )
+    monkeypatch.setattr(LiveTrader, "get_open_orders", lambda self, **kw: [])
+    monkeypatch.setattr(
+        LiveTrader,
+        "place_trigger_order",
+        lambda self, coin, side, size, trigger_price, tp_or_sl="sl": (
+            placed_triggers.append((coin, side, size, trigger_price, tp_or_sl))
+            or {"status": "ok", "response": {"type": "order", "data": {"statuses": [{"resting": {"oid": len(placed_triggers)}}]}}}
+        ),
+    )
+
+    first_trader = LiveTrader(firewall=FakeFirewall(), dry_run=False, max_order_usd=15.0)
+    first = first_trader.protect_orphaned_positions()
+    second_trader = LiveTrader(firewall=FakeFirewall(), dry_run=False, max_order_usd=15.0)
+    second = second_trader.protect_orphaned_positions()
+
+    assert first["protected"] == 1
+    assert second["protected"] == 0
+    assert second["failed"] == 1
+    assert second["churn_blocked"] == 1
+    assert len(placed_triggers) == 2
+    assert second_trader.kill_switch_active is True
+    assert second_trader.status_reason == "protective_order_churn"
+
+
+def test_classify_protective_leg_handles_close_long_short_side_strings():
+    close_long = LiveTrader._classify_protective_leg(
+        {
+            "coin": "BTC",
+            "isTrigger": True,
+            "isPositionTpsl": True,
+            "reduceOnly": True,
+            "orderType": "Stop Market",
+            "side": "Close Long",
+            "origSz": "0.00015",
+            "triggerPx": "73979",
+            "oid": 101,
+        }
+    )
+    close_short = LiveTrader._classify_protective_leg(
+        {
+            "coin": "ETH",
+            "isTrigger": True,
+            "isPositionTpsl": True,
+            "reduceOnly": True,
+            "orderType": "Take Profit Market",
+            "direction": "Close Short",
+            "origSz": "0.01",
+            "triggerPx": "1800",
+            "oid": 102,
+        }
+    )
+
+    assert close_long["side"] == "sell"
+    assert close_long["leg"] == "sl"
+    assert close_short["side"] == "buy"
+    assert close_short["leg"] == "tp"
+
+
+def test_get_open_orders_uses_plain_open_orders_fallback_when_frontend_empty():
+    class FakeApiManager:
+        def __init__(self):
+            self.calls = []
+
+        def post(self, payload, **kwargs):
+            self.calls.append(payload["type"])
+            if payload["type"] == "frontendOpenOrders":
+                return []
+            return [
+                {
+                    "coin": "BTC",
+                    "isTrigger": True,
+                    "isPositionTpsl": True,
+                    "reduceOnly": True,
+                    "orderType": "Stop Market",
+                    "side": "Close Long",
+                    "origSz": "0.00015",
+                    "triggerPx": "73979",
+                    "oid": 101,
+                }
+            ]
+
+    trader = LiveTrader.__new__(LiveTrader)
+    trader.public_address = "0x2222222222222222222222222222222222222222"
+    trader.api_manager = FakeApiManager()
+    trader._state_lock = threading.Lock()
+    trader._last_order_visibility_status = {}
+
+    orders = trader.get_open_orders(force_fresh=True)
+
+    assert trader.api_manager.calls == ["frontendOpenOrders", "openOrders"]
+    assert len(orders) == 1
+    assert orders[0]["oid"] == 101
+
+
 def test_rescale_size_for_live_allows_1x_leverage_on_tight_wallet(monkeypatch):
     """1x leverage orders should not be blocked on a small wallet when
     the wallet actually has enough headroom.  Regression test for the
