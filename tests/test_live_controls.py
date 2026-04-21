@@ -20,6 +20,7 @@ from src.core.cycles.trading_cycle import (
     _execute_signal_live,
     _execute_lcrs_signals,
     _execute_options_flow_trades,
+    _live_safety_stop_reason,
     _process_closed_trades,
     _run_alpha_arena,
 )
@@ -1710,6 +1711,37 @@ def test_positive_daily_pnl_does_not_trigger_kill_switch(monkeypatch):
 
     assert trader.check_daily_loss() is False
     assert trader.kill_switch_active is False
+
+
+def test_live_safety_stop_reports_actual_kill_switch_reason():
+    trader = LiveTrader.__new__(LiveTrader)
+    trader._state_lock = threading.Lock()
+    trader.kill_switch_active = True
+    trader._kill_switch_reason = "dualwrite_unhealthy:recent_failures=11:total_failed=11"
+    trader.status_reason = "persisted_kill_switch"
+
+    reason = trader.get_safety_stop_reason()
+
+    assert reason == (
+        "kill_switch_active:dualwrite_unhealthy:"
+        "recent_failures=11:total_failed=11"
+    )
+    assert trader._safety_stop_rejection_code() == "kill_switch_active"
+    assert _live_safety_stop_reason(trader) == reason
+    assert "daily_loss" not in reason
+
+
+def test_live_safety_stop_keeps_daily_loss_rejection_code():
+    trader = LiveTrader.__new__(LiveTrader)
+    trader._state_lock = threading.Lock()
+    trader.kill_switch_active = True
+    trader._kill_switch_reason = "daily_loss_limit:125.00>100.00"
+    trader.status_reason = "daily_loss_limit_exceeded"
+
+    assert trader.get_safety_stop_reason() == (
+        "kill_switch_active:daily_loss_limit:125.00>100.00"
+    )
+    assert trader._safety_stop_rejection_code() == "daily_loss_exceeded"
 
 
 def test_hyperliquid_signer_zero_pads_signature_components(monkeypatch):

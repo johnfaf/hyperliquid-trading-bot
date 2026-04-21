@@ -108,6 +108,37 @@ def _fetch_arena_candle_universe():
 # Helpers
 # ---------------------------------------------------------------------------
 
+def _live_safety_stop_reason(live_trader) -> str:
+    """Return the actual reason live entries are stopped.
+
+    ``LiveTrader.check_daily_loss()`` intentionally acts as a shared safety
+    gate for daily loss, external kill switch, persisted kill switch and
+    dualwrite health.  Keep the trading-cycle log honest so operators do not
+    chase a fake daily-loss incident when the active stop came from another
+    guard.
+    """
+    state = {}
+    try:
+        if hasattr(live_trader, "get_safety_stop_reason"):
+            return str(live_trader.get_safety_stop_reason())
+        if hasattr(live_trader, "get_kill_switch_state"):
+            state = live_trader.get_kill_switch_state() or {}
+        elif hasattr(live_trader, "get_stats"):
+            stats = live_trader.get_stats() or {}
+            state = {
+                "active": bool(stats.get("kill_switch_active", False)),
+                "reason": stats.get("kill_switch_reason"),
+                "status_reason": stats.get("status_reason"),
+            }
+    except Exception:
+        state = {}
+
+    if state.get("active"):
+        reason = str(state.get("reason") or state.get("status_reason") or "active")
+        return f"kill_switch_active:{reason}"
+    return "daily_loss_limit_exceeded"
+
+
 def _inject_forecaster_signals(container, regime_data):
     """Feed options flow + polymarket into the predictive forecaster."""
     forecaster = container.predictive_forecaster
@@ -477,7 +508,10 @@ def run_trading_cycle(container, cycle_count: int) -> None:
     if container.live_trader and not container.live_trader.dry_run:
         container.live_trader.update_daily_pnl_from_fills()
         if container.live_trader.check_daily_loss():
-            logger.error("KILL SWITCH ACTIVE -- daily loss limit hit, skipping live trades")
+            logger.warning(
+                "LIVE SAFETY STOP -- %s; skipping new live entries",
+                _live_safety_stop_reason(container.live_trader),
+            )
 
         # Sweep for orphaned positions (opened successfully but SL/TP
         # placement was skipped due to an upstream error like the

@@ -1064,7 +1064,11 @@ class LiveTrader:
                     self.kill_switch_active = True
                     self._kill_switch_reason = reason
                     self.status_reason = "persisted_kill_switch"
-                logger.critical("Persisted kill switch restored (%s)", reason)
+                logger.warning(
+                    "Persisted kill switch restored (%s). New live entries remain "
+                    "blocked until an operator clears the persisted state.",
+                    reason,
+                )
         except Exception as exc:
             logger.warning("Failed to load kill-switch state from %s: %s", path, exc)
 
@@ -1349,6 +1353,37 @@ class LiveTrader:
             return bool(getattr(self, "kill_switch_active", False))
         with lock:
             return bool(self.kill_switch_active)
+
+    def get_kill_switch_state(self) -> Dict[str, Any]:
+        """Return a thread-safe snapshot of the sticky kill-switch state."""
+        lock = getattr(self, "_state_lock", None)
+        if lock is None:
+            return {
+                "active": bool(getattr(self, "kill_switch_active", False)),
+                "reason": getattr(self, "_kill_switch_reason", "") or None,
+                "status_reason": getattr(self, "status_reason", "") or None,
+            }
+        with lock:
+            return {
+                "active": bool(self.kill_switch_active),
+                "reason": self._kill_switch_reason or None,
+                "status_reason": self.status_reason or None,
+            }
+
+    def get_safety_stop_reason(self) -> str:
+        """Return the active live-entry stop reason for operator logs."""
+        state = self.get_kill_switch_state()
+        if state.get("active"):
+            reason = str(state.get("reason") or state.get("status_reason") or "active")
+            return f"kill_switch_active:{reason}"
+        return "daily_loss_limit_exceeded"
+
+    def _safety_stop_rejection_code(self) -> str:
+        """Map the current safety stop to the public rejection code."""
+        reason = self.get_safety_stop_reason()
+        if "daily_loss_limit" in reason:
+            return "daily_loss_exceeded"
+        return "kill_switch_active"
 
     def _coerce_signal(self, signal: Union[TradeSignal, Dict[str, Any]]) -> TradeSignal:
         """Accept either TradeSignal or execution dict for safer live mirroring."""
@@ -3972,8 +4007,14 @@ class LiveTrader:
                 return {"status": "rejected", "reason": "kill_switch_active"}
 
             if self.check_daily_loss(refresh_from_fills=True):
-                logger.warning(f"Daily loss limit exceeded - rejecting market order {coin} {side}")
-                return {"status": "rejected", "reason": "daily_loss_exceeded"}
+                reason = self.get_safety_stop_reason()
+                logger.warning(
+                    "Live safety stop (%s) - rejecting market order %s %s",
+                    reason,
+                    coin,
+                    side,
+                )
+                return {"status": "rejected", "reason": self._safety_stop_rejection_code()}
 
         # Get asset index
         asset_idx = self._get_asset_index(coin)
@@ -4291,8 +4332,14 @@ class LiveTrader:
                 logger.warning(f"Kill switch active - rejecting limit order {coin}")
                 return {"status": "rejected", "reason": "kill_switch_active"}
             if self.check_daily_loss(refresh_from_fills=True):
-                logger.warning(f"Daily loss limit exceeded - rejecting limit order {coin} {side}")
-                return {"status": "rejected", "reason": "daily_loss_exceeded"}
+                reason = self.get_safety_stop_reason()
+                logger.warning(
+                    "Live safety stop (%s) - rejecting limit order %s %s",
+                    reason,
+                    coin,
+                    side,
+                )
+                return {"status": "rejected", "reason": self._safety_stop_rejection_code()}
 
         asset_idx = self._get_asset_index(coin)
         if asset_idx is None:
@@ -5275,8 +5322,12 @@ class LiveTrader:
         # External kill-switch takes precedence over any other gate.
         self._refresh_external_kill_switch()
         if self.check_daily_loss(refresh_from_fills=True):
-            self._incr_entry_metric("rejected_daily_loss")
-            logger.warning("Daily loss limit exceeded - rejecting signal")
+            reason = self.get_safety_stop_reason()
+            if self._safety_stop_rejection_code() == "daily_loss_exceeded":
+                self._incr_entry_metric("rejected_daily_loss")
+            else:
+                self._incr_entry_metric("rejected_kill_switch")
+            logger.warning("Live safety stop (%s) - rejecting signal", reason)
             return None
 
         if not bypass_firewall:
