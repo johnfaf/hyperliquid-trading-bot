@@ -270,8 +270,13 @@ def test_live_manage_open_positions_trails_stop_using_shadow_policy(monkeypatch)
     monkeypatch.setattr(trader, "_get_mid_price", lambda coin: 102.0)
     monkeypatch.setattr(
         trader,
-        "_cancel_protective_orders",
-        lambda coin: cancellations.append(coin) or 2,
+        "_protective_order_oids",
+        lambda coin: {101, 102},
+    )
+    monkeypatch.setattr(
+        trader,
+        "_cancel_protective_order_oids",
+        lambda coin, oids: cancellations.append((coin, sorted(oids))) or len(oids),
     )
     monkeypatch.setattr(
         trader,
@@ -292,7 +297,7 @@ def test_live_manage_open_positions_trails_stop_using_shadow_policy(monkeypatch)
 
     assert summary["updated"] == 1
     assert summary["closed"] == 0
-    assert cancellations == ["ETH"]
+    assert cancellations == [("ETH", [101, 102])]
     assert placed
     _, close_side, size, stop_loss, take_profit = placed[0]
     assert close_side == "sell"

@@ -226,7 +226,7 @@ def build_subsystems(
 
     c = SubsystemContainer()
     c.data_source_registry = DataSourceRegistry()
-    for source_name in ("polymarket", "options_flow", "deribit"):
+    for source_name in ("polymarket", "options_flow", "deribit", "exchange_aggregator", "macro_regime"):
         c.data_source_registry.register_source(source_name)
     logger.info("Building subsystems (profile has %d features)...", len(profile))
 
@@ -242,7 +242,12 @@ def build_subsystems(
     from src.analysis.features import FeatureEngine
     from src.ui.reporter import Reporter
 
-    c.exchange_agg = _safe_init("exchange_aggregator", ExchangeAggregator, health, affects_trading=False)
+    c.exchange_agg = _safe_init(
+        "exchange_aggregator",
+        lambda: ExchangeAggregator(source_registry=c.data_source_registry),
+        health,
+        affects_trading=False,
+    )
     c.discovery = _safe_init("discovery", TraderDiscovery, health, affects_trading=False)
     c.identifier = _safe_init("strategy_identifier", StrategyIdentifier, health, affects_trading=False)
     c.scorer = _safe_init("strategy_scorer", StrategyScorer, health)
@@ -277,6 +282,24 @@ def build_subsystems(
                 ),
                 "policy_degraded_min_confidence": getattr(
                     config, "SOURCE_POLICY_DEGRADED_MIN_CONFIDENCE", 0.55
+                ),
+                "policy_dynamic_caps_enabled": getattr(
+                    config, "SOURCE_POLICY_DYNAMIC_CAPS_ENABLED", True
+                ),
+                "policy_active_min_signals_per_day": getattr(
+                    config, "SOURCE_POLICY_ACTIVE_MIN_SIGNALS_PER_DAY", 3
+                ),
+                "policy_active_max_signals_per_day": getattr(
+                    config, "SOURCE_POLICY_ACTIVE_MAX_SIGNALS_PER_DAY", 8
+                ),
+                "policy_strong_min_closed_trades": getattr(
+                    config, "SOURCE_POLICY_STRONG_MIN_CLOSED_TRADES", 12
+                ),
+                "policy_strong_win_rate": getattr(
+                    config, "SOURCE_POLICY_STRONG_WIN_RATE", 0.55
+                ),
+                "policy_strong_recent_pnl_floor": getattr(
+                    config, "SOURCE_POLICY_STRONG_RECENT_PNL_FLOOR", 0.0
                 ),
             }
         ),
@@ -563,7 +586,7 @@ def build_subsystems(
         from src.data.macro_regime_scraper import MacroRegimeScraper
         c.macro_regime = _safe_init(
             "macro_regime",
-            MacroRegimeScraper,
+            lambda: MacroRegimeScraper({"source_registry": c.data_source_registry}),
             health,
             affects_trading=False,
         )

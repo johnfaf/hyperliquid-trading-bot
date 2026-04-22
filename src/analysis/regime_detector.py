@@ -15,6 +15,7 @@ Each regime maps to which strategy types should be active vs paused.
 """
 import logging
 import time
+import copy
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 from collections import defaultdict
@@ -471,7 +472,12 @@ class RegimeDetector:
             overall_confidence = 0.0
 
         # Get strategy guidance for the overall regime
-        guidance = REGIME_STRATEGY_MAP.get(overall_regime, REGIME_STRATEGY_MAP[Regime.UNKNOWN])
+        # Return a per-cycle copy.  Downstream crash/macro overlays mutate
+        # strategy_guidance; sharing REGIME_STRATEGY_MAP's nested lists/dicts
+        # would poison future cycles (e.g. trending_up becoming activate=[]).
+        guidance = copy.deepcopy(
+            REGIME_STRATEGY_MAP.get(overall_regime, REGIME_STRATEGY_MAP[Regime.UNKNOWN])
+        )
 
         result = {
             "overall_regime": overall_regime.value,

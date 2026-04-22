@@ -96,6 +96,24 @@ class AgentScorer:
         self.policy_degraded_min_confidence = float(
             cfg.get("policy_degraded_min_confidence", 0.55)
         )
+        self.policy_dynamic_caps_enabled = bool(
+            cfg.get("policy_dynamic_caps_enabled", True)
+        )
+        self.policy_active_min_signals_per_day = int(
+            cfg.get("policy_active_min_signals_per_day", 3)
+        )
+        self.policy_active_max_signals_per_day = int(
+            cfg.get("policy_active_max_signals_per_day", 8)
+        )
+        if self.policy_active_max_signals_per_day < self.policy_active_min_signals_per_day:
+            self.policy_active_max_signals_per_day = self.policy_active_min_signals_per_day
+        self.policy_strong_min_closed_trades = int(
+            cfg.get("policy_strong_min_closed_trades", 12)
+        )
+        self.policy_strong_win_rate = float(cfg.get("policy_strong_win_rate", 0.55))
+        self.policy_strong_recent_pnl_floor = float(
+            cfg.get("policy_strong_recent_pnl_floor", 0.0)
+        )
 
         # Load existing scores from DB
         self._load_scores()
@@ -477,6 +495,7 @@ class AgentScorer:
             "weighted_accuracy": round(self.get_accuracy(source_key), 3),
             "completed_trades": len(self._completed_history(source_key)),
             "recent_pnl": 0.0,
+            "dynamic_cap_reason": "no_scorecard_row",
         }
         if not self.policy_enabled:
             default_policy["status"] = "active"
@@ -494,6 +513,7 @@ class AgentScorer:
             "weighted_accuracy": row["weighted_accuracy"],
             "completed_trades": row["completed_trades"],
             "recent_pnl": row["recent_pnl"],
+            "win_rate": row.get("win_rate", 0.0),
         }
         if row["status"] == "paused":
             policy.update(
@@ -502,6 +522,7 @@ class AgentScorer:
                     "max_signals_per_day": 0,
                     "size_multiplier": 0.0,
                     "min_confidence": 1.0,
+                    "dynamic_cap_reason": "paused",
                 }
             )
         elif row["status"] == "warmup":
@@ -510,6 +531,7 @@ class AgentScorer:
                     "max_signals_per_day": self.policy_warmup_max_signals_per_day,
                     "size_multiplier": self.policy_warmup_size_multiplier,
                     "min_confidence": self.policy_warmup_min_confidence,
+                    "dynamic_cap_reason": "warmup_fixed_cap",
                 }
             )
         elif row["status"] == "degraded":
@@ -518,11 +540,55 @@ class AgentScorer:
                     "max_signals_per_day": self.policy_degraded_max_signals_per_day,
                     "size_multiplier": self.policy_degraded_size_multiplier,
                     "min_confidence": self.policy_degraded_min_confidence,
+                    "dynamic_cap_reason": "degraded_fixed_cap",
                 }
             )
         else:
             policy["status"] = "active"
+            cap, reason = self._active_dynamic_cap(row)
+            policy["max_signals_per_day"] = cap
+            policy["dynamic_cap_reason"] = reason
         return policy
+
+    def _active_dynamic_cap(self, row: Dict) -> tuple[int, str]:
+        """Return a per-day cap for active sources based on realized edge."""
+        if not self.policy_dynamic_caps_enabled:
+            return 0, "dynamic_caps_disabled"
+
+        min_cap = max(0, int(self.policy_active_min_signals_per_day or 0))
+        max_cap = max(min_cap, int(self.policy_active_max_signals_per_day or 0))
+        if max_cap <= 0:
+            return 0, "active_unlimited"
+
+        completed = int(row.get("completed_trades", 0) or 0)
+        if completed < max(1, self.policy_strong_min_closed_trades):
+            return min_cap, f"active_min_until_{self.policy_strong_min_closed_trades}_closed"
+
+        win_rate = float(row.get("win_rate", 0.0) or 0.0)
+        dynamic_weight = float(row.get("dynamic_weight", 0.0) or 0.0)
+        recent_pnl = float(row.get("recent_pnl", 0.0) or 0.0)
+
+        if recent_pnl < self.policy_strong_recent_pnl_floor:
+            return min_cap, "recent_pnl_below_floor"
+
+        # Blend accuracy and dynamic weight into a smooth cap.  Strong sources
+        # earn more daily shots; weak-but-not-degraded sources stay alive but
+        # no longer get an unlimited firehose.
+        edge_score = (0.55 * dynamic_weight) + (0.45 * win_rate)
+        floor = max(0.0, min(self.policy_degrade_weight, 0.95))
+        normalized = (edge_score - floor) / max(1.0 - floor, 1e-6)
+        normalized = max(0.0, min(1.0, normalized))
+
+        span = max_cap - min_cap
+        cap = min_cap + int(round(span * normalized))
+        if win_rate >= self.policy_strong_win_rate:
+            cap = max(cap, min(max_cap, min_cap + int(math.ceil(span * 0.75))))
+
+        cap = max(min_cap, min(max_cap, cap))
+        return cap, (
+            f"active_dynamic_edge={edge_score:.2f};win={win_rate:.2f};"
+            f"weight={dynamic_weight:.2f};recent_pnl={recent_pnl:.2f}"
+        )
 
     def apply_weights_to_signals(self, signals: List) -> List:
         """

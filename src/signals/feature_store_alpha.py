@@ -13,6 +13,8 @@ When Postgres or the feature tables are unavailable it degrades gracefully.
 from __future__ import annotations
 
 import json
+import hashlib
+import hmac
 import logging
 import math
 import os
@@ -50,6 +52,15 @@ logger.addHandler(logging.NullHandler())
 
 HORIZON_STEPS = {"1h": 1, "4h": 4}
 DEFAULT_FEATURE_NAMES = list(fs.FEATURE_NAMES)
+
+
+def _secure_digest_equal(supplied: str, expected: str) -> bool:
+    if not supplied or not expected:
+        return False
+    try:
+        return hmac.compare_digest(str(supplied), str(expected))
+    except (TypeError, ValueError):
+        return False
 
 
 class _ConstantProbModel:
@@ -137,6 +148,16 @@ class FeatureStoreAlphaPipeline:
         self.cache_ttl = int(cfg.get("cache_ttl", 180))
         self.model_dir = Path(cfg.get("model_dir", "models/alpha_direction"))
         self.model_dir.mkdir(parents=True, exist_ok=True)
+        self.artifact_hmac_key = str(
+            cfg.get("artifact_hmac_key")
+            or os.environ.get("ALPHA_MODEL_ARTIFACT_HMAC_KEY", "")
+        )
+        self.require_signed_artifacts = str(
+            cfg.get(
+                "require_signed_artifacts",
+                os.environ.get("ALPHA_MODEL_REQUIRE_SIGNED_ARTIFACTS", "true"),
+            )
+        ).strip().lower() not in {"0", "false", "no", "off"}
 
         self._ensemble_specs = cfg.get(
             "ensemble_specs",
@@ -168,6 +189,58 @@ class FeatureStoreAlphaPipeline:
 
     def _artifact_path(self, horizon: str) -> Path:
         return self.model_dir / f"{self.timeframe}_{horizon}.pkl"
+
+    def _artifact_signature_path(self, path: Path) -> Path:
+        return path.with_suffix(path.suffix + ".sig")
+
+    def _artifact_signature(self, data: bytes) -> Dict[str, str]:
+        digest = hashlib.sha256(data).hexdigest()
+        signature = {"sha256": digest}
+        if self.artifact_hmac_key:
+            signature["hmac_sha256"] = hmac.new(
+                self.artifact_hmac_key.encode("utf-8"),
+                data,
+                hashlib.sha256,
+            ).hexdigest()
+        return signature
+
+    def _write_artifact_signature(self, path: Path, data: bytes) -> None:
+        signature = self._artifact_signature(data)
+        sig_path = self._artifact_signature_path(path)
+        tmp_sig = sig_path.with_suffix(sig_path.suffix + ".tmp")
+        with tmp_sig.open("w", encoding="utf-8") as fh:
+            json.dump(signature, fh, sort_keys=True)
+        os.replace(tmp_sig, sig_path)
+
+    def _verify_artifact_signature(self, path: Path, data: bytes) -> bool:
+        sig_path = self._artifact_signature_path(path)
+        if not sig_path.exists():
+            logger.warning("Alpha artifact %s skipped: missing signature sidecar", path)
+            return False
+        try:
+            with sig_path.open("r", encoding="utf-8") as fh:
+                stored = json.load(fh)
+        except Exception as exc:
+            logger.warning("Alpha artifact %s skipped: unreadable signature: %s", path, exc)
+            return False
+
+        expected = self._artifact_signature(data)
+        if not _secure_digest_equal(str(stored.get("sha256", "")), expected["sha256"]):
+            logger.warning("Alpha artifact %s skipped: sha256 mismatch", path)
+            return False
+
+        expected_hmac = expected.get("hmac_sha256")
+        if self.require_signed_artifacts:
+            if not self.artifact_hmac_key:
+                logger.warning(
+                    "Alpha artifact %s skipped: ALPHA_MODEL_ARTIFACT_HMAC_KEY is required",
+                    path,
+                )
+                return False
+            if not _secure_digest_equal(str(stored.get("hmac_sha256", "")), str(expected_hmac or "")):
+                logger.warning("Alpha artifact %s skipped: hmac mismatch", path)
+                return False
+        return True
 
     def _latest_run_rows(self) -> List[Dict]:
         conn, ret = self._pg_conn()
@@ -658,14 +731,22 @@ class FeatureStoreAlphaPipeline:
         # Atomic write: temp file + os.replace so a crash mid-write cannot
         # corrupt the model artifact that _load_models() reads at startup.
         tmp_path = path.with_suffix(path.suffix + ".tmp")
+        artifact_bytes = pickle.dumps(payload, protocol=pickle.HIGHEST_PROTOCOL)
         with tmp_path.open("wb") as fh:
-            pickle.dump(payload, fh)
+            fh.write(artifact_bytes)
             fh.flush()
             try:
                 os.fsync(fh.fileno())
             except OSError:
                 pass
         os.replace(str(tmp_path), str(path))
+        self._write_artifact_signature(path, artifact_bytes)
+        if self.require_signed_artifacts and not self.artifact_hmac_key:
+            logger.warning(
+                "Alpha artifact %s saved without HMAC; set ALPHA_MODEL_ARTIFACT_HMAC_KEY "
+                "or it will be skipped on next load.",
+                path,
+            )
 
     def _load_models(self) -> None:
         if not HAS_ALPHA_ML:
@@ -678,7 +759,10 @@ class FeatureStoreAlphaPipeline:
                 continue
             try:
                 with path.open("rb") as fh:
-                    payload = pickle.load(fh)
+                    artifact_bytes = fh.read()
+                if not self._verify_artifact_signature(path, artifact_bytes):
+                    continue
+                payload = pickle.loads(artifact_bytes)
                 members = payload.get("members") or []
                 calibrator = payload.get("calibrator")
                 metadata = dict(payload.get("metadata") or {})

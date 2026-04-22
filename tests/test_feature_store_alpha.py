@@ -1,5 +1,6 @@
 from unittest.mock import patch
 
+from src.signals import feature_store_alpha as alpha_mod
 from src.signals.feature_store_alpha import AlphaPrediction, FeatureStoreAlphaPipeline
 
 
@@ -133,3 +134,31 @@ def test_generate_signals_skips_conflicting_horizons_without_clear_winner(monkey
     )
 
     assert pipeline.generate_signals() == []
+
+
+def test_alpha_artifact_load_requires_valid_hmac_signature(monkeypatch, tmp_path):
+    monkeypatch.setattr(alpha_mod, "HAS_ALPHA_ML", True)
+    cfg = {
+        "model_dir": str(tmp_path),
+        "artifact_hmac_key": "test-artifact-key",
+        "require_signed_artifacts": True,
+    }
+    with patch.object(FeatureStoreAlphaPipeline, "_load_models", lambda self: None):
+        with patch.object(FeatureStoreAlphaPipeline, "train_if_due", lambda self, force=False: {}):
+            pipeline = FeatureStoreAlphaPipeline(cfg)
+    pipeline.models = {"1h": [_FakeMember(0.7)]}
+    pipeline.calibrators = {"1h": "calibrator"}
+    pipeline.model_metadata = {"1h": {"trained_at_epoch_s": 123.0}}
+
+    pipeline._save_artifacts("1h")
+
+    with patch.object(FeatureStoreAlphaPipeline, "train_if_due", lambda self, force=False: {}):
+        loaded = FeatureStoreAlphaPipeline(cfg)
+    assert "1h" in loaded.models
+
+    artifact_path = tmp_path / "1h_1h.pkl"
+    artifact_path.write_bytes(artifact_path.read_bytes() + b"tamper")
+
+    with patch.object(FeatureStoreAlphaPipeline, "train_if_due", lambda self, force=False: {}):
+        tampered = FeatureStoreAlphaPipeline(cfg)
+    assert "1h" not in tampered.models

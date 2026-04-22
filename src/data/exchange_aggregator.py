@@ -301,10 +301,25 @@ def _cryptocom_ticker(instrument_name: str) -> Optional[Dict]:
 class ExchangeAggregator:
     """Aggregates market data across exchanges to find volume trends and directional bias."""
 
-    def __init__(self):
+    def __init__(self, source_registry=None):
         self._cache: Dict[str, Dict] = {}
         self._cache_time: float = 0
         self._cache_ttl: float = 120  # 2-minute cache
+        self.source_registry = source_registry
+
+    def _mark_source(self, state: str, reason: str, metadata: Optional[Dict] = None) -> None:
+        registry = self.source_registry
+        if not registry:
+            return
+        try:
+            if state == "UP":
+                registry.mark_up("exchange_aggregator", reason=reason, metadata=metadata)
+            elif state == "DOWN":
+                registry.mark_down("exchange_aggregator", reason=reason, metadata=metadata)
+            else:
+                registry.mark_degraded("exchange_aggregator", reason=reason, metadata=metadata)
+        except Exception as exc:
+            logger.debug("exchange_aggregator source-registry update failed: %s", exc)
 
     def get_multi_exchange_data(self, coin: str) -> Optional[Dict]:
         """
@@ -313,6 +328,7 @@ class ExchangeAggregator:
         """
         symbols = SYMBOL_MAP.get(coin, {})
         if not symbols:
+            self._mark_source("DEGRADED", "coin not mapped", {"coin": coin})
             return None
 
         results = {}
@@ -354,10 +370,15 @@ class ExchangeAggregator:
             if ticker:
                 results["crypto.com"] = ticker
 
+        expected = [ex for ex, symbol in symbols.items() if symbol]
         if not results:
+            self._mark_source(
+                "DOWN",
+                f"no exchanges returned data for {coin}",
+                {"coin": coin, "expected_exchanges": expected},
+            )
             return None
 
-        expected = [ex for ex, symbol in symbols.items() if symbol]
         got = {"cryptocom" if k == "crypto.com" else k for k in results.keys()}
         if len(got) < len(expected):
             missing = sorted(set(expected) - got)
@@ -368,6 +389,17 @@ class ExchangeAggregator:
                     sorted(got),
                     missing,
                 )
+                self._mark_source(
+                    "DEGRADED",
+                    f"partial exchange data for {coin}",
+                    {"coin": coin, "got": sorted(got), "missing": missing},
+                )
+        else:
+            self._mark_source(
+                "UP",
+                f"all mapped exchanges returned data for {coin}",
+                {"coin": coin, "exchanges": sorted(got)},
+            )
 
         return self._compute_aggregate(coin, results)
 

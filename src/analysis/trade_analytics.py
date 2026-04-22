@@ -69,6 +69,11 @@ def _new_bucket() -> Dict:
         "slippage": 0.0,
         "avg_pnl": 0.0,
         "win_rate": 0.0,
+        "path_count": 0,
+        "mfe_r_sum": 0.0,
+        "mae_r_sum": 0.0,
+        "exit_r_sum": 0.0,
+        "path_capture_sum": 0.0,
     }
 
 
@@ -80,6 +85,7 @@ def _finalize_bucket(label: str, bucket: Dict) -> Dict:
     gross_pnl = round(float(bucket.get("gross_pnl", 0.0) or 0.0), 4)
     fees = round(float(bucket.get("fees", 0.0) or 0.0), 4)
     slippage = round(float(bucket.get("slippage", 0.0) or 0.0), 4)
+    path_count = int(bucket.get("path_count", 0) or 0)
     return {
         "label": label,
         "count": count,
@@ -91,6 +97,17 @@ def _finalize_bucket(label: str, bucket: Dict) -> Dict:
         "slippage": slippage,
         "avg_pnl": round(net_pnl / count, 4) if count else 0.0,
         "win_rate": round(wins / count, 4) if count else 0.0,
+        "path_count": path_count,
+        "avg_mfe_r": round(float(bucket.get("mfe_r_sum", 0.0) or 0.0) / path_count, 4)
+        if path_count else 0.0,
+        "avg_mae_r": round(float(bucket.get("mae_r_sum", 0.0) or 0.0) / path_count, 4)
+        if path_count else 0.0,
+        "avg_exit_r": round(float(bucket.get("exit_r_sum", 0.0) or 0.0) / path_count, 4)
+        if path_count else 0.0,
+        "avg_path_capture_ratio": round(
+            float(bucket.get("path_capture_sum", 0.0) or 0.0) / path_count,
+            4,
+        ) if path_count else 0.0,
     }
 
 
@@ -113,6 +130,19 @@ def compute_trade_analytics(
         fees = _coerce_float(meta.get("total_fees_paid", 0.0))
         slippage = _coerce_float(meta.get("total_slippage_cost", 0.0))
         gross_pnl = _coerce_float(meta.get("gross_pnl_before_fees", pnl + fees))
+        has_path_metrics = any(
+            key in meta
+            for key in (
+                "max_r_multiple",
+                "min_r_multiple",
+                "exit_r_multiple",
+                "path_capture_ratio",
+            )
+        )
+        max_r = _coerce_float(meta.get("max_r_multiple", meta.get("mfe_r_multiple", 0.0)))
+        min_r = _coerce_float(meta.get("min_r_multiple", meta.get("mae_r_multiple", 0.0)))
+        exit_r = _coerce_float(meta.get("exit_r_multiple", 0.0))
+        capture_ratio = _coerce_float(meta.get("path_capture_ratio", 0.0))
         source_key = _trade_source_label(trade)
 
         for bucket in (summary, by_side[side], by_source[source_key], by_coin_side[(coin, side)]):
@@ -125,6 +155,12 @@ def compute_trade_analytics(
                 bucket["wins"] += 1
             elif pnl < 0:
                 bucket["losses"] += 1
+            if has_path_metrics:
+                bucket["path_count"] += 1
+                bucket["mfe_r_sum"] += max_r
+                bucket["mae_r_sum"] += min_r
+                bucket["exit_r_sum"] += exit_r
+                bucket["path_capture_sum"] += capture_ratio
 
     side_rows: List[Dict] = []
     for side in ("long", "short", "unknown"):

@@ -7,11 +7,13 @@ Serves a unified web dashboard on port 8080 with:
 Both dashboards served from the same port for Railway compatibility.
 """
 import errno
+import hashlib
 import hmac
 import json
 import os
 import sys
 import threading
+import time
 from http.cookies import SimpleCookie
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime, timezone
@@ -75,6 +77,20 @@ def _dashboard_auth_token() -> str:
     return os.environ.get("DASHBOARD_AUTH_TOKEN", "").strip()
 
 
+def _dashboard_session_ttl_s() -> int:
+    try:
+        return max(300, min(int(os.environ.get("DASHBOARD_SESSION_TTL_S", "86400")), 30 * 86400))
+    except (TypeError, ValueError):
+        return 86400
+
+
+def _max_request_body_bytes() -> int:
+    try:
+        return max(1024, min(int(os.environ.get("DASHBOARD_MAX_REQUEST_BODY_BYTES", "65536")), 2_000_000))
+    except (TypeError, ValueError):
+        return 65536
+
+
 def _secure_token_eq(supplied: str, expected: str) -> bool:
     """
     Constant-time comparison of supplied token vs expected token.
@@ -89,6 +105,62 @@ def _secure_token_eq(supplied: str, expected: str) -> bool:
         return hmac.compare_digest(str(supplied), str(expected))
     except (TypeError, ValueError):
         return False
+
+
+def _make_auth_session_cookie(auth_token: str) -> str:
+    """Create an HMAC session cookie without storing the raw master token."""
+    issued_at = str(int(time.time()))
+    payload = f"v1.{issued_at}"
+    mac = hmac.new(
+        auth_token.encode("utf-8"),
+        payload.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    return f"{payload}.{mac}"
+
+
+def _verify_auth_session_cookie(cookie_value: str, auth_token: str) -> bool:
+    if not cookie_value or not auth_token:
+        return False
+    parts = str(cookie_value).split(".")
+    if len(parts) != 3 or parts[0] != "v1":
+        return False
+    _, issued_at_raw, supplied_mac = parts
+    try:
+        issued_at = int(issued_at_raw)
+    except (TypeError, ValueError):
+        return False
+    now = int(time.time())
+    if issued_at > now + 60:
+        return False
+    if now - issued_at > _dashboard_session_ttl_s():
+        return False
+    payload = f"v1.{issued_at_raw}"
+    expected_mac = hmac.new(
+        auth_token.encode("utf-8"),
+        payload.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    return _secure_token_eq(supplied_mac, expected_mac)
+
+
+def _allowed_dashboard_origins() -> set[str]:
+    origins = {
+        "http://127.0.0.1:8080",
+        "http://localhost:8080",
+    }
+    configured = os.environ.get("DASHBOARD_ALLOWED_ORIGINS") or os.environ.get("DASHBOARD_CORS_ORIGIN", "")
+    for origin in configured.replace(";", ",").split(","):
+        origin = origin.strip().rstrip("/")
+        if origin and origin != "*":
+            origins.add(origin)
+    public_url = os.environ.get("DASHBOARD_PUBLIC_URL", "").strip().rstrip("/")
+    if public_url:
+        origins.add(public_url)
+    railway_domain = os.environ.get("RAILWAY_PUBLIC_DOMAIN", "").strip()
+    if railway_domain:
+        origins.add(f"https://{railway_domain}".rstrip("/"))
+    return origins
 
 
 def _truthy_env(name: str, default: str = "false") -> bool:
@@ -778,6 +850,9 @@ def _build_runtime_health_snapshot() -> Dict:
                 "source_policies": stats.get("source_policies", [])[:10],
                 "short_side_policy": stats.get("short_side_policy", {}),
                 "entry_metrics": stats.get("entry_metrics", {}),
+                "live_sizing": stats.get("live_sizing", {}),
+                "risk_sizing": stats.get("risk_sizing", {}),
+                "order_hygiene_audit": stats.get("order_hygiene_audit", {}),
                 "min_order_rejects_today": stats.get("min_order_rejects_today"),
                 "min_order_floorups_today": stats.get("min_order_floorups_today"),
                 "min_order_top_tier_floorups_today": stats.get("min_order_top_tier_floorups_today"),
@@ -1458,6 +1533,8 @@ function renderTradeAnalytics(analytics, runtime){
     </tr>`).join('') : '<tr><td colspan="5" class="empty-row">No coin-side analytics yet</td></tr>';
 
   const entryMetrics = runtimeLive.entry_metrics || {};
+  const sizing = runtimeLive.live_sizing || {};
+  const hygiene = runtimeLive.order_hygiene_audit || {};
   const attempted = Number(runtimeLive.attempted_entry_signals || 0);
   const executed = Number(runtimeLive.executed_entry_signals || 0);
   const acceptRate = attempted > 0 ? `${((executed / attempted) * 100).toFixed(1)}%` : 'n/a';
@@ -1473,6 +1550,9 @@ function renderTradeAnalytics(analytics, runtime){
     ['Approved but not executable', Number(runtimeLive.approved_but_not_executable_today || 0)],
     ['Canary headroom', runtimeLive.canary_headroom_ratio != null ? `${runtimeLive.canary_headroom_ratio}x` : 'n/a'],
     ['Crash-safe cap', runtimeLive.crash_safe_canary_order_usd != null ? fmtUsd(runtimeLive.crash_safe_canary_order_usd) : 'n/a'],
+    ['Live sizing', sizing.enabled ? `${fmtUsd(sizing.target_margin_usd || 0)} margin / ${fmtUsd(sizing.target_notional_usd || 0)} notional (${sizing.reason || 'n/a'})` : (sizing.reason || 'disabled')],
+    ['Last sizing risk', sizing.stop_roe_pct != null ? `${(Number(sizing.stop_roe_pct) * 100).toFixed(2)}% ROE stop, risk ${fmtUsd(sizing.risk_budget_usd || 0)}` : 'n/a'],
+    ['Order hygiene', hygiene.status ? `${String(hygiene.status).toUpperCase()} | protected ${hygiene.protected || 0}, cancelled ${hygiene.stale_cancelled || 0}, failed ${hygiene.failed || 0}` : 'n/a'],
     ['Top reject', (runtime || {}).firewall?.top_rejection_reason || 'none'],
   ];
   Object.entries(entryMetrics)
@@ -1860,6 +1940,8 @@ function renderRuntimeHealth(runtime) {
   const executed = Number(live.executed_entry_signals || 0);
   const hitRate = attempted > 0 ? `${((executed / attempted) * 100).toFixed(1)}%` : 'n/a';
   const shortPolicy = live.short_side_policy || fw.short_side_policy || {};
+  const liveSizing = live.live_sizing || {};
+  const hygieneAudit = live.order_hygiene_audit || {};
   const copyGuardrail = (runtime.copy_trader || {}).guardrail || {};
   const copyGuardrailLine = copyGuardrail.reason
     ? `<div>Copy-trade guardrail: <strong>${String(copyGuardrail.status || 'unknown').toUpperCase()}</strong> | ${copyGuardrail.reason}</div>`
@@ -1873,6 +1955,8 @@ function renderRuntimeHealth(runtime) {
     `<div>Canary execution: <strong>${executed}/${attempted}</strong> (${hitRate}) | min-order rejects <strong>${live.min_order_rejects_today || 0}</strong> | floor-ups <strong>${live.min_order_floorups_today || 0}</strong></div>` +
     `<div>Execution rescue: top-tier floor-ups <strong>${live.min_order_top_tier_floorups_today || 0}</strong> | same-side merges <strong>${live.min_order_same_side_merges_today || 0}</strong> | approved but not executable <strong>${live.approved_but_not_executable_today || 0}</strong></div>` +
     `<div>Canary headroom: <strong>${live.canary_headroom_ratio != null ? live.canary_headroom_ratio + 'x' : 'n/a'}</strong> | crash-safe cap <strong>${live.crash_safe_canary_order_usd != null ? fmtUsd(live.crash_safe_canary_order_usd) : 'n/a'}</strong></div>` +
+    `<div>Live sizing: <strong>${liveSizing.enabled ? fmtUsd(liveSizing.target_margin_usd || 0) + ' margin / ' + fmtUsd(liveSizing.target_notional_usd || 0) + ' notional' : (liveSizing.reason || 'n/a')}</strong> | stop <strong>${liveSizing.stop_roe_pct != null ? (Number(liveSizing.stop_roe_pct) * 100).toFixed(2) + '% ROE' : 'n/a'}</strong></div>` +
+    `<div>Order hygiene: <strong>${String(hygieneAudit.status || 'n/a').toUpperCase()}</strong> | protected <strong>${hygieneAudit.protected || 0}</strong> | cancelled <strong>${hygieneAudit.stale_cancelled || 0}</strong> | failed <strong>${hygieneAudit.failed || 0}</strong></div>` +
     `<div>Short guardrail: <strong>${String(shortPolicy.status || 'unknown').toUpperCase()}</strong> — ${shortPolicy.reason || 'n/a'}</div>` +
     copyGuardrailLine +
     `<div>Live source usage: <strong>${sourceUsageSummary}</strong></div>` +
@@ -1970,9 +2054,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
         pending_auth_cookie = getattr(self, "_pending_auth_cookie", "")
         if pending_auth_cookie:
             secure_attr = "; Secure" if _is_hosted_dashboard_environment() else ""
+            max_age = _dashboard_session_ttl_s()
             self.send_header(
                 "Set-Cookie",
-                f"{_AUTH_COOKIE_NAME}={pending_auth_cookie}; Path=/; HttpOnly; SameSite=Lax{secure_attr}",
+                f"{_AUTH_COOKIE_NAME}={pending_auth_cookie}; Path=/; "
+                f"Max-Age={max_age}; HttpOnly; SameSite=Lax{secure_attr}",
             )
 
     def _cookie_auth_token(self) -> str:
@@ -2013,9 +2099,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if auth_header.startswith("Bearer ") and _secure_token_eq(
             auth_header[7:].strip(), auth_token
         ):
-            self._pending_auth_cookie = auth_token
+            self._pending_auth_cookie = _make_auth_session_cookie(auth_token)
             return True
-        if _secure_token_eq(self._cookie_auth_token(), auth_token):
+        if _verify_auth_session_cookie(self._cookie_auth_token(), auth_token):
             return True
         if self.command == "GET" and not parsed.path.startswith("/api/"):
             next_path = parsed.path or "/"
@@ -2046,8 +2132,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def _handle_login(self):
         auth_token = _dashboard_auth_token()
-        content_len = int(self.headers.get("Content-Length", 0) or 0)
-        raw_body = self.rfile.read(content_len) if content_len > 0 else b""
+        raw_body = self._read_request_body()
+        if raw_body is None:
+            return
         form = parse_qs(raw_body.decode("utf-8", errors="ignore"))
         token = (form.get("token", [""])[0] or "").strip()
         next_path = (form.get("next", ["/"])[0] or "/").strip()
@@ -2059,8 +2146,54 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if not _secure_token_eq(token, auth_token):
             self._redirect(f"/login?error=invalid&next={quote(next_path, safe='/?=&')}")
             return
-        self._pending_auth_cookie = auth_token
+        self._pending_auth_cookie = _make_auth_session_cookie(auth_token)
         self._redirect(next_path)
+
+    def _read_request_body(self, max_bytes: int | None = None) -> bytes | None:
+        """Read a bounded request body, sending an error response on rejection."""
+        max_bytes = _max_request_body_bytes() if max_bytes is None else max_bytes
+        try:
+            content_len = int(self.headers.get("Content-Length", 0) or 0)
+        except (TypeError, ValueError):
+            self._json_response({"error": "invalid_content_length"}, code=400)
+            return None
+        if content_len < 0:
+            self._json_response({"error": "invalid_content_length"}, code=400)
+            return None
+        if content_len > max_bytes:
+            self._json_response(
+                {
+                    "error": "request_body_too_large",
+                    "max_bytes": max_bytes,
+                },
+                code=413,
+            )
+            return None
+        return self.rfile.read(content_len) if content_len > 0 else b""
+
+    def _read_json_body(self) -> dict | None:
+        raw_body = self._read_request_body()
+        if raw_body is None:
+            return None
+        if not raw_body:
+            return {}
+        try:
+            parsed = json.loads(raw_body)
+        except json.JSONDecodeError as exc:
+            self._json_response({"error": f"invalid_json: {exc.msg}"}, code=400)
+            return None
+        if not isinstance(parsed, dict):
+            self._json_response({"error": "json_object_required"}, code=400)
+            return None
+        return parsed
+
+    def _send_cors_headers(self):
+        origin = self.headers.get("Origin", "").strip().rstrip("/")
+        if not origin:
+            return
+        if origin in _allowed_dashboard_origins():
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Vary", "Origin")
 
     def do_GET(self):
         if not self._check_auth():
@@ -2284,9 +2417,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
             import config as _cfg
             # Read optional balance from request body
             balance = _cfg.PAPER_TRADING_INITIAL_BALANCE
-            content_len = int(self.headers.get("Content-Length", 0))
-            if content_len > 0:
-                body = json.loads(self.rfile.read(content_len))
+            body = self._read_json_body()
+            if body is None:
+                return
+            if body:
                 balance = float(body.get("balance", balance))
             result = reset_paper_trades(balance)
             self._json_response({"status": "ok", **result})
@@ -2296,8 +2430,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def _handle_close_trade(self):
         """Close a single paper trade at current market price."""
         try:
-            content_len = int(self.headers.get("Content-Length", 0))
-            body = json.loads(self.rfile.read(content_len)) if content_len > 0 else {}
+            body = self._read_json_body()
+            if body is None:
+                return
             trade_id = body.get("trade_id")
             if not trade_id:
                 self._json_response({"error": "trade_id required"}, code=400)
@@ -2363,8 +2498,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def _handle_stress_run(self):
         """Run a stress test on demand."""
         try:
-            content_len = int(self.headers.get("Content-Length", 0))
-            body = json.loads(self.rfile.read(content_len)) if content_len > 0 else {}
+            body = self._read_json_body()
+            if body is None:
+                return
             scenarios = body.get("scenarios", None)
             use_seed = body.get("use_seed", False)
 
@@ -2389,8 +2525,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def _handle_candle_fetch(self):
         """Fetch candle data from Hyperliquid API (and cache it)."""
         try:
-            content_len = int(self.headers.get("Content-Length", 0))
-            body = json.loads(self.rfile.read(content_len)) if content_len > 0 else {}
+            body = self._read_json_body()
+            if body is None:
+                return
 
             from src.backtest.data_fetcher import DataFetcher
             fetcher = DataFetcher()
@@ -2415,8 +2552,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def _handle_candle_backtest(self):
         """Run a candle-based backtest and return results."""
         try:
-            content_len = int(self.headers.get("Content-Length", 0))
-            body = json.loads(self.rfile.read(content_len)) if content_len > 0 else {}
+            body = self._read_json_body()
+            if body is None:
+                return
 
             from src.backtest.data_fetcher import DataFetcher
             from src.backtest.candle_backtester import CandleBacktester, CandleBacktestConfig
@@ -2482,8 +2620,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def _handle_cache_clear(self):
         """Clear the candle data cache."""
         try:
-            content_len = int(self.headers.get("Content-Length", 0))
-            body = json.loads(self.rfile.read(content_len)) if content_len > 0 else {}
+            body = self._read_json_body()
+            if body is None:
+                return
             from src.backtest.data_fetcher import DataFetcher
             fetcher = DataFetcher()
             coin = body.get("coin")
@@ -2497,7 +2636,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         try:
             self.send_response(code)
             self.send_header("Content-Type", "application/json")
-            self.send_header("Access-Control-Allow-Origin", "*")
+            self._send_cors_headers()
             self._send_no_cache_headers()
             self.end_headers()
             self.wfile.write(json.dumps(data, default=_safe_json).encode())
@@ -2537,8 +2676,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def _handle_order(self):
         """Handle options order placement (needs Deribit API keys)."""
         try:
-            content_len = int(self.headers.get("Content-Length", 0))
-            body = json.loads(self.rfile.read(content_len))
+            body = self._read_json_body()
+            if body is None:
+                return
             self._json_response({
                 "status": "Order queued (Deribit API keys required for live execution)",
                 "order": body,

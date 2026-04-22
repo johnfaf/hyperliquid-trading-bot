@@ -860,6 +860,17 @@ class DecisionFirewall:
                 return _reject("rejected_macro_regime",
                               f"Macro regime blocks new entries: {reason_str}")
 
+            countertrend_block_side = str(
+                regime_data.get("countertrend_block_side", "") or ""
+            ).strip().lower()
+            if countertrend_block_side and side_value == countertrend_block_side:
+                return _reject(
+                    "rejected_regime",
+                    f"Regime disagreement blocks countertrend {side_value} entries "
+                    f"(detector={regime_data.get('detector_regime', regime_data.get('overall_regime', '?'))}, "
+                    f"forecaster={regime_data.get('forecaster_regime', '?')})",
+                )
+
         # 9. Source accuracy check (if we have history)
         if self.min_source_accuracy > 0 and signal.source_accuracy > 0:
             if signal.source_accuracy < self.min_source_accuracy:
