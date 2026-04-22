@@ -8,6 +8,7 @@ Runs every ~5 minutes to react to market changes quickly.
 Extracted from ``HyperliquidResearchBot._run_trading_cycle``.
 """
 import logging
+import copy
 from datetime import datetime, timezone
 
 import config
@@ -200,6 +201,8 @@ def _reconcile_regimes(regime_data: dict, container) -> dict:
 
     regime_data["forecaster_regime"] = pred_regime
     regime_data["forecaster_confidence"] = pred_conf
+    regime_data["detector_regime"] = det_regime
+    regime_data["detector_confidence"] = det_conf
     regime_data["regime_agreement"] = agree
 
     if not agree and min(pred_conf, det_conf) >= 0.5:
@@ -218,8 +221,17 @@ def _reconcile_regimes(regime_data: dict, container) -> dict:
             )
             regime_data["overall_regime"] = "volatile"
             regime_data["regime_override"] = "forecaster_crash"
+            # Treat detector/forecaster disagreement as defensive, not as
+            # permission to invert the trade book.  Dedicated hedge logic can
+            # reduce risk; ordinary entry signals should not open fresh
+            # counter-trend shorts while the technical detector still shows a
+            # high-confidence uptrend.
+            if det_regime == "trending_up":
+                regime_data["countertrend_block_side"] = "short"
+            elif det_regime == "trending_down":
+                regime_data["countertrend_block_side"] = "long"
             # Suppress bullish strategy activation
-            guidance = regime_data.get("strategy_guidance", {})
+            guidance = copy.deepcopy(regime_data.get("strategy_guidance", {}))
             guidance["pause"] = list(set(guidance.get("pause", []) + guidance.get("activate", [])))
             guidance["activate"] = []
             regime_data["strategy_guidance"] = guidance
@@ -280,7 +292,7 @@ def _apply_macro_regime_overlay(container, regime_data: dict) -> dict:
     regime_data["macro_reasons"] = reasons
 
     # Apply size modifier to strategy guidance
-    guidance = regime_data.get("strategy_guidance", {})
+    guidance = copy.deepcopy(regime_data.get("strategy_guidance", {}))
     current_size_mod = float(guidance.get("size_modifier", 1.0))
     guidance["size_modifier"] = round(current_size_mod * size_mod, 3)
     regime_data["strategy_guidance"] = guidance
