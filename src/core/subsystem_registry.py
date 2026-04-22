@@ -278,6 +278,24 @@ def build_subsystems(
                 "policy_degraded_min_confidence": getattr(
                     config, "SOURCE_POLICY_DEGRADED_MIN_CONFIDENCE", 0.55
                 ),
+                "policy_dynamic_caps_enabled": getattr(
+                    config, "SOURCE_POLICY_DYNAMIC_CAPS_ENABLED", True
+                ),
+                "policy_active_min_signals_per_day": getattr(
+                    config, "SOURCE_POLICY_ACTIVE_MIN_SIGNALS_PER_DAY", 3
+                ),
+                "policy_active_max_signals_per_day": getattr(
+                    config, "SOURCE_POLICY_ACTIVE_MAX_SIGNALS_PER_DAY", 8
+                ),
+                "policy_strong_min_closed_trades": getattr(
+                    config, "SOURCE_POLICY_STRONG_MIN_CLOSED_TRADES", 12
+                ),
+                "policy_strong_win_rate": getattr(
+                    config, "SOURCE_POLICY_STRONG_WIN_RATE", 0.55
+                ),
+                "policy_strong_recent_pnl_floor": getattr(
+                    config, "SOURCE_POLICY_STRONG_RECENT_PNL_FLOOR", 0.0
+                ),
             }
         ),
         health,

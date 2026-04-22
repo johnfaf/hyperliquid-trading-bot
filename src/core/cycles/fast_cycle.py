@@ -23,6 +23,13 @@ logger.addHandler(logging.NullHandler())
 DEFAULT_KILL_SWITCH_FILE = "/data/KILL_SWITCH"
 
 
+def _live_order_hygiene_audit_interval_cycles() -> int:
+    try:
+        return max(1, int(float(os.environ.get("LIVE_ORDER_HYGIENE_AUDIT_INTERVAL_CYCLES", "5"))))
+    except (TypeError, ValueError):
+        return 5
+
+
 # CRIT-FIX C5: module-level lock + flag used by BOTH the file-kill-switch
 # path (fast cycle thread) and the shutdown signal handler (main thread) so
 # that live-order cancellation is performed at most once, regardless of which
@@ -372,6 +379,16 @@ def run_fast_cycle(container, cycle_count: int) -> None:
             manage_summary = container.live_trader.manage_open_positions()
             if manage_summary.get("updated") or manage_summary.get("closed") or manage_summary.get("failed"):
                 logger.info("[fast] Live risk management summary: %s", manage_summary)
+            audit_fn = getattr(container.live_trader, "audit_live_order_hygiene", None)
+            if callable(audit_fn):
+                interval = _live_order_hygiene_audit_interval_cycles()
+                if cycle_count % interval == 0:
+                    audit_summary = audit_fn(repair=True)
+                    failed = int(audit_summary.get("failed", 0) or 0)
+                    cancelled = int(audit_summary.get("stale_cancelled", 0) or 0)
+                    cancel_failed = int(audit_summary.get("cancel_failed", 0) or 0)
+                    if failed or cancelled or cancel_failed:
+                        logger.warning("[fast] Live order hygiene audit summary: %s", audit_summary)
 
         if container.copy_trader:
             copy_signals = container.copy_trader.scan_top_traders(top_n=10)

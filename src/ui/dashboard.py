@@ -778,6 +778,9 @@ def _build_runtime_health_snapshot() -> Dict:
                 "source_policies": stats.get("source_policies", [])[:10],
                 "short_side_policy": stats.get("short_side_policy", {}),
                 "entry_metrics": stats.get("entry_metrics", {}),
+                "live_sizing": stats.get("live_sizing", {}),
+                "risk_sizing": stats.get("risk_sizing", {}),
+                "order_hygiene_audit": stats.get("order_hygiene_audit", {}),
                 "min_order_rejects_today": stats.get("min_order_rejects_today"),
                 "min_order_floorups_today": stats.get("min_order_floorups_today"),
                 "min_order_top_tier_floorups_today": stats.get("min_order_top_tier_floorups_today"),
@@ -1458,6 +1461,8 @@ function renderTradeAnalytics(analytics, runtime){
     </tr>`).join('') : '<tr><td colspan="5" class="empty-row">No coin-side analytics yet</td></tr>';
 
   const entryMetrics = runtimeLive.entry_metrics || {};
+  const sizing = runtimeLive.live_sizing || {};
+  const hygiene = runtimeLive.order_hygiene_audit || {};
   const attempted = Number(runtimeLive.attempted_entry_signals || 0);
   const executed = Number(runtimeLive.executed_entry_signals || 0);
   const acceptRate = attempted > 0 ? `${((executed / attempted) * 100).toFixed(1)}%` : 'n/a';
@@ -1473,6 +1478,9 @@ function renderTradeAnalytics(analytics, runtime){
     ['Approved but not executable', Number(runtimeLive.approved_but_not_executable_today || 0)],
     ['Canary headroom', runtimeLive.canary_headroom_ratio != null ? `${runtimeLive.canary_headroom_ratio}x` : 'n/a'],
     ['Crash-safe cap', runtimeLive.crash_safe_canary_order_usd != null ? fmtUsd(runtimeLive.crash_safe_canary_order_usd) : 'n/a'],
+    ['Live sizing', sizing.enabled ? `${fmtUsd(sizing.target_margin_usd || 0)} margin / ${fmtUsd(sizing.target_notional_usd || 0)} notional (${sizing.reason || 'n/a'})` : (sizing.reason || 'disabled')],
+    ['Last sizing risk', sizing.stop_roe_pct != null ? `${(Number(sizing.stop_roe_pct) * 100).toFixed(2)}% ROE stop, risk ${fmtUsd(sizing.risk_budget_usd || 0)}` : 'n/a'],
+    ['Order hygiene', hygiene.status ? `${String(hygiene.status).toUpperCase()} | protected ${hygiene.protected || 0}, cancelled ${hygiene.stale_cancelled || 0}, failed ${hygiene.failed || 0}` : 'n/a'],
     ['Top reject', (runtime || {}).firewall?.top_rejection_reason || 'none'],
   ];
   Object.entries(entryMetrics)
@@ -1860,6 +1868,8 @@ function renderRuntimeHealth(runtime) {
   const executed = Number(live.executed_entry_signals || 0);
   const hitRate = attempted > 0 ? `${((executed / attempted) * 100).toFixed(1)}%` : 'n/a';
   const shortPolicy = live.short_side_policy || fw.short_side_policy || {};
+  const liveSizing = live.live_sizing || {};
+  const hygieneAudit = live.order_hygiene_audit || {};
   const copyGuardrail = (runtime.copy_trader || {}).guardrail || {};
   const copyGuardrailLine = copyGuardrail.reason
     ? `<div>Copy-trade guardrail: <strong>${String(copyGuardrail.status || 'unknown').toUpperCase()}</strong> | ${copyGuardrail.reason}</div>`
@@ -1873,6 +1883,8 @@ function renderRuntimeHealth(runtime) {
     `<div>Canary execution: <strong>${executed}/${attempted}</strong> (${hitRate}) | min-order rejects <strong>${live.min_order_rejects_today || 0}</strong> | floor-ups <strong>${live.min_order_floorups_today || 0}</strong></div>` +
     `<div>Execution rescue: top-tier floor-ups <strong>${live.min_order_top_tier_floorups_today || 0}</strong> | same-side merges <strong>${live.min_order_same_side_merges_today || 0}</strong> | approved but not executable <strong>${live.approved_but_not_executable_today || 0}</strong></div>` +
     `<div>Canary headroom: <strong>${live.canary_headroom_ratio != null ? live.canary_headroom_ratio + 'x' : 'n/a'}</strong> | crash-safe cap <strong>${live.crash_safe_canary_order_usd != null ? fmtUsd(live.crash_safe_canary_order_usd) : 'n/a'}</strong></div>` +
+    `<div>Live sizing: <strong>${liveSizing.enabled ? fmtUsd(liveSizing.target_margin_usd || 0) + ' margin / ' + fmtUsd(liveSizing.target_notional_usd || 0) + ' notional' : (liveSizing.reason || 'n/a')}</strong> | stop <strong>${liveSizing.stop_roe_pct != null ? (Number(liveSizing.stop_roe_pct) * 100).toFixed(2) + '% ROE' : 'n/a'}</strong></div>` +
+    `<div>Order hygiene: <strong>${String(hygieneAudit.status || 'n/a').toUpperCase()}</strong> | protected <strong>${hygieneAudit.protected || 0}</strong> | cancelled <strong>${hygieneAudit.stale_cancelled || 0}</strong> | failed <strong>${hygieneAudit.failed || 0}</strong></div>` +
     `<div>Short guardrail: <strong>${String(shortPolicy.status || 'unknown').toUpperCase()}</strong> — ${shortPolicy.reason || 'n/a'}</div>` +
     copyGuardrailLine +
     `<div>Live source usage: <strong>${sourceUsageSummary}</strong></div>` +

@@ -556,6 +556,21 @@ class LiveTrader:
         self.max_orders_per_source_per_day = int(
             getattr(config, "LIVE_MAX_ORDERS_PER_SOURCE_PER_DAY", 0)
         )
+        self.risk_sizing_enabled = bool(
+            getattr(config, "LIVE_RISK_SIZING_ENABLED", True)
+        )
+        self.live_risk_per_trade_pct = float(
+            getattr(config, "LIVE_RISK_PER_TRADE_PCT", 0.0075)
+        )
+        self.live_max_margin_per_order_pct = float(
+            getattr(config, "LIVE_MAX_MARGIN_PER_ORDER_PCT", 0.12)
+        )
+        self.live_min_margin_per_order_usd = float(
+            getattr(config, "LIVE_MIN_MARGIN_PER_ORDER_USD", 0.0)
+        )
+        self.dynamic_source_caps_allow_static_expansion = bool(
+            getattr(config, "LIVE_DYNAMIC_SOURCE_CAPS_ALLOW_STATIC_EXPANSION", False)
+        )
         self.min_order_top_tier_enabled = bool(
             getattr(config, "LIVE_MIN_ORDER_TOP_TIER_ENABLED", True)
         )
@@ -705,6 +720,8 @@ class LiveTrader:
         self._protective_attempt_history: Dict[str, Deque[float]] = defaultdict(deque)
         self._protective_churn_trips = 0
         self._last_orphan_protection_summary: Dict[str, Any] = {}
+        self._last_order_hygiene_audit: Dict[str, Any] = {}
+        self._last_sizing_explanation: Dict[str, Any] = {}
         self._last_order_visibility_status: Dict[str, Any] = {
             "source": "frontendOpenOrders",
             "ok": None,
@@ -1183,7 +1200,11 @@ class LiveTrader:
     # ``_reserve_entry_slot`` bundles the read/compare/increment under a
     # single ``_state_lock`` acquisition, and ``_release_entry_slot`` is
     # called on any failure path between reservation and commit.
-    def _reserve_entry_slot(self, source_key: str):
+    def _reserve_entry_slot(
+        self,
+        source_key: str,
+        source_policy: Optional[Dict[str, Any]] = None,
+    ):
         """Atomically check canary + per-source caps and reserve a slot.
 
         Returns a tuple (reserved: bool, reason: str).  When ``reserved`` is
@@ -1199,12 +1220,13 @@ class LiveTrader:
                     return False, (
                         f"canary_cap:{total}/{self.canary_max_signals_per_day}"
                     )
-            if self.max_orders_per_source_per_day > 0:
+            effective_source_cap = self._effective_live_source_cap(source_policy)
+            if effective_source_cap > 0:
                 used = self._source_orders_today.get(source_key, 0)
-                if used >= self.max_orders_per_source_per_day:
+                if used >= effective_source_cap:
                     self._incr_entry_metric("rejected_source_cap")
                     return False, (
-                        f"source_cap:{used}/{self.max_orders_per_source_per_day}"
+                        f"source_cap:{used}/{effective_source_cap}"
                     )
             # Reserve: bump counter under the lock so the next concurrent
             # signal sees the reserved slot and cannot race past the cap.
@@ -1988,6 +2010,179 @@ class LiveTrader:
         policy.setdefault("blocked", False)
         return policy
 
+    def _effective_live_source_cap(self, policy: Optional[Dict[str, Any]]) -> int:
+        """Combine static live source caps with allocator-driven caps."""
+        configured_cap = int(self.max_orders_per_source_per_day or 0)
+        policy = dict(policy or {})
+        policy_cap = int(policy.get("max_signals_per_day", 0) or 0)
+        if configured_cap > 0 and policy_cap > 0:
+            status = str(policy.get("status", "") or "").strip().lower()
+            if (
+                self.dynamic_source_caps_allow_static_expansion
+                and status == "active"
+                and policy_cap > configured_cap
+            ):
+                return policy_cap
+            return min(configured_cap, policy_cap)
+        return configured_cap or policy_cap
+
+    @staticmethod
+    def _resolve_signal_stop_roe_pct(signal: TradeSignal) -> float:
+        """Resolve the signal stop distance in margin/ROE space."""
+        risk = getattr(signal, "risk", None)
+        leverage = max(float(getattr(signal, "leverage", 1.0) or 1.0), 1.0)
+        if risk is not None and hasattr(risk, "resolve_roe_stop_loss_pct"):
+            try:
+                stop_roe = float(risk.resolve_roe_stop_loss_pct(leverage))
+                if stop_roe > 0:
+                    return stop_roe
+            except Exception:
+                pass
+
+        context = getattr(signal, "context", {}) or {}
+        if isinstance(context, dict):
+            risk_policy = context.get("risk_policy", {}) or {}
+            if isinstance(risk_policy, dict):
+                try:
+                    stop_roe = float(risk_policy.get("stop_roe_pct", 0.0) or 0.0)
+                    if stop_roe > 0:
+                        return stop_roe
+                except (TypeError, ValueError):
+                    pass
+
+        return max(float(getattr(config, "PAPER_TRADING_STOP_LOSS_PCT", 0.05) or 0.05), 0.001)
+
+    def _store_sizing_explanation(self, explanation: Dict[str, Any]) -> None:
+        explanation = dict(explanation)
+        explanation.setdefault("timestamp", datetime.now(timezone.utc).isoformat())
+        with self._state_lock:
+            self._last_sizing_explanation = explanation
+
+    def _apply_risk_based_live_sizing(
+        self,
+        signal: TradeSignal,
+        *,
+        source_policy: Optional[Dict[str, Any]] = None,
+    ) -> TradeSignal:
+        """Size live entries from risk-at-stop instead of token price distance.
+
+        The target notional is derived from:
+          equity * LIVE_RISK_PER_TRADE_PCT / signal_stop_roe
+        then bounded by free margin and the existing hard order cap.
+        """
+        if not self.risk_sizing_enabled:
+            self._store_sizing_explanation({"enabled": False, "reason": "disabled"})
+            return signal
+
+        coin = str(getattr(signal, "coin", "") or "")
+        mid = self._get_mid_price(coin)
+        if not mid or mid <= 0:
+            self._store_sizing_explanation(
+                {"enabled": True, "coin": coin, "reason": "mid_unavailable"}
+            )
+            return signal
+
+        equity = self.get_account_value()
+        free_margin = self.get_free_margin()
+        if equity is None or equity <= 0:
+            equity = free_margin
+        if free_margin is None or free_margin <= 0:
+            free_margin = equity
+        if equity is None or equity <= 0 or free_margin is None or free_margin <= 0:
+            self._store_sizing_explanation(
+                {
+                    "enabled": True,
+                    "coin": coin,
+                    "reason": "margin_unavailable",
+                    "equity": equity,
+                    "free_margin": free_margin,
+                }
+            )
+            return signal
+
+        leverage = max(float(getattr(signal, "leverage", 1.0) or 1.0), 1.0)
+        stop_roe_pct = max(self._resolve_signal_stop_roe_pct(signal), 0.001)
+        confidence = max(0.0, min(float(getattr(signal, "confidence", 0.5) or 0.5), 1.0))
+        policy = dict(source_policy or {})
+        source_multiplier = max(0.0, float(policy.get("size_multiplier", 1.0) or 1.0))
+        confidence_multiplier = 0.50 + (0.50 * confidence)
+        risk_budget_usd = (
+            float(equity)
+            * max(float(self.live_risk_per_trade_pct or 0.0), 0.0)
+            * confidence_multiplier
+            * source_multiplier
+        )
+        max_margin_usd = float(free_margin) * max(float(self.live_max_margin_per_order_pct or 0.0), 0.0)
+        if max_margin_usd <= 0:
+            max_margin_usd = float(free_margin)
+
+        target_margin_usd = risk_budget_usd / stop_roe_pct if stop_roe_pct > 0 else 0.0
+        target_margin_usd = min(target_margin_usd, max_margin_usd, float(free_margin))
+        if self.live_min_margin_per_order_usd > 0:
+            target_margin_usd = max(target_margin_usd, min(self.live_min_margin_per_order_usd, max_margin_usd))
+
+        target_notional_usd = max(0.0, target_margin_usd * leverage)
+        if self.max_order_usd and self.max_order_usd > 0:
+            target_notional_usd = min(target_notional_usd, float(self.max_order_usd))
+            target_margin_usd = target_notional_usd / leverage
+
+        if target_notional_usd <= 0:
+            self._store_sizing_explanation(
+                {
+                    "enabled": True,
+                    "coin": coin,
+                    "reason": "zero_target_notional",
+                    "equity": round(float(equity), 4),
+                    "free_margin": round(float(free_margin), 4),
+                    "stop_roe_pct": round(stop_roe_pct, 6),
+                }
+            )
+            return signal
+
+        pre_size = float(getattr(signal, "size", 0.0) or 0.0)
+        pre_notional = pre_size * mid
+        adjusted = copy.deepcopy(signal)
+        adjusted.size = target_notional_usd / mid
+        adjusted.position_pct = target_margin_usd / max(float(equity), 1e-9)
+
+        explanation = {
+            "enabled": True,
+            "reason": "risk_at_stop",
+            "coin": coin,
+            "side": self._signal_side_value(adjusted),
+            "mid": round(float(mid), 6),
+            "equity": round(float(equity), 4),
+            "free_margin": round(float(free_margin), 4),
+            "leverage": round(leverage, 4),
+            "stop_roe_pct": round(stop_roe_pct, 6),
+            "risk_per_trade_pct": round(float(self.live_risk_per_trade_pct or 0.0), 6),
+            "risk_budget_usd": round(risk_budget_usd, 4),
+            "confidence_multiplier": round(confidence_multiplier, 4),
+            "source_multiplier": round(source_multiplier, 4),
+            "max_margin_usd": round(max_margin_usd, 4),
+            "target_margin_usd": round(target_margin_usd, 4),
+            "target_notional_usd": round(target_notional_usd, 4),
+            "pre_notional_usd": round(pre_notional, 4),
+            "size": round(float(adjusted.size or 0.0), 10),
+        }
+        context = dict(adjusted.context or {})
+        context["live_sizing"] = explanation
+        adjusted.context = context
+        self._store_sizing_explanation(explanation)
+        logger.info(
+            "Live risk sizing %s %s: margin=$%.2f notional=$%.2f "
+            "(risk=$%.2f, stop=%.2f%% ROE, lev=%.1fx, pre=$%.2f)",
+            coin,
+            self._signal_side_value(adjusted),
+            target_margin_usd,
+            target_notional_usd,
+            risk_budget_usd,
+            stop_roe_pct * 100.0,
+            leverage,
+            pre_notional,
+        )
+        return adjusted
+
     def _find_same_side_position(
         self,
         signal: TradeSignal,
@@ -2739,6 +2934,54 @@ class LiveTrader:
         ):
             logger.warning("Orphan protection summary: %s", summary)
         return self._store_orphan_protection_summary(summary)
+
+    def audit_live_order_hygiene(self, *, repair: bool = True) -> Dict[str, Any]:
+        """Audit live protective orders and optionally repair drift.
+
+        The repair path intentionally reuses ``protect_orphaned_positions`` so
+        the audit cannot disagree with the actual safety mechanism.  The
+        returned summary is stored separately for dashboard/runtime visibility.
+        """
+        if repair:
+            summary = self.protect_orphaned_positions()
+        else:
+            positions = self.get_positions(force_fresh=True)
+            open_orders = self.get_open_orders(force_fresh=True)
+            if positions is None or open_orders is None:
+                summary = {
+                    "status": "degraded",
+                    "reason": "positions_or_orders_unavailable",
+                    "positions": None if positions is None else len(positions),
+                    "open_orders": None if open_orders is None else len(open_orders),
+                }
+            else:
+                protective_orders = [
+                    order for order in open_orders
+                    if self._classify_protective_leg(order) is not None
+                ]
+                summary = {
+                    "status": "ok",
+                    "positions": len(positions),
+                    "open_orders": len(open_orders),
+                    "protective_orders": len(protective_orders),
+                }
+
+        summary = dict(summary or {})
+        summary["audit"] = "live_order_hygiene"
+        summary["repair"] = bool(repair)
+        summary["timestamp"] = datetime.now(timezone.utc).isoformat()
+        with self._state_lock:
+            self._last_order_hygiene_audit = summary
+        if (
+            str(summary.get("status", "")).lower() not in {"ok", "skipped"}
+            or int(summary.get("failed", 0) or 0) > 0
+            or int(summary.get("cancel_failed", 0) or 0) > 0
+            or int(summary.get("stale_cancelled", 0) or 0) > 0
+        ):
+            logger.warning("Live order hygiene audit: %s", summary)
+        else:
+            logger.info("Live order hygiene audit: %s", summary)
+        return summary
 
     @staticmethod
     def _shadow_trade_metadata(trade: Dict[str, Any]) -> Dict[str, Any]:
@@ -5636,7 +5879,10 @@ class LiveTrader:
         # at the success point to keep the counter incremented.
         _slot_reserved = False
         if not self.dry_run:
-            reserved, reserve_reason = self._reserve_entry_slot(source_key)
+            reserved, reserve_reason = self._reserve_entry_slot(
+                source_key,
+                source_policy=source_policy,
+            )
             if not reserved:
                 logger.warning(
                     "Entry cap reached (%s) - rejecting %s (source=%s)",
@@ -5705,6 +5951,11 @@ class LiveTrader:
                     regime_data={"regime": signal.regime} if signal.regime else None,
                     source_policy=source_policy,
                 )
+
+            signal = self._apply_risk_based_live_sizing(
+                signal,
+                source_policy=source_policy,
+            )
 
             # Hard per-order $ cap — applied AFTER regime overlay and any paper→live
             # rescaling so nothing above max_order_usd ever hits the exchange.
@@ -6190,6 +6441,8 @@ class LiveTrader:
                 "total_entry_signals_today": int(sum(self._source_orders_today.values())),
                 "entry_metrics": dict(self._entry_metrics),
                 "orphan_protection": dict(self._last_orphan_protection_summary),
+                "order_hygiene_audit": dict(self._last_order_hygiene_audit),
+                "live_sizing": dict(self._last_sizing_explanation),
                 "order_visibility": dict(self._last_order_visibility_status),
                 "protective_churn_trips": self._protective_churn_trips,
             }
@@ -6228,6 +6481,17 @@ class LiveTrader:
             "order_dedup_window_s": self._ORDER_DEDUP_WINDOW,
             "order_visibility": state_snapshot["order_visibility"],
             "orphan_protection": state_snapshot["orphan_protection"],
+            "order_hygiene_audit": state_snapshot["order_hygiene_audit"],
+            "live_sizing": state_snapshot["live_sizing"],
+            "risk_sizing": {
+                "enabled": bool(self.risk_sizing_enabled),
+                "risk_per_trade_pct": float(self.live_risk_per_trade_pct),
+                "max_margin_per_order_pct": float(self.live_max_margin_per_order_pct),
+                "min_margin_per_order_usd": float(self.live_min_margin_per_order_usd),
+            },
+            "dynamic_source_caps_allow_static_expansion": bool(
+                self.dynamic_source_caps_allow_static_expansion
+            ),
             "protective_churn_trips": int(state_snapshot["protective_churn_trips"]),
             "protective_repeat_window_s": self._protective_repeat_window_s,
             "protective_repeat_max": self._protective_repeat_max,

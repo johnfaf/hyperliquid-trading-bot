@@ -219,6 +219,61 @@ class PaperTrader:
                 tuple(params),
             )
 
+    @staticmethod
+    def _price_roe_pct(trade: Dict, price: float) -> float:
+        entry = float(trade.get("entry_price", 0) or 0)
+        if entry <= 0 or price <= 0:
+            return 0.0
+        leverage = max(float(trade.get("leverage", 1) or 1), 1.0)
+        direction = 1.0 if str(trade.get("side", "")).lower() == "long" else -1.0
+        return ((float(price) - entry) / entry) * leverage * direction
+
+    def _update_trade_excursion(
+        self,
+        trade: Dict,
+        *,
+        current_price: float,
+        current_r: float,
+        risk_policy: Dict[str, float],
+        now_utc: datetime,
+    ) -> None:
+        """Track MFE/MAE for TP/SL path analytics while a trade is open."""
+        try:
+            meta = self._trade_metadata(trade)
+            current_roe = self._price_roe_pct(trade, current_price)
+            prev_mfe_roe = float(meta.get("mfe_roe_pct", 0.0) or 0.0)
+            prev_mae_roe = float(meta.get("mae_roe_pct", 0.0) or 0.0)
+            stop_roe_pct = max(float(risk_policy.get("stop_roe_pct", 0.0) or 0.0), 1e-9)
+
+            updates: Dict[str, Any] = {
+                "last_path_price": round(float(current_price), 8),
+                "last_r_multiple": round(float(current_r), 6),
+                "last_path_updated_at": now_utc.isoformat(),
+            }
+
+            if current_roe >= prev_mfe_roe:
+                updates.update(
+                    {
+                        "mfe_price": round(float(current_price), 8),
+                        "mfe_roe_pct": round(float(current_roe), 6),
+                        "max_r_multiple": round(float(current_roe) / stop_roe_pct, 6),
+                        "mfe_updated_at": now_utc.isoformat(),
+                    }
+                )
+            if current_roe <= prev_mae_roe:
+                updates.update(
+                    {
+                        "mae_price": round(float(current_price), 8),
+                        "mae_roe_pct": round(float(current_roe), 6),
+                        "min_r_multiple": round(float(current_roe) / stop_roe_pct, 6),
+                        "mae_updated_at": now_utc.isoformat(),
+                    }
+                )
+
+            db.update_paper_trade_metadata(trade["id"], updates)
+        except Exception as exc:
+            logger.debug("Path analytics update failed for trade %s: %s", trade.get("id"), exc)
+
     def get_account_summary(self) -> Dict:
         """Get current paper trading account summary."""
         account = db.get_paper_account()
@@ -1302,6 +1357,29 @@ class PaperTrader:
             float(trade.get("leverage", 1) or 1),
         )
         total_slippage_cost = round(entry_slippage_cost + exit_slippage_cost, 4)
+        risk_policy = self._resolve_trade_risk_policy(
+            {**trade, "metadata": trade_meta}
+        )
+        stop_roe_pct = max(float(risk_policy.get("stop_roe_pct", 0.0) or 0.0), 1e-9)
+        exit_roe_pct = self._price_roe_pct(trade, slipped_exit)
+        exit_r_multiple = exit_roe_pct / stop_roe_pct
+        max_r_multiple = float(trade_meta.get("max_r_multiple", max(exit_r_multiple, 0.0)) or 0.0)
+        min_r_multiple = float(trade_meta.get("min_r_multiple", min(exit_r_multiple, 0.0)) or 0.0)
+        realized_max_r = max(max_r_multiple, exit_r_multiple)
+        realized_min_r = min(min_r_multiple, exit_r_multiple)
+        path_capture_ratio = (
+            exit_r_multiple / realized_max_r
+            if realized_max_r > 0 and exit_r_multiple > 0
+            else 0.0
+        )
+        path_metrics = {
+            "exit_roe_pct": round(exit_roe_pct, 6),
+            "exit_r_multiple": round(exit_r_multiple, 6),
+            "max_r_multiple": round(realized_max_r, 6),
+            "min_r_multiple": round(realized_min_r, 6),
+            "path_capture_ratio": round(path_capture_ratio, 6),
+            "close_reason": close_reason,
+        }
 
         db.update_paper_trade_metadata(
             trade["id"],
@@ -1320,6 +1398,7 @@ class PaperTrader:
                 "net_pnl_after_fees": pnl,
                 "intended_exit_price": float(current_price or 0),
                 "exit_slipped_price": slipped_exit,
+                **path_metrics,
             },
         )
         trade_meta.update(
@@ -1338,6 +1417,7 @@ class PaperTrader:
                 "net_pnl_after_fees": pnl,
                 "intended_exit_price": float(current_price or 0),
                 "exit_slipped_price": slipped_exit,
+                **path_metrics,
             }
         )
         # CRIT-FIX C2: atomic close + account credit in one transaction
@@ -1569,6 +1649,13 @@ class PaperTrader:
                 str(trade.get("side", "")),
                 float(leverage or 1),
                 stop_roe_pct,
+            )
+            self._update_trade_excursion(
+                trade,
+                current_price=current_price,
+                current_r=current_r,
+                risk_policy=risk_policy,
+                now_utc=now_utc,
             )
 
             if trade["side"] == "long":

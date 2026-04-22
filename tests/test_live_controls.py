@@ -15,7 +15,7 @@ import config
 import main
 from src.core import boot
 from src.core.api_manager import Priority
-from src.core.cycles.fast_cycle import check_file_kill_switch
+from src.core.cycles.fast_cycle import check_file_kill_switch, run_fast_cycle
 from src.core.cycles.reporting_cycle import run_reporting
 from src.core.cycles.trading_cycle import (
     _execute_signal_live,
@@ -34,11 +34,13 @@ from src.core.live_execution import (
 )
 from src.signals.decision_firewall import DecisionFirewall
 from src.signals.signal_schema import (
+    RiskParams,
     SignalSide,
     SignalSource,
     TradeSignal,
     signal_from_execution_dict,
 )
+from src.signals.agent_scoring import AgentScorer, SourceScore
 from src.trading.live_trader import (
     HyperliquidSigner,
     LiveTrader,
@@ -53,6 +55,7 @@ def _isolate_live_kill_switch_state(tmp_path, monkeypatch):
     state_file = tmp_path / "live_kill_switch_state.json"
     monkeypatch.setenv("LIVE_KILL_SWITCH_STATE_FILE", str(state_file))
     monkeypatch.setattr(config, "LIVE_KILL_SWITCH_STATE_FILE", str(state_file), raising=False)
+    monkeypatch.setattr(config, "LIVE_RISK_SIZING_ENABLED", False, raising=False)
 
 
 def _fake_live_credentials(self):
@@ -184,6 +187,158 @@ def test_health_registry_requires_dependency_ready_for_trading_safety():
 
     assert registry.is_trading_safe("strategy_scorer") is True
     assert registry.is_all_trading_safe() is True
+
+
+def test_live_risk_sizing_targets_margin_at_stop(monkeypatch):
+    monkeypatch.setattr(config, "LIVE_RISK_SIZING_ENABLED", True, raising=False)
+    monkeypatch.setattr(config, "LIVE_RISK_PER_TRADE_PCT", 0.01, raising=False)
+    monkeypatch.setattr(config, "LIVE_MAX_MARGIN_PER_ORDER_PCT", 0.20, raising=False)
+    monkeypatch.setattr(config, "LIVE_MIN_MARGIN_PER_ORDER_USD", 0.0, raising=False)
+    monkeypatch.setattr(LiveTrader, "_load_credentials", _fake_live_credentials)
+    monkeypatch.setattr(LiveTrader, "_load_asset_index_map", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "reconcile_positions", lambda self: None)
+
+    trader = LiveTrader(firewall=type("FW", (), {})(), dry_run=True, max_order_usd=1_000.0)
+    monkeypatch.setattr(trader, "_get_mid_price", lambda coin: 100.0)
+    monkeypatch.setattr(trader, "get_account_value", lambda: 100.0)
+    monkeypatch.setattr(trader, "get_free_margin", lambda: 100.0)
+
+    signal = TradeSignal(
+        coin="ETH",
+        side=SignalSide.LONG,
+        confidence=0.80,
+        source=SignalSource.STRATEGY,
+        reason="test",
+        risk=RiskParams(stop_loss_pct=0.10, take_profit_pct=0.50, risk_basis="roe"),
+        leverage=5,
+        size=0.01,
+    )
+
+    adjusted = trader._apply_risk_based_live_sizing(signal, source_policy={"size_multiplier": 1.0})
+
+    assert round(adjusted.size * 100.0, 6) == 45.0
+    assert round(adjusted.position_pct, 6) == 0.09
+    sizing = trader.get_stats()["live_sizing"]
+    assert sizing["reason"] == "risk_at_stop"
+    assert sizing["target_margin_usd"] == 9.0
+    assert sizing["target_notional_usd"] == 45.0
+
+
+def test_dynamic_source_policy_caps_active_sources():
+    scorer = AgentScorer(
+        {
+            "policy_enabled": True,
+            "policy_min_closed_trades": 3,
+            "policy_keep_top_n": 5,
+            "policy_pause_weight": 0.12,
+            "policy_degrade_weight": 0.32,
+            "policy_dynamic_caps_enabled": True,
+            "policy_active_min_signals_per_day": 2,
+            "policy_active_max_signals_per_day": 6,
+            "policy_strong_min_closed_trades": 12,
+            "policy_strong_win_rate": 0.55,
+            "policy_strong_recent_pnl_floor": 0.0,
+        }
+    )
+    source = "strategy:edge"
+    scorer.scores = {}
+    scorer._trade_history = {}
+    scorer.scores[source] = SourceScore(
+        source_key=source,
+        total_signals=12,
+        correct_signals=9,
+        total_pnl=12.0,
+        accuracy=0.75,
+        weighted_accuracy=0.75,
+        dynamic_weight=0.80,
+    )
+    scorer._trade_history[source] = [
+        {
+            "signal_id": f"s{i}",
+            "pnl": 1.0,
+            "correct": i < 9,
+            "return_pct": 0.01,
+            "timestamp": "2026-01-01T00:00:00+00:00",
+        }
+        for i in range(12)
+    ]
+
+    policy = scorer.get_source_policy(source)
+
+    assert policy["status"] == "active"
+    assert 2 < policy["max_signals_per_day"] <= 6
+    assert policy["dynamic_cap_reason"].startswith("active_dynamic_edge=")
+
+
+def test_live_source_cap_honors_static_ceiling_unless_expansion_enabled():
+    trader = LiveTrader.__new__(LiveTrader)
+    trader.max_orders_per_source_per_day = 3
+    trader.dynamic_source_caps_allow_static_expansion = False
+
+    policy = {"status": "active", "max_signals_per_day": 6}
+    assert trader._effective_live_source_cap(policy) == 3
+
+    trader.dynamic_source_caps_allow_static_expansion = True
+    assert trader._effective_live_source_cap(policy) == 6
+    assert trader._effective_live_source_cap({"status": "degraded", "max_signals_per_day": 2}) == 2
+
+
+def test_audit_live_order_hygiene_stores_summary():
+    trader = LiveTrader.__new__(LiveTrader)
+    trader._state_lock = threading.RLock()
+    trader._last_order_hygiene_audit = {}
+    trader.protect_orphaned_positions = lambda: {
+        "status": "ok",
+        "protected": 1,
+        "skipped": 0,
+        "failed": 0,
+        "stale_cancelled": 2,
+    }
+
+    summary = trader.audit_live_order_hygiene(repair=True)
+
+    assert summary["audit"] == "live_order_hygiene"
+    assert summary["repair"] is True
+    assert summary["protected"] == 1
+    assert trader._last_order_hygiene_audit["stale_cancelled"] == 2
+
+
+def test_fast_cycle_runs_live_order_hygiene_on_cadence(monkeypatch):
+    calls = []
+
+    class FakePaper:
+        def check_open_positions(self):
+            return []
+
+    class FakeLive:
+        def snapshot_balance(self):
+            pass
+
+        def update_daily_pnl_from_fills(self):
+            pass
+
+        def manage_open_positions(self):
+            return {"updated": 0, "closed": 0, "failed": 0}
+
+        def audit_live_order_hygiene(self, repair=True):
+            calls.append(repair)
+            return {"status": "ok", "protected": 0, "failed": 0}
+
+    container = types.SimpleNamespace(
+        paper_trader=FakePaper(),
+        live_trader=FakeLive(),
+        copy_trader=None,
+    )
+    monkeypatch.setattr("src.core.cycles.fast_cycle.check_file_kill_switch", lambda _container: False)
+    monkeypatch.setattr("src.core.cycles.fast_cycle.is_live_trading_active", lambda _container: True)
+    monkeypatch.setattr("src.core.cycles.fast_cycle.sync_shadow_book_to_live", lambda _container: [])
+    monkeypatch.setattr("src.core.cycles.fast_cycle._scan_whale_trades", lambda _container: None)
+    monkeypatch.setenv("LIVE_ORDER_HYGIENE_AUDIT_INTERVAL_CYCLES", "5")
+
+    run_fast_cycle(container, cycle_count=4)
+    run_fast_cycle(container, cycle_count=5)
+
+    assert calls == [True]
 
 
 def test_run_reporting_skips_false_positive_stale_warning(monkeypatch):

@@ -56,6 +56,44 @@ def test_compute_trade_analytics_groups_by_side_and_source():
     assert coin_side_row["net_pnl"] == -0.8
 
 
+def test_compute_trade_analytics_includes_tp_sl_path_metrics():
+    analytics = compute_trade_analytics(
+        [
+            {
+                "coin": "ETH",
+                "side": "long",
+                "pnl": 1.0,
+                "metadata": {
+                    "source_key": "strategy:path",
+                    "max_r_multiple": 2.5,
+                    "min_r_multiple": -0.4,
+                    "exit_r_multiple": 1.5,
+                    "path_capture_ratio": 0.6,
+                },
+            },
+            {
+                "coin": "ETH",
+                "side": "long",
+                "pnl": -0.5,
+                "metadata": {
+                    "source_key": "strategy:path",
+                    "max_r_multiple": 0.2,
+                    "min_r_multiple": -1.0,
+                    "exit_r_multiple": -1.0,
+                    "path_capture_ratio": 0.0,
+                },
+            },
+        ]
+    )
+
+    summary = analytics["summary"]
+    assert summary["path_count"] == 2
+    assert summary["avg_mfe_r"] == 1.35
+    assert summary["avg_mae_r"] == -0.7
+    assert summary["avg_exit_r"] == 0.25
+    assert summary["avg_path_capture_ratio"] == 0.3
+
+
 def test_evaluate_short_side_policy_blocks_bad_short_run():
     trades = [
         {"side": "short", "pnl": -0.7, "metadata": {"source_key": "strategy:a"}},

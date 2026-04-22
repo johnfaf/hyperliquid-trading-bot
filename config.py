@@ -269,6 +269,7 @@ LIVE_TRADING_DUAL_CONTROL_CONFIRM = os.environ.get(
 # The helper logs a warning and falls back to the module default rather
 # than raising ValueError at import time.
 from src.core.env_utils import (  # noqa: E402 -- must follow sys.path setup above
+    safe_env_bool as _safe_env_bool,
     safe_env_float as _safe_env_float,
     safe_env_int as _safe_env_int,
 )
@@ -318,6 +319,22 @@ LIVE_CANARY_MAX_SIGNALS_PER_DAY = _safe_env_int(
 )
 LIVE_MAX_ORDERS_PER_SOURCE_PER_DAY = int(
     os.environ.get("LIVE_MAX_ORDERS_PER_SOURCE_PER_DAY", 0)
+)
+LIVE_RISK_SIZING_ENABLED = _safe_env_bool("LIVE_RISK_SIZING_ENABLED", True)
+LIVE_RISK_PER_TRADE_PCT = _safe_env_float(
+    "LIVE_RISK_PER_TRADE_PCT", 0.0075, lo=0.0, hi=0.25,
+)
+LIVE_MAX_MARGIN_PER_ORDER_PCT = _safe_env_float(
+    "LIVE_MAX_MARGIN_PER_ORDER_PCT", 0.12, lo=0.0, hi=1.0,
+)
+LIVE_MIN_MARGIN_PER_ORDER_USD = _safe_env_float(
+    "LIVE_MIN_MARGIN_PER_ORDER_USD", 0.0, lo=0.0, hi=1_000_000.0,
+)
+LIVE_DYNAMIC_SOURCE_CAPS_ALLOW_STATIC_EXPANSION = _safe_env_bool(
+    "LIVE_DYNAMIC_SOURCE_CAPS_ALLOW_STATIC_EXPANSION", False,
+)
+LIVE_ORDER_HYGIENE_AUDIT_INTERVAL_CYCLES = _safe_env_int(
+    "LIVE_ORDER_HYGIENE_AUDIT_INTERVAL_CYCLES", 5, lo=1, hi=100_000,
 )
 LIVE_MIN_ORDER_TOP_TIER_ENABLED = os.environ.get(
     "LIVE_MIN_ORDER_TOP_TIER_ENABLED", "true"
@@ -517,6 +534,24 @@ SOURCE_POLICY_WARMUP_MIN_CONFIDENCE = float(
 )
 SOURCE_POLICY_DEGRADED_MIN_CONFIDENCE = float(
     os.environ.get("SOURCE_POLICY_DEGRADED_MIN_CONFIDENCE", 0.55)
+)
+SOURCE_POLICY_DYNAMIC_CAPS_ENABLED = _safe_env_bool(
+    "SOURCE_POLICY_DYNAMIC_CAPS_ENABLED", True,
+)
+SOURCE_POLICY_ACTIVE_MIN_SIGNALS_PER_DAY = _safe_env_int(
+    "SOURCE_POLICY_ACTIVE_MIN_SIGNALS_PER_DAY", 3, lo=0, hi=100_000,
+)
+SOURCE_POLICY_ACTIVE_MAX_SIGNALS_PER_DAY = _safe_env_int(
+    "SOURCE_POLICY_ACTIVE_MAX_SIGNALS_PER_DAY", 8, lo=0, hi=100_000,
+)
+SOURCE_POLICY_STRONG_MIN_CLOSED_TRADES = _safe_env_int(
+    "SOURCE_POLICY_STRONG_MIN_CLOSED_TRADES", 12, lo=1, hi=100_000,
+)
+SOURCE_POLICY_STRONG_WIN_RATE = _safe_env_float(
+    "SOURCE_POLICY_STRONG_WIN_RATE", 0.55, lo=0.0, hi=1.0,
+)
+SOURCE_POLICY_STRONG_RECENT_PNL_FLOOR = _safe_env_float(
+    "SOURCE_POLICY_STRONG_RECENT_PNL_FLOOR", 0.0, lo=-1_000_000.0, hi=1_000_000.0,
 )
 
 # Runtime readiness / incident monitoring.
@@ -749,6 +784,11 @@ def _validate_config_bounds() -> None:
         ("SOURCE_POLICY_DEGRADED_SIZE_MULTIPLIER", 0.0, 1.0, 0.60),
         ("SOURCE_POLICY_WARMUP_MIN_CONFIDENCE", 0.0, 1.0, 0.45),
         ("SOURCE_POLICY_DEGRADED_MIN_CONFIDENCE", 0.0, 1.0, 0.55),
+        ("SOURCE_POLICY_ACTIVE_MIN_SIGNALS_PER_DAY", 0, 100_000, 3),
+        ("SOURCE_POLICY_ACTIVE_MAX_SIGNALS_PER_DAY", 0, 100_000, 8),
+        ("SOURCE_POLICY_STRONG_MIN_CLOSED_TRADES", 1, 100_000, 12),
+        ("SOURCE_POLICY_STRONG_WIN_RATE", 0.0, 1.0, 0.55),
+        ("SOURCE_POLICY_STRONG_RECENT_PNL_FLOOR", -1_000_000.0, 1_000_000.0, 0.0),
         ("TRADING_CYCLE_INTERVAL", 10, 86_400, 900),
         ("DISCOVERY_CYCLE_INTERVAL", 60, 2_592_000, 86400),
         ("POLYMARKET_SCAN_INTERVAL", 10, 3600, 180),
@@ -820,6 +860,10 @@ def _validate_config_bounds() -> None:
         ("LIVE_CANARY_MAX_ORDER_USD", 10.0, 1_000_000.0, 25.0),
         ("LIVE_CANARY_MAX_SIGNALS_PER_DAY", 1, 100_000, 25),
         ("LIVE_MAX_ORDERS_PER_SOURCE_PER_DAY", 0, 100_000, 0),
+        ("LIVE_RISK_PER_TRADE_PCT", 0.0, 0.25, 0.0075),
+        ("LIVE_MAX_MARGIN_PER_ORDER_PCT", 0.0, 1.0, 0.12),
+        ("LIVE_MIN_MARGIN_PER_ORDER_USD", 0.0, 1_000_000.0, 0.0),
+        ("LIVE_ORDER_HYGIENE_AUDIT_INTERVAL_CYCLES", 1, 100_000, 5),
         ("LIVE_MIN_ORDER_TOP_TIER_MIN_CONFIDENCE", 0.0, 1.0, 0.72),
         ("LIVE_MIN_ORDER_TOP_TIER_MAX_BUMP_MULTIPLIER", 1.0, 10.0, 1.35),
         ("LIVE_MIN_ORDER_SAME_SIDE_MAX_BUMP_MULTIPLIER", 1.0, 10.0, 2.5),
@@ -878,6 +922,15 @@ def _validate_config_bounds() -> None:
             "clamping pause threshold down to the degrade threshold."
         )
         globals()["SOURCE_POLICY_PAUSE_WEIGHT"] = float(SOURCE_POLICY_DEGRADE_WEIGHT)
+
+    if SOURCE_POLICY_ACTIVE_MAX_SIGNALS_PER_DAY < SOURCE_POLICY_ACTIVE_MIN_SIGNALS_PER_DAY:
+        _warn_config(
+            "SOURCE_POLICY_ACTIVE_MAX_SIGNALS_PER_DAY is below "
+            "SOURCE_POLICY_ACTIVE_MIN_SIGNALS_PER_DAY; raising active max to active min."
+        )
+        globals()["SOURCE_POLICY_ACTIVE_MAX_SIGNALS_PER_DAY"] = int(
+            SOURCE_POLICY_ACTIVE_MIN_SIGNALS_PER_DAY
+        )
 
     if COPY_TRADER_AUTO_PAUSE_BLOCK_WIN_RATE > COPY_TRADER_AUTO_PAUSE_DEGRADE_WIN_RATE:
         _warn_config(
