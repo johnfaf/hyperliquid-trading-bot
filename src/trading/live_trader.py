@@ -764,6 +764,17 @@ class LiveTrader:
         self._max_drawdown_usd = _safe_env_float(
             "LIVE_MAX_DRAWDOWN_USD", 0.0, lo=0.0, hi=1e8,
         )
+        live_dual_control_effective = bool(
+            getattr(config, "LIVE_TRADING_ENABLED", False)
+            and getattr(config, "LIVE_TRADING_DUAL_CONTROL_CONFIRM", False)
+        )
+        if self.live_requested and live_dual_control_effective and self._max_drawdown_usd <= 0:
+            logger.critical(
+                "LIVE_MAX_DRAWDOWN_USD must be > 0 when live dual-control is enabled; "
+                "forcing dry_run to prevent uncapped rolling drawdown exposure."
+            )
+            self.dry_run = True
+            self.status_reason = "live_drawdown_cap_required"
         self._drawdown_window_s = _safe_env_float(
             "LIVE_DRAWDOWN_WINDOW_S", 24 * 3600.0, lo=300.0, hi=30 * 86_400.0,
         )
@@ -784,7 +795,7 @@ class LiveTrader:
         self._load_persisted_protective_attempt_history()
 
         logger.info(
-            f"LiveTrader initialized: dry_run={dry_run}, "
+            f"LiveTrader initialized: dry_run={self.dry_run}, "
             f"max_daily_loss=${self.max_daily_loss:.2f}, "
             f"max_position_size=${self.max_position_size:.2f}, "
             f"max_order_usd=${self.max_order_usd:.2f}"
@@ -798,7 +809,7 @@ class LiveTrader:
         # set but LIVE_TRADING_DUAL_CONTROL_CONFIRM missing) hard to spot.
         live_requested_flag = bool(getattr(config, "LIVE_TRADING_ENABLED", False))
         dual_control_flag = bool(getattr(config, "LIVE_TRADING_DUAL_CONTROL_CONFIRM", False))
-        if not dry_run:
+        if not self.dry_run:
             logger.info("=" * 60)
             logger.info("LIVE TRADING MODE ACTIVE — real orders will be sent to Hyperliquid")
             logger.info("=" * 60)
@@ -828,7 +839,8 @@ class LiveTrader:
             self.dry_run = True
             self.status_reason = "missing_agent_wallet_signer"
         elif self.live_requested and self.dry_run:
-            self.status_reason = "dry_run_forced"
+            if self.status_reason != "live_drawdown_cap_required":
+                self.status_reason = "dry_run_forced"
         elif self.live_requested:
             self.status_reason = "live_ready"
         else:
@@ -2075,11 +2087,34 @@ class LiveTrader:
             return signal
 
         coin = str(getattr(signal, "coin", "") or "")
+        def _fail_closed(reason: str, **extra: Any) -> TradeSignal:
+            explanation = {
+                "enabled": True,
+                "coin": coin,
+                "reason": reason,
+                "blocked": True,
+                **extra,
+            }
+            self._store_sizing_explanation(explanation)
+            logger.warning(
+                "Live risk sizing blocked %s entry: %s %s",
+                coin or "(unknown)",
+                reason,
+                extra,
+            )
+            adjusted_signal = copy.deepcopy(signal)
+            adjusted_signal.size = 0.0
+            adjusted_signal.position_pct = 0.0
+            context = dict(adjusted_signal.context or {})
+            context["live_sizing"] = explanation
+            adjusted_signal.context = context
+            return adjusted_signal
+
         mid = self._get_mid_price(coin)
         if not mid or mid <= 0:
-            self._store_sizing_explanation(
-                {"enabled": True, "coin": coin, "reason": "mid_unavailable"}
-            )
+            if not self.dry_run:
+                return _fail_closed("mid_unavailable")
+            self._store_sizing_explanation({"enabled": True, "coin": coin, "reason": "mid_unavailable"})
             return signal
 
         equity = self.get_account_value()
@@ -2087,16 +2122,22 @@ class LiveTrader:
         if equity is None or equity <= 0:
             equity = free_margin
         if free_margin is None or free_margin <= 0:
+            if not self.dry_run:
+                return _fail_closed(
+                    "free_margin_unavailable",
+                    equity=equity,
+                    free_margin=free_margin,
+                )
             free_margin = equity
         if equity is None or equity <= 0 or free_margin is None or free_margin <= 0:
+            if not self.dry_run:
+                return _fail_closed(
+                    "margin_unavailable",
+                    equity=equity,
+                    free_margin=free_margin,
+                )
             self._store_sizing_explanation(
-                {
-                    "enabled": True,
-                    "coin": coin,
-                    "reason": "margin_unavailable",
-                    "equity": equity,
-                    "free_margin": free_margin,
-                }
+                {"enabled": True, "coin": coin, "reason": "margin_unavailable", "equity": equity, "free_margin": free_margin}
             )
             return signal
 
@@ -3464,6 +3505,39 @@ class LiveTrader:
                 cancelled += 1
         return cancelled
 
+    def _protective_order_oids(self, coin: str) -> set[int]:
+        """Return currently visible protective order ids for a coin."""
+        open_orders = self.get_open_orders(force_fresh=True)
+        if open_orders is None:
+            raise RuntimeError("open_orders_unavailable")
+        oids: set[int] = set()
+        for order in open_orders:
+            if not self._is_protective_order(order, coin=coin):
+                continue
+            oid = order.get("oid") or order.get("order_id") or order.get("id")
+            if oid is None:
+                continue
+            try:
+                oids.add(int(oid))
+            except (TypeError, ValueError):
+                logger.warning("Skipping protective order with non-integer oid for %s: %s", coin, order)
+        return oids
+
+    def _cancel_protective_order_oids(self, coin: str, oids: set[int]) -> int:
+        """Cancel a known set of protective orders without touching newly placed replacements."""
+        cancelled = 0
+        for oid in sorted(oids):
+            if self.cancel_order(coin, int(oid)):
+                cancelled += 1
+        if cancelled < len(oids):
+            logger.warning(
+                "Cancelled %d/%d stale protective order(s) for %s",
+                cancelled,
+                len(oids),
+                coin,
+            )
+        return cancelled
+
     def _update_shadow_trade_risk_levels(
         self,
         trades: List[Dict[str, Any]],
@@ -3635,7 +3709,7 @@ class LiveTrader:
                 continue
 
             try:
-                self._cancel_protective_orders(coin)
+                stale_protective_oids = self._protective_order_oids(coin)
                 sl_result, tp_result, attempts = self._place_protective_orders_with_retries(
                     coin,
                     close_side,
@@ -3649,6 +3723,12 @@ class LiveTrader:
                 continue
 
             if self._is_order_result_success(sl_result) and self._is_order_result_success(tp_result):
+                cancelled_stale = 0
+                if stale_protective_oids:
+                    cancelled_stale = self._cancel_protective_order_oids(
+                        coin,
+                        stale_protective_oids,
+                    )
                 updated += 1
                 self._update_shadow_trade_risk_levels(
                     shadow_trades,
@@ -3667,6 +3747,8 @@ class LiveTrader:
                             "take_profit": round(desired_tp, 8),
                             "current_r": round(current_r, 4),
                             "attempts": attempts,
+                            "stale_protective_cancelled": cancelled_stale,
+                            "stale_protective_seen": len(stale_protective_oids),
                             "updated_at": now_utc.isoformat(),
                         },
                     },
@@ -3680,6 +3762,25 @@ class LiveTrader:
                     sl_result,
                     tp_result,
                 )
+                if stale_protective_oids:
+                    logger.warning(
+                        "manage_open_positions: keeping %d existing protective order(s) "
+                        "for %s because replacement failed",
+                        len(stale_protective_oids),
+                        coin,
+                    )
+                    self._update_shadow_trade_risk_levels(
+                        shadow_trades,
+                        metadata_updates={
+                            "risk_event": "protective_update_failed_existing_retained",
+                            "live_risk_state": {
+                                "event": "protective_update_failed_existing_retained",
+                                "existing_protective_oids": sorted(stale_protective_oids),
+                                "updated_at": now_utc.isoformat(),
+                            },
+                        },
+                    )
+                    continue
                 close_result = self.close_position(coin)
                 self._update_shadow_trade_risk_levels(
                     shadow_trades,
@@ -6221,39 +6322,15 @@ class LiveTrader:
                     protective_size,
                 )
                 if observed_position_size > actual_fill_size * 1.01 and not self.dry_run:
-                    try:
-                        cancelled_existing = self._cancel_protective_orders(coin)
-                    except Exception as exc:
-                        cancelled_existing = 0
-                        logger.warning(
-                            "Could not cancel existing protective orders for %s before "
-                            "same-side protection refresh (%s). Placing protection "
-                            "only for the new fill size %.6f to avoid over-covering.",
-                            coin,
-                            exc,
-                            actual_fill_size,
-                        )
-                        protective_size = actual_fill_size
-                    else:
-                        if cancelled_existing > 0:
-                            logger.warning(
-                                "Cancelled %d existing protective order(s) for %s "
-                                "before replacing with total-position protection "
-                                "size %.6f.",
-                                cancelled_existing,
-                                coin,
-                                protective_size,
-                            )
-                        else:
-                            logger.warning(
-                                "No existing protective orders for %s were visible "
-                                "before same-side protection refresh. Placing "
-                                "protection only for the new fill size %.6f to "
-                                "avoid over-covering.",
-                                coin,
-                                actual_fill_size,
-                            )
-                            protective_size = actual_fill_size
+                    logger.warning(
+                        "Existing same-side %s position detected. Keeping current "
+                        "protective orders live and placing protection only for "
+                        "the new fill size %.6f; total-position replacement is "
+                        "handled by manage_open_positions after new protection is verified.",
+                        coin,
+                        actual_fill_size,
+                    )
+                    protective_size = actual_fill_size
 
             # 2. Calculate stop loss and take profit prices from actual fill price when available.
             entry_anchor_price = exchange_reported_fill_price or verified_fill_price

@@ -2,16 +2,101 @@
 Options Flow Dashboard - Standalone web dashboard on port 8081.
 Three-panel layout: Account/Convictions | Flow Heatmap | Unusual Prints Tape
 """
+import hashlib
+import hmac
 import json
 import logging
 import threading
+import time
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import os
+from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
 
 # Module-level scanner reference (set by start_options_dashboard)
 _scanner = None
+_PUBLIC_BIND_HOSTS = {"0.0.0.0", "::", ""}
+
+
+def _truthy_env(name: str, default: str = "false") -> bool:
+    return os.environ.get(name, default).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _dashboard_auth_token() -> str:
+    return os.environ.get("OPTIONS_DASHBOARD_AUTH_TOKEN", "").strip() or os.environ.get(
+        "DASHBOARD_AUTH_TOKEN",
+        "",
+    ).strip()
+
+
+def _secure_token_eq(supplied: str, expected: str) -> bool:
+    if not supplied or not expected:
+        return False
+    try:
+        return hmac.compare_digest(str(supplied), str(expected))
+    except (TypeError, ValueError):
+        return False
+
+
+def _session_cookie_name() -> str:
+    return "options_dashboard_auth"
+
+
+def _make_session_cookie(auth_token: str) -> str:
+    issued_at = str(int(time.time()))
+    payload = f"v1.{issued_at}"
+    mac = hmac.new(auth_token.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
+    return f"{payload}.{mac}"
+
+
+def _verify_session_cookie(cookie_header: str, auth_token: str) -> bool:
+    if not cookie_header or not auth_token:
+        return False
+    marker = f"{_session_cookie_name()}="
+    cookie_value = ""
+    for part in cookie_header.split(";"):
+        part = part.strip()
+        if part.startswith(marker):
+            cookie_value = part[len(marker):]
+            break
+    pieces = cookie_value.split(".")
+    if len(pieces) != 3 or pieces[0] != "v1":
+        return False
+    try:
+        issued_at = int(pieces[1])
+    except (TypeError, ValueError):
+        return False
+    try:
+        ttl = max(300, min(int(os.environ.get("OPTIONS_DASHBOARD_SESSION_TTL_S", "86400")), 30 * 86400))
+    except (TypeError, ValueError):
+        ttl = 86400
+    now = int(time.time())
+    if issued_at > now + 60 or now - issued_at > ttl:
+        return False
+    payload = f"v1.{pieces[1]}"
+    expected = hmac.new(auth_token.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
+    return _secure_token_eq(pieces[2], expected)
+
+
+def _max_body_bytes() -> int:
+    try:
+        return max(1024, min(int(os.environ.get("OPTIONS_DASHBOARD_MAX_REQUEST_BODY_BYTES", "65536")), 2_000_000))
+    except (TypeError, ValueError):
+        return 65536
+
+
+def _allowed_origins() -> set[str]:
+    origins = {
+        "http://127.0.0.1:8081",
+        "http://localhost:8081",
+    }
+    configured = os.environ.get("OPTIONS_DASHBOARD_ALLOWED_ORIGINS", "").replace(";", ",")
+    for origin in configured.split(","):
+        origin = origin.strip().rstrip("/")
+        if origin and origin != "*":
+            origins.add(origin)
+    return origins
 
 
 def _get_dashboard_html() -> str:
@@ -544,18 +629,98 @@ class FlowDashboardHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass  # Suppress default HTTP logs
 
+    def _send_security_headers(self):
+        self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+        self.send_header("Pragma", "no-cache")
+        self.send_header("Expires", "0")
+        pending_cookie = getattr(self, "_pending_auth_cookie", "")
+        if pending_cookie:
+            self.send_header(
+                "Set-Cookie",
+                f"{_session_cookie_name()}={pending_cookie}; Path=/; "
+                "Max-Age=86400; HttpOnly; SameSite=Lax",
+            )
+
+    def _send_cors_headers(self):
+        origin = self.headers.get("Origin", "").strip().rstrip("/")
+        if origin and origin in _allowed_origins():
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Vary", "Origin")
+
+    def _check_auth(self) -> bool:
+        parsed = urlparse(self.path)
+        if parsed.path == "/api/health":
+            return True
+
+        auth_token = _dashboard_auth_token()
+        if not auth_token:
+            if self.command == "POST":
+                self._json_response(
+                    {
+                        "error": "options_dashboard_write_auth_not_configured",
+                        "hint": "Set OPTIONS_DASHBOARD_AUTH_TOKEN or DASHBOARD_AUTH_TOKEN before enabling POST endpoints",
+                    },
+                    code=403,
+                )
+                return False
+            return True
+
+        auth_header = self.headers.get("Authorization", "")
+        if auth_header.startswith("Bearer ") and _secure_token_eq(auth_header[7:].strip(), auth_token):
+            self._pending_auth_cookie = _make_session_cookie(auth_token)
+            return True
+        if _verify_session_cookie(self.headers.get("Cookie", ""), auth_token):
+            return True
+
+        self._json_response({"error": "unauthorized"}, code=401)
+        return False
+
+    def _read_json_body(self) -> dict | None:
+        try:
+            content_len = int(self.headers.get("Content-Length", 0) or 0)
+        except (TypeError, ValueError):
+            self._json_response({"error": "invalid_content_length"}, code=400)
+            return None
+        if content_len < 0:
+            self._json_response({"error": "invalid_content_length"}, code=400)
+            return None
+        if content_len > _max_body_bytes():
+            self._json_response(
+                {"error": "request_body_too_large", "max_bytes": _max_body_bytes()},
+                code=413,
+            )
+            return None
+        raw = self.rfile.read(content_len) if content_len > 0 else b""
+        if not raw:
+            return {}
+        try:
+            body = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            self._json_response({"error": f"invalid_json: {exc.msg}"}, code=400)
+            return None
+        if not isinstance(body, dict):
+            self._json_response({"error": "json_object_required"}, code=400)
+            return None
+        return body
+
     def do_GET(self):
-        if self.path == "/" or self.path == "/dashboard":
+        if not self._check_auth():
+            return
+        parsed = urlparse(self.path)
+        if parsed.path == "/" or parsed.path == "/dashboard":
             self._serve_html()
-        elif self.path == "/api/flow":
+        elif parsed.path == "/api/flow":
             self._serve_flow_data()
-        elif self.path == "/api/health":
+        elif parsed.path == "/api/health":
             self._json_response({"status": "ok"})
         else:
             self.send_error(404)
 
     def do_POST(self):
-        if self.path == "/api/order":
+        if not self._check_auth():
+            return
+        parsed = urlparse(self.path)
+        if parsed.path == "/api/order":
             self._handle_order()
         else:
             self.send_error(404)
@@ -564,6 +729,7 @@ class FlowDashboardHandler(BaseHTTPRequestHandler):
         html = _get_dashboard_html()
         self.send_response(200)
         self.send_header("Content-Type", "text/html")
+        self._send_security_headers()
         self.end_headers()
         self.wfile.write(html.encode())
 
@@ -580,9 +746,20 @@ class FlowDashboardHandler(BaseHTTPRequestHandler):
 
     def _handle_order(self):
         """Handle order placement (placeholder - needs Deribit API keys)."""
+        if not _truthy_env("OPTIONS_DASHBOARD_ENABLE_ORDER_ENDPOINT", "false"):
+            self._json_response(
+                {
+                    "status": "disabled",
+                    "error": "options_order_endpoint_disabled",
+                    "hint": "Set OPTIONS_DASHBOARD_ENABLE_ORDER_ENDPOINT=true only after live Deribit execution is implemented and reviewed",
+                },
+                code=403,
+            )
+            return
         try:
-            content_len = int(self.headers.get("Content-Length", 0))
-            body = json.loads(self.rfile.read(content_len))
+            body = self._read_json_body()
+            if body is None:
+                return
             logger.info(f"Order request: {body}")
             # TODO: Implement Deribit order execution with API keys
             self._json_response({
@@ -595,7 +772,8 @@ class FlowDashboardHandler(BaseHTTPRequestHandler):
     def _json_response(self, data: dict, code: int = 200):
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
-        self.send_header("Access-Control-Allow-Origin", "*")
+        self._send_cors_headers()
+        self._send_security_headers()
         self.end_headers()
         self.wfile.write(json.dumps(data, default=str).encode())
 
@@ -606,9 +784,19 @@ def start_options_dashboard(scanner, port: int = None):
     _scanner = scanner
 
     port = port or int(os.environ.get("OPTIONS_DASHBOARD_PORT", 8081))
+    host = os.environ.get("OPTIONS_DASHBOARD_HOST", "127.0.0.1").strip() or "127.0.0.1"
+    if host in _PUBLIC_BIND_HOSTS and not _dashboard_auth_token() and not _truthy_env(
+        "OPTIONS_DASHBOARD_ALLOW_UNAUTH_PUBLIC",
+        "false",
+    ):
+        raise RuntimeError(
+            "Refusing to start public options dashboard without auth. "
+            "Set OPTIONS_DASHBOARD_HOST=127.0.0.1, configure DASHBOARD_AUTH_TOKEN, "
+            "or explicitly set OPTIONS_DASHBOARD_ALLOW_UNAUTH_PUBLIC=true."
+        )
 
-    server = HTTPServer(("0.0.0.0", port), FlowDashboardHandler)
+    server = HTTPServer((host, port), FlowDashboardHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
-    logger.info(f"Options Flow Dashboard running on port {port}")
+    logger.info("Options Flow Dashboard running on %s:%s", host, port)
     return server

@@ -226,7 +226,7 @@ def build_subsystems(
 
     c = SubsystemContainer()
     c.data_source_registry = DataSourceRegistry()
-    for source_name in ("polymarket", "options_flow", "deribit"):
+    for source_name in ("polymarket", "options_flow", "deribit", "exchange_aggregator", "macro_regime"):
         c.data_source_registry.register_source(source_name)
     logger.info("Building subsystems (profile has %d features)...", len(profile))
 
@@ -242,7 +242,12 @@ def build_subsystems(
     from src.analysis.features import FeatureEngine
     from src.ui.reporter import Reporter
 
-    c.exchange_agg = _safe_init("exchange_aggregator", ExchangeAggregator, health, affects_trading=False)
+    c.exchange_agg = _safe_init(
+        "exchange_aggregator",
+        lambda: ExchangeAggregator(source_registry=c.data_source_registry),
+        health,
+        affects_trading=False,
+    )
     c.discovery = _safe_init("discovery", TraderDiscovery, health, affects_trading=False)
     c.identifier = _safe_init("strategy_identifier", StrategyIdentifier, health, affects_trading=False)
     c.scorer = _safe_init("strategy_scorer", StrategyScorer, health)
@@ -581,7 +586,7 @@ def build_subsystems(
         from src.data.macro_regime_scraper import MacroRegimeScraper
         c.macro_regime = _safe_init(
             "macro_regime",
-            MacroRegimeScraper,
+            lambda: MacroRegimeScraper({"source_registry": c.data_source_registry}),
             health,
             affects_trading=False,
         )

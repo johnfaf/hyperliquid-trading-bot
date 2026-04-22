@@ -224,6 +224,54 @@ def test_live_risk_sizing_targets_margin_at_stop(monkeypatch):
     assert sizing["target_notional_usd"] == 45.0
 
 
+def test_live_risk_sizing_blocks_live_when_free_margin_unavailable(monkeypatch):
+    monkeypatch.setattr(config, "LIVE_RISK_SIZING_ENABLED", True, raising=False)
+    monkeypatch.setattr(config, "LIVE_RISK_PER_TRADE_PCT", 0.01, raising=False)
+    monkeypatch.setattr(config, "LIVE_MAX_MARGIN_PER_ORDER_PCT", 0.20, raising=False)
+    monkeypatch.setattr(config, "LIVE_MIN_MARGIN_PER_ORDER_USD", 0.0, raising=False)
+    monkeypatch.setattr(LiveTrader, "_load_credentials", _fake_live_credentials)
+    monkeypatch.setattr(LiveTrader, "_load_asset_index_map", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "reconcile_positions", lambda self: None)
+
+    trader = LiveTrader(firewall=type("FW", (), {})(), dry_run=False, max_order_usd=1_000.0)
+    monkeypatch.setattr(trader, "_get_mid_price", lambda coin: 100.0)
+    monkeypatch.setattr(trader, "get_account_value", lambda: 100.0)
+    monkeypatch.setattr(trader, "get_free_margin", lambda: None)
+
+    signal = TradeSignal(
+        coin="ETH",
+        side=SignalSide.LONG,
+        confidence=0.80,
+        source=SignalSource.STRATEGY,
+        reason="test",
+        risk=RiskParams(stop_loss_pct=0.10, take_profit_pct=0.50, risk_basis="roe"),
+        leverage=5,
+        size=0.01,
+    )
+
+    adjusted = trader._apply_risk_based_live_sizing(signal, source_policy={"size_multiplier": 1.0})
+
+    assert adjusted.size == 0.0
+    assert adjusted.position_pct == 0.0
+    sizing = trader.get_stats()["live_sizing"]
+    assert sizing["reason"] == "free_margin_unavailable"
+    assert sizing["blocked"] is True
+
+
+def test_live_dual_control_requires_rolling_drawdown_cap(monkeypatch):
+    monkeypatch.setattr(config, "LIVE_TRADING_ENABLED", True, raising=False)
+    monkeypatch.setattr(config, "LIVE_TRADING_DUAL_CONTROL_CONFIRM", True, raising=False)
+    monkeypatch.setenv("LIVE_MAX_DRAWDOWN_USD", "0")
+    monkeypatch.setattr(LiveTrader, "_load_credentials", _fake_live_credentials)
+    monkeypatch.setattr(LiveTrader, "_load_asset_index_map", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "reconcile_positions", lambda self: None)
+
+    trader = LiveTrader(firewall=type("FW", (), {})(), dry_run=False, max_order_usd=1_000.0)
+
+    assert trader.dry_run is True
+    assert trader.status_reason == "live_drawdown_cap_required"
+
+
 def test_dynamic_source_policy_caps_active_sources():
     scorer = AgentScorer(
         {
@@ -587,7 +635,7 @@ def test_live_trader_uses_verified_fill_size_for_protection(monkeypatch):
     assert [call[2] for call in trigger_calls] == [0.06, 0.06]
 
 
-def test_execute_signal_replaces_existing_protection_before_total_position_bracket(monkeypatch):
+def test_execute_signal_keeps_existing_protection_before_new_fill_bracket(monkeypatch):
     class FakeFirewall:
         def validate(self, signal, **kwargs):
             return True, "ok"
@@ -622,11 +670,7 @@ def test_execute_signal_replaces_existing_protection_before_total_position_brack
         },
     )
     monkeypatch.setattr(LiveTrader, "_get_mid_price", lambda self, coin: 2000.0)
-    monkeypatch.setattr(
-        LiveTrader,
-        "_cancel_protective_orders",
-        lambda self, coin: events.append(("cancel", coin)) or 2,
-    )
+    monkeypatch.setattr(LiveTrader, "_cancel_protective_orders", lambda self, coin: events.append(("cancel", coin)) or 2)
     monkeypatch.setattr(
         LiveTrader,
         "place_trigger_order",
@@ -654,10 +698,10 @@ def test_execute_signal_replaces_existing_protection_before_total_position_brack
 
     assert result is not None
     assert result["status"] == "success"
-    assert events[0] == ("cancel", "ETH")
-    assert [event[0] for event in events[1:]] == ["trigger", "trigger"]
-    assert trigger_sizes == [0.105, 0.105]
-    assert result["protected_size"] == 0.105
+    assert ("cancel", "ETH") not in events
+    assert [event[0] for event in events] == ["trigger", "trigger"]
+    assert trigger_sizes == [0.1, 0.1]
+    assert result["protected_size"] == 0.1
 
 
 def test_execute_signal_protects_only_new_fill_when_existing_protection_not_visible(monkeypatch):

@@ -134,6 +134,7 @@ class MacroRegimeScraper:
 
     def __init__(self, config_override: Optional[Dict] = None):
         cfg = dict(config_override or {})
+        self.source_registry = cfg.get("source_registry")
         self.enabled = bool(cfg.get(
             "enabled",
             getattr(config, "MACRO_REGIME_ENABLED", True),
@@ -214,6 +215,16 @@ class MacroRegimeScraper:
             "detail": detail[:200] if detail else "",
             "updated_at": _utc_now().isoformat(),
         }
+        if self.source_registry:
+            try:
+                registry_name = f"macro_regime:{name}"
+                metadata = {"source": name, "detail": detail[:200] if detail else ""}
+                if ok:
+                    self.source_registry.mark_up(registry_name, reason=detail or "ok", metadata=metadata)
+                else:
+                    self.source_registry.mark_degraded(registry_name, reason=detail or "failed", metadata=metadata)
+            except Exception as exc:
+                logger.debug("macro source-registry update failed for %s: %s", name, exc)
 
     # =====================================================================
     # Source 1: Finviz Futures
@@ -911,6 +922,32 @@ class MacroRegimeScraper:
             "sources": dict(self._source_status),
             "timestamp": _utc_now().isoformat(),
         }
+
+        if self.source_registry:
+            try:
+                source_count = len(self._source_status)
+                ok_count = sum(1 for src in self._source_status.values() if src.get("ok"))
+                metadata = {"sources": source_count, "ok": ok_count, "failed": source_count - ok_count}
+                if source_count <= 0 or ok_count <= 0:
+                    self.source_registry.mark_down(
+                        "macro_regime",
+                        reason="no macro sources available",
+                        metadata=metadata,
+                    )
+                elif ok_count < source_count:
+                    self.source_registry.mark_degraded(
+                        "macro_regime",
+                        reason=f"partial macro sources: {ok_count}/{source_count} ok",
+                        metadata=metadata,
+                    )
+                else:
+                    self.source_registry.mark_up(
+                        "macro_regime",
+                        reason=f"{ok_count} macro sources ok",
+                        metadata=metadata,
+                    )
+            except Exception as exc:
+                logger.debug("macro aggregate source-registry update failed: %s", exc)
 
         with self._lock:
             self._snapshot = posture

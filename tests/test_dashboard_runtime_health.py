@@ -260,7 +260,8 @@ def test_dashboard_bearer_auth_sets_cookie(monkeypatch):
     allowed = handler._check_auth()
 
     assert allowed is True
-    assert handler._pending_auth_cookie == "secret-token"
+    assert handler._pending_auth_cookie != "secret-token"
+    assert dashboard._verify_auth_session_cookie(handler._pending_auth_cookie, "secret-token") is True
 
 
 def test_dashboard_redirects_page_requests_to_login(monkeypatch):
@@ -284,7 +285,8 @@ def test_dashboard_login_post_sets_cookie_and_redirects(monkeypatch):
 
     handler._handle_login()
 
-    assert handler._pending_auth_cookie == "secret-token"
+    assert handler._pending_auth_cookie != "secret-token"
+    assert dashboard._verify_auth_session_cookie(handler._pending_auth_cookie, "secret-token") is True
     assert ("status", 303) in handler._responses
     assert ("header", "Location", "/") in handler._responses
 
@@ -323,3 +325,32 @@ def test_dashboard_json_response_swallows_client_disconnect_during_headers():
     handler._json_response({"ok": True})
 
     assert handler.close_connection is True
+
+
+def test_dashboard_rejects_oversized_login_body(monkeypatch):
+    monkeypatch.setenv("DASHBOARD_AUTH_TOKEN", "secret-token")
+    monkeypatch.setenv("DASHBOARD_MAX_REQUEST_BODY_BYTES", "1024")
+    handler = _make_dashboard_handler(
+        path="/api/auth/login",
+        headers={"Content-Length": "1025"},
+        command="POST",
+    )
+
+    handler._handle_login()
+
+    assert ("status", 413) in handler._responses
+    assert b"request_body_too_large" in handler.wfile.getvalue()
+
+
+def test_dashboard_json_response_does_not_emit_wildcard_cors(monkeypatch):
+    handler = _make_dashboard_handler(
+        path="/api/data",
+        headers={"Origin": "https://evil.example"},
+    )
+
+    handler._json_response({"ok": True})
+
+    assert not any(
+        item[0] == "header" and item[1] == "Access-Control-Allow-Origin" and item[2] == "*"
+        for item in handler._responses
+    )
