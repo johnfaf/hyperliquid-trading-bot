@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 # ─── SQLite helpers ─────────────────────────────────────────────
 
 def _sqlite_connect() -> sqlite3.Connection:
-    """Open a fresh SQLite connection with WAL + busy_timeout."""
+    """Open a fresh SQLite connection with WAL, FK checks, and busy_timeout."""
     import shutil
 
     db_path = config.DB_PATH
@@ -48,6 +48,7 @@ def _sqlite_connect() -> sqlite3.Connection:
 
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys=ON")
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=5000")
     return conn

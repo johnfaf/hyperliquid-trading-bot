@@ -82,6 +82,8 @@ from cli import (
     run_candle_backtest,
     run_cache_list,
     run_cache_clear,
+    run_db_audit_cli,
+    run_db_repair_cli,
 )
 
 
@@ -110,6 +112,24 @@ class HyperliquidResearchBot:
         log_persistence_info(self.logger)
         validate_dependencies(self.logger)
         init_database(self.logger)
+        try:
+            from src.data.db_audit import format_db_audit_report, run_db_audit
+
+            audit_report = run_db_audit(include_candle_cache=True, include_code_scan=False)
+            block_severity = getattr(config, "READINESS_DB_AUDIT_BLOCK_SEVERITY", "high")
+            if audit_report.findings_at_or_above(block_severity):
+                self.logger.warning(
+                    "Database audit found readiness blockers:\n%s",
+                    format_db_audit_report(audit_report, block_severity=block_severity),
+                )
+            else:
+                self.logger.info(
+                    "Database audit passed readiness threshold (%s): %d finding(s)",
+                    block_severity,
+                    len(audit_report.findings),
+                )
+        except Exception as exc:
+            self.logger.warning("Database audit skipped during boot: %s", exc)
 
         # ── Build subsystems ──
         effective_profile = profile or FULL_PROFILE
@@ -619,6 +639,12 @@ def main():
     if args.cache_clear:
         run_cache_clear(setup_logging())
         return
+
+    if args.db_repair:
+        sys.exit(run_db_repair_cli(args))
+
+    if args.db_audit:
+        sys.exit(run_db_audit_cli(args))
 
     if args.candle_backtest:
         run_candle_backtest(setup_logging(), args)

@@ -85,6 +85,34 @@ POSTGRES_POOL_MAX = int(os.environ.get("POSTGRES_POOL_MAX", 10))
 POSTGRES_STATEMENT_TIMEOUT_MS = int(os.environ.get("POSTGRES_STATEMENT_TIMEOUT_MS", 5000))
 POSTGRES_APP_NAME = os.environ.get("POSTGRES_APP_NAME", "hyperliquid-bot").strip()
 
+# Runtime DB audit/readiness guardrails. The audit is read-only; readiness
+# blocks when findings at or above READINESS_DB_AUDIT_BLOCK_SEVERITY are found.
+READINESS_DB_AUDIT_ENABLED = os.environ.get(
+    "READINESS_DB_AUDIT_ENABLED", "true"
+).lower() in ("true", "1", "yes")
+READINESS_DB_AUDIT_TTL_S = int(os.environ.get("READINESS_DB_AUDIT_TTL_S", 300))
+READINESS_DB_AUDIT_BLOCK_SEVERITY = os.environ.get(
+    "READINESS_DB_AUDIT_BLOCK_SEVERITY", "high"
+).strip().lower()
+if READINESS_DB_AUDIT_BLOCK_SEVERITY not in {"low", "medium", "high", "critical"}:
+    READINESS_DB_AUDIT_BLOCK_SEVERITY = "high"
+DB_AUDIT_PENDING_DECISION_MAX_AGE_MINUTES = float(
+    os.environ.get("DB_AUDIT_PENDING_DECISION_MAX_AGE_MINUTES", 30.0)
+)
+DB_AUDIT_REGIME_MAX_AGE_HOURS = float(
+    os.environ.get("DB_AUDIT_REGIME_MAX_AGE_HOURS", 24.0)
+)
+DB_AUDIT_SOURCE_STALE_MULTIPLIER = float(
+    os.environ.get("DB_AUDIT_SOURCE_STALE_MULTIPLIER", 2.0)
+)
+DB_AUDIT_MIN_CANDLE_COINS = int(os.environ.get("DB_AUDIT_MIN_CANDLE_COINS", 2))
+DB_AUDIT_DUALWRITE_HEALTH_WINDOW_S = float(
+    os.environ.get("DB_AUDIT_DUALWRITE_HEALTH_WINDOW_S", 300.0)
+)
+DB_AUDIT_DUALWRITE_MAX_FAILURES = int(
+    os.environ.get("DB_AUDIT_DUALWRITE_MAX_FAILURES", 5)
+)
+
 # ─── Feature Store (Postgres-only, auto-enabled when POSTGRES_DSN set) ─
 FEATURE_STORE_COINS = os.environ.get("FEATURE_STORE_COINS", "").strip()
 FEATURE_STORE_MAX_COINS = int(os.environ.get("FEATURE_STORE_MAX_COINS", 30))
