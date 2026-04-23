@@ -188,8 +188,8 @@ def test_register_background_tasks_includes_heartbeat_supervisor(monkeypatch):
     bot = main.HyperliquidResearchBot.__new__(main.HyperliquidResearchBot)
     registered = []
     bot.task_runner = SimpleNamespace(
-        register=lambda name, target, interval_seconds, max_retries=5: registered.append(
-            (name, interval_seconds, max_retries, target)
+        register=lambda name, target, interval_seconds, initial_delay_seconds=0.0, max_retries=5: registered.append(
+            (name, interval_seconds, initial_delay_seconds, max_retries, target)
         )
     )
     bot.container = SimpleNamespace(polymarket=None, options_scanner=None)
@@ -201,4 +201,30 @@ def test_register_background_tasks_includes_heartbeat_supervisor(monkeypatch):
 
     assert registered[0][0] == "bg-heartbeat"
     assert registered[0][1] >= 15.0
+    assert registered[0][2] == 5.0
     assert calls[0] == ("bg-heartbeat", False)
+
+
+def test_register_background_tasks_staggers_heavy_scanners(monkeypatch):
+    bot = main.HyperliquidResearchBot.__new__(main.HyperliquidResearchBot)
+    registered = []
+    bot.task_runner = SimpleNamespace(
+        register=lambda name, target, interval_seconds, initial_delay_seconds=0.0, max_retries=5: registered.append(
+            {
+                "name": name,
+                "interval_seconds": interval_seconds,
+                "initial_delay_seconds": initial_delay_seconds,
+                "max_retries": max_retries,
+            }
+        )
+    )
+    bot.container = SimpleNamespace(polymarket=object(), options_scanner=object())
+
+    monkeypatch.setattr(main.health_registry, "register", lambda *args, **kwargs: None)
+
+    bot._register_background_tasks()
+
+    delays = {item["name"]: item["initial_delay_seconds"] for item in registered}
+    assert delays["bg-heartbeat"] == 5.0
+    assert delays["bg-polymarket"] == 20.0
+    assert delays["bg-options-flow"] == 40.0

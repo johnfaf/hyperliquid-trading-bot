@@ -178,10 +178,23 @@ class HyperliquidResearchBot:
             15.0,
             min(60.0, float(getattr(config, "READINESS_STALE_SECONDS", 600)) / 4.0),
         )
+        heartbeat_startup_delay = max(
+            0.0,
+            float(os.environ.get("BG_HEARTBEAT_STARTUP_DELAY_S", "5")),
+        )
+        polymarket_startup_delay = max(
+            0.0,
+            float(os.environ.get("BG_POLYMARKET_STARTUP_DELAY_S", "20")),
+        )
+        options_startup_delay = max(
+            0.0,
+            float(os.environ.get("BG_OPTIONS_FLOW_STARTUP_DELAY_S", "40")),
+        )
         self.task_runner.register(
             "bg-heartbeat",
             self._background_heartbeat,
             interval_seconds=heartbeat_interval,
+            initial_delay_seconds=heartbeat_startup_delay,
             max_retries=3,
         )
         health_registry.register("bg-heartbeat", affects_trading=False)
@@ -191,6 +204,7 @@ class HyperliquidResearchBot:
                 "bg-polymarket",
                 self._polymarket_scan,
                 interval_seconds=config.POLYMARKET_SCAN_INTERVAL,
+                initial_delay_seconds=polymarket_startup_delay,
                 max_retries=10,
             )
             health_registry.register("bg-polymarket", affects_trading=False)
@@ -200,6 +214,7 @@ class HyperliquidResearchBot:
                 "bg-options-flow",
                 self._options_scan,
                 interval_seconds=config.OPTIONS_FLOW_SCAN_INTERVAL,
+                initial_delay_seconds=options_startup_delay,
                 max_retries=10,
             )
             health_registry.register("bg-options-flow", affects_trading=False)

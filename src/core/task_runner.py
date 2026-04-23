@@ -40,6 +40,7 @@ class SupervisedTask:
     name: str
     target: Callable
     interval_seconds: float
+    initial_delay_seconds: float = 0.0
     max_retries: int = 5
     auto_recover_cooldown_s: float = 300.0
     stop_event: threading.Event = field(default_factory=threading.Event)
@@ -71,7 +72,8 @@ class SupervisedTaskRunner:
     # ── Registration ──────────────────────────────────────────────
 
     def register(self, name: str, target: Callable,
-                 interval_seconds: float, max_retries: int = 5,
+                 interval_seconds: float, initial_delay_seconds: float = 0.0,
+                 max_retries: int = 5,
                  auto_recover_cooldown_s: float = 300.0) -> None:
         """Register a background task.  Does NOT start it yet."""
         with self._lock:
@@ -81,13 +83,15 @@ class SupervisedTaskRunner:
                 name=name,
                 target=target,
                 interval_seconds=interval_seconds,
+                initial_delay_seconds=max(0.0, float(initial_delay_seconds)),
                 max_retries=max_retries,
                 auto_recover_cooldown_s=max(0.0, float(auto_recover_cooldown_s)),
             )
         logger.debug(
-            "Registered supervised task: %s (interval=%ss, max_retries=%d, auto_recover=%ss)",
+            "Registered supervised task: %s (interval=%ss, initial_delay=%ss, max_retries=%d, auto_recover=%ss)",
             name,
             interval_seconds,
+            initial_delay_seconds,
             max_retries,
             auto_recover_cooldown_s,
         )
@@ -226,6 +230,7 @@ class SupervisedTaskRunner:
             "name": task.name,
             "state": task.state,
             "interval_seconds": task.interval_seconds,
+            "initial_delay_seconds": task.initial_delay_seconds,
             "retry_count": task.retry_count,
             "max_retries": task.max_retries,
             "auto_recover_cooldown_s": task.auto_recover_cooldown_s,
@@ -249,6 +254,12 @@ class SupervisedTaskRunner:
         """
         logger.info("Supervised loop started: %s (interval=%ss)",
                      task.name, task.interval_seconds)
+        initial_delay = max(0.0, float(getattr(task, "initial_delay_seconds", 0.0) or 0.0))
+        if initial_delay > 0:
+            logger.info("Task '%s' initial delay %.1fs before first run", task.name, initial_delay)
+            if task.stop_event.wait(initial_delay):
+                logger.info("Supervised loop exited before first run: %s (state=%s)", task.name, task.state)
+                return
         while not task.stop_event.is_set():
             try:
                 task.target()
@@ -351,4 +362,3 @@ class SupervisedTaskRunner:
 # Module-level singleton
 # ---------------------------------------------------------------------------
 runner = SupervisedTaskRunner()
-
