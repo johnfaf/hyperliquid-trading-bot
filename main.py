@@ -69,6 +69,7 @@ from src.core.cycles.fast_cycle import (
     cancel_live_orders_once,
     start_kill_switch_watchdog,
     stop_kill_switch_watchdog,
+    DEFAULT_KILL_SWITCH_FILE,
 )
 from src.core.cycles.reporting_cycle import run_reporting
 from src.core.cycles.feature_cycle import run_feature_cycle, backfill_all as backfill_features, feature_store_is_empty
@@ -424,6 +425,55 @@ class HyperliquidResearchBot:
             remaining = deadline - time.time()
             time.sleep(min(1.0, max(0.0, remaining)))
 
+    @staticmethod
+    def _kill_switch_file_path() -> str:
+        return (
+            os.environ.get("LIVE_EXTERNAL_KILL_SWITCH_FILE", "").strip()
+            or DEFAULT_KILL_SWITCH_FILE
+        )
+
+    def _wait_for_startup_kill_switch_clear(self) -> None:
+        """Pause startup while the external kill-switch file is present."""
+        path = self._kill_switch_file_path()
+        if not path:
+            return
+
+        warned = False
+        while self.running and os.path.exists(path):
+            try:
+                check_file_kill_switch(self.container)
+            except Exception as exc:
+                self.logger.warning("Startup kill-switch check failed: %s", exc)
+
+            if not warned:
+                self.logger.critical(
+                    "KILL_SWITCH active at startup (%s). Background tasks and "
+                    "trading loops are paused until the file is removed.",
+                    path,
+                )
+                warned = True
+
+            try:
+                self.runtime_config.poll(self.container)
+            except Exception as exc:
+                self.logger.warning(
+                    "Runtime config poll failed while startup kill switch is active: %s",
+                    exc,
+                )
+            time.sleep(1.0)
+
+        if warned and self.running:
+            # Reset the edge-trigger bookkeeping now that the file itself is
+            # gone, so a later real shutdown or future file-trigger can still
+            # dispatch order cancels exactly once.
+            setattr(self.container, "_file_kill_switch_triggered", False)
+            setattr(self.container, "_stop_requested", False)
+            setattr(self.container, "_shutdown_orders_cancelled", False)
+            self.logger.info(
+                "Startup KILL_SWITCH file cleared; resuming bot startup. "
+                "Persisted live-trader kill-switch state, if any, still applies."
+            )
+
     def run_once(self):
         """Run discovery + trading cycle (CLI --once)."""
         self._run_discovery()
@@ -491,52 +541,55 @@ class HyperliquidResearchBot:
         signal.signal(signal.SIGINT, signal_handler)
         signal.signal(signal.SIGTERM, signal_handler)
 
-        # ── Start supervised background tasks ──
-        self.task_runner.start_all()
+        self._wait_for_startup_kill_switch_clear()
 
-        self.logger.info("Bot starting continuous operation…")
-        self.logger.info("  Fast cycle:      every %ds", config.FAST_CYCLE_INTERVAL)
-        self.logger.info("  Trading cycle:   every %ds", config.TRADING_CYCLE_INTERVAL)
-        self.logger.info("  Discovery cycle: every %ds", config.DISCOVERY_CYCLE_INTERVAL)
-        sys.stdout.flush()
+        if self.running:
+            # Start supervised background tasks
+            self.task_runner.start_all()
 
-        # Initial discovery if needed
-        trader_count = 0
-        try:
-            trader_count = len(db.get_active_traders())
-        except Exception:
-            pass
+            self.logger.info("Bot starting continuous operation…")
+            self.logger.info("  Fast cycle:      every %ds", config.FAST_CYCLE_INTERVAL)
+            self.logger.info("  Trading cycle:   every %ds", config.TRADING_CYCLE_INTERVAL)
+            self.logger.info("  Discovery cycle: every %ds", config.DISCOVERY_CYCLE_INTERVAL)
+            sys.stdout.flush()
 
-        if trader_count == 0:
-            self.logger.info(
-                "No traders in DB — scheduling initial discovery in background "
-                "so trading cycles can continue."
-            )
-            self._start_discovery_async("startup_empty_trader_pool")
-        else:
-            restored_ts = self._restore_last_discovery_time()
-            if restored_ts and (time.time() - restored_ts) < config.DISCOVERY_CYCLE_INTERVAL:
-                self._last_discovery = restored_ts
-                remaining_h = (config.DISCOVERY_CYCLE_INTERVAL - (time.time() - restored_ts)) / 3600
-                self.logger.info("Restored discovery timer, next in %.1fh", remaining_h)
-            else:
-                self._last_discovery = time.time()
+            # Initial discovery if needed
+            trader_count = 0
+            try:
+                trader_count = len(db.get_active_traders())
+            except Exception:
+                pass
+
+            if trader_count == 0:
                 self.logger.info(
-                    "DB has %d traders — next discovery in %.0fh",
-                    trader_count, config.DISCOVERY_CYCLE_INTERVAL / 3600,
+                    "No traders in DB — scheduling initial discovery in background "
+                    "so trading cycles can continue."
                 )
+                self._start_discovery_async("startup_empty_trader_pool")
+            else:
+                restored_ts = self._restore_last_discovery_time()
+                if restored_ts and (time.time() - restored_ts) < config.DISCOVERY_CYCLE_INTERVAL:
+                    self._last_discovery = restored_ts
+                    remaining_h = (config.DISCOVERY_CYCLE_INTERVAL - (time.time() - restored_ts)) / 3600
+                    self.logger.info("Restored discovery timer, next in %.1fh", remaining_h)
+                else:
+                    self._last_discovery = time.time()
+                    self.logger.info(
+                        "DB has %d traders — next discovery in %.0fh",
+                        trader_count, config.DISCOVERY_CYCLE_INTERVAL / 3600,
+                    )
 
-        # ── Independent kill-switch watchdog (P0-1) ──
-        # Polls /data/KILL_SWITCH on a 1s cadence regardless of what the
-        # main loop is doing.  Catches the case where a long trading cycle
-        # is mid-flight when the operator drops the file.
-        try:
-            watchdog_interval_s = float(
-                os.environ.get("LIVE_KILL_SWITCH_WATCHDOG_INTERVAL_S", "1.0")
-            )
-        except (TypeError, ValueError):
-            watchdog_interval_s = 1.0
-        start_kill_switch_watchdog(self.container, interval_s=watchdog_interval_s)
+            # Independent kill-switch watchdog (P0-1)
+            # Polls /data/KILL_SWITCH on a 1s cadence regardless of what the
+            # main loop is doing. Catches the case where a long trading cycle
+            # is mid-flight when the operator drops the file.
+            try:
+                watchdog_interval_s = float(
+                    os.environ.get("LIVE_KILL_SWITCH_WATCHDOG_INTERVAL_S", "1.0")
+                )
+            except (TypeError, ValueError):
+                watchdog_interval_s = 1.0
+            start_kill_switch_watchdog(self.container, interval_s=watchdog_interval_s)
 
         # ── Main loop ──
         while self.running:
