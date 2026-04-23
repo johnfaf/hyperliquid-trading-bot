@@ -360,6 +360,122 @@ class PaperTrader:
                 pass
         return 0.02
 
+    @staticmethod
+    def _signal_expected_cost_bps() -> float:
+        fee_bps = float(getattr(config, "PAPER_TRADING_TAKER_FEE_BPS", 2.5) or 2.5) * 2.0
+        slippage_bps = float(
+            getattr(
+                config,
+                "TRADE_QUALITY_EXPECTED_SLIPPAGE_BPS",
+                getattr(config, "PAPER_TRADING_SLIPPAGE_MAX_BPS", 5.0),
+            )
+            or 0.0
+        ) * 2.0
+        return max(0.0, fee_bps + slippage_bps)
+
+    @staticmethod
+    def _coerce_expected_return_bps(value: object) -> float:
+        try:
+            expected = float(value or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+        if abs(expected) <= 1.0:
+            return expected * 10_000.0
+        return expected
+
+    def _estimate_signal_edge_bps(self, trade_signal: TradeSignal, sig: Dict) -> float:
+        context = dict(getattr(trade_signal, "context", {}) or {})
+        expected_return = (
+            sig.get("expected_return")
+            or context.get("expected_return")
+            or (sig.get("risk_policy") or {}).get("expected_return")
+        )
+        edge_bps = self._coerce_expected_return_bps(expected_return)
+        if edge_bps <= 0:
+            # Confidence-only fallback: 60% confidence ~= 20 bps, 75% ~= 50 bps.
+            edge_bps = max(0.0, float(trade_signal.confidence or 0.0) - 0.50) * 200.0
+        if sig.get("volume_confirmed"):
+            edge_bps += 5.0
+        if sig.get("options_flow_aligned"):
+            edge_bps += 5.0
+        features = dict(sig.get("features") or {})
+        try:
+            feature_score = float(features.get("overall_score", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            feature_score = 0.0
+        side = str(sig.get("side", "") or "").lower()
+        if side == "long" and feature_score > 0:
+            edge_bps += min(feature_score * 10.0, 10.0)
+        elif side == "short" and feature_score < 0:
+            edge_bps += min(abs(feature_score) * 10.0, 10.0)
+        elif side == "short" and feature_score > 0:
+            edge_bps -= min(feature_score * 15.0, 20.0)
+        return round(edge_bps, 4)
+
+    def _passes_trade_quality_gate(self, trade_signal: TradeSignal, sig: Dict) -> tuple[bool, Dict[str, object]]:
+        cost_bps = self._signal_expected_cost_bps()
+        edge_bps = self._estimate_signal_edge_bps(trade_signal, sig)
+        minimum_edge_bps = cost_bps * float(
+            getattr(config, "TRADE_QUALITY_MIN_EDGE_COST_MULTIPLE", 1.5) or 1.5
+        )
+        side = str(sig.get("side", "") or "").lower()
+        confidence = float(trade_signal.confidence or 0.0)
+        if (
+            bool(getattr(config, "TRADE_QUALITY_STRONG_SHORT_CONFIRMATION", True))
+            and side == "short"
+            and confidence < float(getattr(config, "TRADE_QUALITY_SHORT_MIN_CONFIDENCE", 0.55) or 0.55)
+            and not (sig.get("volume_confirmed") or sig.get("options_flow_aligned"))
+        ):
+            return False, {
+                "reason": "short_lacks_confirmation",
+                "edge_bps": edge_bps,
+                "cost_bps": cost_bps,
+                "minimum_edge_bps": minimum_edge_bps,
+            }
+        if bool(getattr(config, "TRADE_QUALITY_FEE_EV_GATE_ENABLED", True)) and edge_bps < minimum_edge_bps:
+            return False, {
+                "reason": "edge_below_cost",
+                "edge_bps": edge_bps,
+                "cost_bps": cost_bps,
+                "minimum_edge_bps": minimum_edge_bps,
+            }
+        return True, {
+            "reason": "passed",
+            "edge_bps": edge_bps,
+            "cost_bps": cost_bps,
+            "minimum_edge_bps": minimum_edge_bps,
+        }
+
+    def _final_executable_score(
+        self,
+        trade_signal: TradeSignal,
+        sig: Dict,
+        regime_data: Optional[Dict] = None,
+    ) -> float:
+        edge_bps = self._estimate_signal_edge_bps(trade_signal, sig)
+        cost_bps = max(self._signal_expected_cost_bps(), 1.0)
+        confidence = float(trade_signal.confidence or 0.0)
+        source_accuracy = float(getattr(trade_signal, "source_accuracy", 0.0) or 0.0)
+        rotation_score = self.rotation_manager.candidate_score(trade_signal, regime_data=regime_data)
+        confirmation_bonus = 0.0
+        if sig.get("volume_confirmed"):
+            confirmation_bonus += 0.05
+        if sig.get("options_flow_aligned"):
+            confirmation_bonus += 0.05
+        side_penalty = 0.0
+        if str(sig.get("side", "") or "").lower() == "short" and confirmation_bonus <= 0:
+            side_penalty = 0.05
+        ev_score = min(max(edge_bps / (cost_bps * 3.0), 0.0), 1.0)
+        return round(
+            confidence * 0.40
+            + rotation_score * 0.25
+            + source_accuracy * 0.15
+            + ev_score * 0.15
+            + confirmation_bonus
+            - side_penalty,
+            6,
+        )
+
     def _get_position_sizing(
         self,
         strategy_key: str,
@@ -457,7 +573,8 @@ class PaperTrader:
         raw_signals = []
         _drop_counts = {"existing_position": 0, "no_signal": 0, "volume_reject": 0,
                         "schema_error": 0, "firewall": 0, "arena": 0, "memory": 0,
-                        "llm_filter": 0, "other_error": 0}
+                        "llm_filter": 0, "ev_gate": 0, "execution_cap": 0,
+                        "missing_asset": 0, "other_error": 0}
         for strategy in strategies:
             try:
                 existing = [t for t in open_trades if t["strategy_id"] == strategy.get("id")]
@@ -465,7 +582,10 @@ class PaperTrader:
                 # Generate signal from strategy
                 signal = self._generate_signal(strategy, mids, regime_data=regime_data)
                 if not signal:
-                    _drop_counts["no_signal"] += 1
+                    if strategy.get("_decision_skip_reason") == "missing_asset":
+                        _drop_counts["missing_asset"] += 1
+                    else:
+                        _drop_counts["no_signal"] += 1
                     logger.info(f"No signal generated for {strategy.get('name', '?')}")
                     continue
 
@@ -735,9 +855,32 @@ class PaperTrader:
                 sig["confidence"] = trade_signal.confidence
                 sig["source_accuracy"] = trade_signal.source_accuracy
                 sig["regime"] = trade_signal.regime
+                quality_ok, quality_meta = self._passes_trade_quality_gate(trade_signal, sig)
+                if isinstance(trade_signal.context, dict):
+                    trade_signal.context["trade_quality"] = dict(quality_meta)
+                sig["trade_quality"] = dict(quality_meta)
+                if not quality_ok:
+                    _drop_counts["ev_gate"] += 1
+                    logger.info(
+                        "Trade-quality gate rejected %s %s: %s "
+                        "(edge %.1fbps, cost %.1fbps, min %.1fbps)",
+                        sig["side"],
+                        sig["coin"],
+                        quality_meta.get("reason", "unknown"),
+                        float(quality_meta.get("edge_bps", 0.0) or 0.0),
+                        float(quality_meta.get("cost_bps", 0.0) or 0.0),
+                        float(quality_meta.get("minimum_edge_bps", 0.0) or 0.0),
+                    )
+                    continue
+                sig["quality_score"] = self._final_executable_score(
+                    trade_signal,
+                    sig,
+                    regime_data=regime_data,
+                )
                 rotation_candidates.append({
                     "trade_signal": trade_signal,
                     "signal": sig,
+                    "quality_score": sig["quality_score"],
                 })
 
             except Exception as e:
@@ -747,13 +890,15 @@ class PaperTrader:
         rotation_enabled = bool(config.ROTATION_ENGINE_ENABLED)
         rotation_dry_run = bool(config.ROTATION_DRY_RUN_TELEMETRY)
         shadow_mode = rotation_enabled and rotation_dry_run
+        max_executable = max(0, int(getattr(config, "PAPER_EXECUTION_MAX_TRADES_PER_CYCLE", 3) or 3))
         for candidate in sorted(
             rotation_candidates,
-            key=lambda item: self.rotation_manager.candidate_score(
-                item["trade_signal"], regime_data=regime_data
-            ),
+            key=lambda item: float(item.get("quality_score", 0.0) or 0.0),
             reverse=True,
         ):
+            if max_executable > 0 and len(executed) >= max_executable:
+                _drop_counts["execution_cap"] += 1
+                continue
             trade_signal = candidate["trade_signal"]
             sig = candidate["signal"]
             victim = None
@@ -992,24 +1137,13 @@ class PaperTrader:
         if isinstance(coins, str):
             coins = [coins]
 
-        # If strategy has no specific coins, pick from top liquid coins
-        # to diversify across many assets instead of all piling into BTC
         if not coins:
-            TOP_COINS = ["BTC", "ETH", "SOL", "DOGE", "AVAX", "LINK", "ARB",
-                         "OP", "SUI", "APT", "INJ", "SEI", "TIA", "JUP",
-                         "WIF", "PEPE", "ONDO", "RENDER", "FET", "NEAR"]
-            available = [c for c in TOP_COINS if c in mids]
-            if available:
-                # HIGH-FIX HIGH-5: hash() is not stable across Python process
-                # restarts (PYTHONHASHSEED randomisation since 3.3).  Use a
-                # deterministic MD5-based int so a strategy always maps to the
-                # same coin across sessions.
-                import hashlib
-                seed_str = str(strategy.get("id", 0)).encode()
-                stable_hash = int(hashlib.md5(seed_str).hexdigest(), 16)
-                coins = [available[stable_hash % len(available)]]
-            else:
-                coins = ["BTC", "ETH"]
+            strategy["_decision_skip_reason"] = "missing_asset"
+            logger.info(
+                "Skipping strategy %s: no executable asset in strategy parameters",
+                strategy.get("name", strategy.get("id", "?")),
+            )
+            return None
 
         # Pick the first available coin with a price
         target_coin = None
@@ -1028,11 +1162,12 @@ class PaperTrader:
                     break
 
         if not target_coin or target_price == 0:
-            # Fallback to BTC
-            target_coin = "BTC"
-            target_price = float(mids.get("BTC", 0))
-            if target_price == 0:
-                return None
+            logger.info(
+                "Skipping strategy %s: none of its assets have a valid mid price (%s)",
+                strategy.get("name", strategy.get("id", "?")),
+                ",".join(str(c) for c in coins),
+            )
+            return None
 
         # Determine direction — regime-aware for ambiguous types.
         # Use pre-computed side from decision engine when available.

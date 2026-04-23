@@ -185,6 +185,37 @@ def test_risk_policy_engine_hybrid_min_5r_keeps_dynamic_upside_when_above_floor(
     assert policy.rr_mode == "hybrid_min_5r"
 
 
+def test_risk_policy_engine_cautious_short_caps_target_and_moves_breakeven_earlier():
+    engine = RiskPolicyEngine(
+        {
+            "short_caution_enabled": True,
+            "short_caution_confidence_threshold": 0.60,
+            "short_caution_max_reward_multiple": 3.0,
+            "short_caution_breakeven_at_r": 0.65,
+        }
+    )
+    signal = TradeSignal(
+        coin="BTC",
+        side=SignalSide.SHORT,
+        confidence=0.55,
+        source=SignalSource.STRATEGY,
+        reason="weak short in uptrend",
+        leverage=5,
+        source_accuracy=0.55,
+        context={"atr_pct": 0.006, "expected_return": 0.10},
+    )
+
+    policy = engine.resolve(
+        signal,
+        regime_data={"regime": "trending_up", "confidence": 0.80},
+        source_policy={"quality": 0.55, "status": "healthy"},
+    )
+
+    assert policy.reward_multiple <= 3.0
+    assert policy.breakeven_at_r <= 0.65
+    assert "short_caution:shorter_time_stop" in policy.rationale
+
+
 def test_risk_policy_engine_caps_extreme_price_distance_even_with_low_leverage():
     engine = RiskPolicyEngine()
     signal = TradeSignal(

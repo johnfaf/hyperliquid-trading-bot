@@ -41,7 +41,7 @@ class DecisionEngine:
         # Weights for composite ranking score
         self.w_score = cfg.get("w_score", 0.35)          # Strategy score from scorer
         self.w_regime = cfg.get("w_regime", 0.25)         # Regime alignment bonus
-        self.w_diversity = cfg.get("w_diversity", 0.20)   # Diversification bonus
+        self.w_diversity = cfg.get("w_diversity", 0.05)   # Tie-breaker, not a quality substitute
         self.w_freshness = cfg.get("w_freshness", 0.10)   # Prefer strategies with recent activity
         self.w_consensus = cfg.get("w_consensus", 0.10)   # Dedup consensus boost
 
@@ -53,6 +53,8 @@ class DecisionEngine:
 
         # Max trades to execute per cycle (independent of position slots)
         self.max_trades_per_cycle = cfg.get("max_trades_per_cycle", 3)
+        self.max_prescreen_candidates = cfg.get("max_prescreen_candidates", 8)
+        self.max_positions = cfg.get("max_positions", 8)
 
         # Track decisions for audit
         self._decision_history: deque = deque(maxlen=100)
@@ -64,6 +66,7 @@ class DecisionEngine:
             "total_executions": 0,
             "total_no_trade": 0,
             "total_candidates": 0,
+            "total_missing_asset": 0,
         }
 
     def decide(self, strategies: List[Dict],
@@ -87,7 +90,7 @@ class DecisionEngine:
         self._cycle_count += 1
         open_positions = open_positions or []
         open_coins = {t["coin"] for t in open_positions}
-        available_slots = max(0, 8 - len(open_positions))
+        available_slots = max(0, self.max_positions - len(open_positions))
 
         self.stats["total_candidates"] += len(strategies)
 
@@ -96,9 +99,9 @@ class DecisionEngine:
             self.stats["total_no_trade"] += 1
             return []
 
-        # Extract and validate coin field — fallback to positions if missing
-        TOP_COINS = ["BTC", "ETH", "SOL", "DOGE", "ARB", "OP", "AVAX", "MATIC",
-                     "LINK", "WLD", "SUI", "TIA", "SEI", "INJ", "NEAR"]
+        # Extract and validate coin field. Strategies without a concrete asset
+        # are shadow-only; assigning a random liquid coin makes the bot trade a
+        # market the strategy never actually identified.
         valid_strategies = []
         for s in strategies:
             params = s.get("parameters", {})
@@ -123,17 +126,16 @@ class DecisionEngine:
                     coins = traded_coins
                     params["coins"] = coins  # Persist so _compute_composite_score sees it
 
-            # Fallback 2: infer from strategy type — use top liquid coins
             if not coins or (coins and coins[0] == "unknown"):
-                import random
                 strategy_type = s.get("strategy_type", s.get("type", ""))
-                # Pick a coin based on strategy: momentum → BTC/ETH, mean_reversion → alts
-                if "momentum" in strategy_type or "trend" in strategy_type:
-                    coins = [random.choice(TOP_COINS[:3])]  # BTC, ETH, SOL
-                else:
-                    coins = [random.choice(TOP_COINS[:7])]  # Top 7 liquid
-                logger.info(f"Inferred coin {coins[0]} for strategy "
-                           f"{strategy_type} (no asset in parameters)")
+                s["_decision_skip_reason"] = "missing_asset"
+                self.stats["total_missing_asset"] += 1
+                logger.info(
+                    "Skipping non-executable strategy %s (%s): no asset in parameters/metrics",
+                    s.get("name", s.get("id", "?")),
+                    strategy_type,
+                )
+                continue
 
             # Always persist resolved coins back into params
             params["coins"] = coins
@@ -167,7 +169,7 @@ class DecisionEngine:
         disqualified = [s for s in scored if s["_composite_score"] < self.min_decision_score]
 
         # ─── Limit by cycle trade cap AND available slots ─
-        max_this_cycle = min(self.max_trades_per_cycle, available_slots)
+        max_this_cycle = min(self.max_prescreen_candidates, available_slots)
         executions = qualified[:max_this_cycle]
         overflow = qualified[max_this_cycle:]
 
@@ -193,7 +195,7 @@ class DecisionEngine:
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "candidates": len(strategies),
             "qualified": len(qualified),
-            "executed": len(executions),
+            "prescreened": len(executions),
             "long_score": long_score,
             "short_score": short_score,
             "market_bias": "long" if long_score > short_score else "short" if short_score > long_score else "neutral",
@@ -365,18 +367,18 @@ class DecisionEngine:
             bias_str = "LONG" if long_score > short_score else "SHORT" if short_score > long_score else "NEUTRAL"
 
         logger.info("DECISION #%d | regime=%s slots=%d/%d candidates=%d bias=%s",
-                    self._cycle_count, regime, available_slots, 5, len(scored), bias_str or "N/A")
+                    self._cycle_count, regime, available_slots, self.max_positions, len(scored), bias_str or "N/A")
 
         # Log only top 5 candidates on one line each
         for i, s in enumerate(scored[:5]):
             coin = s.get("_decision_coin", "?")
             side = s.get("_decision_side", "?")
             composite = s.get("_composite_score", 0)
-            marker = " ← EXEC" if s in executions else ""
+            marker = " <- PRESCREEN" if s in executions else ""
             logger.info("  #%d %s %s composite=%.4f%s", i + 1, side.upper(), coin, composite, marker)
 
         if executions:
-            logger.info("-> EXECUTING %d trade(s) this cycle", len(executions))
+            logger.info("-> PRESCREENED %d candidate(s) for executable ranking", len(executions))
         else:
             reason = "no candidates" if not scored else \
                      "below threshold" if not [s for s in scored if s.get("_composite_score", 0) >= self.min_decision_score] else \

@@ -2,6 +2,7 @@ from src.analysis.trade_analytics import (
     compute_live_paper_drift,
     compute_trade_analytics,
     evaluate_short_side_policy,
+    evaluate_side_source_policy,
     evaluate_source_policy,
 )
 
@@ -54,6 +55,13 @@ def test_compute_trade_analytics_groups_by_side_and_source():
     coin_side_row = next(row for row in analytics["by_coin_side"] if row["label"] == "UNKNOWN short")
     assert coin_side_row["count"] == 2
     assert coin_side_row["net_pnl"] == -0.8
+    exact_row = next(row for row in analytics["by_exact_source"] if row["label"] == "copy_trade:0xabc")
+    assert exact_row["count"] == 2
+    exact_side_row = next(
+        row for row in analytics["by_exact_source_side"]
+        if row["label"] == "copy_trade:0xabc short"
+    )
+    assert exact_side_row["net_pnl"] == -0.8
 
 
 def test_compute_trade_analytics_includes_tp_sl_path_metrics():
@@ -135,6 +143,39 @@ def test_evaluate_source_policy_blocks_bad_copy_trades():
     assert policy["status"] == "blocked"
     assert policy["metrics"]["count"] == 3
     assert policy["metrics"]["net_pnl"] == -27.0
+
+
+def test_evaluate_side_source_policy_blocks_bad_exact_copy_short_only():
+    trades = [
+        {"coin": "SOL", "side": "short", "pnl": -0.4, "metadata": {"source_key": "copy_trade:0xabc"}},
+        {"coin": "ETH", "side": "short", "pnl": -0.3, "metadata": {"source_key": "copy_trade:0xabc"}},
+        {"coin": "BTC", "side": "short", "pnl": -0.2, "metadata": {"source_key": "copy_trade:0xabc"}},
+        {"coin": "SOL", "side": "short", "pnl": 0.8, "metadata": {"source_key": "copy_trade:0xdef"}},
+        {"coin": "SOL", "side": "long", "pnl": 0.5, "metadata": {"source_key": "copy_trade:0xabc"}},
+    ]
+
+    bad_source_short = evaluate_side_source_policy(
+        trades,
+        side="short",
+        source_key="copy_trade:0xabc",
+        min_trades=3,
+        degrade_win_rate=0.45,
+        block_win_rate=0.35,
+        block_net_pnl=-0.25,
+    )
+    good_source_short = evaluate_side_source_policy(
+        trades,
+        side="short",
+        source_key="copy_trade:0xdef",
+        min_trades=1,
+        degrade_win_rate=0.45,
+        block_win_rate=0.35,
+        block_net_pnl=-0.25,
+    )
+
+    assert bad_source_short["status"] == "blocked"
+    assert bad_source_short["metrics"]["count"] == 3
+    assert good_source_short["status"] == "healthy"
 
 
 def test_compute_live_paper_drift_combines_paper_audit_and_live_counts():

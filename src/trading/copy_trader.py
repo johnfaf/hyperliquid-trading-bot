@@ -18,7 +18,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import config
 from src.data import database as db
 from src.data import hyperliquid_client as hl
-from src.analysis.trade_analytics import evaluate_source_policy
+from src.analysis.trade_analytics import evaluate_source_policy, evaluate_side_source_policy
 from src.signals.signal_schema import RiskParams, SignalSide, SignalSource, TradeSignal, signal_from_copy_trade
 from src.signals.decision_firewall import DecisionFirewall
 from src.signals.agent_scoring import AgentScorer
@@ -100,6 +100,29 @@ class CopyTrader:
         self.auto_pause_block_net_pnl = float(
             getattr(config, "COPY_TRADER_AUTO_PAUSE_BLOCK_NET_PNL", -25.0)
         )
+        self.source_side_guard_enabled = bool(
+            getattr(config, "COPY_TRADER_SOURCE_SIDE_GUARD_ENABLED", True)
+        )
+        self.source_side_min_closed_trades = max(
+            1, int(getattr(config, "COPY_TRADER_SOURCE_SIDE_MIN_CLOSED_TRADES", 3))
+        )
+        self.source_side_degrade_win_rate = float(
+            getattr(config, "COPY_TRADER_SOURCE_SIDE_DEGRADE_WIN_RATE", 0.45)
+        )
+        self.source_side_block_win_rate = float(
+            getattr(config, "COPY_TRADER_SOURCE_SIDE_BLOCK_WIN_RATE", 0.35)
+        )
+        self.source_side_block_net_pnl = float(
+            getattr(config, "COPY_TRADER_SOURCE_SIDE_BLOCK_NET_PNL", -0.25)
+        )
+        self.source_side_confidence_multiplier = float(
+            getattr(config, "COPY_TRADER_SOURCE_SIDE_CONFIDENCE_MULTIPLIER", 0.75)
+        )
+        self.source_side_size_multiplier = float(
+            getattr(config, "COPY_TRADER_SOURCE_SIDE_SIZE_MULTIPLIER", 0.50)
+        )
+        self._source_side_policy_cache: Dict[str, object] = {"ts": 0.0, "closed": [], "policies": {}}
+        self._source_side_policy_cache_ttl_s = 300.0
         self._copy_guardrail_status: Dict[str, object] = {
             "status": "healthy" if self.enabled else "paused",
             "reason": (
@@ -117,6 +140,69 @@ class CopyTrader:
     def _source_key(payload: Dict) -> str:
         trader = str(payload.get("source_trader", "") or "").strip().lower()
         return f"copy_trade:{trader}" if trader else "copy_trade"
+
+    def _get_source_side_closed_trades(self) -> List[Dict]:
+        now = time.time()
+        cache_ts = float(self._source_side_policy_cache.get("ts", 0.0) or 0.0)
+        if (now - cache_ts) < self._source_side_policy_cache_ttl_s:
+            return list(self._source_side_policy_cache.get("closed") or [])
+        try:
+            closed = db.get_paper_trade_history(limit=250)
+        except Exception as exc:
+            logger.debug("Copy source/side policy lookup failed: %s", exc)
+            closed = []
+        self._source_side_policy_cache = {
+            "ts": now,
+            "closed": list(closed or []),
+            "policies": {},
+        }
+        return list(closed or [])
+
+    def _apply_source_side_guard(self, signal: Dict) -> tuple[bool, str]:
+        if not self.source_side_guard_enabled:
+            return True, ""
+        side = str(signal.get("side", "") or "").strip().lower()
+        if not side:
+            return True, ""
+        source_key = self._source_key(signal)
+        cache_key = f"{source_key}:{side}"
+        policies = dict(self._source_side_policy_cache.get("policies") or {})
+        policy = policies.get(cache_key)
+        if not policy:
+            policy = evaluate_side_source_policy(
+                self._get_source_side_closed_trades(),
+                side=side,
+                source_key=source_key,
+                min_trades=self.source_side_min_closed_trades,
+                degrade_win_rate=self.source_side_degrade_win_rate,
+                block_win_rate=self.source_side_block_win_rate,
+                block_net_pnl=self.source_side_block_net_pnl,
+            )
+            policies[cache_key] = dict(policy)
+            self._source_side_policy_cache["policies"] = policies
+
+        status = str(policy.get("status", "") or "").lower()
+        if status == "blocked":
+            return False, policy.get("reason", "copy source/side policy blocked signal")
+        if status == "degraded":
+            original_confidence = float(signal.get("confidence", 0.5) or 0.5)
+            signal["confidence"] = original_confidence * self.source_side_confidence_multiplier
+            signal["copy_source_size_multiplier"] = min(
+                float(signal.get("copy_source_size_multiplier", 1.0) or 1.0),
+                self.source_side_size_multiplier,
+            )
+            signal["copy_source_side_policy"] = dict(policy)
+            logger.warning(
+                "Copy source/side guard de-risked %s %s from %s: confidence %.0f%% -> %.0f%%, size *= %.2f (%s)",
+                signal.get("coin", "?"),
+                side,
+                source_key,
+                original_confidence * 100,
+                float(signal.get("confidence", 0.0) or 0.0) * 100,
+                self.source_side_size_multiplier,
+                policy.get("reason", "recent source/side underperformance"),
+            )
+        return True, ""
 
     @staticmethod
     def _calculate_signal_confidence(signal_type: str, trader_win_rate: float) -> float:
@@ -525,6 +611,15 @@ class CopyTrader:
                         )
                         continue
                     signal = self._apply_regime_weight(signal, signal["coin"])
+                    source_side_ok, source_side_reason = self._apply_source_side_guard(signal)
+                    if not source_side_ok:
+                        logger.info(
+                            "  Copy source/side guard rejected %s %s: %s",
+                            signal["side"],
+                            signal["coin"],
+                            source_side_reason,
+                        )
+                        continue
                     trade_signal = None
 
                     if self.firewall and signal.get("price", 0) > 0:
@@ -796,6 +891,8 @@ class CopyTrader:
             "signal_id": signal.get("_signal_id", ""),
             "source_key": signal.get("_source_key", ""),
             "source_accuracy": signal.get("source_accuracy", 0),
+            "copy_source_size_multiplier": signal.get("copy_source_size_multiplier", 1.0),
+            "copy_source_side_policy": signal.get("copy_source_side_policy", {}),
             "regime": signal.get("regime", ""),
             "risk_policy": risk_policy,
             "is_copy_trade": True,
@@ -838,6 +935,17 @@ class CopyTrader:
                 signal.get("side", "?"), signal.get("coin", "?"), regime_mod, size_usd,
             )
         size_usd = size_usd * regime_mod
+        source_side_mod = float(signal.get("copy_source_size_multiplier", 1.0) or 1.0)
+        if source_side_mod < 0.0:
+            source_side_mod = 0.0
+        elif source_side_mod > 1.0:
+            source_side_mod = 1.0
+        if source_side_mod != 1.0:
+            logger.debug(
+                "Copy trade %s %s: applying source/side multiplier %.3f to size_usd $%.2f",
+                signal.get("side", "?"), signal.get("coin", "?"), source_side_mod, size_usd,
+            )
+        size_usd = size_usd * source_side_mod
 
         price = signal["price"]
         if price <= 0:

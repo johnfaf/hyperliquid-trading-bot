@@ -395,6 +395,24 @@ def build_subsystems(
             "short_hardening_size_multiplier": float(
                 getattr(_fw_cfg, "SHORT_HARDENING_SIZE_MULTIPLIER", 0.50)
             ),
+            "short_hardening_source_guard_enabled": bool(
+                getattr(_fw_cfg, "SHORT_HARDENING_SOURCE_GUARD_ENABLED", True)
+            ),
+            "short_hardening_source_min_closed_trades": int(
+                getattr(_fw_cfg, "SHORT_HARDENING_SOURCE_MIN_CLOSED_TRADES", 3)
+            ),
+            "short_hardening_source_block_net_pnl": float(
+                getattr(_fw_cfg, "SHORT_HARDENING_SOURCE_BLOCK_NET_PNL", -0.25)
+            ),
+            "short_hardening_coin_guard_enabled": bool(
+                getattr(_fw_cfg, "SHORT_HARDENING_COIN_GUARD_ENABLED", True)
+            ),
+            "short_hardening_coin_min_closed_trades": int(
+                getattr(_fw_cfg, "SHORT_HARDENING_COIN_MIN_CLOSED_TRADES", 4)
+            ),
+            "short_hardening_coin_block_net_pnl": float(
+                getattr(_fw_cfg, "SHORT_HARDENING_COIN_BLOCK_NET_PNL", -0.25)
+            ),
             "cooldown_seconds": int(getattr(_fw_cfg, "FIREWALL_COIN_COOLDOWN_SECONDS", 180)),
             "same_side_cooldown_seconds": int(
                 getattr(_fw_cfg, "FIREWALL_SAME_SIDE_COOLDOWN_SECONDS", 900)
@@ -484,6 +502,21 @@ def build_subsystems(
                     ),
                     "hybrid_min_r_floor": getattr(
                         config, "RISK_POLICY_HYBRID_MIN_R_FLOOR", 5.0
+                    ),
+                    "short_caution_enabled": getattr(
+                        config, "RISK_POLICY_SHORT_CAUTION_ENABLED", True
+                    ),
+                    "short_caution_confidence_threshold": getattr(
+                        config, "RISK_POLICY_SHORT_CAUTION_CONFIDENCE_THRESHOLD", 0.60
+                    ),
+                    "short_caution_max_reward_multiple": getattr(
+                        config, "RISK_POLICY_SHORT_CAUTION_MAX_REWARD_MULTIPLE", 3.0
+                    ),
+                    "short_caution_time_limit_multiplier": getattr(
+                        config, "RISK_POLICY_SHORT_CAUTION_TIME_LIMIT_MULTIPLIER", 0.75
+                    ),
+                    "short_caution_breakeven_at_r": getattr(
+                        config, "RISK_POLICY_SHORT_CAUTION_BREAKEVEN_AT_R", 0.65
                     ),
                     "default_reward_multiple": config.RISK_POLICY_DEFAULT_REWARD_MULTIPLE,
                     "min_reward_multiple": config.RISK_POLICY_MIN_REWARD_MULTIPLE,

@@ -21,7 +21,7 @@ from datetime import datetime, timezone
 from typing import List, Dict, Optional, Tuple
 from collections import defaultdict
 
-from src.analysis.trade_analytics import evaluate_short_side_policy
+from src.analysis.trade_analytics import evaluate_short_side_policy, evaluate_side_source_policy
 from src.signals.signal_schema import TradeSignal
 from src.data import database as db
 
@@ -84,6 +84,24 @@ class DecisionFirewall:
         )
         self.short_hardening_size_multiplier = float(
             cfg.get("short_hardening_size_multiplier", 0.50)
+        )
+        self.short_hardening_source_guard_enabled = bool(
+            cfg.get("short_hardening_source_guard_enabled", True)
+        )
+        self.short_hardening_source_min_closed_trades = max(
+            1, int(cfg.get("short_hardening_source_min_closed_trades", 3))
+        )
+        self.short_hardening_source_block_net_pnl = float(
+            cfg.get("short_hardening_source_block_net_pnl", -0.25)
+        )
+        self.short_hardening_coin_guard_enabled = bool(
+            cfg.get("short_hardening_coin_guard_enabled", True)
+        )
+        self.short_hardening_coin_min_closed_trades = max(
+            1, int(cfg.get("short_hardening_coin_min_closed_trades", 4))
+        )
+        self.short_hardening_coin_block_net_pnl = float(
+            cfg.get("short_hardening_coin_block_net_pnl", -0.25)
         )
         self.canary_mode = bool(cfg.get("canary_mode", False))
         self.canary_max_positions = max(1, int(cfg.get("canary_max_positions", 2)))
@@ -164,7 +182,12 @@ class DecisionFirewall:
         self._daily_losses: float = 0.0
         self._daily_reset_date: str = ""
         self._source_signal_counts: Dict[str, int] = defaultdict(int)
-        self._side_policy_cache: Dict[str, object] = {"ts": 0.0, "short": {}}
+        self._side_policy_cache: Dict[str, object] = {
+            "ts": 0.0,
+            "closed": [],
+            "short": {},
+            "scoped": {},
+        }
         self._side_policy_cache_ttl_s = 300.0
 
         # Stats
@@ -299,6 +322,48 @@ class DecisionFirewall:
                     self.short_hardening_size_multiplier,
                 )
             )
+            self.short_hardening_source_guard_enabled = bool(
+                overrides.get(
+                    "SHORT_HARDENING_SOURCE_GUARD_ENABLED",
+                    self.short_hardening_source_guard_enabled,
+                )
+            )
+            self.short_hardening_source_min_closed_trades = max(
+                1,
+                int(
+                    overrides.get(
+                        "SHORT_HARDENING_SOURCE_MIN_CLOSED_TRADES",
+                        self.short_hardening_source_min_closed_trades,
+                    )
+                ),
+            )
+            self.short_hardening_source_block_net_pnl = float(
+                overrides.get(
+                    "SHORT_HARDENING_SOURCE_BLOCK_NET_PNL",
+                    self.short_hardening_source_block_net_pnl,
+                )
+            )
+            self.short_hardening_coin_guard_enabled = bool(
+                overrides.get(
+                    "SHORT_HARDENING_COIN_GUARD_ENABLED",
+                    self.short_hardening_coin_guard_enabled,
+                )
+            )
+            self.short_hardening_coin_min_closed_trades = max(
+                1,
+                int(
+                    overrides.get(
+                        "SHORT_HARDENING_COIN_MIN_CLOSED_TRADES",
+                        self.short_hardening_coin_min_closed_trades,
+                    )
+                ),
+            )
+            self.short_hardening_coin_block_net_pnl = float(
+                overrides.get(
+                    "SHORT_HARDENING_COIN_BLOCK_NET_PNL",
+                    self.short_hardening_coin_block_net_pnl,
+                )
+            )
             self.cooldown_seconds = int(
                 overrides.get("FIREWALL_COIN_COOLDOWN_SECONDS", self.cooldown_seconds)
             )
@@ -317,7 +382,7 @@ class DecisionFirewall:
                     )
                 ),
             )
-            self._side_policy_cache = {"ts": 0.0, "short": {}}
+            self._side_policy_cache = {"ts": 0.0, "closed": [], "short": {}, "scoped": {}}
 
         logger.info(
             "DecisionFirewall runtime overrides applied: min_confidence=%s, source_cap=%s, "
@@ -330,18 +395,14 @@ class DecisionFirewall:
             self.same_side_cooldown_seconds,
         )
 
-    def _get_short_side_policy(self) -> Dict:
-        if not self.short_hardening_enabled:
-            return {
-                "status": "disabled",
-                "reason": "Short hardening disabled",
-                "metrics": {"count": 0, "win_rate": 0.0, "net_pnl": 0.0},
-            }
-
+    def _get_short_policy_cache(self) -> Dict[str, object]:
         now = time.time()
-        cached = self._side_policy_cache.get("short") or {}
-        if cached and (now - float(self._side_policy_cache.get("ts", 0.0) or 0.0)) < self._side_policy_cache_ttl_s:
-            return dict(cached)
+        cached_ts = float(self._side_policy_cache.get("ts", 0.0) or 0.0)
+        if (
+            self._side_policy_cache.get("short")
+            and (now - cached_ts) < self._side_policy_cache_ttl_s
+        ):
+            return dict(self._side_policy_cache)
 
         try:
             closed = db.get_paper_trade_history(limit=self.short_hardening_lookback_trades)
@@ -354,30 +415,117 @@ class DecisionFirewall:
             )
         except Exception as exc:
             logger.debug("Short-side policy lookup failed: %s", exc)
+            closed = []
             policy = {
                 "status": "policy_error",
                 "reason": str(exc),
                 "metrics": {"count": 0, "win_rate": 0.0, "net_pnl": 0.0},
             }
 
-        self._side_policy_cache = {"ts": now, "short": dict(policy)}
-        return dict(policy)
+        self._side_policy_cache = {
+            "ts": now,
+            "closed": list(closed or []),
+            "short": dict(policy),
+            "scoped": {},
+        }
+        return dict(self._side_policy_cache)
+
+    def _get_short_side_policy(self) -> Dict:
+        if not self.short_hardening_enabled:
+            return {
+                "status": "disabled",
+                "reason": "Short hardening disabled",
+                "metrics": {"count": 0, "win_rate": 0.0, "net_pnl": 0.0},
+            }
+        return dict((self._get_short_policy_cache().get("short") or {}))
+
+    def _get_scoped_short_policies(self, signal: TradeSignal) -> List[Dict]:
+        if not self.short_hardening_enabled:
+            return []
+
+        cache = self._get_short_policy_cache()
+        closed = list(cache.get("closed") or [])
+        scoped_cache = dict(cache.get("scoped") or {})
+        policies: List[Dict] = []
+        source_key = self._source_key(signal)
+        coin = str(getattr(signal, "coin", "") or "").strip().upper()
+
+        def _lookup(scope_key: str, **kwargs) -> Dict:
+            if scope_key in scoped_cache:
+                return dict(scoped_cache[scope_key])
+            policy = evaluate_side_source_policy(
+                closed,
+                side="short",
+                degrade_win_rate=self.short_hardening_degrade_win_rate,
+                block_win_rate=self.short_hardening_block_win_rate,
+                **kwargs,
+            )
+            scoped_cache[scope_key] = dict(policy)
+            self._side_policy_cache["scoped"] = scoped_cache
+            return dict(policy)
+
+        if self.short_hardening_source_guard_enabled and source_key:
+            try:
+                policies.append(
+                    _lookup(
+                        f"source:{source_key}",
+                        source_key=source_key,
+                        min_trades=self.short_hardening_source_min_closed_trades,
+                        block_net_pnl=self.short_hardening_source_block_net_pnl,
+                    )
+                )
+            except Exception as exc:
+                logger.debug("Scoped short source policy lookup failed for %s: %s", source_key, exc)
+
+        if self.short_hardening_coin_guard_enabled and coin:
+            try:
+                policies.append(
+                    _lookup(
+                        f"coin:{coin}",
+                        coin=coin,
+                        min_trades=self.short_hardening_coin_min_closed_trades,
+                        block_net_pnl=self.short_hardening_coin_block_net_pnl,
+                    )
+                )
+            except Exception as exc:
+                logger.debug("Scoped short coin policy lookup failed for %s: %s", coin, exc)
+
+        return policies
 
     def _apply_side_policy(self, signal: TradeSignal) -> Tuple[bool, str]:
         side_val = signal.side.value if hasattr(signal.side, "value") else str(signal.side)
         if str(side_val).lower() != "short":
             return True, ""
 
-        policy = self._get_short_side_policy()
-        status = str(policy.get("status", "healthy") or "healthy")
-        if status == "blocked":
-            return False, policy.get("reason", "Short-side guardrail blocked the signal")
-        if status == "degraded":
+        policies = [self._get_short_side_policy(), *self._get_scoped_short_policies(signal)]
+        blocking = next(
+            (policy for policy in policies if str(policy.get("status", "")).lower() == "blocked"),
+            None,
+        )
+        if blocking:
+            return False, blocking.get("reason", "Short-side guardrail blocked the signal")
+
+        degraded_policies = [
+            policy for policy in policies
+            if str(policy.get("status", "")).lower() == "degraded"
+        ]
+        if degraded_policies:
+            policy = degraded_policies[0]
             original_confidence = float(signal.confidence)
             signal.confidence *= self.short_hardening_confidence_multiplier
             signal.position_pct *= self.short_hardening_size_multiplier
             if signal.size > 0:
                 signal.size *= self.short_hardening_size_multiplier
+            if isinstance(getattr(signal, "context", None), dict):
+                signal.context["short_side_policies"] = [
+                    {
+                        "status": p.get("status"),
+                        "reason": p.get("reason"),
+                        "metrics": p.get("metrics", {}),
+                        "scope": p.get("scope", "global_short"),
+                    }
+                    for p in policies
+                ]
             logger.warning(
                 "Short hardening de-risked %s: confidence %.0f%% -> %.0f%%, size *= %.2f (%s)",
                 signal.coin,

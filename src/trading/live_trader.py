@@ -583,6 +583,12 @@ class LiveTrader:
         self.min_order_allow_degraded_sources = bool(
             getattr(config, "LIVE_MIN_ORDER_ALLOW_DEGRADED_SOURCES", False)
         )
+        self.min_order_allow_policy_error_floorup = bool(
+            getattr(config, "LIVE_MIN_ORDER_ALLOW_POLICY_ERROR_FLOORUP", False)
+        )
+        self.min_order_short_min_confidence = float(
+            getattr(config, "LIVE_MIN_ORDER_SHORT_MIN_CONFIDENCE", 0.75)
+        )
         self.min_order_same_side_merge_enabled = bool(
             getattr(config, "LIVE_MIN_ORDER_SAME_SIDE_MERGE_ENABLED", True)
         )
@@ -5827,17 +5833,26 @@ class LiveTrader:
                 )
                 floor_metric = "min_notional_same_side_merges"
             else:
-                allowed_source_status = {"active", "unknown", "policy_error"}
+                allowed_source_status = {"active", "unknown"}
+                if self.min_order_allow_policy_error_floorup:
+                    allowed_source_status.add("policy_error")
                 if self.min_order_allow_degraded_sources:
                     allowed_source_status.update({"warmup", "degraded"})
+                side_value = self._signal_side_value(signal)
+                confidence = float(signal.confidence or 0.0)
+                side_floor_ok = (
+                    side_value != "short"
+                    or confidence >= self.min_order_short_min_confidence
+                )
                 if (
                     self.min_order_top_tier_enabled
-                    and float(signal.confidence or 0.0) >= self.min_order_top_tier_min_confidence
+                    and confidence >= self.min_order_top_tier_min_confidence
+                    and side_floor_ok
                     and policy_status in allowed_source_status
                     and bump_multiplier <= self.min_order_top_tier_max_bump_multiplier
                 ):
                     floor_reason = (
-                        f"top-tier signal (confidence {float(signal.confidence or 0.0):.0%}, "
+                        f"top-tier signal (confidence {confidence:.0%}, "
                         f"source status {policy_status})"
                     )
                     floor_metric = "min_notional_top_tier_floorups"
