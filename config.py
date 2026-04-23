@@ -102,6 +102,9 @@ DB_AUDIT_PENDING_DECISION_MAX_AGE_MINUTES = float(
 DB_AUDIT_REGIME_MAX_AGE_HOURS = float(
     os.environ.get("DB_AUDIT_REGIME_MAX_AGE_HOURS", 24.0)
 )
+DB_AUDIT_NON_ACTIVE_REGIME_RETENTION_DAYS = float(
+    os.environ.get("DB_AUDIT_NON_ACTIVE_REGIME_RETENTION_DAYS", 7.0)
+)
 DB_AUDIT_SOURCE_STALE_MULTIPLIER = float(
     os.environ.get("DB_AUDIT_SOURCE_STALE_MULTIPLIER", 2.0)
 )
@@ -769,6 +772,17 @@ POLYMARKET_MIN_LIQUIDITY = float(
 POLYMARKET_MAX_MARKETS_PER_SCAN = int(
     os.environ.get("POLYMARKET_MAX_MARKETS_PER_SCAN", 100)
 )
+POLYMARKET_TRADE_BACKFILL_SOURCE = str(
+    os.environ.get("POLYMARKET_TRADE_BACKFILL_SOURCE", "data_api") or "data_api"
+).strip().lower()
+if POLYMARKET_TRADE_BACKFILL_SOURCE not in {"data_api", "clob"}:
+    POLYMARKET_TRADE_BACKFILL_SOURCE = "data_api"
+POLYMARKET_TRADE_BACKFILL_TAKER_ONLY = os.environ.get(
+    "POLYMARKET_TRADE_BACKFILL_TAKER_ONLY", "false"
+).lower() in ("true", "1", "yes")
+POLYMARKET_TRADE_BACKFILL_LIMIT_PER_MARKET = int(
+    os.environ.get("POLYMARKET_TRADE_BACKFILL_LIMIT_PER_MARKET", 50)
+)
 
 # ─── Options Flow Integration ───────────────────────────────
 OPTIONS_FLOW_ENABLED = os.environ.get("OPTIONS_FLOW_ENABLED", "true").lower() in ("true", "1", "yes")
@@ -902,6 +916,7 @@ def _validate_config_bounds() -> None:
         ("DISCOVERY_CYCLE_INTERVAL", 60, 2_592_000, 86400),
         ("POLYMARKET_SCAN_INTERVAL", 10, 3600, 180),
         ("POLYMARKET_MAX_MARKETS_PER_SCAN", 10, 10_000, 100),
+        ("POLYMARKET_TRADE_BACKFILL_LIMIT_PER_MARKET", 1, 10_000, 50),
         ("OPTIONS_FLOW_SCAN_INTERVAL", 10, 3600, 120),
         ("RISK_POLICY_DEFAULT_REWARD_MULTIPLE", 0.5, 20.0, 3.25),
         ("RISK_POLICY_MIN_REWARD_MULTIPLE", 0.1, 10.0, 1.75),
@@ -964,6 +979,7 @@ def _validate_config_bounds() -> None:
         ("XGBOOST_CRASH_THRESHOLD", -1.0, 0.0, -0.18),
         ("FUNDING_NEGATIVE_THRESHOLD", -1.0, 0.0, -0.001),
         ("FUNDING_POSITIVE_THRESHOLD", 0.0, 1.0, 0.003),
+        ("DB_AUDIT_NON_ACTIVE_REGIME_RETENTION_DAYS", 0.0, 3650.0, 7.0),
         ("POLYMARKET_MIN_VOLUME", 0.0, 1e9, 10_000.0),
         ("POLYMARKET_MIN_LIQUIDITY", 0.0, 1e9, 1_000.0),
         ("LIVE_CANARY_MAX_ORDER_USD", 10.0, 1_000_000.0, 25.0),

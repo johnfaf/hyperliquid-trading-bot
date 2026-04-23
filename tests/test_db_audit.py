@@ -443,3 +443,43 @@ def test_db_audit_same_side_open_trades_only_flag_above_cap(monkeypatch):
     report = db_audit.run_db_audit(include_candle_cache=False, include_code_scan=False)
     checks = {finding.check for finding in report.findings}
     assert "duplicate_same_side_open_trades" in checks
+
+
+def test_non_active_regime_repair_prunes_stale_predicted_rows(monkeypatch):
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.executescript(
+        """
+        CREATE TABLE regime_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            coin TEXT NOT NULL,
+            label_source TEXT DEFAULT 'predicted'
+        );
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO regime_history (timestamp, coin, label_source)
+        VALUES ('2026-04-10T00:00:00+00:00', 'SOL', 'predicted')
+        """
+    )
+    conn.commit()
+
+    monkeypatch.setattr(db, "get_backend_name", lambda: "sqlite")
+    monkeypatch.setattr(db, "get_db_path", lambda: "test.db")
+    monkeypatch.setattr(db, "get_connection", lambda for_read=False: _connection_ctx(conn))
+    monkeypatch.setattr(
+        db_audit.config,
+        "DB_AUDIT_NON_ACTIVE_REGIME_RETENTION_DAYS",
+        7.0,
+        raising=False,
+    )
+
+    actions = []
+    db_audit._repair_non_active_regime_history(actions, [{"coin": "SOL"}])
+
+    assert conn.execute("SELECT COUNT(*) FROM regime_history").fetchone()[0] == 0
+    assert actions[0].status == "applied"
+    assert actions[0].details["pruned_by_coin"] == {"SOL": 1}

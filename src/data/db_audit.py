@@ -858,6 +858,7 @@ def _regime_checks(
         "coin_count": len(entries),
         "entries": entries,
         "stale_active": stale_active,
+        "stale_other": stale_other,
         "stale_other_count": len(stale_other),
         "max_age_hours": max_age_hours,
     }
@@ -1641,12 +1642,18 @@ def _repair_historical_sources(actions: list[DbRepairAction]) -> None:
         market_rows = int(downloader.backfill_markets(max_markets=100, page_size=100) or 0)
         market_ids = [normalize_market_id(market) for market in markets[:25]]
         trade_rows = int(
-            downloader.backfill_recent_trades(market_ids, per_market=25, max_markets=25) or 0
+            downloader.backfill_recent_trades(
+                markets[:25],
+                per_market=int(getattr(config, "POLYMARKET_TRADE_BACKFILL_LIMIT_PER_MARKET", 50)),
+                max_markets=25,
+            )
+            or 0
         )
         results["polymarket"] = {
             "market_rows": market_rows,
             "trade_rows": trade_rows,
             "market_ids": market_ids[:10],
+            "trade_source": getattr(downloader, "trade_source", "data_api"),
         }
     except Exception as exc:
         results["polymarket_error"] = str(exc)
@@ -1806,6 +1813,111 @@ def _repair_stale_regime_history(actions: list[DbRepairAction], coins: Iterable[
         )
 
 
+def _repair_non_active_regime_history(actions: list[DbRepairAction], items: Iterable[dict[str, Any]]) -> None:
+    stale_items = [
+        item for item in (items or [])
+        if str(item.get("coin") or "").strip()
+    ]
+    if not stale_items:
+        _record_action(
+            actions,
+            "stale_non_active_regime_history",
+            "skipped",
+            "No non-active coins require regime-history cleanup.",
+        )
+        return
+
+    retention_days = float(
+        getattr(config, "DB_AUDIT_NON_ACTIVE_REGIME_RETENTION_DAYS", 7.0)
+    )
+    cutoff_dt = datetime.now(timezone.utc).timestamp() - (retention_days * 86400.0)
+    cutoff_iso = datetime.fromtimestamp(cutoff_dt, tz=timezone.utc).isoformat()
+    pruned_by_coin: dict[str, int] = {}
+    refresh_after_prune: list[str] = []
+
+    try:
+        with db.get_connection() as conn:
+            for item in stale_items:
+                coin = str(item.get("coin") or "").upper()
+                if not coin:
+                    continue
+                rows = conn.execute(
+                    """
+                    SELECT id, timestamp, label_source
+                    FROM regime_history
+                    WHERE UPPER(COALESCE(coin, '')) = ?
+                    ORDER BY timestamp ASC
+                    """,
+                    (coin,),
+                ).fetchall()
+                if not rows:
+                    continue
+                prune_ids: list[int] = []
+                for row in rows:
+                    label_source = str(_row_get(row, "label_source", 2, "predicted") or "predicted").lower()
+                    parsed_ts = _parse_dt(_row_get(row, "timestamp", 1, None))
+                    if label_source == "observed" or parsed_ts is None:
+                        continue
+                    if parsed_ts.timestamp() < cutoff_dt:
+                        prune_ids.append(int(_row_get(row, "id", 0, 0) or 0))
+                if prune_ids:
+                    for row_id in prune_ids:
+                        conn.execute("DELETE FROM regime_history WHERE id = ?", (row_id,))
+                    pruned_by_coin[coin] = len(prune_ids)
+                remaining = conn.execute(
+                    """
+                    SELECT COUNT(*) AS c
+                    FROM regime_history
+                    WHERE UPPER(COALESCE(coin, '')) = ?
+                    """,
+                    (coin,),
+                ).fetchone()
+                if int(_scalar(remaining, "c", 0) or 0) > 0:
+                    refresh_after_prune.append(coin)
+
+        refreshed: list[dict[str, Any]] = []
+        if refresh_after_prune:
+            from src.signals.xgboost_regime_forecaster import XGBoostRegimeForecaster
+
+            forecaster = XGBoostRegimeForecaster()
+            for coin in sorted(set(refresh_after_prune)):
+                result = forecaster.predict_regime(coin)
+                refreshed.append(
+                    {
+                        "coin": coin,
+                        "regime": str(result.get("regime", "") or ""),
+                        "confidence": float(result.get("confidence", 0.0) or 0.0),
+                    }
+                )
+
+        status = "applied" if pruned_by_coin or refreshed else "skipped"
+        message = (
+            "Pruned stale predicted regime rows for non-active coins and refreshed survivors."
+            if status == "applied"
+            else "No non-active regime rows needed cleanup."
+        )
+        _record_action(
+            actions,
+            "stale_non_active_regime_history",
+            status,
+            message,
+            retention_days=retention_days,
+            cutoff_iso=cutoff_iso,
+            pruned_by_coin=pruned_by_coin,
+            refreshed=refreshed,
+        )
+    except Exception as exc:
+        _record_action(
+            actions,
+            "stale_non_active_regime_history",
+            "failed",
+            "Could not clean stale regime history for non-active coins.",
+            retention_days=retention_days,
+            cutoff_iso=cutoff_iso,
+            error=str(exc),
+        )
+
+
 def _repair_candle_cache(actions: list[DbRepairAction], coins: Iterable[str]) -> None:
     target_coins = sorted({str(coin or "").upper() for coin in coins if str(coin or "").strip()})
     if not target_coins:
@@ -1867,11 +1979,15 @@ def run_db_repair(
             str(item.get("coin") or "").upper()
             for item in (pre_audit.checks.get("regime_history", {}) or {}).get("stale_active", [])
         ]
+        stale_non_active_regime = list(
+            (pre_audit.checks.get("regime_history", {}) or {}).get("stale_other", [])
+        )
         missing_candle_coins = [
             str(coin or "").upper()
             for coin in (pre_audit.checks.get("candle_cache", {}) or {}).get("missing_active_coins", [])
         ]
         _repair_stale_regime_history(actions, stale_regime)
+        _repair_non_active_regime_history(actions, stale_non_active_regime)
         if include_candle_cache:
             _repair_candle_cache(actions, missing_candle_coins)
         else:

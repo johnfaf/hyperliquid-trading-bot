@@ -12,10 +12,13 @@ from typing import Any, Dict, Iterable, List, Optional
 
 import requests
 
+import config
+
 logger = logging.getLogger(__name__)
 
 CLOB_API = "https://clob.polymarket.com"
 GAMMA_API = "https://gamma-api.polymarket.com"
+DATA_API = "https://data-api.polymarket.com"
 
 
 def _now_ms() -> int:
@@ -83,6 +86,19 @@ def normalize_market_id(market: Dict[str, Any]) -> str:
     )
     value = str(value or "").strip()
     return value or _stable_id("pmkt", market)
+
+
+def _is_condition_id(value: Any) -> bool:
+    raw = str(value or "").strip().lower()
+    if len(raw) != 66 or not raw.startswith("0x"):
+        return False
+    return all(ch in "0123456789abcdef" for ch in raw[2:])
+
+
+def _condition_id_from_market(market: Dict[str, Any]) -> str:
+    value = _first(market, ("conditionId", "condition_id", "market"), "")
+    value = str(value or "").strip()
+    return value if _is_condition_id(value) else ""
 
 
 def _market_probability(market: Dict[str, Any]) -> Optional[float]:
@@ -268,9 +284,7 @@ def store_trades(raw_trades: Iterable[Dict[str, Any]]) -> int:
         for trade in rows:
             if not isinstance(trade, dict):
                 continue
-            trade_id = str(_first(trade, ("id", "trade_id", "transactionHash"), "") or "").strip()
-            if not trade_id:
-                trade_id = _stable_id("ptrade", trade)
+            trade_id = _trade_id(trade)
             ts = int(_float(_first(trade, ("timestamp_ms", "timestampMs", "createdAtMs"), 0), 0) or 0)
             if ts <= 0:
                 seconds = _float(_first(trade, ("timestamp", "createdAt"), 0), 0) or 0
@@ -294,18 +308,44 @@ def store_trades(raw_trades: Iterable[Dict[str, Any]]) -> int:
                 """,
                 (
                     trade_id,
-                    _first(trade, ("market_id", "market", "conditionId"), None),
-                    _first(trade, ("token_id", "tokenId", "asset"), None),
+                    _first(trade, ("market_id", "market", "marketId", "conditionId"), None),
+                    _first(trade, ("token_id", "tokenId", "asset_id", "asset"), None),
                     ts,
                     _first(trade, ("side", "takerSide"), None),
                     _float(trade.get("price")),
                     _float(_first(trade, ("size", "amount"), None)),
-                    _first(trade, ("maker_address", "maker"), None),
-                    _first(trade, ("taker_address", "taker"), None),
+                    _first(trade, ("maker_address", "maker", "makerAddress"), None),
+                    _first(trade, ("taker_address", "taker", "takerAddress", "proxyWallet"), None),
                     _json(trade),
                 ),
             )
     return len(rows)
+
+
+def _trade_id(trade: Dict[str, Any]) -> str:
+    explicit_id = str(_first(trade, ("id", "trade_id"), "") or "").strip()
+    if explicit_id:
+        return explicit_id
+    tx_hash = str(_first(trade, ("transactionHash", "transaction_hash"), "") or "").strip()
+    if tx_hash:
+        suffix = _stable_id(
+            "trade",
+            {
+                "asset": _first(trade, ("asset", "asset_id", "tokenId"), None),
+                "conditionId": _first(trade, ("conditionId", "market_id", "market"), None),
+                "side": _first(trade, ("side", "takerSide"), None),
+                "size": _first(trade, ("size", "amount"), None),
+                "price": trade.get("price"),
+                "timestamp": _first(
+                    trade,
+                    ("timestamp_ms", "timestampMs", "timestamp", "createdAtMs", "createdAt"),
+                    None,
+                ),
+                "wallet": _first(trade, ("proxyWallet", "taker", "taker_address"), None),
+            },
+        )
+        return f"{tx_hash}:{suffix.split('_', 1)[-1]}"
+    return _stable_id("ptrade", trade)
 
 
 def store_price_points(rows: Iterable[Dict[str, Any]]) -> int:
@@ -405,14 +445,22 @@ class PolymarketHistoricalProvider:
 class PolymarketHistoricalDownloader:
     """Small downloader for seeding historical/replay Polymarket snapshots."""
 
-    def __init__(self, timeout: int = 10, max_retries: int = 3):
+    def __init__(self, timeout: int = 10, max_retries: int = 3, trade_source: Optional[str] = None):
         self.timeout = int(timeout)
         self.max_retries = int(max_retries)
+        self.trade_source = str(
+            trade_source or getattr(config, "POLYMARKET_TRADE_BACKFILL_SOURCE", "data_api")
+        ).strip().lower()
+        if self.trade_source not in {"data_api", "clob"}:
+            self.trade_source = "data_api"
+        self.trade_taker_only = bool(
+            getattr(config, "POLYMARKET_TRADE_BACKFILL_TAKER_ONLY", False)
+        )
 
-    def _fetch_json(self, url: str) -> Any:
+    def _fetch_json(self, url: str, *, params: Optional[Dict[str, Any]] = None) -> Any:
         for attempt in range(self.max_retries):
             try:
-                response = requests.get(url, timeout=self.timeout)
+                response = requests.get(url, params=params, timeout=self.timeout)
                 if response.status_code == 429 or response.status_code >= 500:
                     sleep_s = min(8.0, 0.5 * (2 ** attempt))
                     time.sleep(sleep_s)
@@ -439,25 +487,104 @@ class PolymarketHistoricalDownloader:
             return data if isinstance(data, list) else []
         return []
 
-    def fetch_market_trades(self, market_id: str, limit: int = 100) -> List[Dict[str, Any]]:
-        url = f"{CLOB_API}/trades?market={market_id}&limit={int(limit)}"
-        payload = self._fetch_json(url)
-        if isinstance(payload, list):
-            trades = payload
-        elif isinstance(payload, dict):
-            trades = payload.get("data", payload.get("trades", []))
-            if not isinstance(trades, list):
-                trades = []
+    def _resolve_market_reference(self, market_ref: Any) -> tuple[str, str]:
+        if isinstance(market_ref, dict):
+            market_id = normalize_market_id(market_ref)
+            condition_id = _condition_id_from_market(market_ref)
+            if not condition_id and _is_condition_id(market_id):
+                condition_id = market_id
+            return market_id, condition_id
+
+        raw = str(market_ref or "").strip()
+        if not raw:
+            return "", ""
+        if _is_condition_id(raw):
+            return raw, raw
+
+        try:
+            from src.data import database as db
+
+            with db.get_connection(for_read=True) as conn:
+                row = conn.execute(
+                    "SELECT market_id, raw_market FROM polymarket_markets WHERE market_id = ? LIMIT 1",
+                    (raw,),
+                ).fetchone()
+            if row is not None:
+                market_id = str(row["market_id"] if hasattr(row, "keys") else row[0] or raw)
+                raw_market = _loads(row["raw_market"] if hasattr(row, "keys") else row[1], {}) or {}
+                return market_id, _condition_id_from_market(raw_market)
+        except Exception:
+            pass
+        return raw, ""
+
+    def _normalize_trade_rows(
+        self,
+        trades: Any,
+        *,
+        market_id: str,
+        condition_id: str,
+    ) -> List[Dict[str, Any]]:
+        if isinstance(trades, list):
+            raw_rows = trades
+        elif isinstance(trades, dict):
+            raw_rows = trades.get("data", trades.get("trades", []))
+            if not isinstance(raw_rows, list):
+                raw_rows = []
         else:
-            trades = []
+            raw_rows = []
+
         normalized = []
-        for trade in trades:
+        for trade in raw_rows:
             if not isinstance(trade, dict):
                 continue
             record = dict(trade)
-            record.setdefault("market_id", market_id)
+            record["market_id"] = market_id or str(record.get("market_id") or condition_id or "").strip()
+            if condition_id:
+                record.setdefault("conditionId", condition_id)
+            record.setdefault("taker_address", record.get("proxyWallet"))
             normalized.append(record)
         return normalized
+
+    def fetch_market_trades(self, market_ref: Any, limit: int = 100) -> List[Dict[str, Any]]:
+        market_id, condition_id = self._resolve_market_reference(market_ref)
+        if not condition_id:
+            logger.debug("Skipping Polymarket trade backfill without conditionId: %s", market_ref)
+            return []
+
+        if self.trade_source == "clob":
+            try:
+                payload = self._fetch_json(
+                    f"{CLOB_API}/trades",
+                    params={"market": condition_id, "limit": int(limit)},
+                )
+                return self._normalize_trade_rows(
+                    payload,
+                    market_id=market_id,
+                    condition_id=condition_id,
+                )
+            except requests.RequestException as exc:
+                status = getattr(getattr(exc, "response", None), "status_code", None)
+                if status not in {401, 403}:
+                    raise
+                logger.info(
+                    "Polymarket CLOB trade backfill requires auth for %s; falling back to public data-api /trades",
+                    condition_id,
+                )
+
+        payload = self._fetch_json(
+            f"{DATA_API}/trades",
+            params={
+                "market": condition_id,
+                "limit": int(limit),
+                "offset": 0,
+                "takerOnly": str(self.trade_taker_only).lower(),
+            },
+        )
+        return self._normalize_trade_rows(
+            payload,
+            market_id=market_id,
+            condition_id=condition_id,
+        )
 
     def backfill_markets(
         self,
@@ -481,21 +608,20 @@ class PolymarketHistoricalDownloader:
 
     def backfill_recent_trades(
         self,
-        market_ids: Iterable[str],
+        market_ids: Iterable[Any],
         *,
         per_market: int = 50,
         max_markets: int = 25,
     ) -> int:
         total = 0
         seen = 0
-        for market_id in market_ids:
-            normalized = str(market_id or "").strip()
-            if not normalized:
+        for market_ref in market_ids:
+            if market_ref in (None, ""):
                 continue
             if seen >= int(max_markets):
                 break
             seen += 1
-            trades = self.fetch_market_trades(normalized, limit=per_market)
+            trades = self.fetch_market_trades(market_ref, limit=per_market)
             if trades:
                 total += store_trades(trades)
         return total
