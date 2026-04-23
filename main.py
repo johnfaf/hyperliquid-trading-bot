@@ -174,6 +174,13 @@ class HyperliquidResearchBot:
 
     def _register_background_tasks(self):
         """Register background scanner tasks with the supervised runner."""
+        defer_scanner_startup = os.environ.get(
+            "DEFER_STARTUP_SCANNER_TASKS",
+            "true",
+        ).strip().lower() not in {"0", "false", "no", "off"}
+        self._startup_background_task_names = ["bg-heartbeat"]
+        self._deferred_background_task_names = []
+        self._deferred_background_tasks_started = False
         heartbeat_interval = max(
             15.0,
             min(60.0, float(getattr(config, "READINESS_STALE_SECONDS", 600)) / 4.0),
@@ -208,6 +215,10 @@ class HyperliquidResearchBot:
                 max_retries=10,
             )
             health_registry.register("bg-polymarket", affects_trading=False)
+            if defer_scanner_startup:
+                self._deferred_background_task_names.append("bg-polymarket")
+            else:
+                self._startup_background_task_names.append("bg-polymarket")
 
         if self.container.options_scanner:
             self.task_runner.register(
@@ -218,6 +229,64 @@ class HyperliquidResearchBot:
                 max_retries=10,
             )
             health_registry.register("bg-options-flow", affects_trading=False)
+            if defer_scanner_startup:
+                self._deferred_background_task_names.append("bg-options-flow")
+            else:
+                self._startup_background_task_names.append("bg-options-flow")
+
+        if not self._deferred_background_task_names:
+            self._deferred_background_tasks_started = True
+
+    def _start_boot_background_tasks(self) -> None:
+        """Start only the startup-safe background tasks.
+
+        The trading cycle already runs options/polymarket scans inline on boot.
+        Deferring those non-critical background scanners until the first trading
+        cycle completes avoids duplicate market scans and SQLite write
+        contention during startup.
+        """
+        start_one = getattr(self.task_runner, "start", None)
+        if not callable(start_one):
+            self.task_runner.start_all()
+            self._deferred_background_tasks_started = True
+            return
+
+        for name in self._startup_background_task_names:
+            start_one(name)
+
+        if self._deferred_background_task_names:
+            self.logger.info(
+                "Deferring non-critical background scanners until after the first "
+                "trading cycle: %s",
+                ", ".join(self._deferred_background_task_names),
+            )
+        else:
+            self._deferred_background_tasks_started = True
+
+    def _ensure_deferred_background_tasks_started(self) -> None:
+        """Start scanner tasks that were intentionally deferred during boot."""
+        if self._deferred_background_tasks_started:
+            return
+
+        start_one = getattr(self.task_runner, "start", None)
+        if not callable(start_one):
+            self._deferred_background_tasks_started = True
+            return
+
+        started = []
+        for name in self._deferred_background_task_names:
+            try:
+                start_one(name)
+                started.append(name)
+            except KeyError:
+                continue
+
+        self._deferred_background_tasks_started = True
+        if started:
+            self.logger.info(
+                "Started deferred background scanners after the first trading cycle: %s",
+                ", ".join(started),
+            )
 
     def _polymarket_scan(self):
         self.container.polymarket.scan_markets()
@@ -560,7 +629,7 @@ class HyperliquidResearchBot:
 
         if self.running:
             # Start supervised background tasks
-            self.task_runner.start_all()
+            self._start_boot_background_tasks()
 
             self.logger.info("Bot starting continuous operation…")
             self.logger.info("  Fast cycle:      every %ds", config.FAST_CYCLE_INTERVAL)
@@ -620,6 +689,7 @@ class HyperliquidResearchBot:
                 # Tier 2: Trading (5 min)
                 if now - self._last_research >= config.TRADING_CYCLE_INTERVAL:
                     self._run_trading_cycle()
+                    self._ensure_deferred_background_tasks_started()
                     self._last_research = now
                 else:
                     # Tier 1: Fast (60s)

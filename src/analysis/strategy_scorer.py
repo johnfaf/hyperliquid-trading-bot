@@ -29,6 +29,63 @@ class StrategyScorer:
         self.weights = config.SCORING_WEIGHTS
         self.decay_rate = config.SCORE_DECAY_RATE
 
+    def _persist_scoring_results(
+        self,
+        results: List[Dict],
+        desired_active_ids: set[int],
+    ) -> None:
+        """Persist one scoring cycle in a single DB transaction.
+
+        The old implementation opened a new SQLite write transaction for every
+        score insert, every current-score update, and every active-flag update.
+        During startup that multiplied lock contention with background writers.
+        Persisting the whole cycle in one short transaction keeps the scoring
+        window tight and materially reduces `database is locked` failures.
+        """
+        if not results:
+            return
+
+        scored_at = datetime.now(timezone.utc).isoformat()
+        note = f"Auto-scored at {scored_at}"
+        with db.get_connection() as conn:
+            for result in results:
+                breakdown = result["breakdown"]
+                strategy_id = int(result["strategy_id"])
+                should_be_active = strategy_id in desired_active_ids
+                result["active"] = bool(should_be_active)
+                conn.execute(
+                    """
+                    INSERT INTO strategy_scores
+                    (strategy_id, timestamp, score, pnl_score, win_rate_score,
+                     sharpe_score, consistency_score, risk_adj_score, notes)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        strategy_id,
+                        scored_at,
+                        float(result["score"]),
+                        float(breakdown["pnl_score"]),
+                        float(breakdown["win_rate_score"]),
+                        float(breakdown["sharpe_score"]),
+                        float(breakdown["consistency_score"]),
+                        float(breakdown["risk_adj_score"]),
+                        note,
+                    ),
+                )
+                conn.execute(
+                    """
+                    UPDATE strategies
+                    SET current_score = ?, last_scored = ?, active = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        float(result["score"]),
+                        scored_at,
+                        bool(should_be_active),
+                        strategy_id,
+                    ),
+                )
+
     def score_strategy(self, strategy: Dict) -> Dict:
         """
         Compute a composite score for a strategy across multiple dimensions.
@@ -239,21 +296,6 @@ class StrategyScorer:
                 score_breakdown = self.score_strategy(strategy)
                 composite = score_breakdown["composite"]
 
-                # Save the score to history
-                db.save_strategy_score(
-                    strategy_id=strategy["id"],
-                    score=composite,
-                    pnl_score=score_breakdown["pnl_score"],
-                    win_rate_score=score_breakdown["win_rate_score"],
-                    sharpe_score=score_breakdown["sharpe_score"],
-                    consistency_score=score_breakdown["consistency_score"],
-                    risk_adj_score=score_breakdown["risk_adj_score"],
-                    notes=f"Auto-scored at {datetime.now(timezone.utc).isoformat()}"
-                )
-
-                # Update the strategy's current score
-                db.update_strategy_score(strategy["id"], composite)
-
                 results.append({
                     "strategy_id": strategy["id"],
                     "name": strategy["name"],
@@ -291,23 +333,13 @@ class StrategyScorer:
             }
             desired_active_ids = capped_ids
 
-        # Persist active flags.
         for r in results:
-            should_be_active = r["strategy_id"] in desired_active_ids
-            r["active"] = should_be_active
-            try:
-                with db.get_connection() as conn:
-                    conn.execute(
-                        "UPDATE strategies SET active = ? WHERE id = ?",
-                        (bool(should_be_active), r["strategy_id"]),
-                    )
-            except Exception as e:
-                logger.error(
-                    "Failed to persist active=%s for strategy %s: %s",
-                    should_be_active,
-                    r["strategy_id"],
-                    e,
-                )
+            r["active"] = r["strategy_id"] in desired_active_ids
+
+        try:
+            self._persist_scoring_results(results, desired_active_ids)
+        except Exception as exc:
+            logger.error("Failed to persist scoring cycle: %s", exc)
 
         logger.info(
             "Strategy activation policy: threshold=%.3f, keep_top_n=%d, active=%d/%d",
@@ -319,12 +351,15 @@ class StrategyScorer:
 
         # Log the scoring cycle
         active_count = sum(1 for r in results if r["active"])
-        db.log_research_cycle(
-            cycle_type="scoring",
-            summary=f"Scored {len(results)} strategies, {active_count} active",
-            details={"top_strategies": results[:5]},
-            strategies_updated=len(results),
-        )
+        try:
+            db.log_research_cycle(
+                cycle_type="scoring",
+                summary=f"Scored {len(results)} strategies, {active_count} active",
+                details={"top_strategies": results[:5]},
+                strategies_updated=len(results),
+            )
+        except Exception as exc:
+            logger.error("Failed to log scoring cycle: %s", exc)
 
         return results
 

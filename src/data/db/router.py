@@ -46,11 +46,14 @@ def _sqlite_connect() -> sqlite3.Connection:
             f"(minimum {min_free:.1f}MB)"
         )
 
-    conn = sqlite3.connect(db_path)
+    busy_timeout_ms = int(
+        safe_env_float("DB_BUSY_TIMEOUT_MS", 15_000.0, lo=1_000.0, hi=600_000.0)
+    )
+    conn = sqlite3.connect(db_path, timeout=busy_timeout_ms / 1000.0)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys=ON")
     conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA busy_timeout=5000")
+    conn.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
     return conn
 
 

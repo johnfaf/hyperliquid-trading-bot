@@ -720,7 +720,7 @@ def update_strategy_score(strategy_id, score):
 
 
 def get_active_strategies():
-    with get_connection() as conn:
+    with get_connection(for_read=True) as conn:
         rows = conn.execute(
             "SELECT * FROM strategies WHERE active = ? ORDER BY current_score DESC",
             (True,),
@@ -729,7 +729,7 @@ def get_active_strategies():
 
 
 def get_strategy(strategy_id):
-    with get_connection() as conn:
+    with get_connection(for_read=True) as conn:
         row = conn.execute("SELECT * FROM strategies WHERE id = ?", (strategy_id,)).fetchone()
     return dict(row) if row else None
 
@@ -751,7 +751,7 @@ def save_strategy_score(strategy_id, score, pnl_score=0, win_rate_score=0,
 
 
 def get_strategy_score_history(strategy_id, limit=30):
-    with get_connection() as conn:
+    with get_connection(for_read=True) as conn:
         rows = conn.execute("""
             SELECT * FROM strategy_scores
             WHERE strategy_id = ?

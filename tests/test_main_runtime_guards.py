@@ -228,3 +228,35 @@ def test_register_background_tasks_staggers_heavy_scanners(monkeypatch):
     assert delays["bg-heartbeat"] == 5.0
     assert delays["bg-polymarket"] == 20.0
     assert delays["bg-options-flow"] == 40.0
+
+
+def test_start_boot_background_tasks_defers_noncritical_scanners():
+    bot = main.HyperliquidResearchBot.__new__(main.HyperliquidResearchBot)
+    bot.logger = _FakeLogger()
+    started = []
+    bot.task_runner = SimpleNamespace(start=lambda name: started.append(name))
+    bot._startup_background_task_names = ["bg-heartbeat"]
+    bot._deferred_background_task_names = ["bg-polymarket", "bg-options-flow"]
+    bot._deferred_background_tasks_started = False
+
+    bot._start_boot_background_tasks()
+
+    assert started == ["bg-heartbeat"]
+    assert bot._deferred_background_tasks_started is False
+    assert any("Deferring non-critical background scanners" in msg for msg in bot.logger.infos)
+
+
+def test_ensure_deferred_background_tasks_started_only_runs_once():
+    bot = main.HyperliquidResearchBot.__new__(main.HyperliquidResearchBot)
+    bot.logger = _FakeLogger()
+    started = []
+    bot.task_runner = SimpleNamespace(start=lambda name: started.append(name))
+    bot._deferred_background_task_names = ["bg-polymarket", "bg-options-flow"]
+    bot._deferred_background_tasks_started = False
+
+    bot._ensure_deferred_background_tasks_started()
+    bot._ensure_deferred_background_tasks_started()
+
+    assert started == ["bg-polymarket", "bg-options-flow"]
+    assert bot._deferred_background_tasks_started is True
+    assert any("Started deferred background scanners" in msg for msg in bot.logger.infos)
