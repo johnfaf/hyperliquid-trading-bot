@@ -17,6 +17,7 @@ import logging
 import os
 import sqlite3
 import sys
+import threading
 import time
 from contextlib import contextmanager
 
@@ -27,6 +28,7 @@ from src.core.env_utils import safe_env_float
 from src.data.db.connection import ConnectionAdapter, DualWriteAdapter
 
 logger = logging.getLogger(__name__)
+_SQLITE_WRITE_LOCK = threading.RLock()
 
 
 # ─── SQLite helpers ─────────────────────────────────────────────
@@ -55,6 +57,26 @@ def _sqlite_connect() -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
     return conn
+
+
+@contextmanager
+def _sqlite_write_guard(enabled: bool):
+    """Serialize in-process SQLite write transactions.
+
+    WAL mode still only permits a single writer at a time. The bot runs
+    multiple background threads that can all open write-capable connections
+    against the same SQLite file, which turns harmless overlap into
+    `database is locked` churn during startup and first-cycle scans.
+
+    Serializing write transactions inside this process is the pragmatic fix:
+    readers remain concurrent, while writers line up behind one shared guard.
+    """
+    if not enabled:
+        yield
+        return
+
+    with _SQLITE_WRITE_LOCK:
+        yield
 
 
 # ─── Postgres helpers ──────────────────────────────────────────
@@ -118,67 +140,69 @@ def get_connection(*, for_read: bool = False):
         # Every statement executes on SQLite first (authoritative), then
         # mirrors to Postgres (best-effort).  Postgres failures are logged
         # and counted but never propagate to the caller.
-        raw_sq = _sqlite_connect()
-        pg_raw = None
-        try:
-            pg_raw = _pg_connect()
-        except Exception as exc:
-            # Rate-limit this warning to avoid log spam when PG is down
-            if not hasattr(get_connection, "_pg_warn_ts") or \
-               (time.time() - get_connection._pg_warn_ts) > 300:
-                logger.warning(
-                    "Dualwrite: could not obtain Postgres connection (%s) -- "
-                    "falling back to SQLite-only.", exc,
-                )
-                get_connection._pg_warn_ts = time.time()
+        with _sqlite_write_guard(enabled=True):
+            raw_sq = _sqlite_connect()
+            pg_raw = None
+            try:
+                pg_raw = _pg_connect()
+            except Exception as exc:
+                # Rate-limit this warning to avoid log spam when PG is down
+                if not hasattr(get_connection, "_pg_warn_ts") or \
+                   (time.time() - get_connection._pg_warn_ts) > 300:
+                    logger.warning(
+                        "Dualwrite: could not obtain Postgres connection (%s) -- "
+                        "falling back to SQLite-only.", exc,
+                    )
+                    get_connection._pg_warn_ts = time.time()
 
-        if pg_raw is not None:
-            adapter = DualWriteAdapter(raw_sq, pg_raw)
-            try:
-                yield adapter
-                adapter.commit()
-            except sqlite3.OperationalError as exc:
-                logger.warning("SQLite operational error: %s", exc)
-                adapter.rollback()
-                raise
-            except Exception:
-                adapter.rollback()
-                raise
-            finally:
-                raw_sq.close()
-                _pg_return(pg_raw)
-        else:
-            # Postgres unavailable — degrade to SQLite-only
-            adapter = ConnectionAdapter(raw_sq, "sqlite")
-            try:
-                yield adapter
-                raw_sq.commit()
-            except sqlite3.OperationalError as exc:
-                logger.warning("SQLite operational error: %s", exc)
-                raw_sq.rollback()
-                raise
-            except Exception:
-                raw_sq.rollback()
-                raise
-            finally:
-                raw_sq.close()
+            if pg_raw is not None:
+                adapter = DualWriteAdapter(raw_sq, pg_raw)
+                try:
+                    yield adapter
+                    adapter.commit()
+                except sqlite3.OperationalError as exc:
+                    logger.warning("SQLite operational error: %s", exc)
+                    adapter.rollback()
+                    raise
+                except Exception:
+                    adapter.rollback()
+                    raise
+                finally:
+                    raw_sq.close()
+                    _pg_return(pg_raw)
+            else:
+                # Postgres unavailable — degrade to SQLite-only
+                adapter = ConnectionAdapter(raw_sq, "sqlite")
+                try:
+                    yield adapter
+                    raw_sq.commit()
+                except sqlite3.OperationalError as exc:
+                    logger.warning("SQLite operational error: %s", exc)
+                    raw_sq.rollback()
+                    raise
+                except Exception:
+                    raw_sq.rollback()
+                    raise
+                finally:
+                    raw_sq.close()
 
     else:
         # Default: pure SQLite
-        raw = _sqlite_connect()
-        adapter = ConnectionAdapter(raw, "sqlite")
-        try:
-            yield adapter
-            raw.commit()
-        except sqlite3.OperationalError as exc:
-            logger.warning("SQLite operational error: %s", exc)
-            raw.rollback()
-            raise
-        except Exception:
-            raw.rollback()
-            raise
-        finally:
-            raw.close()
+        with _sqlite_write_guard(enabled=not for_read):
+            raw = _sqlite_connect()
+            adapter = ConnectionAdapter(raw, "sqlite")
+            try:
+                yield adapter
+                raw.commit()
+            except sqlite3.OperationalError as exc:
+                logger.warning("SQLite operational error: %s", exc)
+                raw.rollback()
+                raise
+            except Exception:
+                raw.rollback()
+                raise
+            finally:
+                raw.close()
 
 
 def is_postgres_active() -> bool:

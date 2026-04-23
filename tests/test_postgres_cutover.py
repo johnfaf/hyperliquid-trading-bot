@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+import threading
 from contextlib import contextmanager
 
 import pytest
@@ -121,6 +122,77 @@ def test_dualwrite_read_only_path_skips_postgres(monkeypatch):
         row = conn.execute("SELECT 1").fetchone()
 
     assert row[0] == 1
+
+
+class _TrackingLock:
+    def __init__(self):
+        self.enter_count = 0
+        self.exit_count = 0
+        self.max_active = 0
+        self._active = 0
+        self._inner = threading.Lock()
+
+    def __enter__(self):
+        self._inner.acquire()
+        self.enter_count += 1
+        self._active += 1
+        self.max_active = max(self.max_active, self._active)
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self._active -= 1
+        self.exit_count += 1
+        self._inner.release()
+        return False
+
+
+def test_sqlite_write_path_uses_process_write_guard(monkeypatch, tmp_path):
+    db_path = tmp_path / "router-write-lock.db"
+    monkeypatch.setattr(router.config, "DB_BACKEND", "sqlite")
+    monkeypatch.setattr(router.config, "DB_PATH", str(db_path))
+    tracking_lock = _TrackingLock()
+    monkeypatch.setattr(router, "_SQLITE_WRITE_LOCK", tracking_lock)
+
+    with router.get_connection() as conn:
+        conn.execute("CREATE TABLE IF NOT EXISTS test_rows (id INTEGER PRIMARY KEY, value TEXT)")
+
+    def _write_row(value: str):
+        with router.get_connection() as conn:
+            conn.execute("INSERT INTO test_rows (value) VALUES (?)", (value,))
+
+    t1 = threading.Thread(target=_write_row, args=("a",))
+    t2 = threading.Thread(target=_write_row, args=("b",))
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
+
+    with router.get_connection(for_read=True) as conn:
+        rows = conn.execute("SELECT value FROM test_rows ORDER BY id").fetchall()
+
+    assert [row[0] for row in rows] == ["a", "b"]
+    assert tracking_lock.enter_count == 3
+    assert tracking_lock.exit_count == 3
+    assert tracking_lock.max_active == 1
+
+
+def test_dualwrite_read_only_path_skips_process_write_guard(monkeypatch):
+    tracking_lock = _TrackingLock()
+    monkeypatch.setattr(router, "_SQLITE_WRITE_LOCK", tracking_lock)
+    monkeypatch.setattr(router.config, "DB_BACKEND", "dualwrite")
+    monkeypatch.setattr(router, "_sqlite_connect", lambda: sqlite3.connect(":memory:"))
+
+    def _unexpected_pg():
+        raise AssertionError("dualwrite read path should not open Postgres")
+
+    monkeypatch.setattr(router, "_pg_connect", _unexpected_pg)
+
+    with router.get_connection(for_read=True) as conn:
+        row = conn.execute("SELECT 1").fetchone()
+
+    assert row[0] == 1
+    assert tracking_lock.enter_count == 0
+    assert tracking_lock.exit_count == 0
 
 
 def test_dualwrite_insert_preserves_sqlite_generated_ids_in_postgres():
