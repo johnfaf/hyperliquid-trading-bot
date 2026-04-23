@@ -425,6 +425,13 @@ class PolymarketScanner:
                 )
             return []
 
+        try:
+            from src.data.polymarket_history import store_markets
+
+            store_markets(raw_markets, observed_at_ms=int(time.time() * 1000))
+        except Exception as exc:
+            logger.debug("Polymarket history persistence skipped: %s", exc)
+
         enriched = []
         crypto_count = 0
 

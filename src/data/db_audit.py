@@ -452,15 +452,21 @@ def _paper_trade_checks(conn: Any, findings: list[DbAuditFinding], checks: dict[
     active_coins.update(str(_row_get(row, "coin", 0, "") or "").upper() for row in open_coin_rows)
     active_coins.discard("")
 
+    same_side_limit = max(
+        1,
+        int(getattr(config, "FIREWALL_MAX_SAME_SIDE_POSITIONS_PER_COIN", 2) or 2),
+    )
     dup_rows = conn.execute(
         """
         SELECT coin, side, COUNT(*) AS c
         FROM paper_trades
         WHERE LOWER(COALESCE(status, '')) = 'open'
         GROUP BY coin, side
-        HAVING COUNT(*) > 1
+        HAVING COUNT(*) > ?
         ORDER BY c DESC
         """
+        ,
+        (same_side_limit,),
     ).fetchall()
     duplicate_same_side = [dict(row) for row in dup_rows]
 
@@ -480,6 +486,7 @@ def _paper_trade_checks(conn: Any, findings: list[DbAuditFinding], checks: dict[
         "bad_numeric_count": bad_numeric_count,
         "open_missing_protection_count": len(missing_protection),
         "open_missing_protection_examples": missing_protection,
+        "same_side_limit": same_side_limit,
         "duplicate_same_side_open": duplicate_same_side,
         "conflicting_open_sides": conflicting_sides,
         "active_open_coins": sorted(active_coins),
@@ -506,7 +513,8 @@ def _paper_trade_checks(conn: Any, findings: list[DbAuditFinding], checks: dict[
             findings,
             "duplicate_same_side_open_trades",
             "medium",
-            "Multiple open paper trades exist for the same coin and side.",
+            "Open same-side paper trades exceed the configured pyramiding cap.",
+            limit=same_side_limit,
             examples=duplicate_same_side,
         )
     if conflicting_sides:
@@ -773,24 +781,36 @@ def _source_health_checks(conn: Any, findings: list[DbAuditFinding], checks: dic
 
 
 def _historical_data_checks(conn: Any, findings: list[DbAuditFinding], checks: dict[str, Any]) -> None:
-    tables = [
+    required_tables = [
         "funding_history",
         "open_interest_history",
         "options_summary_history",
         "polymarket_markets",
         "polymarket_market_snapshots",
+    ]
+    optional_tables = [
         "polymarket_trades",
     ]
+    tables = required_tables + optional_tables
     counts = {table: _count(conn, table) for table in tables if _table_exists(conn, table)}
     checks["historical_sources"] = counts
-    empty = [name for name, count in counts.items() if count == 0]
-    if empty:
+    empty_required = [name for name in required_tables if counts.get(name, 0) == 0]
+    empty_optional = [name for name in optional_tables if counts.get(name, 0) == 0]
+    if empty_required:
         _add(
             findings,
             "historical_source_tables_empty",
             "medium",
             "Historical source tables exist but have no persisted rows.",
-            empty_tables=empty,
+            empty_tables=empty_required,
+        )
+    if empty_optional:
+        _add(
+            findings,
+            "historical_source_tables_optional_empty",
+            "low",
+            "Optional historical source tables are still empty.",
+            empty_tables=empty_optional,
         )
 
 
@@ -1065,6 +1085,16 @@ def _merge_metadata_blob(raw: Any, extra: dict[str, Any]) -> str:
     return json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
 
 
+def _load_metadata_blob(raw: Any) -> dict[str, Any]:
+    if isinstance(raw, dict):
+        return dict(raw)
+    try:
+        payload = json.loads(raw or "{}")
+        return payload if isinstance(payload, dict) else {}
+    except Exception:
+        return {}
+
+
 def _repair_schema_migrations_table(actions: list[DbRepairAction]) -> None:
     try:
         with db.get_connection() as conn:
@@ -1287,15 +1317,6 @@ def _repair_source_inventory(actions: list[DbRepairAction]) -> None:
                 )
                 return
             existing = _count(conn, "source_inventory")
-        if existing > 0:
-            _record_action(
-                actions,
-                "source_inventory",
-                "skipped",
-                "source_inventory already contains rows.",
-                count=existing,
-            )
-            return
         from src.learning.source_inventory import seed_source_inventory
 
         inserted = int(seed_source_inventory() or 0)
@@ -1303,8 +1324,9 @@ def _repair_source_inventory(actions: list[DbRepairAction]) -> None:
             actions,
             "source_inventory",
             "applied",
-            "Seeded source_inventory with the default registry.",
+            "Synced source_inventory with the default registry.",
             inserted=inserted,
+            existing=existing,
         )
     except Exception as exc:
         _record_action(
@@ -1439,6 +1461,210 @@ def _repair_open_trade_protection(actions: list[DbRepairAction]) -> None:
             "Could not repair missing SL/TP values on open paper trades.",
             error=str(exc),
         )
+
+
+def _same_side_open_trade_limit() -> int:
+    return max(
+        1,
+        int(getattr(config, "FIREWALL_MAX_SAME_SIDE_POSITIONS_PER_COIN", 2) or 2),
+    )
+
+
+def _looks_like_synthetic_placeholder_trade(row: Any) -> bool:
+    metadata = _load_metadata_blob(_row_get(row, "metadata", 7, "{}"))
+    if not metadata:
+        return False
+    if metadata.get("source") or metadata.get("signal_id") or metadata.get("decision_id"):
+        return False
+    if not bool(metadata.get("auto_repaired")):
+        return False
+    if str(metadata.get("repair_reason", "") or "") != "missing_trade_protection":
+        return False
+    try:
+        entry_price = float(_row_get(row, "entry_price", 3, 0.0) or 0.0)
+        size = float(_row_get(row, "size", 4, 0.0) or 0.0)
+        leverage = float(_row_get(row, "leverage", 5, 0.0) or 0.0)
+    except (TypeError, ValueError):
+        return False
+    return entry_price > 0 and entry_price <= 1000.0 and abs(size - 1.0) < 1e-9 and abs(leverage - 1.0) < 1e-9
+
+
+def _repair_duplicate_same_side_open_trades(actions: list[DbRepairAction]) -> None:
+    limit = _same_side_open_trade_limit()
+    try:
+        with db.get_connection() as conn:
+            if not _table_exists(conn, "paper_trades"):
+                _record_action(
+                    actions,
+                    "duplicate_same_side_open_trades",
+                    "skipped",
+                    "paper_trades table is not present.",
+                )
+                return
+            rows = conn.execute(
+                """
+                SELECT id, coin, side, entry_price, size, leverage, opened_at, metadata
+                FROM paper_trades
+                WHERE LOWER(COALESCE(status, '')) = 'open'
+                ORDER BY COALESCE(opened_at, ''), id
+                """
+            ).fetchall()
+            grouped: dict[tuple[str, str], list[Any]] = {}
+            for row in rows:
+                key = (
+                    str(_row_get(row, "coin", 1, "") or "").upper(),
+                    str(_row_get(row, "side", 2, "") or "").strip().lower(),
+                )
+                grouped.setdefault(key, []).append(row)
+
+            cancelled = []
+            unresolved = []
+            now_iso = _now()
+            for (coin, side), group in grouped.items():
+                if len(group) <= limit:
+                    continue
+                synthetic = [row for row in group if _looks_like_synthetic_placeholder_trade(row)]
+                for row in synthetic:
+                    trade_id = int(_row_get(row, "id", 0, 0) or 0)
+                    merged_meta = _merge_metadata_blob(
+                        _row_get(row, "metadata", 7, "{}"),
+                        {
+                            "auto_repaired": True,
+                            "repair_reason": "synthetic_duplicate_cancelled",
+                            "repair_timestamp": now_iso,
+                        },
+                    )
+                    conn.execute(
+                        """
+                        UPDATE paper_trades
+                        SET status = ?, closed_at = ?, exit_price = ?, pnl = ?, metadata = ?
+                        WHERE id = ?
+                        """,
+                        (
+                            "cancelled",
+                            now_iso,
+                            float(_row_get(row, "entry_price", 3, 0.0) or 0.0),
+                            0.0,
+                            merged_meta,
+                            trade_id,
+                        ),
+                    )
+                    cancelled.append(
+                        {
+                            "id": trade_id,
+                            "coin": coin,
+                            "side": side,
+                        }
+                    )
+                remaining = len(group) - len(synthetic)
+                if remaining > limit:
+                    unresolved.append({"coin": coin, "side": side, "open_count": remaining, "limit": limit})
+
+            if cancelled:
+                _record_action(
+                    actions,
+                    "duplicate_same_side_open_trades",
+                    "applied",
+                    "Cancelled synthetic placeholder paper trades that exceeded the same-side cap.",
+                    limit=limit,
+                    cancelled=cancelled[:20],
+                    unresolved=unresolved[:10],
+                )
+            else:
+                _record_action(
+                    actions,
+                    "duplicate_same_side_open_trades",
+                    "skipped",
+                    "No synthetic same-side duplicate paper trades required repair.",
+                    limit=limit,
+                    unresolved=unresolved[:10],
+                )
+    except Exception as exc:
+        _record_action(
+            actions,
+            "duplicate_same_side_open_trades",
+            "failed",
+            "Could not repair duplicate same-side open paper trades.",
+            error=str(exc),
+            limit=limit,
+        )
+
+
+def _repair_source_health_history(actions: list[DbRepairAction]) -> None:
+    try:
+        from src.learning.source_inventory import persist_source_health_snapshot
+
+        inserted = int(persist_source_health_snapshot(force=True) or 0)
+        _record_action(
+            actions,
+            "source_health_history",
+            "applied" if inserted else "skipped",
+            "Persisted a fresh source-health snapshot.",
+            inserted=inserted,
+        )
+    except Exception as exc:
+        _record_action(
+            actions,
+            "source_health_history",
+            "failed",
+            "Could not persist source-health snapshot history.",
+            error=str(exc),
+        )
+
+
+def _repair_historical_sources(actions: list[DbRepairAction]) -> None:
+    results: dict[str, Any] = {}
+    try:
+        from src.data.historical_market_data import snapshot_live_derivatives_history
+
+        results["derivatives"] = snapshot_live_derivatives_history()
+    except Exception as exc:
+        results["derivatives_error"] = str(exc)
+
+    try:
+        from src.data.options_flow import OptionsFlowScanner
+
+        scanner = OptionsFlowScanner()
+        summary = scanner.scan_flow() or {}
+        results["options_flow"] = {
+            "unusual_prints": int(summary.get("unusual_prints", 0) or 0),
+            "summary_rows_persisted": int(summary.get("summary_rows_persisted", 0) or 0),
+        }
+    except Exception as exc:
+        results["options_flow_error"] = str(exc)
+
+    try:
+        from src.data.polymarket_history import PolymarketHistoricalDownloader, normalize_market_id
+
+        downloader = PolymarketHistoricalDownloader()
+        markets = downloader.fetch_gamma_markets(limit=100, offset=0)
+        market_rows = int(downloader.backfill_markets(max_markets=100, page_size=100) or 0)
+        market_ids = [normalize_market_id(market) for market in markets[:25]]
+        trade_rows = int(
+            downloader.backfill_recent_trades(market_ids, per_market=25, max_markets=25) or 0
+        )
+        results["polymarket"] = {
+            "market_rows": market_rows,
+            "trade_rows": trade_rows,
+            "market_ids": market_ids[:10],
+        }
+    except Exception as exc:
+        results["polymarket_error"] = str(exc)
+
+    inserted_total = 0
+    for key in ("derivatives", "options_flow", "polymarket"):
+        payload = results.get(key)
+        if isinstance(payload, dict):
+            for value in payload.values():
+                if isinstance(value, int):
+                    inserted_total += value
+    status = "applied" if inserted_total > 0 else "skipped"
+    message = (
+        "Backfilled historical source tables from live market snapshots."
+        if inserted_total > 0
+        else "Historical source backfill produced no new rows."
+    )
+    _record_action(actions, "historical_sources", status, message, results=results)
 
 
 def _repair_stale_pending_decisions(actions: list[DbRepairAction]) -> None:
@@ -1632,9 +1858,11 @@ def run_db_repair(
     _repair_orphan_strategy_score_parents(actions)
     _repair_source_inventory(actions)
     _repair_open_trade_protection(actions)
+    _repair_duplicate_same_side_open_trades(actions)
     _repair_stale_pending_decisions(actions)
 
     if repair_live_data:
+        _repair_historical_sources(actions)
         stale_regime = [
             str(item.get("coin") or "").upper()
             for item in (pre_audit.checks.get("regime_history", {}) or {}).get("stale_active", [])
@@ -1658,8 +1886,9 @@ def run_db_repair(
             actions,
             "live_data_refresh",
             "skipped",
-            "Network-backed regime/candle refresh was disabled for this repair run.",
+            "Network-backed regime/candle/history refresh was disabled for this repair run.",
         )
+    _repair_source_health_history(actions)
 
     post_audit = run_db_audit(
         include_candle_cache=include_candle_cache,

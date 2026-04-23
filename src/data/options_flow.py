@@ -9,6 +9,7 @@ Data sources:
   - Binance Options API (secondary)
 """
 import logging
+import math
 import time
 import threading
 from datetime import datetime, timedelta, timezone
@@ -84,6 +85,108 @@ class OptionsFlowScanner:
         self._last_trade_fetch_success: Dict[str, bool] = {}
 
         logger.info("OptionsFlowScanner initialized")
+
+    def _persist_summary_history(self) -> int:
+        """Persist one options-summary snapshot per tracked underlying."""
+        try:
+            from src.data.historical_market_data import store_options_summaries
+        except Exception as exc:
+            logger.debug("Options summary persistence unavailable: %s", exc)
+            return 0
+
+        observed_at_ms = int(time.time() * 1000)
+        rows = []
+        with self._lock:
+            conviction_by_ticker = {
+                str(item.get("ticker", "") or "").upper(): dict(item or {})
+                for item in (self.top_convictions or [])
+                if str(item.get("ticker", "") or "").strip()
+            }
+            prints_by_ticker: Dict[str, List[Dict]] = defaultdict(list)
+            for print_row in self.unusual_prints:
+                ticker = str(print_row.get("underlying", "") or "").upper()
+                if ticker:
+                    prints_by_ticker[ticker].append(dict(print_row))
+
+        tickers = sorted(set(prints_by_ticker) | set(conviction_by_ticker))
+        for ticker in tickers:
+            conviction = conviction_by_ticker.get(ticker, {})
+            prints = prints_by_ticker.get(ticker, [])
+            if not conviction and not prints:
+                continue
+
+            ivs = []
+            call_ivs = []
+            put_ivs = []
+            call_notional = 0.0
+            put_notional = 0.0
+            for print_row in prints:
+                iv = print_row.get("iv")
+                try:
+                    iv = float(iv)
+                except (TypeError, ValueError):
+                    iv = None
+                if iv is not None and math.isfinite(iv):
+                    ivs.append(iv)
+                option_type = str(print_row.get("option_type", "") or "").lower()
+                notional = float(print_row.get("notional", 0.0) or 0.0)
+                if option_type == "call":
+                    call_notional += notional
+                    if iv is not None and math.isfinite(iv):
+                        call_ivs.append(iv)
+                elif option_type == "put":
+                    put_notional += notional
+                    if iv is not None and math.isfinite(iv):
+                        put_ivs.append(iv)
+
+            net_flow = float(conviction.get("net_flow", 0.0) or 0.0)
+            flow_direction = str(conviction.get("direction", "") or "").lower()
+            if flow_direction not in {"bullish", "bearish"}:
+                if net_flow > 0:
+                    flow_direction = "bullish"
+                elif net_flow < 0:
+                    flow_direction = "bearish"
+                else:
+                    flow_direction = "neutral"
+
+            iv_rank = sum(ivs) / len(ivs) if ivs else None
+            call_put_ratio = None
+            if call_notional > 0 and put_notional > 0:
+                call_put_ratio = call_notional / put_notional
+            elif call_notional > 0 and put_notional == 0:
+                call_put_ratio = 999.0
+            elif put_notional > 0 and call_notional == 0:
+                call_put_ratio = 0.0
+            skew = None
+            if call_ivs and put_ivs:
+                skew = (sum(call_ivs) / len(call_ivs)) - (sum(put_ivs) / len(put_ivs))
+
+            rows.append(
+                {
+                    "source": "deribit_options",
+                    "coin": ticker,
+                    "timestamp_ms": observed_at_ms,
+                    "iv_rank": iv_rank,
+                    "iv_percentile": conviction.get("conviction_pct"),
+                    "skew": skew,
+                    "call_put_ratio": call_put_ratio,
+                    "net_premium_usd": net_flow,
+                    "flow_direction": flow_direction,
+                    "metadata": {
+                        "print_count": len(prints),
+                        "bullish_notional": float(conviction.get("bullish_notional", 0.0) or 0.0),
+                        "bearish_notional": float(conviction.get("bearish_notional", 0.0) or 0.0),
+                        "total_prints": int(conviction.get("total_prints", len(prints)) or len(prints)),
+                    },
+                }
+            )
+        if not rows:
+            return 0
+        try:
+            return int(store_options_summaries(rows) or 0)
+        except Exception as exc:
+            logger.debug("Options summary persistence failed: %s", exc)
+            return 0
 
     def _throttle_venue(self, venue: str) -> None:
         """Simple per-venue rate limiter for direct external API calls."""
@@ -539,6 +642,9 @@ class OptionsFlowScanner:
                     else f"scan ok: {successful_fetches} currencies"
                 )
                 state_method("options_flow", reason=state_reason, metadata=summary)
+        persisted = self._persist_summary_history()
+        if persisted:
+            summary["summary_rows_persisted"] = persisted
         logger.info(f"Flow scan complete: {len(all_unusual)} new unusual prints, "
                     f"{len(self.unusual_prints)} total tracked")
         return summary

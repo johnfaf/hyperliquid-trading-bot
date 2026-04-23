@@ -439,6 +439,26 @@ class PolymarketHistoricalDownloader:
             return data if isinstance(data, list) else []
         return []
 
+    def fetch_market_trades(self, market_id: str, limit: int = 100) -> List[Dict[str, Any]]:
+        url = f"{CLOB_API}/trades?market={market_id}&limit={int(limit)}"
+        payload = self._fetch_json(url)
+        if isinstance(payload, list):
+            trades = payload
+        elif isinstance(payload, dict):
+            trades = payload.get("data", payload.get("trades", []))
+            if not isinstance(trades, list):
+                trades = []
+        else:
+            trades = []
+        normalized = []
+        for trade in trades:
+            if not isinstance(trade, dict):
+                continue
+            record = dict(trade)
+            record.setdefault("market_id", market_id)
+            normalized.append(record)
+        return normalized
+
     def backfill_markets(
         self,
         max_markets: int = 500,
@@ -457,6 +477,27 @@ class PolymarketHistoricalDownloader:
             if len(markets) < batch_limit:
                 break
             offset += len(markets)
+        return total
+
+    def backfill_recent_trades(
+        self,
+        market_ids: Iterable[str],
+        *,
+        per_market: int = 50,
+        max_markets: int = 25,
+    ) -> int:
+        total = 0
+        seen = 0
+        for market_id in market_ids:
+            normalized = str(market_id or "").strip()
+            if not normalized:
+                continue
+            if seen >= int(max_markets):
+                break
+            seen += 1
+            trades = self.fetch_market_trades(normalized, limit=per_market)
+            if trades:
+                total += store_trades(trades)
         return total
 
     def snapshot_label(self) -> str:

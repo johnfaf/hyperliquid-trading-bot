@@ -8,6 +8,7 @@ and options summaries without touching the live execution path.
 from __future__ import annotations
 
 import json
+import time
 from typing import Any, Dict, Iterable, List, Optional
 
 
@@ -123,6 +124,68 @@ def store_options_summaries(rows: Iterable[Dict[str, Any]]) -> int:
                 ),
             )
     return len(items)
+
+
+def snapshot_live_derivatives_history(
+    coins: Optional[Iterable[str]] = None,
+    *,
+    observed_at_ms: Optional[int] = None,
+) -> Dict[str, int]:
+    """Persist one current funding/OI snapshot from Hyperliquid asset contexts."""
+    from src.data import hyperliquid_client as hl
+
+    observed = int(observed_at_ms or time.time() * 1000)
+    contexts = hl.get_asset_contexts() or {}
+    if not contexts:
+        return {"funding_rows": 0, "open_interest_rows": 0}
+
+    coin_filter = {
+        str(coin or "").strip().upper()
+        for coin in (coins or contexts.keys())
+        if str(coin or "").strip()
+    }
+    funding_rows = []
+    oi_rows = []
+    for coin in sorted(coin_filter):
+        ctx = contexts.get(coin) or {}
+        if not ctx:
+            continue
+        funding_rate = float(ctx.get("funding", 0.0) or 0.0)
+        open_interest = float(ctx.get("open_interest", 0.0) or 0.0)
+        mark_price = float(ctx.get("mark_price", 0.0) or 0.0)
+        annualized = funding_rate * 24.0 * 365.0
+        funding_rows.append(
+            {
+                "source": "hyperliquid",
+                "coin": coin,
+                "timestamp_ms": observed,
+                "funding_rate": funding_rate,
+                "annualized": annualized,
+                "metadata": {
+                    "mark_price": mark_price,
+                    "oracle_price": float(ctx.get("oracle_price", 0.0) or 0.0),
+                    "premium": float(ctx.get("premium", 0.0) or 0.0),
+                },
+            }
+        )
+        oi_rows.append(
+            {
+                "source": "hyperliquid",
+                "coin": coin,
+                "timestamp_ms": observed,
+                "open_interest": open_interest,
+                "notional_usd": (open_interest * mark_price) if mark_price > 0 else None,
+                "metadata": {
+                    "mark_price": mark_price,
+                    "day_volume": float(ctx.get("day_volume", 0.0) or 0.0),
+                },
+            }
+        )
+
+    return {
+        "funding_rows": store_funding_points(funding_rows),
+        "open_interest_rows": store_open_interest_points(oi_rows),
+    }
 
 
 def get_funding_history(coin: str, limit: int = 100, source: Optional[str] = None) -> List[Dict[str, Any]]:

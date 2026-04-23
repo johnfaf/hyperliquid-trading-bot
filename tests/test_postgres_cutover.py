@@ -774,6 +774,12 @@ def test_open_paper_trade_idempotency_key_deduplicates(monkeypatch, tmp_path):
     db_file = tmp_path / "h5.db"
     monkeypatch.setattr(db_module.config, "DB_BACKEND", "sqlite")
     monkeypatch.setattr(db_module.config, "DB_PATH", str(db_file), raising=False)
+    monkeypatch.setattr(
+        db_module.config,
+        "FIREWALL_MAX_SAME_SIDE_POSITIONS_PER_COIN",
+        10,
+        raising=False,
+    )
     monkeypatch.setattr(db_module, "_RESOLVED_DB_PATH", str(db_file), raising=False)
 
     db_module.init_db()
@@ -872,3 +878,25 @@ def test_open_paper_trade_idempotency_key_schema_migration(monkeypatch, tmp_path
         None, "ETH", "long", 100.0, 1.0, idempotency_key="k1",
     )
     assert tid1 == tid2
+
+
+def test_open_paper_trade_enforces_same_side_cap(monkeypatch, tmp_path):
+    from src.data import database as db_module
+
+    db_file = tmp_path / "cap.db"
+    monkeypatch.setattr(db_module.config, "DB_BACKEND", "sqlite")
+    monkeypatch.setattr(db_module.config, "DB_PATH", str(db_file), raising=False)
+    monkeypatch.setattr(
+        db_module.config,
+        "FIREWALL_MAX_SAME_SIDE_POSITIONS_PER_COIN",
+        2,
+        raising=False,
+    )
+    monkeypatch.setattr(db_module, "_RESOLVED_DB_PATH", str(db_file), raising=False)
+
+    db_module.init_db()
+    db_module.open_paper_trade(None, "ETH", "long", 100.0, 1.0)
+    db_module.open_paper_trade(None, "ETH", "long", 100.0, 1.0)
+
+    with pytest.raises(ValueError, match="Pyramiding blocked"):
+        db_module.open_paper_trade(None, "ETH", "long", 100.0, 1.0)

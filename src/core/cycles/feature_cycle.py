@@ -131,6 +131,15 @@ def _collect_and_compute(coins: List[str], timeframes: List[str]) -> dict:
 
     # Phase 1: Collect all candles (BTC/ETH first so they're available for cross-asset)
     ordered = sorted(coins, key=lambda c: (c not in ("BTC", "ETH"), c))
+    try:
+        from src.data.historical_market_data import snapshot_live_derivatives_history
+
+        derivative_stats = snapshot_live_derivatives_history(ordered)
+        stats["funding_rows"] = int(derivative_stats.get("funding_rows", 0) or 0)
+        stats["open_interest_rows"] = int(derivative_stats.get("open_interest_rows", 0) or 0)
+    except Exception as exc:
+        logger.debug("derivatives history snapshot failed: %s", exc)
+        stats["errors"] += 1
     for coin in ordered:
         for tf in timeframes:
             try:

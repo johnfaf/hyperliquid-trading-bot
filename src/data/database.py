@@ -849,6 +849,22 @@ def update_paper_account(balance, total_pnl, total_trades, winning_trades):
             raise LookupError("paper_account singleton row (id=1) does not exist")
 
 
+def _normalize_trade_side_value(side) -> str:
+    raw = side.value if hasattr(side, "value") else side
+    return str(raw or "").strip().lower()
+
+
+def _normalize_coin_value(coin) -> str:
+    return str(coin or "").strip().upper()
+
+
+def _same_side_open_trade_limit() -> int:
+    try:
+        return max(1, int(getattr(config, "FIREWALL_MAX_SAME_SIDE_POSITIONS_PER_COIN", 2) or 2))
+    except (TypeError, ValueError):
+        return 2
+
+
 def open_paper_trade(strategy_id, coin, side, entry_price, size, leverage=1,
                      stop_loss=None, take_profit=None, metadata=None,
                      idempotency_key: Optional[str] = None):
@@ -889,6 +905,29 @@ def open_paper_trade(strategy_id, coin, side, entry_price, size, leverage=1,
                     key[:40], existing["id"],
                 )
                 return int(existing["id"])
+
+        normalized_coin = _normalize_coin_value(coin)
+        normalized_side = _normalize_trade_side_value(side)
+        same_side_limit = _same_side_open_trade_limit()
+        same_side_count_row = conn.execute(
+            """
+            SELECT COUNT(*) AS c
+            FROM paper_trades
+            WHERE LOWER(COALESCE(status, '')) = 'open'
+              AND UPPER(COALESCE(coin, '')) = ?
+              AND LOWER(COALESCE(side, '')) = ?
+            """,
+            (normalized_coin, normalized_side),
+        ).fetchone()
+        same_side_count = int(
+            (same_side_count_row["c"] if hasattr(same_side_count_row, "keys") else same_side_count_row[0])
+            or 0
+        )
+        if same_side_count >= same_side_limit:
+            raise ValueError(
+                f"Pyramiding blocked for {normalized_coin} {normalized_side}: "
+                f"{same_side_count} open positions already exist (limit={same_side_limit})"
+            )
 
         try:
             return _insert_and_get_id(conn, """

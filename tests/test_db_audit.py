@@ -293,6 +293,13 @@ def test_db_repair_backfills_safe_local_state(monkeypatch):
     monkeypatch.setattr(db, "get_backend_name", lambda: "sqlite")
     monkeypatch.setattr(db, "get_db_path", lambda: "test.db")
     monkeypatch.setattr(db, "get_connection", lambda for_read=False: _connection_ctx(conn))
+    from src.learning import source_inventory as source_inventory_module
+
+    monkeypatch.setattr(
+        source_inventory_module,
+        "persist_source_health_snapshot",
+        lambda *args, **kwargs: 5,
+    )
 
     report = db_audit.run_db_repair(
         include_candle_cache=False,
@@ -328,3 +335,111 @@ def test_db_repair_backfills_safe_local_state(monkeypatch):
 
     assert conn.execute("SELECT COUNT(*) FROM source_inventory").fetchone()[0] > 0
     assert not report.post_audit.findings_at_or_above("high")
+
+
+def test_db_audit_same_side_open_trades_only_flag_above_cap(monkeypatch):
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.executescript(
+        """
+        CREATE TABLE traders (address TEXT PRIMARY KEY);
+        CREATE TABLE strategies (id INTEGER PRIMARY KEY);
+        CREATE TABLE bot_state (key TEXT PRIMARY KEY, value TEXT);
+        CREATE TABLE paper_account (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            balance REAL NOT NULL,
+            total_pnl REAL DEFAULT 0,
+            total_trades INTEGER DEFAULT 0,
+            winning_trades INTEGER DEFAULT 0,
+            last_updated TEXT NOT NULL
+        );
+        CREATE TABLE paper_trades (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            strategy_id INTEGER,
+            opened_at TEXT NOT NULL,
+            closed_at TEXT,
+            coin TEXT NOT NULL,
+            side TEXT NOT NULL,
+            entry_price REAL NOT NULL,
+            exit_price REAL,
+            size REAL NOT NULL,
+            leverage REAL DEFAULT 1,
+            pnl REAL DEFAULT 0,
+            status TEXT DEFAULT 'open',
+            stop_loss REAL,
+            take_profit REAL,
+            metadata TEXT DEFAULT '{}',
+            FOREIGN KEY (strategy_id) REFERENCES strategies(id)
+        );
+        CREATE TABLE audit_trail (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            action TEXT NOT NULL,
+            details TEXT DEFAULT '{}'
+        );
+        CREATE TABLE decision_snapshots (
+            decision_id TEXT PRIMARY KEY,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            coin TEXT,
+            firewall_decision TEXT,
+            final_status TEXT NOT NULL DEFAULT 'candidate'
+        );
+        CREATE TABLE source_inventory (
+            source_name TEXT PRIMARY KEY,
+            required INTEGER NOT NULL DEFAULT 0,
+            expected_freshness_seconds INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE data_source_health_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            observed_at TEXT NOT NULL,
+            source_name TEXT NOT NULL,
+            status TEXT NOT NULL,
+            freshness_seconds REAL,
+            reason TEXT
+        );
+        """
+    )
+    conn.execute(
+        "INSERT INTO paper_account "
+        "(id, balance, total_pnl, total_trades, winning_trades, last_updated) "
+        "VALUES (1, 10000, 0, 0, 0, '2026-04-23T00:00:00+00:00')"
+    )
+    for opened_at in ("2026-04-23T00:00:00+00:00", "2026-04-23T00:05:00+00:00"):
+        conn.execute(
+            """
+            INSERT INTO paper_trades
+            (opened_at, coin, side, entry_price, size, leverage, status, stop_loss, take_profit)
+            VALUES (?, 'BTC', 'short', 70000, 0.01, 2, 'open', 72000, 65000)
+            """,
+            (opened_at,),
+        )
+    conn.commit()
+
+    monkeypatch.setattr(db, "get_backend_name", lambda: "sqlite")
+    monkeypatch.setattr(db, "get_db_path", lambda: "test.db")
+    monkeypatch.setattr(db, "get_connection", lambda for_read=False: _connection_ctx(conn))
+    monkeypatch.setattr(
+        db_audit.config,
+        "FIREWALL_MAX_SAME_SIDE_POSITIONS_PER_COIN",
+        2,
+        raising=False,
+    )
+
+    report = db_audit.run_db_audit(include_candle_cache=False, include_code_scan=False)
+    checks = {finding.check for finding in report.findings}
+    assert "duplicate_same_side_open_trades" not in checks
+
+    conn.execute(
+        """
+        INSERT INTO paper_trades
+        (opened_at, coin, side, entry_price, size, leverage, status, stop_loss, take_profit)
+        VALUES ('2026-04-23T00:10:00+00:00', 'BTC', 'short', 69900, 0.01, 2, 'open', 72000, 65000)
+        """
+    )
+    conn.commit()
+
+    report = db_audit.run_db_audit(include_candle_cache=False, include_code_scan=False)
+    checks = {finding.check for finding in report.findings}
+    assert "duplicate_same_side_open_trades" in checks

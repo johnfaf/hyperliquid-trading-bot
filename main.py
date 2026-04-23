@@ -212,6 +212,12 @@ class HyperliquidResearchBot:
 
     def _background_heartbeat(self):
         heartbeat_active(self.container, health_registry)
+        try:
+            from src.learning.source_inventory import persist_source_health_snapshot
+
+            persist_source_health_snapshot(getattr(self.container, "data_source_registry", None))
+        except Exception as exc:
+            self.logger.debug("Source-health snapshot skipped: %s", exc)
 
     # ── Discovery timer persistence ───────────────────────────
 
