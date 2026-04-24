@@ -87,6 +87,8 @@ class KellySizer:
 
         # Track per-strategy trade outcomes for Kelly computation
         self._strategy_outcomes: Dict[str, list] = {}
+        self._bootstrapped_from_agent_scorer = False
+        self._bootstrap_warning_emitted: set[str] = set()
 
         logger.info(f"KellySizer initialized: multiplier={self.kelly_multiplier}, "
                     f"max={self.max_position_pct:.0%}, min_trades={self.min_trades_for_kelly}")
@@ -194,6 +196,14 @@ class KellySizer:
 
         # Not enough data — use default sizing scaled by confidence
         if n_trades < self.min_trades_for_kelly:
+            if strategy_key not in self._bootstrap_warning_emitted and not self._bootstrapped_from_agent_scorer:
+                logger.warning(
+                    "KellySizer using default sizing for %s because historical outcomes were "
+                    "not bootstrapped from AgentScorer after startup. "
+                    "Call load_from_agent_scorer() to restore persisted trade history.",
+                    strategy_key,
+                )
+                self._bootstrap_warning_emitted.add(strategy_key)
             position_pct = self.default_position_pct * signal_confidence
             position_pct = max(self.min_position_pct, min(position_pct, self.max_position_pct))
             return SizingResult(
@@ -340,7 +350,8 @@ class KellySizer:
                         "return_pct": return_pct,
                         "win": pnl > 0,
                     })
+            self._bootstrapped_from_agent_scorer = True
             logger.info(f"KellySizer bootstrapped from AgentScorer: "
                         f"{len(self._strategy_outcomes)} strategies loaded")
         except Exception as e:
-            logger.debug(f"Could not bootstrap from AgentScorer: {e}")
+            logger.warning("KellySizer bootstrap from AgentScorer failed: %s", e)

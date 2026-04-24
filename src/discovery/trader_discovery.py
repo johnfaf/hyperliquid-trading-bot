@@ -253,7 +253,9 @@ class TraderDiscovery:
                         except (ValueError, TypeError):
                             continue
 
-                display_name = entry.get("displayName", entry.get("name", entry.get("label", "")))
+                display_name = hl.mask_display_name(
+                    entry.get("displayName", entry.get("name", entry.get("label", "")))
+                )
 
                 # Accept all traders from leaderboard (they're already filtered by the API)
                 traders.append({
@@ -261,8 +263,10 @@ class TraderDiscovery:
                     "total_pnl": pnl,
                     "roi_pct": roi * 100 if 0 < abs(roi) < 10 else roi,
                     "source": "leaderboard",
-                    "metadata": {"display_name": display_name,
-                               "raw_entry_keys": list(entry.keys())[:10]},
+                    "metadata": {
+                        "display_name": display_name,
+                        "raw_entry_keys": list(entry.keys())[:10],
+                    },
                 })
 
             except Exception as e:

@@ -24,6 +24,29 @@ from src.data import hyperliquid_client as hl
 logger = logging.getLogger(__name__)
 
 
+def _coerce_optional_float(value) -> Optional[float]:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        value = value.strip()
+        if not value:
+            return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _first_present_float(payload: Dict, *keys: str) -> float:
+    for key in keys:
+        if key not in payload:
+            continue
+        parsed = _coerce_optional_float(payload.get(key))
+        if parsed is not None:
+            return parsed
+    return 0.0
+
+
 class HyperliquidAdapter(BaseExchangeAdapter):
     """
     Adapter for Hyperliquid's public Info API.
@@ -76,11 +99,11 @@ class HyperliquidAdapter(BaseExchangeAdapter):
 
                 if isinstance(entry, dict):
                     addr = entry.get("ethAddress", entry.get("address", ""))
-                    display = entry.get("displayName", entry.get("accountName"))
-                    # Various PnL field names across HL API versions
-                    pnl = float(entry.get("accountValue", 0)) or float(
-                        entry.get("totalPnl", entry.get("allTime", 0))
+                    display = hl.mask_display_name(
+                        entry.get("displayName", entry.get("accountName"))
                     )
+                    # Various PnL field names across HL API versions
+                    pnl = _first_present_float(entry, "accountValue", "totalPnl", "allTime")
                 elif isinstance(entry, (list, tuple)) and len(entry) >= 2:
                     addr = str(entry[0])
                     pnl = float(entry[1]) if len(entry) > 1 else 0.0
@@ -93,7 +116,11 @@ class HyperliquidAdapter(BaseExchangeAdapter):
                     exchange="hyperliquid",
                     display_name=display,
                     pnl_total=pnl,
-                    raw_data=entry if isinstance(entry, dict) else {"raw": entry},
+                    raw_data=(
+                        hl.redact_leaderboard_identity_fields(entry)
+                        if isinstance(entry, dict)
+                        else {"raw": entry}
+                    ),
                 ))
 
             logger.info(f"Hyperliquid: fetched {len(traders)} traders from leaderboard")
@@ -194,11 +221,12 @@ class HyperliquidAdapter(BaseExchangeAdapter):
                 if coins and coin not in coins:
                     continue
 
-                mid = float(mids.get(coin, 0))
-                funding = float(ctx.get("funding", 0))
-                oi = float(ctx.get("open_interest", ctx.get("openInterest", 0)))
-                vol = float(ctx.get("day_volume", ctx.get("dayNtlVlm", 0)))
-                mark = float(ctx.get("mark_price", ctx.get("markPx", 0)))
+                mid = hl._safe_float(mids.get(coin, 0))
+                funding = _first_present_float(ctx, "funding")
+                oi = _first_present_float(ctx, "open_interest", "openInterest")
+                vol = _first_present_float(ctx, "day_volume", "dayNtlVlm")
+                mark = _first_present_float(ctx, "mark_price", "markPx")
+                index = _first_present_float(ctx, "oracle_price", "oraclePx")
 
                 results.append(NormalizedMarketData(
                     exchange="hyperliquid",
@@ -207,8 +235,8 @@ class HyperliquidAdapter(BaseExchangeAdapter):
                     funding_rate=funding,
                     open_interest=oi,
                     volume_24h=vol,
-                    mark_price=mark or mid,
-                    index_price=float(ctx.get("oracle_price", ctx.get("oraclePx", 0))),
+                    mark_price=mark,
+                    index_price=index,
                 ))
 
             return results
