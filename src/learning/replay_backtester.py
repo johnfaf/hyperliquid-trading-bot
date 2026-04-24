@@ -7,7 +7,7 @@ import json
 import math
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from src.learning.dataset_builder import DatasetBuildResult, LearningExample
 from src.learning.policy_registry import CHAMPION_POLICY_ID
@@ -75,9 +75,19 @@ class ReplayBacktestResult:
 class DecisionReplayBacktester:
     """Replays policy filters over already-labelled decisions."""
 
-    def __init__(self, min_trades: int = 20, min_profit_factor: float = 1.05):
+    def __init__(
+        self,
+        min_trades: int = 20,
+        min_profit_factor: float = 1.05,
+        train_fraction: float = 0.70,
+        min_test_trades: Optional[int] = None,
+    ):
         self.min_trades = int(min_trades)
         self.min_profit_factor = float(min_profit_factor)
+        self.train_fraction = min(max(float(train_fraction), 0.10), 0.90)
+        if min_test_trades is None:
+            min_test_trades = max(1, int(math.ceil(self.min_trades * (1.0 - self.train_fraction) - 1e-9)))
+        self.min_test_trades = int(min_test_trades)
 
     @staticmethod
     def _max_drawdown(pnls: List[float]) -> float:
@@ -99,6 +109,61 @@ class DecisionReplayBacktester:
         std = math.sqrt(max(variance, 0.0))
         return mean / std if std > 1e-12 else 0.0
 
+    @staticmethod
+    def _sort_key(example: LearningExample) -> Tuple[int, Any]:
+        value = example.created_at
+        if isinstance(value, (int, float)):
+            return (0, float(value))
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            return (1, parsed.timestamp())
+        except Exception:
+            return (2, str(value))
+
+    def _split_examples(self, examples: List[LearningExample]) -> Tuple[List[LearningExample], List[LearningExample]]:
+        ordered = sorted(examples, key=self._sort_key)
+        if len(ordered) < 2:
+            return ordered, []
+        split_idx = int(math.floor(len(ordered) * self.train_fraction))
+        split_idx = min(max(split_idx, 1), len(ordered) - 1)
+        return ordered[:split_idx], ordered[split_idx:]
+
+    def _evaluate_policy(
+        self,
+        examples: List[LearningExample],
+        policy: ReplayPolicy,
+    ) -> Dict[str, Any]:
+        accepted = [item for item in examples if policy.accepts(item)]
+        pnls = [float(item.outcome_pnl or 0.0) for item in accepted]
+        wins = sum(1 for pnl in pnls if pnl > 0)
+        losses = [abs(pnl) for pnl in pnls if pnl < 0]
+        gains = [pnl for pnl in pnls if pnl > 0]
+        total_pnl = sum(pnls)
+        trade_count = len(pnls)
+        profit_factor = sum(gains) / sum(losses) if losses and sum(losses) > 0 else (999.0 if gains else 0.0)
+        return {
+            "wins": wins,
+            "losses": sum(1 for pnl in pnls if pnl <= 0),
+            "total_gain": sum(gains),
+            "total_loss_abs": sum(losses),
+            "coverage_ratio": trade_count / len(examples) if examples else 0.0,
+            "trade_count": trade_count,
+            "win_rate": wins / trade_count if trade_count else 0.0,
+            "total_pnl": total_pnl,
+            "avg_pnl": total_pnl / trade_count if trade_count else 0.0,
+            "max_drawdown": self._max_drawdown(pnls),
+            "profit_factor": profit_factor,
+            "sharpe_like": self._sharpe_like(pnls),
+            "pnls": pnls,
+        }
+
+    def _slice_passed(self, metrics: Dict[str, Any], *, min_trades: int) -> bool:
+        return (
+            int(metrics.get("trade_count", 0) or 0) >= min_trades
+            and float(metrics.get("profit_factor", 0.0) or 0.0) >= self.min_profit_factor
+            and float(metrics.get("total_pnl", 0.0) or 0.0) > 0
+        )
+
     def run(
         self,
         dataset: DatasetBuildResult,
@@ -107,34 +172,51 @@ class DecisionReplayBacktester:
         champion_policy_id: str = CHAMPION_POLICY_ID,
         persist: bool = True,
     ) -> ReplayBacktestResult:
-        accepted = [item for item in dataset.examples if policy.accepts(item)]
-        pnls = [float(item.outcome_pnl or 0.0) for item in accepted]
-        wins = sum(1 for pnl in pnls if pnl > 0)
-        losses = [abs(pnl) for pnl in pnls if pnl < 0]
-        gains = [pnl for pnl in pnls if pnl > 0]
-        total_pnl = sum(pnls)
-        trade_count = len(pnls)
-        profit_factor = sum(gains) / sum(losses) if losses and sum(losses) > 0 else (999.0 if gains else 0.0)
-        metrics = {
-            "wins": wins,
-            "losses": sum(1 for pnl in pnls if pnl <= 0),
-            "total_gain": sum(gains),
-            "total_loss_abs": sum(losses),
-            "coverage_ratio": trade_count / len(dataset.examples) if dataset.examples else 0.0,
-        }
-        passed = trade_count >= self.min_trades and profit_factor >= self.min_profit_factor and total_pnl > 0
+        train_examples, test_examples = self._split_examples(dataset.examples)
+        train_metrics = self._evaluate_policy(train_examples, policy)
+        test_metrics = self._evaluate_policy(test_examples, policy)
+        all_metrics = self._evaluate_policy(dataset.examples, policy)
+        train_passed = self._slice_passed(train_metrics, min_trades=self.min_trades)
+        test_passed = self._slice_passed(test_metrics, min_trades=self.min_test_trades)
+        metrics = dict(test_metrics)
+        metrics.pop("pnls", None)
+        metrics.update({
+            "train": {k: v for k, v in train_metrics.items() if k != "pnls"},
+            "test": {k: v for k, v in test_metrics.items() if k != "pnls"},
+            "all": {k: v for k, v in all_metrics.items() if k != "pnls"},
+            "split": {
+                "train_examples": len(train_examples),
+                "test_examples": len(test_examples),
+                "train_fraction": self.train_fraction,
+                "min_train_trades": self.min_trades,
+                "min_test_trades": self.min_test_trades,
+                "train_passed": train_passed,
+                "test_passed": test_passed,
+            },
+        })
+        passed = train_passed and test_passed
+        pnls = list(test_metrics["pnls"])
         result = ReplayBacktestResult(
-            run_id=_stable_id("lbt", {"dataset_id": dataset.dataset_id, "policy": policy.to_dict(), "pnls": pnls}),
+            run_id=_stable_id(
+                "lbt",
+                {
+                    "dataset_id": dataset.dataset_id,
+                    "policy": policy.to_dict(),
+                    "train_pnls": train_metrics["pnls"],
+                    "test_pnls": pnls,
+                    "train_fraction": self.train_fraction,
+                },
+            ),
             dataset_id=dataset.dataset_id,
             policy_id=champion_policy_id,
             candidate_policy_id=policy.policy_id,
-            trade_count=trade_count,
-            win_rate=wins / trade_count if trade_count else 0.0,
-            total_pnl=total_pnl,
-            avg_pnl=total_pnl / trade_count if trade_count else 0.0,
-            max_drawdown=self._max_drawdown(pnls),
-            profit_factor=profit_factor,
-            sharpe_like=self._sharpe_like(pnls),
+            trade_count=int(test_metrics["trade_count"]),
+            win_rate=float(test_metrics["win_rate"]),
+            total_pnl=float(test_metrics["total_pnl"]),
+            avg_pnl=float(test_metrics["avg_pnl"]),
+            max_drawdown=float(test_metrics["max_drawdown"]),
+            profit_factor=float(test_metrics["profit_factor"]),
+            sharpe_like=float(test_metrics["sharpe_like"]),
             metrics=metrics,
             parameters=policy.to_dict(),
             passed=passed,

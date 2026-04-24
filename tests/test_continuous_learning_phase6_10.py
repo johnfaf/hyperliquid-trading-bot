@@ -85,20 +85,46 @@ def test_phase7_replay_backtester_records_policy_result(monkeypatch):
     examples = [
         LearningExample("d1", "BTC", "long", "strategy", "t1", {}, 0.70, True, 1, 10.0, 1),
         LearningExample("d2", "BTC", "long", "strategy", "t2", {}, 0.55, True, 0, -4.0, 2),
+        LearningExample("d3", "BTC", "long", "strategy", "t3", {}, 0.75, True, 1, 8.0, 3),
+        LearningExample("d4", "BTC", "long", "strategy", "t4", {}, 0.50, True, 0, -2.0, 4),
     ]
-    dataset = DatasetBuildResult("ds1", examples, [], {"rows": 2})
+    dataset = DatasetBuildResult("ds1", examples, [], {"rows": 4})
 
-    result = DecisionReplayBacktester(min_trades=1).run(
+    result = DecisionReplayBacktester(min_trades=1, train_fraction=0.5, min_test_trades=1).run(
         dataset,
         ReplayPolicy("candidate_conf_0p60", min_confidence=0.60),
         persist=True,
     )
 
     assert result.trade_count == 1
-    assert result.total_pnl == 10.0
+    assert result.total_pnl == 8.0
     assert result.passed is True
+    assert result.metrics["split"]["train_passed"] is True
+    assert result.metrics["split"]["test_passed"] is True
     row = conn.execute("SELECT * FROM learning_backtest_runs WHERE run_id = ?", (result.run_id,)).fetchone()
     assert row is not None
+
+
+def test_phase7_replay_backtester_rejects_in_sample_only_edge(monkeypatch):
+    _memory_db(monkeypatch)
+    examples = [
+        LearningExample("d1", "BTC", "long", "strategy", "t1", {}, 0.80, True, 1, 10.0, 1),
+        LearningExample("d2", "BTC", "long", "strategy", "t2", {}, 0.75, True, 1, 5.0, 2),
+        LearningExample("d3", "BTC", "long", "strategy", "t3", {}, 0.85, True, 0, -6.0, 3),
+        LearningExample("d4", "BTC", "long", "strategy", "t4", {}, 0.90, True, 0, -4.0, 4),
+    ]
+    dataset = DatasetBuildResult("ds_oos_reject", examples, [], {"rows": 4})
+
+    result = DecisionReplayBacktester(min_trades=1, train_fraction=0.5, min_test_trades=1).run(
+        dataset,
+        ReplayPolicy("candidate_conf_0p70", min_confidence=0.70),
+        persist=False,
+    )
+
+    assert result.metrics["split"]["train_passed"] is True
+    assert result.metrics["split"]["test_passed"] is False
+    assert result.passed is False
+    assert result.total_pnl == -10.0
 
 
 def _bt(run_id, candidate, trades, pnl, avg, dd, pf, wr=0.6, passed=True):
@@ -118,6 +144,13 @@ def _bt(run_id, candidate, trades, pnl, avg, dd, pf, wr=0.6, passed=True):
         parameters={},
         passed=passed,
     )
+
+
+def test_phase9_score_prefers_oos_quality_over_raw_dollar_pnl():
+    raw_dollar_but_bad_risk = _bt("raw", "candidate_raw", 100, 5000.0, 1.0, 3000.0, 2.0, wr=0.6)
+    smaller_but_clean = _bt("clean", "candidate_clean", 10, 100.0, 10.0, 5.0, 2.0, wr=0.7)
+
+    assert OfflineImprovementRunner._score(smaller_but_clean) > OfflineImprovementRunner._score(raw_dollar_but_bad_risk)
 
 
 def test_phase8_shadow_evaluator_and_phase10_manual_promotion(monkeypatch):
@@ -147,9 +180,10 @@ def test_phase8_shadow_evaluator_and_phase10_manual_promotion(monkeypatch):
 def test_phase9_improvement_runner_records_offline_search(monkeypatch):
     conn = _memory_db(monkeypatch)
     examples = []
-    for idx in range(35):
-        confidence = 0.85 if idx < 25 else 0.55
-        pnl = 2.0 if idx < 25 else -0.5
+    for idx in range(80):
+        winner = idx % 4 != 0
+        confidence = 0.85 if winner else 0.55
+        pnl = 2.0 if winner else -3.0
         examples.append(
             LearningExample(f"d{idx}", "BTC", "long", "strategy", f"t{idx}", {}, confidence, True, 1 if pnl > 0 else 0, pnl, idx)
         )

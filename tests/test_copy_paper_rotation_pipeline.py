@@ -120,6 +120,47 @@ def test_copy_trader_crash_weight_preserves_strong_signal_above_firewall_floor()
     assert weighted["confidence"] >= getattr(config, "FIREWALL_MIN_CONFIDENCE", 0.45)
 
 
+def test_copy_trader_scale_out_signal_closes_source_reduce(monkeypatch):
+    monkeypatch.setattr(config, "COPY_TRADER_ENABLED", True, raising=False)
+    monkeypatch.setattr(config, "COPY_TRADER_AUTO_PAUSE_MIN_CLOSED_TRADES", 10, raising=False)
+    open_copy = _open_trade(7, "BTC", "long", confidence=0.8)
+    open_copy["metadata"] = {
+        "is_copy_trade": True,
+        "source": "copy_trade",
+        "source_trader": "0xabc",
+    }
+    closed = []
+
+    monkeypatch.setattr("src.trading.copy_trader.db.get_paper_account", lambda: {"balance": 10_000.0})
+    monkeypatch.setattr("src.trading.copy_trader.db.get_open_paper_trades", lambda: [open_copy])
+    monkeypatch.setattr("src.trading.copy_trader.db.get_paper_trade_history", lambda limit=250: [])
+    monkeypatch.setattr("src.trading.copy_trader.hl.get_all_mids", lambda: {"BTC": 101.0})
+
+    trader = CopyTrader()
+    monkeypatch.setattr(trader, "_annotate_open_trades", lambda trades, mids: None)
+    monkeypatch.setattr(
+        trader,
+        "_close_trade",
+        lambda trade, exit_price, close_reason: closed.append((trade["id"], close_reason, exit_price))
+        or {"trade_id": trade["id"]},
+    )
+
+    executed = trader.execute_copy_signals(
+        [
+            {
+                "type": "copy_scale_out",
+                "coin": "BTC",
+                "confidence": 1.0,
+                "source_trader": "0xabc",
+            }
+        ],
+        regime_data={"overall_regime": "neutral"},
+    )
+
+    assert executed == []
+    assert closed == [(7, "source_reduce", 101.0)]
+
+
 def test_copy_trader_auto_pauses_new_entries_when_copy_book_is_bad(monkeypatch):
     monkeypatch.setattr(config, "COPY_TRADER_ENABLED", True, raising=False)
     monkeypatch.setattr(config, "COPY_TRADER_MAX_CONCURRENT_TRADES", 2, raising=False)

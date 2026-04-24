@@ -79,6 +79,7 @@ SIMILARITY_FEATURES = [
     "volatility", "volume_ratio", "rsi", "momentum_score",
     "bollinger_position", "overall_score",
 ]
+MIN_FEATURE_OVERLAP = 3
 
 
 class TradeMemory:
@@ -257,12 +258,25 @@ class TradeMemory:
             SimilarityResult with similar trades and statistics.
         """
         query_vector = self._extract_feature_vector(features)
+        query_feature_keys = self._available_feature_keys(features)
 
-        if not any(v != 0 for v in query_vector):
+        if not query_feature_keys or not any(v != 0 for v in query_vector):
+            logger.warning("Trade memory received empty/zero feature vector; defaulting to caution")
             return SimilarityResult(
                 similar_trades=[], total_found=0, win_rate=0, avg_pnl=0,
-                avg_return=0, recommendation="proceed",
+                avg_return=0, recommendation="caution",
                 reason="No feature data available", similarity_scores=[],
+            )
+        if len(query_feature_keys) < MIN_FEATURE_OVERLAP:
+            logger.warning(
+                "Trade memory received sparse feature vector (%d/%d usable); defaulting to caution",
+                len(query_feature_keys),
+                len(SIMILARITY_FEATURES),
+            )
+            return SimilarityResult(
+                similar_trades=[], total_found=0, win_rate=0, avg_pnl=0,
+                avg_return=0, recommendation="caution",
+                reason="Insufficient feature data available", similarity_scores=[],
             )
 
         # Query past trades
@@ -305,11 +319,18 @@ class TradeMemory:
 
         # Calculate similarity for each past trade
         scored_trades = []
+        skipped_sparse = 0
         for row in rows:
             row = dict(row)
             try:
                 past_vector = json.loads(row.get("feature_vector", "[]"))
                 if not past_vector:
+                    continue
+                past_features = json.loads(row.get("features_json", "{}") or "{}")
+                past_feature_keys = self._available_feature_keys(past_features)
+                overlap = query_feature_keys & past_feature_keys
+                if len(past_feature_keys) < MIN_FEATURE_OVERLAP or len(overlap) < MIN_FEATURE_OVERLAP:
+                    skipped_sparse += 1
                     continue
                 sim = self._cosine_similarity(query_vector, past_vector)
                 if sim >= min_similarity:
@@ -322,6 +343,13 @@ class TradeMemory:
         top_trades = scored_trades[:top_k]
 
         if not top_trades:
+            if skipped_sparse:
+                return SimilarityResult(
+                    similar_trades=[], total_found=0, win_rate=0, avg_pnl=0,
+                    avg_return=0, recommendation="caution",
+                    reason="Insufficient overlapping feature data for similarity check",
+                    similarity_scores=[],
+                )
             return SimilarityResult(
                 similar_trades=[], total_found=0, win_rate=0, avg_pnl=0,
                 avg_return=0, recommendation="proceed",
@@ -394,6 +422,19 @@ class TradeMemory:
             return {"total_trades": 0, "win_rate": 0, "unique_coins": 0, "unique_strategies": 0}
 
     # ─── Internal Methods ────────────────────────────────────────
+
+    @staticmethod
+    def _available_feature_keys(features: Optional[Dict]) -> set:
+        if not isinstance(features, dict):
+            return set()
+        keys = set()
+        for key in SIMILARITY_FEATURES:
+            if key not in features:
+                continue
+            val = features.get(key)
+            if isinstance(val, (int, float)) and math.isfinite(float(val)):
+                keys.add(key)
+        return keys
 
     def _extract_feature_vector(self, features: Dict) -> List[float]:
         """

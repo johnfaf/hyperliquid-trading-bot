@@ -56,11 +56,14 @@ class OfflineImprovementRunner:
     def _score(result: ReplayBacktestResult) -> float:
         if result.trade_count <= 0:
             return float("-inf")
+        drawdown_per_trade = result.max_drawdown / max(result.trade_count, 1)
+        bounded_pf = min(max(result.profit_factor, 0.0), 5.0)
         return (
-            result.total_pnl
-            + result.profit_factor * 0.25
+            result.avg_pnl
+            + result.sharpe_like
+            + bounded_pf * 0.25
             + result.win_rate * 0.25
-            - result.max_drawdown * 0.50
+            - drawdown_per_trade
         )
 
     def run(

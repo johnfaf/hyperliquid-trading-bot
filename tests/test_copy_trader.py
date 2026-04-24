@@ -7,6 +7,7 @@ Covers:
   - Position cache TTL eviction (scan_top_traders)
   - Silent risk policy failure handling (_resolve_copy_trade_risk)
 """
+import logging
 import time
 from unittest.mock import MagicMock, patch
 
@@ -377,6 +378,31 @@ class TestDetectPositionChanges:
         assert len(flips) == 1
         assert flips[0]["side"] == "short"
 
+    def test_flip_with_size_growth_emits_only_flip(self):
+        ct = CopyTrader()
+        trader = self._make_trader()
+        mids = {"SOL": 100.0}
+        old = {"SOL": {"side": "long", "size": 5.0, "entry_price": 100.0, "leverage": 3}}
+        new = {"SOL": {"side": "short", "size": 10.0, "entry_price": 100.0, "leverage": 3}}
+
+        signals = ct._detect_position_changes("0xtest", old, new, trader, mids)
+
+        assert [s["type"] for s in signals] == ["copy_flip"]
+
+    def test_size_decrease_generates_copy_scale_out(self):
+        ct = CopyTrader()
+        trader = self._make_trader()
+        mids = {"ETH": 3000.0}
+        old = {"ETH": {"side": "long", "size": 2.0, "entry_price": 3000.0, "leverage": 2}}
+        new = {"ETH": {"side": "long", "size": 0.8, "entry_price": 3000.0, "leverage": 2}}
+
+        signals = ct._detect_position_changes("0xtest", old, new, trader, mids)
+        scale_outs = [s for s in signals if s["type"] == "copy_scale_out"]
+
+        assert len(scale_outs) == 1
+        assert scale_outs[0]["coin"] == "ETH"
+        assert scale_outs[0]["reduction_pct"] == 0.6
+
     def test_confidence_uses_model(self):
         """Open signal confidence is derived from the model, not hardcoded."""
         ct = CopyTrader()
@@ -388,3 +414,34 @@ class TestDetectPositionChanges:
         signals = ct._detect_position_changes("0xtest", old, new, trader, mids)
         expected = CopyTrader._calculate_signal_confidence("copy_open", 0.8)
         assert abs(signals[0]["confidence"] - expected) < 0.001
+
+
+def test_open_copy_trade_logs_sizer_fallback(monkeypatch, caplog):
+    class BrokenSizer:
+        pass
+
+    ct = CopyTrader(kelly_sizer=BrokenSizer())
+    monkeypatch.setattr(
+        ct,
+        "_get_position_sizing",
+        lambda signal, balance: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+    monkeypatch.setattr(ct, "_resolve_copy_trade_risk", lambda *args, **kwargs: (90.0, 110.0, {}))
+    monkeypatch.setattr("src.trading.copy_trader.db.open_paper_trade", lambda **kwargs: 123)
+
+    signal = {
+        "type": "copy_open",
+        "coin": "BTC",
+        "side": "long",
+        "price": 100.0,
+        "leverage": 2,
+        "confidence": 0.8,
+        "source_trader": "0xtest",
+    }
+
+    with caplog.at_level(logging.WARNING):
+        trade = ct._open_copy_trade({"balance": 10_000.0}, signal, [])
+
+    assert trade["id"] == 123
+    assert ct._sizer_fallback_count == 1
+    assert "Copy-trader sizing failed" in caplog.text

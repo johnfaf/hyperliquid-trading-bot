@@ -38,7 +38,7 @@ def _memory_db(monkeypatch):
 def _dataset(dataset_id="ds_phase_11_19", n=60, shift=0.0):
     examples = []
     for idx in range(n):
-        winner = idx < n // 2
+        winner = idx % 4 != 0
         confidence = 0.86 if winner else 0.54
         pnl = 2.0 if winner else -0.5
         examples.append(
