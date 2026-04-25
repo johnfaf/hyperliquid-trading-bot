@@ -260,12 +260,16 @@ class CapitalAllocator:
     Equal capital allocation for the 9 fixed arena agents.
     Each agent receives an equal share of the total pool ($10,000 each).
     No fitness-based weighting — agents compete on pure performance.
+
+    ★ H11 FIX: removed dead `MAX_SINGLE_AGENT` and `MIN_ALLOCATION`
+    constants that suggested fitness-based caps but were never read.
+    The docstring above is the truth: this is pure equal allocation.
+    Reintroduce those constants only when an actual fitness-weighted
+    allocator is implemented.
     """
 
     BASE_CAPITAL = 10_000.0   # Each of 9 agents gets equal share
     TOTAL_POOL = 90_000.0     # Total virtual capital: 9 agents × $10,000 each
-    MAX_SINGLE_AGENT = 0.25   # No single agent gets more than 25% of pool (not used with equal allocation)
-    MIN_ALLOCATION = 10_000.0 # Minimum capital for any active agent (not used with equal allocation)
 
     def __init__(self, total_pool: float = None):
         if total_pool:

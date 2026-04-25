@@ -25,6 +25,7 @@ Polymarket API:
 
 import json
 import logging
+import os
 import time
 import requests
 from typing import Dict, List, Optional
@@ -33,6 +34,24 @@ from dataclasses import dataclass, field
 from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
+
+
+def _safe_env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, default) or default)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+# ★ M20 FIX: configurable confidence boost.  Default 0.0 (no boost,
+# raw smart-money score).  Override via env to restore the old +0.2
+# inflation while tuning, but log it so it isn't invisible.
+POLYMARKET_CONFIDENCE_BOOST = _safe_env_float("POLYMARKET_CONFIDENCE_BOOST", 0.0)
+if POLYMARKET_CONFIDENCE_BOOST != 0.0:
+    logger.info(
+        "Polymarket signal confidence boost active: %+0.2f",
+        POLYMARKET_CONFIDENCE_BOOST,
+    )
 
 
 @dataclass
@@ -936,11 +955,23 @@ class PolymarketScanner:
                      f"{movement.direction} {movement.magnitude*100:.1f}% ({movement.timeframe}), "
                      f"smart money score: {movement.smart_money_score:.2f}")
 
+            # ★ M20 FIX: previously `min(movement.smart_money_score + 0.2, 1.0)`
+            # — an undocumented +0.2 boost over the raw smart-money score.
+            # Without calibration evidence the boost is just confidence
+            # inflation, which feeds straight into firewall and sizing gates.
+            # Use the raw score by default; expose env-tunable boost so we can
+            # restore the old behaviour if telemetry shows the gate is too
+            # cold.  When tuning, log the chosen value in get_market_sentiment
+            # so it appears in production logs.
+            confidence = min(
+                float(movement.smart_money_score) + POLYMARKET_CONFIDENCE_BOOST,
+                1.0,
+            )
             signal = {
                 "source": "polymarket",
                 "coin": coin,
                 "side": signal_side,
-                "confidence": min(movement.smart_money_score + 0.2, 1.0),
+                "confidence": confidence,
                 "reason": reason,
                 "polymarket_market": movement.title,
                 "polymarket_probability": movement.current_probability,

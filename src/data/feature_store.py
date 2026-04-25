@@ -293,6 +293,16 @@ def compute_features(
     """
     result: Dict[str, float] = {}
     if not candles or len(candles) < 15:
+        # ★ M14 FIX: previously returned silently.  Downstream consumers
+        # (especially trade_memory) treat an empty feature dict as a
+        # zero-vector and used to fall through to "proceed" — masking
+        # upstream candle outages.  Log the gap so it surfaces in
+        # production logs alongside the "caution" verdict that
+        # trade_memory now emits on zero vectors (see H7).
+        logger.warning(
+            "compute_features: insufficient candles (%d/15) — returning empty feature dict",
+            len(candles or []),
+        )
         return result
 
     closes = np.array([float(c["c"]) for c in candles])

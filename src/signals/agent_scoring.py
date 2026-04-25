@@ -323,7 +323,12 @@ class AgentScorer:
 
         # Dynamic weight: blend of accuracy and recency
         # Formula: 0.5 * weighted_accuracy + 0.3 * raw_accuracy + 0.2 * sharpe_normalized
-        sharpe_norm = min(max(score.sharpe / 2.0, 0), 1)  # Normalize sharpe to 0-1
+        # ★ L7 FIX: previous divisor 2.0 saturated at Sharpe 2.0 — making
+        # Sharpe 2.0 and 4.0 indistinguishable.  4.0 keeps the upper end
+        # discriminative (Sharpe 1 -> 0.25, Sharpe 2 -> 0.5, Sharpe 3 -> 0.75,
+        # Sharpe 4 -> 1.0) while still giving thin-edge sources a meaningful
+        # 0.05–0.25 floor.
+        sharpe_norm = min(max(score.sharpe / 4.0, 0), 1)  # Normalize sharpe to 0-1
         score.dynamic_weight = (
             0.5 * score.weighted_accuracy +
             0.3 * score.accuracy +

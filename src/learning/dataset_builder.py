@@ -178,7 +178,12 @@ class DecisionDatasetBuilder:
             "positive_labels": positives,
             "win_rate": positives / len(labelled) if labelled else 0.0,
             "missing_feature_ratio": missing_feature_ratio,
-            "ready_for_training": len(labelled) >= 50 and missing_feature_ratio <= 0.35,
+            # ★ M11 FIX: tightened from 0.35 -> 0.15.  Statistical methods
+            # used downstream (replay backtester, p-value gates, feature
+            # importance) become unreliable above ~15% missing-feature ratio.
+            # 35% was permissive enough to flag clearly sparse datasets as
+            # "ready" — now we require dense feature coverage before training.
+            "ready_for_training": len(labelled) >= 50 and missing_feature_ratio <= 0.15,
         }
 
     def build(self, limit: int = 5000, min_created_at: Optional[str] = None, persist: bool = True) -> DatasetBuildResult:

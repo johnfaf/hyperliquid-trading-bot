@@ -4020,7 +4020,16 @@ class LiveTrader:
             return False
 
     def _get_mid_price(self, coin: str) -> Optional[float]:
-        """Get mid price from Hyperliquid."""
+        """Get mid price from Hyperliquid.
+
+        ★ M7 FIX: previously returned the raw price without invoking
+        ``_validate_price`` (which sits right below).  A corrupt API response
+        — zero, NaN, Inf, or a price that deviates >10% from the last
+        confirmed baseline — would flow straight into sizing and order
+        placement.  Now every price is validated before return; rejected
+        prices yield ``None`` so callers fall through their no-price paths
+        instead of submitting an order against bad data.
+        """
         try:
             mids = self.api_manager.post(
                 {"type": "allMids"},
@@ -4032,7 +4041,14 @@ class LiveTrader:
 
             price = mids.get(coin)
             if price:
-                return float(price)
+                try:
+                    price_f = float(price)
+                except (TypeError, ValueError):
+                    logger.error("Invalid mid price for %s: %r", coin, price)
+                    return None
+                if not self._validate_price(coin, price_f):
+                    return None
+                return price_f
         except Exception as e:
             logger.error(f"Failed to get mid price for {coin}: {e}")
 

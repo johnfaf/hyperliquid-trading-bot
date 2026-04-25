@@ -470,8 +470,21 @@ class TraderDiscovery:
                 logger.info(f"Bot DETECTED (prob={bot_result.bot_probability:.0%}, "
                            f"conf={bot_result.confidence:.0%}): {address[:10]}... "
                            f"reason={bot_result.reason}")
-        except Exception:
-            # Fallback to legacy detection
+        except Exception as exc:
+            # ★ L8 FIX: previous bare `except` swallowed the failure.
+            # Surface why we're falling back so it shows up in production
+            # logs (and so a recurring failure can be debugged) and
+            # increment a metric we expose via discovery stats.
+            logger.warning(
+                "AdaptiveBotDetector failed for %s -- falling back to legacy "
+                "detection: %s", address[:10], exc,
+            )
+            try:
+                self._adaptive_detector_fallback_count = getattr(
+                    self, "_adaptive_detector_fallback_count", 0
+                ) + 1
+            except Exception:
+                pass
             bot_score = self._get_bot_score(fills, positions, trade_analysis)
 
         # Build trader profile (always, even for suspected bots — let caller decide)

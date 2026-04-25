@@ -218,6 +218,11 @@ def sync_shadow_book_to_live(container) -> List[Dict]:
             exit_price=current_price,
         )
 
+        # ★ H8 FIX: previously hardcoded "pnl": 0.0 in the returned dict
+        # despite computing reconciled_pnl correctly above and writing it to
+        # the DB. Callers consuming the returned dict (shadow tracker, kelly
+        # outcome feed, telegram notifier) saw zero PnL on every reconciled
+        # trade, poisoning their stats. Mirror the DB value into the dict.
         closed_trade = {
             "trade_id": trade_id,
             "entry_price": trade.get("entry_price", 0),
@@ -225,8 +230,8 @@ def sync_shadow_book_to_live(container) -> List[Dict]:
             "leverage": trade.get("leverage", 1),
             "coin": trade.get("coin", ""),
             "side": trade.get("side", ""),
-            "pnl": 0.0,
-            "gross_pnl": 0.0,
+            "pnl": reconciled_pnl,
+            "gross_pnl": reconciled_pnl,
             "fees_paid": 0.0,
             "slippage_cost": 0.0,
             "reason": "live_reconciled_closed",

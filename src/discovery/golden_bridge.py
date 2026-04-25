@@ -26,10 +26,27 @@ logger = logging.getLogger("golden_bridge")
 
 # How much to boost golden wallet confidence scores (additive)
 GOLDEN_CONFIDENCE_BOOST = 0.15
+# ★ M19 FIX: previous values (0.3 Sharpe, 40% DD) were too loose -- a
+# pure gambler with one good month could pass them.  Combined with H19
+# (realistic execution penalties) the gates now match the eval-harness
+# standard: Sharpe >= 1.5 (statistically positive risk-adjusted edge),
+# DD <= 20% (capital-preservation discipline).  Override via env vars
+# `GOLDEN_BRIDGE_MIN_SHARPE` / `GOLDEN_BRIDGE_MAX_DD` if you want the
+# old looser bar back during data-build phases.
+import os as _os
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(_os.environ.get(name, default) or default)
+    except (TypeError, ValueError):
+        return float(default)
+
+
 # Minimum Sharpe from backtest to qualify for live
-MIN_SHARPE_FOR_LIVE = 0.3
+MIN_SHARPE_FOR_LIVE = _env_float("GOLDEN_BRIDGE_MIN_SHARPE", 1.5)
 # Maximum drawdown to qualify for live
-MAX_DD_FOR_LIVE = 40.0
+MAX_DD_FOR_LIVE = _env_float("GOLDEN_BRIDGE_MAX_DD", 20.0)
 
 
 def _get_db():

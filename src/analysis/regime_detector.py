@@ -77,9 +77,17 @@ REGIME_STRATEGY_MAP = {
         "size_modifier": 0.3,  # Heavily reduced but NOT zero
     },
     Regime.UNKNOWN: {
-        "activate": ["mean_reversion", "funding_arb"],  # Conservative defaults
-        "pause": ["momentum_long", "momentum_short", "breakout"],
-        "size_modifier": 0.5,
+        # ★ M15 FIX: previously this was a permissive default (size_mod=0.5,
+        # pause list of 3).  UNKNOWN is the ADX 20-25 transition zone — by
+        # construction we are NOT confident which way the market is going.
+        # Treat it like VOLATILE (size_mod=0.3, pause everything directional)
+        # so transitioning markets get caution by default rather than mid-
+        # weight exposure.  Mean-reversion and funding_arb still fire because
+        # they are the strategies most resilient to direction uncertainty.
+        "activate": ["mean_reversion", "funding_arb"],
+        "pause": ["momentum_long", "momentum_short", "breakout", "scalping",
+                   "swing_trading", "concentrated_bet"],
+        "size_modifier": 0.3,
     },
 }
 
