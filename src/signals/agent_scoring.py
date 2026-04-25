@@ -305,18 +305,14 @@ class AgentScorer:
 
         score.weighted_accuracy = weighted_correct / weighted_total if weighted_total > 0 else 0
 
-        # Sharpe-like score: mean return / std return
+        # Sharpe-like score: mean return / std return.
+        # ★ H25 FIX: route through canonical helper so this Sharpe is
+        # comparable to replay_backtester / alpha_arena / golden_wallet.
         returns = [t.get("return_pct", 0) for t in completed if t.get("return_pct") is not None]
         if len(returns) >= 5:
-            import numpy as np
-            mean_ret = np.mean(returns)
-            # MED-FIX MED-6: use ddof=1 (sample std) to match statistics.stdev
-            # used by shadow_tracker.compute_sharpe_proxy — previously population
-            # std (ddof=0) underestimated variance vs sample std, making Sharpe
-            # values incomparable across the two subsystems.
-            std_ret = np.std(returns, ddof=1)
-            score.sharpe = mean_ret / std_ret if std_ret > 0 else 0
-            score.avg_return = mean_ret
+            from src.analysis.sharpe import sharpe_per_trade
+            score.sharpe = sharpe_per_trade(returns)
+            score.avg_return = sum(returns) / len(returns)
         else:
             score.sharpe = 0
             score.avg_return = sum(returns) / len(returns) if returns else 0

@@ -102,12 +102,11 @@ class DecisionReplayBacktester:
 
     @staticmethod
     def _sharpe_like(pnls: List[float]) -> float:
-        if len(pnls) < 2:
-            return 0.0
-        mean = sum(pnls) / len(pnls)
-        variance = sum((x - mean) ** 2 for x in pnls) / (len(pnls) - 1)
-        std = math.sqrt(max(variance, 0.0))
-        return mean / std if std > 1e-12 else 0.0
+        # ★ H25 FIX: route through canonical helper so every Sharpe
+        # number in the codebase shares the same definition (sample
+        # stdev, no annualization for per-trade observations).
+        from src.analysis.sharpe import sharpe_per_trade
+        return sharpe_per_trade(pnls)
 
     @staticmethod
     def _sort_key(example: LearningExample) -> Tuple[int, Any]:

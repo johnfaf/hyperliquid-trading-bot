@@ -477,8 +477,16 @@ def compute_sharpe(daily_returns: List[float], periods_per_year: float = 365.0) 
     Values outside the configured [min, max] range are treated as invalid and dropped.
 
     Returns 0.0 if fewer than 5 valid data points are available.
+
+    ★ H25 FIX: this is one of the wallet-specific outlier-filtered Sharpe
+    paths.  We keep the [SHARPE_RETURN_MIN, SHARPE_RETURN_MAX] outlier
+    filter (it's specific to fill-derived equity curves) but route the
+    final calculation through ``src.analysis.sharpe.sharpe_daily`` so the
+    annualization, ddof, and √N convention all match every other Sharpe
+    in the codebase.
     """
     import math
+    from src.analysis.sharpe import sharpe_daily
 
     valid = []
     dropped = 0
@@ -503,15 +511,7 @@ def compute_sharpe(daily_returns: List[float], periods_per_year: float = 365.0) 
             SHARPE_RETURN_MAX,
         )
 
-    if len(valid) < 5:
-        return 0.0
-
-    import statistics
-    mean_r = statistics.mean(valid)
-    std_r = statistics.stdev(valid)
-    if std_r < 1e-10:
-        return 0.0
-    return round((mean_r / std_r) * (periods_per_year ** 0.5), 3)
+    return round(sharpe_daily(valid, periods_per_year=periods_per_year), 3)
 
 
 def _equity_curve_to_daily_returns(equity_curve: List[float],

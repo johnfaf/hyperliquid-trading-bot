@@ -1203,11 +1203,12 @@ class Backtester:
         total_pnl = sum(pnls)
         win_rate = wins / len(trades)
 
-        # Sharpe
-        if len(returns) >= 5:
-            sharpe = np.mean(returns) / (np.std(returns) + 1e-8)
-        else:
-            sharpe = 0.0
+        # Sharpe.
+        # ★ H25 FIX: route through canonical helper so the Sharpe number
+        # this backtester emits matches replay_backtester / agent_scoring /
+        # golden_wallet definitions (sample stdev, no annualization).
+        from src.analysis.sharpe import sharpe_per_trade
+        sharpe = sharpe_per_trade(returns)
 
         # Max drawdown from equity curve
         peak = equity_curve[0]

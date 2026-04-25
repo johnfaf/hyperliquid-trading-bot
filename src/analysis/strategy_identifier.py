@@ -17,7 +17,16 @@ logger = logging.getLogger(__name__)
 
 def _estimate_sharpe(metrics: Dict) -> float:
     """
-    Estimate Sharpe ratio from available strategy metrics.
+    Estimate Sharpe ratio from aggregate strategy metrics.
+
+    ★ H25 NOTE: this is the one Sharpe path that does NOT route through
+    ``src.analysis.sharpe`` because we don't have a per-trade or per-day
+    return series here — only aggregates (trade_count, win_rate,
+    profit_factor).  The output is therefore a heuristic estimate, NOT a
+    direct calculation, and should not be compared 1:1 with values
+    produced by the canonical helpers in src.analysis.sharpe.  We clamp
+    to [-3, +5] to keep the heuristic from outranging real measurements
+    in downstream scoring.
 
     Without daily return series, we approximate using:
     - profit_factor: measures reward/risk (PF > 1 = profitable)
@@ -31,9 +40,16 @@ def _estimate_sharpe(metrics: Dict) -> float:
     - WR=60%, PF=2.0, 500 trades → Sharpe ≈ 2.5
     - WR=45%, PF=0.8, 100 trades → Sharpe ≈ -0.5
     """
-    trade_count = metrics.get("trade_count", 0)
-    win_rate = metrics.get("win_rate", 0) / 100.0  # convert from pct
-    profit_factor = metrics.get("profit_factor", 0)
+    trade_count = metrics.get("trade_count", 0) or 0
+    win_rate = (metrics.get("win_rate", 0) or 0) / 100.0  # convert from pct
+    # ★ H27 propagation: research_cycle now passes None when PF is unknown.
+    # Treat None / non-numeric as "no edge" so the heuristic returns 0.0
+    # rather than crashing on a None comparison.
+    raw_pf = metrics.get("profit_factor", 0)
+    try:
+        profit_factor = float(raw_pf) if raw_pf is not None else 0.0
+    except (TypeError, ValueError):
+        profit_factor = 0.0
 
     if trade_count < 5 or profit_factor <= 0:
         return 0.0

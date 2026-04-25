@@ -169,19 +169,33 @@ class EventScanner:
         }
 
     def _classify_event(self, title: str, source: str) -> Dict:
+        """Classify a news/calendar event title into category + severity.
+
+        ★ M25 FIX: previously broke on the FIRST matching rule, so an event
+        that legitimately matched multiple rules (e.g. "FOMC rate decision"
+        matching both central_bank and rate_decision) was triaged by rule
+        ordering rather than by severity.  Adding a new rule at position N
+        could silently demote events that previously matched a later rule.
+        Now we collect ALL matching rules and pick the one with the
+        highest severity_rank, breaking ties by rule order so behaviour
+        stays deterministic.
+        """
         title_norm = _normalize_whitespace(title).lower()
         category = "macro"
         severity = "low"
         is_core = False
         tags: List[str] = []
 
+        best_rank = -1
         for keywords, rule_category, rule_severity, rule_core in _EVENT_RULES:
             if any(keyword in title_norm for keyword in keywords):
-                category = rule_category
-                severity = rule_severity
-                is_core = rule_core
-                tags.extend(keywords[:2])
-                break
+                rule_rank = SEVERITY_RANK.get(rule_severity, -1)
+                if rule_rank > best_rank:
+                    best_rank = rule_rank
+                    category = rule_category
+                    severity = rule_severity
+                    is_core = rule_core
+                    tags = list(keywords[:2])
 
         if source == "Federal Reserve" and severity == "low":
             category = "central_bank"
@@ -198,6 +212,16 @@ class EventScanner:
 
     @staticmethod
     def _infer_assets(*texts: str) -> List[str]:
+        """Infer affected assets from event text.
+
+        ★ M26 FIX: previously checked exchange-wide tokens via plain
+        ``token in haystack``.  "API" matched inside "PAPI"/"OPAPI" and
+        "WEBSITE" matched inside any compound containing the word.
+        These false positives elevated non-incident titles into
+        all-asset event-risk gates.  Now we use the same ``\\b...\\b``
+        word-boundary regex pattern that the explicit-asset scan above
+        uses, so matches require true word boundaries.
+        """
         haystack = " ".join(_normalize_whitespace(text).upper() for text in texts if text)
         assets = [asset for asset in _KNOWN_ASSETS if re.search(rf"\b{re.escape(asset)}\b", haystack)]
         exchange_wide_tokens = (
@@ -210,7 +234,10 @@ class EventScanner:
             "API",
             "WEBSITE",
         )
-        if not assets and any(token in haystack for token in exchange_wide_tokens):
+        if not assets and any(
+            re.search(rf"\b{re.escape(token)}\b", haystack)
+            for token in exchange_wide_tokens
+        ):
             return ["ALL"]
         return assets
 

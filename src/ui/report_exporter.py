@@ -29,24 +29,15 @@ def _ensure_reports_dir(output_dir: Optional[str] = None) -> str:
 
 
 def _calculate_sharpe_ratio(trades: List[Dict]) -> float:
-    """Calculate Sharpe ratio from trade history."""
-    if not trades or len(trades) < 2:
-        return 0.0
+    """Calculate Sharpe ratio from trade history.
 
-    pnls = [t.get("pnl", 0) for t in trades]
-    if not pnls:
-        return 0.0
+    ★ H25 FIX: route through canonical helper so dashboard reports show
+    the same Sharpe definition as scoring / arena / replay backtester.
+    """
+    from src.analysis.sharpe import sharpe_per_trade
 
-    import statistics
-    try:
-        std_dev = statistics.stdev(pnls)
-        if std_dev == 0:
-            return 0.0
-        avg_pnl = statistics.mean(pnls)
-        # Sharpe ratio (simplified, assuming risk-free rate = 0)
-        return avg_pnl / std_dev if std_dev > 0 else 0.0
-    except Exception:
-        return 0.0
+    pnls = [t.get("pnl", 0) for t in (trades or [])]
+    return sharpe_per_trade(pnls)
 
 
 def _calculate_max_drawdown(closed_trades: List[Dict]) -> float:

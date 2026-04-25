@@ -7,6 +7,7 @@ import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from statistics import mean
+import math
 from typing import Any, Dict, List, Optional
 
 from src.learning.dataset_builder import DatasetBuildResult, LearningExample
@@ -81,17 +82,42 @@ class FeatureAttributionAnalyzer:
             win_mean = mean(win_values)
             loss_mean = mean(loss_values)
             delta = win_mean - loss_mean
-            pooled_abs = max(abs(win_mean) + abs(loss_mean), 1e-12)
-            score = abs(delta) / pooled_abs
+            # ★ H22 FIX: previous score was |delta| / (|win_mean|+|loss_mean|)
+            # which is not Cohen's d, not Glass's delta, not any standard
+            # effect-size measure.  Two features could score identically
+            # (=1.0) when one was meaningful (means ±0.4) and the other
+            # was symmetric noise (means ±0.0001).  Replace with Cohen's d
+            # using pooled standard deviation:
+            #   d = (μ_w − μ_l) / sqrt(((nₓ−1)·sₓ² + (nᵧ−1)·sᵧ²) / (nₓ+nᵧ−2))
+            # When either sample has <2 elements, fall back to a magnitude
+            # ratio that at least requires non-trivial absolute means.
+            n_w, n_l = len(win_values), len(loss_values)
+            if n_w >= 2 and n_l >= 2:
+                var_w = sum((v - win_mean) ** 2 for v in win_values) / (n_w - 1)
+                var_l = sum((v - loss_mean) ** 2 for v in loss_values) / (n_l - 1)
+                pooled_var = (
+                    ((n_w - 1) * var_w) + ((n_l - 1) * var_l)
+                ) / max(n_w + n_l - 2, 1)
+                pooled_sd = math.sqrt(max(pooled_var, 1e-24))
+                cohens_d = delta / pooled_sd if pooled_sd > 0 else 0.0
+                score = abs(cohens_d)
+            else:
+                # Tiny-sample fallback: keep absolute-magnitude floor so
+                # noise features (means ~0) cannot dominate via the ratio.
+                cohens_d = None
+                score = abs(delta) / max(abs(win_mean) + abs(loss_mean), 1e-12)
             scores.append(
                 {
                     "feature": feature,
                     "score": score,
+                    "cohens_d": cohens_d,
                     "direction": "higher_when_winning" if delta >= 0 else "lower_when_winning",
                     "win_mean": win_mean,
                     "loss_mean": loss_mean,
                     "delta": delta,
                     "coverage": (len(win_values) + len(loss_values)) / len(labelled) if labelled else 0.0,
+                    "n_win": n_w,
+                    "n_loss": n_l,
                 }
             )
         scores.sort(key=lambda item: (item["score"], item["coverage"]), reverse=True)

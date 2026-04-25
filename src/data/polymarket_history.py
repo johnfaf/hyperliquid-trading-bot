@@ -102,15 +102,50 @@ def _condition_id_from_market(market: Dict[str, Any]) -> str:
 
 
 def _market_probability(market: Dict[str, Any]) -> Optional[float]:
+    """Return the YES probability for a binary Polymarket market.
+
+    ★ M23 FIX: previously fell through to ``prices[0]`` from
+    ``outcomePrices`` without zipping against ``outcomes`` to confirm
+    that position 0 corresponds to YES.  Polymarket convention is not
+    universal — some markets list NO first.  When that happens the
+    function would return ``1 - p_yes`` and propagate the inverse
+    probability through ``polymarket_scanner.generate_signals`` (see
+    M20), systematically biasing signals on those markets.
+
+    Now we look at ``outcomes`` (or fall back to ``tokens[*].outcome``)
+    to pick the index whose label resolves to YES.  Markets with no
+    discoverable outcome ordering keep the legacy ``prices[0]`` path
+    but log the ambiguity so it can be inspected later.
+    """
     for key in ("probability", "lastTradePrice", "last_price", "price"):
         parsed = _float(market.get(key))
         if parsed is not None:
             return parsed
+
     prices = [_float(v) for v in _as_list(market.get("outcomePrices"))]
     prices = [v for v in prices if v is not None]
-    if prices:
-        return prices[0]
-    return None
+    if not prices:
+        return None
+
+    # Try to resolve outcome labels for this market.  Look for explicit
+    # ``outcomes`` first, then fall back to the per-token outcome list.
+    outcome_labels: List[str] = []
+    raw_outcomes = market.get("outcomes")
+    for item in _as_list(raw_outcomes):
+        outcome_labels.append(str(item or ""))
+    if not outcome_labels:
+        for item in _as_list(market.get("tokens")):
+            if isinstance(item, dict):
+                outcome_labels.append(str(_first(item, ("outcome", "name"), "") or ""))
+
+    if outcome_labels and len(outcome_labels) == len(prices):
+        for label, price in zip(outcome_labels, prices):
+            if label.strip().lower() in ("yes", "y", "true", "1"):
+                return price
+        # Found labels but neither was YES -- return first as legacy
+        # behaviour, but the result is ambiguous on these markets.
+
+    return prices[0]
 
 
 def _extract_tokens(market: Dict[str, Any], market_id: str, observed_at_ms: int) -> List[Dict[str, Any]]:

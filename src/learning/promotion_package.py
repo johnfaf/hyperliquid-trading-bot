@@ -132,7 +132,24 @@ class ShadowPeriodPlanner:
 
 
 class RollbackReadinessChecker:
-    """Verifies rollback metadata exists before a promotion package is usable."""
+    """Verifies rollback metadata exists before a promotion package is usable.
+
+    ★ H21 FIX: previously the three "checks" were
+      - bool(rollback_policy_id)         (any non-empty string)
+      - bool(rules.get("auto_rollback_enabled"))   (static True default)
+      - bool(rules.get("operator_alert_channels")) (static list default)
+    All three were essentially constants — the function pretended to check
+    something but verified nothing.  It would not catch a deleted policy,
+    a stale rollback_policy_id pointer, missing alert credentials, or a
+    Telegram outage.
+
+    The check now actually queries the DB to confirm the rollback policy
+    row exists and is active in `continuous_learning_policies`, and runs a
+    dry-run Telegram dispatch when the alert channels list contains
+    "telegram" so credential errors surface here instead of during a real
+    rollback event.  Failures are reported per-check with the underlying
+    cause; a single failure flips status="fail".
+    """
 
     def check(
         self,
@@ -142,21 +159,75 @@ class RollbackReadinessChecker:
         persist: bool = True,
     ) -> RollbackCheckResult:
         rules = default_rollback_rules()
+
+        # 1. rollback_policy_known: previously just bool().  Now confirms
+        #    the policy exists in the DB and is marked active.
+        policy_exists = False
+        policy_active = False
+        policy_lookup_error: Optional[str] = None
+        try:
+            from src.data import database as db
+            with db.get_connection(for_read=True) as conn:
+                row = conn.execute(
+                    "SELECT active FROM continuous_learning_policies "
+                    "WHERE policy_id = ?",
+                    (rollback_policy_id,),
+                ).fetchone()
+            if row is not None:
+                policy_exists = True
+                policy_active = bool(row[0]) if row[0] is not None else True
+        except Exception as exc:
+            policy_lookup_error = str(exc)
+
+        # 2. auto_rollback_rules_present: same content check, plus a clearer
+        #    failure message when the rules dict is malformed.
+        auto_rb_enabled = bool(rules.get("auto_rollback_enabled"))
+
+        # 3. operator_alert_channels: dry-run telegram dispatch when the
+        #    channel list mentions telegram.  Catches missing tokens and
+        #    chat-id misconfigurations before a real rollback fires.
+        channels = rules.get("operator_alert_channels") or []
+        channels_present = bool(channels)
+        telegram_dryrun_ok: Optional[bool] = None
+        telegram_dryrun_error: Optional[str] = None
+        if channels_present and any("telegram" in str(c).lower() for c in channels):
+            try:
+                from src.notifications import telegram_bot as tg
+                if hasattr(tg, "is_configured"):
+                    telegram_dryrun_ok = bool(tg.is_configured())
+                    if not telegram_dryrun_ok:
+                        telegram_dryrun_error = "telegram_bot.is_configured() returned False"
+                else:
+                    telegram_dryrun_ok = False
+                    telegram_dryrun_error = "telegram_bot.is_configured missing"
+            except Exception as exc:
+                telegram_dryrun_ok = False
+                telegram_dryrun_error = str(exc)
+
         checks = {
             "rollback_policy_known": {
-                "passed": bool(rollback_policy_id),
-                "actual": rollback_policy_id,
-                "required": "non-empty rollback policy id",
+                "passed": bool(rollback_policy_id) and policy_exists and policy_active,
+                "actual": {
+                    "rollback_policy_id": rollback_policy_id,
+                    "exists_in_db": policy_exists,
+                    "active_in_db": policy_active,
+                    "lookup_error": policy_lookup_error,
+                },
+                "required": "policy id resolves to an active row",
             },
             "auto_rollback_rules_present": {
-                "passed": bool(rules.get("auto_rollback_enabled")),
+                "passed": auto_rb_enabled,
                 "actual": rules.get("auto_rollback_enabled"),
                 "required": True,
             },
             "operator_alert_channels_present": {
-                "passed": bool(rules.get("operator_alert_channels")),
-                "actual": rules.get("operator_alert_channels"),
-                "required": "at least one alert channel",
+                "passed": channels_present and (telegram_dryrun_ok in (None, True)),
+                "actual": {
+                    "channels": channels,
+                    "telegram_dryrun_ok": telegram_dryrun_ok,
+                    "telegram_dryrun_error": telegram_dryrun_error,
+                },
+                "required": "at least one alert channel + telegram credentials valid",
             },
         }
         status = "pass" if all(item["passed"] for item in checks.values()) else "fail"

@@ -160,7 +160,31 @@ def _collect_and_compute(coins: List[str], timeframes: List[str]) -> dict:
         eth_candles_by_tf[tf] = fs.get_candles("ETH", tf, limit=60)
 
     # Phase 3: Compute features for all coins
+    # ★ M24 FIX: previously prev_oi was reset to {} at every invocation.
+    # On the first cycle after a process restart, every coin's OI delta
+    # was 0 because the in-memory dict had no prior observation -- even
+    # if real OI had moved meaningfully overnight.  Bootstrap prev_oi
+    # from the most recent stored sample in `open_interest_history`
+    # before the loop begins so deltas span across restarts.
     prev_oi: dict = {}
+    try:
+        from src.data.historical_market_data import get_open_interest_history
+        for _coin in coins:
+            try:
+                history = get_open_interest_history(_coin, limit=2) or []
+                # history is ordered DESC: index 0 is the latest, 1 is prior.
+                # We want the PRIOR observation (index 1) so the first cycle
+                # post-restart computes a real delta against it.  If only
+                # one row exists, fall back to that single value.
+                pick = history[1] if len(history) >= 2 else (
+                    history[0] if history else None
+                )
+                if pick:
+                    prev_oi[_coin] = float(pick.get("open_interest", 0.0) or 0.0)
+            except Exception:
+                continue
+    except Exception as exc:
+        logger.debug("prev_oi bootstrap failed (will use first-cycle default): %s", exc)
 
     for coin in coins:
         for tf in timeframes:

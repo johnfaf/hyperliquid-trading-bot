@@ -121,14 +121,21 @@ class WhaleScanner:
                         # Record in cache
                         self._whale_cache[cache_key] = current_time
 
+                    # ★ L9 FIX: previously this block used whale["coin"]
+                    # subscript access while the cache-key block above used
+                    # whale.get(...).  A whale dict missing one of these
+                    # keys would raise here and be silently swallowed by
+                    # the outer except, dropping the whole scan for that
+                    # coin without surfacing why.  Use .get() consistently
+                    # with the rest of the function.
                     whales.append({
-                        "coin": whale["coin"],
-                        "side": whale["side"],  # "buy" or "sell"
-                        "price": whale["price"],
-                        "qty": whale["qty"],
-                        "notional": whale["notional"],
-                        "timestamp": whale["timestamp"],
-                        "exchange": whale["exchange"],
+                        "coin": w_coin,
+                        "side": w_side,
+                        "price": w_price,
+                        "qty": w_qty,
+                        "notional": float(whale.get("notional", w_price * w_qty) or 0),
+                        "timestamp": w_ts,
+                        "exchange": whale.get("exchange", ""),
                     })
                     self._whales_found += 1
 

@@ -244,10 +244,14 @@ def _derive_candle_cache_health(source_name: str) -> Dict[str, Any]:
                 reason="candle cache is empty",
                 metadata={"path": str(path)},
             )
+        # ★ M22 FIX: previously hardcoded freshness_seconds=0.0 even though
+        # latest_age_seconds was computed correctly into metadata.  Downstream
+        # SLA checks gating on freshness_seconds saw "fresh" when the cache
+        # could be hours old.  Use the real age.
         return _snapshot_row(
             source_name,
             "UP",
-            freshness_seconds=0.0,
+            freshness_seconds=latest_age_seconds,
             reason=f"candle cache has {count} rows",
             metadata={
                 "path": str(path),

@@ -14,7 +14,7 @@ import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import config
 from src.data import database as db
@@ -589,6 +589,14 @@ def _decision_journal_checks(conn: Any, findings: list[DbAuditFinding], checks: 
             LIMIT 1000
             """
         ).fetchall()
+        # ★ M27 FIX: previously this loop ran a SELECT per audit_row -- up
+        # to 1000 sequential queries on every audit run.  Now we collect
+        # all decision_keys first, run ONE bulk SELECT against
+        # decision_snapshots, build a lookup, then iterate without
+        # re-querying.  Keeps the audit fast even on large audit_trail
+        # tables.
+        audit_payloads: List[Tuple[Any, str]] = []
+        decision_keys: set[str] = set()
         for audit_row in audit_rows:
             details = _row_get(audit_row, "details", 5, "{}")
             try:
@@ -597,17 +605,44 @@ def _decision_journal_checks(conn: Any, findings: list[DbAuditFinding], checks: 
                 payload = {}
             decision_key = str(payload.get("decision_id") or payload.get("signal_id") or "").strip()
             if not decision_key:
+                audit_payloads.append((audit_row, ""))
+                continue
+            audit_payloads.append((audit_row, decision_key))
+            decision_keys.add(decision_key)
+
+        snapshot_lookup: Dict[str, Tuple[str, str, str]] = {}
+        if decision_keys:
+            placeholders = ",".join("?" for _ in decision_keys)
+            keys_tuple = tuple(decision_keys)
+            try:
+                rows = conn.execute(
+                    f"""
+                    SELECT decision_id, signal_id, final_status, firewall_decision
+                    FROM decision_snapshots
+                    WHERE decision_id IN ({placeholders})
+                       OR signal_id IN ({placeholders})
+                    """,
+                    keys_tuple + keys_tuple,
+                ).fetchall()
+            except Exception:
+                rows = []
+            for r in rows:
+                d_id = str(_row_get(r, "decision_id", 0, "") or "")
+                s_id = str(_row_get(r, "signal_id", 1, "") or "")
+                final_status = str(_row_get(r, "final_status", 2, "") or "")
+                firewall_decision = str(_row_get(r, "firewall_decision", 3, "") or "")
+                # Map both decision_id and signal_id to the snapshot tuple
+                # so the lookup matches the original OR semantics.
+                if d_id and d_id not in snapshot_lookup:
+                    snapshot_lookup[d_id] = (d_id, final_status, firewall_decision)
+                if s_id and s_id not in snapshot_lookup:
+                    snapshot_lookup[s_id] = (d_id, final_status, firewall_decision)
+
+        for audit_row, decision_key in audit_payloads:
+            if not decision_key:
                 continue
             linkable_terminal_audit_count += 1
-            matched = conn.execute(
-                """
-                SELECT decision_id, final_status, firewall_decision
-                FROM decision_snapshots
-                WHERE decision_id = ? OR signal_id = ?
-                LIMIT 1
-                """,
-                (decision_key, decision_key),
-            ).fetchone()
+            matched = snapshot_lookup.get(decision_key)
             if matched is None:
                 unresolved_linked_audits.append(
                     {
@@ -618,8 +653,9 @@ def _decision_journal_checks(conn: Any, findings: list[DbAuditFinding], checks: 
                     }
                 )
                 continue
-            matched_status = str(_row_get(matched, "final_status", 1, "") or "").lower()
-            matched_firewall = str(_row_get(matched, "firewall_decision", 2, "") or "").lower()
+            matched_decision_id, matched_status_raw, matched_firewall_raw = matched
+            matched_status = matched_status_raw.lower()
+            matched_firewall = matched_firewall_raw.lower()
             if matched_status == "candidate" or matched_firewall == "pending":
                 unresolved_linked_audits.append(
                     {
@@ -627,7 +663,7 @@ def _decision_journal_checks(conn: Any, findings: list[DbAuditFinding], checks: 
                         "action": _row_get(audit_row, "action", 1, ""),
                         "coin": _row_get(audit_row, "coin", 2, ""),
                         "decision_key": decision_key,
-                        "matched_decision_id": _row_get(matched, "decision_id", 0, ""),
+                        "matched_decision_id": matched_decision_id,
                         "final_status": matched_status,
                         "firewall_decision": matched_firewall,
                     }

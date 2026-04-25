@@ -181,8 +181,19 @@ class MacroRegimeScraper:
     # ─── Fetch Helpers ───────────────────────────────────────────────────
 
     def _fetch(self, url: str, timeout: int = 20, max_retries: int = 2,
-               as_json: bool = False) -> Optional[Any]:
-        """Fetch with retry + exponential backoff."""
+               as_json: bool = False,
+               source_name: Optional[str] = None) -> Optional[Any]:
+        """Fetch with retry + exponential backoff.
+
+        ★ M28 FIX: previously the JSONDecodeError catch returned None
+        without surfacing the failure to ``_source_status``.  The caller
+        couldn't tell ``"fetch returned non-JSON"`` apart from ``"fetch
+        genuinely returned None data"`` and the source-registry mark_degraded
+        path was never reached for parse-time failures.  Now the optional
+        ``source_name`` parameter lets ``_fetch`` mark the source as
+        degraded itself on parse / fetch failures.  Caller still gets None.
+        """
+        last_failure_detail = ""
         for attempt in range(max_retries + 1):
             try:
                 resp = self.session.get(url, timeout=timeout)
@@ -192,21 +203,31 @@ class MacroRegimeScraper:
                     time.sleep(wait)
                     continue
                 if resp.status_code >= 500:
+                    last_failure_detail = f"HTTP {resp.status_code}"
                     if attempt < max_retries:
                         time.sleep(min(10, 2 ** attempt))
                         continue
+                    if source_name:
+                        self._set_source(source_name, False, last_failure_detail)
                     return None
                 resp.raise_for_status()
                 return resp.json() if as_json else resp.text
-            except requests.exceptions.JSONDecodeError:
-                logger.debug("JSON decode failed for %s", url)
+            except requests.exceptions.JSONDecodeError as exc:
+                logger.debug("JSON decode failed for %s: %s", url, exc)
+                if source_name:
+                    self._set_source(source_name, False, f"JSONDecodeError: {exc}")
                 return None
             except Exception as exc:
+                last_failure_detail = f"{type(exc).__name__}: {exc}"
                 if attempt < max_retries:
                     time.sleep(min(10, 2 ** attempt))
                     continue
                 logger.debug("Fetch failed for %s: %s", url, exc)
+                if source_name:
+                    self._set_source(source_name, False, last_failure_detail)
                 return None
+        if source_name and last_failure_detail:
+            self._set_source(source_name, False, last_failure_detail)
         return None
 
     def _set_source(self, name: str, ok: bool, detail: str = "") -> None:
@@ -818,10 +839,27 @@ class MacroRegimeScraper:
 
         return components
 
-    def _aggregate_score(self, components: Dict[str, Tuple[float, Dict]]) -> float:
+    def _aggregate_score(self, components: Dict[str, Tuple[float, Dict]]) -> Tuple[float, str]:
         """
         Weighted average of all component scores.
         Weights reflect reliability and importance.
+
+        ★ H23 FIX: previously the inclusion gate was ``score != 0.0`` which
+        couldn't distinguish "computed a genuine neutral signal" from
+        "scraper failed and defaulted to 0".  If all scrapers were
+        IP-blocked during a real macro stress event, every component
+        returned 0.0, weight_sum stayed positive (futures + calendar are
+        always-included), and the aggregate read as "calm" — exactly the
+        wrong call during the stress event that broke the scrapers.
+
+        Now we gate inclusion on ``_source_status[key]["ok"]``.  Sources
+        marked not-ok don't contribute to weighted_sum or weight_sum.
+        If we can't reach a quorum (>=50% of total possible weight from
+        ok sources), we return a sentinel "unknown" status so the caller
+        treats macro as defensive rather than calm.
+
+        Returns ``(score, quorum_status)`` where quorum_status is one of
+        ``"ok"``, ``"low_quorum"``, or ``"no_data"``.
         """
         weights = {
             "futures_sentiment": 0.30,       # Most reliable, real-time market data
@@ -831,21 +869,35 @@ class MacroRegimeScraper:
             "order_depth_liq": 0.15,         # Crypto-specific, very relevant
             "institutional_sentiment": 0.10, # Often unavailable, low weight
         }
+        total_weight = sum(weights.values())
 
         weighted_sum = 0.0
         weight_sum = 0.0
 
         for key, (score, _detail) in components.items():
             w = weights.get(key, 0.1)
-            if score != 0.0 or key in ("futures_sentiment", "macro_calendar"):
-                # Always include futures & calendar even if 0 (they're reliable zeros)
+            # ★ H23: only include sources marked ok in _source_status.
+            # When a source has never reported (key not in _source_status)
+            # treat as ok if it returned a non-zero score — futures/calendar
+            # always-include behavior is preserved when they ARE marked ok.
+            src_status = self._source_status.get(key, {})
+            src_ok = bool(src_status.get("ok", True)) if src_status else (
+                # No status recorded yet: treat zero-score components as
+                # "no data" rather than "ok-but-zero" so we don't fail-open.
+                score != 0.0 or key in ("futures_sentiment", "macro_calendar")
+            )
+            if src_ok and (score != 0.0 or key in ("futures_sentiment", "macro_calendar")):
                 weighted_sum += score * w
                 weight_sum += w
 
-        if weight_sum == 0:
-            return 0.0
+        if weight_sum <= 0:
+            return 0.0, "no_data"
 
-        return _clamp(weighted_sum / weight_sum)
+        # Require quorum (>=50% of possible weight) before trusting the
+        # aggregate.  Below that, the aggregate is dominated by whichever
+        # subset of sources happened to stay reachable.
+        quorum_status = "ok" if weight_sum >= (total_weight * 0.5) else "low_quorum"
+        return _clamp(weighted_sum / weight_sum), quorum_status
 
     def _score_to_risk_level(self, score: float) -> str:
         """Convert aggregate score to a risk level string."""
@@ -893,8 +945,21 @@ class MacroRegimeScraper:
 
         # Scrape all sources (outside lock — can be slow)
         components = self._compute_components()
-        agg_score = self._aggregate_score(components)
-        risk_level = self._score_to_risk_level(agg_score)
+        agg_score, quorum_status = self._aggregate_score(components)
+        # ★ H23: when we lose source quorum, treat macro as defensive
+        # ("elevated" with size_mod < 1) rather than letting the aggregate
+        # default to "normal" just because 0/0 sources reported.
+        if quorum_status == "no_data":
+            risk_level = "extreme"
+        elif quorum_status == "low_quorum":
+            # Bias toward caution: take the worse of the computed level
+            # and "elevated" so a low-quorum scrape can never read calmer
+            # than elevated even if the few reachable sources were neutral.
+            computed_level = self._score_to_risk_level(agg_score)
+            order = ["low", "normal", "elevated", "high", "extreme"]
+            risk_level = computed_level if order.index(computed_level) >= order.index("elevated") else "elevated"
+        else:
+            risk_level = self._score_to_risk_level(agg_score)
         level_params = RISK_LEVELS[risk_level]
 
         # Build reasons
@@ -920,6 +985,7 @@ class MacroRegimeScraper:
                 for k, (s, d) in components.items()
             },
             "sources": dict(self._source_status),
+            "quorum_status": quorum_status,  # ★ H23
             "timestamp": _utc_now().isoformat(),
         }
 

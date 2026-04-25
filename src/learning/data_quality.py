@@ -51,9 +51,18 @@ class DatasetQualityAuditor:
         *,
         min_rows: int = 50,
         min_labelled: int = 30,
-        max_missing_feature_ratio: float = 0.35,
-        min_positive_ratio: float = 0.05,
-        max_positive_ratio: float = 0.95,
+        max_missing_feature_ratio: float = 0.15,
+        # ★ M21 FIX: was 0.05 / 0.95.  A dataset of 95% wins (or 5%) was
+        # passing the balance check, even though such an extreme ratio is
+        # strongly suggestive of label leakage, broken close-detection, or
+        # a degenerate strategy that's never genuinely losing -- none of
+        # which should pass quality gate.  Tightened to 0.20 / 0.80 so
+        # we still allow asymmetric edges (e.g. high-PF setups with
+        # plenty of small losses) while rejecting suspect distributions.
+        # Also tightened max_missing_feature_ratio 0.35 -> 0.15 (mirrors
+        # M11 in dataset_builder).
+        min_positive_ratio: float = 0.20,
+        max_positive_ratio: float = 0.80,
     ):
         self.min_rows = int(min_rows)
         self.min_labelled = int(min_labelled)

@@ -859,7 +859,18 @@ class PositionMonitor:
         new_positions: Dict[str, Dict],
     ) -> List[Dict]:
         """
-        Detect new, closed, scaled, or flipped positions.
+        Detect new, closed, scaled, flipped, or scaled-OUT positions.
+
+        ★ H26 FIX: previously this was a stale copy of copy_trader's
+        _detect_position_changes that still had the H4 (duplicate flip+
+        scale-in signals iterating the same intersection twice) and H5
+        (no scale-out detection) bugs.  Mirroring the copy_trader fixes:
+          * sections 3 / 4 collapsed into a single ``if/elif/elif/elif``
+            branch over ``old_coins & new_coins`` so each coin emits
+            exactly one delta signal (flip > scale-in > scale-out).
+          * new ``copy_scale_out`` branch detects 50%+ size *reductions*
+            so a leader scaling out before fully exiting produces a
+            real-time reduce signal instead of leaving us full size.
 
         Returns signals in the SAME format as copy_trader.py's
         _detect_position_changes() output.
@@ -898,17 +909,34 @@ class PositionMonitor:
                 "source_trader": address[:10],
             })
 
-        # 3. Scaled-in positions (>50% size increase)
+        # 3+4+5. Existing-position deltas — exactly ONE signal per coin.
+        # Flip beats scale-in beats scale-out; matches copy_trader.py.
         for coin in old_coins & new_coins:
-            old_size = old_positions[coin]["size"]
-            new_size = new_positions[coin]["size"]
+            old_size = float(old_positions[coin].get("size", 0))
+            new_size = float(new_positions[coin].get("size", 0))
+            old_side = old_positions[coin].get("side")
+            new_side = new_positions[coin].get("side")
 
-            if new_size > old_size * 1.5:  # 50%+ increase
+            if old_side != new_side:
                 pos = new_positions[coin]
                 price = float(mids.get(coin, pos["entry_price"]))
                 if price <= 0:
                     continue
-
+                signals.append({
+                    "type": "copy_flip",
+                    "coin": coin,
+                    "side": pos["side"],
+                    "price": price,
+                    "leverage": min(pos["leverage"], config.PAPER_TRADING_MAX_LEVERAGE),
+                    "source_trader": address[:10],
+                    "source_pnl": 0,
+                    "confidence": 0.90,
+                })
+            elif old_size > 0 and new_size > old_size * 1.5:  # 50%+ increase
+                pos = new_positions[coin]
+                price = float(mids.get(coin, pos["entry_price"]))
+                if price <= 0:
+                    continue
                 signals.append({
                     "type": "copy_scale_in",
                     "coin": coin,
@@ -919,24 +947,15 @@ class PositionMonitor:
                     "source_pnl": 0,
                     "confidence": 0.80,
                 })
-
-        # 4. Side flips (trader reversed position)
-        for coin in old_coins & new_coins:
-            if old_positions[coin]["side"] != new_positions[coin]["side"]:
-                pos = new_positions[coin]
-                price = float(mids.get(coin, pos["entry_price"]))
-                if price <= 0:
-                    continue
-
+            elif old_size > 0 and new_size <= old_size * 0.5:  # ★ H26: 50%+ decrease
                 signals.append({
-                    "type": "copy_flip",
+                    "type": "copy_scale_out",
                     "coin": coin,
-                    "side": pos["side"],
-                    "price": price,
-                    "leverage": min(pos["leverage"], config.PAPER_TRADING_MAX_LEVERAGE),
                     "source_trader": address[:10],
-                    "source_pnl": 0,
-                    "confidence": 0.90,
+                    "old_size": old_size,
+                    "new_size": new_size,
+                    "reduction_pct": 1.0 - (new_size / old_size),
+                    "confidence": 0.85,
                 })
 
         return signals

@@ -60,6 +60,15 @@ def run_discovery(container) -> None:
                     continue
                 state = hl.get_user_state(address)
                 if state:
+                    # ★ H27 FIX: previously injected ``profit_factor: 1.5`` as
+                    # a hard-coded constant for every newly-identified
+                    # strategy.  That credited every trader with a synthetic
+                    # PF=1.5 regardless of real performance, giving downstream
+                    # ``StrategyScorer._score_pnl`` a free score boost from
+                    # data we never measured.  Use ``None`` so callers can
+                    # tell "we don't have a profit factor" apart from "we
+                    # measured PF=1.5", and let the scorer apply a thin-data
+                    # penalty rather than reward fictional alpha.
                     profile = {
                         "address": address,
                         "positions": state["positions"],
@@ -69,7 +78,7 @@ def run_discovery(container) -> None:
                             "win_rate": trader["win_rate"],
                             "total_closed_pnl": trader["total_pnl"],
                             "trading_frequency": "unknown",
-                            "profit_factor": 1.5,
+                            "profit_factor": None,
                             "coins_traded": [
                                 p["coin"] for p in state["positions"] if p["size"] > 0
                             ],
