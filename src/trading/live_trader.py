@@ -724,6 +724,7 @@ class LiveTrader:
             "LIVE_PROTECTIVE_REPEAT_MAX", 1.0, lo=1.0, hi=20.0,
         ))
         self._protective_attempt_history: Dict[str, Deque[float]] = defaultdict(deque)
+        self._protective_churn_quarantined_coins: Dict[str, Dict[str, Any]] = {}
         self._protective_churn_trips = 0
         self._last_orphan_protection_summary: Dict[str, Any] = {}
         self._last_order_hygiene_audit: Dict[str, Any] = {}
@@ -795,6 +796,7 @@ class LiveTrader:
         # E7: restore recent order-dedup hashes so a restart within the dedup
         # window doesn't re-ship an order that may have already executed.
         self._load_persisted_order_dedup_cache()
+        self._load_persisted_protective_churn_quarantine()
         # Restore fallback-protection attempts too.  Without this, every
         # redeploy forgets that it already placed a rescue SL/TP bracket for
         # the same position and can stack duplicate protective orders.
@@ -1101,6 +1103,23 @@ class LiveTrader:
                 payload = json.load(handle)
             if isinstance(payload, dict) and payload.get("active"):
                 reason = str(payload.get("reason") or f"persisted:{path}")
+                if reason.startswith("protective_order_churn:"):
+                    coin = reason.split(":", 1)[1] or "UNKNOWN"
+                    self._quarantine_protective_churn_coin(
+                        coin,
+                        key=f"legacy_persisted_kill_switch:{reason}",
+                        source="legacy_kill_switch_state",
+                        persist=True,
+                    )
+                    logger.warning(
+                        "Auto-clearing legacy persisted protective-order churn "
+                        "kill switch (%s). New entries for %s remain blocked, "
+                        "but other coins may trade.",
+                        reason,
+                        self._normalize_coin_key(coin),
+                    )
+                    self._persist_kill_switch_state(False, f"coin_quarantine:{reason}")
+                    return
                 if self._should_auto_clear_persisted_kill_switch(reason):
                     logger.warning(
                         "Auto-clearing stale persisted kill switch (%s): "
@@ -1124,9 +1143,11 @@ class LiveTrader:
     def _should_auto_clear_persisted_kill_switch(self, reason: str) -> bool:
         """Return True for healed, machine-detectable persisted kill switches.
 
-        Only the stale ``dualwrite_unhealthy`` case can clear itself. Manual,
-        external-file, daily-loss and protective-order kill switches stay
-        sticky until an operator clears them.
+        Only the stale ``dualwrite_unhealthy`` case can clear itself here.
+        Legacy ``protective_order_churn:<coin>`` states are handled in
+        _load_persisted_kill_switch_state by converting the global stop into
+        a coin-level quarantine. Manual, external-file and daily-loss kill
+        switches stay sticky until an operator clears them.
         """
         reason = str(reason or "")
         if not reason.startswith("dualwrite_unhealthy:"):
@@ -2569,6 +2590,116 @@ class LiveTrader:
         return f"{str(coin).upper()}:{side}:{entry_price:.8g}:{size:.8g}"
 
     _PROTECTIVE_ATTEMPT_STATE_KEY = "live_protective_attempt_history"
+    _PROTECTIVE_CHURN_QUARANTINE_STATE_KEY = "live_protective_churn_quarantine"
+
+    @staticmethod
+    def _normalize_coin_key(coin: Any) -> str:
+        return str(coin or "").strip().upper()
+
+    def _persist_protective_churn_quarantine(self) -> None:
+        """Persist coin-level protective churn quarantine across restarts."""
+        try:
+            with self._state_lock:
+                quarantined = dict(getattr(self, "_protective_churn_quarantined_coins", {}) or {})
+            db.set_bot_state(
+                self._PROTECTIVE_CHURN_QUARANTINE_STATE_KEY,
+                {
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                    "coins": quarantined,
+                },
+            )
+        except Exception as exc:
+            logger.debug("Failed to persist protective churn quarantine: %s", exc)
+
+    def _load_persisted_protective_churn_quarantine(self) -> None:
+        """Restore coin-level quarantine without globally stopping live trading."""
+        try:
+            snapshot = db.get_bot_state(self._PROTECTIVE_CHURN_QUARANTINE_STATE_KEY)
+        except Exception as exc:
+            logger.debug("Failed to load protective churn quarantine: %s", exc)
+            return
+        if not isinstance(snapshot, dict):
+            return
+        raw = snapshot.get("coins", snapshot)
+        if not isinstance(raw, dict):
+            return
+        restored = {}
+        for coin, payload in raw.items():
+            coin_key = self._normalize_coin_key(coin)
+            if not coin_key:
+                continue
+            restored[coin_key] = dict(payload or {}) if isinstance(payload, dict) else {}
+        if not restored:
+            return
+        with self._state_lock:
+            self._protective_churn_quarantined_coins.update(restored)
+            self._protective_churn_trips = max(
+                int(getattr(self, "_protective_churn_trips", 0) or 0),
+                len(restored),
+            )
+        logger.warning(
+            "Restored protective-order churn quarantine for coin(s): %s. "
+            "Those coins are blocked from new live entries until protection is healthy.",
+            ", ".join(sorted(restored)),
+        )
+
+    def _quarantine_protective_churn_coin(
+        self,
+        coin: str,
+        key: str,
+        *,
+        source: str = "orphan_protection",
+        persist: bool = True,
+    ) -> bool:
+        coin_key = self._normalize_coin_key(coin)
+        if not coin_key:
+            return False
+        now = datetime.now(timezone.utc).isoformat()
+        with self._state_lock:
+            quarantined = getattr(self, "_protective_churn_quarantined_coins", {})
+            already = coin_key in quarantined
+            quarantined[coin_key] = {
+                "reason": f"protective_order_churn:{coin_key}",
+                "attempt_key": key,
+                "source": source,
+                "updated_at": now,
+            }
+            self._protective_churn_quarantined_coins = quarantined
+            if not already:
+                self._protective_churn_trips = int(getattr(self, "_protective_churn_trips", 0) or 0) + 1
+        if persist:
+            self._persist_protective_churn_quarantine()
+        return not already
+
+    def _clear_protective_churn_quarantine(self, coin: str, reason: str) -> None:
+        coin_key = self._normalize_coin_key(coin)
+        if not coin_key:
+            return
+        with self._state_lock:
+            quarantined = getattr(self, "_protective_churn_quarantined_coins", {})
+            removed = quarantined.pop(coin_key, None)
+        if removed is None:
+            return
+        logger.warning(
+            "Cleared protective-order churn quarantine for %s: %s",
+            coin_key,
+            reason,
+        )
+        self._persist_protective_churn_quarantine()
+
+    def _is_protective_churn_quarantined(self, coin: Any) -> bool:
+        coin_key = self._normalize_coin_key(coin)
+        if not coin_key:
+            return False
+        with self._state_lock:
+            return coin_key in getattr(self, "_protective_churn_quarantined_coins", {})
+
+    def _release_absent_protective_churn_quarantines(self, positions: List[Dict[str, Any]]) -> None:
+        active = {self._normalize_coin_key(pos.get("coin")) for pos in positions if pos.get("coin")}
+        with self._state_lock:
+            quarantined = set(getattr(self, "_protective_churn_quarantined_coins", {}).keys())
+        for coin in sorted(quarantined - active):
+            self._clear_protective_churn_quarantine(coin, "position_absent")
 
     def _load_persisted_protective_attempt_history(self) -> None:
         """Restore recent fallback SL/TP attempts from bot_state.
@@ -2667,24 +2798,24 @@ class LiveTrader:
         self._persist_protective_attempt_history()
 
     def _trip_protective_churn_guard(self, coin: str, key: str) -> None:
-        with self._state_lock:
-            self._protective_churn_trips += 1
+        first_trip = self._quarantine_protective_churn_coin(coin, key)
         logger.critical(
             "PROTECTIVE ORDER CHURN GUARD: %s still appears unprotected after "
             "%d fallback placement(s) in %.0fs (key=%s). Refusing to stack "
-            "another SL/TP pair and activating kill switch.",
+            "another SL/TP pair. New live entries for this coin are quarantined; "
+            "other coins may continue trading.",
             coin,
             self._protective_repeat_max,
             self._protective_repeat_window_s,
             key,
         )
-        try:
-            self.activate_kill_switch(
-                f"protective_order_churn:{coin}",
-                status_reason="protective_order_churn",
+        if first_trip:
+            logger.critical(
+                "Protective churn quarantine active for %s. Manual intervention "
+                "is required unless a later hygiene sweep sees valid SL + TP "
+                "or the position disappears.",
+                self._normalize_coin_key(coin),
             )
-        except Exception as exc:
-            logger.critical("activate_kill_switch failed during protective churn guard: %s", exc)
 
     def protect_orphaned_positions(
         self,
@@ -2729,9 +2860,11 @@ class LiveTrader:
             })
 
         if not positions:
+            self._release_absent_protective_churn_quarantines([])
             return self._store_orphan_protection_summary(
                 {"status": "ok", "protected": 0, "skipped": 0, "failed": 0}
             )
+        self._release_absent_protective_churn_quarantines(positions)
 
         # One fetch of open orders, then index by coin for O(1) lookup.
         # P0-3: orphan protection also reasons about WHICH legs (SL vs TP)
@@ -2876,6 +3009,7 @@ class LiveTrader:
             has_tp = bool(valid_tp)
 
             if has_sl and has_tp:
+                self._clear_protective_churn_quarantine(coin, "valid_sl_tp_detected")
                 logger.info(
                     "protect_orphaned_positions: %s already has valid SL + TP "
                     "(sl_oid=%s tp_oid=%s), skipping",
@@ -2948,6 +3082,7 @@ class LiveTrader:
             if protective_record_key and (sl_ok or tp_ok):
                 self._record_protective_attempt(protective_record_key)
             if sl_ok and tp_ok:
+                self._clear_protective_churn_quarantine(coin, "fallback_protection_verified")
                 protected += 1
                 logger.info(
                     "Orphan protection complete for %s: "
@@ -5999,6 +6134,14 @@ class LiveTrader:
             self._incr_entry_metric("rejected_kill_switch")
             logger.warning("Kill switch active - rejecting signal")
             return None
+        if not self.dry_run and self._is_protective_churn_quarantined(signal.coin):
+            self._incr_entry_metric("rejected_protective_churn_coin")
+            logger.critical(
+                "Protective-order churn quarantine active for %s - rejecting "
+                "new live entry for this coin while allowing other coins to trade",
+                signal.coin,
+            )
+            return None
 
         # H10 (audit): Canary/source caps apply to NEW live entries only.
         # The read-compare-increment sequence is executed atomically in
@@ -6553,6 +6696,9 @@ class LiveTrader:
                 "live_sizing": dict(self._last_sizing_explanation),
                 "order_visibility": dict(self._last_order_visibility_status),
                 "protective_churn_trips": self._protective_churn_trips,
+                "protective_churn_quarantined_coins": dict(
+                    getattr(self, "_protective_churn_quarantined_coins", {}) or {}
+                ),
             }
 
         return {
@@ -6601,6 +6747,9 @@ class LiveTrader:
                 self.dynamic_source_caps_allow_static_expansion
             ),
             "protective_churn_trips": int(state_snapshot["protective_churn_trips"]),
+            "protective_churn_quarantined_coins": state_snapshot[
+                "protective_churn_quarantined_coins"
+            ],
             "protective_repeat_window_s": self._protective_repeat_window_s,
             "protective_repeat_max": self._protective_repeat_max,
             "fill_verify_blocking": self._fill_verify_blocking,

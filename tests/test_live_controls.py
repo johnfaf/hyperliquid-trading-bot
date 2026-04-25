@@ -2206,6 +2206,34 @@ def test_non_dualwrite_kill_switch_remains_sticky(monkeypatch, tmp_path):
     assert payload["active"] is True
 
 
+def test_legacy_protective_churn_kill_switch_becomes_coin_quarantine(monkeypatch, tmp_path):
+    state_file = tmp_path / "kill_state.json"
+    state_file.write_text(
+        '{"active": true, "reason": "protective_order_churn:TRUMP"}',
+        encoding="utf-8",
+    )
+    bot_state = {}
+    monkeypatch.setattr("src.trading.live_trader.db.set_bot_state", lambda key, value: bot_state.setdefault(key, value) or True)
+
+    trader = LiveTrader.__new__(LiveTrader)
+    trader.kill_switch_state_file = str(state_file)
+    trader._state_lock = threading.Lock()
+    trader.kill_switch_active = False
+    trader._kill_switch_reason = ""
+    trader.status_reason = ""
+    trader._protective_churn_quarantined_coins = {}
+    trader._protective_churn_trips = 0
+
+    trader._load_persisted_kill_switch_state()
+
+    assert trader.kill_switch_active is False
+    assert trader._is_protective_churn_quarantined("TRUMP") is True
+    payload = json.loads(state_file.read_text(encoding="utf-8"))
+    assert payload["active"] is False
+    assert payload["reason"] == "coin_quarantine:protective_order_churn:TRUMP"
+    assert "TRUMP" in bot_state[LiveTrader._PROTECTIVE_CHURN_QUARANTINE_STATE_KEY]["coins"]
+
+
 def test_hyperliquid_signer_zero_pads_signature_components(monkeypatch):
     class FakeAccount:
         def sign_message(self, message):
@@ -3919,8 +3947,9 @@ def test_protect_orphaned_positions_churn_guard_blocks_repeated_brackets(monkeyp
     assert second["failed"] == 1
     assert second["churn_blocked"] == 1
     assert len(placed_triggers) == 2
-    assert trader.kill_switch_active is True
-    assert trader.status_reason == "protective_order_churn"
+    assert trader.kill_switch_active is False
+    assert trader._is_protective_churn_quarantined("SOL") is True
+    assert "SOL" in trader.get_stats()["protective_churn_quarantined_coins"]
 
 
 def test_protective_churn_guard_persists_across_restart(monkeypatch):
@@ -3977,8 +4006,44 @@ def test_protective_churn_guard_persists_across_restart(monkeypatch):
     assert second["failed"] == 1
     assert second["churn_blocked"] == 1
     assert len(placed_triggers) == 2
-    assert second_trader.kill_switch_active is True
-    assert second_trader.status_reason == "protective_order_churn"
+    assert second_trader.kill_switch_active is False
+    assert second_trader._is_protective_churn_quarantined("SOL") is True
+    assert "SOL" in bot_state[LiveTrader._PROTECTIVE_CHURN_QUARANTINE_STATE_KEY]["coins"]
+
+
+def test_execute_signal_rejects_only_quarantined_churn_coin(monkeypatch):
+    class FakeFirewall:
+        def validate(self, signal, **kwargs):
+            return True, "ok"
+
+    monkeypatch.setattr(LiveTrader, "_load_credentials", _fake_live_credentials)
+    monkeypatch.setattr(LiveTrader, "_load_asset_index_map", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "reconcile_positions", lambda self: None)
+
+    trader = LiveTrader(firewall=FakeFirewall(), dry_run=False, max_order_usd=15.0)
+    monkeypatch.setattr(trader, "_refresh_external_kill_switch", lambda: False)
+    monkeypatch.setattr(trader, "check_daily_loss", lambda refresh_from_fills=True: False)
+    monkeypatch.setattr(trader, "_get_source_policy", lambda signal: {})
+    monkeypatch.setattr("src.trading.live_trader.db.set_bot_state", lambda *args, **kwargs: True)
+    trader._quarantine_protective_churn_coin("TRUMP", "test")
+
+    result = trader.execute_signal(
+        TradeSignal(
+            coin="TRUMP",
+            side=SignalSide.LONG,
+            confidence=0.80,
+            source=SignalSource.STRATEGY,
+            reason="test",
+            risk=RiskParams(stop_loss_pct=0.10, take_profit_pct=0.50, risk_basis="roe"),
+            leverage=2,
+            size=0.01,
+        ),
+        bypass_firewall=True,
+    )
+
+    assert result is None
+    assert trader.kill_switch_active is False
+    assert trader._entry_metrics["rejected_protective_churn_coin"] == 1
 
 
 def test_startup_reconcile_clears_restored_unresolved_dedup_markers(monkeypatch):
