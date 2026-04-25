@@ -264,6 +264,13 @@ class DecisionEngine:
         long_types  = {"momentum_long"}
         short_types = {"momentum_short", "contrarian"}
 
+        # ★ H14 FIX: contrarian-class strategies must NOT follow the trend.
+        # Mean reversion buys dips in trending-down regimes; if we flip its
+        # direction to match the trend, we're trading it opposite to its
+        # documented edge. These types must use their params["direction"]
+        # (set by strategy_identifier) even if the regime is strongly trending.
+        contrarian_types = {"mean_reversion", "contrarian", "fade", "counter_trend"}
+
         # Derive regime direction bias (default for all non-explicit strategies)
         overall_regime = (regime_data or {}).get("overall_regime", "unknown")
         regime_conf    = (regime_data or {}).get("overall_confidence", 0.0)
@@ -278,9 +285,20 @@ class DecisionEngine:
             direction = "long"
         elif strategy_type in short_types:
             direction = "short"
+        elif strategy_type in contrarian_types:
+            # ★ H14: use the strategy's own direction, never the regime trend.
+            # Fall back to "long" only if direction missing (shouldn't happen
+            # after H17 fix ensures strategy_identifier sets direction).
+            direction = params.get("direction") or "long"
+            if not params.get("direction"):
+                logger.warning(
+                    "Contrarian strategy %s missing direction param -- "
+                    "defaulting to long. Check strategy_identifier.",
+                    strategy_type,
+                )
         else:
             # breakout, trend_following, swing_trading, concentrated_bet,
-            # mean_reversion, scalping, funding_arb, delta_neutral, etc.
+            # scalping, funding_arb, delta_neutral, etc.
             # — follow the regime when confident, else use stored param
             direction = params.get("direction") or regime_default
         strategy["_decision_side"] = direction

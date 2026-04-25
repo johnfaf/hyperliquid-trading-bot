@@ -220,9 +220,10 @@ class TestApplyExecutionPenalties:
         assert penalised[0].penalised_price < 50000.0
 
     def test_delay_applied(self):
+        from src.discovery.golden_wallet import EXECUTION_DELAY_MS
         fill = _make_fill(time_ms=1_000_000)
         penalised = apply_execution_penalties([fill])
-        assert penalised[0].delayed_time_ms == 1_000_100
+        assert penalised[0].delayed_time_ms == 1_000_000 + EXECUTION_DELAY_MS
 
     def test_closing_fill_pnl_reduced(self):
         """A profitable closing fill should have lower penalised PnL."""

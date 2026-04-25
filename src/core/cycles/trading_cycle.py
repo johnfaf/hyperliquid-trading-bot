@@ -192,6 +192,8 @@ def _reconcile_regimes(regime_data: dict, container) -> dict:
 
     pred_regime = pred.get("regime", "neutral")           # crash / neutral / bullish
     pred_conf = float(pred.get("confidence", 0))
+    pred_synthetic = bool(pred.get("synthetic_warm_start", False))
+    pred_training_source = pred.get("training_source", "unknown")
     det_regime = regime_data.get("overall_regime", "unknown")  # trending_up / trending_down / ranging / volatile / ...
     det_conf = float(regime_data.get("overall_confidence", 0))
 
@@ -204,6 +206,8 @@ def _reconcile_regimes(regime_data: dict, container) -> dict:
     regime_data["detector_regime"] = det_regime
     regime_data["detector_confidence"] = det_conf
     regime_data["regime_agreement"] = agree
+    regime_data["forecaster_training_source"] = pred_training_source
+    regime_data["forecaster_synthetic_warm_start"] = pred_synthetic
 
     if not agree and min(pred_conf, det_conf) >= 0.5:
         # Conservative policy: if forecaster says crash, override to crash-equivalent.
@@ -213,7 +217,13 @@ def _reconcile_regimes(regime_data: dict, container) -> dict:
         # and dragging every signal's confidence -0.07 via macro overlay.
         # A 75% bar requires the forecaster to be meaningfully confident
         # before it can veto the consensus detector read.
-        if pred_regime == "crash" and pred_conf >= 0.75:
+        if pred_synthetic and pred_regime == "crash":
+            logger.info(
+                "  REGIME DISAGREEMENT: detector=%s (%.0f%%) vs forecaster=%s "
+                "(%.0f%%, source=%s) -- synthetic warm-start cannot override detector",
+                det_regime, det_conf * 100, pred_regime, pred_conf * 100, pred_training_source,
+            )
+        elif pred_regime == "crash" and pred_conf >= 0.75:
             logger.warning(
                 "  REGIME DISAGREEMENT: detector=%s (%.0f%%) vs forecaster=%s (%.0f%%) -- "
                 "applying crash-protective override",
@@ -1480,11 +1490,30 @@ def _run_alpha_arena(container, regime_data):
                             live_signal = _apply_dynamic_risk_policy(container, live_signal, regime_data=regime_data)
                             sl, tp = live_signal.risk.resolve_trigger_prices(price, side, live_signal.leverage)
                             position_pct = 0.05 * conf
+                            # ★ M17 FIX: for live trading, size against real account value
+                            # not PAPER_TRADING_INITIAL_BALANCE constant. For paper mode,
+                            # fall back to the constant as before.
+                            live_active = is_live_trading_active(container)
                             if getattr(container, "kelly_sizer", None) or getattr(container, "rl_sizer", None):
                                 try:
-                                    account_balance = float(
-                                        getattr(config, "PAPER_TRADING_INITIAL_BALANCE", 10_000.0)
-                                    )
+                                    if live_active and container.live_trader is not None:
+                                        try:
+                                            fm = None
+                                            if hasattr(container.live_trader, "get_free_margin"):
+                                                fm = container.live_trader.get_free_margin()
+                                            if fm is None and hasattr(container.live_trader, "get_account_value"):
+                                                fm = container.live_trader.get_account_value()
+                                            account_balance = float(fm) if fm is not None else float(
+                                                getattr(config, "PAPER_TRADING_INITIAL_BALANCE", 10_000.0)
+                                            )
+                                        except Exception:
+                                            account_balance = float(
+                                                getattr(config, "PAPER_TRADING_INITIAL_BALANCE", 10_000.0)
+                                            )
+                                    else:
+                                        account_balance = float(
+                                            getattr(config, "PAPER_TRADING_INITIAL_BALANCE", 10_000.0)
+                                        )
                                     sizing = _get_dynamic_sizing(
                                         container,
                                         sig["strategy_type"],
@@ -1498,8 +1527,27 @@ def _run_alpha_arena(container, regime_data):
                                         position_pct = sizing.position_pct
                                 except Exception as exc:
                                     logger.debug("  Arena champion sizing failed: %s", exc)
-                            if is_live_trading_active(container):
+                            if live_active:
                                 live_signal.position_pct = position_pct
+                                # ★ H18 FIX: Arena signals previously bypassed the
+                                # firewall entirely on the live path. Run the same
+                                # validation LCRS does (line ~1063) so cooldowns,
+                                # per-coin limits, source caps, side policies, and
+                                # event risk gates all apply to Arena signals.
+                                arena_firewall = getattr(container, "firewall", None)
+                                if arena_firewall:
+                                    open_trades = get_execution_open_positions(container)
+                                    passed, reason = arena_firewall.validate(
+                                        live_signal,
+                                        regime_data=regime_data,
+                                        open_positions=open_trades,
+                                    )
+                                    if not passed:
+                                        logger.info(
+                                            "  Arena firewall rejected %s %s: %s",
+                                            sig["coin"], side, reason,
+                                        )
+                                        continue
                                 _execute_signal_live(container, live_signal, "ARENA")
                                 continue
                             if account is None:

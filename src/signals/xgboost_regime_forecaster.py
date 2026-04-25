@@ -26,6 +26,7 @@ If not installed, falls back to the weighted-signal PredictiveRegimeForecaster.
 # ruff: noqa: E402
 
 import logging
+import json
 import os
 import time
 from typing import Dict, Optional
@@ -141,6 +142,19 @@ class XGBoostRegimeForecaster:
         # Model state
         self.model = None
         self._last_train_ts = 0
+        self._model_training_source = "untrained"
+        self._model_observed_rows = 0
+        self._model_uses_synthetic_warm_start = False
+        try:
+            self._synthetic_max_confidence = float(
+                cfg.get(
+                    "synthetic_max_confidence",
+                    os.environ.get("XGB_SYNTHETIC_MAX_CONFIDENCE", 0.60),
+                )
+            )
+        except (TypeError, ValueError):
+            self._synthetic_max_confidence = 0.60
+        self._synthetic_max_confidence = max(0.0, min(0.74, self._synthetic_max_confidence))
 
         # Ensure models dir exists
         Path(self.model_path).parent.mkdir(parents=True, exist_ok=True)
@@ -212,7 +226,10 @@ class XGBoostRegimeForecaster:
                 proba = self.model.predict_proba(X)[0]
                 pred_class = int(np.argmax(proba))
                 regime = REGIME_NAMES[pred_class]
-                confidence = float(proba[pred_class])
+                raw_confidence = float(proba[pred_class])
+                confidence = raw_confidence
+                if self._model_uses_synthetic_warm_start:
+                    confidence = min(confidence, self._synthetic_max_confidence)
 
                 result = {
                     "signal": confidence if regime == "bullish"
@@ -220,7 +237,11 @@ class XGBoostRegimeForecaster:
                               else 0.0,
                     "regime": regime,
                     "confidence": round(confidence, 4),
+                    "raw_confidence": round(raw_confidence, 4),
                     "model": "xgboost",
+                    "training_source": self._model_training_source,
+                    "observed_training_rows": int(self._model_observed_rows),
+                    "synthetic_warm_start": bool(self._model_uses_synthetic_warm_start),
                     "probabilities": {
                         "crash": round(float(proba[0]), 4),
                         "neutral": round(float(proba[1]), 4),
@@ -237,8 +258,8 @@ class XGBoostRegimeForecaster:
                 self.prediction_cache[coin] = {"data": result, "ts": now}
 
                 logger.info(
-                    "XGBoost Forecaster %s -> %s (conf=%.1f%%, signal=%.3f)",
-                    coin, regime, confidence * 100, result["signal"],
+                    "XGBoost Forecaster %s -> %s (conf=%.1f%%, signal=%.3f, source=%s)",
+                    coin, regime, confidence * 100, result["signal"], self._model_training_source,
                 )
 
                 # Store prediction for future training
@@ -251,6 +272,9 @@ class XGBoostRegimeForecaster:
 
         # Fallback
         base["model"] = "weighted_signal"
+        base.setdefault("training_source", "fallback")
+        base.setdefault("observed_training_rows", int(self._model_observed_rows))
+        base.setdefault("synthetic_warm_start", False)
         self.prediction_cache[coin] = {"data": base, "ts": now}
 
         # Still store for training (using the fallback's regime label)
@@ -445,6 +469,7 @@ class XGBoostRegimeForecaster:
 
         # Time-series walk-forward validation (if enough chronologically-labeled data)
         cv_mean = 0.0
+        cv_failed = False
         try:
             from sklearn.metrics import accuracy_score
             from sklearn.model_selection import TimeSeriesSplit
@@ -469,8 +494,22 @@ class XGBoostRegimeForecaster:
                     float(np.std(fold_scores)),
                     len(fold_scores),
                 )
+            else:
+                cv_failed = True
+                logger.warning("XGBoost walk-forward: no folds completed")
         except Exception as exc:
-            logger.debug("Walk-forward validation skipped: %s", exc)
+            # ★ M9 FIX: was logger.debug — CV failure should be loud, not silent
+            cv_failed = True
+            logger.warning("XGBoost walk-forward validation FAILED: %s", exc)
+
+        # ★ M9 FIX: refuse to save a model with no validation evidence
+        if cv_failed:
+            logger.error(
+                "XGBoost training complete but CV validation failed -- "
+                "NOT saving model to avoid deploying unvalidated predictions"
+            )
+            self.model = None
+            return None
 
         # Train on full data
         self.model.fit(X, y)
@@ -485,6 +524,9 @@ class XGBoostRegimeForecaster:
         metrics = {
             "samples": len(y),
             "cv_accuracy": round(cv_mean, 4),
+            "training_source": self._model_training_source,
+            "observed_training_rows": int(self._model_observed_rows),
+            "synthetic_warm_start": bool(self._model_uses_synthetic_warm_start),
             "feature_importance": dict(zip(
                 FEATURE_NAMES,
                 [round(float(v), 4) for v in self.model.feature_importances_],
@@ -500,6 +542,7 @@ class XGBoostRegimeForecaster:
         """
         X_rows = []
         y_rows = []
+        observed_count = 0
 
         try:
             from src.data import database as db
@@ -522,32 +565,51 @@ class XGBoostRegimeForecaster:
                 """).fetchall()
 
             if rows:
+                # ★ H9 FIX: defensive row access — works whether connection
+                # returns sqlite3.Row, dict, or tuple cursor
+                def _row_get(r, name: str, idx: int):
+                    try:
+                        return r[name]
+                    except (TypeError, IndexError, KeyError):
+                        try:
+                            return r[idx]
+                        except Exception:
+                            return 0
+
                 X_rows = np.array(
                     [
-                        [float(r[name]) for name in FEATURE_NAMES]
+                        [float(_row_get(r, name, i)) for i, name in enumerate(FEATURE_NAMES)]
                         for r in rows
                     ],
                     dtype=np.float32,
                 )
                 y_rows = np.array(
-                    [int(r["regime_label"]) for r in rows],
+                    [int(_row_get(r, "regime_label", len(FEATURE_NAMES))) for r in rows],
                     dtype=np.int32,
                 )
+                observed_count = len(y_rows)
+                self._model_observed_rows = int(observed_count)
                 logger.info(
                     "Loaded %d observed-label rows from regime_history for training",
                     len(y_rows),
                 )
 
                 if len(y_rows) >= self.min_samples:
+                    self._model_training_source = "observed"
+                    self._model_uses_synthetic_warm_start = False
                     return X_rows, y_rows
 
         except Exception as exc:
             logger.debug("Could not load training data from DB: %s", exc)
 
         # Fallback: synthetic warm-start with realistic distributions
+        observed_count = len(y_rows) if isinstance(y_rows, np.ndarray) else observed_count
+        self._model_observed_rows = int(observed_count)
+        self._model_training_source = "mixed_synthetic" if observed_count > 0 else "synthetic"
+        self._model_uses_synthetic_warm_start = True
         logger.info(
             "Using synthetic warm-start (%d DB rows, need %d)",
-            len(y_rows) if isinstance(y_rows, np.ndarray) else 0,
+            observed_count,
             self.min_samples,
         )
         n = 2000
@@ -637,12 +699,31 @@ class XGBoostRegimeForecaster:
 
     # ─── Model Persistence ──────────────────────────────────────────
 
+    def _model_metadata_path(self) -> str:
+        return f"{self.model_path}.meta.json"
+
     def _save_model(self):
         """Save trained model to disk."""
         if self.model is None:
             return
+        if self._model_uses_synthetic_warm_start:
+            logger.warning(
+                "XGBoost warm-start model not saved (source=%s, observed_rows=%d); "
+                "waiting for observed regime_history labels before persisting.",
+                self._model_training_source,
+                self._model_observed_rows,
+            )
+            return
         try:
             self.model.save_model(self.model_path)
+            metadata = {
+                "training_source": self._model_training_source,
+                "observed_training_rows": int(self._model_observed_rows),
+                "synthetic_warm_start": bool(self._model_uses_synthetic_warm_start),
+                "saved_at_epoch_s": time.time(),
+            }
+            with open(self._model_metadata_path(), "w", encoding="utf-8") as fh:
+                json.dump(metadata, fh, sort_keys=True)
             logger.info("XGBoost model saved to %s", self.model_path)
         except Exception as e:
             logger.error("Failed to save XGBoost model: %s", e)
@@ -655,10 +736,41 @@ class XGBoostRegimeForecaster:
             self.model = xgb.XGBClassifier()
             self.model.load_model(self.model_path)
             self._last_train_ts = os.path.getmtime(self.model_path)
+            metadata = {}
+            meta_path = self._model_metadata_path()
+            if os.path.exists(meta_path):
+                with open(meta_path, "r", encoding="utf-8") as fh:
+                    metadata = json.load(fh)
+            else:
+                metadata = {
+                    "training_source": "unknown_legacy",
+                    "observed_training_rows": 0,
+                    "synthetic_warm_start": True,
+                }
+                logger.warning(
+                    "XGBoost model %s has no metadata sidecar; treating as "
+                    "non-authoritative until retrained on observed labels.",
+                    self.model_path,
+                )
+            self._model_training_source = str(metadata.get("training_source") or "unknown")
+            self._model_observed_rows = int(metadata.get("observed_training_rows") or 0)
+            raw_synthetic = metadata.get(
+                "synthetic_warm_start",
+                self._model_training_source != "observed",
+            )
+            if isinstance(raw_synthetic, str):
+                self._model_uses_synthetic_warm_start = raw_synthetic.strip().lower() in {
+                    "1", "true", "yes", "on",
+                }
+            else:
+                self._model_uses_synthetic_warm_start = bool(raw_synthetic)
             logger.info("XGBoost model loaded from %s", self.model_path)
         except Exception as e:
             logger.debug("Could not load XGBoost model: %s", e)
             self.model = None
+            self._model_training_source = "untrained"
+            self._model_observed_rows = 0
+            self._model_uses_synthetic_warm_start = False
 
     # ─── Stats ──────────────────────────────────────────────────────
 
@@ -670,4 +782,7 @@ class XGBoostRegimeForecaster:
             "last_train_ts": self._last_train_ts,
             "has_xgboost": HAS_XGBOOST,
             "cache_size": len(self.prediction_cache),
+            "training_source": self._model_training_source,
+            "observed_training_rows": int(self._model_observed_rows),
+            "synthetic_warm_start": bool(self._model_uses_synthetic_warm_start),
         }

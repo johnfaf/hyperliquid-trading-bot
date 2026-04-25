@@ -170,13 +170,28 @@ class StrategyIdentifier:
         return None
 
     def _detect_mean_reversion(self, positions, pos_analysis, trade_analysis, address) -> Optional[Dict]:
-        """Detect mean reversion strategy (buying dips / selling rips)."""
+        """Detect mean reversion strategy (buying dips / selling rips).
+
+        ★ H17 FIX: now sets parameters["direction"] and parameters["coins"]
+        so downstream decision_engine has the data it needs. Without these,
+        decision_engine.decide either skips the strategy (missing coins) or
+        triggers the regime-direction override (missing direction) which
+        can flip a mean-reversion signal the wrong way in trending regimes.
+
+        ★ M13 FIX: bands scale by realized volatility (ATR%) instead of
+        fixed 2% thresholds. Low-vol days no longer produce zero signals
+        and high-vol days no longer classify every entry as mean reversion.
+        """
         if not positions:
             return None
 
         # Look for positions entered against recent price moves
         reversion_signals = 0
         total_checked = 0
+        # Track which direction dominates so we can set params["direction"]
+        long_reversions = 0
+        short_reversions = 0
+        reverted_coins: set = set()
 
         for pos in positions:
             coin = pos["coin"]
@@ -186,24 +201,51 @@ class StrategyIdentifier:
                 oracle = ctx.get("oracle_price", 0)
 
                 if mark and oracle and pos["entry_price"]:
+                    # ★ M13: scale threshold by coin volatility (ATR%)
+                    # Fall back to 2% if ATR unavailable.
+                    atr_pct = float(ctx.get("atr_pct", 0.02) or 0.02)
+                    # Mean reversion implies entry displaced by ~1-2× typical move
+                    band = max(0.005, min(atr_pct * 1.5, 0.05))  # clamp [0.5%, 5%]
+
                     # If long and entry is below current mark (bought the dip)
-                    if pos["side"] == "long" and pos["entry_price"] < mark * 0.98:
+                    if pos["side"] == "long" and pos["entry_price"] < mark * (1 - band):
                         reversion_signals += 1
+                        long_reversions += 1
+                        reverted_coins.add(coin)
                     # If short and entry is above current mark (sold the rip)
-                    elif pos["side"] == "short" and pos["entry_price"] > mark * 1.02:
+                    elif pos["side"] == "short" and pos["entry_price"] > mark * (1 + band):
                         reversion_signals += 1
+                        short_reversions += 1
+                        reverted_coins.add(coin)
                     total_checked += 1
 
         if total_checked > 0 and reversion_signals / total_checked > 0.5:
             confidence = min(0.85, 0.3 + (reversion_signals / total_checked) * 0.4 +
                            trade_analysis.get("win_rate", 0) * 0.2)
+            # ★ H17: determine dominant direction so downstream code has it
+            # If mix is tilted one way, that's the strategy's bias; if 50/50,
+            # we default to the direction of pos_analysis.bias or "long".
+            if long_reversions > short_reversions:
+                direction = "long"
+            elif short_reversions > long_reversions:
+                direction = "short"
+            else:
+                bias = pos_analysis.get("bias", "")
+                direction = "short" if "short" in bias else "long"
+
             return {
                 "type": "mean_reversion",
                 "description": STRATEGY_TYPES["mean_reversion"],
                 "confidence": confidence,
                 "parameters": {
+                    # ★ H17: coins and direction preserved so decision_engine
+                    # can route this strategy without skipping or flipping it
+                    "direction": direction,
+                    "coins": sorted(reverted_coins),
                     "reversion_pct": reversion_signals / total_checked,
                     "avg_leverage": pos_analysis.get("avg_leverage", 1),
+                    "long_reversions": long_reversions,
+                    "short_reversions": short_reversions,
                 },
                 "trader_address": address,
                 "metrics": {

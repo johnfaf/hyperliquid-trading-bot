@@ -34,9 +34,31 @@ logger = logging.getLogger("golden_wallet")
 
 # ─── Constants ───────────────────────────────────────────────────
 LOOKBACK_DAYS = 90
-EXECUTION_DELAY_MS = 100        # +100 ms assumed latency
-FEE_SLIPPAGE_BPS = 4.5          # 0.045% total (taker fee + slippage)
-PENALTY_FACTOR = 1 - FEE_SLIPPAGE_BPS / 10_000  # ~0.99955
+# ★ H19 FIX: previous values (100ms, 4.5 bps) were unrealistically friendly:
+#   - 100ms does not reflect copy-trade reality. In production you observe
+#     a leader's fill via userFills polling, then your scan interval
+#     (typically 15-30s), plus your own order round-trip.
+#   - 4.5 bps is roughly the HL taker fee alone (3.5 bps base); it does not
+#     include slippage, which for copy-trade fills typically adds another
+#     10-20 bps due to adverse selection (you fill when the price is already
+#     moving against you, because the leader moved it).
+#
+# New values: 15s delay + 15 bps total penalty. Both can be tuned via env
+# vars (HL_GOLDEN_EXEC_DELAY_MS, HL_GOLDEN_FEE_SLIPPAGE_BPS) so you can
+# recalibrate against observed live-vs-backtest performance over time.
+import os as _os
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(_os.environ.get(name, default) or default)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+EXECUTION_DELAY_MS = int(_env_float("HL_GOLDEN_EXEC_DELAY_MS", 15_000))    # 15 s copy-trade latency
+FEE_SLIPPAGE_BPS = _env_float("HL_GOLDEN_FEE_SLIPPAGE_BPS", 15.0)          # 0.15% taker + slippage
+PENALTY_FACTOR = 1 - FEE_SLIPPAGE_BPS / 10_000
 MIN_FILLS_FOR_EVAL = 30         # need at least 30 round-trips
 MAX_FILLS_FOR_EVAL = 3000       # cap: anything above this is not human-like
 GOLDEN_THRESHOLD = 0.0          # penalised equity must be net-positive

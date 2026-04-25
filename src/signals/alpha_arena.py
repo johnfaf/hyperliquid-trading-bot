@@ -307,13 +307,23 @@ class ConsensusEngine:
 
     Voting is weighted by each agent's ELO + track record.
     A signal needs >50% weighted approval to pass.
+
+    ★ H12 FIX: previously fell open to APPROVE with 70% confidence when
+    voters < MIN_VOTERS or total_weight <= 0. For live trading this meant
+    fresh deployments (all agents with <3 trades) produced 100% auto-approval
+    on every signal. Now fails CLOSED by default; can be overridden with
+    fail_open=True for explicit testing.
     """
 
     APPROVAL_THRESHOLD = 0.50   # Need 50%+ weighted votes to approve
     MIN_VOTERS = 3              # Need at least 3 agents to form consensus
 
-    def __init__(self):
+    def __init__(self, fail_open: bool = False):
         self.vote_history: List[Dict] = []
+        # ★ H12: default to fail-CLOSED (reject when quorum not reached).
+        # Set fail_open=True only for paper-mode testing or bootstrap periods.
+        self.fail_open = bool(fail_open)
+        self.insufficient_quorum_count = 0
 
     def get_consensus(self, signal: TradeSignal,
                        agents: List[ArenaAgent],
@@ -327,8 +337,25 @@ class ConsensusEngine:
         voters = self._select_voters(signal, agents)
 
         if len(voters) < self.MIN_VOTERS:
-            # Not enough voters — approve by default with reduced confidence
-            return True, signal.confidence * 0.7, []
+            # ★ H12 FIX: fail CLOSED by default. Previously returned
+            # (True, 0.7 * confidence) which silently approved every signal
+            # during bootstrap periods with no track-record voters.
+            self.insufficient_quorum_count += 1
+            if self.fail_open:
+                logger.warning(
+                    "Consensus: insufficient voters (%d < %d) for %s %s -- "
+                    "fail_open=True, approving with reduced confidence",
+                    len(voters), self.MIN_VOTERS,
+                    signal.side.value, signal.coin,
+                )
+                return True, signal.confidence * 0.7, []
+            logger.info(
+                "Consensus: insufficient voters (%d < %d) for %s %s -- "
+                "rejecting (fail-closed)",
+                len(voters), self.MIN_VOTERS,
+                signal.side.value, signal.coin,
+            )
+            return False, 0.0, []
 
         votes = []
         for agent in voters:
@@ -338,7 +365,21 @@ class ConsensusEngine:
         # Compute weighted consensus
         total_weight = sum(v.weight for v in votes)
         if total_weight <= 0:
-            return True, signal.confidence * 0.7, votes
+            # ★ H12 FIX: fail CLOSED when all voters have zero weight
+            self.insufficient_quorum_count += 1
+            if self.fail_open:
+                logger.warning(
+                    "Consensus: zero total weight for %s %s -- "
+                    "fail_open=True, approving with reduced confidence",
+                    signal.side.value, signal.coin,
+                )
+                return True, signal.confidence * 0.7, votes
+            logger.info(
+                "Consensus: zero total weight for %s %s -- "
+                "rejecting (fail-closed)",
+                signal.side.value, signal.coin,
+            )
+            return False, 0.0, votes
 
         weighted_approve = sum(
             v.weight * v.confidence for v in votes if v.vote == "approve"
@@ -754,15 +795,27 @@ class Backtester:
 
             tested_coins += 1
 
-            if agent.strategy_type == "lstm_direction" and self.lstm_agent:
-                try:
-                    self.lstm_agent.train(coin_candles)
-                except Exception as exc:
-                    logger.debug("LSTM backtest train skipped for %s: %s", coin, exc)
-
             train_end = int(n * train_pct)
             test_size = max(1, (n - train_end) // max(test_windows, 1))
             coin_trades = []
+
+            # ★ H13 FIX: train LSTM only on the TRAINING slice, not the full
+            # candle history. Previously `self.lstm_agent.train(coin_candles)`
+            # saw the entire series including test windows, invalidating the
+            # "out-of-sample" claim. Train on [:train_end] so the LSTM has
+            # never seen test-period data at prediction time.
+            if agent.strategy_type == "lstm_direction" and self.lstm_agent:
+                try:
+                    training_slice = coin_candles[:train_end]
+                    if len(training_slice) >= 50:
+                        self.lstm_agent.train(training_slice)
+                    else:
+                        logger.debug(
+                            "LSTM training slice for %s too short (%d < 50), skipping",
+                            coin, len(training_slice),
+                        )
+                except Exception as exc:
+                    logger.debug("LSTM backtest train skipped for %s: %s", coin, exc)
 
             for window in range(test_windows):
                 test_start = train_end + window * test_size
