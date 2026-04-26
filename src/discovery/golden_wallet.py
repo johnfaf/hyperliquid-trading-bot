@@ -520,6 +520,16 @@ def _equity_curve_to_daily_returns(equity_curve: List[float],
     Resample an intra-day equity curve into daily returns.
     Takes the last equity value for each calendar day and computes
     day-over-day percentage returns.
+
+    ★ M37 FIX: previously skipped no-trade days entirely, so a trader
+    who traded 60 days out of 365 returned ~60 daily returns -- and the
+    annualization at 365 periods/year overstated implied alpha by ~6x
+    because the no-return days that would dampen vol were missing.
+    Now we forward-fill the equity curve across every calendar day in
+    the [first, last] span and emit a 0% return for each padded day.
+    The resulting series feeds ``compute_sharpe`` (and through it the
+    canonical ``sharpe_daily`` helper) at the right periods_per_year
+    base.
     """
     if len(equity_curve) < 2 or len(timestamps) < 2:
         return []
@@ -534,12 +544,17 @@ def _equity_curve_to_daily_returns(equity_curve: List[float],
     if len(sorted_days) < 2:
         return []
 
-    daily_returns = []
-    for i in range(1, len(sorted_days)):
-        prev_eq = daily_equity[sorted_days[i - 1]]
-        curr_eq = daily_equity[sorted_days[i]]
-        if prev_eq > 0:
-            daily_returns.append((curr_eq - prev_eq) / prev_eq)
+    # ★ M37: pad missing calendar days with the prior day's equity so
+    # the resulting daily-returns series has a 0% entry for non-trading
+    # days instead of silently dropping them.
+    first_day, last_day = sorted_days[0], sorted_days[-1]
+    last_known = daily_equity[first_day]
+    daily_returns: List[float] = []
+    for day in range(int(first_day) + 1, int(last_day) + 1):
+        curr_eq = daily_equity.get(day, last_known)
+        if last_known > 0:
+            daily_returns.append((curr_eq - last_known) / last_known)
+        last_known = curr_eq
 
     return daily_returns
 
@@ -681,10 +696,35 @@ def evaluate_wallet(address: str, bot_score: int = 0,
     best_coin = max(coin_pnl, key=coin_pnl.get) if coin_pnl else ""
     worst_coin = min(coin_pnl, key=coin_pnl.get) if coin_pnl else ""
 
-    # Win rate on closing fills
+    # Win rate on closing TRADES (not fills).
+    # ★ M38 FIX: previously a single trade closed in 3 partial fills was
+    # counted as 3 closing fills, inflating the sample size 3x for
+    # partial-fill-heavy wallets and making win_rate look more
+    # statistically robust than it really was.  Aggregate consecutive
+    # closing fills on the same (coin, side) into a single trade outcome
+    # before counting wins.  Use the same chronologically-sorted fill
+    # iteration that compute_avg_hold_time_hours uses so a flip is
+    # treated as exactly one outcome boundary.
     closing_fills = [f for f in penalised if f.penalised_pnl != 0]
-    wins = len([f for f in closing_fills if f.penalised_pnl > 0])
-    win_rate = (wins / len(closing_fills) * 100) if closing_fills else 0.0
+    sorted_closing = sorted(closing_fills, key=lambda f: int(f.time_ms))
+    aggregated_pnls: List[float] = []
+    current_key: Optional[Tuple[str, str]] = None
+    current_pnl = 0.0
+    for f in sorted_closing:
+        key = (f.coin, f.side)
+        if current_key is None:
+            current_key = key
+            current_pnl = f.penalised_pnl
+        elif key == current_key:
+            current_pnl += f.penalised_pnl
+        else:
+            aggregated_pnls.append(current_pnl)
+            current_key = key
+            current_pnl = f.penalised_pnl
+    if current_key is not None:
+        aggregated_pnls.append(current_pnl)
+    wins = sum(1 for p in aggregated_pnls if p > 0)
+    win_rate = (wins / len(aggregated_pnls) * 100) if aggregated_pnls else 0.0
 
     # Trades per day (based on actual time span, not raw count)
     if len(fills) >= 2:
@@ -717,13 +757,34 @@ def evaluate_wallet(address: str, bot_score: int = 0,
         )
 
     # Golden = penalised equity still positive AND curve trending up
-    # AND passes the superhuman reality check
+    # AND passes the superhuman reality check.
+    # ★ H32 FIX: previously compared first_third_avg to last_third_avg,
+    # which was too permissive -- a wallet that lost early then recovered
+    # to flat (e.g. first_third_avg ~$7k, last_third_avg ~$10k) was
+    # tagged GOLDEN despite breaking even overall.  Now require:
+    #   * last_third_max > first_third_max (real progress, not just
+    #     mean-reversion to start)
+    #   * positive linear-regression slope across the full equity curve
+    #     OR last point clearly above start by a configurable margin
     is_golden = False
     if not superhuman and pen_total > GOLDEN_THRESHOLD and len(pen_curve) > 10:
         split = len(pen_curve) // 3
-        first_third_avg = sum(pen_curve[:split]) / split if split > 0 else 0.0
-        last_third_avg = sum(pen_curve[-split:]) / split if split > 0 else 0.0
-        is_golden = last_third_avg > first_third_avg and pen_curve[-1] > pen_curve[0]
+        if split > 0:
+            first_third_max = max(pen_curve[:split])
+            last_third_max = max(pen_curve[-split:])
+            # Linear regression slope of equity vs index.  Pure-Python so we
+            # don't drag numpy in for a 30-line check.
+            n = len(pen_curve)
+            mean_x = (n - 1) / 2.0
+            mean_y = sum(pen_curve) / n
+            num = sum((i - mean_x) * (pen_curve[i] - mean_y) for i in range(n))
+            den = sum((i - mean_x) ** 2 for i in range(n)) or 1.0
+            slope = num / den
+            is_golden = (
+                last_third_max > first_third_max
+                and slope > 0
+                and pen_curve[-1] > pen_curve[0]
+            )
 
     # Compute avg hold time from raw fills (before penalisation, same timestamps)
     avg_hold_hours = compute_avg_hold_time_hours(fills)

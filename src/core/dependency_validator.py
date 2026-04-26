@@ -110,11 +110,23 @@ def _is_feature_enabled(feature_name: str, config_module=None) -> bool:
         return True  # no config flag → always check
 
     if config_module is None:
-        # Try to import the project config
+        # Try to import the project config.
+        # ★ L13 FIX: previously this caught ImportError only, which masked
+        # SyntaxError, AttributeError, and other config-load failures
+        # behind "assume enabled" -- a syntax error in config.py turned the
+        # validator dramatically more aggressive than usual.  Catch any
+        # import-time exception and log loudly so the operator can see why
+        # the validator fell back to assume-enabled.
         try:
             import config as config_module  # noqa: F811
-        except ImportError:
-            return True  # can't read config → assume enabled, validate anyway
+        except Exception as exc:  # noqa: BLE001 -- intentional broad catch
+            logger.warning(
+                "dependency_validator: config import failed (%s: %s) -- "
+                "assuming feature '%s' is enabled and validating anyway. "
+                "Fix config.py to silence this warning.",
+                type(exc).__name__, exc, feature_name,
+            )
+            return True
 
     return bool(getattr(config_module, flag, False))
 

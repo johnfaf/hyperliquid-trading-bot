@@ -379,10 +379,22 @@ class OptionsFlowScanner:
             self._last_trade_fetch_success[currency] = True
             for t in data["trades"]:
                 inst_name = t.get("instrument_name", "")
-                # Parse instrument name: BTC-28MAR26-90000-C
+                # Parse instrument name: BTC-28MAR26-90000-C, or fractional
+                # strikes like BTC-28MAR26-90000d5-C ("d5" = .5).
                 parts = inst_name.split("-")
                 if len(parts) >= 4:
-                    strike = float(parts[2]) if parts[2].isdigit() else 0
+                    # ★ M36 FIX: previously ``parts[2].isdigit()`` rejected
+                    # "90000d5" entirely so strike fell back to 0 and
+                    # downstream moneyness/direction tagging went wrong.
+                    # Deribit's ``d`` separator denotes the fractional part
+                    # (e.g. "90000d5" = 90000.5).  Convert it before parsing.
+                    raw_strike = parts[2]
+                    try:
+                        strike = float(raw_strike.replace("d", ".")) if any(
+                            ch.isdigit() for ch in raw_strike
+                        ) else 0.0
+                    except (TypeError, ValueError):
+                        strike = 0.0
                     opt_type = "call" if parts[3] == "C" else "put"
                     expiry_str = parts[1]
                 else:
@@ -392,9 +404,24 @@ class OptionsFlowScanner:
 
                 price_usd = float(t.get("price", 0))
                 amount = float(t.get("amount", 0))
-                # Deribit prices are in BTC for BTC options
+                # Deribit prices are in BTC for BTC options.
+                # ★ H31 FIX: previously fell back to ``price_usd * amount``
+                # (no spot multiplier) when spot fetch returned 0, which
+                # produced a notional in BTC/ETH instead of USD.  Downstream
+                # tier thresholds (MEGA_BLOCK / BLOCK / SWEEP / LARGE) and
+                # MIN_NOTIONAL are USD, so those fills got classified at the
+                # wrong tier and could pass gates they shouldn't.  Now we
+                # SKIP the fill when spot is unavailable -- a missing-unit
+                # signal is much safer than a wrong-unit signal.
                 spot = self.get_spot_price(currency)
-                notional = price_usd * amount * spot if spot > 0 else price_usd * amount
+                if spot <= 0:
+                    logger.debug(
+                        "Skipping %s trade: spot price unavailable, refusing to "
+                        "produce wrong-unit notional",
+                        inst_name,
+                    )
+                    continue
+                notional = price_usd * amount * spot
 
                 trades.append({
                     "instrument": inst_name,
@@ -473,14 +500,49 @@ class OptionsFlowScanner:
         else:
             tier = "NORMAL"
 
-        # Flow direction
-        # Buy call or Sell put = bullish; Buy put or Sell call = bearish
+        # Flow direction.
+        # Buy call or Sell put = bullish; Buy put or Sell call = bearish.
+        # ★ M35 FIX: large block trades go through RFQ/negotiation and the
+        # recorded ``side`` field reflects whichever party logged the trade
+        # -- not necessarily the demand side.  For BLOCK / MEGA_BLOCK
+        # tiers we cross-check against price impact (trade vs mark): if
+        # the trade printed materially above mark, that's "lifted on the
+        # offer" (buy demand) regardless of the side label; below mark is
+        # "hit the bid" (sell pressure).  When the cross-check disagrees
+        # with the recorded side, we downgrade to ``neutral`` rather than
+        # fight ourselves.
         if (side == "buy" and opt_type == "call") or (side == "sell" and opt_type == "put"):
             direction = "bullish"
         elif (side == "buy" and opt_type == "put") or (side == "sell" and opt_type == "call"):
             direction = "bearish"
         else:
             direction = "neutral"
+
+        if tier in ("BLOCK", "MEGA_BLOCK") and direction != "neutral":
+            try:
+                mark_px = float(trade.get("mark_price", 0) or 0)
+                trade_px = float(trade.get("price", 0) or 0)
+                if mark_px > 0 and trade_px > 0:
+                    px_impact = (trade_px - mark_px) / mark_px
+                    # Threshold: ~5% deviation from mark on options is
+                    # already a meaningful aggression signal.
+                    if px_impact > 0.05:
+                        impact_dir = "bullish" if opt_type == "call" else "bearish"
+                    elif px_impact < -0.05:
+                        impact_dir = "bearish" if opt_type == "call" else "bullish"
+                    else:
+                        impact_dir = direction  # ambiguous; trust label
+                    if impact_dir != direction:
+                        logger.debug(
+                            "classify_print: side=%s says %s but price impact "
+                            "(trade=%.4f, mark=%.4f, impact=%+0.1f%%) suggests %s "
+                            "for %s -- downgrading to neutral",
+                            side, direction, trade_px, mark_px,
+                            px_impact * 100, impact_dir, instrument,
+                        )
+                        direction = "neutral"
+            except (TypeError, ValueError, ZeroDivisionError):
+                pass
 
         # Strike vs spot (moneyness)
         spot = self.get_spot_price(underlying)
@@ -684,10 +746,20 @@ class OptionsFlowScanner:
                 continue
 
             conviction_pct = abs(net) / total if total > 0 else 0
+            # ★ L11 FIX: previously ``net == 0`` was classified as BEARISH
+            # (because the ternary fell to the else branch).  Net-zero flow
+            # means bullish and bearish notional cancelled exactly -- it
+            # should be NEUTRAL.
+            if net > 0:
+                direction = "BULLISH"
+            elif net < 0:
+                direction = "BEARISH"
+            else:
+                direction = "NEUTRAL"
             convictions.append({
                 "ticker": ticker,
                 "net_flow": net,
-                "direction": "BULLISH" if net > 0 else "BEARISH",
+                "direction": direction,
                 "bullish_notional": flow["bullish_notional"],
                 "bearish_notional": flow["bearish_notional"],
                 "total_prints": total_prints,
@@ -776,20 +848,39 @@ class OptionsFlowScanner:
         Get a flow-based trading signal for a ticker.
         Used by the main bot's strategy engine for integration.
         Returns signal dict or None if no strong conviction.
+
+        ★ L12 FIX: confidence used to be conviction_pct only -- a single
+        $5M trade and 50 prints totalling $5M reported the same
+        confidence, even though the latter has 50x the statistical
+        weight.  Now we down-weight by sample size: confidence is
+        scaled by sqrt(min(total_prints, 50)/50) so single-print
+        signals top out around conviction_pct * 0.14 while signals
+        with >=50 prints get the full conviction_pct.
+        ★ L11 propagation: NEUTRAL convictions (net=0) cannot produce
+        a directional signal; skip them.
         """
+        import math
         with self._lock:
             for conv in self.top_convictions:
                 try:
+                    direction = conv.get("direction")
                     if (
                         conv.get("ticker") == ticker
                         and conv.get("conviction_pct", 0) >= self.min_conviction_pct
+                        and direction in ("BULLISH", "BEARISH")
                     ):
+                        n_prints = int(conv.get("total_prints", 0) or 0)
+                        sample_weight = math.sqrt(min(n_prints, 50) / 50.0) if n_prints > 0 else 0.0
+                        raw_conf = float(conv.get("conviction_pct", 0)) / 100.0
+                        confidence = round(raw_conf * sample_weight, 4)
                         return {
                             "ticker": ticker,
-                            "side": "long" if conv.get("direction") == "BULLISH" else "short",
-                            "confidence": conv.get("conviction_pct", 0) / 100,
+                            "side": "long" if direction == "BULLISH" else "short",
+                            "confidence": confidence,
+                            "raw_conviction": raw_conf,
+                            "sample_weight": round(sample_weight, 4),
                             "net_flow": conv.get("net_flow", 0),
-                            "total_prints": conv.get("total_prints", 0),
+                            "total_prints": n_prints,
                             "source": "options_flow",
                         }
                 except (KeyError, TypeError) as e:

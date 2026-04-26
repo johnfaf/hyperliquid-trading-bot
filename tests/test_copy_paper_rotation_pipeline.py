@@ -172,12 +172,18 @@ def test_copy_trader_auto_pauses_new_entries_when_copy_book_is_bad(monkeypatch):
 
     monkeypatch.setattr("src.trading.copy_trader.db.get_paper_account", lambda: {"balance": 10_000.0})
     monkeypatch.setattr("src.trading.copy_trader.db.get_open_paper_trades", lambda: [])
+    # H28: evaluate_source_policy now requires the win-rate to be
+    # statistically distinguishable from a 50% null (p < 0.20).  Three
+    # losing trades have p=0.25 -- not significant.  Five gives p=0.0625
+    # which trips the gate, so bumped sample.
     monkeypatch.setattr(
         "src.trading.copy_trader.db.get_paper_trade_history",
         lambda limit=250: [
             {"side": "short", "pnl": -12.0, "metadata": {"source_key": "copy_trade:0xabc"}},
             {"side": "short", "pnl": -9.0, "metadata": {"source_key": "copy_trade:0xdef"}},
             {"side": "long", "pnl": -8.0, "metadata": {"source_key": "copy_trade:0xabc"}},
+            {"side": "short", "pnl": -7.0, "metadata": {"source_key": "copy_trade:0xabc"}},
+            {"side": "long", "pnl": -6.0, "metadata": {"source_key": "copy_trade:0xdef"}},
         ],
     )
     monkeypatch.setattr("src.trading.copy_trader.hl.get_all_mids", lambda: {"BTC": 100.0})

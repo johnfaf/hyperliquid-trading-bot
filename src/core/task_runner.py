@@ -20,6 +20,11 @@ Usage::
     runner.start_all()
     # ...
     runner.stop_all()   # graceful shutdown with thread join
+
+To mark a failure as unrecoverable (corrupt config, missing schema column,
+permanent permission error etc.), raise :class:`PermanentTaskFailure` from
+the task target.  The supervisor will mark the task FAILED and skip the
+auto-recovery cooldown -- no retries, no restarts.  ★ M41
 """
 import logging
 import threading
@@ -29,6 +34,16 @@ from typing import Callable, Dict, Optional
 
 logger = logging.getLogger(__name__)
 logger.addHandler(logging.NullHandler())
+
+
+class PermanentTaskFailure(Exception):
+    """★ M41: raise this from a task target to bypass retry + auto-recovery.
+
+    Use for failures that the runner cannot fix by retrying -- e.g. config
+    references a missing DB column, a required env var is unset, or a
+    schema migration is needed.  Transient errors should keep using
+    bare exceptions so the existing exponential-backoff retry path runs.
+    """
 
 
 # ---------------------------------------------------------------------------
@@ -279,6 +294,32 @@ class SupervisedTaskRunner:
                             task.name, exc,
                         )
 
+            except PermanentTaskFailure as exc:
+                # ★ M41: caller signalled the failure cannot be retried.
+                # Mark FAILED, skip cooldown, and break the supervised
+                # loop entirely -- a human needs to fix the underlying
+                # state before this task can resume.
+                with self._lock:
+                    task.consecutive_failures += 1
+                    task.last_error = f"PermanentTaskFailure: {str(exc)[:180]}"
+                    task.state = "failed"
+                logger.error(
+                    "Task '%s' raised PermanentTaskFailure -- not retrying: %s",
+                    task.name, exc,
+                )
+                if self._health:
+                    try:
+                        from src.core.health_registry import SubsystemState
+                        self._health.set_status(
+                            task.name, SubsystemState.FAILED,
+                            reason=f"permanent failure: {task.last_error}",
+                        )
+                    except Exception as inner:
+                        logger.debug(
+                            "health registry FAILED set_status failed for '%s': %s",
+                            task.name, inner,
+                        )
+                break  # explicit permanent stop, no auto-recovery
             except Exception as exc:
                 with self._lock:
                     task.consecutive_failures += 1

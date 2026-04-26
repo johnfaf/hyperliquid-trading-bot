@@ -2169,7 +2169,23 @@ class LiveTrader:
             return signal
 
         leverage = max(float(getattr(signal, "leverage", 1.0) or 1.0), 1.0)
-        stop_roe_pct = max(self._resolve_signal_stop_roe_pct(signal), 0.001)
+        # ★ H33 FIX: previously the floor was 0.001 (= 0.1% ROE).  With
+        # target_margin = risk_budget / stop_roe, a $100 risk_budget at the
+        # 0.001 floor produces a $100,000 target margin -- 1000x the
+        # intended risk.  A signal with a malformed/missing stop got sized
+        # roughly that much above ceiling.  Raise the floor to 0.01 (1% ROE
+        # min stop) so a corrupt signal can blow through risk-per-trade by
+        # at most 10x rather than 1000x, and log loudly when the floor is
+        # actually hit so the bad signals surface in production logs.
+        raw_stop_roe_pct = float(self._resolve_signal_stop_roe_pct(signal))
+        stop_roe_pct = max(raw_stop_roe_pct, 0.01)
+        if raw_stop_roe_pct < 0.01:
+            logger.warning(
+                "Signal stop_roe_pct=%.6f below safety floor (0.01) for %s -- "
+                "applying floor.  This usually indicates a missing or "
+                "malformed risk_policy.stop_roe_pct upstream.",
+                raw_stop_roe_pct, getattr(signal, "coin", "?"),
+            )
         confidence = max(0.0, min(float(getattr(signal, "confidence", 0.5) or 0.5), 1.0))
         policy = dict(source_policy or {})
         source_multiplier = max(0.0, float(policy.get("size_multiplier", 1.0) or 1.0))
@@ -2410,9 +2426,21 @@ class LiveTrader:
         try:
             if db.get_backend_name() != "dualwrite":
                 return False
-        except Exception:
+        except Exception as exc:
             # If the backend can't be introspected we don't want the
             # check itself to crash the trading loop — fail open.
+            # ★ M40 FIX: previously failed silently, hiding how often the
+            # dualwrite health gate was disabled by an introspection bug.
+            # Increment a counter and log a WARN so operators see the
+            # frequency of fail-opens and can investigate before they
+            # cumulatively erode the H4 protection.
+            self._dualwrite_introspection_fail_count = getattr(
+                self, "_dualwrite_introspection_fail_count", 0
+            ) + 1
+            logger.warning(
+                "dualwrite backend introspection failed (fail-open count=%d): %s",
+                self._dualwrite_introspection_fail_count, exc,
+            )
             return False
         try:
             healthy = db.dualwrite_is_healthy(

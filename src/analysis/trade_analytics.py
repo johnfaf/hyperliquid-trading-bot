@@ -127,7 +127,13 @@ def _finalize_bucket(label: str, bucket: Dict) -> Dict:
         "fees": fees,
         "slippage": slippage,
         "avg_pnl": round(net_pnl / count, 4) if count else 0.0,
-        "win_rate": round(wins / count, 4) if count else 0.0,
+        # ★ M31 FIX: previously divided wins by `count` (which includes
+        # zero-PnL trades).  Every other win_rate in the codebase
+        # (strategy_scorer, agent_scoring, replay_backtester, golden_wallet)
+        # uses ``wins / (wins + losses)`` -- excluding break-even fills.
+        # Using count made buckets with many zero-PnL closes look worse
+        # than they were.  Switch to the project-wide convention.
+        "win_rate": round(wins / (wins + losses), 4) if (wins + losses) else 0.0,
         "path_count": path_count,
         "avg_mfe_r": round(float(bucket.get("mfe_r_sum", 0.0) or 0.0) / path_count, 4)
         if path_count else 0.0,
@@ -401,20 +407,56 @@ def evaluate_source_policy(
             "metrics": metrics,
             "source": normalized,
         }
-    if win_rate < float(block_win_rate) and net_pnl <= float(block_net_pnl):
+
+    # ★ H28 FIX: previously a low win-rate run with negative net PnL
+    # automatically tripped the "blocked" / "degraded" gates even when the
+    # sample size was small enough that the underperformance was not
+    # statistically distinguishable from noise (mirror of the H16 fix in
+    # strategy_scorer).  Reuse the same exact two-sided binomial p-value
+    # against a 50% null so a 4/12 streak isn't treated identically to a
+    # 25/100 sustained underperformance.
+    pvalue = None
+    try:
+        wins = int(round(win_rate * count))
+        # Lazy import keeps this module importable in environments that
+        # don't have scipy installed; the helper has its own fallback.
+        from src.analysis.strategy_scorer import _binomial_pvalue_two_sided
+        pvalue = _binomial_pvalue_two_sided(wins, count, 0.5)
+    except Exception:
+        pvalue = None
+    metrics["win_rate_pvalue"] = round(pvalue, 4) if pvalue is not None else None
+    significant_underperformance = (
+        pvalue is None or pvalue < 0.20
+    )
+
+    if (
+        win_rate < float(block_win_rate)
+        and net_pnl <= float(block_net_pnl)
+        and significant_underperformance
+    ):
         return {
             "status": "blocked",
             "reason": (
+                f"Recent {normalized} trades are underperforming ({count} trades, "
+                f"win rate {win_rate:.0%}, net {net_pnl:.2f}, "
+                f"p={pvalue:.3f})" if pvalue is not None else
                 f"Recent {normalized} trades are underperforming ({count} trades, "
                 f"win rate {win_rate:.0%}, net {net_pnl:.2f})"
             ),
             "metrics": metrics,
             "source": normalized,
         }
-    if win_rate < float(degrade_win_rate) and net_pnl < 0:
+    if (
+        win_rate < float(degrade_win_rate)
+        and net_pnl < 0
+        and significant_underperformance
+    ):
         return {
             "status": "degraded",
             "reason": (
+                f"Recent {normalized} trades need caution ({count} trades, "
+                f"win rate {win_rate:.0%}, net {net_pnl:.2f}, "
+                f"p={pvalue:.3f})" if pvalue is not None else
                 f"Recent {normalized} trades need caution ({count} trades, "
                 f"win rate {win_rate:.0%}, net {net_pnl:.2f})"
             ),

@@ -124,10 +124,17 @@ def test_evaluate_short_side_policy_blocks_bad_short_run():
 
 
 def test_evaluate_source_policy_blocks_bad_copy_trades():
+    # H28: require enough trades that a 0% win rate is statistically
+    # distinguishable from a 50% null (binomial p-value < 0.20).  At
+    # n=3 the two-sided p is 0.25 -- too noisy to block on; at n>=5 it
+    # drops to 0.0625 and the gate fires correctly.  Bumped sample
+    # size accordingly.
     trades = [
         {"side": "short", "pnl": -10.0, "metadata": {"source_key": "copy_trade:0xabc"}},
         {"side": "short", "pnl": -8.0, "metadata": {"source_key": "copy_trade:0xdef"}},
         {"side": "long", "pnl": -9.0, "metadata": {"source_key": "copy_trade:0xabc"}},
+        {"side": "short", "pnl": -7.0, "metadata": {"source_key": "copy_trade:0xabc"}},
+        {"side": "long", "pnl": -6.0, "metadata": {"source_key": "copy_trade:0xdef"}},
         {"side": "short", "pnl": 1.0, "metadata": {"source_key": "strategy:trend"}},
     ]
 
@@ -141,8 +148,11 @@ def test_evaluate_source_policy_blocks_bad_copy_trades():
     )
 
     assert policy["status"] == "blocked"
-    assert policy["metrics"]["count"] == 3
-    assert policy["metrics"]["net_pnl"] == -27.0
+    assert policy["metrics"]["count"] == 5
+    assert policy["metrics"]["net_pnl"] == -40.0
+    # H28: pvalue is exposed in the metrics for downstream auditing.
+    assert policy["metrics"]["win_rate_pvalue"] is not None
+    assert policy["metrics"]["win_rate_pvalue"] < 0.20
 
 
 def test_evaluate_side_source_policy_blocks_bad_exact_copy_short_only():

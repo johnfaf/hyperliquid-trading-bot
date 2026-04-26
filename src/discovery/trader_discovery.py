@@ -712,6 +712,14 @@ class TraderDiscovery:
         for coin, coin_fills in by_coin.items():
             if len(coin_fills) < 10:
                 continue
+            # ★ H30 FIX: HL userFills returns rows in REVERSE chronological
+            # order (newest first).  The pair iteration below treats f1 as
+            # the EARLIER fill, so without sorting ascending the gap was
+            # negative for every pair and ``time_gap_ms >= MAX_GAP`` never
+            # tripped the filter -- arb-pattern detection silently degraded
+            # to "every fill counts."  Sort ascending so f2.time > f1.time
+            # holds and the gap filter actually rejects far-apart pairs.
+            coin_fills = sorted(coin_fills, key=lambda x: int(x.get("time", 0) or 0))
             candidate_pairs = 0
             match_pairs = 0
             for i in range(len(coin_fills) - 1):
@@ -818,19 +826,32 @@ class TraderDiscovery:
             bot_signals += 2
 
         # Signal 5: Uniform trade sizes (low coefficient of variation = robotic)
+        # ★ M39 FIX: previously sampled fills[:50] only -- a bot that
+        # randomizes after the first 50 fills (anti-detection) escaped this
+        # signal, while a human whose first 50 happened to be similar got
+        # false-positively flagged.  Sample evenly across the full fill
+        # history (random sample with seeded RNG for determinism on retest)
+        # so neither pattern can game the detector.
         if len(fills) > 20:
-            sizes = [f["size"] * f["price"] for f in fills[:50]]
-            if sizes:
-                try:
+            try:
+                import random as _random
+                rng = _random.Random(len(fills))  # deterministic per-trader
+                sample_size = min(100, len(fills))
+                sampled = rng.sample(fills, sample_size)
+                sizes = [f["size"] * f["price"] for f in sampled]
+                if sizes:
                     import numpy as np
-                    mean_size = np.mean(sizes)
-                    std_size = np.std(sizes)
+                    mean_size = float(np.mean(sizes))
+                    std_size = float(np.std(sizes, ddof=1)) if len(sizes) > 1 else 0.0
                     cv = std_size / mean_size if mean_size > 0 else 0
                     if cv < 0.05:
-                        logger.info("Bot signal: uniform trade sizes (CV=%.3f)", cv)
+                        logger.info(
+                            "Bot signal: uniform trade sizes (CV=%.3f, n=%d random sample)",
+                            cv, len(sizes),
+                        )
                         bot_signals += 2
-                except ImportError:
-                    pass  # numpy optional for this signal
+            except ImportError:
+                pass  # numpy optional for this signal
 
         # Signal 6: High liquidation rate = reckless / poorly coded algo
         if total > 10 and liquidations / total > 0.15:
