@@ -238,11 +238,34 @@ class CrossVenueConfirmation:
             rates = list(funding_rates.values())
             signal.funding_spread = max(rates) - min(rates)
 
-        # Weighted composite score
+        # Weighted composite score.
+        # ★ M44 FIX: previously ``min(1.0, signal.funding_spread * 1000)``
+        # saturated at 0.001/h spread (~876% annualized) -- realistic
+        # spreads of 0.0001 (0.01%/h ~ 87% annualized) scored only 0.1
+        # and the component became near-binary "any spread vs no spread"
+        # rather than a continuous signal.  Normalize against an annualized
+        # spread of 25% (0.25), which corresponds to a meaningful but not
+        # extreme cross-venue funding arb.  Spreads above that get a
+        # diminishing-returns log scaling so a 100% annualized opportunity
+        # is still distinguishable from a 25% one.
+        funding_spread_per_hour = max(0.0, float(signal.funding_spread))
+        # Annualize the per-hour spread for normalization.
+        annualized_spread = funding_spread_per_hour * 8760
+        if annualized_spread <= 0:
+            funding_score = 0.0
+        elif annualized_spread <= 0.25:
+            funding_score = annualized_spread / 0.25
+        else:
+            # Past 25% annualized: log-scale toward 1.0 so a 100% spread
+            # still beats a 30% spread but doesn't saturate.
+            import math
+            funding_score = min(
+                1.0, 0.7 + 0.3 * math.log10(1 + (annualized_spread - 0.25) / 0.25),
+            )
         signal.confirmation_score = (
             self.WEIGHTS["direction"] * signal.direction_agreement +
             self.WEIGHTS["volume"] * signal.volume_confirmation +
-            self.WEIGHTS["funding"] * min(1.0, signal.funding_spread * 1000) +
+            self.WEIGHTS["funding"] * funding_score +
             self.WEIGHTS["trader_overlap"] * (min(1.0, signal.trader_overlap / 5) if signal.trader_overlap else 0) +
             self.WEIGHTS["liquidity"] * signal.liquidity_score
         )
@@ -317,41 +340,57 @@ class CrossVenueConfirmation:
 
         opportunities = []
 
-        # Collect all coins available on at least 2 venues
+        # ★ H34 FIX: previously assumed every venue paid funding hourly, so
+        # ``annualized = spread * 8760`` worked.  Hyperliquid pays hourly,
+        # but Binance / Bybit / OKX perps pay every 8 hours and Lighter's
+        # cadence isn't documented in the adapter -- comparing raw rates
+        # across mixed periods is unit-mismatched arithmetic and silently
+        # fabricates arb opportunities.  Normalize every rate to a per-hour
+        # rate before comparing.  Adapters expose ``funding_period_hours``
+        # (default 8h, the most common perp cadence); HL adapter overrides
+        # to 1h, Lighter adapter to 1h.
         coin_venues: Dict[str, Dict[str, float]] = {}
+        venue_periods: Dict[str, float] = {}
         for venue_name, markets in self._market_data_cache.items():
+            adapter = self.adapters.get(venue_name)
+            period_hours = float(getattr(adapter, "funding_period_hours", 8.0) or 8.0)
+            venue_periods[venue_name] = period_hours
             for m in markets:
                 if m.coin not in coin_venues:
                     coin_venues[m.coin] = {}
                 if m.funding_rate != 0:
-                    coin_venues[m.coin][venue_name] = m.funding_rate
+                    # Normalize raw funding to a per-hour rate for the comparison.
+                    coin_venues[m.coin][venue_name] = m.funding_rate / period_hours
 
         for coin, venues in coin_venues.items():
             if len(venues) < 2:
                 continue
 
-            # Find max and min funding venues
+            # Find max and min funding venues (now in per-hour rate units).
             sorted_venues = sorted(venues.items(), key=lambda x: x[1])
-            lowest_venue, lowest_rate = sorted_venues[0]
-            highest_venue, highest_rate = sorted_venues[-1]
+            lowest_venue, lowest_per_hour = sorted_venues[0]
+            highest_venue, highest_per_hour = sorted_venues[-1]
 
-            spread = highest_rate - lowest_rate
+            spread = highest_per_hour - lowest_per_hour
             if spread < self.FUNDING_ARB_THRESHOLD:
                 continue
 
-            # Annualize: hourly rate × 8760 hours/year
+            # Annualize: per-hour spread × 8760 hours/year
             annualized = spread * 8760 * 100  # As percentage
 
             # Confidence based on spread magnitude and venue reliability
             confidence = min(1.0, spread / 0.005)  # Full confidence at 0.5%/hr spread
 
+            # Report rates in their native period for operator clarity
+            # (so an HL hourly 0.0001 doesn't look identical to a Binance
+            # 8-hourly 0.0001 on dashboards).
             opportunities.append(FundingArbitrageOpportunity(
                 coin=coin,
                 long_venue=lowest_venue,    # Go long where funding is lowest
                 short_venue=highest_venue,  # Go short where funding is highest
                 funding_spread_annualized=annualized,
-                long_funding_rate=lowest_rate,
-                short_funding_rate=highest_rate,
+                long_funding_rate=lowest_per_hour * venue_periods.get(lowest_venue, 1.0),
+                short_funding_rate=highest_per_hour * venue_periods.get(highest_venue, 1.0),
                 confidence=confidence,
             ))
 

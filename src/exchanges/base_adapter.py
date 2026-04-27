@@ -104,6 +104,14 @@ class BaseExchangeAdapter(ABC):
     the multi-venue trader discovery pipeline.
     """
 
+    # ★ H34 FIX: cross_venue.scan_funding_arb normalizes funding rates to a
+    # per-hour basis before comparing across venues.  The most common perp
+    # funding cadence (Binance, Bybit, OKX) is 8 hours -- so 8 is the safer
+    # default for adapters that don't know otherwise.  Hyperliquid and
+    # Lighter both override to 1.  When adding a new adapter, set this on
+    # the class to match the venue's funding cadence.
+    funding_period_hours: float = 8.0
+
     def __init__(self, name: str, base_url: str, config: Optional[Dict] = None):
         self.name = name
         self.base_url = base_url
@@ -192,13 +200,42 @@ class BaseExchangeAdapter(ABC):
         """
         Check if the exchange API is reachable and functioning.
         Default implementation tries to fetch market data.
+
+        ★ L14 FIX: previously this called ``get_available_markets()`` which
+        many adapters serve from a 5-minute cache.  A venue that went down
+        within the cache window kept reporting healthy until the cache
+        expired -- silent fail-open at exactly the wrong time.  Adapters
+        can now override ``ping()`` to make a fresh, uncached round-trip
+        (e.g. /info ping, /v1/exchange info).  When ``ping()`` is not
+        overridden, fall back to the cached path but log a one-shot
+        DEBUG so it's clear why.
         """
+        try:
+            ping = self.ping()
+            if ping is not None:
+                return bool(ping)
+        except Exception as exc:
+            self.logger.warning(f"Health-check ping failed for {self.name}: {exc}")
+            return False
+        # Adapter hasn't overridden ping(); fall back to cached probe.
         try:
             markets = self.get_available_markets()
             return len(markets) > 0
         except Exception as e:
             self.logger.warning(f"Health check failed for {self.name}: {e}")
             return False
+
+    def ping(self) -> Optional[bool]:
+        """★ L14: optional uncached liveness probe.
+
+        Adapters should override this to perform a minimal-cost call to
+        the exchange API that bypasses any local caches (e.g. fetching
+        a status endpoint, requesting a single market's mid price with
+        cache disabled).  Return True/False; return None to signal that
+        no fresh probe is implemented and ``health_check`` should fall
+        back to the cached path.
+        """
+        return None
 
     # ─── Stats ─────────────────────────────────────────
 

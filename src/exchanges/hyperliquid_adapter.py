@@ -59,6 +59,11 @@ class HyperliquidAdapter(BaseExchangeAdapter):
       - GET  https://stats-data.hyperliquid.xyz/Mainnet/leaderboard
     """
 
+    # ★ H34 FIX: HL pays funding hourly.  Used by cross_venue.scan_funding_arb
+    # to normalize rates across venues with different cadences before
+    # computing spreads.  See base_adapter for the canonical default (8h).
+    funding_period_hours: float = 1.0
+
     def __init__(self, config: Optional[Dict] = None):
         super().__init__(
             name="hyperliquid",

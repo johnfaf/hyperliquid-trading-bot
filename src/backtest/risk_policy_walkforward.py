@@ -100,7 +100,19 @@ def _compute_metrics(trades: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
     significant = False
     if count >= 5 and std_dev > 0:
         t_stat = avg_return / (std_dev / math.sqrt(count))
-        p_value = max(0.0, min(1.0, 2.0 * (1.0 - NormalDist().cdf(abs(t_stat)))))
+        # ★ M45 FIX: previously used Normal CDF for the t-test p-value.
+        # For small samples (count < 30) the normal approximation
+        # understates p-value, calling things significant that aren't:
+        # t=2.0 with 4 df is p~0.116 under t-distribution but p~0.046
+        # under normal CDF.  Use scipy's t-distribution survival
+        # function with count-1 degrees of freedom; fall back to the
+        # normal approximation only when scipy is unavailable.
+        try:
+            from scipy import stats as _scipy_stats
+            p_value = float(2.0 * _scipy_stats.t.sf(abs(t_stat), df=count - 1))
+        except Exception:
+            p_value = max(0.0, min(1.0, 2.0 * (1.0 - NormalDist().cdf(abs(t_stat)))))
+        p_value = max(0.0, min(1.0, p_value))
         significant = p_value < 0.05 and avg_return > 0
 
     avg_hold = sum(_hold_hours(row) for row in rows) / count if count else 0.0

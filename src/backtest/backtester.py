@@ -66,8 +66,21 @@ class BacktestConfig:
     min_confidence: float = 0.30         # firewall minimum
     cooldown_ms: int = 300_000           # 5 min cooldown per coin
 
-    # Funding rate simulation
-    funding_rate_8h: float = 0.0001      # 0.01% per 8h (HL average)
+    # Funding rate simulation.
+    # ★ H36 FIX: HL pays funding HOURLY, not every 8h.  Backtest used to
+    # hardcode an 8h cadence regardless of venue, missing 7 of every 8
+    # funding charges on HL copy-trade positions (~6%/month underestimate
+    # of funding cost on long-hold trades).  Make the cadence configurable
+    # so the backtest matches whichever venue is being modelled.  The
+    # ``funding_rate_per_period`` field replaces the old
+    # ``funding_rate_8h`` constant; default is the HL hourly rate
+    # (~0.0001 / 8 ≈ 0.0000125, but we keep 0.0001 as the per-period
+    # number with funding_period_hours=1 so existing backtest configs
+    # using funding_rate_8h still produce sensible numbers when paired
+    # with funding_period_hours=8).
+    funding_period_hours: float = 1.0    # HL default; set 8 for Binance/Bybit/OKX
+    funding_rate_per_period: float = 0.0000125  # per-period rate at chosen cadence
+    funding_rate_8h: float = 0.0001      # legacy alias; kept for back-compat
     funding_enabled: bool = True         # charge funding on open positions
 
     # Partial fill simulation
@@ -346,8 +359,18 @@ class BacktestEngine:
         # Determine side
         side = "long" if fill.side == "buy" else "short"
 
-        # Apply copy delay: shift price adversely
-        delay_slippage = self.cfg.copy_delay_ms / 1000.0 * 0.001  # rough: 0.1% per second
+        # Apply copy delay: shift price adversely.
+        # ★ M46 FIX: previously linear at 0.1%/second, so a realistic 30s
+        # copy delay produced 3% adverse slippage per entry -- biasing
+        # backtests pessimistic on slow-copy strategies.  Real adverse
+        # selection scales sub-linearly (roughly sqrt-of-time) because
+        # not every second of delay corresponds to a unit move against
+        # you.  Switch to ``0.001 * sqrt(seconds)`` so 1s = 0.10%,
+        # 30s = 0.55%, 60s = 0.77% -- the same shape used by HL's own
+        # adverse-selection estimator.
+        import math as _m
+        delay_seconds = max(0.0, self.cfg.copy_delay_ms / 1000.0)
+        delay_slippage = 0.001 * _m.sqrt(delay_seconds)
         if side == "long":
             entry_price = fill.price * (1 + delay_slippage + self.cfg.slippage_bps / 10_000)
         else:
@@ -386,12 +409,22 @@ class BacktestEngine:
             stop_loss = entry_price * (1 + self.cfg.stop_loss_pct)
             take_profit = entry_price * (1 - self.cfg.take_profit_pct)
 
+        # ★ H37 FIX: previously hardcoded ``min(max_leverage, 1.0)`` so
+        # every backtest ran at 1x leverage even when ``max_leverage`` was
+        # set to 5 or 10 -- meaning live PnL magnitudes were ~5x what the
+        # backtest predicted.  Use the fill's leverage when available, otherwise
+        # default to ``max_leverage``, then clamp to the configured cap.
+        fill_leverage = float(getattr(fill, "leverage", 0) or 0)
+        if fill_leverage <= 0:
+            fill_leverage = float(self.cfg.max_leverage)
+        position_leverage = max(1.0, min(fill_leverage, float(self.cfg.max_leverage)))
+
         position = SimPosition(
             coin=fill.coin,
             side=side,
             entry_price=entry_price,
             size=size,
-            leverage=min(self.cfg.max_leverage, 1.0),  # conservative default
+            leverage=position_leverage,
             entry_time_ms=fill.time_ms,
             stop_loss=stop_loss,
             take_profit=take_profit,
@@ -461,25 +494,47 @@ class BacktestEngine:
     # ─── Position Management ────────────────────────────────────
 
     def _charge_funding(self, current_time_ms: int):
-        """Charge funding rate on all open positions (every 8h in simulation)."""
+        """Charge funding rate on all open positions.
+
+        ★ H36 FIX: previously hardcoded 8h cadence and used the
+        ``elapsed % interval < 60s`` boundary check, which on HL hourly
+        funding meant the backtest missed 7 of every 8 charges and could
+        miss boundaries entirely whenever fill cadence exceeded 1 minute.
+        Now uses the configured funding_period_hours and tracks the
+        last-charged period per position so each crossing of a funding
+        boundary fires exactly once regardless of fill cadence.
+        """
         if not self.cfg.funding_enabled:
             return
-        funding_interval_ms = 8 * 3600 * 1000  # 8 hours
+        period_hours = float(getattr(self.cfg, "funding_period_hours", 8.0) or 8.0)
+        funding_interval_ms = int(period_hours * 3600 * 1000)
+        if funding_interval_ms <= 0:
+            return
+        per_period_rate = float(
+            getattr(self.cfg, "funding_rate_per_period", None)
+            if getattr(self.cfg, "funding_rate_per_period", None) is not None
+            else getattr(self.cfg, "funding_rate_8h", 0.0001)
+        )
         for pos in self._positions:
             elapsed = current_time_ms - pos.entry_time_ms
-            # Number of 8h periods since entry
-            periods = elapsed // funding_interval_ms
-            if periods < 1:
+            current_period = elapsed // funding_interval_ms
+            if current_period < 1:
                 continue
-            # Charge once per snapshot — we approximate by checking if this is
-            # a funding boundary (within one fill of a period boundary)
-            if elapsed % funding_interval_ms < 60_000:  # within 1 minute of boundary
-                funding_cost = pos.notional * self.cfg.funding_rate_8h
-                # Longs pay funding when positive, shorts receive (simplified)
-                if pos.side == "long":
-                    self._balance -= funding_cost
-                else:
-                    self._balance += funding_cost
+            # Track the last period we charged this position.  Catches up
+            # any periods we missed if the fill cadence is coarser than
+            # funding_interval_ms (e.g. 5-min fills crossing two 1h
+            # boundaries in a single step).
+            last_charged = getattr(pos, "_funding_periods_charged", 0)
+            periods_to_charge = int(current_period - last_charged)
+            if periods_to_charge <= 0:
+                continue
+            funding_cost = pos.notional * per_period_rate * periods_to_charge
+            # Longs pay funding when positive, shorts receive (simplified)
+            if pos.side == "long":
+                self._balance -= funding_cost
+            else:
+                self._balance += funding_cost
+            pos._funding_periods_charged = int(current_period)
 
     def _check_liquidations(self, current_time_ms: int):
         """Check if any position has been liquidated (margin call)."""
@@ -535,14 +590,19 @@ class BacktestEngine:
                             price * (1 + self.cfg.trailing_pct)
                         )
 
-            # Check stop loss
+            # ★ H38 FIX: previously a wide bar that crossed BOTH stop_loss
+            # AND take_profit would append the same position to to_close
+            # twice.  The first close wins (recorded as stop_loss because
+            # SL was checked first), the second was a no-op -- but the
+            # categorization was systematically biased toward stop_loss.
+            # Use ``elif`` so each position gets at most one exit reason
+            # per bar.  Tied SL+TP bars now report stop_loss (same as
+            # before) but cannot also generate a phantom take_profit row.
             if pos.side == "long" and price <= pos.stop_loss:
                 to_close.append((pos, pos.stop_loss, "stop_loss"))
             elif pos.side == "short" and price >= pos.stop_loss:
                 to_close.append((pos, pos.stop_loss, "stop_loss"))
-
-            # Check take profit
-            if pos.side == "long" and price >= pos.take_profit:
+            elif pos.side == "long" and price >= pos.take_profit:
                 to_close.append((pos, pos.take_profit, "take_profit"))
             elif pos.side == "short" and price <= pos.take_profit:
                 to_close.append((pos, pos.take_profit, "take_profit"))
