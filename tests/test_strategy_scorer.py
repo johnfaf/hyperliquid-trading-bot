@@ -35,6 +35,11 @@ def test_score_all_strategies_batches_persistence(monkeypatch):
     ]
 
     monkeypatch.setattr(db, "get_active_strategies", lambda: strategies)
+    monkeypatch.setattr(
+        db,
+        "quarantine_contaminated_runtime_data",
+        lambda: {"invalid_strategies": []},
+    )
     monkeypatch.setattr(db, "get_strategy_score_history", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(
         scorer,

@@ -65,6 +65,10 @@ def get_live_golden_wallets() -> List[Dict]:
     Get golden wallets that are connected to live execution.
     Returns list of dicts with address, sharpe, penalised_pnl, etc.
     """
+    try:
+        db.quarantine_invalid_golden_wallets()
+    except Exception as exc:
+        logger.debug("Golden bridge quarantine skipped: %s", exc)
     with db.get_connection() as conn:
         rows = conn.execute(
             "SELECT address, sharpe_ratio, penalised_pnl, win_rate, "
@@ -216,13 +220,21 @@ def get_stats() -> Dict:
     try:
         with _get_db() as conn:
             # Named aliases so psycopg dict_row and sqlite3.Row both work.
-            total = conn.execute("SELECT COUNT(*) AS c FROM golden_wallets").fetchone()["c"]
-            golden = conn.execute("SELECT COUNT(*) AS c FROM golden_wallets WHERE is_golden = 1").fetchone()["c"]
-            live = conn.execute("SELECT COUNT(*) AS c FROM golden_wallets WHERE connected_to_live = 1").fetchone()["c"]
+            rows = conn.execute(
+                "SELECT address, is_golden, connected_to_live FROM golden_wallets"
+            ).fetchall()
+            total = len(rows)
+            valid_rows = [
+                dict(row) for row in rows
+                if _normalise_valid_address(dict(row).get("address"))
+            ]
+            golden = sum(1 for row in valid_rows if row.get("is_golden"))
+            live = sum(1 for row in valid_rows if row.get("connected_to_live"))
             return {
                 "total_evaluated": total,
                 "golden_wallets": golden,
                 "live_connected": live,
+                "invalid_rows": total - len(valid_rows),
             }
     except Exception:
-        return {"total_evaluated": 0, "golden_wallets": 0, "live_connected": 0}
+        return {"total_evaluated": 0, "golden_wallets": 0, "live_connected": 0, "invalid_rows": 0}

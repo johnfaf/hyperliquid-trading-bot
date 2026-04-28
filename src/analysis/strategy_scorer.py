@@ -344,6 +344,16 @@ class StrategyScorer:
         Score all active strategies and update the database.
         This is the main "learning" loop - called periodically.
         """
+        try:
+            summary = db.quarantine_contaminated_runtime_data()
+            quarantined = len(summary.get("invalid_strategies", []))
+            if quarantined:
+                logger.warning(
+                    "Strategy scorer quarantined %d contaminated strategy row(s) before scoring",
+                    quarantined,
+                )
+        except Exception as exc:
+            logger.warning("Strategy data quarantine failed before scoring: %s", exc)
         strategies = db.get_active_strategies()
         results = []
 

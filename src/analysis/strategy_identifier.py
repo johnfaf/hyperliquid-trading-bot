@@ -5,10 +5,12 @@ Detects patterns like: momentum, mean-reversion, funding arbitrage, breakout, et
 """
 import logging
 from typing import List, Dict, Optional
+from datetime import datetime, timezone
 
 import sys
 import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+import config
 from src.data import database as db
 from src.data import hyperliquid_client as hl
 
@@ -148,6 +150,8 @@ class StrategyIdentifier:
                 logger.debug(f"Strategy detection error in {detector.__name__}: {e}")
 
         # Score and rank the identified strategies
+        for strategy in strategies:
+            strategy["bot_score"] = trader_profile.get("bot_score", 0)
         strategies.sort(key=lambda s: s.get("confidence", 0), reverse=True)
 
         if strategies:
@@ -526,26 +530,60 @@ class StrategyIdentifier:
 
         # Step 2: Prepare batch data
         batch_data = []
+        source_validated = []
         for strat in qualified:
             metrics = strat.get("metrics", {})
-            addr = strat.get("trader_address", "unknown")[:8]
+            source_wallet = str(strat.get("trader_address") or "").strip().lower()
+            if not db.is_valid_trader_address(source_wallet):
+                logger.warning(
+                    "Discarded %s strategy with invalid source wallet %s",
+                    strat.get("type", "unknown"),
+                    source_wallet[:18] if source_wallet else "<missing>",
+                )
+                continue
+            try:
+                bot_score = float(
+                    strat.get("bot_score", metrics.get("bot_score", 0)) or 0
+                )
+            except (TypeError, ValueError):
+                bot_score = 0.0
+            if bot_score >= float(getattr(config, "BOT_THRESHOLD", 3)):
+                logger.info(
+                    "Discarded %s strategy from bot-like source %s (bot_score=%.2f)",
+                    strat.get("type", "unknown"),
+                    source_wallet[:10],
+                    bot_score,
+                )
+                continue
+            addr = source_wallet[:8]
+            params = dict(strat.get("parameters") or {})
+            params.update({
+                "source_wallet": source_wallet,
+                "source_wallet_validated_at": datetime.now(timezone.utc).isoformat(),
+                "source_wallet_bot_score": bot_score,
+            })
             batch_data.append({
                 "name": f"{strat['type']}_{addr}",
                 "description": strat.get("description", ""),
                 "strategy_type": strat["type"],
-                "parameters": strat.get("parameters", {}),
+                "parameters": params,
                 "total_pnl": metrics.get("pnl", 0),
                 "trade_count": metrics.get("trade_count", 0),
                 "win_rate": metrics.get("win_rate", 0),
                 "sharpe_ratio": _estimate_sharpe(metrics),
             })
+            source_validated.append(strat)
+
+        if not batch_data:
+            logger.info("No strategies passed source-wallet validation")
+            return []
 
         # Step 3: Batch insert (single transaction)
         try:
             saved_ids = db.save_strategies_batch(batch_data)
 
             # Log with trader address for traceability
-            for strat, sid in zip(qualified, saved_ids):
+            for strat, sid in zip(source_validated, saved_ids):
                 addr = strat.get("trader_address", "unknown")[:10]
                 logger.debug(f"Saved strategy for {addr}...: {strat['type']} "
                             f"(confidence: {strat['confidence']:.2f})")
@@ -561,12 +599,29 @@ class StrategyIdentifier:
             for strat in qualified:
                 try:
                     metrics = strat.get("metrics", {})
-                    addr = strat.get("trader_address", "unknown")[:8]
+                    source_wallet = str(strat.get("trader_address") or "").strip().lower()
+                    if not db.is_valid_trader_address(source_wallet):
+                        continue
+                    try:
+                        bot_score = float(
+                            strat.get("bot_score", metrics.get("bot_score", 0)) or 0
+                        )
+                    except (TypeError, ValueError):
+                        bot_score = 0.0
+                    if bot_score >= float(getattr(config, "BOT_THRESHOLD", 3)):
+                        continue
+                    addr = source_wallet[:8]
+                    params = dict(strat.get("parameters") or {})
+                    params.update({
+                        "source_wallet": source_wallet,
+                        "source_wallet_validated_at": datetime.now(timezone.utc).isoformat(),
+                        "source_wallet_bot_score": bot_score,
+                    })
                     strategy_id = db.save_strategy(
                         name=f"{strat['type']}_{addr}",
                         description=strat.get("description", ""),
                         strategy_type=strat["type"],
-                        parameters=strat.get("parameters", {}),
+                        parameters=params,
                         total_pnl=metrics.get("pnl", 0),
                         trade_count=metrics.get("trade_count", 0),
                         win_rate=metrics.get("win_rate", 0),

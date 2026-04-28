@@ -29,6 +29,22 @@ from src.core.env_utils import safe_env_float
 
 logger = logging.getLogger(__name__)
 _TRADER_ADDRESS_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
+_FIXTURE_ADDRESS_MARKERS = (
+    "alpha_momentum",
+    "bravo_reversion",
+    "charlie_swing",
+    "sample_data",
+    "seed_",
+)
+_FIXTURE_STRATEGY_MARKERS = (
+    "alpha_momentum",
+    "bravo_reversion",
+    "charlie_swing",
+    "sample_data",
+    "seed_",
+    "demo",
+    "fixture",
+)
 _LEARNING_SEED_TABLES = frozenset({
     "continuous_learning_policies",
     "source_inventory",
@@ -55,6 +71,74 @@ def _is_valid_trader_address(address) -> bool:
     if not isinstance(address, str):
         return False
     return bool(_TRADER_ADDRESS_RE.match(address.strip()))
+
+
+def is_valid_trader_address(address) -> bool:
+    """Public wrapper used by source filters outside the DB module."""
+    return _is_valid_trader_address(address)
+
+
+def _loads_json_dict(raw) -> dict:
+    if isinstance(raw, dict):
+        return dict(raw)
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+        return dict(parsed) if isinstance(parsed, dict) else {}
+    except Exception:
+        return {}
+
+
+def _looks_like_fixture_address(address) -> bool:
+    text = str(address or "").strip().lower()
+    if not text:
+        return True
+    return any(marker in text for marker in _FIXTURE_ADDRESS_MARKERS)
+
+
+def _strategy_parameters(strategy: dict) -> dict:
+    return _loads_json_dict((strategy or {}).get("parameters"))
+
+
+def strategy_quarantine_reason(strategy: dict) -> Optional[str]:
+    """Return why a strategy must not be used for live selection, or None."""
+    strategy = dict(strategy or {})
+    params = _strategy_parameters(strategy)
+    name = str(strategy.get("name") or "").strip().lower()
+    description = str(strategy.get("description") or "").strip().lower()
+    strategy_type = str(strategy.get("strategy_type") or "").strip().lower()
+    combined = " ".join([name, description, json.dumps(params, sort_keys=True).lower()])
+
+    if strategy_type == "retired_placeholder" or params.get("auto_repaired"):
+        return "auto_repaired_placeholder"
+    if any(marker in combined for marker in _FIXTURE_STRATEGY_MARKERS):
+        return "fixture_or_demo_strategy"
+
+    source_wallet = (
+        params.get("source_wallet")
+        or params.get("trader_address")
+        or params.get("source_trader")
+    )
+    if not source_wallet:
+        return "missing_source_wallet"
+    if not _is_valid_trader_address(str(source_wallet).strip()):
+        return "invalid_source_wallet"
+    try:
+        bot_score = float(params.get("source_wallet_bot_score", 0) or 0)
+    except (TypeError, ValueError):
+        bot_score = 0.0
+    try:
+        bot_threshold = float(getattr(config, "BOT_THRESHOLD", 3))
+    except (TypeError, ValueError):
+        bot_threshold = 3.0
+    if bot_score >= bot_threshold:
+        return "source_wallet_bot_like"
+    return None
+
+
+def is_strategy_live_eligible(strategy: dict) -> bool:
+    return strategy_quarantine_reason(strategy) is None
 
 
 def _merge_quarantine_metadata(metadata, *, reason: str) -> dict:
@@ -202,6 +286,7 @@ def init_db():
 
     if _is_pg():
         _seed_continuous_learning_defaults()
+        quarantine_contaminated_runtime_data()
         return
 
     # H5 (audit): pre-migrate an existing SQLite database to add the
@@ -389,6 +474,7 @@ def init_db():
             logger.debug("Continuous-learning SQLite schema skipped: %s", exc)
 
     _seed_continuous_learning_defaults()
+    quarantine_contaminated_runtime_data()
 
 
 # ─── Trader CRUD ───────────────────────────────────────────────
@@ -492,6 +578,112 @@ def quarantine_invalid_traders() -> list[str]:
             len(invalid),
         )
     return invalid
+
+
+def quarantine_invalid_golden_wallets() -> list[str]:
+    """Disconnect malformed or fixture golden-wallet rows from live use."""
+    if not table_exists("golden_wallets"):
+        return []
+    quarantined: list[str] = []
+    with get_connection() as conn:
+        try:
+            rows = conn.execute(
+                "SELECT address FROM golden_wallets "
+                "WHERE is_golden = ? OR connected_to_live = ?",
+                (True, True),
+            ).fetchall()
+        except Exception as exc:
+            logger.debug("quarantine_invalid_golden_wallets skipped: %s", exc)
+            return []
+
+        for row in rows:
+            address = str(row["address"] if hasattr(row, "keys") else row[0] or "").strip()
+            if _is_valid_trader_address(address) and not _looks_like_fixture_address(address):
+                continue
+            try:
+                conn.execute(
+                    "UPDATE golden_wallets "
+                    "SET connected_to_live = ?, is_golden = ?, bot_score = ? "
+                    "WHERE address = ?",
+                    (False, False, 10, address),
+                )
+            except Exception:
+                conn.execute(
+                    "UPDATE golden_wallets SET connected_to_live = ?, is_golden = ? "
+                    "WHERE address = ?",
+                    (False, False, address),
+                )
+            quarantined.append(address)
+
+    if quarantined:
+        logger.warning(
+            "Quarantined %d invalid/fixture golden wallet row(s) from live use",
+            len(quarantined),
+        )
+    return quarantined
+
+
+def quarantine_invalid_strategies() -> list[dict]:
+    """Deactivate active strategies that are seeded, synthetic, or untraceable."""
+    if not table_exists("strategies"):
+        return []
+    now = datetime.now(timezone.utc).isoformat()
+    quarantined: list[dict] = []
+    with get_connection() as conn:
+        try:
+            rows = conn.execute(
+                "SELECT * FROM strategies WHERE active = ?",
+                (True,),
+            ).fetchall()
+        except Exception as exc:
+            logger.debug("quarantine_invalid_strategies skipped: %s", exc)
+            return []
+
+        for row in rows:
+            strategy = dict(row)
+            reason = strategy_quarantine_reason(strategy)
+            if not reason:
+                continue
+            conn.execute(
+                "UPDATE strategies SET active = ?, current_score = ?, last_scored = ? "
+                "WHERE id = ?",
+                (False, 0.0, now, strategy.get("id")),
+            )
+            quarantined.append({
+                "id": strategy.get("id"),
+                "name": strategy.get("name"),
+                "reason": reason,
+            })
+
+    if quarantined:
+        logger.warning(
+            "Quarantined %d invalid/fixture active strategy row(s): %s",
+            len(quarantined),
+            ", ".join(str(item["name"]) for item in quarantined[:5]),
+        )
+    return quarantined
+
+
+def quarantine_contaminated_runtime_data() -> dict:
+    """Run all runtime data quarantines used before strategy/live selection."""
+    summary = {
+        "invalid_traders": [],
+        "invalid_golden_wallets": [],
+        "invalid_strategies": [],
+    }
+    try:
+        summary["invalid_traders"] = quarantine_invalid_traders()
+    except Exception as exc:
+        logger.debug("Invalid trader quarantine skipped: %s", exc)
+    try:
+        summary["invalid_golden_wallets"] = quarantine_invalid_golden_wallets()
+    except Exception as exc:
+        logger.debug("Invalid golden-wallet quarantine skipped: %s", exc)
+    try:
+        summary["invalid_strategies"] = quarantine_invalid_strategies()
+    except Exception as exc:
+        logger.debug("Invalid strategy quarantine skipped: %s", exc)
+    return summary
 
 
 def _get_sqlite_strategy_row(strategy_id):
@@ -719,13 +911,31 @@ def update_strategy_score(strategy_id, score):
         """, (score, now, strategy_id))
 
 
-def get_active_strategies():
+def get_active_strategies(validated_only: bool = True):
     with get_connection(for_read=True) as conn:
         rows = conn.execute(
             "SELECT * FROM strategies WHERE active = ? ORDER BY current_score DESC",
             (True,),
         ).fetchall()
-    return [dict(r) for r in rows]
+    strategies = [dict(r) for r in rows]
+    if not validated_only:
+        return strategies
+
+    valid = []
+    rejected = []
+    for strategy in strategies:
+        reason = strategy_quarantine_reason(strategy)
+        if reason:
+            rejected.append((strategy.get("name"), reason))
+            continue
+        valid.append(strategy)
+    if rejected:
+        logger.warning(
+            "Filtered %d active strategy row(s) from live selection: %s",
+            len(rejected),
+            ", ".join(f"{name}:{reason}" for name, reason in rejected[:5]),
+        )
+    return valid
 
 
 def get_strategy(strategy_id):

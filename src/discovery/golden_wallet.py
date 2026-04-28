@@ -956,6 +956,12 @@ def save_wallet_report(report: WalletReport, last_fill_sync_time_ms: int = 0):
     incremental fill fetching instead of re-downloading the full 90-day window.
     Pass the timestamp of the newest fill in the current batch as this value.
     """
+    if not db.is_valid_trader_address(report.address):
+        logger.warning(
+            "Rejected golden wallet report with invalid address %s",
+            str(report.address or "")[:18],
+        )
+        return
     with _get_db() as conn:
         conn.execute("""
             INSERT INTO golden_wallets
@@ -1004,7 +1010,23 @@ def save_wallet_report(report: WalletReport, last_fill_sync_time_ms: int = 0):
 
 def save_wallet_fills(address: str, penalised_fills: List[PenalisedFill]):
     """Persist penalised fills for backtest replay."""
+    if not db.is_valid_trader_address(address):
+        logger.warning(
+            "Rejected wallet fills for invalid address %s",
+            str(address or "")[:18],
+        )
+        return
     with _get_db() as conn:
+        parent = conn.execute(
+            "SELECT 1 FROM golden_wallets WHERE address = ?",
+            (address,),
+        ).fetchone()
+        if not parent:
+            logger.warning(
+                "Rejected wallet fills for %s: missing golden_wallet parent row",
+                address[:10],
+            )
+            return
         # Clear old fills for this wallet
         conn.execute("DELETE FROM wallet_fills WHERE wallet_address = ?", (address,))
         for f in penalised_fills:

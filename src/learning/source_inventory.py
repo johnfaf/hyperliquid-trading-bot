@@ -342,28 +342,56 @@ def _derive_golden_wallet_health() -> Dict[str, Any]:
 
     try:
         with db.get_connection(for_read=True) as conn:
-            wallet_count = conn.execute("SELECT COUNT(*) AS c FROM golden_wallets").fetchone()
+            wallet_rows = conn.execute(
+                "SELECT address, is_golden, connected_to_live FROM golden_wallets"
+            ).fetchall()
             latest_fill = conn.execute("SELECT MAX(time_ms) AS latest_ts FROM wallet_fills").fetchone()
-        count = int(wallet_count["c"] if hasattr(wallet_count, "keys") else wallet_count[0] or 0)
+        wallets = [dict(row) for row in wallet_rows]
+        count = len(wallets)
+        valid_golden = [
+            row for row in wallets
+            if row.get("is_golden") and db.is_valid_trader_address(row.get("address"))
+        ]
+        invalid_golden = [
+            row for row in wallets
+            if row.get("is_golden") and not db.is_valid_trader_address(row.get("address"))
+        ]
+        valid_live = [
+            row for row in valid_golden
+            if row.get("connected_to_live")
+        ]
         latest_ts = latest_fill["latest_ts"] if hasattr(latest_fill, "keys") else latest_fill[0]
-        if count <= 0:
+        if count <= 0 or not valid_golden:
             return _snapshot_row(
                 "golden_wallets",
                 "DEGRADED",
                 freshness_seconds=None,
-                reason="golden_wallets table has no rows",
-                metadata={"wallet_count": count},
+                reason="golden_wallets has no valid golden wallet rows",
+                metadata={
+                    "wallet_count": count,
+                    "valid_golden_wallet_count": len(valid_golden),
+                    "invalid_golden_wallet_count": len(invalid_golden),
+                },
             )
         latest_fill_age_seconds = None
         if latest_ts not in (None, "", 0):
             latest_fill_age_seconds = time.time() - (float(latest_ts) / 1000.0)
+        status = "DEGRADED" if invalid_golden else "UP"
+        reason = (
+            f"{len(valid_golden)} valid golden wallets tracked"
+            if not invalid_golden
+            else f"{len(invalid_golden)} invalid golden wallet rows need quarantine"
+        )
         return _snapshot_row(
             "golden_wallets",
-            "UP",
+            status,
             freshness_seconds=0.0,
-            reason=f"{count} golden wallets tracked",
+            reason=reason,
             metadata={
                 "wallet_count": count,
+                "valid_golden_wallet_count": len(valid_golden),
+                "invalid_golden_wallet_count": len(invalid_golden),
+                "valid_live_connected_count": len(valid_live),
                 "latest_fill_age_seconds": latest_fill_age_seconds,
             },
         )
