@@ -259,6 +259,24 @@ def test_db_repair_backfills_safe_local_state(monkeypatch):
     )
     conn.execute(
         """
+        INSERT INTO paper_trades
+        (opened_at, closed_at, coin, side, entry_price, exit_price, size, leverage,
+         pnl, status, stop_loss, take_profit, metadata)
+        VALUES ('2026-04-20T10:00:00+00:00', '2026-04-20T11:00:00+00:00',
+                'BTC', 'long', 100, 105, 1, 1, 5, 'closed', 90, 110, '{}')
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO paper_trades
+        (opened_at, closed_at, coin, side, entry_price, exit_price, size, leverage,
+         pnl, status, stop_loss, take_profit, metadata)
+        VALUES ('2026-04-20T11:00:00+00:00', '2026-04-20T12:00:00+00:00',
+                'ETH', 'short', 100, 102, 1, 1, -2, 'closed', 105, 90, '{}')
+        """
+    )
+    conn.execute(
+        """
         INSERT INTO decision_snapshots
         (decision_id, created_at, updated_at, signal_id, coin, firewall_decision, final_status, metadata)
         VALUES ('dec-1', '2026-04-20T12:00:00+00:00', '2026-04-20T12:00:00+00:00',
@@ -315,6 +333,13 @@ def test_db_repair_backfills_safe_local_state(monkeypatch):
     ).fetchone()
     assert repaired_trade["stop_loss"] > 0
     assert repaired_trade["take_profit"] > repaired_trade["stop_loss"]
+
+    repaired_account = conn.execute(
+        "SELECT total_pnl, total_trades, winning_trades FROM paper_account WHERE id = 1"
+    ).fetchone()
+    assert repaired_account["total_pnl"] == 3
+    assert repaired_account["total_trades"] == 2
+    assert repaired_account["winning_trades"] == 1
 
     repaired_decision = conn.execute(
         "SELECT final_status, firewall_decision FROM decision_snapshots WHERE decision_id = 'dec-1'"

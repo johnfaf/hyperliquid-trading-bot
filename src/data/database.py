@@ -1631,9 +1631,45 @@ def backup_to_json(filepath: str = None):
         try:
             with get_connection() as conn:
                 if table_exists("golden_wallets"):
-                    rows = conn.execute(
-                        "SELECT * FROM golden_wallets ORDER BY penalised_pnl DESC"
-                    ).fetchall()
+                    include_curves = bool(
+                        getattr(config, "HL_BOT_BACKUP_INCLUDE_EQUITY_CURVES", False)
+                    )
+                    columns = [
+                        "address",
+                        "bot_score",
+                        "total_fills",
+                        "raw_pnl",
+                        "penalised_pnl",
+                        "max_drawdown_pct",
+                        "penalised_max_drawdown_pct",
+                        "sharpe_ratio",
+                        "win_rate",
+                        "trades_per_day",
+                        "is_golden",
+                        "coins_traded",
+                        "best_coin",
+                        "worst_coin",
+                        "evaluated_at",
+                        "connected_to_live",
+                    ]
+                    if include_curves:
+                        columns.extend([
+                            "raw_equity_curve",
+                            "penalised_equity_curve",
+                            "equity_timestamps",
+                        ])
+                    max_wallets = int(
+                        getattr(config, "HL_BOT_BACKUP_MAX_GOLDEN_WALLETS", 200) or 0
+                    )
+                    sql = (
+                        "SELECT " + ", ".join(columns) +
+                        " FROM golden_wallets ORDER BY penalised_pnl DESC"
+                    )
+                    params = ()
+                    if max_wallets > 0:
+                        sql += " LIMIT ?"
+                        params = (max_wallets,)
+                    rows = conn.execute(sql, params).fetchall()
                     data["golden_wallets"] = [dict(r) for r in rows]
 
                 if table_exists("wallet_fills"):
@@ -1677,7 +1713,7 @@ def backup_to_json(filepath: str = None):
         # deploys.  Truncated bot_backup.json has caused real data loss.
         tmp_path = f"{filepath}.tmp"
         with open(tmp_path, "w") as f:
-            json.dump(data, f)
+            json.dump(data, f, separators=(",", ":"), default=str)
             f.flush()
             try:
                 os.fsync(f.fileno())

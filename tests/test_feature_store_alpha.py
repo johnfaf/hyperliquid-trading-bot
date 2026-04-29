@@ -162,3 +162,24 @@ def test_alpha_artifact_load_requires_valid_hmac_signature(monkeypatch, tmp_path
     with patch.object(FeatureStoreAlphaPipeline, "train_if_due", lambda self, force=False: {}):
         tampered = FeatureStoreAlphaPipeline(cfg)
     assert "1h" not in tampered.models
+
+
+def test_alpha_artifact_save_skips_when_hmac_required_without_key(monkeypatch, tmp_path):
+    monkeypatch.setattr(alpha_mod, "HAS_ALPHA_ML", True)
+    monkeypatch.delenv("ALPHA_MODEL_ARTIFACT_HMAC_KEY", raising=False)
+    cfg = {
+        "model_dir": str(tmp_path),
+        "artifact_hmac_key": "",
+        "require_signed_artifacts": True,
+    }
+    with patch.object(FeatureStoreAlphaPipeline, "_load_models", lambda self: None):
+        with patch.object(FeatureStoreAlphaPipeline, "train_if_due", lambda self, force=False: {}):
+            pipeline = FeatureStoreAlphaPipeline(cfg)
+    pipeline.models = {"1h": [_FakeMember(0.7)]}
+    pipeline.calibrators = {"1h": "calibrator"}
+    pipeline.model_metadata = {"1h": {"trained_at_epoch_s": 123.0}}
+
+    pipeline._save_artifacts("1h")
+
+    assert not (tmp_path / "1h_1h.pkl").exists()
+    assert not (tmp_path / "1h_1h.pkl.sig").exists()

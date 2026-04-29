@@ -118,6 +118,9 @@ DB_AUDIT_DUALWRITE_HEALTH_WINDOW_S = float(
 DB_AUDIT_DUALWRITE_MAX_FAILURES = int(
     os.environ.get("DB_AUDIT_DUALWRITE_MAX_FAILURES", 5)
 )
+DB_SAFE_AUTO_REPAIR_ON_BOOT = os.environ.get(
+    "DB_SAFE_AUTO_REPAIR_ON_BOOT", "true"
+).lower() in ("true", "1", "yes")
 
 # ─── Feature Store (Postgres-only, auto-enabled when POSTGRES_DSN set) ─
 FEATURE_STORE_COINS = os.environ.get("FEATURE_STORE_COINS", "").strip()
@@ -132,6 +135,10 @@ FEATURE_STORE_BACKFILL_1D_DAYS = int(os.environ.get("FEATURE_STORE_BACKFILL_1D_D
 # keeping the newest rows preserves redeploy continuity without writing a
 # hundreds-of-MB JSON file on every reporting cycle.  Set 0 to disable capping.
 HL_BOT_BACKUP_MAX_WALLET_FILLS = int(os.environ.get("HL_BOT_BACKUP_MAX_WALLET_FILLS", 5000))
+HL_BOT_BACKUP_MAX_GOLDEN_WALLETS = int(os.environ.get("HL_BOT_BACKUP_MAX_GOLDEN_WALLETS", 200))
+HL_BOT_BACKUP_INCLUDE_EQUITY_CURVES = os.environ.get(
+    "HL_BOT_BACKUP_INCLUDE_EQUITY_CURVES", "false"
+).lower() in ("true", "1", "yes")
 
 # Dynamic risk policy engine
 RISK_POLICY_DEFAULT_REWARD_MULTIPLE = float(
@@ -926,6 +933,7 @@ def _validate_config_bounds() -> None:
         ("OPTIONS_FLOW_SCAN_INTERVAL", 10, 3600, 120),
         ("FEATURE_STORE_BOOTSTRAP_TOP_COINS", 0, 100, 8),
         ("HL_BOT_BACKUP_MAX_WALLET_FILLS", 0, 1_000_000, 5000),
+        ("HL_BOT_BACKUP_MAX_GOLDEN_WALLETS", 0, 100_000, 200),
         ("RISK_POLICY_DEFAULT_REWARD_MULTIPLE", 0.5, 20.0, 3.25),
         ("RISK_POLICY_MIN_REWARD_MULTIPLE", 0.1, 10.0, 1.75),
         ("RISK_POLICY_MAX_REWARD_MULTIPLE", 0.1, 50.0, 4.5),

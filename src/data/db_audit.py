@@ -1375,6 +1375,121 @@ def _repair_source_inventory(actions: list[DbRepairAction]) -> None:
         )
 
 
+def _repair_paper_account(actions: list[DbRepairAction]) -> None:
+    """Repair derived paper_account counters from closed paper_trades.
+
+    ``paper_account.total_trades``, ``winning_trades`` and ``total_pnl`` are
+    cached summary fields.  They can drift after concurrent close handling or
+    manual DB repair, but the closed ``paper_trades`` rows are the ledger of
+    record.  Recomputing these counters is safe: it does not alter open trades,
+    balance, SL/TP, live orders, or any exchange state.
+    """
+    try:
+        with db.get_connection() as conn:
+            if not _table_exists(conn, "paper_trades"):
+                _record_action(
+                    actions,
+                    "paper_account",
+                    "skipped",
+                    "paper_trades table is not present.",
+                )
+                return
+            if not _table_exists(conn, "paper_account"):
+                _record_action(
+                    actions,
+                    "paper_account",
+                    "skipped",
+                    "paper_account table is not present.",
+                )
+                return
+
+            closed = conn.execute(
+                """
+                SELECT COUNT(*) AS closed_count,
+                       COALESCE(SUM(pnl), 0) AS closed_pnl,
+                       COALESCE(SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END), 0) AS closed_wins
+                FROM paper_trades
+                WHERE LOWER(COALESCE(status, '')) = 'closed'
+                """
+            ).fetchone()
+            closed_count = int(_row_get(closed, "closed_count", 0, 0) or 0)
+            closed_pnl = float(_row_get(closed, "closed_pnl", 1, 0.0) or 0.0)
+            closed_wins = int(_row_get(closed, "closed_wins", 2, 0) or 0)
+
+            account = conn.execute("SELECT * FROM paper_account WHERE id = 1").fetchone()
+            now = _now()
+            if account is None:
+                balance = float(getattr(config, "PAPER_TRADING_INITIAL_BALANCE", 10_000.0)) + closed_pnl
+                conn.execute(
+                    """
+                    INSERT INTO paper_account
+                    (id, balance, total_pnl, total_trades, winning_trades, last_updated)
+                    VALUES (1, ?, ?, ?, ?, ?)
+                    """,
+                    (balance, closed_pnl, closed_count, closed_wins, now),
+                )
+                _record_action(
+                    actions,
+                    "paper_account",
+                    "applied",
+                    "Created missing paper_account singleton from closed paper-trade ledger.",
+                    balance=balance,
+                    closed_count=closed_count,
+                    closed_pnl=closed_pnl,
+                    closed_wins=closed_wins,
+                )
+                return
+
+            before = {
+                "total_trades": int(_row_get(account, "total_trades", default=0) or 0),
+                "total_pnl": float(_row_get(account, "total_pnl", default=0.0) or 0.0),
+                "winning_trades": int(_row_get(account, "winning_trades", default=0) or 0),
+            }
+            after = {
+                "total_trades": closed_count,
+                "total_pnl": closed_pnl,
+                "winning_trades": closed_wins,
+            }
+            if (
+                before["total_trades"] == after["total_trades"]
+                and before["winning_trades"] == after["winning_trades"]
+                and abs(before["total_pnl"] - after["total_pnl"]) <= 0.01
+            ):
+                _record_action(
+                    actions,
+                    "paper_account",
+                    "skipped",
+                    "paper_account summary already matches closed paper-trade ledger.",
+                    summary=after,
+                )
+                return
+
+            conn.execute(
+                """
+                UPDATE paper_account
+                SET total_pnl = ?, total_trades = ?, winning_trades = ?, last_updated = ?
+                WHERE id = 1
+                """,
+                (closed_pnl, closed_count, closed_wins, now),
+            )
+            _record_action(
+                actions,
+                "paper_account",
+                "applied",
+                "Recomputed paper_account summary fields from closed paper-trade ledger.",
+                before=before,
+                after=after,
+            )
+    except Exception as exc:
+        _record_action(
+            actions,
+            "paper_account",
+            "failed",
+            "Could not repair paper_account summary fields.",
+            error=str(exc),
+        )
+
+
 def _resolve_repair_risk(metadata: dict[str, Any]) -> Any:
     from src.signals.signal_schema import RiskParams
 
@@ -2005,6 +2120,7 @@ def run_db_repair(
     _repair_orphan_position_snapshot_parents(actions)
     _repair_orphan_strategy_score_parents(actions)
     _repair_source_inventory(actions)
+    _repair_paper_account(actions)
     _repair_open_trade_protection(actions)
     _repair_duplicate_same_side_open_trades(actions)
     _repair_stale_pending_decisions(actions)
@@ -2054,6 +2170,38 @@ def run_db_repair(
         post_audit=post_audit,
         actions=actions,
     )
+
+
+def run_startup_safe_repair() -> list[DbRepairAction]:
+    """Run idempotent local repairs that are safe during normal boot.
+
+    This intentionally excludes repairs that can place network load or mutate
+    trade intent.  It only refreshes derived local state that readiness checks
+    otherwise flag as blockers:
+
+    - paper_account counters derived from closed paper_trades
+    - stale unresolved candidate decisions with no trade/order attached
+    - source-health snapshot freshness
+    """
+    actions: list[DbRepairAction] = []
+    _repair_paper_account(actions)
+    _repair_stale_pending_decisions(actions)
+    _repair_source_health_history(actions)
+    try:
+        audit = run_db_audit(include_candle_cache=False, include_code_scan=False)
+        stale_non_active_regime = list(
+            (audit.checks.get("regime_history", {}) or {}).get("stale_other", []) or []
+        )
+        _repair_non_active_regime_history(actions, stale_non_active_regime)
+    except Exception as exc:
+        _record_action(
+            actions,
+            "stale_regime_history",
+            "failed",
+            "Could not prune stale non-active regime history during startup repair.",
+            error=str(exc),
+        )
+    return actions
 
 
 def run_db_audit(

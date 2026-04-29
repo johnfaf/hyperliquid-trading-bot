@@ -173,6 +173,7 @@ class FeatureStoreAlphaPipeline:
         self.model_metadata: Dict[str, Dict] = {}
         self.prediction_cache: Dict[Tuple[str, str], Dict] = {}
         self._last_train_ts = 0.0
+        self._artifact_persistence_disabled_logged = False
 
         self._load_models()
         if HAS_ALPHA_ML and self._pg_available() and not self.models:
@@ -723,6 +724,15 @@ class FeatureStoreAlphaPipeline:
 
     def _save_artifacts(self, horizon: str) -> None:
         path = self._artifact_path(horizon)
+        if self.require_signed_artifacts and not self.artifact_hmac_key:
+            if not self._artifact_persistence_disabled_logged:
+                logger.info(
+                    "Alpha artifact persistence disabled because "
+                    "ALPHA_MODEL_ARTIFACT_HMAC_KEY is not set; models remain "
+                    "in-memory for this run and will retrain on restart."
+                )
+                self._artifact_persistence_disabled_logged = True
+            return
         payload = {
             "members": self.models.get(horizon, []),
             "calibrator": self.calibrators.get(horizon),
@@ -741,15 +751,17 @@ class FeatureStoreAlphaPipeline:
                 pass
         os.replace(str(tmp_path), str(path))
         self._write_artifact_signature(path, artifact_bytes)
-        if self.require_signed_artifacts and not self.artifact_hmac_key:
-            logger.warning(
-                "Alpha artifact %s saved without HMAC; set ALPHA_MODEL_ARTIFACT_HMAC_KEY "
-                "or it will be skipped on next load.",
-                path,
-            )
 
     def _load_models(self) -> None:
         if not HAS_ALPHA_ML:
+            return
+
+        if self.require_signed_artifacts and not self.artifact_hmac_key:
+            if any(self._artifact_path(horizon).exists() for horizon in HORIZON_STEPS):
+                logger.info(
+                    "Alpha artifacts ignored because ALPHA_MODEL_ARTIFACT_HMAC_KEY "
+                    "is not set; unsigned/unknown artifacts will not be loaded."
+                )
             return
 
         latest_ts = 0.0

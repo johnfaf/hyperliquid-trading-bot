@@ -66,6 +66,24 @@ def _get_watched_coins(container=None) -> List[str]:
     except Exception:
         pass
 
+    # Add coins from the execution source of truth.  In live mode this reads
+    # exchange positions, so active live exposure keeps receiving candles even
+    # if the paper shadow book is stale or missing.
+    if container is not None:
+        try:
+            from src.core.live_execution import get_execution_open_positions
+
+            for pos in get_execution_open_positions(container) or []:
+                if isinstance(pos, dict):
+                    coin = pos.get("coin") or pos.get("symbol") or ""
+                else:
+                    coin = getattr(pos, "coin", "") or getattr(pos, "symbol", "")
+                coin = str(coin or "").upper().strip()
+                if coin:
+                    coins.add(coin)
+        except Exception as exc:
+            logger.debug("execution watched-coin lookup failed: %s", exc)
+
     # Add coins from recent strategies
     try:
         from src.data import database as db
