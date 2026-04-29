@@ -1256,7 +1256,11 @@ def _repair_orphan_position_snapshot_parents(actions: list[DbRepairAction]) -> N
         )
 
 
-def _repair_invalid_strategy_bloat(actions: list[DbRepairAction]) -> None:
+def _repair_invalid_strategy_bloat(
+    actions: list[DbRepairAction],
+    *,
+    max_rows: Optional[int] = None,
+) -> None:
     """Prune non-executable strategy rows created by old repair paths.
 
     Older repairs preserved orphan ``strategy_scores`` by creating inactive
@@ -1273,6 +1277,63 @@ def _repair_invalid_strategy_bloat(actions: list[DbRepairAction]) -> None:
                     "invalid_strategy_bloat",
                     "skipped",
                     "strategies table is not present.",
+                )
+                return
+            if max_rows is not None:
+                limit = max(0, int(max_rows or 0))
+                if limit <= 0:
+                    _record_action(
+                        actions,
+                        "invalid_strategy_bloat",
+                        "skipped",
+                        "Startup placeholder pruning is disabled by limit.",
+                        limit=limit,
+                    )
+                    return
+                deleted_scores = 0
+                if _table_exists(conn, "strategy_scores"):
+                    cur = conn.execute(
+                        """
+                        DELETE FROM strategy_scores
+                        WHERE strategy_id IN (
+                            SELECT id
+                            FROM strategies
+                            WHERE active = ? AND strategy_type = ?
+                            ORDER BY id
+                            LIMIT ?
+                        )
+                        """,
+                        (False, "retired_placeholder", limit),
+                    )
+                    deleted_scores = int(getattr(cur, "rowcount", 0) or 0)
+                cur = conn.execute(
+                    """
+                    DELETE FROM strategies
+                    WHERE id IN (
+                        SELECT id
+                        FROM strategies
+                        WHERE active = ? AND strategy_type = ?
+                        ORDER BY id
+                        LIMIT ?
+                    )
+                    """,
+                    (False, "retired_placeholder", limit),
+                )
+                deleted_strategies = int(getattr(cur, "rowcount", 0) or 0)
+                status = "applied" if deleted_strategies or deleted_scores else "skipped"
+                message = (
+                    "Pruned a bounded batch of synthetic placeholder strategies."
+                    if status == "applied"
+                    else "No retired placeholder strategies were found in the startup batch."
+                )
+                _record_action(
+                    actions,
+                    "invalid_strategy_bloat",
+                    status,
+                    message,
+                    deleted_strategies=deleted_strategies,
+                    deleted_scores=deleted_scores,
+                    limit=limit,
                 )
                 return
             rows = conn.execute("SELECT * FROM strategies WHERE active = ?", (False,)).fetchall()
@@ -1325,7 +1386,11 @@ def _repair_invalid_strategy_bloat(actions: list[DbRepairAction]) -> None:
         )
 
 
-def _repair_orphan_strategy_score_parents(actions: list[DbRepairAction]) -> None:
+def _repair_orphan_strategy_score_parents(
+    actions: list[DbRepairAction],
+    *,
+    max_rows: Optional[int] = None,
+) -> None:
     try:
         with db.get_connection() as conn:
             if not _table_exists(conn, "strategy_scores") or not _table_exists(conn, "strategies"):
@@ -1334,6 +1399,45 @@ def _repair_orphan_strategy_score_parents(actions: list[DbRepairAction]) -> None
                     "orphan_strategy_score_parents",
                     "skipped",
                     "strategy_scores/strategies tables are not present.",
+                )
+                return
+            if max_rows is not None:
+                limit = max(0, int(max_rows or 0))
+                if limit <= 0:
+                    _record_action(
+                        actions,
+                        "orphan_strategy_score_parents",
+                        "skipped",
+                        "Startup orphan strategy-score pruning is disabled by limit.",
+                        limit=limit,
+                    )
+                    return
+                cur = conn.execute(
+                    """
+                    DELETE FROM strategy_scores
+                    WHERE id IN (
+                        SELECT ss.id
+                        FROM strategy_scores ss
+                        LEFT JOIN strategies s ON s.id = ss.strategy_id
+                        WHERE s.id IS NULL
+                        ORDER BY ss.id
+                        LIMIT ?
+                    )
+                    """,
+                    (limit,),
+                )
+                deleted = int(getattr(cur, "rowcount", 0) or 0)
+                _record_action(
+                    actions,
+                    "orphan_strategy_score_parents",
+                    "applied" if deleted else "skipped",
+                    (
+                        "Pruned a bounded batch of orphan strategy_scores rows."
+                        if deleted
+                        else "No orphan strategy_scores rows were found in the startup batch."
+                    ),
+                    deleted=deleted,
+                    limit=limit,
                 )
                 return
             row = conn.execute(
@@ -2301,9 +2405,12 @@ def run_startup_safe_repair() -> list[DbRepairAction]:
     - source-health snapshot freshness
     """
     actions: list[DbRepairAction] = []
-    _repair_invalid_strategy_bloat(actions)
-    _repair_orphan_strategy_score_parents(actions)
-    _repair_missing_source_wallet_strategy_bloat(actions)
+    startup_strategy_prune_limit = max(
+        0,
+        int(getattr(config, "DB_REPAIR_STARTUP_STRATEGY_PRUNE_LIMIT", 1000) or 0),
+    )
+    _repair_invalid_strategy_bloat(actions, max_rows=startup_strategy_prune_limit)
+    _repair_orphan_strategy_score_parents(actions, max_rows=startup_strategy_prune_limit)
     _repair_paper_account(actions)
     _repair_stale_pending_decisions(actions)
     _repair_source_health_history(actions)

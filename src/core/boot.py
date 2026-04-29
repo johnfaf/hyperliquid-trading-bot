@@ -237,6 +237,7 @@ def init_database(logger: logging.Logger) -> None:
         try:
             from src.data.db_audit import run_startup_safe_repair
 
+            logger.info("Running startup DB safe-repair...")
             actions = run_startup_safe_repair()
             applied = [a for a in actions if str(a.status).lower() == "applied"]
             failed = [a for a in actions if str(a.status).lower() == "failed"]

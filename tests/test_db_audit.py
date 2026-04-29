@@ -475,6 +475,56 @@ def test_strategy_repair_prunes_synthetic_and_caps_missing_source_rows(monkeypat
     assert any(action.action == "missing_source_strategy_bloat" for action in actions)
 
 
+def test_startup_strategy_repair_is_bounded(monkeypatch):
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.executescript(
+        """
+        CREATE TABLE strategies (
+            id INTEGER PRIMARY KEY,
+            name TEXT NOT NULL,
+            strategy_type TEXT NOT NULL,
+            parameters TEXT DEFAULT '{}',
+            discovered_at TEXT NOT NULL,
+            active INTEGER DEFAULT 1
+        );
+        CREATE TABLE strategy_scores (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            strategy_id INTEGER NOT NULL,
+            timestamp TEXT NOT NULL,
+            score REAL DEFAULT 0
+        );
+        """
+    )
+    for strategy_id in range(1, 4):
+        conn.execute(
+            """
+            INSERT INTO strategies
+            (id, name, strategy_type, parameters, discovered_at, active)
+            VALUES (?, ?, 'retired_placeholder', '{"auto_repaired":true}',
+                    '2026-04-10T00:00:00+00:00', 0)
+            """,
+            (strategy_id, f"recovered_{strategy_id}"),
+        )
+        conn.execute(
+            "INSERT INTO strategy_scores (strategy_id, timestamp, score) VALUES (?, ?, ?)",
+            (strategy_id, "2026-04-10T00:00:00+00:00", 0.1),
+        )
+    conn.commit()
+
+    monkeypatch.setattr(db, "get_connection", lambda for_read=False: _connection_ctx(conn))
+
+    actions = []
+    db_audit._repair_invalid_strategy_bloat(actions, max_rows=1)
+
+    assert conn.execute("SELECT COUNT(*) FROM strategies").fetchone()[0] == 2
+    assert conn.execute("SELECT COUNT(*) FROM strategy_scores").fetchone()[0] == 2
+    action = next(action for action in actions if action.action == "invalid_strategy_bloat")
+    assert action.details["deleted_strategies"] == 1
+    assert action.details["limit"] == 1
+
+
 def test_db_audit_same_side_open_trades_only_flag_above_cap(monkeypatch):
     conn = sqlite3.connect(":memory:")
     conn.row_factory = sqlite3.Row

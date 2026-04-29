@@ -124,6 +124,12 @@ DB_SAFE_AUTO_REPAIR_ON_BOOT = os.environ.get(
 DB_REPAIR_KEEP_MISSING_SOURCE_STRATEGIES = int(
     os.environ.get("DB_REPAIR_KEEP_MISSING_SOURCE_STRATEGIES", 500)
 )
+DB_REPAIR_STARTUP_STRATEGY_PRUNE_LIMIT = int(
+    os.environ.get("DB_REPAIR_STARTUP_STRATEGY_PRUNE_LIMIT", 1000)
+)
+BOOT_DB_AUDIT_INCLUDE_CANDLE_CACHE = os.environ.get(
+    "BOOT_DB_AUDIT_INCLUDE_CANDLE_CACHE", "false"
+).lower() in ("true", "1", "yes")
 
 # ─── Feature Store (Postgres-only, auto-enabled when POSTGRES_DSN set) ─
 FEATURE_STORE_COINS = os.environ.get("FEATURE_STORE_COINS", "").strip()

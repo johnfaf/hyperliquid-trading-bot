@@ -138,7 +138,17 @@ class HyperliquidResearchBot:
         try:
             from src.data.db_audit import format_db_audit_report, run_db_audit
 
-            audit_report = run_db_audit(include_candle_cache=True, include_code_scan=False)
+            include_candle_cache = bool(
+                getattr(config, "BOOT_DB_AUDIT_INCLUDE_CANDLE_CACHE", False)
+            )
+            self.logger.info(
+                "Running startup DB audit (candle_cache=%s)...",
+                include_candle_cache,
+            )
+            audit_report = run_db_audit(
+                include_candle_cache=include_candle_cache,
+                include_code_scan=False,
+            )
             block_severity = getattr(config, "READINESS_DB_AUDIT_BLOCK_SEVERITY", "high")
             if audit_report.findings_at_or_above(block_severity):
                 self.logger.warning(
