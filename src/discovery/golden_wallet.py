@@ -934,18 +934,22 @@ def init_golden_tables():
             CREATE INDEX IF NOT EXISTS idx_wf_time ON wallet_fills(time_ms);
             CREATE INDEX IF NOT EXISTS idx_wf_coin ON wallet_fills(coin);
             """)
-        # Migrate existing databases: add new columns if they don't exist yet.
-        for col, definition in [
-            ("avg_hold_time_hours", "REAL DEFAULT 0"),
-            ("last_fill_sync_time", "INTEGER DEFAULT 0"),
-        ]:
-            try:
-                conn.execute(
-                    f"ALTER TABLE golden_wallets ADD COLUMN {col} {definition}"
-                )
-            except sqlite3.OperationalError as exc:
-                if "duplicate column" not in str(exc).lower():
-                    raise
+        # Migrate existing SQLite databases: add new columns if they don't exist
+        # yet. Postgres is covered by idempotent DDL above plus migrations; using
+        # SQLite's duplicate-column exception path on Postgres leaves the
+        # connection in an aborted transaction.
+        if db.get_backend_name() != "postgres":
+            for col, definition in [
+                ("avg_hold_time_hours", "REAL DEFAULT 0"),
+                ("last_fill_sync_time", "INTEGER DEFAULT 0"),
+            ]:
+                try:
+                    conn.execute(
+                        f"ALTER TABLE golden_wallets ADD COLUMN {col} {definition}"
+                    )
+                except sqlite3.OperationalError as exc:
+                    if "duplicate column" not in str(exc).lower():
+                        raise
 
 
 def save_wallet_report(report: WalletReport, last_fill_sync_time_ms: int = 0):
@@ -1008,6 +1012,113 @@ def save_wallet_report(report: WalletReport, last_fill_sync_time_ms: int = 0):
         ))
 
 
+def _ensure_postgres_wallet_parent(address: str) -> None:
+    """Repair a missed dualwrite parent row before mirroring wallet_fills.
+
+    In dualwrite mode SQLite is authoritative.  If a previous golden_wallets
+    mirror failed, SQLite can have the parent wallet while Postgres does not.
+    Replaying wallet_fills then produces an FK violation for every fill.  This
+    helper upserts the parent from SQLite to Postgres immediately before fills
+    are saved, so the mirror catches up instead of spamming warnings.
+    """
+    if db.get_backend_name() != "dualwrite":
+        return
+    try:
+        with db.get_connection(for_read=True) as sqlite_conn:
+            row = sqlite_conn.execute(
+                "SELECT * FROM golden_wallets WHERE address = ?",
+                (address,),
+            ).fetchone()
+        if not row:
+            return
+        gw = dict(row)
+    except Exception as exc:
+        logger.debug("Could not load SQLite golden_wallet parent for %s: %s", address[:10], exc)
+        return
+
+    pg_conn = None
+    try:
+        from src.data.db.postgres import get_connection as get_pg_connection
+        from src.data.db.postgres import return_connection as return_pg_connection
+
+        pg_conn = get_pg_connection()
+        pg_conn.execute(
+            """
+            INSERT INTO golden_wallets
+            (address, bot_score, total_fills, raw_pnl, penalised_pnl,
+             max_drawdown_pct, penalised_max_drawdown_pct, sharpe_ratio,
+             win_rate, trades_per_day, is_golden, coins_traded, best_coin,
+             worst_coin, raw_equity_curve, penalised_equity_curve,
+             equity_timestamps, evaluated_at, connected_to_live,
+             avg_hold_time_hours, last_fill_sync_time)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (address) DO UPDATE SET
+                bot_score = EXCLUDED.bot_score,
+                total_fills = EXCLUDED.total_fills,
+                raw_pnl = EXCLUDED.raw_pnl,
+                penalised_pnl = EXCLUDED.penalised_pnl,
+                max_drawdown_pct = EXCLUDED.max_drawdown_pct,
+                penalised_max_drawdown_pct = EXCLUDED.penalised_max_drawdown_pct,
+                sharpe_ratio = EXCLUDED.sharpe_ratio,
+                win_rate = EXCLUDED.win_rate,
+                trades_per_day = EXCLUDED.trades_per_day,
+                is_golden = EXCLUDED.is_golden,
+                coins_traded = EXCLUDED.coins_traded,
+                best_coin = EXCLUDED.best_coin,
+                worst_coin = EXCLUDED.worst_coin,
+                raw_equity_curve = EXCLUDED.raw_equity_curve,
+                penalised_equity_curve = EXCLUDED.penalised_equity_curve,
+                equity_timestamps = EXCLUDED.equity_timestamps,
+                evaluated_at = EXCLUDED.evaluated_at,
+                connected_to_live = EXCLUDED.connected_to_live,
+                avg_hold_time_hours = EXCLUDED.avg_hold_time_hours,
+                last_fill_sync_time = EXCLUDED.last_fill_sync_time
+            """,
+            (
+                gw.get("address"),
+                int(gw.get("bot_score", 0) or 0),
+                int(gw.get("total_fills", 0) or 0),
+                float(gw.get("raw_pnl", 0) or 0),
+                float(gw.get("penalised_pnl", 0) or 0),
+                float(gw.get("max_drawdown_pct", 0) or 0),
+                float(gw.get("penalised_max_drawdown_pct", 0) or 0),
+                float(gw.get("sharpe_ratio", 0) or 0),
+                float(gw.get("win_rate", 0) or 0),
+                float(gw.get("trades_per_day", 0) or 0),
+                bool(gw.get("is_golden", False)),
+                gw.get("coins_traded", "[]") or "[]",
+                gw.get("best_coin", "") or "",
+                gw.get("worst_coin", "") or "",
+                gw.get("raw_equity_curve", "[]") or "[]",
+                gw.get("penalised_equity_curve", "[]") or "[]",
+                gw.get("equity_timestamps", "[]") or "[]",
+                gw.get("evaluated_at"),
+                bool(gw.get("connected_to_live", False)),
+                float(gw.get("avg_hold_time_hours", 0) or 0),
+                int(gw.get("last_fill_sync_time", 0) or 0),
+            ),
+        )
+        pg_conn.commit()
+    except Exception as exc:
+        if pg_conn is not None:
+            try:
+                pg_conn.rollback()
+            except Exception:
+                pass
+        logger.warning(
+            "Could not sync golden_wallet parent %s to Postgres before fills: %s",
+            address[:10],
+            exc,
+        )
+    finally:
+        if pg_conn is not None:
+            try:
+                return_pg_connection(pg_conn)
+            except Exception:
+                pass
+
+
 def save_wallet_fills(address: str, penalised_fills: List[PenalisedFill]):
     """Persist penalised fills for backtest replay."""
     if not db.is_valid_trader_address(address):
@@ -1016,6 +1127,7 @@ def save_wallet_fills(address: str, penalised_fills: List[PenalisedFill]):
             str(address or "")[:18],
         )
         return
+    _ensure_postgres_wallet_parent(address)
     with _get_db() as conn:
         parent = conn.execute(
             "SELECT 1 FROM golden_wallets WHERE address = ?",
