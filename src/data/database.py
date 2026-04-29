@@ -938,6 +938,107 @@ def get_active_strategies(validated_only: bool = True):
     return valid
 
 
+def get_strategy_runtime_status() -> dict:
+    """Return strategy table health without weakening live eligibility checks."""
+    if not table_exists("strategies"):
+        return {
+            "table_exists": False,
+            "total": 0,
+            "active_raw": 0,
+            "active_valid": 0,
+            "active_invalid": 0,
+            "inactive_valid": 0,
+            "inactive_invalid": 0,
+            "invalid_reasons": {},
+        }
+
+    with get_connection(for_read=True) as conn:
+        rows = conn.execute("SELECT * FROM strategies").fetchall()
+
+    status = {
+        "table_exists": True,
+        "total": 0,
+        "active_raw": 0,
+        "active_valid": 0,
+        "active_invalid": 0,
+        "inactive_valid": 0,
+        "inactive_invalid": 0,
+        "invalid_reasons": {},
+    }
+    for row in rows:
+        strategy = dict(row)
+        status["total"] += 1
+        is_active = bool(strategy.get("active"))
+        reason = strategy_quarantine_reason(strategy)
+        if is_active:
+            status["active_raw"] += 1
+            if reason:
+                status["active_invalid"] += 1
+            else:
+                status["active_valid"] += 1
+        elif reason:
+            status["inactive_invalid"] += 1
+        else:
+            status["inactive_valid"] += 1
+        if reason:
+            reasons = status["invalid_reasons"]
+            reasons[reason] = int(reasons.get(reason, 0)) + 1
+    return status
+
+
+def recover_valid_inactive_strategies(limit: int = None) -> list[dict]:
+    """Reactivate a small set of valid inactive strategies after quarantine.
+
+    The contamination guard intentionally deactivates seeded/demo/bot-like
+    strategy rows.  A separate failure mode showed up in live logs: once every
+    active row is quarantined, valid rows that were inactive from a previous
+    scoring pass never get rescored, leaving the strategy engine permanently
+    empty.  This recovery path only reactivates rows that still pass
+    ``strategy_quarantine_reason`` and therefore keeps the live-data guardrail
+    intact.
+    """
+    if not table_exists("strategies"):
+        return []
+    if limit is None:
+        limit = max(1, int(getattr(config, "MIN_ACTIVE_STRATEGIES", 5) or 5))
+    limit = max(1, int(limit))
+
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT * FROM strategies
+            WHERE active = ?
+            ORDER BY current_score DESC, discovered_at DESC
+            """,
+            (False,),
+        ).fetchall()
+
+        recovered: list[dict] = []
+        for row in rows:
+            strategy = dict(row)
+            if strategy_quarantine_reason(strategy):
+                continue
+            recovered.append(strategy)
+            if len(recovered) >= limit:
+                break
+
+        if not recovered:
+            return []
+
+        now = datetime.now(timezone.utc).isoformat()
+        for strategy in recovered:
+            conn.execute(
+                "UPDATE strategies SET active = ?, last_scored = ? WHERE id = ?",
+                (True, now, strategy["id"]),
+            )
+
+    logger.warning(
+        "Recovered %d valid inactive strategy row(s) for rescoring after active set went empty",
+        len(recovered),
+    )
+    return recovered
+
+
 def get_strategy(strategy_id):
     with get_connection(for_read=True) as conn:
         row = conn.execute("SELECT * FROM strategies WHERE id = ?", (strategy_id,)).fetchone()
@@ -1536,13 +1637,31 @@ def backup_to_json(filepath: str = None):
                     data["golden_wallets"] = [dict(r) for r in rows]
 
                 if table_exists("wallet_fills"):
-                    # Only backup fills from golden wallets (not all fills)
-                    rows = conn.execute("""
-                        SELECT wf.* FROM wallet_fills wf
-                        JOIN golden_wallets gw ON wf.wallet_address = gw.address
-                        WHERE gw.is_golden = 1
-                        ORDER BY wf.time_ms
-                    """).fetchall()
+                    # Only backup fills from golden wallets (not all fills).
+                    # Cap newest rows by default: this file is written every
+                    # reporting cycle, and unbounded wallet_fills made live
+                    # backups hundreds of MB with no execution benefit.
+                    max_fills = int(
+                        getattr(config, "HL_BOT_BACKUP_MAX_WALLET_FILLS", 5000) or 0
+                    )
+                    if max_fills > 0:
+                        rows = conn.execute("""
+                            SELECT * FROM (
+                                SELECT wf.* FROM wallet_fills wf
+                                JOIN golden_wallets gw ON wf.wallet_address = gw.address
+                                WHERE gw.is_golden = 1
+                                ORDER BY wf.time_ms DESC
+                                LIMIT ?
+                            ) recent_fills
+                            ORDER BY time_ms
+                        """, (max_fills,)).fetchall()
+                    else:
+                        rows = conn.execute("""
+                            SELECT wf.* FROM wallet_fills wf
+                            JOIN golden_wallets gw ON wf.wallet_address = gw.address
+                            WHERE gw.is_golden = 1
+                            ORDER BY wf.time_ms
+                        """).fetchall()
                     data["wallet_fills"] = [dict(r) for r in rows]
 
                 if table_exists("calibration_records"):

@@ -789,6 +789,17 @@ class PaperTrader:
                             logger.debug(f"Calibration adjust {sig['coin']}: "
                                        f"{trade_signal.confidence:.2f} -> {adjusted:.2f}")
                         trade_signal.confidence = adjusted
+                        reliability_mult = self.calibration.get_reliability_multiplier(source_key)
+                        if reliability_mult < 1.0:
+                            before = trade_signal.confidence
+                            trade_signal.confidence = max(0.05, trade_signal.confidence * reliability_mult)
+                            logger.info(
+                                "Calibration derisk %s: %.2f -> %.2f (mult=%.2f)",
+                                sig["coin"],
+                                before,
+                                trade_signal.confidence,
+                                reliability_mult,
+                            )
                     except Exception as e:
                         logger.debug(f"Calibration error: {e}")
 

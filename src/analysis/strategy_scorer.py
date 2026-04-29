@@ -355,6 +355,20 @@ class StrategyScorer:
         except Exception as exc:
             logger.warning("Strategy data quarantine failed before scoring: %s", exc)
         strategies = db.get_active_strategies()
+        if not strategies:
+            try:
+                recovered = db.recover_valid_inactive_strategies(
+                    limit=max(1, int(getattr(config, "MIN_ACTIVE_STRATEGIES", 5) or 5))
+                )
+            except Exception as exc:
+                recovered = []
+                logger.warning("Strategy recovery failed after active set went empty: %s", exc)
+            if recovered:
+                logger.warning(
+                    "Strategy active set was empty; recovered %d valid inactive strategy row(s)",
+                    len(recovered),
+                )
+                strategies = db.get_active_strategies()
         results = []
 
         logger.info(f"Scoring {len(strategies)} active strategies...")
@@ -364,12 +378,17 @@ class StrategyScorer:
                 score_breakdown = self.score_strategy(strategy)
                 composite = score_breakdown["composite"]
 
+                normalized_breakdown = {
+                    k: (None if v is None else float(v))
+                    for k, v in score_breakdown.items()
+                }
+
                 results.append({
                     "strategy_id": strategy["id"],
                     "name": strategy["name"],
                     "type": strategy["strategy_type"],
                     "score": float(composite),
-                    "breakdown": {k: float(v) for k, v in score_breakdown.items()},
+                    "breakdown": normalized_breakdown,
                     "active": bool(composite >= config.MIN_STRATEGY_SCORE),
                 })
 
@@ -489,7 +508,26 @@ class StrategyScorer:
         strategies = db.get_active_strategies()
 
         if not strategies:
-            return {"status": "no_strategies", "message": "No strategies tracked yet"}
+            try:
+                runtime_status = db.get_strategy_runtime_status()
+            except Exception:
+                runtime_status = {}
+            total = int(runtime_status.get("total", 0) or 0)
+            inactive_valid = int(runtime_status.get("inactive_valid", 0) or 0)
+            health = "cold_start" if total == 0 else "degraded_no_valid_active_strategies"
+            message = (
+                "No strategies tracked yet"
+                if total == 0
+                else "No valid active strategies; discovery/scoring recovery required"
+            )
+            return {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "status": "no_strategies",
+                "health": health,
+                "message": message,
+                "strategy_runtime_status": runtime_status,
+                "recoverable_inactive_strategies": inactive_valid,
+            }
 
         # Analyze trends for all strategies
         trends = {}

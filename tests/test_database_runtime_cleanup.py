@@ -225,3 +225,61 @@ def test_get_active_strategies_filters_missing_or_bot_like_source(tmp_path, monk
 
     assert [row["name"] for row in db.get_active_strategies()] == ["valid_sourced"]
     assert len(db.get_active_strategies(validated_only=False)) == 3
+
+
+def test_recover_valid_inactive_strategies_keeps_quarantine_guard(tmp_path, monkeypatch):
+    db_path = tmp_path / "runtime.db"
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    conn.execute(
+        """
+        CREATE TABLE strategies (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            description TEXT,
+            strategy_type TEXT NOT NULL,
+            parameters TEXT DEFAULT '{}',
+            discovered_at TEXT NOT NULL,
+            last_scored TEXT,
+            current_score REAL DEFAULT 0,
+            active INTEGER DEFAULT 1
+        )
+        """
+    )
+    valid_wallet = "0x" + "3" * 40
+    rows = [
+        ("valid_inactive", json.dumps({"source_wallet": valid_wallet}), 0.7, 0),
+        ("fixture_inactive", "{}", 0.9, 0),
+        ("active_valid", json.dumps({"source_wallet": valid_wallet}), 0.5, 1),
+    ]
+    for name, params, score, active in rows:
+        conn.execute(
+            """
+            INSERT INTO strategies
+            (name, description, strategy_type, parameters, discovered_at, current_score, active)
+            VALUES (?, '', 'momentum_long', ?, '2026-01-01', ?, ?)
+            """,
+            (name, params, score, active),
+        )
+    conn.commit()
+    conn.close()
+
+    @contextmanager
+    def _fake_connection(*, for_read=False):
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        try:
+            yield conn
+            conn.commit()
+        finally:
+            conn.close()
+
+    monkeypatch.setattr(db, "get_connection", _fake_connection)
+
+    status_before = db.get_strategy_runtime_status()
+    recovered = db.recover_valid_inactive_strategies(limit=5)
+    active_names = [row["name"] for row in db.get_active_strategies()]
+
+    assert status_before["inactive_valid"] == 1
+    assert [row["name"] for row in recovered] == ["valid_inactive"]
+    assert active_names == ["valid_inactive", "active_valid"]

@@ -122,10 +122,16 @@ DB_AUDIT_DUALWRITE_MAX_FAILURES = int(
 # ─── Feature Store (Postgres-only, auto-enabled when POSTGRES_DSN set) ─
 FEATURE_STORE_COINS = os.environ.get("FEATURE_STORE_COINS", "").strip()
 FEATURE_STORE_MAX_COINS = int(os.environ.get("FEATURE_STORE_MAX_COINS", 30))
+FEATURE_STORE_BOOTSTRAP_TOP_COINS = int(os.environ.get("FEATURE_STORE_BOOTSTRAP_TOP_COINS", 8))
 FEATURE_STORE_BACKFILL_5M_DAYS = int(os.environ.get("FEATURE_STORE_BACKFILL_5M_DAYS", 7))
 FEATURE_STORE_BACKFILL_1H_DAYS = int(os.environ.get("FEATURE_STORE_BACKFILL_1H_DAYS", 30))
 FEATURE_STORE_BACKFILL_4H_DAYS = int(os.environ.get("FEATURE_STORE_BACKFILL_4H_DAYS", 90))
 FEATURE_STORE_BACKFILL_1D_DAYS = int(os.environ.get("FEATURE_STORE_BACKFILL_1D_DAYS", 365))
+
+# Runtime backup size guard.  Wallet fills are the largest backup component;
+# keeping the newest rows preserves redeploy continuity without writing a
+# hundreds-of-MB JSON file on every reporting cycle.  Set 0 to disable capping.
+HL_BOT_BACKUP_MAX_WALLET_FILLS = int(os.environ.get("HL_BOT_BACKUP_MAX_WALLET_FILLS", 5000))
 
 # Dynamic risk policy engine
 RISK_POLICY_DEFAULT_REWARD_MULTIPLE = float(
@@ -918,6 +924,8 @@ def _validate_config_bounds() -> None:
         ("POLYMARKET_MAX_MARKETS_PER_SCAN", 10, 10_000, 100),
         ("POLYMARKET_TRADE_BACKFILL_LIMIT_PER_MARKET", 1, 10_000, 200),
         ("OPTIONS_FLOW_SCAN_INTERVAL", 10, 3600, 120),
+        ("FEATURE_STORE_BOOTSTRAP_TOP_COINS", 0, 100, 8),
+        ("HL_BOT_BACKUP_MAX_WALLET_FILLS", 0, 1_000_000, 5000),
         ("RISK_POLICY_DEFAULT_REWARD_MULTIPLE", 0.5, 20.0, 3.25),
         ("RISK_POLICY_MIN_REWARD_MULTIPLE", 0.1, 10.0, 1.75),
         ("RISK_POLICY_MAX_REWARD_MULTIPLE", 0.1, 50.0, 4.5),

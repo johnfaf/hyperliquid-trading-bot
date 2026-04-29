@@ -30,6 +30,7 @@ _BACKFILL_DAYS = {
 
 # Cap watched coins to avoid API flooding
 _MAX_COINS = int(getattr(config, "FEATURE_STORE_MAX_COINS", 30))
+_BOOTSTRAP_TOP_COINS = int(getattr(config, "FEATURE_STORE_BOOTSTRAP_TOP_COINS", 8))
 
 
 # ─── Watched coins ─────────────────────────────────────────────
@@ -89,7 +90,10 @@ def _get_watched_coins(container=None) -> List[str]:
             from src.data import hyperliquid_client as hl
             all_coins = hl.get_all_coins()
             if all_coins:
-                for c in all_coins[:20]:
+                target_total = min(_BOOTSTRAP_TOP_COINS, _MAX_COINS)
+                for c in all_coins:
+                    if len(coins) >= target_total:
+                        break
                     coins.add(c.upper())
         except Exception:
             pass
