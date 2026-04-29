@@ -355,11 +355,124 @@ def test_db_repair_backfills_safe_local_state(monkeypatch):
     repaired_strategy = conn.execute(
         "SELECT active, strategy_type FROM strategies WHERE id = 6"
     ).fetchone()
-    assert repaired_strategy["active"] == 0
-    assert repaired_strategy["strategy_type"] == "retired_placeholder"
+    assert repaired_strategy is None
+    assert conn.execute(
+        "SELECT COUNT(*) FROM strategy_scores WHERE strategy_id = 6"
+    ).fetchone()[0] == 0
+    assert any(
+        action.action == "orphan_strategy_score_parents"
+        and action.status == "applied"
+        and action.details.get("deleted") == 1
+        for action in report.actions
+    )
 
     assert conn.execute("SELECT COUNT(*) FROM source_inventory").fetchone()[0] > 0
     assert not report.post_audit.findings_at_or_above("high")
+
+
+def test_strategy_repair_prunes_synthetic_and_caps_missing_source_rows(monkeypatch):
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.executescript(
+        """
+        CREATE TABLE strategies (
+            id INTEGER PRIMARY KEY,
+            name TEXT NOT NULL,
+            description TEXT,
+            strategy_type TEXT NOT NULL,
+            parameters TEXT DEFAULT '{}',
+            discovered_at TEXT NOT NULL,
+            last_scored TEXT,
+            current_score REAL DEFAULT 0,
+            total_pnl REAL DEFAULT 0,
+            trade_count INTEGER DEFAULT 0,
+            win_rate REAL DEFAULT 0,
+            sharpe_ratio REAL DEFAULT 0,
+            active INTEGER DEFAULT 1
+        );
+        CREATE TABLE strategy_scores (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            strategy_id INTEGER NOT NULL,
+            timestamp TEXT NOT NULL,
+            score REAL DEFAULT 0
+        );
+        """
+    )
+    conn.executemany(
+        """
+        INSERT INTO strategies
+        (id, name, description, strategy_type, parameters, discovered_at, last_scored, active)
+        VALUES (?, ?, '', ?, ?, ?, ?, ?)
+        """,
+        [
+            (
+                1,
+                "valid_inactive",
+                "momentum_long",
+                '{"source_wallet":"0x1111111111111111111111111111111111111111"}',
+                "2026-04-10T00:00:00+00:00",
+                "2026-04-20T00:00:00+00:00",
+                0,
+            ),
+            (
+                2,
+                "recovered_strategy_2",
+                "retired_placeholder",
+                '{"auto_repaired":true,"repair_reason":"orphan_strategy_score_parent"}',
+                "2026-04-10T00:00:00+00:00",
+                "2026-04-10T00:00:00+00:00",
+                0,
+            ),
+            (
+                10,
+                "old_missing_source",
+                "momentum_long",
+                '{}',
+                "2026-04-01T00:00:00+00:00",
+                "2026-04-01T00:00:00+00:00",
+                0,
+            ),
+            (
+                11,
+                "new_missing_source",
+                "momentum_long",
+                '{}',
+                "2026-04-02T00:00:00+00:00",
+                "2026-04-02T00:00:00+00:00",
+                0,
+            ),
+        ],
+    )
+    conn.executemany(
+        "INSERT INTO strategy_scores (strategy_id, timestamp, score) VALUES (?, ?, ?)",
+        [
+            (1, "2026-04-20T00:00:00+00:00", 0.8),
+            (2, "2026-04-10T00:00:00+00:00", 0.1),
+            (10, "2026-04-01T00:00:00+00:00", 0.2),
+            (11, "2026-04-02T00:00:00+00:00", 0.3),
+        ],
+    )
+    conn.commit()
+
+    monkeypatch.setattr(db, "get_connection", lambda for_read=False: _connection_ctx(conn))
+    monkeypatch.setattr(db_audit.config, "DB_REPAIR_KEEP_MISSING_SOURCE_STRATEGIES", 1)
+
+    actions = []
+    db_audit._repair_invalid_strategy_bloat(actions)
+    db_audit._repair_missing_source_wallet_strategy_bloat(actions)
+
+    remaining_ids = {
+        row["id"] for row in conn.execute("SELECT id FROM strategies ORDER BY id").fetchall()
+    }
+    assert remaining_ids == {1, 11}
+    remaining_score_ids = {
+        row["strategy_id"]
+        for row in conn.execute("SELECT strategy_id FROM strategy_scores ORDER BY strategy_id")
+    }
+    assert remaining_score_ids == {1, 11}
+    assert any(action.action == "invalid_strategy_bloat" for action in actions)
+    assert any(action.action == "missing_source_strategy_bloat" for action in actions)
 
 
 def test_db_audit_same_side_open_trades_only_flag_above_cap(monkeypatch):

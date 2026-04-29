@@ -1256,6 +1256,75 @@ def _repair_orphan_position_snapshot_parents(actions: list[DbRepairAction]) -> N
         )
 
 
+def _repair_invalid_strategy_bloat(actions: list[DbRepairAction]) -> None:
+    """Prune non-executable strategy rows created by old repair paths.
+
+    Older repairs preserved orphan ``strategy_scores`` by creating inactive
+    ``retired_placeholder`` strategy rows.  That prevented orphan score rows but
+    polluted the strategy inventory with fake strategies.  Synthetic rows are
+    never live-eligible, so pruning their scores and parents is safer than
+    repeatedly resurrecting them.
+    """
+    try:
+        with db.get_connection() as conn:
+            if not _table_exists(conn, "strategies"):
+                _record_action(
+                    actions,
+                    "invalid_strategy_bloat",
+                    "skipped",
+                    "strategies table is not present.",
+                )
+                return
+            rows = conn.execute("SELECT * FROM strategies WHERE active = ?", (False,)).fetchall()
+            strategy_ids = []
+            for row in rows:
+                strategy = dict(row)
+                if db.strategy_quarantine_reason(strategy) == "auto_repaired_placeholder":
+                    strategy_id = int(strategy.get("id") or 0)
+                    if strategy_id > 0:
+                        strategy_ids.append(strategy_id)
+            if not strategy_ids:
+                _record_action(
+                    actions,
+                    "invalid_strategy_bloat",
+                    "skipped",
+                    "No synthetic placeholder strategies were found.",
+                )
+                return
+
+            deleted_scores = 0
+            if _table_exists(conn, "strategy_scores"):
+                for strategy_id in strategy_ids:
+                    cur = conn.execute(
+                        "DELETE FROM strategy_scores WHERE strategy_id = ?",
+                        (strategy_id,),
+                    )
+                    deleted_scores += int(getattr(cur, "rowcount", 0) or 0)
+            deleted_strategies = 0
+            for strategy_id in strategy_ids:
+                cur = conn.execute(
+                    "DELETE FROM strategies WHERE id = ? AND active = ?",
+                    (strategy_id, False),
+                )
+                deleted_strategies += int(getattr(cur, "rowcount", 0) or 0)
+            _record_action(
+                actions,
+                "invalid_strategy_bloat",
+                "applied",
+                "Pruned synthetic placeholder strategies and their score history.",
+                deleted_strategies=deleted_strategies,
+                deleted_scores=deleted_scores,
+            )
+    except Exception as exc:
+        _record_action(
+            actions,
+            "invalid_strategy_bloat",
+            "failed",
+            "Could not prune synthetic placeholder strategies.",
+            error=str(exc),
+        )
+
+
 def _repair_orphan_strategy_score_parents(actions: list[DbRepairAction]) -> None:
     try:
         with db.get_connection() as conn:
@@ -1267,18 +1336,15 @@ def _repair_orphan_strategy_score_parents(actions: list[DbRepairAction]) -> None
                     "strategy_scores/strategies tables are not present.",
                 )
                 return
-            rows = conn.execute(
+            row = conn.execute(
                 """
-                SELECT strategy_id, COUNT(*) AS score_count,
-                       MIN(timestamp) AS first_seen,
-                       MAX(timestamp) AS last_seen
+                SELECT COUNT(*) AS c
                 FROM strategy_scores
                 WHERE strategy_id NOT IN (SELECT id FROM strategies)
-                GROUP BY strategy_id
-                ORDER BY strategy_id
                 """
-            ).fetchall()
-            if not rows:
+            ).fetchone()
+            orphan_count = int(_scalar(row, "c", 0) or 0)
+            if orphan_count <= 0:
                 _record_action(
                     actions,
                     "orphan_strategy_score_parents",
@@ -1286,58 +1352,106 @@ def _repair_orphan_strategy_score_parents(actions: list[DbRepairAction]) -> None
                     "No orphan strategy_scores rows were found.",
                 )
                 return
-            for row in rows:
-                strategy_id = int(_row_get(row, "strategy_id", 0, 0) or 0)
-                if strategy_id <= 0:
-                    continue
-                score_count = int(_row_get(row, "score_count", 1, 0) or 0)
-                first_seen = str(_row_get(row, "first_seen", 2, "") or _now())
-                last_seen = str(_row_get(row, "last_seen", 3, "") or first_seen)
-                conn.execute(
-                    """
-                    INSERT INTO strategies
-                    (id, name, description, strategy_type, parameters, discovered_at,
-                     last_scored, current_score, total_pnl, trade_count, win_rate,
-                     sharpe_ratio, active)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, 0, 0)
-                    ON CONFLICT(id) DO UPDATE SET
-                        last_scored = EXCLUDED.last_scored,
-                        active = 0
-                    """,
-                    (
-                        strategy_id,
-                        f"recovered_strategy_{strategy_id}",
-                        (
-                            "Auto-repaired placeholder strategy created to preserve "
-                            f"{score_count} historical strategy_scores rows."
-                        ),
-                        "retired_placeholder",
-                        json.dumps(
-                            {
-                                "auto_repaired": True,
-                                "repair_reason": "orphan_strategy_score_parent",
-                                "score_count": score_count,
-                            },
-                            sort_keys=True,
-                            separators=(",", ":"),
-                        ),
-                        first_seen,
-                        last_seen,
-                    ),
-                )
+            conn.execute(
+                """
+                DELETE FROM strategy_scores
+                WHERE strategy_id NOT IN (SELECT id FROM strategies)
+                """
+            )
             _record_action(
                 actions,
                 "orphan_strategy_score_parents",
                 "applied",
-                "Backfilled placeholder strategies for orphan strategy_scores rows.",
-                repaired=len(rows),
+                "Pruned orphan strategy_scores rows instead of creating placeholder strategies.",
+                deleted=orphan_count,
             )
     except Exception as exc:
         _record_action(
             actions,
             "orphan_strategy_score_parents",
             "failed",
-            "Could not backfill placeholder strategy parents.",
+            "Could not prune orphan strategy_scores rows.",
+            error=str(exc),
+        )
+
+
+def _repair_missing_source_wallet_strategy_bloat(actions: list[DbRepairAction]) -> None:
+    """Cap old inactive strategies that have no source-wallet provenance."""
+    try:
+        keep = max(
+            0,
+            int(getattr(config, "DB_REPAIR_KEEP_MISSING_SOURCE_STRATEGIES", 500) or 500),
+        )
+    except (TypeError, ValueError):
+        keep = 500
+
+    try:
+        with db.get_connection() as conn:
+            if not _table_exists(conn, "strategies"):
+                _record_action(
+                    actions,
+                    "missing_source_strategy_bloat",
+                    "skipped",
+                    "strategies table is not present.",
+                )
+                return
+            rows = conn.execute("SELECT * FROM strategies WHERE active = ?", (False,)).fetchall()
+            candidates = []
+            for row in rows:
+                strategy = dict(row)
+                if db.strategy_quarantine_reason(strategy) != "missing_source_wallet":
+                    continue
+                strategy_id = int(strategy.get("id") or 0)
+                if strategy_id <= 0:
+                    continue
+                sort_key = (
+                    str(strategy.get("last_scored") or strategy.get("discovered_at") or ""),
+                    strategy_id,
+                )
+                candidates.append((sort_key, strategy_id))
+            candidates.sort(reverse=True)
+            if len(candidates) <= keep:
+                _record_action(
+                    actions,
+                    "missing_source_strategy_bloat",
+                    "skipped",
+                    "Inactive missing-source strategy rows are within the retention cap.",
+                    total=len(candidates),
+                    keep=keep,
+                )
+                return
+
+            prune_ids = [strategy_id for _sort_key, strategy_id in candidates[keep:]]
+            deleted_scores = 0
+            if _table_exists(conn, "strategy_scores"):
+                for strategy_id in prune_ids:
+                    cur = conn.execute(
+                        "DELETE FROM strategy_scores WHERE strategy_id = ?",
+                        (strategy_id,),
+                    )
+                    deleted_scores += int(getattr(cur, "rowcount", 0) or 0)
+            deleted_strategies = 0
+            for strategy_id in prune_ids:
+                cur = conn.execute(
+                    "DELETE FROM strategies WHERE id = ? AND active = ?",
+                    (strategy_id, False),
+                )
+                deleted_strategies += int(getattr(cur, "rowcount", 0) or 0)
+            _record_action(
+                actions,
+                "missing_source_strategy_bloat",
+                "applied",
+                "Pruned old inactive strategies without source-wallet provenance.",
+                deleted_strategies=deleted_strategies,
+                deleted_scores=deleted_scores,
+                kept=keep,
+            )
+    except Exception as exc:
+        _record_action(
+            actions,
+            "missing_source_strategy_bloat",
+            "failed",
+            "Could not prune inactive missing-source strategy rows.",
             error=str(exc),
         )
 
@@ -2118,7 +2232,9 @@ def run_db_repair(
     actions: list[DbRepairAction] = []
     _repair_schema_migrations_table(actions)
     _repair_orphan_position_snapshot_parents(actions)
+    _repair_invalid_strategy_bloat(actions)
     _repair_orphan_strategy_score_parents(actions)
+    _repair_missing_source_wallet_strategy_bloat(actions)
     _repair_source_inventory(actions)
     _repair_paper_account(actions)
     _repair_open_trade_protection(actions)
@@ -2181,9 +2297,13 @@ def run_startup_safe_repair() -> list[DbRepairAction]:
 
     - paper_account counters derived from closed paper_trades
     - stale unresolved candidate decisions with no trade/order attached
+    - synthetic strategy placeholders and orphan strategy-score rows
     - source-health snapshot freshness
     """
     actions: list[DbRepairAction] = []
+    _repair_invalid_strategy_bloat(actions)
+    _repair_orphan_strategy_score_parents(actions)
+    _repair_missing_source_wallet_strategy_bloat(actions)
     _repair_paper_account(actions)
     _repair_stale_pending_decisions(actions)
     _repair_source_health_history(actions)
