@@ -30,6 +30,32 @@ def test_crash_reconciliation_does_not_mutate_trending_up_guidance():
     assert REGIME_STRATEGY_MAP[Regime.TRENDING_UP]["size_modifier"] == original_size
 
 
+def test_synthetic_forecaster_crash_cannot_override_detector():
+    from src.analysis.regime_detector import REGIME_STRATEGY_MAP, Regime
+    from src.core.cycles.trading_cycle import _reconcile_regimes
+
+    container = MagicMock()
+    container.predictive_forecaster.predict_regime.return_value = {
+        "regime": "crash",
+        "confidence": 0.90,
+        "training_source": "synthetic",
+        "synthetic_warm_start": True,
+    }
+    regime_data = {
+        "overall_regime": "trending_up",
+        "overall_confidence": 0.95,
+        "strategy_guidance": REGIME_STRATEGY_MAP[Regime.TRENDING_UP],
+    }
+
+    result = _reconcile_regimes(regime_data, container)
+
+    assert result["overall_regime"] == "trending_up"
+    assert "regime_override" not in result
+    assert "countertrend_block_side" not in result
+    assert result["forecaster_training_source"] == "synthetic"
+    assert result["forecaster_synthetic_warm_start"] is True
+
+
 def test_macro_overlay_does_not_compound_global_trending_up_size_modifier():
     from src.analysis.regime_detector import REGIME_STRATEGY_MAP, Regime
     from src.core.cycles.trading_cycle import _apply_macro_regime_overlay

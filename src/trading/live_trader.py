@@ -85,6 +85,33 @@ from src.trading.scaling_tiers import (
 logger = logging.getLogger(__name__)
 
 
+def _derive_missing_live_drawdown_cap(
+    *,
+    max_daily_loss: float,
+    max_position_size: float,
+    max_order_usd: float,
+    min_order_usd: float,
+) -> float:
+    """Derive a conservative rolling drawdown cap when the env var is absent.
+
+    This does not replace an explicit operator cap. It only prevents a live
+    deployment from running uncapped when the per-tier/per-order limits already
+    define a tighter safety envelope.
+    """
+    candidates = []
+    if max_daily_loss > 0:
+        candidates.append(float(max_daily_loss) * 0.25)
+    if max_position_size > 0:
+        candidates.append(float(max_position_size) * 0.10)
+    if max_order_usd > 0:
+        candidates.append(float(max_order_usd) * 0.25)
+    if not candidates:
+        return 0.0
+    default_min_cap = max(1.0, float(min_order_usd) * 0.10) if min_order_usd > 0 else 1.0
+    min_cap = _safe_env_float("LIVE_MIN_DRAWDOWN_CAP_USD", default_min_cap, lo=0.0, hi=1e6)
+    return max(float(min_cap), min(candidates))
+
+
 class OrderType(str, Enum):
     """Order types supported by Hyperliquid."""
     LIMIT_GTC = "Gtc"         # Good Till Canceled limit
@@ -768,6 +795,7 @@ class LiveTrader:
         # by snapshot_balance().  0 / unset disables the check.
         # C6: drawdown envs go through the same safe parser — bad input
         # must fail closed (disable the check) rather than raise.
+        raw_max_drawdown = os.environ.get("LIVE_MAX_DRAWDOWN_USD")
         self._max_drawdown_usd = _safe_env_float(
             "LIVE_MAX_DRAWDOWN_USD", 0.0, lo=0.0, hi=1e8,
         )
@@ -775,6 +803,26 @@ class LiveTrader:
             getattr(config, "LIVE_TRADING_ENABLED", False)
             and getattr(config, "LIVE_TRADING_DUAL_CONTROL_CONFIRM", False)
         )
+        if (
+            self.live_requested
+            and live_dual_control_effective
+            and (raw_max_drawdown is None or str(raw_max_drawdown).strip() == "")
+            and self._max_drawdown_usd <= 0
+        ):
+            derived_cap = _derive_missing_live_drawdown_cap(
+                max_daily_loss=self.max_daily_loss,
+                max_position_size=self.max_position_size,
+                max_order_usd=self.max_order_usd,
+                min_order_usd=self.min_order_usd,
+            )
+            if derived_cap > 0:
+                self._max_drawdown_usd = derived_cap
+                logger.warning(
+                    "LIVE_MAX_DRAWDOWN_USD is unset; using conservative derived "
+                    "rolling drawdown cap $%.2f from current tier/order limits. "
+                    "Set LIVE_MAX_DRAWDOWN_USD explicitly before scaling.",
+                    self._max_drawdown_usd,
+                )
         if self.live_requested and live_dual_control_effective and self._max_drawdown_usd <= 0:
             logger.critical(
                 "LIVE_MAX_DRAWDOWN_USD must be > 0 when live dual-control is enabled; "

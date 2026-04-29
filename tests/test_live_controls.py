@@ -272,6 +272,30 @@ def test_live_dual_control_requires_rolling_drawdown_cap(monkeypatch):
     assert trader.status_reason == "live_drawdown_cap_required"
 
 
+def test_live_dual_control_derives_missing_rolling_drawdown_cap(monkeypatch):
+    monkeypatch.setattr(config, "LIVE_TRADING_ENABLED", True, raising=False)
+    monkeypatch.setattr(config, "LIVE_TRADING_DUAL_CONTROL_CONFIRM", True, raising=False)
+    monkeypatch.setattr(config, "LIVE_TIER", "", raising=False)
+    monkeypatch.delenv("LIVE_TIER", raising=False)
+    monkeypatch.delenv("LIVE_MAX_DRAWDOWN_USD", raising=False)
+    monkeypatch.delenv("HL_MAX_DAILY_LOSS", raising=False)
+    monkeypatch.setattr(LiveTrader, "_load_credentials", _fake_live_credentials)
+    monkeypatch.setattr(LiveTrader, "_load_asset_index_map", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "reconcile_positions", lambda self: None)
+
+    trader = LiveTrader(
+        firewall=type("FW", (), {})(),
+        dry_run=False,
+        max_daily_loss=100.0,
+        max_position_size=150.0,
+        max_order_usd=50.0,
+    )
+
+    assert trader.dry_run is False
+    assert trader.status_reason == "live_ready"
+    assert trader._max_drawdown_usd == pytest.approx(12.5)
+
+
 def test_dynamic_source_policy_caps_active_sources():
     scorer = AgentScorer(
         {

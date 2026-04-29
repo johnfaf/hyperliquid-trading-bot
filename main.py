@@ -90,6 +90,28 @@ from cli import (
 
 # ─── Bot Engine ────────────────────────────────────────────────
 
+def _strategy_pool_requires_startup_discovery() -> tuple[bool, dict]:
+    """Return whether startup should refresh trader/strategy discovery.
+
+    Startup previously only checked whether traders existed. After the
+    strategy-source guardrails quarantine contaminated rows, the DB can still
+    contain traders while every strategy is invalid. In that state waiting for
+    the daily discovery timer leaves the strategy engine empty for hours.
+    """
+    try:
+        status = db.get_strategy_runtime_status()
+    except Exception as exc:
+        return False, {"error": str(exc)}
+
+    total = int(status.get("total", 0) or 0)
+    active_valid = int(status.get("active_valid", 0) or 0)
+    inactive_valid = int(status.get("inactive_valid", 0) or 0)
+    if total <= 0:
+        return True, status
+    if active_valid <= 0 and inactive_valid <= 0:
+        return True, status
+    return False, status
+
 class HyperliquidResearchBot:
     """
     Orchestrates the 3-tier scheduling loop.  Delegates all work to cycle
@@ -646,21 +668,34 @@ class HyperliquidResearchBot:
 
             if trader_count == 0:
                 self.logger.info(
-                    "No traders in DB — scheduling initial discovery in background "
+                    "No traders in DB -- scheduling initial discovery in background "
                     "so trading cycles can continue."
                 )
                 self._start_discovery_async("startup_empty_trader_pool")
             else:
+                strategy_refresh_needed, strategy_status = _strategy_pool_requires_startup_discovery()
+                if strategy_refresh_needed:
+                    self.logger.warning(
+                        "Strategy pool has no valid rows (status=%s) -- scheduling "
+                        "startup discovery instead of waiting for the daily timer.",
+                        strategy_status,
+                    )
+                    self._start_discovery_async("startup_empty_strategy_pool")
                 restored_ts = self._restore_last_discovery_time()
-                if restored_ts and (time.time() - restored_ts) < config.DISCOVERY_CYCLE_INTERVAL:
+                if (
+                    not strategy_refresh_needed
+                    and restored_ts
+                    and (time.time() - restored_ts) < config.DISCOVERY_CYCLE_INTERVAL
+                ):
                     self._last_discovery = restored_ts
                     remaining_h = (config.DISCOVERY_CYCLE_INTERVAL - (time.time() - restored_ts)) / 3600
                     self.logger.info("Restored discovery timer, next in %.1fh", remaining_h)
                 else:
                     self._last_discovery = time.time()
                     self.logger.info(
-                        "DB has %d traders — next discovery in %.0fh",
-                        trader_count, config.DISCOVERY_CYCLE_INTERVAL / 3600,
+                        "DB has %d traders; strategy_status=%s -- next scheduled "
+                        "discovery in %.0fh",
+                        trader_count, strategy_status, config.DISCOVERY_CYCLE_INTERVAL / 3600,
                     )
 
             # Independent kill-switch watchdog (P0-1)

@@ -103,6 +103,33 @@ class TestXGBoostRegimeForecaster:
         assert result["signal"] < 0  # Negative signal for crash
         assert result["confidence"] >= 0.8
 
+    @patch("src.signals.xgboost_regime_forecaster.HAS_XGBOOST", True)
+    def test_synthetic_warm_start_caps_prediction_confidence(self, forecaster):
+        """Synthetic warm-start models are non-authoritative live inputs."""
+        import numpy as np
+
+        mock_model = MagicMock()
+        mock_model.predict_proba.return_value = np.array([[0.9, 0.05, 0.05]])
+        forecaster.model = mock_model
+        forecaster._last_train_ts = time.time()
+        forecaster._model_training_source = "synthetic"
+        forecaster._model_observed_rows = 0
+        forecaster._model_uses_synthetic_warm_start = True
+        forecaster._synthetic_max_confidence = 0.60
+
+        features = {f: 0.0 for f in FEATURE_NAMES}
+        with patch.object(forecaster, "_extract_features", return_value=features):
+            with patch.object(forecaster, "_store_prediction"):
+                forecaster.prediction_cache.clear()
+                result = forecaster.predict_regime("BTC")
+
+        assert result["regime"] == "crash"
+        assert result["raw_confidence"] == pytest.approx(0.9)
+        assert result["confidence"] == pytest.approx(0.6)
+        assert result["signal"] == pytest.approx(-0.6)
+        assert result["synthetic_warm_start"] is True
+        assert result["training_source"] == "synthetic"
+
     def test_prediction_caching(self, forecaster):
         """Second call within cache_ttl returns cached result."""
         forecaster.model = None
@@ -112,6 +139,20 @@ class TestXGBoostRegimeForecaster:
         # Both should be identical (cached)
         assert r1["regime"] == r2["regime"]
         assert r1["confidence"] == r2["confidence"]
+
+    def test_synthetic_warm_start_model_is_not_persisted(self, forecaster, tmp_path):
+        mock_model = MagicMock()
+        forecaster.model = mock_model
+        forecaster.model_path = str(tmp_path / "regime_xgboost.json")
+        forecaster._model_training_source = "synthetic"
+        forecaster._model_observed_rows = 0
+        forecaster._model_uses_synthetic_warm_start = True
+
+        forecaster._save_model()
+
+        mock_model.save_model.assert_not_called()
+        assert not (tmp_path / "regime_xgboost.json").exists()
+        assert not (tmp_path / "regime_xgboost.json.meta.json").exists()
 
     def test_update_passthrough(self, forecaster):
         """update_polymarket_sentiment and update_options_flow pass to fallback."""
