@@ -1442,7 +1442,7 @@ def test_mirror_executed_trades_logs_warning_for_insufficient_margin(monkeypatch
     assert "live copy failed" not in caplog.text.lower()
 
 
-def test_mirror_executed_trades_logs_warning_for_guardrail_skip(monkeypatch, caplog):
+def test_mirror_executed_trades_logs_info_for_guardrail_skip(monkeypatch, caplog):
     class FakeLiveTrader:
         def __init__(self):
             self.executed = []
@@ -1481,7 +1481,7 @@ def test_mirror_executed_trades_logs_warning_for_guardrail_skip(monkeypatch, cap
         )
     ]
 
-    with caplog.at_level(logging.WARNING):
+    with caplog.at_level(logging.INFO):
         mirror_executed_trades_to_live(
             container,
             executed,

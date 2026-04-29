@@ -241,7 +241,13 @@ def init_database(logger: logging.Logger) -> None:
             applied = [a for a in actions if str(a.status).lower() == "applied"]
             failed = [a for a in actions if str(a.status).lower() == "failed"]
             if applied:
-                logger.warning(
+                benign_actions = {
+                    "source_health_history",
+                    "stale_pending_decisions",
+                    "stale_regime_history",
+                }
+                log = logger.info if all(a.action in benign_actions for a in applied) else logger.warning
+                log(
                     "Startup DB safe-repair applied: %s",
                     ", ".join(a.action for a in applied),
                 )

@@ -787,7 +787,7 @@ def mirror_executed_trades_to_live(
                     )
                 else:
                     if live_result is None:
-                        logger.warning(
+                        logger.info(
                             "%s skipped: %s %s blocked by live guardrails (no execution result)",
                             success_label,
                             live_signal.coin,

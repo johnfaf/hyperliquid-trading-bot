@@ -548,7 +548,7 @@ class LiveTrader:
             # explicitly moves to T4.
             self.canary_mode = self.active_tier.name != "T4"
             self.kelly_dampen = float(self.active_tier.kelly_dampen)
-            logger.warning(
+            logger.info(
                 "LIVE_TIER=%s (%s) active: max_order_usd=$%.2f, "
                 "max_daily_loss=$%.2f, max_position_size=$%.2f, "
                 "max_signals_per_day=%s, kelly_dampen=%.2f",
@@ -6235,7 +6235,7 @@ class LiveTrader:
                 source_policy=source_policy,
             )
             if not reserved:
-                logger.warning(
+                logger.info(
                     "Entry cap reached (%s) - rejecting %s (source=%s)",
                     reserve_reason,
                     signal.coin,

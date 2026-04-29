@@ -707,7 +707,7 @@ class XGBoostRegimeForecaster:
         if self.model is None:
             return
         if self._model_uses_synthetic_warm_start:
-            logger.warning(
+            logger.info(
                 "XGBoost warm-start model not saved (source=%s, observed_rows=%d); "
                 "waiting for observed regime_history labels before persisting.",
                 self._model_training_source,
