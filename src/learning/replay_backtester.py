@@ -32,15 +32,49 @@ class ReplayPolicy:
     min_confidence: float = 0.0
     allowed_sources: Optional[List[str]] = None
     allowed_sides: Optional[List[str]] = None
+    include_rejected: bool = False
+    allowed_source_keys: Optional[List[str]] = None
+    allowed_statuses: Optional[List[str]] = None
+    allowed_regimes: Optional[List[str]] = None
+    blocked_rejection_reasons: Optional[List[str]] = None
+    source_confidence_multipliers: Optional[Dict[str, float]] = None
+    side_confidence_multipliers: Optional[Dict[str, float]] = None
+
+    def effective_confidence(self, example: LearningExample) -> float:
+        confidence = float(example.confidence or 0.0)
+        source_key = example.source_key or example.metadata.get("source_key") or example.source
+        if self.source_confidence_multipliers and source_key in self.source_confidence_multipliers:
+            confidence *= float(self.source_confidence_multipliers[source_key])
+        if self.side_confidence_multipliers and example.side in self.side_confidence_multipliers:
+            confidence *= float(self.side_confidence_multipliers[example.side])
+        return max(0.0, min(confidence, 1.0))
 
     def accepts(self, example: LearningExample) -> bool:
-        if example.confidence < self.min_confidence:
+        if example.label_win is None:
+            return False
+        if not example.executed and not self.include_rejected:
+            return False
+        if self.effective_confidence(example) < self.min_confidence:
             return False
         if self.allowed_sources and example.source not in self.allowed_sources:
             return False
+        source_key = example.source_key or example.metadata.get("source_key") or ""
+        if self.allowed_source_keys and source_key not in self.allowed_source_keys:
+            return False
         if self.allowed_sides and example.side not in self.allowed_sides:
             return False
-        return example.executed and example.label_win is not None
+        status = example.final_status or str(example.metadata.get("final_status") or "")
+        if self.allowed_statuses and status not in self.allowed_statuses:
+            return False
+        regime = ""
+        if isinstance(example.regime, dict):
+            regime = str(example.regime.get("overall_regime") or example.regime.get("regime") or "")
+        if self.allowed_regimes and regime not in self.allowed_regimes:
+            return False
+        reason = example.rejection_reason or str(example.metadata.get("rejection_reason") or "")
+        if self.blocked_rejection_reasons and reason in self.blocked_rejection_reasons:
+            return False
+        return True
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -48,6 +82,13 @@ class ReplayPolicy:
             "min_confidence": self.min_confidence,
             "allowed_sources": self.allowed_sources,
             "allowed_sides": self.allowed_sides,
+            "include_rejected": self.include_rejected,
+            "allowed_source_keys": self.allowed_source_keys,
+            "allowed_statuses": self.allowed_statuses,
+            "allowed_regimes": self.allowed_regimes,
+            "blocked_rejection_reasons": self.blocked_rejection_reasons,
+            "source_confidence_multipliers": self.source_confidence_multipliers,
+            "side_confidence_multipliers": self.side_confidence_multipliers,
         }
 
 
@@ -81,13 +122,16 @@ class DecisionReplayBacktester:
         min_profit_factor: float = 1.05,
         train_fraction: float = 0.70,
         min_test_trades: Optional[int] = None,
+        purge_fraction: float = 0.02,
     ):
         self.min_trades = int(min_trades)
         self.min_profit_factor = float(min_profit_factor)
         self.train_fraction = min(max(float(train_fraction), 0.10), 0.90)
+        self.purge_fraction = min(max(float(purge_fraction), 0.0), 0.20)
         if min_test_trades is None:
             min_test_trades = max(1, int(math.ceil(self.min_trades * (1.0 - self.train_fraction) - 1e-9)))
         self.min_test_trades = int(min_test_trades)
+        self._last_purged_examples = 0
 
     @staticmethod
     def _max_drawdown(pnls: List[float]) -> float:
@@ -122,10 +166,14 @@ class DecisionReplayBacktester:
     def _split_examples(self, examples: List[LearningExample]) -> Tuple[List[LearningExample], List[LearningExample]]:
         ordered = sorted(examples, key=self._sort_key)
         if len(ordered) < 2:
+            self._last_purged_examples = 0
             return ordered, []
         split_idx = int(math.floor(len(ordered) * self.train_fraction))
         split_idx = min(max(split_idx, 1), len(ordered) - 1)
-        return ordered[:split_idx], ordered[split_idx:]
+        purge = int(math.floor(len(ordered) * self.purge_fraction)) if len(ordered) >= 50 else 0
+        test_start = min(split_idx + purge, len(ordered) - 1)
+        self._last_purged_examples = max(0, test_start - split_idx)
+        return ordered[:split_idx], ordered[test_start:]
 
     def _evaluate_policy(
         self,
@@ -155,6 +203,40 @@ class DecisionReplayBacktester:
             "sharpe_like": self._sharpe_like(pnls),
             "pnls": pnls,
         }
+
+    def _walkforward_metrics(
+        self,
+        examples: List[LearningExample],
+        policy: ReplayPolicy,
+        *,
+        windows: int = 4,
+    ) -> List[Dict[str, Any]]:
+        ordered = sorted(examples, key=self._sort_key)
+        if len(ordered) < max(20, windows * 4):
+            return []
+        out: List[Dict[str, Any]] = []
+        window_count = min(max(int(windows), 1), 8)
+        step = max(1, len(ordered) // window_count)
+        for idx in range(window_count):
+            start = idx * step
+            end = len(ordered) if idx == window_count - 1 else min(len(ordered), (idx + 1) * step)
+            chunk = ordered[start:end]
+            if len(chunk) < 2:
+                continue
+            train, test = self._split_examples(chunk)
+            metrics = self._evaluate_policy(test, policy)
+            out.append(
+                {
+                    "window": idx + 1,
+                    "examples": len(chunk),
+                    "train_examples": len(train),
+                    "test_examples": len(test),
+                    "purged_examples": self._last_purged_examples,
+                    **{k: v for k, v in metrics.items() if k != "pnls"},
+                    "passed": self._slice_passed(metrics, min_trades=max(1, self.min_test_trades)),
+                }
+            )
+        return out
 
     def _slice_passed(self, metrics: Dict[str, Any], *, min_trades: int) -> bool:
         return (
@@ -186,12 +268,14 @@ class DecisionReplayBacktester:
             "split": {
                 "train_examples": len(train_examples),
                 "test_examples": len(test_examples),
+                "purged_examples": self._last_purged_examples,
                 "train_fraction": self.train_fraction,
                 "min_train_trades": self.min_trades,
                 "min_test_trades": self.min_test_trades,
                 "train_passed": train_passed,
                 "test_passed": test_passed,
             },
+            "walk_forward": self._walkforward_metrics(dataset.examples, policy),
         })
         passed = train_passed and test_passed
         pnls = list(test_metrics["pnls"])

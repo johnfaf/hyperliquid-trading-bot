@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from src.learning.candidate_registry import CandidatePolicyRegistry
+from src.learning.conservative_calibrator import ConservativeDecisionCalibrator
 from src.learning.data_quality import DatasetQualityAuditor
 from src.learning.dataset_builder import DatasetBuildResult, DecisionDatasetBuilder
 from src.learning.feature_attribution import FeatureAttributionAnalyzer
@@ -68,12 +69,14 @@ class ContinuousLearningOrchestrator:
         improvement_runner: Optional[OfflineImprovementRunner] = None,
         replay_backtester: Optional[DecisionReplayBacktester] = None,
         shadow_evaluator: Optional[ShadowPolicyEvaluator] = None,
+        conservative_calibrator: Optional[ConservativeDecisionCalibrator] = None,
     ):
         self.dataset_builder = dataset_builder or DecisionDatasetBuilder()
         self.quality_auditor = quality_auditor or DatasetQualityAuditor()
         self.improvement_runner = improvement_runner or OfflineImprovementRunner()
         self.replay_backtester = replay_backtester or DecisionReplayBacktester()
         self.shadow_evaluator = shadow_evaluator or ShadowPolicyEvaluator()
+        self.conservative_calibrator = conservative_calibrator or ConservativeDecisionCalibrator()
 
     @staticmethod
     def _policy_from_candidate(candidate_policy_id: str, candidate_metrics: Dict[str, Any]) -> ReplayPolicy:
@@ -83,6 +86,13 @@ class ContinuousLearningOrchestrator:
             min_confidence=float(params.get("min_confidence", 0.0) or 0.0),
             allowed_sources=params.get("allowed_sources"),
             allowed_sides=params.get("allowed_sides"),
+            include_rejected=bool(params.get("include_rejected", False)),
+            allowed_source_keys=params.get("allowed_source_keys"),
+            allowed_statuses=params.get("allowed_statuses"),
+            allowed_regimes=params.get("allowed_regimes"),
+            blocked_rejection_reasons=params.get("blocked_rejection_reasons"),
+            source_confidence_multipliers=params.get("source_confidence_multipliers"),
+            side_confidence_multipliers=params.get("side_confidence_multipliers"),
         )
 
     def run_offline_cycle(
@@ -118,6 +128,9 @@ class ContinuousLearningOrchestrator:
                     artifacts=artifacts,
                     persist=persist,
                 )
+
+            calibrator = self.conservative_calibrator.fit(dataset, persist=persist)
+            artifacts["decision_calibrator"] = calibrator.to_dict()
 
             improvement = self.improvement_runner.run(dataset=dataset, persist=persist)
             improvement_id = improvement.improvement_id

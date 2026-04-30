@@ -72,6 +72,7 @@ _POSTGRES_BOOLEAN_COLUMNS = frozenset({
     "is_golden",
     "connected_to_live",
     "is_liquidation",
+    "action_taken",
 })
 
 

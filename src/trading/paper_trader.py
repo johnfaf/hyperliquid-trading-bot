@@ -65,6 +65,74 @@ class PaperTrader:
         self._ensure_account()
         self._sync_fee_tier()
 
+    @staticmethod
+    def _decision_id_for_signal(trade_signal: Any = None, sig: Optional[Dict] = None) -> str:
+        sig = sig or {}
+        decision_id = str(sig.get("decision_id") or "").strip()
+        if decision_id:
+            return decision_id
+        if trade_signal is not None:
+            context = getattr(trade_signal, "context", None)
+            if isinstance(context, dict):
+                decision_id = str(context.get("decision_id") or "").strip()
+                if decision_id:
+                    return decision_id
+            return str(getattr(trade_signal, "signal_id", "") or "").strip()
+        return ""
+
+    def _journal_signal_stage(
+        self,
+        trade_signal: Any,
+        sig: Dict,
+        *,
+        stage: str,
+        status: str,
+        reason: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        decision_id = self._decision_id_for_signal(trade_signal, sig)
+        if not decision_id:
+            return
+        try:
+            decision_journal.record_stage_event(
+                decision_id,
+                stage=stage,
+                status=status,
+                reason=reason,
+                confidence=getattr(trade_signal, "confidence", sig.get("confidence")),
+                metadata=metadata or {},
+            )
+        except Exception:
+            pass
+
+    def _journal_signal_final(
+        self,
+        trade_signal: Any,
+        sig: Dict,
+        *,
+        final_status: str,
+        stage: str,
+        reason: Optional[str] = None,
+        firewall_decision: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        decision_id = self._decision_id_for_signal(trade_signal, sig)
+        if not decision_id:
+            return
+        try:
+            decision_journal.finalize_decision(
+                decision_id,
+                final_status=final_status,
+                stage=stage,
+                reason=reason,
+                firewall_decision=firewall_decision,
+                confidence=getattr(trade_signal, "confidence", sig.get("confidence")),
+                metadata=metadata or {},
+            )
+            decision_journal.record_decision_outcome(decision_id)
+        except Exception:
+            pass
+
     def _ensure_account(self):
         """Initialize paper trading account if it doesn't exist."""
         account = db.get_paper_account()
@@ -719,6 +787,13 @@ class PaperTrader:
                     firewall_decision="pending",
                     metadata={"stage": "paper_trader_candidate"},
                 )
+                self._journal_signal_stage(
+                    trade_signal,
+                    sig,
+                    stage="candidate",
+                    status="generated",
+                    metadata={"strategy_id": sig["strategy"].get("id")},
+                )
                 trade_signals.append((trade_signal, sig))
             except Exception as e:
                 _drop_counts["schema_error"] += 1
@@ -749,13 +824,36 @@ class PaperTrader:
                     if not passed:
                         _drop_counts["firewall"] += 1
                         logger.info(f"Firewall rejected {sig['side']} {sig['coin']}: {reason}")
+                        self._journal_signal_final(
+                            trade_signal,
+                            sig,
+                            final_status="firewall_prescreen_rejected",
+                            stage="firewall_prescreen",
+                            reason=reason,
+                            firewall_decision="rejected",
+                        )
                         continue
+                    self._journal_signal_stage(
+                        trade_signal,
+                        sig,
+                        stage="firewall_prescreen",
+                        status="approved",
+                        metadata={"ignore_position_limit": True},
+                    )
                     logger.debug(f"Firewall approved {sig['side']} {sig['coin']} "
                                 f"(confidence={trade_signal.confidence:.0%})")
                 else:
                     # Legacy fallback
                     if not self._check_risk_limits(account, sig, open_trades):
                         logger.debug(f"Risk limit hit, skipping {sig['coin']}")
+                        self._journal_signal_final(
+                            trade_signal,
+                            sig,
+                            final_status="risk_rejected",
+                            stage="legacy_risk",
+                            reason="legacy_risk_limits",
+                            firewall_decision="unavailable",
+                        )
                         continue
 
                 # Arena consensus vote (multi-agent debate).  Arena is an
@@ -774,9 +872,24 @@ class PaperTrader:
                             if not approved:
                                 _drop_counts["arena"] += 1
                                 logger.info(f"Arena consensus REJECTED {sig['side']} {sig['coin']}")
+                                self._journal_signal_final(
+                                    trade_signal,
+                                    sig,
+                                    final_status="arena_rejected",
+                                    stage="arena_consensus",
+                                    reason="consensus_rejected",
+                                    metadata={"consensus_confidence": consensus_conf},
+                                )
                                 continue
                             # Use consensus-adjusted confidence
                             trade_signal.confidence = consensus_conf
+                            self._journal_signal_stage(
+                                trade_signal,
+                                sig,
+                                stage="arena_consensus",
+                                status="approved",
+                                metadata={"consensus_confidence": consensus_conf},
+                            )
                         else:
                             logger.info(
                                 "Arena consensus bootstrap not ready; skipping optional vote for %s %s",
@@ -828,10 +941,25 @@ class PaperTrader:
                         if memory_result.recommendation == "avoid":
                             _drop_counts["memory"] += 1
                             logger.info(f"Memory BLOCKED {sig['side']} {sig['coin']}: {memory_result.reason}")
+                            self._journal_signal_final(
+                                trade_signal,
+                                sig,
+                                final_status="memory_rejected",
+                                stage="trade_memory",
+                                reason=memory_result.reason,
+                                metadata=memory_result.to_dict() if hasattr(memory_result, "to_dict") else {},
+                            )
                             continue
                         elif memory_result.recommendation == "caution":
                             trade_signal.confidence *= 0.8
                             logger.debug(f"Memory caution for {sig['coin']}: {memory_result.reason}")
+                            self._journal_signal_stage(
+                                trade_signal,
+                                sig,
+                                stage="trade_memory",
+                                status="caution",
+                                reason=memory_result.reason,
+                            )
                     except Exception as e:
                         logger.debug(f"Trade memory error: {e}")
                         memory_result = None
@@ -849,8 +977,23 @@ class PaperTrader:
                         if not llm_approved:
                             _drop_counts["llm_filter"] += 1
                             logger.info(f"LLM filter BLOCKED {sig['side']} {sig['coin']}: {llm_reason}")
+                            self._journal_signal_final(
+                                trade_signal,
+                                sig,
+                                final_status="llm_rejected",
+                                stage="llm_filter",
+                                reason=llm_reason,
+                                metadata={"llm_confidence": llm_conf},
+                            )
                             continue
                         trade_signal.confidence = llm_conf
+                        self._journal_signal_stage(
+                            trade_signal,
+                            sig,
+                            stage="llm_filter",
+                            status="approved",
+                            metadata={"llm_confidence": llm_conf},
+                        )
                     except Exception as e:
                         logger.debug(f"LLM filter error: {e}")
 
@@ -894,11 +1037,26 @@ class PaperTrader:
                         float(quality_meta.get("cost_bps", 0.0) or 0.0),
                         float(quality_meta.get("minimum_edge_bps", 0.0) or 0.0),
                     )
+                    self._journal_signal_final(
+                        trade_signal,
+                        sig,
+                        final_status="ev_rejected",
+                        stage="trade_quality",
+                        reason=str(quality_meta.get("reason", "unknown")),
+                        metadata=dict(quality_meta),
+                    )
                     continue
                 sig["quality_score"] = self._final_executable_score(
                     trade_signal,
                     sig,
                     regime_data=regime_data,
+                )
+                self._journal_signal_stage(
+                    trade_signal,
+                    sig,
+                    stage="candidate_pool",
+                    status="eligible",
+                    metadata={"quality_score": sig["quality_score"], "trade_quality": dict(quality_meta)},
                 )
                 rotation_candidates.append({
                     "trade_signal": trade_signal,
@@ -921,6 +1079,14 @@ class PaperTrader:
         ):
             if max_executable > 0 and len(executed) >= max_executable:
                 _drop_counts["execution_cap"] += 1
+                self._journal_signal_final(
+                    candidate["trade_signal"],
+                    candidate["signal"],
+                    final_status="execution_cap_rejected",
+                    stage="execution_cap",
+                    reason=f"cycle_cap_{max_executable}_reached",
+                    metadata={"executed_so_far": len(executed), "max_executable": max_executable},
+                )
                 continue
             trade_signal = candidate["trade_signal"]
             sig = candidate["signal"]
@@ -941,6 +1107,17 @@ class PaperTrader:
                         replacements_used,
                         self.rotation_manager.max_replacements_per_cycle,
                     )
+                    self._journal_signal_final(
+                        trade_signal,
+                        sig,
+                        final_status="rotation_rejected",
+                        stage="rotation",
+                        reason="replacement_budget_exhausted",
+                        metadata={
+                            "replacements_used": replacements_used,
+                            "max_replacements": self.rotation_manager.max_replacements_per_cycle,
+                        },
+                    )
                     continue
                 victim = next(
                     (trade for trade in open_trades if trade.get("id") == forced_victim_id),
@@ -948,6 +1125,13 @@ class PaperTrader:
                 )
                 if not victim:
                     logger.info("Strategy refresh skipped %s: incumbent not found", sig["coin"])
+                    self._journal_signal_final(
+                        trade_signal,
+                        sig,
+                        final_status="rotation_rejected",
+                        stage="rotation",
+                        reason="incumbent_not_found",
+                    )
                     continue
                 candidate_open_positions = [
                     trade for trade in open_trades if trade.get("id") != victim.get("id")
@@ -980,6 +1164,17 @@ class PaperTrader:
                         sig["coin"],
                         decision.reason,
                     )
+                    self._journal_signal_final(
+                        trade_signal,
+                        sig,
+                        final_status="rotation_rejected",
+                        stage="rotation",
+                        reason=decision.reason,
+                        metadata={
+                            "candidate_score": decision.candidate_score,
+                            "incumbent_score": decision.incumbent_score,
+                        },
+                    )
                     continue
                 if shadow_bypass_open:
                     logger.info(
@@ -1006,6 +1201,14 @@ class PaperTrader:
                             sig["side"].upper(),
                             sig["coin"],
                         )
+                        self._journal_signal_final(
+                            trade_signal,
+                            sig,
+                            final_status="rotation_rejected",
+                            stage="rotation",
+                            reason="rotation_disabled",
+                            metadata={"decision_reason": decision.reason, "dry_run": rotation_dry_run},
+                        )
                         continue
                     if rotation_dry_run:
                         self.rotation_manager.record_dry_run_replacement_skip(
@@ -1017,6 +1220,14 @@ class PaperTrader:
                             sig["coin"],
                             decision.reason,
                         )
+                        self._journal_signal_final(
+                            trade_signal,
+                            sig,
+                            final_status="rotation_rejected",
+                            stage="rotation",
+                            reason="rotation_dry_run",
+                            metadata={"decision_reason": decision.reason},
+                        )
                         continue
 
                 if decision.action == "replace":
@@ -1026,6 +1237,14 @@ class PaperTrader:
                     )
                     if not victim:
                         logger.info("Rotation skipped %s: incumbent not found", sig["coin"])
+                        self._journal_signal_final(
+                            trade_signal,
+                            sig,
+                            final_status="rotation_rejected",
+                            stage="rotation",
+                            reason="incumbent_not_found",
+                            metadata={"replacement_trade_id": decision.replacement_trade_id},
+                        )
                         continue
 
                     candidate_open_positions = [
@@ -1046,7 +1265,21 @@ class PaperTrader:
                         sig["coin"],
                         reason,
                     )
+                    self._journal_signal_final(
+                        trade_signal,
+                        sig,
+                        final_status="firewall_execution_rejected",
+                        stage="firewall_execution",
+                        reason=reason,
+                        firewall_decision="rejected",
+                    )
                     continue
+                self._journal_signal_stage(
+                    trade_signal,
+                    sig,
+                    stage="firewall_execution",
+                    status="approved",
+                )
 
             signal_id = ""
             if self.agent_scorer:
@@ -1084,6 +1317,14 @@ class PaperTrader:
                         victim.get("coin"), sig["coin"],
                     )
                     _drop_counts["rotation_victim_close_failed"] = _drop_counts.get("rotation_victim_close_failed", 0) + 1
+                    self._journal_signal_final(
+                        trade_signal,
+                        sig,
+                        final_status="rotation_victim_close_failed",
+                        stage="rotation",
+                        reason="victim_close_failed",
+                        metadata={"victim_trade_id": victim.get("id"), "victim_coin": victim.get("coin")},
+                    )
                     continue
                 closed_victim_event = closed_victim
                 # Remove closed victim from working position list immediately so
@@ -1117,6 +1358,14 @@ class PaperTrader:
                         sig["coin"],
                         decision_reason,
                     )
+            else:
+                self._journal_signal_final(
+                    trade_signal,
+                    sig,
+                    final_status="paper_open_failed",
+                    stage="paper_execution",
+                    reason="open_paper_trade_failed",
+                )
 
         if executed:
             logger.info(f"Executed {len(executed)} paper trades (V2 pipeline)")
@@ -1434,6 +1683,20 @@ class PaperTrader:
                         "paper_trade_signal_id": signal_id,
                     },
                 )
+                decision_journal.record_stage_event(
+                    decision_id,
+                    stage="paper_execution",
+                    status="paper_opened",
+                    reason="paper_trade_opened",
+                    confidence=signal.get("confidence", 0),
+                    metadata={
+                        "paper_trade_id": trade_id,
+                        "entry_price": slipped_price,
+                        "size": signal["size"],
+                        "leverage": signal["leverage"],
+                    },
+                )
+                decision_journal.record_decision_outcome(decision_id)
 
             logger.info(
                 f"Paper trade opened: {signal['side'].upper()} {signal['coin']} "
@@ -1732,6 +1995,60 @@ class PaperTrader:
         except Exception:
             pass
         self._closed_events.append(closed_event)
+        decision_id = str(trade_meta.get("decision_id") or trade.get("decision_id") or "").strip()
+        if decision_id:
+            hold_minutes = None
+            try:
+                opened_raw = trade.get("opened_at") or trade_meta.get("opened_at")
+                if opened_raw:
+                    opened_dt = datetime.fromisoformat(str(opened_raw).replace("Z", "+00:00"))
+                    if opened_dt.tzinfo is None:
+                        opened_dt = opened_dt.replace(tzinfo=timezone.utc)
+                    closed_dt = datetime.fromisoformat(str(closed_event["closed_at"]).replace("Z", "+00:00"))
+                    hold_minutes = max((closed_dt - opened_dt).total_seconds() / 60.0, 0.0)
+            except Exception:
+                hold_minutes = None
+            try:
+                decision_journal.record_stage_event(
+                    decision_id,
+                    stage="paper_close",
+                    status="paper_closed",
+                    reason=close_reason,
+                    confidence=trade_meta.get("confidence"),
+                    metadata={
+                        "paper_trade_id": trade.get("id"),
+                        "pnl": pnl,
+                        "return_pct": return_pct,
+                        "exit_price": slipped_exit,
+                        **path_metrics,
+                    },
+                )
+                decision_journal.update_decision_status(
+                    decision_id,
+                    final_status="paper_closed",
+                    firewall_decision="approved",
+                    metadata={"paper_trade_closed": True, "close_reason": close_reason},
+                )
+                decision_journal.record_decision_outcome(
+                    decision_id,
+                    outcome={
+                        "outcome_pnl": pnl,
+                        "outcome_return_pct": return_pct,
+                        "label_win": 1 if pnl > 0 else 0,
+                        "exit_reason": close_reason,
+                        "hold_minutes": hold_minutes,
+                        "max_favorable_r": realized_max_r,
+                        "max_adverse_r": realized_min_r,
+                        "metadata": {
+                            "close_reason": close_reason,
+                            "path_metrics": path_metrics,
+                            "fees_paid": round(total_fees, 4),
+                            "slippage_cost": total_slippage_cost,
+                        },
+                    },
+                )
+            except Exception:
+                pass
         return closed_event
 
     def drain_closed_events(self) -> List[Dict]:

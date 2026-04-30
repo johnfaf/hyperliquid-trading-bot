@@ -42,9 +42,10 @@ class ImprovementRunResult:
 class OfflineImprovementRunner:
     """Searches safe policy knobs offline and records the best challenger.
 
-    The first implementation only searches confidence thresholds. That improves
-    selectivity without changing SL/TP, leverage, position size, kill-switch, or
-    any non-trainable safety limit.
+    The search is intentionally constrained to trainable/selective knobs:
+    confidence thresholds, source filters, side filters, and offline rejected
+    decision diagnostics. It never changes SL/TP, leverage, position size,
+    kill-switch, or any non-trainable safety limit.
     """
 
     def __init__(self, thresholds: Optional[Iterable[float]] = None):
@@ -77,11 +78,54 @@ class OfflineImprovementRunner:
             dataset = DecisionDatasetBuilder().build(limit=limit, persist=persist)
         backtester = DecisionReplayBacktester()
         candidates: List[ReplayBacktestResult] = []
+        policies: List[ReplayPolicy] = []
         for threshold in self.thresholds:
-            policy = ReplayPolicy(
-                policy_id=f"candidate_conf_{float(threshold):.2f}".replace(".", "p"),
-                min_confidence=float(threshold),
+            policies.append(
+                ReplayPolicy(
+                    policy_id=f"candidate_conf_{float(threshold):.2f}".replace(".", "p"),
+                    min_confidence=float(threshold),
+                )
             )
+
+        source_keys = sorted({
+            item.source_key
+            for item in dataset.examples
+            if item.source_key and sum(1 for ex in dataset.examples if ex.source_key == item.source_key) >= 10
+        })
+        for source_key in source_keys[:20]:
+            for threshold in self.thresholds:
+                policies.append(
+                    ReplayPolicy(
+                        policy_id=f"candidate_source_{source_key}_{float(threshold):.2f}".replace(".", "p").replace(":", "_"),
+                        min_confidence=float(threshold),
+                        allowed_source_keys=[source_key],
+                    )
+                )
+
+        sides = sorted({item.side for item in dataset.examples if item.side})
+        for side in sides:
+            if sum(1 for item in dataset.examples if item.side == side) < 10:
+                continue
+            for threshold in self.thresholds:
+                policies.append(
+                    ReplayPolicy(
+                        policy_id=f"candidate_side_{side}_{float(threshold):.2f}".replace(".", "p"),
+                        min_confidence=float(threshold),
+                        allowed_sides=[side],
+                    )
+                )
+
+        if any(not item.executed and item.label_win is not None for item in dataset.examples):
+            for threshold in self.thresholds:
+                policies.append(
+                    ReplayPolicy(
+                        policy_id=f"candidate_include_rejected_{float(threshold):.2f}".replace(".", "p"),
+                        min_confidence=float(threshold),
+                        include_rejected=True,
+                    )
+                )
+
+        for policy in policies:
             candidates.append(backtester.run(dataset, policy, persist=persist))
         eligible = [item for item in candidates if item.passed]
         best = max(eligible or candidates, key=self._score, default=None)
@@ -102,7 +146,16 @@ class OfflineImprovementRunner:
             next_action=next_action,
         )
         if persist:
-            self.record_result(result, search_space={"thresholds": self.thresholds})
+            self.record_result(
+                result,
+                search_space={
+                    "thresholds": self.thresholds,
+                    "source_keys": source_keys[:20],
+                    "sides": sides,
+                    "candidate_count": len(policies),
+                    "safe_knobs_only": True,
+                },
+            )
         return result
 
     @staticmethod

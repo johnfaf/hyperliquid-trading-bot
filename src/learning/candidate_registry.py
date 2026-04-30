@@ -19,6 +19,13 @@ TRAINABLE_POLICY_KEYS = {
     "min_confidence",
     "allowed_sources",
     "allowed_sides",
+    "include_rejected",
+    "allowed_source_keys",
+    "allowed_statuses",
+    "allowed_regimes",
+    "blocked_rejection_reasons",
+    "source_confidence_multipliers",
+    "side_confidence_multipliers",
     "source_weights",
     "source_confidence_offsets",
 }

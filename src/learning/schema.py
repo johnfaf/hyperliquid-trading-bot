@@ -206,6 +206,59 @@ CREATE INDEX IF NOT EXISTS idx_decision_snapshots_status
 CREATE INDEX IF NOT EXISTS idx_decision_snapshots_trade
     ON decision_snapshots (paper_trade_id);
 
+CREATE TABLE IF NOT EXISTS decision_stage_events (
+    event_id TEXT PRIMARY KEY,
+    decision_id TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    stage TEXT NOT NULL,
+    status TEXT NOT NULL,
+    reason TEXT,
+    confidence REAL,
+    metadata TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_decision_stage_events_decision
+    ON decision_stage_events (decision_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_decision_stage_events_stage
+    ON decision_stage_events (stage, status, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS decision_outcomes (
+    decision_id TEXT PRIMARY KEY,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    coin TEXT,
+    side TEXT,
+    source TEXT,
+    source_key TEXT,
+    strategy_type TEXT,
+    final_status TEXT,
+    action_taken INTEGER NOT NULL DEFAULT 0,
+    paper_trade_id INTEGER,
+    label_win INTEGER,
+    outcome_pnl REAL,
+    outcome_return_pct REAL,
+    exit_reason TEXT,
+    hold_minutes REAL,
+    max_favorable_r REAL,
+    max_adverse_r REAL,
+    forward_return_15m REAL,
+    forward_return_1h REAL,
+    forward_return_4h REAL,
+    forward_return_24h REAL,
+    would_have_won INTEGER,
+    side_correct INTEGER,
+    missed_profit_usd REAL,
+    features TEXT NOT NULL DEFAULT '{}',
+    decision_metadata TEXT NOT NULL DEFAULT '{}',
+    outcome_metadata TEXT NOT NULL DEFAULT '{}',
+    explanation TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_decision_outcomes_source
+    ON decision_outcomes (source, source_key, strategy_type);
+CREATE INDEX IF NOT EXISTS idx_decision_outcomes_status
+    ON decision_outcomes (final_status, action_taken);
+CREATE INDEX IF NOT EXISTS idx_decision_outcomes_created
+    ON decision_outcomes (created_at DESC);
+
 CREATE TABLE IF NOT EXISTS learning_datasets (
     dataset_id TEXT PRIMARY KEY,
     created_at TEXT NOT NULL,
@@ -280,6 +333,20 @@ CREATE TABLE IF NOT EXISTS learning_improvement_runs (
 );
 CREATE INDEX IF NOT EXISTS idx_learning_improvement_recent
     ON learning_improvement_runs (created_at DESC);
+
+CREATE TABLE IF NOT EXISTS learning_decision_calibrators (
+    calibrator_id TEXT PRIMARY KEY,
+    created_at TEXT NOT NULL,
+    dataset_id TEXT,
+    model_type TEXT NOT NULL DEFAULT 'conservative_empirical',
+    feature_names TEXT NOT NULL DEFAULT '[]',
+    source_stats TEXT NOT NULL DEFAULT '{}',
+    global_stats TEXT NOT NULL DEFAULT '{}',
+    gates TEXT NOT NULL DEFAULT '{}',
+    metadata TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_learning_decision_calibrators_recent
+    ON learning_decision_calibrators (created_at DESC);
 
 CREATE TABLE IF NOT EXISTS learning_promotion_decisions (
     decision_id TEXT PRIMARY KEY,

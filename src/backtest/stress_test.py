@@ -32,7 +32,7 @@ import time
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Dict, Optional
+from typing import Any, List, Dict, Optional
 
 # ─── Path setup ────────────────────────────────────────────────
 ROOT = Path(__file__).resolve().parent.parent.parent
@@ -323,6 +323,189 @@ class StressTestEngine:
         # Composite resilience score: 100 - avg severity
         avg_severity = sum(s.severity_score for s in report.scenarios) / len(report.scenarios)
         report.composite_stress_score = round(max(0, 100 - avg_severity), 1)
+
+
+@dataclass
+class DecisionScenarioResult:
+    """Stress result computed directly from journaled bot decisions."""
+
+    scenario_key: str
+    decision_count: int
+    baseline_pnl: float
+    stressed_pnl: float
+    pnl_delta: float
+    max_decision_loss: float
+    rejected_winners: int
+    accepted_losers: int
+    survival_score: float
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class DecisionStressReport:
+    """Stress report for decision_outcomes rows."""
+
+    timestamp: str
+    baseline_pnl: float
+    decision_count: int
+    scenarios: List[DecisionScenarioResult] = field(default_factory=list)
+    worst_scenario: str = ""
+    worst_pnl: float = 0.0
+    composite_survival_score: float = 0.0
+
+    def to_dict(self) -> Dict[str, Any]:
+        d = asdict(self)
+        d["scenarios"] = [s.to_dict() for s in self.scenarios]
+        return d
+
+
+class DecisionStressTestEngine:
+    """Stress-test the bot's own decision outcomes instead of wallet fills."""
+
+    DEFAULT_SCENARIOS = ("liquidity_drain", "funding_squeeze", "flash_crash", "black_swan")
+
+    def __init__(self, initial_balance: float = 10_000.0):
+        self.initial_balance = float(initial_balance)
+
+    @staticmethod
+    def _loads(value: Any) -> Dict[str, Any]:
+        if isinstance(value, dict):
+            return dict(value)
+        try:
+            loaded = json.loads(value or "{}")
+            return dict(loaded) if isinstance(loaded, dict) else {}
+        except Exception:
+            return {}
+
+    @staticmethod
+    def _float(value: Any, default: float = 0.0) -> float:
+        try:
+            if value in (None, ""):
+                return default
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
+    def _bool(value: Any) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+    def _decision_notional(self, row: Dict[str, Any]) -> float:
+        meta = self._loads(row.get("decision_metadata"))
+        size = self._float(meta.get("proposed_size_usd"), 0.0)
+        leverage = max(self._float(meta.get("proposed_leverage"), 1.0), 1.0)
+        return abs(size * leverage)
+
+    def _decision_return(self, row: Dict[str, Any]) -> float:
+        if row.get("outcome_return_pct") is not None:
+            return self._float(row.get("outcome_return_pct"))
+        for key in ("forward_return_4h", "forward_return_1h", "forward_return_15m", "forward_return_24h"):
+            if row.get(key) is not None:
+                return self._float(row.get(key))
+        notional = self._decision_notional(row)
+        pnl = self._float(row.get("outcome_pnl"), 0.0)
+        return pnl / notional if notional > 0 else 0.0
+
+    def _baseline_pnl(self, row: Dict[str, Any]) -> float:
+        if row.get("outcome_pnl") is not None:
+            return self._float(row.get("outcome_pnl"))
+        return self._decision_return(row) * self._decision_notional(row)
+
+    def _stress_pnl(self, row: Dict[str, Any], scenario: str) -> float:
+        baseline = self._baseline_pnl(row)
+        notional = self._decision_notional(row)
+        side = str(row.get("side") or "").lower()
+        action_taken = self._bool(row.get("action_taken"))
+        hold_minutes = self._float(row.get("hold_minutes"), 60.0)
+        if scenario == "liquidity_drain":
+            return baseline - notional * 0.0015
+        if scenario == "funding_squeeze":
+            return baseline - notional * max(hold_minutes, 60.0) / 480.0 * 0.0006
+        if scenario == "flash_crash":
+            shock = -0.08 if side == "long" else 0.025
+            return baseline + notional * shock
+        if scenario == "black_swan":
+            shock = -0.14 if side == "long" else -0.04
+            rejected_regret = self._float(row.get("missed_profit_usd"), 0.0) if not action_taken else 0.0
+            return baseline + notional * shock - notional * 0.0025 - rejected_regret * 0.25
+        return baseline
+
+    def load_decisions(self, limit: int = 5000) -> List[Dict[str, Any]]:
+        from src.data import database as db
+
+        with db.get_connection(for_read=True) as conn:
+            rows = conn.execute(
+                """
+                SELECT *
+                FROM decision_outcomes
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (int(limit),),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def run(
+        self,
+        decisions: Optional[List[Dict[str, Any]]] = None,
+        *,
+        scenarios: Optional[List[str]] = None,
+        limit: int = 5000,
+    ) -> DecisionStressReport:
+        rows = decisions if decisions is not None else self.load_decisions(limit=limit)
+        scenario_keys = list(scenarios or self.DEFAULT_SCENARIOS)
+        baseline_values = [self._baseline_pnl(row) for row in rows]
+        baseline_pnl = sum(baseline_values)
+        report = DecisionStressReport(
+            timestamp=datetime.now(timezone.utc).isoformat(),
+            baseline_pnl=round(baseline_pnl, 4),
+            decision_count=len(rows),
+        )
+        for scenario in scenario_keys:
+            stressed = [self._stress_pnl(row, scenario) for row in rows]
+            stressed_pnl = sum(stressed)
+            accepted_losers = sum(
+                1 for row, pnl in zip(rows, stressed)
+                if self._bool(row.get("action_taken")) and pnl < 0
+            )
+            rejected_winners = sum(
+                1 for row in rows
+                if not self._bool(row.get("action_taken")) and int(row.get("would_have_won") or 0) == 1
+            )
+            loss_pct = max(0.0, -stressed_pnl / max(self.initial_balance, 1.0))
+            report.scenarios.append(
+                DecisionScenarioResult(
+                    scenario_key=scenario,
+                    decision_count=len(rows),
+                    baseline_pnl=round(baseline_pnl, 4),
+                    stressed_pnl=round(stressed_pnl, 4),
+                    pnl_delta=round(stressed_pnl - baseline_pnl, 4),
+                    max_decision_loss=round(min(stressed or [0.0]), 4),
+                    rejected_winners=rejected_winners,
+                    accepted_losers=accepted_losers,
+                    survival_score=round(max(0.0, 100.0 - loss_pct * 100.0), 2),
+                    metadata={
+                        "uses_decision_outcomes": True,
+                        "initial_balance": self.initial_balance,
+                    },
+                )
+            )
+        if report.scenarios:
+            worst = min(report.scenarios, key=lambda item: item.stressed_pnl)
+            report.worst_scenario = worst.scenario_key
+            report.worst_pnl = worst.stressed_pnl
+            report.composite_survival_score = round(
+                sum(item.survival_score for item in report.scenarios) / len(report.scenarios),
+                2,
+            )
+        return report
 
 
 # ─── Report generation ─────────────────────────────────────────

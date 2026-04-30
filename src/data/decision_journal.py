@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import threading
+import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
@@ -65,6 +66,59 @@ CREATE INDEX IF NOT EXISTS idx_decision_snapshots_status
     ON decision_snapshots (final_status, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_decision_snapshots_trade
     ON decision_snapshots (paper_trade_id);
+
+CREATE TABLE IF NOT EXISTS decision_stage_events (
+    event_id TEXT PRIMARY KEY,
+    decision_id TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    stage TEXT NOT NULL,
+    status TEXT NOT NULL,
+    reason TEXT,
+    confidence DOUBLE PRECISION,
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb
+);
+CREATE INDEX IF NOT EXISTS idx_decision_stage_events_decision
+    ON decision_stage_events (decision_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_decision_stage_events_stage
+    ON decision_stage_events (stage, status, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS decision_outcomes (
+    decision_id TEXT PRIMARY KEY,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    coin TEXT,
+    side TEXT,
+    source TEXT,
+    source_key TEXT,
+    strategy_type TEXT,
+    final_status TEXT,
+    action_taken BOOLEAN NOT NULL DEFAULT FALSE,
+    paper_trade_id BIGINT,
+    label_win INTEGER,
+    outcome_pnl DOUBLE PRECISION,
+    outcome_return_pct DOUBLE PRECISION,
+    exit_reason TEXT,
+    hold_minutes DOUBLE PRECISION,
+    max_favorable_r DOUBLE PRECISION,
+    max_adverse_r DOUBLE PRECISION,
+    forward_return_15m DOUBLE PRECISION,
+    forward_return_1h DOUBLE PRECISION,
+    forward_return_4h DOUBLE PRECISION,
+    forward_return_24h DOUBLE PRECISION,
+    would_have_won INTEGER,
+    side_correct INTEGER,
+    missed_profit_usd DOUBLE PRECISION,
+    features JSONB NOT NULL DEFAULT '{}'::jsonb,
+    decision_metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    outcome_metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    explanation TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_decision_outcomes_source
+    ON decision_outcomes (source, source_key, strategy_type);
+CREATE INDEX IF NOT EXISTS idx_decision_outcomes_status
+    ON decision_outcomes (final_status, action_taken);
+CREATE INDEX IF NOT EXISTS idx_decision_outcomes_created
+    ON decision_outcomes (created_at DESC);
 """
 
 
@@ -481,4 +535,338 @@ def link_paper_trade(
         return True
     except Exception as exc:
         logger.debug("Decision paper-trade link skipped: %s", exc)
+        return False
+
+
+def record_stage_event(
+    decision_id: str,
+    *,
+    stage: str,
+    status: str,
+    reason: Optional[str] = None,
+    confidence: Optional[float] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> bool:
+    """Append a durable stage event for a decision.
+
+    Stage events are the causal breadcrumb trail for later training: generated,
+    feature-adjusted, rejected by a specific gate, opened, closed, and so on.
+    Writes are best-effort and must never block trading.
+    """
+    if not _enabled() or not decision_id:
+        return False
+    if not _schema_or_skip():
+        return False
+    try:
+        from src.data import database as db
+
+        now = _now()
+        with db.get_connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO decision_stage_events
+                (event_id, decision_id, created_at, stage, status, reason,
+                 confidence, metadata)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    uuid.uuid4().hex,
+                    str(decision_id),
+                    now,
+                    str(stage or "unknown"),
+                    str(status or "unknown"),
+                    reason,
+                    _float(confidence, None),
+                    _json(metadata or {}),
+                ),
+            )
+        return True
+    except Exception as exc:
+        logger.debug("Decision stage event write skipped: %s", exc)
+        return False
+
+
+def finalize_decision(
+    decision_id: str,
+    *,
+    final_status: str,
+    stage: str,
+    reason: Optional[str] = None,
+    firewall_decision: Optional[str] = None,
+    confidence: Optional[float] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> bool:
+    """Record a terminal/current decision state and matching stage event."""
+    event_ok = record_stage_event(
+        decision_id,
+        stage=stage,
+        status=final_status,
+        reason=reason,
+        confidence=confidence,
+        metadata=metadata,
+    )
+    status_ok = update_decision_status(
+        decision_id,
+        final_status=final_status,
+        firewall_decision=firewall_decision,
+        rejection_reason=reason,
+        metadata=metadata,
+    )
+    return bool(event_ok or status_ok)
+
+
+def _brief_json_items(value: Any, limit: int = 5) -> list[str]:
+    data = _loads(value)
+    items: list[str] = []
+    for key, raw in data.items():
+        if len(items) >= limit:
+            break
+        if raw in (None, "", {}, []):
+            continue
+        try:
+            if isinstance(raw, float):
+                rendered = f"{raw:.4g}"
+            else:
+                rendered = str(raw)
+        except Exception:
+            rendered = "?"
+        items.append(f"{key}={rendered}")
+    return items
+
+
+def build_decision_explanation(
+    decision: Dict[str, Any],
+    *,
+    outcome: Optional[Dict[str, Any]] = None,
+    stage_summary: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Create a compact human-readable explanation for training review."""
+    outcome = outcome or {}
+    stage_summary = stage_summary or {}
+    parts = []
+    source = decision.get("source") or "unknown"
+    source_key = decision.get("source_key") or source
+    side = decision.get("side") or "?"
+    coin = decision.get("coin") or "?"
+    confidence = _float(decision.get("calibrated_confidence"), None)
+    if confidence is None:
+        confidence = _float(decision.get("raw_confidence"), None)
+    confidence_text = f", confidence={confidence:.2f}" if confidence is not None else ""
+    parts.append(f"Opened candidate: {side} {coin} from {source_key}{confidence_text}.")
+
+    risk_bits = []
+    for label, column in (
+        ("SL_ROE", "proposed_sl_roe"),
+        ("TP_ROE", "proposed_tp_roe"),
+        ("size_usd", "proposed_size_usd"),
+        ("lev", "proposed_leverage"),
+    ):
+        val = decision.get(column)
+        if val not in (None, ""):
+            risk_bits.append(f"{label}={val}")
+    if risk_bits:
+        parts.append("Risk: " + ", ".join(str(v) for v in risk_bits) + ".")
+
+    feature_bits = _brief_json_items(decision.get("features"), limit=4)
+    if feature_bits:
+        parts.append("Key features: " + ", ".join(feature_bits) + ".")
+
+    if stage_summary:
+        last_stage = stage_summary.get("last_stage")
+        last_reason = stage_summary.get("last_reason")
+        if last_stage:
+            parts.append(f"Decision path ended at {last_stage}: {last_reason or 'no reason'}.")
+
+    if outcome:
+        pnl = outcome.get("outcome_pnl")
+        label = outcome.get("label_win")
+        exit_reason = outcome.get("exit_reason") or outcome.get("close_reason")
+        result = "win" if label == 1 else "loss" if label == 0 else "unlabelled"
+        outcome_bits = [result]
+        if pnl is not None:
+            outcome_bits.append(f"pnl={pnl}")
+        if exit_reason:
+            outcome_bits.append(f"exit={exit_reason}")
+        parts.append("Outcome: " + ", ".join(outcome_bits) + ".")
+
+    return " ".join(parts)
+
+
+def _fetch_stage_summary(conn: Any, decision_id: str) -> Dict[str, Any]:
+    try:
+        rows = conn.execute(
+            """
+            SELECT stage, status, reason, created_at
+            FROM decision_stage_events
+            WHERE decision_id = ?
+            ORDER BY created_at ASC
+            """,
+            (decision_id,),
+        ).fetchall()
+    except Exception:
+        return {}
+    if not rows:
+        return {}
+    stages = [dict(row) for row in rows]
+    last = stages[-1]
+    return {
+        "count": len(stages),
+        "stages": [row.get("stage") for row in stages],
+        "last_stage": last.get("stage"),
+        "last_status": last.get("status"),
+        "last_reason": last.get("reason"),
+    }
+
+
+def record_decision_outcome(
+    decision_id: str,
+    *,
+    outcome: Optional[Dict[str, Any]] = None,
+    forward_labels: Optional[Dict[str, Any]] = None,
+    explanation: Optional[str] = None,
+) -> bool:
+    """Upsert the one-row training outcome for a decision snapshot."""
+    if not _enabled() or not decision_id:
+        return False
+    if not _schema_or_skip():
+        return False
+    try:
+        from src.data import database as db
+
+        now = _now()
+        outcome = dict(outcome or {})
+        forward = dict(forward_labels or {})
+        with db.get_connection() as conn:
+            decision_row = conn.execute(
+                "SELECT * FROM decision_snapshots WHERE decision_id = ?",
+                (decision_id,),
+            ).fetchone()
+            if not decision_row:
+                return False
+            decision = dict(decision_row)
+            paper_trade_id = decision.get("paper_trade_id")
+            paper = None
+            if paper_trade_id is not None:
+                try:
+                    paper = conn.execute(
+                        "SELECT * FROM paper_trades WHERE id = ?",
+                        (paper_trade_id,),
+                    ).fetchone()
+                except Exception:
+                    paper = None
+            paper_dict = dict(paper) if paper else {}
+            pnl = outcome.get("outcome_pnl")
+            if pnl is None:
+                pnl = paper_dict.get("pnl")
+            pnl_float = _float(pnl, None)
+            action_taken = bool(paper_trade_id is not None)
+            if pnl_float is None and not action_taken:
+                preferred_forward = None
+                for key in ("forward_return_4h", "forward_return_1h", "forward_return_15m", "forward_return_24h"):
+                    if forward.get(key) is not None:
+                        preferred_forward = _float(forward.get(key), None)
+                        break
+                proposed_size = _float(decision.get("proposed_size_usd"), 0.0) or 0.0
+                proposed_leverage = _float(decision.get("proposed_leverage"), 1.0) or 1.0
+                if preferred_forward is not None and proposed_size > 0:
+                    pnl_float = preferred_forward * proposed_size * max(proposed_leverage, 1.0)
+            label_win = outcome.get("label_win")
+            if label_win is None and pnl_float is not None:
+                label_win = 1 if pnl_float > 0 else 0
+            if label_win is None and forward.get("would_have_won") is not None:
+                label_win = int(forward.get("would_have_won"))
+            entry = _float(paper_dict.get("entry_price") or decision.get("entry_price"), None)
+            size = _float(paper_dict.get("size"), None)
+            leverage = _float(paper_dict.get("leverage") or decision.get("proposed_leverage"), 1.0) or 1.0
+            notional = (entry or 0.0) * (size or 0.0) * max(leverage, 1.0)
+            return_pct = outcome.get("outcome_return_pct")
+            if return_pct is None and pnl_float is not None and notional > 0:
+                return_pct = pnl_float / notional
+            decision_meta = _loads(decision.get("metadata"))
+            decision_meta.update(
+                {
+                    "raw_confidence": decision.get("raw_confidence"),
+                    "calibrated_confidence": decision.get("calibrated_confidence"),
+                    "proposed_size_usd": decision.get("proposed_size_usd"),
+                    "proposed_position_pct": decision.get("proposed_position_pct"),
+                    "proposed_leverage": decision.get("proposed_leverage"),
+                    "proposed_sl_roe": decision.get("proposed_sl_roe"),
+                    "proposed_tp_roe": decision.get("proposed_tp_roe"),
+                    "rejection_reason": decision.get("rejection_reason"),
+                    "regime": _loads(decision.get("regime")),
+                }
+            )
+            outcome_meta = dict(outcome.get("metadata") or {})
+            if paper_dict.get("metadata"):
+                outcome_meta["paper_metadata"] = _loads(paper_dict.get("metadata"))
+            stage_summary = _fetch_stage_summary(conn, decision_id)
+            payload = {
+                "outcome_pnl": pnl_float,
+                "label_win": label_win,
+                "exit_reason": outcome.get("exit_reason") or outcome_meta.get("close_reason"),
+                "close_reason": outcome.get("close_reason") or outcome_meta.get("close_reason"),
+            }
+            explanation_text = explanation or build_decision_explanation(
+                decision,
+                outcome=payload,
+                stage_summary=stage_summary,
+            )
+            columns = [
+                "decision_id", "created_at", "updated_at", "coin", "side",
+                "source", "source_key", "strategy_type", "final_status",
+                "action_taken", "paper_trade_id", "label_win", "outcome_pnl",
+                "outcome_return_pct", "exit_reason", "hold_minutes",
+                "max_favorable_r", "max_adverse_r", "forward_return_15m",
+                "forward_return_1h", "forward_return_4h", "forward_return_24h",
+                "would_have_won", "side_correct", "missed_profit_usd",
+                "features", "decision_metadata", "outcome_metadata", "explanation",
+            ]
+            values = {
+                "decision_id": decision_id,
+                "created_at": decision.get("created_at") or now,
+                "updated_at": now,
+                "coin": decision.get("coin"),
+                "side": decision.get("side"),
+                "source": decision.get("source"),
+                "source_key": decision.get("source_key"),
+                "strategy_type": decision.get("strategy_type"),
+                "final_status": decision.get("final_status"),
+                "action_taken": action_taken,
+                "paper_trade_id": paper_trade_id,
+                "label_win": label_win,
+                "outcome_pnl": pnl_float,
+                "outcome_return_pct": _float(return_pct, None),
+                "exit_reason": payload["exit_reason"],
+                "hold_minutes": _float(outcome.get("hold_minutes"), None),
+                "max_favorable_r": _float(outcome.get("max_favorable_r"), None),
+                "max_adverse_r": _float(outcome.get("max_adverse_r"), None),
+                "forward_return_15m": _float(forward.get("forward_return_15m"), None),
+                "forward_return_1h": _float(forward.get("forward_return_1h"), None),
+                "forward_return_4h": _float(forward.get("forward_return_4h"), None),
+                "forward_return_24h": _float(forward.get("forward_return_24h"), None),
+                "would_have_won": forward.get("would_have_won"),
+                "side_correct": forward.get("side_correct"),
+                "missed_profit_usd": _float(forward.get("missed_profit_usd"), None),
+                "features": _json(_loads(decision.get("features"))),
+                "decision_metadata": _json({**decision_meta, "stage_summary": stage_summary}),
+                "outcome_metadata": _json(outcome_meta),
+                "explanation": explanation_text,
+            }
+            placeholders = ", ".join(["?"] * len(columns))
+            update_sql = ", ".join(
+                f"{column} = EXCLUDED.{column}"
+                for column in columns
+                if column not in {"decision_id", "created_at"}
+            )
+            conn.execute(
+                f"""
+                INSERT INTO decision_outcomes ({", ".join(columns)})
+                VALUES ({placeholders})
+                ON CONFLICT(decision_id) DO UPDATE SET {update_sql}
+                """,
+                tuple(values[column] for column in columns),
+            )
+        return True
+    except Exception as exc:
+        logger.debug("Decision outcome write skipped: %s", exc)
         return False
