@@ -837,8 +837,22 @@ class FeatureStoreAlphaPipeline:
         if not HAS_ALPHA_ML or not self._pg_available():
             return {}
         now = time.time()
-        if not force and self.models and now - self._last_train_ts < self.retrain_interval:
-            return {}
+        if not force and self.models:
+            if self._last_train_ts <= 0:
+                metadata_ts = max(
+                    (
+                        float(meta.get("trained_at_epoch_s", 0.0) or 0.0)
+                        for meta in self.model_metadata.values()
+                        if isinstance(meta, dict)
+                    ),
+                    default=0.0,
+                )
+                # If models are already in memory but no artifact timestamp was
+                # available, do not block the signal path with a training run.
+                self._last_train_ts = metadata_ts or now
+                return {}
+            if now - self._last_train_ts < self.retrain_interval:
+                return {}
         return self.train()
     def _calibrate_probability(self, horizon: str, raw_probability_up: float) -> float:
         calibrator = self.calibrators.get(horizon)

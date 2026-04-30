@@ -20,6 +20,8 @@ from typing import Dict, List, Optional
 import numpy as np
 
 logger = logging.getLogger(__name__)
+_PG_HEALTH_CACHE_VALUE: Optional[bool] = None
+_PG_HEALTH_CACHE_UNTIL = 0.0
 
 # ─── Constants ────────────────────────────────────────────────────
 
@@ -82,11 +84,18 @@ def _pg_conn():
 
 def _pg_available() -> bool:
     """Quick check that the Postgres pool is alive."""
+    global _PG_HEALTH_CACHE_UNTIL, _PG_HEALTH_CACHE_VALUE
+    now = time.time()
+    if _PG_HEALTH_CACHE_UNTIL > now and _PG_HEALTH_CACHE_VALUE is not None:
+        return bool(_PG_HEALTH_CACHE_VALUE)
     try:
         from src.data.db.postgres import check_health
-        return check_health()
+        ok = bool(check_health())
     except Exception:
-        return False
+        ok = False
+    _PG_HEALTH_CACHE_VALUE = ok
+    _PG_HEALTH_CACHE_UNTIL = now + (5.0 if ok else 30.0)
+    return ok
 
 
 # =====================================================================

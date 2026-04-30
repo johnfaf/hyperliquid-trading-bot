@@ -82,6 +82,8 @@ else:
     DB_BACKEND = _raw_db_backend
 POSTGRES_POOL_MIN = int(os.environ.get("POSTGRES_POOL_MIN", 2))
 POSTGRES_POOL_MAX = int(os.environ.get("POSTGRES_POOL_MAX", 10))
+POSTGRES_POOL_TIMEOUT_SEC = float(os.environ.get("POSTGRES_POOL_TIMEOUT_SEC", 3.0))
+POSTGRES_CONNECT_TIMEOUT_SEC = int(float(os.environ.get("POSTGRES_CONNECT_TIMEOUT_SEC", 3)))
 POSTGRES_STATEMENT_TIMEOUT_MS = int(os.environ.get("POSTGRES_STATEMENT_TIMEOUT_MS", 5000))
 POSTGRES_APP_NAME = os.environ.get("POSTGRES_APP_NAME", "hyperliquid-bot").strip()
 

@@ -104,8 +104,10 @@ def _get_pool():
                 conninfo=dsn,
                 min_size=config.POSTGRES_POOL_MIN,
                 max_size=config.POSTGRES_POOL_MAX,
+                timeout=config.POSTGRES_POOL_TIMEOUT_SEC,
                 kwargs={
                     "row_factory": dict_row,
+                    "connect_timeout": config.POSTGRES_CONNECT_TIMEOUT_SEC,
                     "options": (
                         f"-c statement_timeout={config.POSTGRES_STATEMENT_TIMEOUT_MS} "
                         f"-c application_name={config.POSTGRES_APP_NAME}"
