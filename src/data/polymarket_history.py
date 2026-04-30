@@ -195,6 +195,63 @@ def _extract_tokens(market: Dict[str, Any], market_id: str, observed_at_ms: int)
     return tokens
 
 
+def _extract_price_points(market: Dict[str, Any], market_id: str, observed_at_ms: int) -> List[Dict[str, Any]]:
+    """Extract token-level price points from either Gamma or CLOB market shapes."""
+    points: List[Dict[str, Any]] = []
+    question = str(_first(market, ("question", "title", "description"), "") or "")
+
+    raw_tokens = market.get("tokens")
+    if isinstance(raw_tokens, list):
+        for idx, item in enumerate(raw_tokens):
+            if not isinstance(item, dict):
+                continue
+            token_id = str(_first(item, ("token_id", "tokenId", "id"), "") or "").strip()
+            price = _float(_first(item, ("price", "last_price", "lastTradePrice"), None))
+            if not token_id or price is None:
+                continue
+            points.append(
+                {
+                    "token_id": token_id,
+                    "timestamp_ms": observed_at_ms,
+                    "price": price,
+                    "source": "polymarket_scan",
+                    "metadata": {
+                        "market_id": market_id,
+                        "question": question,
+                        "outcome": str(_first(item, ("outcome", "name"), "") or ""),
+                        "index": idx,
+                    },
+                }
+            )
+        if points:
+            return points
+
+    token_ids = _as_list(
+        _first(market, ("clobTokenIds", "clobTokenIDs", "tokenIds", "token_ids"), [])
+    )
+    prices = [_float(v) for v in _as_list(market.get("outcomePrices"))]
+    outcomes = _as_list(market.get("outcomes"))
+    for idx, token_id in enumerate(token_ids):
+        token_id = str(token_id or "").strip()
+        if not token_id or idx >= len(prices) or prices[idx] is None:
+            continue
+        points.append(
+            {
+                "token_id": token_id,
+                "timestamp_ms": observed_at_ms,
+                "price": prices[idx],
+                "source": "polymarket_scan",
+                "metadata": {
+                    "market_id": market_id,
+                    "question": question,
+                    "outcome": str(outcomes[idx] if idx < len(outcomes) else ""),
+                    "index": idx,
+                },
+            }
+        )
+    return points
+
+
 def store_markets(raw_markets: Iterable[Dict[str, Any]], observed_at_ms: Optional[int] = None) -> int:
     """Upsert market metadata, tokens, and one snapshot per raw market."""
     from src.data import database as db
@@ -304,6 +361,24 @@ def store_markets(raw_markets: Iterable[Dict[str, Any]], observed_at_ms: Optiona
                         token["last_seen_ms"],
                     ),
                 )
+            for point in _extract_price_points(market, market_id, observed):
+                conn.execute(
+                    """
+                    INSERT INTO polymarket_price_points
+                    (token_id, timestamp_ms, price, source, metadata)
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(token_id, timestamp_ms, source) DO UPDATE SET
+                        price = EXCLUDED.price,
+                        metadata = EXCLUDED.metadata
+                    """,
+                    (
+                        point["token_id"],
+                        point["timestamp_ms"],
+                        point["price"],
+                        point.get("source", "polymarket_scan"),
+                        _json(point.get("metadata", {})),
+                    ),
+                )
             count += 1
     return count
 
@@ -409,6 +484,46 @@ def store_price_points(rows: Iterable[Dict[str, Any]]) -> int:
                 ),
             )
     return len(items)
+
+
+def latest_price_points_before(
+    token_ids: Iterable[str],
+    *,
+    before_ms: int,
+    max_age_ms: Optional[int] = None,
+) -> Dict[str, Dict[str, Any]]:
+    """Return the latest persisted price point for each token before a timestamp."""
+    from src.data import database as db
+
+    ids = [str(token_id or "").strip() for token_id in token_ids or []]
+    ids = [token_id for token_id in ids if token_id]
+    if not ids:
+        return {}
+    before = int(before_ms or 0)
+    if before <= 0:
+        return {}
+    lower_bound = before - int(max_age_ms or 0) if max_age_ms else 0
+    placeholders = ",".join(["?"] * len(ids))
+    params: List[Any] = list(ids) + [before, lower_bound]
+    with db.get_connection(for_read=True) as conn:
+        rows = conn.execute(
+            f"""
+            SELECT p.token_id, p.timestamp_ms, p.price, p.source, p.metadata
+            FROM polymarket_price_points p
+            JOIN (
+                SELECT token_id, MAX(timestamp_ms) AS timestamp_ms
+                FROM polymarket_price_points
+                WHERE token_id IN ({placeholders})
+                  AND timestamp_ms < ?
+                  AND timestamp_ms >= ?
+                GROUP BY token_id
+            ) latest
+              ON latest.token_id = p.token_id
+             AND latest.timestamp_ms = p.timestamp_ms
+            """,
+            tuple(params),
+        ).fetchall()
+    return {str(row["token_id"]): dict(row) for row in rows}
 
 
 @dataclass

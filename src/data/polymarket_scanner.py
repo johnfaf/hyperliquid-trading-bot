@@ -67,6 +67,7 @@ class PolymarketMarket:
     liquidity: float
     last_traded: str  # ISO timestamp
     category: str
+    token_ids: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -223,6 +224,10 @@ class PolymarketScanner:
         self._markets_tracked = 0
         self._crypto_markets_found = 0
         self._movements_detected = 0
+        self._last_history_observed_at_ms: int = 0
+        self._odds_history_max_age_ms = int(
+            float(self.config.get("odds_history_max_age_seconds", 3600)) * 1000
+        )
         self._scan_cache_window_s = max(
             30.0,
             min(float(self.cache_ttl_minutes) * 60.0, float(self.scan_interval_seconds)),
@@ -447,9 +452,15 @@ class PolymarketScanner:
         try:
             from src.data.polymarket_history import store_markets
 
-            store_markets(raw_markets, observed_at_ms=int(time.time() * 1000))
+            observed_at_ms = int(time.time() * 1000)
+            stored_count = store_markets(raw_markets, observed_at_ms=observed_at_ms)
+            self._last_history_observed_at_ms = observed_at_ms
+            logger.info(
+                "Polymarket persisted %d market snapshots/price points",
+                stored_count,
+            )
         except Exception as exc:
-            logger.debug("Polymarket history persistence skipped: %s", exc)
+            logger.warning("Polymarket history persistence failed: %s", exc)
 
         enriched = []
         crypto_count = 0
@@ -577,6 +588,7 @@ class PolymarketScanner:
                     liquidity=liquidity,
                     last_traded=last_traded,
                     category=category,
+                    token_ids=token_ids,
                 )
 
                 enriched.append(market)
@@ -708,6 +720,29 @@ class PolymarketScanner:
         """
         movements = []
 
+        history_lookup: Dict[str, Dict] = {}
+        history_token_ids = []
+        before_ms = int(self._last_history_observed_at_ms or 0) - 1
+        if before_ms > 0:
+            for market in markets:
+                token_ids = list(market.token_ids or [])
+                if not token_ids and market.token_id:
+                    token_ids = [market.token_id]
+                history_token_ids.extend(token_ids[: len(market.current_prices or [])])
+            if history_token_ids:
+                try:
+                    from src.data.polymarket_history import latest_price_points_before
+
+                    history_lookup = latest_price_points_before(
+                        history_token_ids,
+                        before_ms=before_ms,
+                        max_age_ms=self._odds_history_max_age_ms,
+                    )
+                except Exception as exc:
+                    logger.debug("Polymarket historical price lookup skipped: %s", exc)
+
+        history_compared = 0
+
         for market in markets:
             try:
                 current_prices = market.current_prices
@@ -715,39 +750,60 @@ class PolymarketScanner:
                     continue
 
                 # Get cached prices if available
+                old_prices = None
+                comparison_source = "memory"
                 if market.token_id in self._price_cache:
                     cache_age = time.time() - self._price_cache_time.get(market.token_id, 0)
 
                     if cache_age < 600:  # Compare against prices cached within last 10 minutes
                         old_prices = self._price_cache[market.token_id]
+                if old_prices is None:
+                    token_ids = list(market.token_ids or [])
+                    if not token_ids and market.token_id:
+                        token_ids = [market.token_id]
+                    token_ids = token_ids[: len(current_prices)]
+                    if token_ids and all(token_id in history_lookup for token_id in token_ids):
+                        old_prices = [
+                            float(history_lookup[token_id].get("price", 0.0) or 0.0)
+                            for token_id in token_ids
+                        ]
+                        comparison_source = "database"
+                        history_compared += 1
 
-                        # Calculate changes for each outcome
-                        for outcome_idx, (old_price, new_price) in enumerate(zip(old_prices, current_prices)):
-                            if old_price == 0:
-                                continue
+                if old_prices:
+                    # Calculate changes for each outcome
+                    for outcome_idx, (old_price, new_price) in enumerate(zip(old_prices, current_prices)):
+                        if old_price == 0:
+                            continue
 
-                            change = (new_price - old_price) / old_price
+                        change = (new_price - old_price) / old_price
 
-                            # Check 1h movement threshold
-                            if abs(change) > self.odds_movement_threshold_1h:
-                                direction = "up" if change > 0 else "down"
+                        # Check 1h movement threshold
+                        if abs(change) > self.odds_movement_threshold_1h:
+                            direction = "up" if change > 0 else "down"
 
-                                # Calculate smart money score
-                                smart_money_score = self._calculate_smart_money_score(
-                                    market, change, outcome_idx
-                                )
+                            # Calculate smart money score
+                            smart_money_score = self._calculate_smart_money_score(
+                                market, change, outcome_idx
+                            )
 
-                                movement = OddsMovement(
-                                    market_id=market.market_id,
-                                    title=market.title,
-                                    direction=direction,
-                                    magnitude=abs(change),
-                                    timeframe="1h",
-                                    current_probability=new_price,
-                                    volume_move=market.volume_24h,
-                                    smart_money_score=smart_money_score,
-                                )
-                                movements.append(movement)
+                            movement = OddsMovement(
+                                market_id=market.market_id,
+                                title=market.title,
+                                direction=direction,
+                                magnitude=abs(change),
+                                timeframe="1h",
+                                current_probability=new_price,
+                                volume_move=market.volume_24h,
+                                smart_money_score=smart_money_score,
+                            )
+                            movements.append(movement)
+                            logger.debug(
+                                "Polymarket odds movement from %s history: %s %.2f%%",
+                                comparison_source,
+                                market.title,
+                                abs(change) * 100,
+                            )
 
                 # Update cache
                 self._price_cache[market.token_id] = current_prices
@@ -763,7 +819,7 @@ class PolymarketScanner:
         logger.info(
             f"Detected {len(movements)} odds movements "
             f"(cached={cached_count}, compared={compared_count}/{len(markets)}, "
-            f"threshold={self.odds_movement_threshold_1h:.3f})"
+            f"db_compared={history_compared}, threshold={self.odds_movement_threshold_1h:.3f})"
         )
 
         return movements

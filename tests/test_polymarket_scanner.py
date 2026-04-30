@@ -1,6 +1,25 @@
 import logging
+import contextlib
+import sqlite3
 
+from src.data import database as db
+from src.data.polymarket_history import store_markets
 from src.data.polymarket_scanner import OddsMovement, PolymarketScanner
+from src.learning.schema import ensure_sqlite_schema
+
+
+@contextlib.contextmanager
+def _sqlite_ctx(conn):
+    yield conn
+    conn.commit()
+
+
+def _memory_db(monkeypatch):
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    ensure_sqlite_schema(conn)
+    monkeypatch.setattr(db, "get_connection", lambda for_read=False: _sqlite_ctx(conn))
+    return conn
 
 
 def _raw_market(mid: str, title: str, volume: float, liquidity: float):
@@ -17,6 +36,13 @@ def _raw_market(mid: str, title: str, volume: float, liquidity: float):
         "liquidity": liquidity,
         "category": "crypto",
     }
+
+
+def _raw_market_with_price(mid: str, title: str, yes_price: float, volume: float, liquidity: float):
+    market = _raw_market(mid, title, volume, liquidity)
+    market["tokens"][0]["price"] = yes_price
+    market["tokens"][1]["price"] = round(1.0 - yes_price, 6)
+    return market
 
 
 def _gamma_market(mid: str, title: str, volume: str, liquidity: str):
@@ -102,6 +128,7 @@ def test_scan_markets_parses_gamma_market_string_fields(monkeypatch):
     market = markets[0]
     assert market.market_id == "m1"
     assert market.token_id == "m1-yes"
+    assert market.token_ids == ["m1-yes", "m1-no"]
     assert market.current_prices == [0.61, 0.39]
     assert market.outcomes == ["Yes", "No"]
     assert market.volume_24h == 12000.5
@@ -216,3 +243,50 @@ def test_generate_signals_inverts_bearish_market_odds_moves(monkeypatch):
     assert len(signals) == 1
     assert signals[0]["coin"] == "BTC"
     assert signals[0]["side"] == "short"
+
+
+def test_generate_signals_uses_persisted_price_points_after_restart(monkeypatch):
+    conn = _memory_db(monkeypatch)
+    old_ts = 1_776_000_000_000
+    store_markets(
+        [
+            _raw_market_with_price(
+                "m1",
+                "Will Bitcoin close above 120k?",
+                0.55,
+                4000.0,
+                3000.0,
+            )
+        ],
+        observed_at_ms=old_ts,
+    )
+    assert conn.execute("SELECT COUNT(*) FROM polymarket_price_points").fetchone()[0] == 2
+
+    scanner = PolymarketScanner(
+        config={
+            "min_volume_threshold": 1000.0,
+            "min_liquidity_threshold": 500.0,
+            "odds_history_max_age_seconds": 10_000_000,
+        }
+    )
+    scanner._last_history_observed_at_ms = old_ts + 60_000
+    monkeypatch.setattr(
+        scanner,
+        "_fetch_raw_markets",
+        lambda: [
+            _raw_market_with_price(
+                "m1",
+                "Will Bitcoin close above 120k?",
+                0.62,
+                4000.0,
+                3000.0,
+            )
+        ],
+    )
+
+    signals = scanner.generate_signals()
+
+    assert signals
+    assert signals[0]["source"] == "polymarket"
+    assert signals[0]["coin"] == "BTC"
+    assert signals[0]["side"] == "long"

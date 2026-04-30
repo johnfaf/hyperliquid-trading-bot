@@ -1391,7 +1391,12 @@ def _process_closed_trades(container, closed):
             return_pct = pnl / max(notional, 1e-8)
 
             if container.arena:
-                container.arena.record_trade_for_strategy(stype, pnl, return_pct)
+                container.arena.record_trade_for_strategy(
+                    stype,
+                    pnl,
+                    return_pct,
+                    metadata=c_trade,
+                )
 
             _record_shadow_trade(container, c_trade, pnl, return_pct, entry)
 

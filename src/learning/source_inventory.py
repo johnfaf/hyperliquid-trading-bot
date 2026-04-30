@@ -577,8 +577,15 @@ def collect_source_health_snapshot_rows(registry=None) -> List[Dict[str, Any]]:
         "deribit_options", registry_snapshot, ["options_flow", "deribit"]
     )
     if "polymarket" not in rows_by_source:
-        rows_by_source["polymarket"] = _alias_registry_row(
-            "polymarket", registry_snapshot, ["polymarket"]
+        rows_by_source["polymarket"] = _derive_timestamp_table_health(
+            "polymarket", "polymarket_market_snapshots", "observed_at_ms"
+        )
+    elif rows_by_source["polymarket"].get("status") == "UNKNOWN":
+        # During startup safe-repair there may be a DB snapshot but the live
+        # scanner has not marked the registry yet. Prefer persisted freshness
+        # over recording an unhelpful UNKNOWN/no-snapshot row.
+        rows_by_source["polymarket"] = _derive_timestamp_table_health(
+            "polymarket", "polymarket_market_snapshots", "observed_at_ms"
         )
     rows_by_source["golden_wallets"] = _derive_golden_wallet_health()
     rows_by_source["feature_store"] = _derive_feature_store_health()

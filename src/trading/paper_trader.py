@@ -758,19 +758,31 @@ class PaperTrader:
                         logger.debug(f"Risk limit hit, skipping {sig['coin']}")
                         continue
 
-                # Arena consensus vote (multi-agent debate)
+                # Arena consensus vote (multi-agent debate).  Arena is an
+                # optional quality layer; while it is cold-starting, do not let
+                # zero-history agents veto otherwise firewall-approved signals.
                 if arena:
                     try:
-                        feature_ctx = sig.get("features", {})
-                        approved, consensus_conf = arena.get_consensus_on_signal(
-                            trade_signal, features=feature_ctx
-                        )
-                        if not approved:
-                            _drop_counts["arena"] += 1
-                            logger.info(f"Arena consensus REJECTED {sig['side']} {sig['coin']}")
-                            continue
-                        # Use consensus-adjusted confidence
-                        trade_signal.confidence = consensus_conf
+                        ready = True
+                        if hasattr(arena, "is_consensus_ready"):
+                            ready = bool(arena.is_consensus_ready())
+                        if ready:
+                            feature_ctx = sig.get("features", {})
+                            approved, consensus_conf = arena.get_consensus_on_signal(
+                                trade_signal, features=feature_ctx
+                            )
+                            if not approved:
+                                _drop_counts["arena"] += 1
+                                logger.info(f"Arena consensus REJECTED {sig['side']} {sig['coin']}")
+                                continue
+                            # Use consensus-adjusted confidence
+                            trade_signal.confidence = consensus_conf
+                        else:
+                            logger.info(
+                                "Arena consensus bootstrap not ready; skipping optional vote for %s %s",
+                                sig["side"],
+                                sig["coin"],
+                            )
                     except Exception as e:
                         logger.debug(f"Arena consensus error: {e}")
 
@@ -1226,6 +1238,13 @@ class PaperTrader:
         size = size_usd / target_price
 
         strategy_source = str(strategy.get("source", "strategy") or "strategy")
+        source_key = str(strategy.get("source_key", "") or "").strip().lower()
+        if not source_key:
+            source_key = (
+                f"{strategy_source.lower()}:{str(strategy_type or '').lower()}"
+                if strategy_type
+                else strategy_source.lower()
+            )
         trade_signal = TradeSignal(
             coin=target_coin,
             side=SignalSide(side),
@@ -1262,6 +1281,8 @@ class PaperTrader:
             "stop_loss": round(stop_loss, 2),
             "take_profit": round(take_profit, 2),
             "strategy_type": strategy_type,
+            "source": strategy_source,
+            "source_key": source_key,
             "confidence": score,
             "risk_params": trade_signal.risk.to_dict(),
             "risk_policy": dict((trade_signal.context or {}).get("risk_policy", {}) or {}),

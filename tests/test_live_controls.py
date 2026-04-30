@@ -1992,8 +1992,8 @@ def test_process_closed_trades_skips_synthetic_reconciliation():
         def __init__(self):
             self.calls = []
 
-        def record_trade_for_strategy(self, *args):
-            self.calls.append(args)
+        def record_trade_for_strategy(self, *args, **kwargs):
+            self.calls.append((args, kwargs))
 
     class FakeKelly:
         def __init__(self):

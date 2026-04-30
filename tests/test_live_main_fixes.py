@@ -396,3 +396,28 @@ def test_alpha_arena_backtest_agent_aggregates_multi_coin_histories(monkeypatch)
     assert result["coins_tested"] == 2
     assert set(result["coin_results"]) == {"BTC", "ETH"}
     assert seen_coins == {"BTC", "ETH"}
+
+
+def test_paper_trader_preserves_synthetic_source_on_generated_signal(monkeypatch):
+    from src.trading.paper_trader import PaperTrader
+
+    monkeypatch.setattr(
+        "src.trading.paper_trader.db.get_paper_account",
+        lambda: {"balance": 10_000.0},
+    )
+    trader = PaperTrader()
+    signal = trader._generate_signal(
+        {
+            "id": None,
+            "name": "polymarket_BTC_long",
+            "strategy_type": "event_driven",
+            "source": "polymarket",
+            "current_score": 0.72,
+            "parameters": {"coins": ["BTC"], "direction": "long"},
+        },
+        {"BTC": 100_000.0},
+        regime_data={"overall_regime": "neutral"},
+    )
+
+    assert signal["source"] == "polymarket"
+    assert signal["source_key"] == "polymarket:event_driven"
