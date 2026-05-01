@@ -100,6 +100,8 @@ class HyperliquidAdapter(BaseExchangeAdapter):
             for entry in entries[:limit]:
                 addr = ""
                 pnl = 0.0
+                pnl_7d = 0.0
+                pnl_30d = 0.0
                 display = None
 
                 if isinstance(entry, dict):
@@ -109,23 +111,32 @@ class HyperliquidAdapter(BaseExchangeAdapter):
                     )
                     # Various PnL field names across HL API versions
                     pnl = _first_present_float(entry, "accountValue", "totalPnl", "allTime")
+                    pnl_7d = _first_present_float(entry, "pnl7d", "pnl7D", "sevenDayPnl")
+                    pnl_30d = _first_present_float(entry, "pnl30d", "pnl30D", "thirtyDayPnl", "monthPnl")
                 elif isinstance(entry, (list, tuple)) and len(entry) >= 2:
                     addr = str(entry[0])
                     pnl = float(entry[1]) if len(entry) > 1 else 0.0
 
                 if not addr:
                     continue
+                raw_data = (
+                    hl.redact_leaderboard_identity_fields(entry)
+                    if isinstance(entry, dict)
+                    else {"raw": entry}
+                )
+                raw_data.setdefault("pnl_total_usd", pnl)
+                raw_data.setdefault("pnl_7d_usd", pnl_7d)
+                raw_data.setdefault("pnl_30d_usd", pnl_30d)
+                raw_data.setdefault("pnl_window", "30d" if pnl_30d else "7d" if pnl_7d else "lifetime_or_account_value")
 
                 traders.append(NormalizedTrader(
                     address=addr,
                     exchange="hyperliquid",
                     display_name=display,
                     pnl_total=pnl,
-                    raw_data=(
-                        hl.redact_leaderboard_identity_fields(entry)
-                        if isinstance(entry, dict)
-                        else {"raw": entry}
-                    ),
+                    pnl_7d=pnl_7d,
+                    pnl_30d=pnl_30d,
+                    raw_data=raw_data,
                 ))
 
             logger.info(f"Hyperliquid: fetched {len(traders)} traders from leaderboard")

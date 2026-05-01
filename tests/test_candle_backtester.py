@@ -5,7 +5,7 @@ import pytest
 
 import numpy as np
 from src.backtest.candle_backtester import (
-    CandleBacktestConfig, CandleBacktestResult,
+    CandleBacktester, CandleBacktestConfig, CandleBacktestResult,
     _sma, _ema, _rsi, _atr, _bollinger, STRATEGY_MAP,
 )
 
@@ -43,6 +43,13 @@ def test_rsi_boundaries():
     rsi = _rsi(close, 14)
     valid = rsi[~np.isnan(rsi)]
     assert all(0 <= v <= 100 for v in valid)
+
+
+def test_rsi_no_loss_window_reaches_100():
+    close = np.arange(1.0, 40.0)
+    rsi = _rsi(close, 14)
+    valid = rsi[~np.isnan(rsi)]
+    assert valid[-1] == pytest.approx(100.0)
 
 
 def test_atr_positive():
@@ -118,3 +125,54 @@ def test_result_summary_includes_calmar():
     )
     summary = result.summary()
     assert "calmar" in summary
+
+
+def test_simulation_charges_fees_on_leveraged_notional_and_blocks_same_bar_reentry():
+    cfg = CandleBacktestConfig(
+        initial_balance=10_000,
+        position_size_pct=0.10,
+        max_leverage=10,
+        stop_loss_pct=1.0,
+        take_profit_pct=1.0,
+        taker_fee_bps=10,
+        slippage_bps=0,
+        funding_enabled=False,
+    )
+    bt = CandleBacktester(cfg)
+    close = np.array([100.0, 110.0])
+    high = np.array([100.0, 110.0])
+    low = np.array([100.0, 110.0])
+    ts = np.array([0, 3_600_000], dtype=np.int64)
+    signals = np.array([1, -1], dtype=np.int8)
+
+    trades, _equity = bt._simulate(close, high, low, ts, signals)
+
+    assert len(trades) == 1
+    trade = trades[0]
+    assert trade["entry_fee"] == pytest.approx(10.0)
+    assert trade["exit_fee"] == pytest.approx(11.0)
+    assert trade["pnl"] == pytest.approx(979.0)
+
+
+def test_intrabar_stop_take_profit_ambiguity_is_tagged_worst_case():
+    cfg = CandleBacktestConfig(
+        initial_balance=10_000,
+        position_size_pct=0.10,
+        max_leverage=1,
+        stop_loss_pct=0.05,
+        take_profit_pct=0.05,
+        taker_fee_bps=0,
+        slippage_bps=0,
+        funding_enabled=False,
+    )
+    bt = CandleBacktester(cfg)
+    close = np.array([100.0, 100.0])
+    high = np.array([100.0, 110.0])
+    low = np.array([100.0, 90.0])
+    ts = np.array([0, 3_600_000], dtype=np.int64)
+    signals = np.array([1, 0], dtype=np.int8)
+
+    trades, _equity = bt._simulate(close, high, low, ts, signals)
+
+    assert trades[0]["exit_reason"] == "stop_loss"
+    assert bool(trades[0]["intrabar_ambiguous"]) is True

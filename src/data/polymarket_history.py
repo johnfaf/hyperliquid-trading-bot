@@ -277,8 +277,10 @@ def store_markets(raw_markets: Iterable[Dict[str, Any]], observed_at_ms: Optiona
             best_bid = _float(_first(market, ("bestBid", "best_bid"), None))
             best_ask = _float(_first(market, ("bestAsk", "best_ask"), None))
             spread_bps = None
-            if best_bid is not None and best_ask is not None and probability and probability > 0:
-                spread_bps = max(0.0, (best_ask - best_bid) / probability * 10_000)
+            if best_bid is not None and best_ask is not None:
+                mid = (best_bid + best_ask) / 2.0
+                if mid > 0:
+                    spread_bps = max(0.0, (best_ask - best_bid) / mid * 10_000)
 
             conn.execute(
                 """

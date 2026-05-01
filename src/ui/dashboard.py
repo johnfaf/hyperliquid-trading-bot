@@ -2571,9 +2571,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
             for key in ("position_size_pct", "max_leverage", "stop_loss_pct",
                          "take_profit_pct", "trailing_stop_pct", "fast_period",
                          "slow_period", "rsi_period", "rsi_overbought", "rsi_oversold",
-                         "bb_period", "bb_std"):
+                         "bb_period", "bb_std", "slippage_bps", "maker_fee_bps",
+                         "taker_fee_bps", "vwap_window"):
                 if key in body:
                     cfg_params[key] = float(body[key]) if "." in str(body[key]) else int(body[key])
+            cfg_params.setdefault("maker_fee_bps", float(config.PAPER_TRADING_MAKER_FEE_BPS))
+            cfg_params.setdefault("taker_fee_bps", float(config.PAPER_TRADING_TAKER_FEE_BPS))
             cfg_params["strategy"] = strategy
             cfg = CandleBacktestConfig(**cfg_params)
 

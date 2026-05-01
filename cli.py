@@ -154,7 +154,11 @@ def run_candle_backtest(logger, args):
     from src.backtest.candle_backtester import CandleBacktester, CandleBacktestConfig
 
     fetcher = DataFetcher()
-    cfg = CandleBacktestConfig(strategy=args.cbt_strategy)
+    cfg = CandleBacktestConfig(
+        strategy=args.cbt_strategy,
+        maker_fee_bps=float(config.PAPER_TRADING_MAKER_FEE_BPS),
+        taker_fee_bps=float(config.PAPER_TRADING_TAKER_FEE_BPS),
+    )
     use_cache = not args.cbt_no_cache
 
     if args.cbt_import:

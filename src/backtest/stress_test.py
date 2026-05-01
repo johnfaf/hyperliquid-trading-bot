@@ -104,6 +104,7 @@ class StressTestReport:
     # Aggregate
     composite_stress_score: float = 0.0     # 0-100 resilience score
     worst_scenario: str = ""
+    worst_blown_scenario: str = ""
     worst_drawdown: float = 0.0
     worst_pnl: float = 0.0
     scenarios_survived: int = 0
@@ -319,6 +320,10 @@ class StressTestEngine:
         report.worst_scenario = worst.scenario_name
         report.worst_drawdown = worst.max_drawdown_pct
         report.worst_pnl = worst.total_pnl
+
+        blown = [s for s in report.scenarios if s.blown]
+        if blown:
+            report.worst_blown_scenario = max(blown, key=lambda s: s.severity_score).scenario_name
 
         # Composite resilience score: 100 - avg severity
         avg_severity = sum(s.severity_score for s in report.scenarios) / len(report.scenarios)

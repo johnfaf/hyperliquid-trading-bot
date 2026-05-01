@@ -59,6 +59,8 @@ HL_INTERVALS = {
 
 # Max candles per API request (HL limit)
 HL_MAX_CANDLES = 5000
+HL_MAX_RETRIES = 3
+HL_MIN_REQUEST_INTERVAL_S = 60.0 / 1200.0
 
 
 @dataclass
@@ -135,6 +137,21 @@ class DataFetcher:
         conn.commit()
         conn.close()
 
+    @staticmethod
+    def _has_complete_coverage(candles: List[Candle], start_ms: int, end_ms: int, interval_ms: int) -> bool:
+        """Return True only when cache/fetch covers the requested end and has no large holes."""
+        if not candles:
+            return False
+        ordered = sorted(candles, key=lambda c: c.timestamp_ms)
+        if ordered[0].timestamp_ms > start_ms + interval_ms:
+            return False
+        if ordered[-1].timestamp_ms < end_ms - (2 * interval_ms):
+            return False
+        for prev, cur in zip(ordered, ordered[1:]):
+            if cur.timestamp_ms - prev.timestamp_ms > (2 * interval_ms):
+                return False
+        return True
+
     # ─── Hyperliquid API ─────────────────────────────────────────
 
     def fetch_candles(self, coin: str, timeframe: str,
@@ -161,14 +178,24 @@ class DataFetcher:
 
         start_ms = _parse_date(start) if start else now_ms - (90 * 86_400_000)
         end_ms = _parse_date(end) if end else now_ms
+        interval_ms = TIMEFRAME_MS[timeframe]
 
         # Check cache first
         if use_cache:
             cached = self._get_cached(coin, timeframe, start_ms, end_ms)
-            expected = (end_ms - start_ms) // TIMEFRAME_MS[timeframe]
-            if cached and len(cached) >= expected * 0.95:  # 95% coverage = use cache
+            expected = max(1, (end_ms - start_ms) // interval_ms)
+            if (
+                cached
+                and len(cached) >= expected * 0.95
+                and self._has_complete_coverage(cached, start_ms, end_ms, interval_ms)
+            ):
                 logger.info(f"Cache hit: {coin} {timeframe} -- {len(cached)} candles")
                 return cached
+            if cached:
+                logger.info(
+                    "Cache miss: %s %s has %d/%d candles but does not cover requested end/gaps",
+                    coin, timeframe, len(cached), expected,
+                )
 
         # Fetch from API in chunks
         logger.info(f"Fetching {coin} {timeframe} candles from Hyperliquid "
@@ -176,60 +203,65 @@ class DataFetcher:
 
         all_candles = []
         chunk_start = start_ms
-        interval_ms = TIMEFRAME_MS[timeframe]
         request_count = 0
+        last_request_at = 0.0
 
         while chunk_start < end_ms:
             chunk_end = min(chunk_start + HL_MAX_CANDLES * interval_ms, end_ms)
-
-            try:
-                payload = {
-                    "type": "candleSnapshot",
-                    "req": {
-                        "coin": coin,
-                        "interval": HL_INTERVALS[timeframe],
-                        "startTime": chunk_start,
-                        "endTime": chunk_end,
-                    }
+            payload = {
+                "type": "candleSnapshot",
+                "req": {
+                    "coin": coin,
+                    "interval": HL_INTERVALS[timeframe],
+                    "startTime": chunk_start,
+                    "endTime": chunk_end,
                 }
-                resp = requests.post(HL_INFO_URL, json=payload, timeout=30)
-                resp.raise_for_status()
-                raw = resp.json()
+            }
 
-                if not raw:
+            raw = None
+            for attempt in range(1, HL_MAX_RETRIES + 1):
+                try:
+                    elapsed = time.monotonic() - last_request_at
+                    if elapsed < HL_MIN_REQUEST_INTERVAL_S:
+                        time.sleep(HL_MIN_REQUEST_INTERVAL_S - elapsed)
+                    resp = requests.post(HL_INFO_URL, json=payload, timeout=30)
+                    last_request_at = time.monotonic()
+                    request_count += 1
+                    resp.raise_for_status()
+                    raw = resp.json()
                     break
-
-                for c in raw:
-                    ts = c.get("t", c.get("T", 0))
-                    candle = Candle(
-                        timestamp_ms=int(ts),
-                        open=float(c.get("o", c.get("O", 0))),
-                        high=float(c.get("h", c.get("H", 0))),
-                        low=float(c.get("l", c.get("L", 0))),
-                        close=float(c.get("c", c.get("C", 0))),
-                        volume=float(c.get("v", c.get("V", 0))),
-                        coin=coin,
-                        timeframe=timeframe,
+                except Exception as e:
+                    if attempt >= HL_MAX_RETRIES:
+                        raise RuntimeError(
+                            f"Failed fetching {coin} {timeframe} chunk "
+                            f"{chunk_start}->{chunk_end} after {HL_MAX_RETRIES} attempts"
+                        ) from e
+                    backoff = min(2.0 * attempt, 8.0)
+                    logger.warning(
+                        "Error fetching %s %s chunk %s->%s: %s; retrying in %.1fs (%d/%d)",
+                        coin, timeframe, chunk_start, chunk_end, e, backoff, attempt, HL_MAX_RETRIES,
                     )
-                    all_candles.append(candle)
+                    time.sleep(backoff)
 
-                request_count += 1
+            if not raw:
+                break
 
-                # Rate limit: 1200 req/min on HL info endpoint
-                if request_count % 10 == 0:
-                    time.sleep(0.5)
+            for c in raw:
+                ts = c.get("t", c.get("T", 0))
+                candle = Candle(
+                    timestamp_ms=int(ts),
+                    open=float(c.get("o", c.get("O", 0))),
+                    high=float(c.get("h", c.get("H", 0))),
+                    low=float(c.get("l", c.get("L", 0))),
+                    close=float(c.get("c", c.get("C", 0))),
+                    volume=float(c.get("v", c.get("V", 0))),
+                    coin=coin,
+                    timeframe=timeframe,
+                )
+                all_candles.append(candle)
 
-                # Advance
-                if raw:
-                    last_ts = int(raw[-1].get("t", raw[-1].get("T", 0)))
-                    chunk_start = last_ts + interval_ms
-                else:
-                    break
-
-            except Exception as e:
-                logger.error(f"Error fetching {coin} {timeframe} chunk: {e}")
-                time.sleep(2)
-                chunk_start = chunk_end  # Skip failed chunk
+            last_ts = int(raw[-1].get("t", raw[-1].get("T", 0)))
+            chunk_start = last_ts + interval_ms
 
         # Deduplicate and sort
         seen = set()
@@ -239,6 +271,12 @@ class DataFetcher:
                 seen.add(c.timestamp_ms)
                 unique.append(c)
         unique.sort(key=lambda x: x.timestamp_ms)
+        if unique and not self._has_complete_coverage(unique, start_ms, end_ms, interval_ms):
+            raise RuntimeError(
+                f"Incomplete candle data for {coin} {timeframe}: "
+                f"{len(unique)} candles, first={unique[0].timestamp_ms}, "
+                f"last={unique[-1].timestamp_ms}, requested={start_ms}->{end_ms}"
+            )
 
         # Cache the results
         if unique:

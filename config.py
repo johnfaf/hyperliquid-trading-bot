@@ -343,10 +343,10 @@ TRADE_QUALITY_STRONG_SHORT_CONFIRMATION = os.environ.get(
 # HL_PUBLIC_ADDRESS points to the trading account (master/vault) being managed.
 LIVE_TRADING_ENABLED = os.environ.get(
     "LIVE_TRADING_ENABLED", "false"
-).lower() in ("true", "1", "yes")
+).strip().lower() in ("true", "1", "yes")
 LIVE_TRADING_DUAL_CONTROL_CONFIRM = os.environ.get(
     "LIVE_TRADING_DUAL_CONTROL_CONFIRM", "false"
-).lower() in ("true", "1", "yes")
+).strip().lower() in ("true", "1", "yes")
 
 # ─── Live Order Caps (cautious bootstrap) ─────────────────────
 # Hyperliquid enforces a $10 minimum notional per order on both perps and

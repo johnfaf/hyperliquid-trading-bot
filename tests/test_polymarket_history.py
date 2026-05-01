@@ -1,6 +1,7 @@
 import contextlib
 import sqlite3
 
+import pytest
 import requests
 
 from src.data import database as db
@@ -140,3 +141,28 @@ def test_fetch_market_trades_falls_back_from_clob_401_to_public_data_api(monkeyp
     assert trades[0]["market_id"] == "1294692"
     assert calls[0][0] == f"{CLOB_API}/trades"
     assert calls[1][0] == f"{DATA_API}/trades"
+
+
+def test_store_markets_spread_bps_uses_bid_ask_midpoint(monkeypatch):
+    conn = _memory_db(monkeypatch)
+    store_markets(
+        [
+            {
+                "id": "spread-market",
+                "question": "Will BTC go up?",
+                "probability": 0.80,
+                "bestBid": 0.40,
+                "bestAsk": 0.60,
+                "active": True,
+                "closed": False,
+            }
+        ],
+        observed_at_ms=2_000,
+    )
+
+    row = conn.execute(
+        "SELECT spread_bps FROM polymarket_market_snapshots WHERE market_id = ?",
+        ("spread-market",),
+    ).fetchone()
+
+    assert row["spread_bps"] == pytest.approx(4000.0)
