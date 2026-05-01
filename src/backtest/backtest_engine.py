@@ -228,7 +228,7 @@ def analyse_by_coin(fills: List[Dict]) -> Dict[str, Dict]:
             coins[c]["pen_pnl"] += f["penalised_pnl"]
             if f["penalised_pnl"] > 0:
                 coins[c]["wins"] += 1
-            else:
+            elif f["penalised_pnl"] < 0:
                 coins[c]["losses"] += 1
 
     # Round and add win_rate
