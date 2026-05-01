@@ -34,7 +34,7 @@ jobs:
           if [[ -z "$base_sha" || "$base_sha" =~ ^0+$ ]]; then
             git ls-files | grep -E '^(src|tests)/.*\.py$' > lint_targets.txt || true
           else
-            git diff --name-only "$base_sha" "${{ github.sha }}" | grep -E '^(src|tests)/.*\.py$' > lint_targets.txt || true
+            git diff --name-only --diff-filter=ACMR "$base_sha" "${{ github.sha }}" | grep -E '^(src|tests)/.*\.py$' > lint_targets.txt || true
           fi
 
           count=$(wc -l < lint_targets.txt | tr -d ' ')
