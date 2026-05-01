@@ -166,3 +166,26 @@ def test_store_markets_spread_bps_uses_bid_ask_midpoint(monkeypatch):
     ).fetchone()
 
     assert row["spread_bps"] == pytest.approx(4000.0)
+
+
+def test_store_markets_preserves_same_timestamp_snapshots(monkeypatch):
+    conn = _memory_db(monkeypatch)
+    market = {
+        "id": "collision-market",
+        "question": "Will ETH go up?",
+        "probability": 0.51,
+        "active": True,
+        "closed": False,
+    }
+
+    store_markets([market], observed_at_ms=3_000)
+    market["probability"] = 0.52
+    store_markets([market], observed_at_ms=3_000)
+
+    rows = conn.execute(
+        "SELECT observed_at_ms, probability FROM polymarket_market_snapshots WHERE market_id = ? ORDER BY observed_at_ms",
+        ("collision-market",),
+    ).fetchall()
+
+    assert [row["observed_at_ms"] for row in rows] == [3000, 3001]
+    assert [row["probability"] for row in rows] == [0.51, 0.52]
