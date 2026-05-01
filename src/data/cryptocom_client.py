@@ -134,9 +134,34 @@ class CryptoComClient:
                 if resp.status_code == 200:
                     raw = resp.json()
                     # Crypto.com v1 wraps responses in {"id": -1, "method": "...", "code": 0, "result": {...}}
-                    # Unwrap the result if present
-                    if isinstance(raw, dict) and "result" in raw:
-                        data = raw["result"]
+                    # ★ H29 FIX: previously we cached unconditionally on
+                    # HTTP 200 without checking the API-level ``code``.
+                    # Crypto.com returns ``code: <non-zero>`` for app-level
+                    # failures (rate limit, malformed request, missing
+                    # instrument) while still returning HTTP 200, and we
+                    # were caching those responses as success -- subsequent
+                    # callers within the cache TTL got back stale failure
+                    # payloads as if they were valid data.  Reject any
+                    # response with ``code`` != 0 here so they fall through
+                    # to the retry / fallback path instead of poisoning the
+                    # cache.
+                    if isinstance(raw, dict):
+                        api_code = raw.get("code", 0)
+                        if api_code not in (0, "0", None):
+                            logger.warning(
+                                "crypto.com API %s returned app-level error code=%s msg=%s",
+                                endpoint,
+                                api_code,
+                                str(raw.get("message", ""))[:100],
+                            )
+                            # Fall through to retry / return None below.
+                            backoff = min(8.0, 0.5 * (2 ** attempt))
+                            time.sleep(backoff)
+                            continue
+                        if "result" in raw:
+                            data = raw["result"]
+                        else:
+                            data = raw
                     else:
                         data = raw
                     self._set_cache(cache_key, data)
@@ -359,8 +384,17 @@ class CryptoComClient:
 
             trades = []
             for trade in trades_list:
-                price = float(trade.get("price", 0))
-                qty = float(trade.get("qty", 0))
+                # ★ L10 FIX: previously didn't validate price/qty.  A bad
+                # API row with price=0 or negative qty would propagate
+                # through downstream notional / vol calculations as a
+                # "free trade" and skew aggregations.  Skip invalid rows.
+                try:
+                    price = float(trade.get("price", 0) or 0)
+                    qty = float(trade.get("qty", 0) or 0)
+                except (TypeError, ValueError):
+                    continue
+                if price <= 0 or qty <= 0:
+                    continue
                 notional = price * qty
 
                 trades.append({
@@ -516,22 +550,32 @@ class CryptoComClient:
             # Reverse to chronological order (oldest first)
             candles = list(reversed(candles))
 
-            # Compute log returns
+            # ★ M33 FIX: previously a single bad candle (zero or non-numeric
+            # close) caused the whole window to be discarded.  Now we skip
+            # individual bad candles and continue computing returns from the
+            # next valid pair, only returning None when fewer than 2 valid
+            # log-returns remain.
             log_returns = []
             for i in range(1, len(candles)):
-                close_prev = float(candles[i - 1].get("close", 0))
-                close_curr = float(candles[i].get("close", 0))
-                if close_prev > 0:
-                    log_ret = math.log(close_curr / close_prev)
-                    log_returns.append(log_ret)
+                try:
+                    close_prev = float(candles[i - 1].get("close", 0) or 0)
+                    close_curr = float(candles[i].get("close", 0) or 0)
+                except (TypeError, ValueError):
+                    continue
+                if close_prev <= 0 or close_curr <= 0:
+                    continue
+                log_returns.append(math.log(close_curr / close_prev))
 
-            if not log_returns:
+            if len(log_returns) < 2:
                 return None
 
-            # Compute standard deviation
+            # ★ M34 FIX: switched from population variance (ddof=0) to
+            # sample variance (ddof=1) so this Sharpe-adjacent stdev
+            # matches the rest of the codebase (golden_wallet,
+            # agent_scoring, src/analysis/sharpe).
             mean = sum(log_returns) / len(log_returns)
-            variance = sum((x - mean) ** 2 for x in log_returns) / len(log_returns)
-            std_dev = math.sqrt(variance)
+            variance = sum((x - mean) ** 2 for x in log_returns) / (len(log_returns) - 1)
+            std_dev = math.sqrt(max(variance, 0.0))
 
             # Normalize to 0-1 range (5% std = 1.0)
             volatility = min(1.0, std_dev / 0.05)

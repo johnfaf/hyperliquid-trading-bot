@@ -5,10 +5,12 @@ Detects patterns like: momentum, mean-reversion, funding arbitrage, breakout, et
 """
 import logging
 from typing import List, Dict, Optional
+from datetime import datetime, timezone
 
 import sys
 import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+import config
 from src.data import database as db
 from src.data import hyperliquid_client as hl
 
@@ -17,7 +19,16 @@ logger = logging.getLogger(__name__)
 
 def _estimate_sharpe(metrics: Dict) -> float:
     """
-    Estimate Sharpe ratio from available strategy metrics.
+    Estimate Sharpe ratio from aggregate strategy metrics.
+
+    ★ H25 NOTE: this is the one Sharpe path that does NOT route through
+    ``src.analysis.sharpe`` because we don't have a per-trade or per-day
+    return series here — only aggregates (trade_count, win_rate,
+    profit_factor).  The output is therefore a heuristic estimate, NOT a
+    direct calculation, and should not be compared 1:1 with values
+    produced by the canonical helpers in src.analysis.sharpe.  We clamp
+    to [-3, +5] to keep the heuristic from outranging real measurements
+    in downstream scoring.
 
     Without daily return series, we approximate using:
     - profit_factor: measures reward/risk (PF > 1 = profitable)
@@ -31,9 +42,16 @@ def _estimate_sharpe(metrics: Dict) -> float:
     - WR=60%, PF=2.0, 500 trades → Sharpe ≈ 2.5
     - WR=45%, PF=0.8, 100 trades → Sharpe ≈ -0.5
     """
-    trade_count = metrics.get("trade_count", 0)
-    win_rate = metrics.get("win_rate", 0) / 100.0  # convert from pct
-    profit_factor = metrics.get("profit_factor", 0)
+    trade_count = metrics.get("trade_count", 0) or 0
+    win_rate = (metrics.get("win_rate", 0) or 0) / 100.0  # convert from pct
+    # ★ H27 propagation: research_cycle now passes None when PF is unknown.
+    # Treat None / non-numeric as "no edge" so the heuristic returns 0.0
+    # rather than crashing on a None comparison.
+    raw_pf = metrics.get("profit_factor", 0)
+    try:
+        profit_factor = float(raw_pf) if raw_pf is not None else 0.0
+    except (TypeError, ValueError):
+        profit_factor = 0.0
 
     if trade_count < 5 or profit_factor <= 0:
         return 0.0
@@ -132,6 +150,8 @@ class StrategyIdentifier:
                 logger.debug(f"Strategy detection error in {detector.__name__}: {e}")
 
         # Score and rank the identified strategies
+        for strategy in strategies:
+            strategy["bot_score"] = trader_profile.get("bot_score", 0)
         strategies.sort(key=lambda s: s.get("confidence", 0), reverse=True)
 
         if strategies:
@@ -170,13 +190,28 @@ class StrategyIdentifier:
         return None
 
     def _detect_mean_reversion(self, positions, pos_analysis, trade_analysis, address) -> Optional[Dict]:
-        """Detect mean reversion strategy (buying dips / selling rips)."""
+        """Detect mean reversion strategy (buying dips / selling rips).
+
+        ★ H17 FIX: now sets parameters["direction"] and parameters["coins"]
+        so downstream decision_engine has the data it needs. Without these,
+        decision_engine.decide either skips the strategy (missing coins) or
+        triggers the regime-direction override (missing direction) which
+        can flip a mean-reversion signal the wrong way in trending regimes.
+
+        ★ M13 FIX: bands scale by realized volatility (ATR%) instead of
+        fixed 2% thresholds. Low-vol days no longer produce zero signals
+        and high-vol days no longer classify every entry as mean reversion.
+        """
         if not positions:
             return None
 
         # Look for positions entered against recent price moves
         reversion_signals = 0
         total_checked = 0
+        # Track which direction dominates so we can set params["direction"]
+        long_reversions = 0
+        short_reversions = 0
+        reverted_coins: set = set()
 
         for pos in positions:
             coin = pos["coin"]
@@ -186,24 +221,51 @@ class StrategyIdentifier:
                 oracle = ctx.get("oracle_price", 0)
 
                 if mark and oracle and pos["entry_price"]:
+                    # ★ M13: scale threshold by coin volatility (ATR%)
+                    # Fall back to 2% if ATR unavailable.
+                    atr_pct = float(ctx.get("atr_pct", 0.02) or 0.02)
+                    # Mean reversion implies entry displaced by ~1-2× typical move
+                    band = max(0.005, min(atr_pct * 1.5, 0.05))  # clamp [0.5%, 5%]
+
                     # If long and entry is below current mark (bought the dip)
-                    if pos["side"] == "long" and pos["entry_price"] < mark * 0.98:
+                    if pos["side"] == "long" and pos["entry_price"] < mark * (1 - band):
                         reversion_signals += 1
+                        long_reversions += 1
+                        reverted_coins.add(coin)
                     # If short and entry is above current mark (sold the rip)
-                    elif pos["side"] == "short" and pos["entry_price"] > mark * 1.02:
+                    elif pos["side"] == "short" and pos["entry_price"] > mark * (1 + band):
                         reversion_signals += 1
+                        short_reversions += 1
+                        reverted_coins.add(coin)
                     total_checked += 1
 
         if total_checked > 0 and reversion_signals / total_checked > 0.5:
             confidence = min(0.85, 0.3 + (reversion_signals / total_checked) * 0.4 +
                            trade_analysis.get("win_rate", 0) * 0.2)
+            # ★ H17: determine dominant direction so downstream code has it
+            # If mix is tilted one way, that's the strategy's bias; if 50/50,
+            # we default to the direction of pos_analysis.bias or "long".
+            if long_reversions > short_reversions:
+                direction = "long"
+            elif short_reversions > long_reversions:
+                direction = "short"
+            else:
+                bias = pos_analysis.get("bias", "")
+                direction = "short" if "short" in bias else "long"
+
             return {
                 "type": "mean_reversion",
                 "description": STRATEGY_TYPES["mean_reversion"],
                 "confidence": confidence,
                 "parameters": {
+                    # ★ H17: coins and direction preserved so decision_engine
+                    # can route this strategy without skipping or flipping it
+                    "direction": direction,
+                    "coins": sorted(reverted_coins),
                     "reversion_pct": reversion_signals / total_checked,
                     "avg_leverage": pos_analysis.get("avg_leverage", 1),
+                    "long_reversions": long_reversions,
+                    "short_reversions": short_reversions,
                 },
                 "trader_address": address,
                 "metrics": {
@@ -468,26 +530,60 @@ class StrategyIdentifier:
 
         # Step 2: Prepare batch data
         batch_data = []
+        source_validated = []
         for strat in qualified:
             metrics = strat.get("metrics", {})
-            addr = strat.get("trader_address", "unknown")[:8]
+            source_wallet = str(strat.get("trader_address") or "").strip().lower()
+            if not db.is_valid_trader_address(source_wallet):
+                logger.warning(
+                    "Discarded %s strategy with invalid source wallet %s",
+                    strat.get("type", "unknown"),
+                    source_wallet[:18] if source_wallet else "<missing>",
+                )
+                continue
+            try:
+                bot_score = float(
+                    strat.get("bot_score", metrics.get("bot_score", 0)) or 0
+                )
+            except (TypeError, ValueError):
+                bot_score = 0.0
+            if bot_score >= float(getattr(config, "BOT_THRESHOLD", 3)):
+                logger.info(
+                    "Discarded %s strategy from bot-like source %s (bot_score=%.2f)",
+                    strat.get("type", "unknown"),
+                    source_wallet[:10],
+                    bot_score,
+                )
+                continue
+            addr = source_wallet[:8]
+            params = dict(strat.get("parameters") or {})
+            params.update({
+                "source_wallet": source_wallet,
+                "source_wallet_validated_at": datetime.now(timezone.utc).isoformat(),
+                "source_wallet_bot_score": bot_score,
+            })
             batch_data.append({
                 "name": f"{strat['type']}_{addr}",
                 "description": strat.get("description", ""),
                 "strategy_type": strat["type"],
-                "parameters": strat.get("parameters", {}),
+                "parameters": params,
                 "total_pnl": metrics.get("pnl", 0),
                 "trade_count": metrics.get("trade_count", 0),
                 "win_rate": metrics.get("win_rate", 0),
                 "sharpe_ratio": _estimate_sharpe(metrics),
             })
+            source_validated.append(strat)
+
+        if not batch_data:
+            logger.info("No strategies passed source-wallet validation")
+            return []
 
         # Step 3: Batch insert (single transaction)
         try:
             saved_ids = db.save_strategies_batch(batch_data)
 
             # Log with trader address for traceability
-            for strat, sid in zip(qualified, saved_ids):
+            for strat, sid in zip(source_validated, saved_ids):
                 addr = strat.get("trader_address", "unknown")[:10]
                 logger.debug(f"Saved strategy for {addr}...: {strat['type']} "
                             f"(confidence: {strat['confidence']:.2f})")
@@ -503,12 +599,29 @@ class StrategyIdentifier:
             for strat in qualified:
                 try:
                     metrics = strat.get("metrics", {})
-                    addr = strat.get("trader_address", "unknown")[:8]
+                    source_wallet = str(strat.get("trader_address") or "").strip().lower()
+                    if not db.is_valid_trader_address(source_wallet):
+                        continue
+                    try:
+                        bot_score = float(
+                            strat.get("bot_score", metrics.get("bot_score", 0)) or 0
+                        )
+                    except (TypeError, ValueError):
+                        bot_score = 0.0
+                    if bot_score >= float(getattr(config, "BOT_THRESHOLD", 3)):
+                        continue
+                    addr = source_wallet[:8]
+                    params = dict(strat.get("parameters") or {})
+                    params.update({
+                        "source_wallet": source_wallet,
+                        "source_wallet_validated_at": datetime.now(timezone.utc).isoformat(),
+                        "source_wallet_bot_score": bot_score,
+                    })
                     strategy_id = db.save_strategy(
                         name=f"{strat['type']}_{addr}",
                         description=strat.get("description", ""),
                         strategy_type=strat["type"],
-                        parameters=strat.get("parameters", {}),
+                        parameters=params,
                         total_pnl=metrics.get("pnl", 0),
                         trade_count=metrics.get("trade_count", 0),
                         win_rate=metrics.get("win_rate", 0),

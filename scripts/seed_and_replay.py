@@ -19,6 +19,7 @@ Requires only: numpy, pandas, requests (no websocket/eth_account needed).
 import argparse
 import json
 import logging
+import os
 import random
 import sys
 from datetime import datetime
@@ -39,6 +40,36 @@ logging.basicConfig(
 logger = logging.getLogger("seed_replay")
 
 FIXTURES_PATH = ROOT / "fixtures" / "sample_data.json"
+
+
+def _env_truthy(name: str) -> bool:
+    return str(os.environ.get(name, "")).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _assert_safe_seed_target(*, allow_runtime_db: bool = False) -> None:
+    """Refuse to seed fixture data into the runtime/live database by accident."""
+    if allow_runtime_db or _env_truthy("SEED_REPLAY_ALLOW_RUNTIME_DB"):
+        logger.warning("Fixture seeding override enabled; runtime DB may be overwritten")
+        return
+
+    db_path = Path(db.get_db_path()).resolve()
+    default_runtime_db = (ROOT / "data" / "bot.db").resolve()
+    reasons = []
+    if db_path == default_runtime_db:
+        reasons.append(f"target is default runtime DB: {db_path}")
+    if str(db_path).replace("\\", "/").startswith("/data/"):
+        reasons.append(f"target is persistent /data DB: {db_path}")
+    if db.get_backend_name() != "sqlite":
+        reasons.append(f"DB_BACKEND={db.get_backend_name()} is not isolated sqlite")
+    if _env_truthy("LIVE_TRADING_ENABLED"):
+        reasons.append("LIVE_TRADING_ENABLED=true")
+
+    if reasons:
+        raise RuntimeError(
+            "Refusing to seed fixture data into a runtime database. "
+            + "; ".join(reasons)
+            + ". Use --allow-runtime-db only for an intentional local reset."
+        )
 
 # ─── Deterministic price generator ────────────────────────────
 # Generates a realistic price series with trends, mean-reversion,
@@ -219,8 +250,9 @@ def _generate_fills_for_wallet(wallet: dict, strategies: list, seed: int = 42) -
 
 # ─── Database seeding ─────────────────────────────────────────
 
-def seed_database():
+def seed_database(*, allow_runtime_db: bool = False):
     """Load fixtures/sample_data.json and populate the database."""
+    _assert_safe_seed_target(allow_runtime_db=allow_runtime_db)
     logger.info("Loading sample data from %s", FIXTURES_PATH)
 
     with open(FIXTURES_PATH) as f:
@@ -444,6 +476,11 @@ Examples:
                         help="Only run backtest (DB must already be seeded)")
     parser.add_argument("--sweep", action="store_true",
                         help="Run parameter sweep instead of single backtest")
+    parser.add_argument(
+        "--allow-runtime-db",
+        action="store_true",
+        help="Allow destructive fixture seeding into the configured runtime DB.",
+    )
     args = parser.parse_args()
 
     print()
@@ -453,7 +490,11 @@ Examples:
 
     if not args.replay_only:
         logger.info("Phase 1: Seeding database...")
-        n_fills = seed_database()
+        try:
+            n_fills = seed_database(allow_runtime_db=args.allow_runtime_db)
+        except RuntimeError as exc:
+            logger.error("%s", exc)
+            raise SystemExit(2)
         if args.seed_only:
             print(f"\nDatabase seeded with {n_fills} fills. "
                   f"Run without --seed-only to backtest.")

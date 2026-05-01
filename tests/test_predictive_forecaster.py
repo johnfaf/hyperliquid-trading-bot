@@ -12,6 +12,7 @@ from src.signals.predictive_regime_forecaster import (
     W_FUNDING, W_IMBALANCE, W_ARKHAM,
     CRASH_THRESHOLD, BULLISH_THRESHOLD,
 )
+from src.data.exchange_aggregator import ExchangeAggregator
 
 
 def test_weights_sum_to_one():
@@ -186,3 +187,20 @@ def test_forecaster_marks_options_partial_when_registry_degraded(monkeypatch):
     assert result["partial_signal"] is True
     assert "options_flow" in result["partial_inputs"]
     assert result["data_source_health"]["options_flow"]["state"] == "DEGRADED"
+
+
+def test_exchange_aggregator_marks_registry_down_when_all_sources_fail(monkeypatch):
+    registry = DataSourceRegistry()
+    registry.register_source("exchange_aggregator")
+    agg = ExchangeAggregator(source_registry=registry)
+
+    monkeypatch.setattr("src.data.exchange_aggregator._binance_ticker", lambda symbol: None)
+    monkeypatch.setattr("src.data.exchange_aggregator._bybit_ticker", lambda symbol: None)
+    monkeypatch.setattr("src.data.exchange_aggregator._kraken_ticker", lambda symbol: None)
+    monkeypatch.setattr("src.data.exchange_aggregator._coinbase_ticker", lambda symbol: None)
+    monkeypatch.setattr("src.data.exchange_aggregator._cryptocom_ticker", lambda symbol: None)
+
+    assert agg.get_multi_exchange_data("BTC") is None
+    status = registry.get("exchange_aggregator")
+    assert status["state"] == "DOWN"
+    assert status["metadata"]["coin"] == "BTC"

@@ -226,7 +226,7 @@ def build_subsystems(
 
     c = SubsystemContainer()
     c.data_source_registry = DataSourceRegistry()
-    for source_name in ("polymarket", "options_flow", "deribit"):
+    for source_name in ("polymarket", "options_flow", "deribit", "exchange_aggregator", "macro_regime"):
         c.data_source_registry.register_source(source_name)
     logger.info("Building subsystems (profile has %d features)...", len(profile))
 
@@ -242,7 +242,12 @@ def build_subsystems(
     from src.analysis.features import FeatureEngine
     from src.ui.reporter import Reporter
 
-    c.exchange_agg = _safe_init("exchange_aggregator", ExchangeAggregator, health, affects_trading=False)
+    c.exchange_agg = _safe_init(
+        "exchange_aggregator",
+        lambda: ExchangeAggregator(source_registry=c.data_source_registry),
+        health,
+        affects_trading=False,
+    )
     c.discovery = _safe_init("discovery", TraderDiscovery, health, affects_trading=False)
     c.identifier = _safe_init("strategy_identifier", StrategyIdentifier, health, affects_trading=False)
     c.scorer = _safe_init("strategy_scorer", StrategyScorer, health)
@@ -277,6 +282,24 @@ def build_subsystems(
                 ),
                 "policy_degraded_min_confidence": getattr(
                     config, "SOURCE_POLICY_DEGRADED_MIN_CONFIDENCE", 0.55
+                ),
+                "policy_dynamic_caps_enabled": getattr(
+                    config, "SOURCE_POLICY_DYNAMIC_CAPS_ENABLED", True
+                ),
+                "policy_active_min_signals_per_day": getattr(
+                    config, "SOURCE_POLICY_ACTIVE_MIN_SIGNALS_PER_DAY", 3
+                ),
+                "policy_active_max_signals_per_day": getattr(
+                    config, "SOURCE_POLICY_ACTIVE_MAX_SIGNALS_PER_DAY", 8
+                ),
+                "policy_strong_min_closed_trades": getattr(
+                    config, "SOURCE_POLICY_STRONG_MIN_CLOSED_TRADES", 12
+                ),
+                "policy_strong_win_rate": getattr(
+                    config, "SOURCE_POLICY_STRONG_WIN_RATE", 0.55
+                ),
+                "policy_strong_recent_pnl_floor": getattr(
+                    config, "SOURCE_POLICY_STRONG_RECENT_PNL_FLOOR", 0.0
                 ),
             }
         ),
@@ -372,6 +395,24 @@ def build_subsystems(
             "short_hardening_size_multiplier": float(
                 getattr(_fw_cfg, "SHORT_HARDENING_SIZE_MULTIPLIER", 0.50)
             ),
+            "short_hardening_source_guard_enabled": bool(
+                getattr(_fw_cfg, "SHORT_HARDENING_SOURCE_GUARD_ENABLED", True)
+            ),
+            "short_hardening_source_min_closed_trades": int(
+                getattr(_fw_cfg, "SHORT_HARDENING_SOURCE_MIN_CLOSED_TRADES", 3)
+            ),
+            "short_hardening_source_block_net_pnl": float(
+                getattr(_fw_cfg, "SHORT_HARDENING_SOURCE_BLOCK_NET_PNL", -0.25)
+            ),
+            "short_hardening_coin_guard_enabled": bool(
+                getattr(_fw_cfg, "SHORT_HARDENING_COIN_GUARD_ENABLED", True)
+            ),
+            "short_hardening_coin_min_closed_trades": int(
+                getattr(_fw_cfg, "SHORT_HARDENING_COIN_MIN_CLOSED_TRADES", 4)
+            ),
+            "short_hardening_coin_block_net_pnl": float(
+                getattr(_fw_cfg, "SHORT_HARDENING_COIN_BLOCK_NET_PNL", -0.25)
+            ),
             "cooldown_seconds": int(getattr(_fw_cfg, "FIREWALL_COIN_COOLDOWN_SECONDS", 180)),
             "same_side_cooldown_seconds": int(
                 getattr(_fw_cfg, "FIREWALL_SAME_SIDE_COOLDOWN_SECONDS", 900)
@@ -461,6 +502,21 @@ def build_subsystems(
                     ),
                     "hybrid_min_r_floor": getattr(
                         config, "RISK_POLICY_HYBRID_MIN_R_FLOOR", 5.0
+                    ),
+                    "short_caution_enabled": getattr(
+                        config, "RISK_POLICY_SHORT_CAUTION_ENABLED", True
+                    ),
+                    "short_caution_confidence_threshold": getattr(
+                        config, "RISK_POLICY_SHORT_CAUTION_CONFIDENCE_THRESHOLD", 0.60
+                    ),
+                    "short_caution_max_reward_multiple": getattr(
+                        config, "RISK_POLICY_SHORT_CAUTION_MAX_REWARD_MULTIPLE", 3.0
+                    ),
+                    "short_caution_time_limit_multiplier": getattr(
+                        config, "RISK_POLICY_SHORT_CAUTION_TIME_LIMIT_MULTIPLIER", 0.75
+                    ),
+                    "short_caution_breakeven_at_r": getattr(
+                        config, "RISK_POLICY_SHORT_CAUTION_BREAKEVEN_AT_R", 0.65
                     ),
                     "default_reward_multiple": config.RISK_POLICY_DEFAULT_REWARD_MULTIPLE,
                     "min_reward_multiple": config.RISK_POLICY_MIN_REWARD_MULTIPLE,
@@ -563,7 +619,7 @@ def build_subsystems(
         from src.data.macro_regime_scraper import MacroRegimeScraper
         c.macro_regime = _safe_init(
             "macro_regime",
-            MacroRegimeScraper,
+            lambda: MacroRegimeScraper({"source_registry": c.data_source_registry}),
             health,
             affects_trading=False,
         )

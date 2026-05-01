@@ -236,9 +236,33 @@ class SizingEnvironment:
         return self._get_state()
 
     def _get_state(self) -> np.ndarray:
-        """Construct state vector from current episode position."""
+        """Construct state vector from current episode position.
+
+        ★ H20 FIX: previous slice `[max(0, idx - 20):idx + 1]` included the
+        CURRENT trade's return in the state from which the agent chose its
+        sizing action. That's look-ahead: the policy learned to exploit
+        knowledge of the outcome it was sizing for. Now uses strictly past
+        data `[max(0, idx - 20):idx]`. Also exposes a `confidence` field
+        from outside the environment instead of hardcoded 0.6 so the
+        policy experiences variable confidence during training.
+        """
         idx = self._start + self._step
-        recent = self.trade_returns[max(0, idx - 20):idx + 1]
+        # ★ H20: STRICTLY past data — do not include trade at `idx`
+        recent = self.trade_returns[max(0, idx - 20):idx]
+
+        # If we're at the very first step, we have no history — use a
+        # neutral prior so the env still returns a valid state vector.
+        if len(recent) == 0:
+            return np.array([
+                0.0,  # kelly
+                0.5,  # win_rate prior
+                0.4,  # rr_ratio / 5 prior (~2:1)
+                float(getattr(self, "_confidence", 0.6)),
+                0.0, 0.0, 0.0, 0.0,  # regime flags
+                0.4,  # vol / 0.05 prior
+                0.0,  # drawdown
+                0.0,  # data coverage
+            ], dtype=np.float32)
 
         # Compute pseudo-Kelly from recent data
         wins = recent[recent > 0]
@@ -259,11 +283,16 @@ class SizingEnvironment:
         regime_volatile = 1.0 if vol > 0.03 else 0.0
         regime_ranging = 1.0 if abs(trend) < 0.002 and vol < 0.02 else 0.0
 
+        # ★ H20: use externally-settable confidence (via set_confidence)
+        # so training sees the same variability as deployment. Defaults
+        # to 0.6 for backward compatibility if not set.
+        confidence = float(getattr(self, "_confidence", 0.6))
+
         return np.array([
             kelly,
             win_rate,
             rr_ratio / 5.0,  # normalized
-            0.6,  # simulated signal confidence
+            confidence,
             regime_up,
             regime_down,
             regime_volatile,
@@ -272,6 +301,12 @@ class SizingEnvironment:
             min(drawdown, 1.0),
             min(len(recent) / 100.0, 1.0),
         ], dtype=np.float32)
+
+    def set_confidence(self, confidence: float) -> None:
+        """Allow the training loop to vary confidence across episodes/steps.
+        Without this call, defaults to 0.6 for backward compatibility.
+        """
+        self._confidence = float(max(0.0, min(1.0, confidence)))
 
     def step(self, action: int) -> Tuple[np.ndarray, float, bool]:
         """

@@ -163,9 +163,14 @@ def test_aggregate_score_weighted():
         "order_depth_liq": (0.0, {}),
         "institutional_sentiment": (0.0, {}),
     }
-    score = scraper._aggregate_score(components)
+    # H23: _aggregate_score now returns (score, quorum_status). Futures
+    # and calendar are always-included (so we have non-zero weight even
+    # when other sources return 0), but with only 2/6 sources reporting
+    # data the helper flags the run as low_quorum.
+    score, quorum = scraper._aggregate_score(components)
     # Futures has 0.30 weight, calendar 0.25 — net should be slightly positive
     assert -1.0 <= score <= 1.0
+    assert quorum in {"ok", "low_quorum"}
 
 
 # ─── Integration: full posture with mocked sources ──────────────────────────

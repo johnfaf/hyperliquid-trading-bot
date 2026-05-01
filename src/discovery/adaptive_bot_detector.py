@@ -346,7 +346,7 @@ class AdaptiveBotDetector:
         else:
             return 0.3
 
-    def calibrate(
+    def evaluate_accuracy(
         self,
         known_bots: List[str],
         known_humans: List[str],
@@ -355,11 +355,14 @@ class AdaptiveBotDetector:
         get_trade_analysis_fn
     ) -> Dict:
         """
-        Optional: Fine-tune detector weights based on known classifications.
+        Evaluate detector accuracy against a labelled set.
 
-        This is advanced functionality to improve accuracy over time.
-        In a real system, you'd integrate with a persistent DB and use
-        historical classifications to optimize weights.
+        ★ M18 FIX: previously named ``calibrate`` but it ONLY measured
+        accuracy — it never adjusted weights, so the name was misleading.
+        Renamed to ``evaluate_accuracy`` to reflect what it actually does.
+        ``calibrate`` is kept as a deprecated alias below so existing
+        callers don't break.  Implement true weight calibration in a
+        future PR using these metrics as the optimization target.
 
         Args:
             known_bots: List of addresses known to be bots
@@ -369,7 +372,7 @@ class AdaptiveBotDetector:
             get_trade_analysis_fn: Function(address) -> Dict of trade analysis
 
         Returns:
-            Calibration metrics (accuracy, precision, recall)
+            Accuracy metrics dict (bot_accuracy, human_accuracy, overall_accuracy).
         """
         logger.info(f"Calibrating on {len(known_bots)} bots, {len(known_humans)} humans...")
 
@@ -405,11 +408,23 @@ class AdaptiveBotDetector:
         }
 
         logger.info(
-            f"Calibration results: bot_acc={bot_accuracy:.2%}, "
+            f"Accuracy evaluation: bot_acc={bot_accuracy:.2%}, "
             f"human_acc={human_accuracy:.2%}, overall={overall_accuracy:.2%}"
         )
 
         return metrics
+
+    def calibrate(self, *args, **kwargs) -> Dict:
+        """Deprecated: use ``evaluate_accuracy`` instead. ★ M18.
+
+        The original name implied weight optimization; this method only
+        measures accuracy.  Kept as a thin alias to avoid breaking older
+        callers.  New code should call ``evaluate_accuracy`` directly.
+        """
+        logger.warning(
+            "AdaptiveBotDetector.calibrate() is deprecated -- use evaluate_accuracy()"
+        )
+        return self.evaluate_accuracy(*args, **kwargs)
 
     # ─── Helper Methods ────────────────────────────────────────────
 

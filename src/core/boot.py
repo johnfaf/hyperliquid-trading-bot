@@ -233,6 +233,32 @@ def init_database(logger: logging.Logger) -> None:
     init_db()
     if restore_from_json():
         logger.info("Restored DB from backup (post-deploy recovery)")
+    if getattr(config, "DB_SAFE_AUTO_REPAIR_ON_BOOT", True):
+        try:
+            from src.data.db_audit import run_startup_safe_repair
+
+            logger.info("Running startup DB safe-repair...")
+            actions = run_startup_safe_repair()
+            applied = [a for a in actions if str(a.status).lower() == "applied"]
+            failed = [a for a in actions if str(a.status).lower() == "failed"]
+            if applied:
+                benign_actions = {
+                    "source_health_history",
+                    "stale_pending_decisions",
+                    "stale_regime_history",
+                }
+                log = logger.info if all(a.action in benign_actions for a in applied) else logger.warning
+                log(
+                    "Startup DB safe-repair applied: %s",
+                    ", ".join(a.action for a in applied),
+                )
+            if failed:
+                logger.warning(
+                    "Startup DB safe-repair failures: %s",
+                    ", ".join(f"{a.action}:{a.details.get('error', '')[:80]}" for a in failed),
+                )
+        except Exception as exc:
+            logger.warning("Startup DB safe-repair failed: %s", exc)
 
 
 def log_persistence_info(logger: logging.Logger) -> None:

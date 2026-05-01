@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+import threading
 from contextlib import contextmanager
 
 import pytest
@@ -121,6 +122,77 @@ def test_dualwrite_read_only_path_skips_postgres(monkeypatch):
         row = conn.execute("SELECT 1").fetchone()
 
     assert row[0] == 1
+
+
+class _TrackingLock:
+    def __init__(self):
+        self.enter_count = 0
+        self.exit_count = 0
+        self.max_active = 0
+        self._active = 0
+        self._inner = threading.Lock()
+
+    def __enter__(self):
+        self._inner.acquire()
+        self.enter_count += 1
+        self._active += 1
+        self.max_active = max(self.max_active, self._active)
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self._active -= 1
+        self.exit_count += 1
+        self._inner.release()
+        return False
+
+
+def test_sqlite_write_path_uses_process_write_guard(monkeypatch, tmp_path):
+    db_path = tmp_path / "router-write-lock.db"
+    monkeypatch.setattr(router.config, "DB_BACKEND", "sqlite")
+    monkeypatch.setattr(router.config, "DB_PATH", str(db_path))
+    tracking_lock = _TrackingLock()
+    monkeypatch.setattr(router, "_SQLITE_WRITE_LOCK", tracking_lock)
+
+    with router.get_connection() as conn:
+        conn.execute("CREATE TABLE IF NOT EXISTS test_rows (id INTEGER PRIMARY KEY, value TEXT)")
+
+    def _write_row(value: str):
+        with router.get_connection() as conn:
+            conn.execute("INSERT INTO test_rows (value) VALUES (?)", (value,))
+
+    t1 = threading.Thread(target=_write_row, args=("a",))
+    t2 = threading.Thread(target=_write_row, args=("b",))
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
+
+    with router.get_connection(for_read=True) as conn:
+        rows = conn.execute("SELECT value FROM test_rows ORDER BY id").fetchall()
+
+    assert [row[0] for row in rows] == ["a", "b"]
+    assert tracking_lock.enter_count == 3
+    assert tracking_lock.exit_count == 3
+    assert tracking_lock.max_active == 1
+
+
+def test_dualwrite_read_only_path_skips_process_write_guard(monkeypatch):
+    tracking_lock = _TrackingLock()
+    monkeypatch.setattr(router, "_SQLITE_WRITE_LOCK", tracking_lock)
+    monkeypatch.setattr(router.config, "DB_BACKEND", "dualwrite")
+    monkeypatch.setattr(router, "_sqlite_connect", lambda: sqlite3.connect(":memory:"))
+
+    def _unexpected_pg():
+        raise AssertionError("dualwrite read path should not open Postgres")
+
+    monkeypatch.setattr(router, "_pg_connect", _unexpected_pg)
+
+    with router.get_connection(for_read=True) as conn:
+        row = conn.execute("SELECT 1").fetchone()
+
+    assert row[0] == 1
+    assert tracking_lock.enter_count == 0
+    assert tracking_lock.exit_count == 0
 
 
 def test_dualwrite_insert_preserves_sqlite_generated_ids_in_postgres():
@@ -312,6 +384,16 @@ def test_run_migrations_wraps_each_file_in_transaction(monkeypatch, tmp_path):
     assert conn.commit_calls == 1
     assert conn.executed[0][0] == "CREATE TABLE test_table (id INTEGER);"
     assert conn.executed[1][0].startswith("INSERT INTO schema_migrations")
+
+
+def test_migration_reader_strips_utf8_bom(tmp_path):
+    migration_file = tmp_path / "0009_test.sql"
+    migration_file.write_bytes(b"\xef\xbb\xbf-- comment\nCREATE TABLE t (id INTEGER);")
+
+    sql = migrations_module._read_migration_sql(str(migration_file))
+
+    assert sql.startswith("-- comment")
+    assert "\ufeff" not in sql
 
 
 def test_translate_sql_only_rewrites_datetime_function_calls():
@@ -764,6 +846,12 @@ def test_open_paper_trade_idempotency_key_deduplicates(monkeypatch, tmp_path):
     db_file = tmp_path / "h5.db"
     monkeypatch.setattr(db_module.config, "DB_BACKEND", "sqlite")
     monkeypatch.setattr(db_module.config, "DB_PATH", str(db_file), raising=False)
+    monkeypatch.setattr(
+        db_module.config,
+        "FIREWALL_MAX_SAME_SIDE_POSITIONS_PER_COIN",
+        10,
+        raising=False,
+    )
     monkeypatch.setattr(db_module, "_RESOLVED_DB_PATH", str(db_file), raising=False)
 
     db_module.init_db()
@@ -862,3 +950,25 @@ def test_open_paper_trade_idempotency_key_schema_migration(monkeypatch, tmp_path
         None, "ETH", "long", 100.0, 1.0, idempotency_key="k1",
     )
     assert tid1 == tid2
+
+
+def test_open_paper_trade_enforces_same_side_cap(monkeypatch, tmp_path):
+    from src.data import database as db_module
+
+    db_file = tmp_path / "cap.db"
+    monkeypatch.setattr(db_module.config, "DB_BACKEND", "sqlite")
+    monkeypatch.setattr(db_module.config, "DB_PATH", str(db_file), raising=False)
+    monkeypatch.setattr(
+        db_module.config,
+        "FIREWALL_MAX_SAME_SIDE_POSITIONS_PER_COIN",
+        2,
+        raising=False,
+    )
+    monkeypatch.setattr(db_module, "_RESOLVED_DB_PATH", str(db_file), raising=False)
+
+    db_module.init_db()
+    db_module.open_paper_trade(None, "ETH", "long", 100.0, 1.0)
+    db_module.open_paper_trade(None, "ETH", "long", 100.0, 1.0)
+
+    with pytest.raises(ValueError, match="Pyramiding blocked"):
+        db_module.open_paper_trade(None, "ETH", "long", 100.0, 1.0)

@@ -185,6 +185,37 @@ def test_risk_policy_engine_hybrid_min_5r_keeps_dynamic_upside_when_above_floor(
     assert policy.rr_mode == "hybrid_min_5r"
 
 
+def test_risk_policy_engine_cautious_short_caps_target_and_moves_breakeven_earlier():
+    engine = RiskPolicyEngine(
+        {
+            "short_caution_enabled": True,
+            "short_caution_confidence_threshold": 0.60,
+            "short_caution_max_reward_multiple": 3.0,
+            "short_caution_breakeven_at_r": 0.65,
+        }
+    )
+    signal = TradeSignal(
+        coin="BTC",
+        side=SignalSide.SHORT,
+        confidence=0.55,
+        source=SignalSource.STRATEGY,
+        reason="weak short in uptrend",
+        leverage=5,
+        source_accuracy=0.55,
+        context={"atr_pct": 0.006, "expected_return": 0.10},
+    )
+
+    policy = engine.resolve(
+        signal,
+        regime_data={"regime": "trending_up", "confidence": 0.80},
+        source_policy={"quality": 0.55, "status": "healthy"},
+    )
+
+    assert policy.reward_multiple <= 3.0
+    assert policy.breakeven_at_r <= 0.65
+    assert "short_caution:shorter_time_stop" in policy.rationale
+
+
 def test_risk_policy_engine_caps_extreme_price_distance_even_with_low_leverage():
     engine = RiskPolicyEngine()
     signal = TradeSignal(
@@ -270,8 +301,13 @@ def test_live_manage_open_positions_trails_stop_using_shadow_policy(monkeypatch)
     monkeypatch.setattr(trader, "_get_mid_price", lambda coin: 102.0)
     monkeypatch.setattr(
         trader,
-        "_cancel_protective_orders",
-        lambda coin: cancellations.append(coin) or 2,
+        "_protective_order_oids",
+        lambda coin: {101, 102},
+    )
+    monkeypatch.setattr(
+        trader,
+        "_cancel_protective_order_oids",
+        lambda coin, oids: cancellations.append((coin, sorted(oids))) or len(oids),
     )
     monkeypatch.setattr(
         trader,
@@ -292,7 +328,7 @@ def test_live_manage_open_positions_trails_stop_using_shadow_policy(monkeypatch)
 
     assert summary["updated"] == 1
     assert summary["closed"] == 0
-    assert cancellations == ["ETH"]
+    assert cancellations == [("ETH", [101, 102])]
     assert placed
     _, close_side, size, stop_loss, take_profit = placed[0]
     assert close_side == "sell"

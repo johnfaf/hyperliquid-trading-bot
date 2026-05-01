@@ -89,6 +89,24 @@ REGIME_COMPATIBILITY = {
         "breakout": 0.3,              # Hard to scale in/out
         "concentrated_bet": 0.3,      # Execution risk
     },
+    # ★ M32 FIX: previously there was no entry for "unknown", so every
+    # strategy in an unknown regime got the conservative DEFAULT_COMPATIBILITY
+    # of 0.5 -- effectively flat 0.5 weighting, indistinguishable from
+    # "neutral" in the matrix.  Treat UNKNOWN as defensive (mirror of M15's
+    # regime_detector treatment): only mean_reversion / funding_arb /
+    # delta_neutral score reasonably; directional strategies score low.
+    "unknown": {
+        "mean_reversion": 0.6,        # OK -- direction-agnostic
+        "funding_arb": 0.6,           # OK -- direction-agnostic
+        "delta_neutral": 0.6,         # OK -- direction-agnostic
+        "scalping": 0.4,              # Risky without regime read
+        "swing_trading": 0.3,         # Avoid -- needs direction
+        "momentum_long": 0.2,         # Avoid -- direction unclear
+        "momentum_short": 0.2,        # Avoid -- direction unclear
+        "trend_following": 0.2,       # Avoid -- no measurable trend
+        "breakout": 0.3,              # Avoid -- false-breakout risk
+        "concentrated_bet": 0.2,      # Avoid -- single-name conviction risky
+    },
 }
 
 # Default compatibility if strategy not in matrix (conservative)

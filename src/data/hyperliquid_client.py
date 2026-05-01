@@ -1,6 +1,6 @@
 """
 Hyperliquid API client for fetching leaderboard, trader positions, market data, and PnL.
-Uses only the public Info endpoint — no API key required for read-only operations.
+Uses only the public Info endpoint - no API key required for read-only operations.
 
 V3: All requests route through the centralized APIManager (token bucket +
     TTL cache + WebSocket feed).  The public function signatures are unchanged
@@ -25,9 +25,10 @@ logger = logging.getLogger(__name__)
 # 40-hex-char Ethereum address.  Anything else returns HTTP 422
 # "Failed to deserialize the JSON body into the target type".  The discovery
 # pipeline occasionally inserts placeholder / truncated addresses into the
-# DB — filter them out here instead of spamming the log with 422 warnings.
+# DB - filter them out here instead of spamming the log with 422 warnings.
 _ETH_ADDRESS_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
 _WARNED_INVALID_ADDRESSES: set[str] = set()
+_WARNED_INVALID_ENTRY_PRICES: set[str] = set()
 
 
 def _warn_invalid_address_once(context: str, address: Optional[str]) -> None:
@@ -69,7 +70,51 @@ def _safe_int(value: Any, default: int = 0) -> int:
         return default
 
 
-# ─── Internal post — now delegates to APIManager ─────────────────
+def mask_display_name(value: Any) -> Optional[str]:
+    """Return a fixed redaction for human-readable labels from public leaderboards."""
+    if not isinstance(value, str):
+        return None
+    clean = value.strip()
+    if not clean:
+        return None
+    if len(clean) == 1:
+        return f"{clean[0]}***"
+    return f"{clean[0]}***{clean[-1]}"
+
+
+def redact_leaderboard_identity_fields(entry: Any) -> Any:
+    """Redact human-readable account labels before persisting or logging payloads."""
+    if not isinstance(entry, dict):
+        return entry
+    redacted = dict(entry)
+    for key in ("displayName", "accountName", "name", "label"):
+        if key not in redacted:
+            continue
+        masked = mask_display_name(redacted.get(key))
+        if masked is None:
+            redacted.pop(key, None)
+        else:
+            redacted[key] = masked
+    return redacted
+
+
+def _warn_invalid_entry_price_once(address: str, coin: str, raw_entry_price: Any) -> None:
+    masked_address = address[:10] if isinstance(address, str) else "<unknown>"
+    symbol = str(coin or "?")
+    key = f"{masked_address}:{symbol}"
+    if key in _WARNED_INVALID_ENTRY_PRICES:
+        return
+    if len(_WARNED_INVALID_ENTRY_PRICES) < 2048:
+        _WARNED_INVALID_ENTRY_PRICES.add(key)
+    logger.warning(
+        "get_user_state: skipping %s position for %s because entryPx=%r is invalid",
+        symbol,
+        masked_address,
+        raw_entry_price,
+    )
+
+
+# --- Internal post - now delegates to APIManager -----------------
 
 def _post(payload: dict, retries: int = 3,
           priority: Priority = None) -> Optional[dict]:
@@ -83,11 +128,11 @@ def _post(payload: dict, retries: int = 3,
 
 # Legacy compatibility: modules that imported _rate_limit directly
 def _rate_limit():
-    """No-op — rate limiting now handled by APIManager's token bucket."""
+    """No-op - rate limiting now handled by APIManager's token bucket."""
     pass
 
 
-# ─── Market Metadata ───────────────────────────────────────────
+# --- Market Metadata ---------------------------------------------
 
 def get_meta():
     """Get exchange metadata (list of all perpetual assets)."""
@@ -169,7 +214,7 @@ def get_user_fee_rate(address: str) -> Optional[dict]:
     return None
 
 
-# ─── User / Trader Data ───────────────────────────────────────
+# --- User / Trader Data ------------------------------------------
 
 def get_user_state(address: str):
     """
@@ -205,17 +250,23 @@ def get_user_state(address: str):
             continue
         szi = _safe_float(pos.get("szi", 0))
         if szi == 0:
-            continue  # Skip flat/zero positions entirely — no side to assign
+            continue  # Skip flat/zero positions entirely; no side to assign.
+        coin = str(pos.get("coin", ""))
+        raw_entry_price = pos.get("entryPx")
+        entry_price = _safe_float(raw_entry_price, 0.0)
+        if entry_price <= 0:
+            _warn_invalid_entry_price_once(address, coin, raw_entry_price)
+            continue
         leverage = pos.get("leverage", 1)
         if isinstance(leverage, dict):
             leverage = _safe_float(leverage.get("value", 1), 1.0)
         else:
             leverage = _safe_float(leverage, 1.0)
         positions.append({
-            "coin": pos.get("coin", ""),
+            "coin": coin,
             "side": "long" if szi > 0 else "short",
             "size": abs(szi),
-            "entry_price": _safe_float(pos.get("entryPx", 0)),
+            "entry_price": entry_price,
             "leverage": leverage,
             "unrealized_pnl": _safe_float(pos.get("unrealizedPnl", 0)),
             "return_on_equity": _safe_float(pos.get("returnOnEquity", 0)),
@@ -232,19 +283,21 @@ def get_user_state(address: str):
         )
         return None
     account_value = _safe_float(margin_summary.get("accountValue", 0))
-    if account_value < 0:
+    liquidation_risk = account_value < 0
+    if liquidation_risk:
         logger.warning(
-            "get_user_state: negative account_value %.4f for address %s; treating payload as invalid",
+            "get_user_state: negative account_value %.4f for address %s; returning state with liquidation_risk",
             account_value,
             address[:10],
         )
-        return None
     return {
         "positions": positions,
         "account_value": account_value,
         "total_margin_used": max(0.0, _safe_float(margin_summary.get("totalMarginUsed", 0))),
         "total_ntl_pos": abs(_safe_float(margin_summary.get("totalNtlPos", 0))),
         "withdrawable": max(0.0, _safe_float(data.get("withdrawable", 0))),
+        "account_status": "negative_equity" if liquidation_risk else "ok",
+        "liquidation_risk": liquidation_risk,
     }
 
 
@@ -308,7 +361,7 @@ def get_user_non_funding_ledger(address: str, start_time: Optional[int] = None):
     return _post(payload) or []
 
 
-# ─── Leaderboard ───────────────────────────────────────────────
+# --- Leaderboard -------------------------------------------------
 
 def get_leaderboard():
     """
@@ -318,7 +371,7 @@ def get_leaderboard():
     Note: The info endpoint's {"type": "leaderboard"} returns 422 BAD_PAYLOAD
     on newer API versions, so we try the stats endpoint first.
     """
-    # Method 1: Stats data endpoint (used by the frontend — most reliable)
+    # Method 1: Stats data endpoint (used by the frontend - most reliable)
     # Note: this is a different domain from the HL info API so the bucket
     # token was previously wasted. We still acquire a token to self-throttle
     # the bot's overall outbound request rate.
@@ -363,7 +416,7 @@ def get_vault_details(vault_address: str):
     return _post({"type": "vaultDetails", "user": vault_address}, priority=Priority.LOW)
 
 
-# ─── Order Book & Market Data ─────────────────────────────────
+# --- Order Book & Market Data ------------------------------------
 
 def get_l2_book(coin: str):
     """Get L2 order book for a coin."""
@@ -389,7 +442,7 @@ def get_recent_trades(coin: str):
     return _post({"type": "recentTrades", "coin": coin}, priority=Priority.NORMAL)
 
 
-# ─── Utility ───────────────────────────────────────────────────
+# --- Utility -----------------------------------------------------
 
 def get_all_coins():
     """Get list of all available perpetual coins."""
@@ -407,7 +460,7 @@ def get_funding_history(coin: str, start_time: Optional[int] = None):
     return _post(payload, priority=Priority.LOW) or []
 
 
-# ─── Manager access for other modules ────────────────────────────
+# --- Manager access for other modules ----------------------------
 
 def start_websocket(coins: list = None):
     """Start the WebSocket feed. Call from main.py during init."""

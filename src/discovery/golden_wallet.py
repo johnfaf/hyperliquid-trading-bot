@@ -34,9 +34,31 @@ logger = logging.getLogger("golden_wallet")
 
 # ─── Constants ───────────────────────────────────────────────────
 LOOKBACK_DAYS = 90
-EXECUTION_DELAY_MS = 100        # +100 ms assumed latency
-FEE_SLIPPAGE_BPS = 4.5          # 0.045% total (taker fee + slippage)
-PENALTY_FACTOR = 1 - FEE_SLIPPAGE_BPS / 10_000  # ~0.99955
+# ★ H19 FIX: previous values (100ms, 4.5 bps) were unrealistically friendly:
+#   - 100ms does not reflect copy-trade reality. In production you observe
+#     a leader's fill via userFills polling, then your scan interval
+#     (typically 15-30s), plus your own order round-trip.
+#   - 4.5 bps is roughly the HL taker fee alone (3.5 bps base); it does not
+#     include slippage, which for copy-trade fills typically adds another
+#     10-20 bps due to adverse selection (you fill when the price is already
+#     moving against you, because the leader moved it).
+#
+# New values: 15s delay + 15 bps total penalty. Both can be tuned via env
+# vars (HL_GOLDEN_EXEC_DELAY_MS, HL_GOLDEN_FEE_SLIPPAGE_BPS) so you can
+# recalibrate against observed live-vs-backtest performance over time.
+import os as _os
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(_os.environ.get(name, default) or default)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+EXECUTION_DELAY_MS = int(_env_float("HL_GOLDEN_EXEC_DELAY_MS", 15_000))    # 15 s copy-trade latency
+FEE_SLIPPAGE_BPS = _env_float("HL_GOLDEN_FEE_SLIPPAGE_BPS", 15.0)          # 0.15% taker + slippage
+PENALTY_FACTOR = 1 - FEE_SLIPPAGE_BPS / 10_000
 MIN_FILLS_FOR_EVAL = 30         # need at least 30 round-trips
 MAX_FILLS_FOR_EVAL = 3000       # cap: anything above this is not human-like
 GOLDEN_THRESHOLD = 0.0          # penalised equity must be net-positive
@@ -455,8 +477,16 @@ def compute_sharpe(daily_returns: List[float], periods_per_year: float = 365.0) 
     Values outside the configured [min, max] range are treated as invalid and dropped.
 
     Returns 0.0 if fewer than 5 valid data points are available.
+
+    ★ H25 FIX: this is one of the wallet-specific outlier-filtered Sharpe
+    paths.  We keep the [SHARPE_RETURN_MIN, SHARPE_RETURN_MAX] outlier
+    filter (it's specific to fill-derived equity curves) but route the
+    final calculation through ``src.analysis.sharpe.sharpe_daily`` so the
+    annualization, ddof, and √N convention all match every other Sharpe
+    in the codebase.
     """
     import math
+    from src.analysis.sharpe import sharpe_daily
 
     valid = []
     dropped = 0
@@ -481,15 +511,7 @@ def compute_sharpe(daily_returns: List[float], periods_per_year: float = 365.0) 
             SHARPE_RETURN_MAX,
         )
 
-    if len(valid) < 5:
-        return 0.0
-
-    import statistics
-    mean_r = statistics.mean(valid)
-    std_r = statistics.stdev(valid)
-    if std_r < 1e-10:
-        return 0.0
-    return round((mean_r / std_r) * (periods_per_year ** 0.5), 3)
+    return round(sharpe_daily(valid, periods_per_year=periods_per_year), 3)
 
 
 def _equity_curve_to_daily_returns(equity_curve: List[float],
@@ -498,6 +520,16 @@ def _equity_curve_to_daily_returns(equity_curve: List[float],
     Resample an intra-day equity curve into daily returns.
     Takes the last equity value for each calendar day and computes
     day-over-day percentage returns.
+
+    ★ M37 FIX: previously skipped no-trade days entirely, so a trader
+    who traded 60 days out of 365 returned ~60 daily returns -- and the
+    annualization at 365 periods/year overstated implied alpha by ~6x
+    because the no-return days that would dampen vol were missing.
+    Now we forward-fill the equity curve across every calendar day in
+    the [first, last] span and emit a 0% return for each padded day.
+    The resulting series feeds ``compute_sharpe`` (and through it the
+    canonical ``sharpe_daily`` helper) at the right periods_per_year
+    base.
     """
     if len(equity_curve) < 2 or len(timestamps) < 2:
         return []
@@ -512,12 +544,17 @@ def _equity_curve_to_daily_returns(equity_curve: List[float],
     if len(sorted_days) < 2:
         return []
 
-    daily_returns = []
-    for i in range(1, len(sorted_days)):
-        prev_eq = daily_equity[sorted_days[i - 1]]
-        curr_eq = daily_equity[sorted_days[i]]
-        if prev_eq > 0:
-            daily_returns.append((curr_eq - prev_eq) / prev_eq)
+    # ★ M37: pad missing calendar days with the prior day's equity so
+    # the resulting daily-returns series has a 0% entry for non-trading
+    # days instead of silently dropping them.
+    first_day, last_day = sorted_days[0], sorted_days[-1]
+    last_known = daily_equity[first_day]
+    daily_returns: List[float] = []
+    for day in range(int(first_day) + 1, int(last_day) + 1):
+        curr_eq = daily_equity.get(day, last_known)
+        if last_known > 0:
+            daily_returns.append((curr_eq - last_known) / last_known)
+        last_known = curr_eq
 
     return daily_returns
 
@@ -659,10 +696,35 @@ def evaluate_wallet(address: str, bot_score: int = 0,
     best_coin = max(coin_pnl, key=coin_pnl.get) if coin_pnl else ""
     worst_coin = min(coin_pnl, key=coin_pnl.get) if coin_pnl else ""
 
-    # Win rate on closing fills
+    # Win rate on closing TRADES (not fills).
+    # ★ M38 FIX: previously a single trade closed in 3 partial fills was
+    # counted as 3 closing fills, inflating the sample size 3x for
+    # partial-fill-heavy wallets and making win_rate look more
+    # statistically robust than it really was.  Aggregate consecutive
+    # closing fills on the same (coin, side) into a single trade outcome
+    # before counting wins.  Use the same chronologically-sorted fill
+    # iteration that compute_avg_hold_time_hours uses so a flip is
+    # treated as exactly one outcome boundary.
     closing_fills = [f for f in penalised if f.penalised_pnl != 0]
-    wins = len([f for f in closing_fills if f.penalised_pnl > 0])
-    win_rate = (wins / len(closing_fills) * 100) if closing_fills else 0.0
+    sorted_closing = sorted(closing_fills, key=lambda f: int(f.time_ms))
+    aggregated_pnls: List[float] = []
+    current_key: Optional[Tuple[str, str]] = None
+    current_pnl = 0.0
+    for f in sorted_closing:
+        key = (f.coin, f.side)
+        if current_key is None:
+            current_key = key
+            current_pnl = f.penalised_pnl
+        elif key == current_key:
+            current_pnl += f.penalised_pnl
+        else:
+            aggregated_pnls.append(current_pnl)
+            current_key = key
+            current_pnl = f.penalised_pnl
+    if current_key is not None:
+        aggregated_pnls.append(current_pnl)
+    wins = sum(1 for p in aggregated_pnls if p > 0)
+    win_rate = (wins / len(aggregated_pnls) * 100) if aggregated_pnls else 0.0
 
     # Trades per day (based on actual time span, not raw count)
     if len(fills) >= 2:
@@ -695,13 +757,34 @@ def evaluate_wallet(address: str, bot_score: int = 0,
         )
 
     # Golden = penalised equity still positive AND curve trending up
-    # AND passes the superhuman reality check
+    # AND passes the superhuman reality check.
+    # ★ H32 FIX: previously compared first_third_avg to last_third_avg,
+    # which was too permissive -- a wallet that lost early then recovered
+    # to flat (e.g. first_third_avg ~$7k, last_third_avg ~$10k) was
+    # tagged GOLDEN despite breaking even overall.  Now require:
+    #   * last_third_max > first_third_max (real progress, not just
+    #     mean-reversion to start)
+    #   * positive linear-regression slope across the full equity curve
+    #     OR last point clearly above start by a configurable margin
     is_golden = False
     if not superhuman and pen_total > GOLDEN_THRESHOLD and len(pen_curve) > 10:
         split = len(pen_curve) // 3
-        first_third_avg = sum(pen_curve[:split]) / split if split > 0 else 0.0
-        last_third_avg = sum(pen_curve[-split:]) / split if split > 0 else 0.0
-        is_golden = last_third_avg > first_third_avg and pen_curve[-1] > pen_curve[0]
+        if split > 0:
+            first_third_max = max(pen_curve[:split])
+            last_third_max = max(pen_curve[-split:])
+            # Linear regression slope of equity vs index.  Pure-Python so we
+            # don't drag numpy in for a 30-line check.
+            n = len(pen_curve)
+            mean_x = (n - 1) / 2.0
+            mean_y = sum(pen_curve) / n
+            num = sum((i - mean_x) * (pen_curve[i] - mean_y) for i in range(n))
+            den = sum((i - mean_x) ** 2 for i in range(n)) or 1.0
+            slope = num / den
+            is_golden = (
+                last_third_max > first_third_max
+                and slope > 0
+                and pen_curve[-1] > pen_curve[0]
+            )
 
     # Compute avg hold time from raw fills (before penalisation, same timestamps)
     avg_hold_hours = compute_avg_hold_time_hours(fills)
@@ -851,18 +934,22 @@ def init_golden_tables():
             CREATE INDEX IF NOT EXISTS idx_wf_time ON wallet_fills(time_ms);
             CREATE INDEX IF NOT EXISTS idx_wf_coin ON wallet_fills(coin);
             """)
-        # Migrate existing databases: add new columns if they don't exist yet.
-        for col, definition in [
-            ("avg_hold_time_hours", "REAL DEFAULT 0"),
-            ("last_fill_sync_time", "INTEGER DEFAULT 0"),
-        ]:
-            try:
-                conn.execute(
-                    f"ALTER TABLE golden_wallets ADD COLUMN {col} {definition}"
-                )
-            except sqlite3.OperationalError as exc:
-                if "duplicate column" not in str(exc).lower():
-                    raise
+        # Migrate existing SQLite databases: add new columns if they don't exist
+        # yet. Postgres is covered by idempotent DDL above plus migrations; using
+        # SQLite's duplicate-column exception path on Postgres leaves the
+        # connection in an aborted transaction.
+        if db.get_backend_name() != "postgres":
+            for col, definition in [
+                ("avg_hold_time_hours", "REAL DEFAULT 0"),
+                ("last_fill_sync_time", "INTEGER DEFAULT 0"),
+            ]:
+                try:
+                    conn.execute(
+                        f"ALTER TABLE golden_wallets ADD COLUMN {col} {definition}"
+                    )
+                except sqlite3.OperationalError as exc:
+                    if "duplicate column" not in str(exc).lower():
+                        raise
 
 
 def save_wallet_report(report: WalletReport, last_fill_sync_time_ms: int = 0):
@@ -873,6 +960,12 @@ def save_wallet_report(report: WalletReport, last_fill_sync_time_ms: int = 0):
     incremental fill fetching instead of re-downloading the full 90-day window.
     Pass the timestamp of the newest fill in the current batch as this value.
     """
+    if not db.is_valid_trader_address(report.address):
+        logger.warning(
+            "Rejected golden wallet report with invalid address %s",
+            str(report.address or "")[:18],
+        )
+        return
     with _get_db() as conn:
         conn.execute("""
             INSERT INTO golden_wallets
@@ -919,9 +1012,133 @@ def save_wallet_report(report: WalletReport, last_fill_sync_time_ms: int = 0):
         ))
 
 
+def _ensure_postgres_wallet_parent(address: str) -> None:
+    """Repair a missed dualwrite parent row before mirroring wallet_fills.
+
+    In dualwrite mode SQLite is authoritative.  If a previous golden_wallets
+    mirror failed, SQLite can have the parent wallet while Postgres does not.
+    Replaying wallet_fills then produces an FK violation for every fill.  This
+    helper upserts the parent from SQLite to Postgres immediately before fills
+    are saved, so the mirror catches up instead of spamming warnings.
+    """
+    if db.get_backend_name() != "dualwrite":
+        return
+    try:
+        with db.get_connection(for_read=True) as sqlite_conn:
+            row = sqlite_conn.execute(
+                "SELECT * FROM golden_wallets WHERE address = ?",
+                (address,),
+            ).fetchone()
+        if not row:
+            return
+        gw = dict(row)
+    except Exception as exc:
+        logger.debug("Could not load SQLite golden_wallet parent for %s: %s", address[:10], exc)
+        return
+
+    pg_conn = None
+    try:
+        from src.data.db.postgres import get_connection as get_pg_connection
+        from src.data.db.postgres import return_connection as return_pg_connection
+
+        pg_conn = get_pg_connection()
+        pg_conn.execute(
+            """
+            INSERT INTO golden_wallets
+            (address, bot_score, total_fills, raw_pnl, penalised_pnl,
+             max_drawdown_pct, penalised_max_drawdown_pct, sharpe_ratio,
+             win_rate, trades_per_day, is_golden, coins_traded, best_coin,
+             worst_coin, raw_equity_curve, penalised_equity_curve,
+             equity_timestamps, evaluated_at, connected_to_live,
+             avg_hold_time_hours, last_fill_sync_time)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (address) DO UPDATE SET
+                bot_score = EXCLUDED.bot_score,
+                total_fills = EXCLUDED.total_fills,
+                raw_pnl = EXCLUDED.raw_pnl,
+                penalised_pnl = EXCLUDED.penalised_pnl,
+                max_drawdown_pct = EXCLUDED.max_drawdown_pct,
+                penalised_max_drawdown_pct = EXCLUDED.penalised_max_drawdown_pct,
+                sharpe_ratio = EXCLUDED.sharpe_ratio,
+                win_rate = EXCLUDED.win_rate,
+                trades_per_day = EXCLUDED.trades_per_day,
+                is_golden = EXCLUDED.is_golden,
+                coins_traded = EXCLUDED.coins_traded,
+                best_coin = EXCLUDED.best_coin,
+                worst_coin = EXCLUDED.worst_coin,
+                raw_equity_curve = EXCLUDED.raw_equity_curve,
+                penalised_equity_curve = EXCLUDED.penalised_equity_curve,
+                equity_timestamps = EXCLUDED.equity_timestamps,
+                evaluated_at = EXCLUDED.evaluated_at,
+                connected_to_live = EXCLUDED.connected_to_live,
+                avg_hold_time_hours = EXCLUDED.avg_hold_time_hours,
+                last_fill_sync_time = EXCLUDED.last_fill_sync_time
+            """,
+            (
+                gw.get("address"),
+                int(gw.get("bot_score", 0) or 0),
+                int(gw.get("total_fills", 0) or 0),
+                float(gw.get("raw_pnl", 0) or 0),
+                float(gw.get("penalised_pnl", 0) or 0),
+                float(gw.get("max_drawdown_pct", 0) or 0),
+                float(gw.get("penalised_max_drawdown_pct", 0) or 0),
+                float(gw.get("sharpe_ratio", 0) or 0),
+                float(gw.get("win_rate", 0) or 0),
+                float(gw.get("trades_per_day", 0) or 0),
+                bool(gw.get("is_golden", False)),
+                gw.get("coins_traded", "[]") or "[]",
+                gw.get("best_coin", "") or "",
+                gw.get("worst_coin", "") or "",
+                gw.get("raw_equity_curve", "[]") or "[]",
+                gw.get("penalised_equity_curve", "[]") or "[]",
+                gw.get("equity_timestamps", "[]") or "[]",
+                gw.get("evaluated_at"),
+                bool(gw.get("connected_to_live", False)),
+                float(gw.get("avg_hold_time_hours", 0) or 0),
+                int(gw.get("last_fill_sync_time", 0) or 0),
+            ),
+        )
+        pg_conn.commit()
+    except Exception as exc:
+        if pg_conn is not None:
+            try:
+                pg_conn.rollback()
+            except Exception:
+                pass
+        logger.warning(
+            "Could not sync golden_wallet parent %s to Postgres before fills: %s",
+            address[:10],
+            exc,
+        )
+    finally:
+        if pg_conn is not None:
+            try:
+                return_pg_connection(pg_conn)
+            except Exception:
+                pass
+
+
 def save_wallet_fills(address: str, penalised_fills: List[PenalisedFill]):
     """Persist penalised fills for backtest replay."""
+    if not db.is_valid_trader_address(address):
+        logger.warning(
+            "Rejected wallet fills for invalid address %s",
+            str(address or "")[:18],
+        )
+        return
+    _ensure_postgres_wallet_parent(address)
     with _get_db() as conn:
+        parent = conn.execute(
+            "SELECT 1 FROM golden_wallets WHERE address = ?",
+            (address,),
+        ).fetchone()
+        if not parent:
+            logger.warning(
+                "Rejected wallet fills for %s: missing golden_wallet parent row",
+                address[:10],
+            )
+            return
         # Clear old fills for this wallet
         conn.execute("DELETE FROM wallet_fills WHERE wallet_address = ?", (address,))
         for f in penalised_fills:

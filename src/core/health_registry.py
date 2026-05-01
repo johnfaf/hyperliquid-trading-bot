@@ -247,6 +247,32 @@ class SubsystemHealthRegistry:
                 for s in trading_subsystems
             )
 
+    def audit_registrations(self) -> Dict[str, bool]:
+        """★ M42 FIX: surface every registered subsystem's affects_trading
+        flag so a misconfigured (affects_trading=False) registration can
+        be spotted at boot rather than silently removing the subsystem
+        from the trading-safety check.
+
+        Returns ``{name: affects_trading}`` for every registered subsystem
+        and emits an INFO-level summary log so operators can grep for
+        ``HEALTH_REGISTRY_AUDIT`` after startup.
+        """
+        with self._lock:
+            audit = {
+                name: bool(status.affects_trading)
+                for name, status in self._subsystems.items()
+            }
+        excluded = sorted(name for name, flag in audit.items() if not flag)
+        included_count = sum(1 for flag in audit.values() if flag)
+        logger.info(
+            "HEALTH_REGISTRY_AUDIT: %d subsystems registered, %d affect_trading=True. "
+            "EXCLUDED from is_all_trading_safe: %s",
+            len(audit),
+            included_count,
+            excluded if excluded else "[]",
+        )
+        return audit
+
     def check_stale(self, timeout_seconds: int = 300) -> Dict[str, bool]:
         """
         Check for stale heartbeats and auto-degrade subsystems that exceed timeout.

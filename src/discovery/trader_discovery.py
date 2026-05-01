@@ -253,7 +253,9 @@ class TraderDiscovery:
                         except (ValueError, TypeError):
                             continue
 
-                display_name = entry.get("displayName", entry.get("name", entry.get("label", "")))
+                display_name = hl.mask_display_name(
+                    entry.get("displayName", entry.get("name", entry.get("label", "")))
+                )
 
                 # Accept all traders from leaderboard (they're already filtered by the API)
                 traders.append({
@@ -261,8 +263,10 @@ class TraderDiscovery:
                     "total_pnl": pnl,
                     "roi_pct": roi * 100 if 0 < abs(roi) < 10 else roi,
                     "source": "leaderboard",
-                    "metadata": {"display_name": display_name,
-                               "raw_entry_keys": list(entry.keys())[:10]},
+                    "metadata": {
+                        "display_name": display_name,
+                        "raw_entry_keys": list(entry.keys())[:10],
+                    },
                 })
 
             except Exception as e:
@@ -466,8 +470,21 @@ class TraderDiscovery:
                 logger.info(f"Bot DETECTED (prob={bot_result.bot_probability:.0%}, "
                            f"conf={bot_result.confidence:.0%}): {address[:10]}... "
                            f"reason={bot_result.reason}")
-        except Exception:
-            # Fallback to legacy detection
+        except Exception as exc:
+            # ★ L8 FIX: previous bare `except` swallowed the failure.
+            # Surface why we're falling back so it shows up in production
+            # logs (and so a recurring failure can be debugged) and
+            # increment a metric we expose via discovery stats.
+            logger.warning(
+                "AdaptiveBotDetector failed for %s -- falling back to legacy "
+                "detection: %s", address[:10], exc,
+            )
+            try:
+                self._adaptive_detector_fallback_count = getattr(
+                    self, "_adaptive_detector_fallback_count", 0
+                ) + 1
+            except Exception:
+                pass
             bot_score = self._get_bot_score(fills, positions, trade_analysis)
 
         # Build trader profile (always, even for suspected bots — let caller decide)
@@ -695,6 +712,14 @@ class TraderDiscovery:
         for coin, coin_fills in by_coin.items():
             if len(coin_fills) < 10:
                 continue
+            # ★ H30 FIX: HL userFills returns rows in REVERSE chronological
+            # order (newest first).  The pair iteration below treats f1 as
+            # the EARLIER fill, so without sorting ascending the gap was
+            # negative for every pair and ``time_gap_ms >= MAX_GAP`` never
+            # tripped the filter -- arb-pattern detection silently degraded
+            # to "every fill counts."  Sort ascending so f2.time > f1.time
+            # holds and the gap filter actually rejects far-apart pairs.
+            coin_fills = sorted(coin_fills, key=lambda x: int(x.get("time", 0) or 0))
             candidate_pairs = 0
             match_pairs = 0
             for i in range(len(coin_fills) - 1):
@@ -801,19 +826,32 @@ class TraderDiscovery:
             bot_signals += 2
 
         # Signal 5: Uniform trade sizes (low coefficient of variation = robotic)
+        # ★ M39 FIX: previously sampled fills[:50] only -- a bot that
+        # randomizes after the first 50 fills (anti-detection) escaped this
+        # signal, while a human whose first 50 happened to be similar got
+        # false-positively flagged.  Sample evenly across the full fill
+        # history (random sample with seeded RNG for determinism on retest)
+        # so neither pattern can game the detector.
         if len(fills) > 20:
-            sizes = [f["size"] * f["price"] for f in fills[:50]]
-            if sizes:
-                try:
+            try:
+                import random as _random
+                rng = _random.Random(len(fills))  # deterministic per-trader
+                sample_size = min(100, len(fills))
+                sampled = rng.sample(fills, sample_size)
+                sizes = [f["size"] * f["price"] for f in sampled]
+                if sizes:
                     import numpy as np
-                    mean_size = np.mean(sizes)
-                    std_size = np.std(sizes)
+                    mean_size = float(np.mean(sizes))
+                    std_size = float(np.std(sizes, ddof=1)) if len(sizes) > 1 else 0.0
                     cv = std_size / mean_size if mean_size > 0 else 0
                     if cv < 0.05:
-                        logger.info("Bot signal: uniform trade sizes (CV=%.3f)", cv)
+                        logger.info(
+                            "Bot signal: uniform trade sizes (CV=%.3f, n=%d random sample)",
+                            cv, len(sizes),
+                        )
                         bot_signals += 2
-                except ImportError:
-                    pass  # numpy optional for this signal
+            except ImportError:
+                pass  # numpy optional for this signal
 
         # Signal 6: High liquidation rate = reckless / poorly coded algo
         if total > 10 and liquidations / total > 0.15:

@@ -113,3 +113,28 @@ def test_kelly_logs_when_all_history_is_wins(caplog):
     assert result.has_edge is False
     assert result.reward_risk_ratio == 0.0
     assert "no loss history yet" in caplog.text
+
+
+def test_kelly_warns_when_not_bootstrapped_and_using_default_sizing(caplog):
+    ks = KellySizer({"min_trades_for_kelly": 5, "vol_adjusted_kelly": False})
+
+    with caplog.at_level("WARNING"):
+        result = ks.get_sizing("restart_default", account_balance=10000)
+
+    assert result.confidence == "insufficient"
+    assert "not bootstrapped from AgentScorer" in caplog.text
+
+
+def test_kelly_bootstrap_suppresses_default_restart_warning(caplog):
+    ks = KellySizer({"min_trades_for_kelly": 5, "vol_adjusted_kelly": False})
+
+    class _FakeAgentScorer:
+        _trade_history = {"restart_default": []}
+
+    ks.load_from_agent_scorer(_FakeAgentScorer())
+
+    with caplog.at_level("WARNING"):
+        result = ks.get_sizing("restart_default", account_balance=10000)
+
+    assert result.confidence == "insufficient"
+    assert "not bootstrapped from AgentScorer" not in caplog.text

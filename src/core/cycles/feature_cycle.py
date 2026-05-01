@@ -30,6 +30,7 @@ _BACKFILL_DAYS = {
 
 # Cap watched coins to avoid API flooding
 _MAX_COINS = int(getattr(config, "FEATURE_STORE_MAX_COINS", 30))
+_BOOTSTRAP_TOP_COINS = int(getattr(config, "FEATURE_STORE_BOOTSTRAP_TOP_COINS", 8))
 
 
 # ─── Watched coins ─────────────────────────────────────────────
@@ -65,6 +66,24 @@ def _get_watched_coins(container=None) -> List[str]:
     except Exception:
         pass
 
+    # Add coins from the execution source of truth.  In live mode this reads
+    # exchange positions, so active live exposure keeps receiving candles even
+    # if the paper shadow book is stale or missing.
+    if container is not None:
+        try:
+            from src.core.live_execution import get_execution_open_positions
+
+            for pos in get_execution_open_positions(container) or []:
+                if isinstance(pos, dict):
+                    coin = pos.get("coin") or pos.get("symbol") or ""
+                else:
+                    coin = getattr(pos, "coin", "") or getattr(pos, "symbol", "")
+                coin = str(coin or "").upper().strip()
+                if coin:
+                    coins.add(coin)
+        except Exception as exc:
+            logger.debug("execution watched-coin lookup failed: %s", exc)
+
     # Add coins from recent strategies
     try:
         from src.data import database as db
@@ -89,7 +108,10 @@ def _get_watched_coins(container=None) -> List[str]:
             from src.data import hyperliquid_client as hl
             all_coins = hl.get_all_coins()
             if all_coins:
-                for c in all_coins[:20]:
+                target_total = min(_BOOTSTRAP_TOP_COINS, _MAX_COINS)
+                for c in all_coins:
+                    if len(coins) >= target_total:
+                        break
                     coins.add(c.upper())
         except Exception:
             pass
@@ -131,6 +153,15 @@ def _collect_and_compute(coins: List[str], timeframes: List[str]) -> dict:
 
     # Phase 1: Collect all candles (BTC/ETH first so they're available for cross-asset)
     ordered = sorted(coins, key=lambda c: (c not in ("BTC", "ETH"), c))
+    try:
+        from src.data.historical_market_data import snapshot_live_derivatives_history
+
+        derivative_stats = snapshot_live_derivatives_history(ordered)
+        stats["funding_rows"] = int(derivative_stats.get("funding_rows", 0) or 0)
+        stats["open_interest_rows"] = int(derivative_stats.get("open_interest_rows", 0) or 0)
+    except Exception as exc:
+        logger.debug("derivatives history snapshot failed: %s", exc)
+        stats["errors"] += 1
     for coin in ordered:
         for tf in timeframes:
             try:
@@ -151,7 +182,31 @@ def _collect_and_compute(coins: List[str], timeframes: List[str]) -> dict:
         eth_candles_by_tf[tf] = fs.get_candles("ETH", tf, limit=60)
 
     # Phase 3: Compute features for all coins
+    # ★ M24 FIX: previously prev_oi was reset to {} at every invocation.
+    # On the first cycle after a process restart, every coin's OI delta
+    # was 0 because the in-memory dict had no prior observation -- even
+    # if real OI had moved meaningfully overnight.  Bootstrap prev_oi
+    # from the most recent stored sample in `open_interest_history`
+    # before the loop begins so deltas span across restarts.
     prev_oi: dict = {}
+    try:
+        from src.data.historical_market_data import get_open_interest_history
+        for _coin in coins:
+            try:
+                history = get_open_interest_history(_coin, limit=2) or []
+                # history is ordered DESC: index 0 is the latest, 1 is prior.
+                # We want the PRIOR observation (index 1) so the first cycle
+                # post-restart computes a real delta against it.  If only
+                # one row exists, fall back to that single value.
+                pick = history[1] if len(history) >= 2 else (
+                    history[0] if history else None
+                )
+                if pick:
+                    prev_oi[_coin] = float(pick.get("open_interest", 0.0) or 0.0)
+            except Exception:
+                continue
+    except Exception as exc:
+        logger.debug("prev_oi bootstrap failed (will use first-cycle default): %s", exc)
 
     for coin in coins:
         for tf in timeframes:

@@ -20,6 +20,11 @@ Usage::
     runner.start_all()
     # ...
     runner.stop_all()   # graceful shutdown with thread join
+
+To mark a failure as unrecoverable (corrupt config, missing schema column,
+permanent permission error etc.), raise :class:`PermanentTaskFailure` from
+the task target.  The supervisor will mark the task FAILED and skip the
+auto-recovery cooldown -- no retries, no restarts.  ★ M41
 """
 import logging
 import threading
@@ -31,6 +36,16 @@ logger = logging.getLogger(__name__)
 logger.addHandler(logging.NullHandler())
 
 
+class PermanentTaskFailure(Exception):
+    """★ M41: raise this from a task target to bypass retry + auto-recovery.
+
+    Use for failures that the runner cannot fix by retrying -- e.g. config
+    references a missing DB column, a required env var is unset, or a
+    schema migration is needed.  Transient errors should keep using
+    bare exceptions so the existing exponential-backoff retry path runs.
+    """
+
+
 # ---------------------------------------------------------------------------
 # Data types
 # ---------------------------------------------------------------------------
@@ -40,6 +55,7 @@ class SupervisedTask:
     name: str
     target: Callable
     interval_seconds: float
+    initial_delay_seconds: float = 0.0
     max_retries: int = 5
     auto_recover_cooldown_s: float = 300.0
     stop_event: threading.Event = field(default_factory=threading.Event)
@@ -71,7 +87,8 @@ class SupervisedTaskRunner:
     # ── Registration ──────────────────────────────────────────────
 
     def register(self, name: str, target: Callable,
-                 interval_seconds: float, max_retries: int = 5,
+                 interval_seconds: float, initial_delay_seconds: float = 0.0,
+                 max_retries: int = 5,
                  auto_recover_cooldown_s: float = 300.0) -> None:
         """Register a background task.  Does NOT start it yet."""
         with self._lock:
@@ -81,13 +98,15 @@ class SupervisedTaskRunner:
                 name=name,
                 target=target,
                 interval_seconds=interval_seconds,
+                initial_delay_seconds=max(0.0, float(initial_delay_seconds)),
                 max_retries=max_retries,
                 auto_recover_cooldown_s=max(0.0, float(auto_recover_cooldown_s)),
             )
         logger.debug(
-            "Registered supervised task: %s (interval=%ss, max_retries=%d, auto_recover=%ss)",
+            "Registered supervised task: %s (interval=%ss, initial_delay=%ss, max_retries=%d, auto_recover=%ss)",
             name,
             interval_seconds,
+            initial_delay_seconds,
             max_retries,
             auto_recover_cooldown_s,
         )
@@ -226,6 +245,7 @@ class SupervisedTaskRunner:
             "name": task.name,
             "state": task.state,
             "interval_seconds": task.interval_seconds,
+            "initial_delay_seconds": task.initial_delay_seconds,
             "retry_count": task.retry_count,
             "max_retries": task.max_retries,
             "auto_recover_cooldown_s": task.auto_recover_cooldown_s,
@@ -249,6 +269,12 @@ class SupervisedTaskRunner:
         """
         logger.info("Supervised loop started: %s (interval=%ss)",
                      task.name, task.interval_seconds)
+        initial_delay = max(0.0, float(getattr(task, "initial_delay_seconds", 0.0) or 0.0))
+        if initial_delay > 0:
+            logger.info("Task '%s' initial delay %.1fs before first run", task.name, initial_delay)
+            if task.stop_event.wait(initial_delay):
+                logger.info("Supervised loop exited before first run: %s (state=%s)", task.name, task.state)
+                return
         while not task.stop_event.is_set():
             try:
                 task.target()
@@ -268,6 +294,32 @@ class SupervisedTaskRunner:
                             task.name, exc,
                         )
 
+            except PermanentTaskFailure as exc:
+                # ★ M41: caller signalled the failure cannot be retried.
+                # Mark FAILED, skip cooldown, and break the supervised
+                # loop entirely -- a human needs to fix the underlying
+                # state before this task can resume.
+                with self._lock:
+                    task.consecutive_failures += 1
+                    task.last_error = f"PermanentTaskFailure: {str(exc)[:180]}"
+                    task.state = "failed"
+                logger.error(
+                    "Task '%s' raised PermanentTaskFailure -- not retrying: %s",
+                    task.name, exc,
+                )
+                if self._health:
+                    try:
+                        from src.core.health_registry import SubsystemState
+                        self._health.set_status(
+                            task.name, SubsystemState.FAILED,
+                            reason=f"permanent failure: {task.last_error}",
+                        )
+                    except Exception as inner:
+                        logger.debug(
+                            "health registry FAILED set_status failed for '%s': %s",
+                            task.name, inner,
+                        )
+                break  # explicit permanent stop, no auto-recovery
             except Exception as exc:
                 with self._lock:
                     task.consecutive_failures += 1
@@ -351,4 +403,3 @@ class SupervisedTaskRunner:
 # Module-level singleton
 # ---------------------------------------------------------------------------
 runner = SupervisedTaskRunner()
-

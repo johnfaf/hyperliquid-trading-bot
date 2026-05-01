@@ -15,6 +15,7 @@ Each regime maps to which strategy types should be active vs paused.
 """
 import logging
 import time
+import copy
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 from collections import defaultdict
@@ -76,9 +77,17 @@ REGIME_STRATEGY_MAP = {
         "size_modifier": 0.3,  # Heavily reduced but NOT zero
     },
     Regime.UNKNOWN: {
-        "activate": ["mean_reversion", "funding_arb"],  # Conservative defaults
-        "pause": ["momentum_long", "momentum_short", "breakout"],
-        "size_modifier": 0.5,
+        # ★ M15 FIX: previously this was a permissive default (size_mod=0.5,
+        # pause list of 3).  UNKNOWN is the ADX 20-25 transition zone — by
+        # construction we are NOT confident which way the market is going.
+        # Treat it like VOLATILE (size_mod=0.3, pause everything directional)
+        # so transitioning markets get caution by default rather than mid-
+        # weight exposure.  Mean-reversion and funding_arb still fire because
+        # they are the strategies most resilient to direction uncertainty.
+        "activate": ["mean_reversion", "funding_arb"],
+        "pause": ["momentum_long", "momentum_short", "breakout", "scalping",
+                   "swing_trading", "concentrated_bet"],
+        "size_modifier": 0.3,
     },
 }
 
@@ -471,7 +480,12 @@ class RegimeDetector:
             overall_confidence = 0.0
 
         # Get strategy guidance for the overall regime
-        guidance = REGIME_STRATEGY_MAP.get(overall_regime, REGIME_STRATEGY_MAP[Regime.UNKNOWN])
+        # Return a per-cycle copy.  Downstream crash/macro overlays mutate
+        # strategy_guidance; sharing REGIME_STRATEGY_MAP's nested lists/dicts
+        # would poison future cycles (e.g. trending_up becoming activate=[]).
+        guidance = copy.deepcopy(
+            REGIME_STRATEGY_MAP.get(overall_regime, REGIME_STRATEGY_MAP[Regime.UNKNOWN])
+        )
 
         result = {
             "overall_regime": overall_regime.value,

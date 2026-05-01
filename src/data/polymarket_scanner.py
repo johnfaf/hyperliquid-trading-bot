@@ -25,6 +25,7 @@ Polymarket API:
 
 import json
 import logging
+import os
 import time
 import requests
 from typing import Dict, List, Optional
@@ -33,6 +34,24 @@ from dataclasses import dataclass, field
 from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
+
+
+def _safe_env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, default) or default)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+# ★ M20 FIX: configurable confidence boost.  Default 0.0 (no boost,
+# raw smart-money score).  Override via env to restore the old +0.2
+# inflation while tuning, but log it so it isn't invisible.
+POLYMARKET_CONFIDENCE_BOOST = _safe_env_float("POLYMARKET_CONFIDENCE_BOOST", 0.0)
+if POLYMARKET_CONFIDENCE_BOOST != 0.0:
+    logger.info(
+        "Polymarket signal confidence boost active: %+0.2f",
+        POLYMARKET_CONFIDENCE_BOOST,
+    )
 
 
 @dataclass
@@ -48,6 +67,7 @@ class PolymarketMarket:
     liquidity: float
     last_traded: str  # ISO timestamp
     category: str
+    token_ids: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -158,6 +178,8 @@ class PolymarketScanner:
     def __init__(self, config: Optional[Dict] = None):
         self.config = config or {}
         self.source_registry = self.config.get("source_registry")
+        self.market_provider = self.config.get("market_provider")
+        self.replay_as_of_ms = self.config.get("replay_as_of_ms")
 
         # Cache configuration
         self.cache_ttl_minutes = self.config.get("cache_ttl_minutes", 5)
@@ -202,6 +224,10 @@ class PolymarketScanner:
         self._markets_tracked = 0
         self._crypto_markets_found = 0
         self._movements_detected = 0
+        self._last_history_observed_at_ms: int = 0
+        self._odds_history_max_age_ms = int(
+            float(self.config.get("odds_history_max_age_seconds", 3600)) * 1000
+        )
         self._scan_cache_window_s = max(
             30.0,
             min(float(self.cache_ttl_minutes) * 60.0, float(self.scan_interval_seconds)),
@@ -209,6 +235,10 @@ class PolymarketScanner:
 
         logger.info(f"PolymarketScanner initialized with cache TTL={self.cache_ttl_minutes}min, "
                    f"rate_limit={self.rate_limit_delay}s")
+
+    def set_replay_time(self, as_of_ms: Optional[int]) -> None:
+        """Switch provider-backed scans to a point-in-time replay timestamp."""
+        self.replay_as_of_ms = int(as_of_ms) if as_of_ms is not None else None
 
     def _rate_limit(self, url: str):
         """Enforce per-host rate limiting for Polymarket endpoints."""
@@ -277,6 +307,43 @@ class PolymarketScanner:
         indexed volume/liquidity and uses `limit` + `offset` pagination.
         Falls back to the CLOB listing endpoint if Gamma returns nothing.
         """
+        if self.market_provider is not None:
+            try:
+                try:
+                    markets = self.market_provider.fetch_markets(
+                        limit=self.max_markets_per_scan,
+                        active_only=True,
+                        as_of_ms=self.replay_as_of_ms,
+                    )
+                except TypeError:
+                    markets = self.market_provider.fetch_markets(
+                        limit=self.max_markets_per_scan,
+                        active_only=True,
+                    )
+                if markets:
+                    if self.source_registry:
+                        self.source_registry.mark_up(
+                            "polymarket",
+                            reason="provider fetch ok",
+                            metadata={"provider": type(self.market_provider).__name__},
+                        )
+                    return list(markets)
+                if self.source_registry:
+                    self.source_registry.mark_degraded(
+                        "polymarket",
+                        reason="provider returned no markets",
+                        metadata={"provider": type(self.market_provider).__name__},
+                    )
+            except Exception as exc:
+                if self.source_registry:
+                    self.source_registry.mark_down(
+                        "polymarket",
+                        reason=f"provider fetch failed: {exc}",
+                        metadata={"provider": type(self.market_provider).__name__},
+                    )
+                logger.warning("Polymarket provider fetch failed: %s", exc)
+                return []
+
         raw_markets = []
 
         # --- Primary: Gamma paginated endpoint ---
@@ -381,6 +448,19 @@ class PolymarketScanner:
                     metadata={"raw_markets": 0},
                 )
             return []
+
+        try:
+            from src.data.polymarket_history import store_markets
+
+            observed_at_ms = int(time.time() * 1000)
+            stored_count = store_markets(raw_markets, observed_at_ms=observed_at_ms)
+            self._last_history_observed_at_ms = observed_at_ms
+            logger.info(
+                "Polymarket persisted %d market snapshots/price points",
+                stored_count,
+            )
+        except Exception as exc:
+            logger.warning("Polymarket history persistence failed: %s", exc)
 
         enriched = []
         crypto_count = 0
@@ -508,6 +588,7 @@ class PolymarketScanner:
                     liquidity=liquidity,
                     last_traded=last_traded,
                     category=category,
+                    token_ids=token_ids,
                 )
 
                 enriched.append(market)
@@ -639,6 +720,29 @@ class PolymarketScanner:
         """
         movements = []
 
+        history_lookup: Dict[str, Dict] = {}
+        history_token_ids = []
+        before_ms = int(self._last_history_observed_at_ms or 0) - 1
+        if before_ms > 0:
+            for market in markets:
+                token_ids = list(market.token_ids or [])
+                if not token_ids and market.token_id:
+                    token_ids = [market.token_id]
+                history_token_ids.extend(token_ids[: len(market.current_prices or [])])
+            if history_token_ids:
+                try:
+                    from src.data.polymarket_history import latest_price_points_before
+
+                    history_lookup = latest_price_points_before(
+                        history_token_ids,
+                        before_ms=before_ms,
+                        max_age_ms=self._odds_history_max_age_ms,
+                    )
+                except Exception as exc:
+                    logger.debug("Polymarket historical price lookup skipped: %s", exc)
+
+        history_compared = 0
+
         for market in markets:
             try:
                 current_prices = market.current_prices
@@ -646,39 +750,60 @@ class PolymarketScanner:
                     continue
 
                 # Get cached prices if available
+                old_prices = None
+                comparison_source = "memory"
                 if market.token_id in self._price_cache:
                     cache_age = time.time() - self._price_cache_time.get(market.token_id, 0)
 
                     if cache_age < 600:  # Compare against prices cached within last 10 minutes
                         old_prices = self._price_cache[market.token_id]
+                if old_prices is None:
+                    token_ids = list(market.token_ids or [])
+                    if not token_ids and market.token_id:
+                        token_ids = [market.token_id]
+                    token_ids = token_ids[: len(current_prices)]
+                    if token_ids and all(token_id in history_lookup for token_id in token_ids):
+                        old_prices = [
+                            float(history_lookup[token_id].get("price", 0.0) or 0.0)
+                            for token_id in token_ids
+                        ]
+                        comparison_source = "database"
+                        history_compared += 1
 
-                        # Calculate changes for each outcome
-                        for outcome_idx, (old_price, new_price) in enumerate(zip(old_prices, current_prices)):
-                            if old_price == 0:
-                                continue
+                if old_prices:
+                    # Calculate changes for each outcome
+                    for outcome_idx, (old_price, new_price) in enumerate(zip(old_prices, current_prices)):
+                        if old_price == 0:
+                            continue
 
-                            change = (new_price - old_price) / old_price
+                        change = (new_price - old_price) / old_price
 
-                            # Check 1h movement threshold
-                            if abs(change) > self.odds_movement_threshold_1h:
-                                direction = "up" if change > 0 else "down"
+                        # Check 1h movement threshold
+                        if abs(change) > self.odds_movement_threshold_1h:
+                            direction = "up" if change > 0 else "down"
 
-                                # Calculate smart money score
-                                smart_money_score = self._calculate_smart_money_score(
-                                    market, change, outcome_idx
-                                )
+                            # Calculate smart money score
+                            smart_money_score = self._calculate_smart_money_score(
+                                market, change, outcome_idx
+                            )
 
-                                movement = OddsMovement(
-                                    market_id=market.market_id,
-                                    title=market.title,
-                                    direction=direction,
-                                    magnitude=abs(change),
-                                    timeframe="1h",
-                                    current_probability=new_price,
-                                    volume_move=market.volume_24h,
-                                    smart_money_score=smart_money_score,
-                                )
-                                movements.append(movement)
+                            movement = OddsMovement(
+                                market_id=market.market_id,
+                                title=market.title,
+                                direction=direction,
+                                magnitude=abs(change),
+                                timeframe="1h",
+                                current_probability=new_price,
+                                volume_move=market.volume_24h,
+                                smart_money_score=smart_money_score,
+                            )
+                            movements.append(movement)
+                            logger.debug(
+                                "Polymarket odds movement from %s history: %s %.2f%%",
+                                comparison_source,
+                                market.title,
+                                abs(change) * 100,
+                            )
 
                 # Update cache
                 self._price_cache[market.token_id] = current_prices
@@ -694,7 +819,7 @@ class PolymarketScanner:
         logger.info(
             f"Detected {len(movements)} odds movements "
             f"(cached={cached_count}, compared={compared_count}/{len(markets)}, "
-            f"threshold={self.odds_movement_threshold_1h:.3f})"
+            f"db_compared={history_compared}, threshold={self.odds_movement_threshold_1h:.3f})"
         )
 
         return movements
@@ -886,11 +1011,23 @@ class PolymarketScanner:
                      f"{movement.direction} {movement.magnitude*100:.1f}% ({movement.timeframe}), "
                      f"smart money score: {movement.smart_money_score:.2f}")
 
+            # ★ M20 FIX: previously `min(movement.smart_money_score + 0.2, 1.0)`
+            # — an undocumented +0.2 boost over the raw smart-money score.
+            # Without calibration evidence the boost is just confidence
+            # inflation, which feeds straight into firewall and sizing gates.
+            # Use the raw score by default; expose env-tunable boost so we can
+            # restore the old behaviour if telemetry shows the gate is too
+            # cold.  When tuning, log the chosen value in get_market_sentiment
+            # so it appears in production logs.
+            confidence = min(
+                float(movement.smart_money_score) + POLYMARKET_CONFIDENCE_BOOST,
+                1.0,
+            )
             signal = {
                 "source": "polymarket",
                 "coin": coin,
                 "side": signal_side,
-                "confidence": min(movement.smart_money_score + 0.2, 1.0),
+                "confidence": confidence,
                 "reason": reason,
                 "polymarket_market": movement.title,
                 "polymarket_probability": movement.current_probability,

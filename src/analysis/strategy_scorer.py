@@ -18,6 +18,39 @@ from src.data import database as db
 logger = logging.getLogger(__name__)
 
 
+# ★ H16 FIX: exact two-sided binomial p-value for significance gate.
+# Mirrors src.signals.feature_store_alpha._exact_binomial_pvalue but kept
+# local so strategy_scorer has no cross-layer dependency.
+def _binomial_pvalue_two_sided(k: int, n: int, p: float = 0.5) -> float:
+    """Exact two-sided binomial test p-value.
+
+    H0: the true success probability is p (default 0.5 = no edge).
+    Returns the probability of observing a result at least as extreme
+    as k successes in n trials under H0.
+    """
+    if n <= 0:
+        return 1.0
+    try:
+        from scipy.stats import binomtest
+        try:
+            return float(binomtest(k, n, p, alternative="two-sided").pvalue)
+        except TypeError:
+            # scipy < 1.7 uses `binom_test`
+            from scipy.stats import binom_test
+            return float(binom_test(k, n, p, alternative="two-sided"))
+    except Exception:
+        # Fall back to a normal approximation if scipy isn't available
+        # (valid once np >= 10 and n(1-p) >= 10 — otherwise conservative)
+        import math
+        mean = n * p
+        sd = math.sqrt(n * p * (1 - p))
+        if sd <= 0:
+            return 1.0
+        z = abs(k - mean) / sd
+        # two-sided p from z via erf
+        return math.erfc(z / math.sqrt(2))
+
+
 class StrategyScorer:
     """
     Scores and ranks strategies based on multiple performance dimensions.
@@ -29,38 +62,82 @@ class StrategyScorer:
         self.weights = config.SCORING_WEIGHTS
         self.decay_rate = config.SCORE_DECAY_RATE
 
+    def _persist_scoring_results(
+        self,
+        results: List[Dict],
+        desired_active_ids: set[int],
+    ) -> None:
+        """Persist one scoring cycle in a single DB transaction.
+
+        The old implementation opened a new SQLite write transaction for every
+        score insert, every current-score update, and every active-flag update.
+        During startup that multiplied lock contention with background writers.
+        Persisting the whole cycle in one short transaction keeps the scoring
+        window tight and materially reduces `database is locked` failures.
+        """
+        if not results:
+            return
+
+        scored_at = datetime.now(timezone.utc).isoformat()
+        note = f"Auto-scored at {scored_at}"
+        with db.get_connection() as conn:
+            for result in results:
+                breakdown = result["breakdown"]
+                strategy_id = int(result["strategy_id"])
+                should_be_active = strategy_id in desired_active_ids
+                result["active"] = bool(should_be_active)
+                conn.execute(
+                    """
+                    INSERT INTO strategy_scores
+                    (strategy_id, timestamp, score, pnl_score, win_rate_score,
+                     sharpe_score, consistency_score, risk_adj_score, notes)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        strategy_id,
+                        scored_at,
+                        float(result["score"]),
+                        float(breakdown["pnl_score"]),
+                        float(breakdown["win_rate_score"]),
+                        float(breakdown["sharpe_score"]),
+                        float(breakdown["consistency_score"]),
+                        float(breakdown["risk_adj_score"]),
+                        note,
+                    ),
+                )
+                conn.execute(
+                    """
+                    UPDATE strategies
+                    SET current_score = ?, last_scored = ?, active = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        float(result["score"]),
+                        scored_at,
+                        bool(should_be_active),
+                        strategy_id,
+                    ),
+                )
+
     def score_strategy(self, strategy: Dict) -> Dict:
         """
         Compute a composite score for a strategy across multiple dimensions.
         Returns a score breakdown dict.
 
-        AUDIT M4 — alpha significance (RESEARCH ITEM, not yet wired):
-        -----------------------------------------------------------
-        The ``trade_count < 10`` branch below applies only a *soft
-        multiplicative sample-size penalty* ``(trade_count / 10) ** 1.0``.
-        This is **not** a statistical significance test.  A strategy
-        with 12 trades at 83% win rate (which has a real p-value of
-        ~0.015 against a 50% null) and a strategy with 12 trades at 58%
-        win rate (p ~ 0.39, not significant) both receive the same
-        0.12-multiplier sample penalty — their ranks then depend
-        entirely on the raw win-rate / PnL / Sharpe numerics rather
-        than on whether those numerics are distinguishable from noise.
+        ★ H16 FIX: wired in the exact-binomial p-value test from
+        feature_store_alpha._exact_binomial_pvalue as the author's own
+        AUDIT M4 comment suggested. A strategy's win rate is now tested
+        against a 50% null hypothesis. Strategies whose win-rate advantage
+        is not statistically distinguishable from noise get a significance
+        penalty instead of being ranked purely on raw numerics.
 
-        The project *already ships* an exact-binomial p-value helper
-        at ``src.signals.feature_store_alpha._exact_binomial_pvalue``
-        and a t-test in ``src.backtest.risk_policy_walkforward`` — but
-        neither is wired into strategy ranking here.  A proper fix
-        would gate ``composite`` on either:
-          * a binomial-test p-value against a neutral-edge null
-            (e.g. p < 0.10 to remain eligible at bootstrap, p < 0.05
-            once ``trade_count >= 30``), or
-          * a Wilson lower-confidence-bound on win-rate used in place
-            of the point estimate inside ``_score_win_rate``.
-
-        Tracked as a research item so the scoring cycle is not
-        silently reshuffled mid-canary — implementing this should be
-        a dedicated PR with historical rescoring and a backtest of
-        the new activation policy.
+        Gate logic:
+          * trade_count < 10:  no p-value test (too small), soft sample penalty only
+          * trade_count >= 10: p-value against 0.5 null; penalty scales with p-value
+              - p < 0.05:  no significance penalty
+              - p < 0.10:  0.85x multiplier
+              - p < 0.20:  0.65x multiplier
+              - p >= 0.20: 0.40x multiplier (likely noise)
         """
         # Individual dimension scores (each 0-1)
         pnl_score = self._score_pnl(strategy)
@@ -89,6 +166,41 @@ class StrategyScorer:
             composite *= sample_penalty
             logger.debug(f"Sample-size penalty: {trade_count} trades -> {sample_penalty:.2f}x")
 
+        # ★ H16 FIX: statistical significance gate
+        # Apply once we have enough data (>= 10 trades) to run a real test.
+        pvalue = None
+        significance_penalty = 1.0
+        if trade_count >= 10:
+            win_rate = float(strategy.get("win_rate", 0) or 0)
+            # Accept win_rate as either fraction (0.58) or percent (58.0)
+            if win_rate > 1.5:
+                win_rate = win_rate / 100.0
+            wins = int(round(win_rate * trade_count))
+            try:
+                pvalue = _binomial_pvalue_two_sided(wins, trade_count, 0.5)
+            except Exception:
+                pvalue = None
+
+            if pvalue is not None:
+                # Only apply significance penalty to strategies with edge
+                # ABOVE 50% — losing strategies (win_rate < 0.5) already
+                # lose via win_rate_score and we don't want to double-penalize.
+                if win_rate > 0.5:
+                    if pvalue < 0.05:
+                        significance_penalty = 1.0
+                    elif pvalue < 0.10:
+                        significance_penalty = 0.85
+                    elif pvalue < 0.20:
+                        significance_penalty = 0.65
+                    else:
+                        significance_penalty = 0.40
+                    if significance_penalty < 1.0:
+                        logger.debug(
+                            "Significance penalty: %d/%d wins (wr=%.2f, p=%.3f) -> %.2fx",
+                            wins, trade_count, win_rate, pvalue, significance_penalty,
+                        )
+                    composite *= significance_penalty
+
         # Apply time decay based on when strategy was last scored
         last_scored = strategy.get("last_scored")
         if last_scored:
@@ -114,6 +226,9 @@ class StrategyScorer:
             "sharpe_score": round(sharpe_score, 4),
             "consistency_score": round(consistency_score, 4),
             "risk_adj_score": round(risk_adj_score, 4),
+            # H16: expose significance data in breakdown for dashboards/debugging
+            "win_rate_pvalue": round(pvalue, 4) if pvalue is not None else None,
+            "significance_penalty": round(significance_penalty, 3),
         }
 
         return score_breakdown
@@ -229,7 +344,31 @@ class StrategyScorer:
         Score all active strategies and update the database.
         This is the main "learning" loop - called periodically.
         """
+        try:
+            summary = db.quarantine_contaminated_runtime_data()
+            quarantined = len(summary.get("invalid_strategies", []))
+            if quarantined:
+                logger.warning(
+                    "Strategy scorer quarantined %d contaminated strategy row(s) before scoring",
+                    quarantined,
+                )
+        except Exception as exc:
+            logger.warning("Strategy data quarantine failed before scoring: %s", exc)
         strategies = db.get_active_strategies()
+        if not strategies:
+            try:
+                recovered = db.recover_valid_inactive_strategies(
+                    limit=max(1, int(getattr(config, "MIN_ACTIVE_STRATEGIES", 5) or 5))
+                )
+            except Exception as exc:
+                recovered = []
+                logger.warning("Strategy recovery failed after active set went empty: %s", exc)
+            if recovered:
+                logger.warning(
+                    "Strategy active set was empty; recovered %d valid inactive strategy row(s)",
+                    len(recovered),
+                )
+                strategies = db.get_active_strategies()
         results = []
 
         logger.info(f"Scoring {len(strategies)} active strategies...")
@@ -239,27 +378,17 @@ class StrategyScorer:
                 score_breakdown = self.score_strategy(strategy)
                 composite = score_breakdown["composite"]
 
-                # Save the score to history
-                db.save_strategy_score(
-                    strategy_id=strategy["id"],
-                    score=composite,
-                    pnl_score=score_breakdown["pnl_score"],
-                    win_rate_score=score_breakdown["win_rate_score"],
-                    sharpe_score=score_breakdown["sharpe_score"],
-                    consistency_score=score_breakdown["consistency_score"],
-                    risk_adj_score=score_breakdown["risk_adj_score"],
-                    notes=f"Auto-scored at {datetime.now(timezone.utc).isoformat()}"
-                )
-
-                # Update the strategy's current score
-                db.update_strategy_score(strategy["id"], composite)
+                normalized_breakdown = {
+                    k: (None if v is None else float(v))
+                    for k, v in score_breakdown.items()
+                }
 
                 results.append({
                     "strategy_id": strategy["id"],
                     "name": strategy["name"],
                     "type": strategy["strategy_type"],
                     "score": float(composite),
-                    "breakdown": {k: float(v) for k, v in score_breakdown.items()},
+                    "breakdown": normalized_breakdown,
                     "active": bool(composite >= config.MIN_STRATEGY_SCORE),
                 })
 
@@ -291,23 +420,13 @@ class StrategyScorer:
             }
             desired_active_ids = capped_ids
 
-        # Persist active flags.
         for r in results:
-            should_be_active = r["strategy_id"] in desired_active_ids
-            r["active"] = should_be_active
-            try:
-                with db.get_connection() as conn:
-                    conn.execute(
-                        "UPDATE strategies SET active = ? WHERE id = ?",
-                        (bool(should_be_active), r["strategy_id"]),
-                    )
-            except Exception as e:
-                logger.error(
-                    "Failed to persist active=%s for strategy %s: %s",
-                    should_be_active,
-                    r["strategy_id"],
-                    e,
-                )
+            r["active"] = r["strategy_id"] in desired_active_ids
+
+        try:
+            self._persist_scoring_results(results, desired_active_ids)
+        except Exception as exc:
+            logger.error("Failed to persist scoring cycle: %s", exc)
 
         logger.info(
             "Strategy activation policy: threshold=%.3f, keep_top_n=%d, active=%d/%d",
@@ -319,12 +438,15 @@ class StrategyScorer:
 
         # Log the scoring cycle
         active_count = sum(1 for r in results if r["active"])
-        db.log_research_cycle(
-            cycle_type="scoring",
-            summary=f"Scored {len(results)} strategies, {active_count} active",
-            details={"top_strategies": results[:5]},
-            strategies_updated=len(results),
-        )
+        try:
+            db.log_research_cycle(
+                cycle_type="scoring",
+                summary=f"Scored {len(results)} strategies, {active_count} active",
+                details={"top_strategies": results[:5]},
+                strategies_updated=len(results),
+            )
+        except Exception as exc:
+            logger.error("Failed to log scoring cycle: %s", exc)
 
         return results
 
@@ -386,7 +508,26 @@ class StrategyScorer:
         strategies = db.get_active_strategies()
 
         if not strategies:
-            return {"status": "no_strategies", "message": "No strategies tracked yet"}
+            try:
+                runtime_status = db.get_strategy_runtime_status()
+            except Exception:
+                runtime_status = {}
+            total = int(runtime_status.get("total", 0) or 0)
+            inactive_valid = int(runtime_status.get("inactive_valid", 0) or 0)
+            health = "cold_start" if total == 0 else "degraded_no_valid_active_strategies"
+            message = (
+                "No strategies tracked yet"
+                if total == 0
+                else "No valid active strategies; discovery/scoring recovery required"
+            )
+            return {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "status": "no_strategies",
+                "health": health,
+                "message": message,
+                "strategy_runtime_status": runtime_status,
+                "recoverable_inactive_strategies": inactive_valid,
+            }
 
         # Analyze trends for all strategies
         trends = {}

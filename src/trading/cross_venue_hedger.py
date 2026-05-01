@@ -164,9 +164,17 @@ class CrossVenueHedger:
             hedges_placed = 0
             # Accept both dict {coin: pos} and list [{coin, side, size, ...}]
             if isinstance(open_positions, list):
-                pos_iter = [(p.get("coin", ""), p) for p in open_positions]
+                pos_iter = [
+                    (str(p.get("coin", "") or "").strip().upper(), p)
+                    for p in open_positions
+                    if str(p.get("coin", "") or "").strip()
+                ]
             else:
-                pos_iter = open_positions.items()
+                pos_iter = [
+                    (str(coin or "").strip().upper(), position)
+                    for coin, position in open_positions.items()
+                    if str(coin or "").strip()
+                ]
             for coin, position in pos_iter:
                 if self._place_hedges(coin, position):
                     hedges_placed += 1

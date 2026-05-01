@@ -10,7 +10,7 @@ module focuses purely on signal generation and execution.
 import logging
 
 import config
-from src.data.database import backup_to_json
+from src.data import database as db
 
 logger = logging.getLogger(__name__)
 logger.addHandler(logging.NullHandler())
@@ -114,12 +114,26 @@ def run_reporting(container, cycle_count: int, health_registry=None) -> None:
     if container.scorer:
         try:
             improvement = container.scorer.generate_improvement_report()
-            logger.info("  Bot health: %s", improvement.get("health", "unknown"))
+            health = improvement.get("health") or improvement.get("status") or "unknown"
+            logger.info("  Bot health: %s", health)
+            if str(health).startswith("degraded"):
+                runtime_status = improvement.get("strategy_runtime_status") or {}
+                logger.warning(
+                    "  Strategy engine degraded: total=%s active_valid=%s "
+                    "inactive_valid=%s invalid_reasons=%s",
+                    runtime_status.get("total", "?"),
+                    runtime_status.get("active_valid", "?"),
+                    runtime_status.get("inactive_valid", "?"),
+                    runtime_status.get("invalid_reasons", {}),
+                )
         except Exception:
             pass
 
     # ── DB backup ──
-    backup_to_json()
+    try:
+        db.backup_to_json()
+    except Exception as exc:
+        logger.warning("  DB backup failed: %s", exc)
 
     # ── Telegram daily/weekly alerts ──
     cycles_per_day = max(int(86400 / config.TRADING_CYCLE_INTERVAL), 1)
@@ -232,7 +246,8 @@ def _fmt_kelly(stats):
 def _fmt_calibration(cal):
     global_ece = cal.get_ece("global")
     ece_str = f"{global_ece:.3f}" if global_ece is not None else "N/A"
-    return f"ECE={ece_str}, {len(cal.get_all_stats())} sources tracked"
+    quality = cal._quality_label(global_ece)
+    return f"ECE={ece_str} ({quality}), {len(cal.get_all_stats())} sources tracked"
 
 
 def _fmt_multi(stats):

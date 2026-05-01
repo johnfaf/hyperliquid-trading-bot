@@ -44,6 +44,12 @@ logger.addHandler(logging.NullHandler())
 _WS_GAP_WARN_THRESHOLD_MS_MIN = 5000.0
 _WS_GAP_WARN_COOLDOWN_S_MIN = 5.0
 _WS_GAP_WARN_COOLDOWN_S_MAX = 900.0
+_CACHE_TTL_MULTIPLIER = safe_env_float(
+    "API_CACHE_TTL_MULTIPLIER",
+    1.25,
+    lo=0.25,
+    hi=5.0,
+)
 
 
 # ─── Priority levels ─────────────────────────────────────────────
@@ -213,7 +219,7 @@ class TTLCache:
 
 # ─── Cache TTLs by request type ─────────────────────────────────
 # How long each type of data stays fresh in cache (seconds)
-CACHE_TTLS = {
+_BASE_CACHE_TTLS = {
     "allMids": 5.0,            # Prices: 5s (mid prices read by multiple modules in same cycle; 5s still fresh)
     "metaAndAssetCtxs": 30.0,  # Funding/OI: 30s (regime+options+features all need this)
     "meta": 600.0,             # Exchange metadata: 10 min (almost never changes)
@@ -226,6 +232,14 @@ CACHE_TTLS = {
     "leaderboard": 300.0,      # Leaderboard: 5 min (only refreshed hourly anyway)
     "candleSnapshot": 60.0,    # Candles: 60s (already minute-level data, 1m freshness is adequate)
     "fundingHistory": 300.0,   # Funding history: 5 min
+}
+CACHE_TTLS = {
+    key: (
+        value
+        if key in {"allMids", "l2Book"}
+        else round(value * _CACHE_TTL_MULTIPLIER, 3)
+    )
+    for key, value in _BASE_CACHE_TTLS.items()
 }
 
 # Priority by request type

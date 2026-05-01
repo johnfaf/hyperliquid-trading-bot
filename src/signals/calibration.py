@@ -280,6 +280,28 @@ class CalibrationTracker:
 
         return max(0.05, min(adjusted, 0.95))
 
+    def get_reliability_multiplier(self, source_key: str = "global") -> float:
+        """Return a confidence derisk multiplier based on calibration error.
+
+        Bin-level calibration only adjusts confidence when that bin has enough
+        samples.  A live log showed global ECE above 0.40, which means the
+        confidence system as a whole is unreliable.  In that state, leaving
+        thin-bin predictions untouched is too optimistic, so we apply a small
+        global derisk multiplier until calibration improves.
+        """
+        ece = self.get_ece(source_key)
+        if ece is None and source_key != "global":
+            ece = self.get_ece("global")
+        if ece is None:
+            return 1.0
+        if ece >= 0.35:
+            return 0.65
+        if ece >= 0.25:
+            return 0.75
+        if ece >= 0.20:
+            return 0.85
+        return 1.0
+
     def get_all_stats(self) -> Dict:
         """Get calibration stats for all tracked sources."""
         stats = {}

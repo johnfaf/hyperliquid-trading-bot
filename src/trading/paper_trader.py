@@ -20,6 +20,7 @@ import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import config
 from src.data import database as db
+from src.data import decision_journal
 from src.data import hyperliquid_client as hl
 from src.signals.signal_schema import TradeSignal, SignalSide, SignalSource, RiskParams
 from src.signals.decision_firewall import DecisionFirewall
@@ -63,6 +64,74 @@ class PaperTrader:
         self._closed_events: List[Dict] = []
         self._ensure_account()
         self._sync_fee_tier()
+
+    @staticmethod
+    def _decision_id_for_signal(trade_signal: Any = None, sig: Optional[Dict] = None) -> str:
+        sig = sig or {}
+        decision_id = str(sig.get("decision_id") or "").strip()
+        if decision_id:
+            return decision_id
+        if trade_signal is not None:
+            context = getattr(trade_signal, "context", None)
+            if isinstance(context, dict):
+                decision_id = str(context.get("decision_id") or "").strip()
+                if decision_id:
+                    return decision_id
+            return str(getattr(trade_signal, "signal_id", "") or "").strip()
+        return ""
+
+    def _journal_signal_stage(
+        self,
+        trade_signal: Any,
+        sig: Dict,
+        *,
+        stage: str,
+        status: str,
+        reason: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        decision_id = self._decision_id_for_signal(trade_signal, sig)
+        if not decision_id:
+            return
+        try:
+            decision_journal.record_stage_event(
+                decision_id,
+                stage=stage,
+                status=status,
+                reason=reason,
+                confidence=getattr(trade_signal, "confidence", sig.get("confidence")),
+                metadata=metadata or {},
+            )
+        except Exception:
+            pass
+
+    def _journal_signal_final(
+        self,
+        trade_signal: Any,
+        sig: Dict,
+        *,
+        final_status: str,
+        stage: str,
+        reason: Optional[str] = None,
+        firewall_decision: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        decision_id = self._decision_id_for_signal(trade_signal, sig)
+        if not decision_id:
+            return
+        try:
+            decision_journal.finalize_decision(
+                decision_id,
+                final_status=final_status,
+                stage=stage,
+                reason=reason,
+                firewall_decision=firewall_decision,
+                confidence=getattr(trade_signal, "confidence", sig.get("confidence")),
+                metadata=metadata or {},
+            )
+            decision_journal.record_decision_outcome(decision_id)
+        except Exception:
+            pass
 
     def _ensure_account(self):
         """Initialize paper trading account if it doesn't exist."""
@@ -218,6 +287,61 @@ class PaperTrader:
                 tuple(params),
             )
 
+    @staticmethod
+    def _price_roe_pct(trade: Dict, price: float) -> float:
+        entry = float(trade.get("entry_price", 0) or 0)
+        if entry <= 0 or price <= 0:
+            return 0.0
+        leverage = max(float(trade.get("leverage", 1) or 1), 1.0)
+        direction = 1.0 if str(trade.get("side", "")).lower() == "long" else -1.0
+        return ((float(price) - entry) / entry) * leverage * direction
+
+    def _update_trade_excursion(
+        self,
+        trade: Dict,
+        *,
+        current_price: float,
+        current_r: float,
+        risk_policy: Dict[str, float],
+        now_utc: datetime,
+    ) -> None:
+        """Track MFE/MAE for TP/SL path analytics while a trade is open."""
+        try:
+            meta = self._trade_metadata(trade)
+            current_roe = self._price_roe_pct(trade, current_price)
+            prev_mfe_roe = float(meta.get("mfe_roe_pct", 0.0) or 0.0)
+            prev_mae_roe = float(meta.get("mae_roe_pct", 0.0) or 0.0)
+            stop_roe_pct = max(float(risk_policy.get("stop_roe_pct", 0.0) or 0.0), 1e-9)
+
+            updates: Dict[str, Any] = {
+                "last_path_price": round(float(current_price), 8),
+                "last_r_multiple": round(float(current_r), 6),
+                "last_path_updated_at": now_utc.isoformat(),
+            }
+
+            if current_roe >= prev_mfe_roe:
+                updates.update(
+                    {
+                        "mfe_price": round(float(current_price), 8),
+                        "mfe_roe_pct": round(float(current_roe), 6),
+                        "max_r_multiple": round(float(current_roe) / stop_roe_pct, 6),
+                        "mfe_updated_at": now_utc.isoformat(),
+                    }
+                )
+            if current_roe <= prev_mae_roe:
+                updates.update(
+                    {
+                        "mae_price": round(float(current_price), 8),
+                        "mae_roe_pct": round(float(current_roe), 6),
+                        "min_r_multiple": round(float(current_roe) / stop_roe_pct, 6),
+                        "mae_updated_at": now_utc.isoformat(),
+                    }
+                )
+
+            db.update_paper_trade_metadata(trade["id"], updates)
+        except Exception as exc:
+            logger.debug("Path analytics update failed for trade %s: %s", trade.get("id"), exc)
+
     def get_account_summary(self) -> Dict:
         """Get current paper trading account summary."""
         account = db.get_paper_account()
@@ -303,6 +427,122 @@ class PaperTrader:
             except (TypeError, ValueError):
                 pass
         return 0.02
+
+    @staticmethod
+    def _signal_expected_cost_bps() -> float:
+        fee_bps = float(getattr(config, "PAPER_TRADING_TAKER_FEE_BPS", 2.5) or 2.5) * 2.0
+        slippage_bps = float(
+            getattr(
+                config,
+                "TRADE_QUALITY_EXPECTED_SLIPPAGE_BPS",
+                getattr(config, "PAPER_TRADING_SLIPPAGE_MAX_BPS", 5.0),
+            )
+            or 0.0
+        ) * 2.0
+        return max(0.0, fee_bps + slippage_bps)
+
+    @staticmethod
+    def _coerce_expected_return_bps(value: object) -> float:
+        try:
+            expected = float(value or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+        if abs(expected) <= 1.0:
+            return expected * 10_000.0
+        return expected
+
+    def _estimate_signal_edge_bps(self, trade_signal: TradeSignal, sig: Dict) -> float:
+        context = dict(getattr(trade_signal, "context", {}) or {})
+        expected_return = (
+            sig.get("expected_return")
+            or context.get("expected_return")
+            or (sig.get("risk_policy") or {}).get("expected_return")
+        )
+        edge_bps = self._coerce_expected_return_bps(expected_return)
+        if edge_bps <= 0:
+            # Confidence-only fallback: 60% confidence ~= 20 bps, 75% ~= 50 bps.
+            edge_bps = max(0.0, float(trade_signal.confidence or 0.0) - 0.50) * 200.0
+        if sig.get("volume_confirmed"):
+            edge_bps += 5.0
+        if sig.get("options_flow_aligned"):
+            edge_bps += 5.0
+        features = dict(sig.get("features") or {})
+        try:
+            feature_score = float(features.get("overall_score", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            feature_score = 0.0
+        side = str(sig.get("side", "") or "").lower()
+        if side == "long" and feature_score > 0:
+            edge_bps += min(feature_score * 10.0, 10.0)
+        elif side == "short" and feature_score < 0:
+            edge_bps += min(abs(feature_score) * 10.0, 10.0)
+        elif side == "short" and feature_score > 0:
+            edge_bps -= min(feature_score * 15.0, 20.0)
+        return round(edge_bps, 4)
+
+    def _passes_trade_quality_gate(self, trade_signal: TradeSignal, sig: Dict) -> tuple[bool, Dict[str, object]]:
+        cost_bps = self._signal_expected_cost_bps()
+        edge_bps = self._estimate_signal_edge_bps(trade_signal, sig)
+        minimum_edge_bps = cost_bps * float(
+            getattr(config, "TRADE_QUALITY_MIN_EDGE_COST_MULTIPLE", 1.5) or 1.5
+        )
+        side = str(sig.get("side", "") or "").lower()
+        confidence = float(trade_signal.confidence or 0.0)
+        if (
+            bool(getattr(config, "TRADE_QUALITY_STRONG_SHORT_CONFIRMATION", True))
+            and side == "short"
+            and confidence < float(getattr(config, "TRADE_QUALITY_SHORT_MIN_CONFIDENCE", 0.55) or 0.55)
+            and not (sig.get("volume_confirmed") or sig.get("options_flow_aligned"))
+        ):
+            return False, {
+                "reason": "short_lacks_confirmation",
+                "edge_bps": edge_bps,
+                "cost_bps": cost_bps,
+                "minimum_edge_bps": minimum_edge_bps,
+            }
+        if bool(getattr(config, "TRADE_QUALITY_FEE_EV_GATE_ENABLED", True)) and edge_bps < minimum_edge_bps:
+            return False, {
+                "reason": "edge_below_cost",
+                "edge_bps": edge_bps,
+                "cost_bps": cost_bps,
+                "minimum_edge_bps": minimum_edge_bps,
+            }
+        return True, {
+            "reason": "passed",
+            "edge_bps": edge_bps,
+            "cost_bps": cost_bps,
+            "minimum_edge_bps": minimum_edge_bps,
+        }
+
+    def _final_executable_score(
+        self,
+        trade_signal: TradeSignal,
+        sig: Dict,
+        regime_data: Optional[Dict] = None,
+    ) -> float:
+        edge_bps = self._estimate_signal_edge_bps(trade_signal, sig)
+        cost_bps = max(self._signal_expected_cost_bps(), 1.0)
+        confidence = float(trade_signal.confidence or 0.0)
+        source_accuracy = float(getattr(trade_signal, "source_accuracy", 0.0) or 0.0)
+        rotation_score = self.rotation_manager.candidate_score(trade_signal, regime_data=regime_data)
+        confirmation_bonus = 0.0
+        if sig.get("volume_confirmed"):
+            confirmation_bonus += 0.05
+        if sig.get("options_flow_aligned"):
+            confirmation_bonus += 0.05
+        side_penalty = 0.0
+        if str(sig.get("side", "") or "").lower() == "short" and confirmation_bonus <= 0:
+            side_penalty = 0.05
+        ev_score = min(max(edge_bps / (cost_bps * 3.0), 0.0), 1.0)
+        return round(
+            confidence * 0.40
+            + rotation_score * 0.25
+            + source_accuracy * 0.15
+            + ev_score * 0.15
+            + confirmation_bonus
+            - side_penalty,
+            6,
+        )
 
     def _get_position_sizing(
         self,
@@ -401,7 +641,8 @@ class PaperTrader:
         raw_signals = []
         _drop_counts = {"existing_position": 0, "no_signal": 0, "volume_reject": 0,
                         "schema_error": 0, "firewall": 0, "arena": 0, "memory": 0,
-                        "llm_filter": 0, "other_error": 0}
+                        "llm_filter": 0, "ev_gate": 0, "execution_cap": 0,
+                        "missing_asset": 0, "other_error": 0}
         for strategy in strategies:
             try:
                 existing = [t for t in open_trades if t["strategy_id"] == strategy.get("id")]
@@ -409,7 +650,10 @@ class PaperTrader:
                 # Generate signal from strategy
                 signal = self._generate_signal(strategy, mids, regime_data=regime_data)
                 if not signal:
-                    _drop_counts["no_signal"] += 1
+                    if strategy.get("_decision_skip_reason") == "missing_asset":
+                        _drop_counts["missing_asset"] += 1
+                    else:
+                        _drop_counts["no_signal"] += 1
                     logger.info(f"No signal generated for {strategy.get('name', '?')}")
                     continue
 
@@ -531,6 +775,25 @@ class PaperTrader:
                     sig=sig,
                     regime_data=regime_data,
                 )
+                sig["decision_id"] = trade_signal.signal_id
+                if isinstance(trade_signal.context, dict):
+                    trade_signal.context["decision_id"] = trade_signal.signal_id
+                decision_journal.record_decision_snapshot(
+                    trade_signal,
+                    raw_signal=sig,
+                    regime_data=regime_data,
+                    account_balance=account.get("balance"),
+                    final_status="candidate",
+                    firewall_decision="pending",
+                    metadata={"stage": "paper_trader_candidate"},
+                )
+                self._journal_signal_stage(
+                    trade_signal,
+                    sig,
+                    stage="candidate",
+                    status="generated",
+                    metadata={"strategy_id": sig["strategy"].get("id")},
+                )
                 trade_signals.append((trade_signal, sig))
             except Exception as e:
                 _drop_counts["schema_error"] += 1
@@ -561,28 +824,78 @@ class PaperTrader:
                     if not passed:
                         _drop_counts["firewall"] += 1
                         logger.info(f"Firewall rejected {sig['side']} {sig['coin']}: {reason}")
+                        self._journal_signal_final(
+                            trade_signal,
+                            sig,
+                            final_status="firewall_prescreen_rejected",
+                            stage="firewall_prescreen",
+                            reason=reason,
+                            firewall_decision="rejected",
+                        )
                         continue
+                    self._journal_signal_stage(
+                        trade_signal,
+                        sig,
+                        stage="firewall_prescreen",
+                        status="approved",
+                        metadata={"ignore_position_limit": True},
+                    )
                     logger.debug(f"Firewall approved {sig['side']} {sig['coin']} "
                                 f"(confidence={trade_signal.confidence:.0%})")
                 else:
                     # Legacy fallback
                     if not self._check_risk_limits(account, sig, open_trades):
                         logger.debug(f"Risk limit hit, skipping {sig['coin']}")
+                        self._journal_signal_final(
+                            trade_signal,
+                            sig,
+                            final_status="risk_rejected",
+                            stage="legacy_risk",
+                            reason="legacy_risk_limits",
+                            firewall_decision="unavailable",
+                        )
                         continue
 
-                # Arena consensus vote (multi-agent debate)
+                # Arena consensus vote (multi-agent debate).  Arena is an
+                # optional quality layer; while it is cold-starting, do not let
+                # zero-history agents veto otherwise firewall-approved signals.
                 if arena:
                     try:
-                        feature_ctx = sig.get("features", {})
-                        approved, consensus_conf = arena.get_consensus_on_signal(
-                            trade_signal, features=feature_ctx
-                        )
-                        if not approved:
-                            _drop_counts["arena"] += 1
-                            logger.info(f"Arena consensus REJECTED {sig['side']} {sig['coin']}")
-                            continue
-                        # Use consensus-adjusted confidence
-                        trade_signal.confidence = consensus_conf
+                        ready = True
+                        if hasattr(arena, "is_consensus_ready"):
+                            ready = bool(arena.is_consensus_ready())
+                        if ready:
+                            feature_ctx = sig.get("features", {})
+                            approved, consensus_conf = arena.get_consensus_on_signal(
+                                trade_signal, features=feature_ctx
+                            )
+                            if not approved:
+                                _drop_counts["arena"] += 1
+                                logger.info(f"Arena consensus REJECTED {sig['side']} {sig['coin']}")
+                                self._journal_signal_final(
+                                    trade_signal,
+                                    sig,
+                                    final_status="arena_rejected",
+                                    stage="arena_consensus",
+                                    reason="consensus_rejected",
+                                    metadata={"consensus_confidence": consensus_conf},
+                                )
+                                continue
+                            # Use consensus-adjusted confidence
+                            trade_signal.confidence = consensus_conf
+                            self._journal_signal_stage(
+                                trade_signal,
+                                sig,
+                                stage="arena_consensus",
+                                status="approved",
+                                metadata={"consensus_confidence": consensus_conf},
+                            )
+                        else:
+                            logger.info(
+                                "Arena consensus bootstrap not ready; skipping optional vote for %s %s",
+                                sig["side"],
+                                sig["coin"],
+                            )
                     except Exception as e:
                         logger.debug(f"Arena consensus error: {e}")
 
@@ -601,6 +914,17 @@ class PaperTrader:
                             logger.debug(f"Calibration adjust {sig['coin']}: "
                                        f"{trade_signal.confidence:.2f} -> {adjusted:.2f}")
                         trade_signal.confidence = adjusted
+                        reliability_mult = self.calibration.get_reliability_multiplier(source_key)
+                        if reliability_mult < 1.0:
+                            before = trade_signal.confidence
+                            trade_signal.confidence = max(0.05, trade_signal.confidence * reliability_mult)
+                            logger.info(
+                                "Calibration derisk %s: %.2f -> %.2f (mult=%.2f)",
+                                sig["coin"],
+                                before,
+                                trade_signal.confidence,
+                                reliability_mult,
+                            )
                     except Exception as e:
                         logger.debug(f"Calibration error: {e}")
 
@@ -617,10 +941,25 @@ class PaperTrader:
                         if memory_result.recommendation == "avoid":
                             _drop_counts["memory"] += 1
                             logger.info(f"Memory BLOCKED {sig['side']} {sig['coin']}: {memory_result.reason}")
+                            self._journal_signal_final(
+                                trade_signal,
+                                sig,
+                                final_status="memory_rejected",
+                                stage="trade_memory",
+                                reason=memory_result.reason,
+                                metadata=memory_result.to_dict() if hasattr(memory_result, "to_dict") else {},
+                            )
                             continue
                         elif memory_result.recommendation == "caution":
                             trade_signal.confidence *= 0.8
                             logger.debug(f"Memory caution for {sig['coin']}: {memory_result.reason}")
+                            self._journal_signal_stage(
+                                trade_signal,
+                                sig,
+                                stage="trade_memory",
+                                status="caution",
+                                reason=memory_result.reason,
+                            )
                     except Exception as e:
                         logger.debug(f"Trade memory error: {e}")
                         memory_result = None
@@ -638,8 +977,23 @@ class PaperTrader:
                         if not llm_approved:
                             _drop_counts["llm_filter"] += 1
                             logger.info(f"LLM filter BLOCKED {sig['side']} {sig['coin']}: {llm_reason}")
+                            self._journal_signal_final(
+                                trade_signal,
+                                sig,
+                                final_status="llm_rejected",
+                                stage="llm_filter",
+                                reason=llm_reason,
+                                metadata={"llm_confidence": llm_conf},
+                            )
                             continue
                         trade_signal.confidence = llm_conf
+                        self._journal_signal_stage(
+                            trade_signal,
+                            sig,
+                            stage="llm_filter",
+                            status="approved",
+                            metadata={"llm_confidence": llm_conf},
+                        )
                     except Exception as e:
                         logger.debug(f"LLM filter error: {e}")
 
@@ -667,9 +1021,47 @@ class PaperTrader:
                 sig["confidence"] = trade_signal.confidence
                 sig["source_accuracy"] = trade_signal.source_accuracy
                 sig["regime"] = trade_signal.regime
+                quality_ok, quality_meta = self._passes_trade_quality_gate(trade_signal, sig)
+                if isinstance(trade_signal.context, dict):
+                    trade_signal.context["trade_quality"] = dict(quality_meta)
+                sig["trade_quality"] = dict(quality_meta)
+                if not quality_ok:
+                    _drop_counts["ev_gate"] += 1
+                    logger.info(
+                        "Trade-quality gate rejected %s %s: %s "
+                        "(edge %.1fbps, cost %.1fbps, min %.1fbps)",
+                        sig["side"],
+                        sig["coin"],
+                        quality_meta.get("reason", "unknown"),
+                        float(quality_meta.get("edge_bps", 0.0) or 0.0),
+                        float(quality_meta.get("cost_bps", 0.0) or 0.0),
+                        float(quality_meta.get("minimum_edge_bps", 0.0) or 0.0),
+                    )
+                    self._journal_signal_final(
+                        trade_signal,
+                        sig,
+                        final_status="ev_rejected",
+                        stage="trade_quality",
+                        reason=str(quality_meta.get("reason", "unknown")),
+                        metadata=dict(quality_meta),
+                    )
+                    continue
+                sig["quality_score"] = self._final_executable_score(
+                    trade_signal,
+                    sig,
+                    regime_data=regime_data,
+                )
+                self._journal_signal_stage(
+                    trade_signal,
+                    sig,
+                    stage="candidate_pool",
+                    status="eligible",
+                    metadata={"quality_score": sig["quality_score"], "trade_quality": dict(quality_meta)},
+                )
                 rotation_candidates.append({
                     "trade_signal": trade_signal,
                     "signal": sig,
+                    "quality_score": sig["quality_score"],
                 })
 
             except Exception as e:
@@ -679,13 +1071,23 @@ class PaperTrader:
         rotation_enabled = bool(config.ROTATION_ENGINE_ENABLED)
         rotation_dry_run = bool(config.ROTATION_DRY_RUN_TELEMETRY)
         shadow_mode = rotation_enabled and rotation_dry_run
+        max_executable = max(0, int(getattr(config, "PAPER_EXECUTION_MAX_TRADES_PER_CYCLE", 3) or 3))
         for candidate in sorted(
             rotation_candidates,
-            key=lambda item: self.rotation_manager.candidate_score(
-                item["trade_signal"], regime_data=regime_data
-            ),
+            key=lambda item: float(item.get("quality_score", 0.0) or 0.0),
             reverse=True,
         ):
+            if max_executable > 0 and len(executed) >= max_executable:
+                _drop_counts["execution_cap"] += 1
+                self._journal_signal_final(
+                    candidate["trade_signal"],
+                    candidate["signal"],
+                    final_status="execution_cap_rejected",
+                    stage="execution_cap",
+                    reason=f"cycle_cap_{max_executable}_reached",
+                    metadata={"executed_so_far": len(executed), "max_executable": max_executable},
+                )
+                continue
             trade_signal = candidate["trade_signal"]
             sig = candidate["signal"]
             victim = None
@@ -705,6 +1107,17 @@ class PaperTrader:
                         replacements_used,
                         self.rotation_manager.max_replacements_per_cycle,
                     )
+                    self._journal_signal_final(
+                        trade_signal,
+                        sig,
+                        final_status="rotation_rejected",
+                        stage="rotation",
+                        reason="replacement_budget_exhausted",
+                        metadata={
+                            "replacements_used": replacements_used,
+                            "max_replacements": self.rotation_manager.max_replacements_per_cycle,
+                        },
+                    )
                     continue
                 victim = next(
                     (trade for trade in open_trades if trade.get("id") == forced_victim_id),
@@ -712,6 +1125,13 @@ class PaperTrader:
                 )
                 if not victim:
                     logger.info("Strategy refresh skipped %s: incumbent not found", sig["coin"])
+                    self._journal_signal_final(
+                        trade_signal,
+                        sig,
+                        final_status="rotation_rejected",
+                        stage="rotation",
+                        reason="incumbent_not_found",
+                    )
                     continue
                 candidate_open_positions = [
                     trade for trade in open_trades if trade.get("id") != victim.get("id")
@@ -744,6 +1164,17 @@ class PaperTrader:
                         sig["coin"],
                         decision.reason,
                     )
+                    self._journal_signal_final(
+                        trade_signal,
+                        sig,
+                        final_status="rotation_rejected",
+                        stage="rotation",
+                        reason=decision.reason,
+                        metadata={
+                            "candidate_score": decision.candidate_score,
+                            "incumbent_score": decision.incumbent_score,
+                        },
+                    )
                     continue
                 if shadow_bypass_open:
                     logger.info(
@@ -770,6 +1201,14 @@ class PaperTrader:
                             sig["side"].upper(),
                             sig["coin"],
                         )
+                        self._journal_signal_final(
+                            trade_signal,
+                            sig,
+                            final_status="rotation_rejected",
+                            stage="rotation",
+                            reason="rotation_disabled",
+                            metadata={"decision_reason": decision.reason, "dry_run": rotation_dry_run},
+                        )
                         continue
                     if rotation_dry_run:
                         self.rotation_manager.record_dry_run_replacement_skip(
@@ -781,6 +1220,14 @@ class PaperTrader:
                             sig["coin"],
                             decision.reason,
                         )
+                        self._journal_signal_final(
+                            trade_signal,
+                            sig,
+                            final_status="rotation_rejected",
+                            stage="rotation",
+                            reason="rotation_dry_run",
+                            metadata={"decision_reason": decision.reason},
+                        )
                         continue
 
                 if decision.action == "replace":
@@ -790,6 +1237,14 @@ class PaperTrader:
                     )
                     if not victim:
                         logger.info("Rotation skipped %s: incumbent not found", sig["coin"])
+                        self._journal_signal_final(
+                            trade_signal,
+                            sig,
+                            final_status="rotation_rejected",
+                            stage="rotation",
+                            reason="incumbent_not_found",
+                            metadata={"replacement_trade_id": decision.replacement_trade_id},
+                        )
                         continue
 
                     candidate_open_positions = [
@@ -810,7 +1265,21 @@ class PaperTrader:
                         sig["coin"],
                         reason,
                     )
+                    self._journal_signal_final(
+                        trade_signal,
+                        sig,
+                        final_status="firewall_execution_rejected",
+                        stage="firewall_execution",
+                        reason=reason,
+                        firewall_decision="rejected",
+                    )
                     continue
+                self._journal_signal_stage(
+                    trade_signal,
+                    sig,
+                    stage="firewall_execution",
+                    status="approved",
+                )
 
             signal_id = ""
             if self.agent_scorer:
@@ -826,7 +1295,8 @@ class PaperTrader:
                     if hasattr(trade_signal.source, "value")
                     else str(trade_signal.source)
                 )
-            sig["signal_id"] = signal_id
+            sig["decision_id"] = sig.get("decision_id") or trade_signal.signal_id
+            sig["signal_id"] = signal_id or sig["decision_id"]
 
             # CRIT-FIX CRIT-6: close victim BEFORE opening replacement.
             # Original order (open → close) left both positions alive simultaneously
@@ -847,6 +1317,14 @@ class PaperTrader:
                         victim.get("coin"), sig["coin"],
                     )
                     _drop_counts["rotation_victim_close_failed"] = _drop_counts.get("rotation_victim_close_failed", 0) + 1
+                    self._journal_signal_final(
+                        trade_signal,
+                        sig,
+                        final_status="rotation_victim_close_failed",
+                        stage="rotation",
+                        reason="victim_close_failed",
+                        metadata={"victim_trade_id": victim.get("id"), "victim_coin": victim.get("coin")},
+                    )
                     continue
                 closed_victim_event = closed_victim
                 # Remove closed victim from working position list immediately so
@@ -855,7 +1333,8 @@ class PaperTrader:
 
             trade = self._execute_paper_trade(account, sig["strategy"], sig)
             if trade:
-                trade["signal_id"] = signal_id
+                trade["signal_id"] = sig.get("signal_id", signal_id)
+                trade["decision_id"] = sig.get("decision_id", "")
                 trade["strategy_type"] = sig.get("strategy_type", "")
                 executed.append(trade)
                 self._annotate_open_trades([trade], mids)
@@ -879,6 +1358,14 @@ class PaperTrader:
                         sig["coin"],
                         decision_reason,
                     )
+            else:
+                self._journal_signal_final(
+                    trade_signal,
+                    sig,
+                    final_status="paper_open_failed",
+                    stage="paper_execution",
+                    reason="open_paper_trade_failed",
+                )
 
         if executed:
             logger.info(f"Executed {len(executed)} paper trades (V2 pipeline)")
@@ -922,24 +1409,13 @@ class PaperTrader:
         if isinstance(coins, str):
             coins = [coins]
 
-        # If strategy has no specific coins, pick from top liquid coins
-        # to diversify across many assets instead of all piling into BTC
         if not coins:
-            TOP_COINS = ["BTC", "ETH", "SOL", "DOGE", "AVAX", "LINK", "ARB",
-                         "OP", "SUI", "APT", "INJ", "SEI", "TIA", "JUP",
-                         "WIF", "PEPE", "ONDO", "RENDER", "FET", "NEAR"]
-            available = [c for c in TOP_COINS if c in mids]
-            if available:
-                # HIGH-FIX HIGH-5: hash() is not stable across Python process
-                # restarts (PYTHONHASHSEED randomisation since 3.3).  Use a
-                # deterministic MD5-based int so a strategy always maps to the
-                # same coin across sessions.
-                import hashlib
-                seed_str = str(strategy.get("id", 0)).encode()
-                stable_hash = int(hashlib.md5(seed_str).hexdigest(), 16)
-                coins = [available[stable_hash % len(available)]]
-            else:
-                coins = ["BTC", "ETH"]
+            strategy["_decision_skip_reason"] = "missing_asset"
+            logger.info(
+                "Skipping strategy %s: no executable asset in strategy parameters",
+                strategy.get("name", strategy.get("id", "?")),
+            )
+            return None
 
         # Pick the first available coin with a price
         target_coin = None
@@ -958,11 +1434,12 @@ class PaperTrader:
                     break
 
         if not target_coin or target_price == 0:
-            # Fallback to BTC
-            target_coin = "BTC"
-            target_price = float(mids.get("BTC", 0))
-            if target_price == 0:
-                return None
+            logger.info(
+                "Skipping strategy %s: none of its assets have a valid mid price (%s)",
+                strategy.get("name", strategy.get("id", "?")),
+                ",".join(str(c) for c in coins),
+            )
+            return None
 
         # Determine direction — regime-aware for ambiguous types.
         # Use pre-computed side from decision engine when available.
@@ -1010,6 +1487,13 @@ class PaperTrader:
         size = size_usd / target_price
 
         strategy_source = str(strategy.get("source", "strategy") or "strategy")
+        source_key = str(strategy.get("source_key", "") or "").strip().lower()
+        if not source_key:
+            source_key = (
+                f"{strategy_source.lower()}:{str(strategy_type or '').lower()}"
+                if strategy_type
+                else strategy_source.lower()
+            )
         trade_signal = TradeSignal(
             coin=target_coin,
             side=SignalSide(side),
@@ -1046,6 +1530,8 @@ class PaperTrader:
             "stop_loss": round(stop_loss, 2),
             "take_profit": round(take_profit, 2),
             "strategy_type": strategy_type,
+            "source": strategy_source,
+            "source_key": source_key,
             "confidence": score,
             "risk_params": trade_signal.risk.to_dict(),
             "risk_policy": dict((trade_signal.context or {}).get("risk_policy", {}) or {}),
@@ -1155,7 +1641,8 @@ class PaperTrader:
             # pipeline supplies one) as the paper-trade idempotency key
             # so a crash-retry or re-delivery of the same signal does
             # not open two logical paper trades.
-            signal_id = str(signal.get("signal_id") or "").strip()
+            signal_id = str(signal.get("signal_id") or signal.get("decision_id") or "").strip()
+            decision_id = str(signal.get("decision_id") or signal_id or "").strip()
             idem_key = f"paper:{signal_id}" if signal_id else None
             trade_id = db.open_paper_trade(
                 strategy_id=strategy.get("id"),
@@ -1172,6 +1659,7 @@ class PaperTrader:
                     "source_key": signal.get("source_key", ""),
                     "confidence": signal.get("confidence", 0),
                     "signal_id": signal.get("signal_id", ""),
+                    "decision_id": decision_id,
                     "execution_role": signal.get("execution_role", config.PAPER_TRADING_DEFAULT_EXECUTION_ROLE),
                     "maker_fee_bps": config.PAPER_TRADING_MAKER_FEE_BPS,
                     "taker_fee_bps": config.PAPER_TRADING_TAKER_FEE_BPS,
@@ -1186,6 +1674,29 @@ class PaperTrader:
                 },
                 idempotency_key=idem_key,
             )
+            if decision_id:
+                decision_journal.link_paper_trade(
+                    decision_id,
+                    trade_id,
+                    metadata={
+                        "paper_trade_opened": True,
+                        "paper_trade_signal_id": signal_id,
+                    },
+                )
+                decision_journal.record_stage_event(
+                    decision_id,
+                    stage="paper_execution",
+                    status="paper_opened",
+                    reason="paper_trade_opened",
+                    confidence=signal.get("confidence", 0),
+                    metadata={
+                        "paper_trade_id": trade_id,
+                        "entry_price": slipped_price,
+                        "size": signal["size"],
+                        "leverage": signal["leverage"],
+                    },
+                )
+                decision_journal.record_decision_outcome(decision_id)
 
             logger.info(
                 f"Paper trade opened: {signal['side'].upper()} {signal['coin']} "
@@ -1214,6 +1725,7 @@ class PaperTrader:
                     "source_key": signal.get("source_key", ""),
                     "confidence": signal.get("confidence", 0),
                     "signal_id": signal.get("signal_id", ""),
+                    "decision_id": decision_id,
                     "execution_role": signal.get("execution_role", config.PAPER_TRADING_DEFAULT_EXECUTION_ROLE),
                     "maker_fee_bps": config.PAPER_TRADING_MAKER_FEE_BPS,
                     "taker_fee_bps": config.PAPER_TRADING_TAKER_FEE_BPS,
@@ -1275,6 +1787,29 @@ class PaperTrader:
             float(trade.get("leverage", 1) or 1),
         )
         total_slippage_cost = round(entry_slippage_cost + exit_slippage_cost, 4)
+        risk_policy = self._resolve_trade_risk_policy(
+            {**trade, "metadata": trade_meta}
+        )
+        stop_roe_pct = max(float(risk_policy.get("stop_roe_pct", 0.0) or 0.0), 1e-9)
+        exit_roe_pct = self._price_roe_pct(trade, slipped_exit)
+        exit_r_multiple = exit_roe_pct / stop_roe_pct
+        max_r_multiple = float(trade_meta.get("max_r_multiple", max(exit_r_multiple, 0.0)) or 0.0)
+        min_r_multiple = float(trade_meta.get("min_r_multiple", min(exit_r_multiple, 0.0)) or 0.0)
+        realized_max_r = max(max_r_multiple, exit_r_multiple)
+        realized_min_r = min(min_r_multiple, exit_r_multiple)
+        path_capture_ratio = (
+            exit_r_multiple / realized_max_r
+            if realized_max_r > 0 and exit_r_multiple > 0
+            else 0.0
+        )
+        path_metrics = {
+            "exit_roe_pct": round(exit_roe_pct, 6),
+            "exit_r_multiple": round(exit_r_multiple, 6),
+            "max_r_multiple": round(realized_max_r, 6),
+            "min_r_multiple": round(realized_min_r, 6),
+            "path_capture_ratio": round(path_capture_ratio, 6),
+            "close_reason": close_reason,
+        }
 
         db.update_paper_trade_metadata(
             trade["id"],
@@ -1293,6 +1828,7 @@ class PaperTrader:
                 "net_pnl_after_fees": pnl,
                 "intended_exit_price": float(current_price or 0),
                 "exit_slipped_price": slipped_exit,
+                **path_metrics,
             },
         )
         trade_meta.update(
@@ -1311,6 +1847,7 @@ class PaperTrader:
                 "net_pnl_after_fees": pnl,
                 "intended_exit_price": float(current_price or 0),
                 "exit_slipped_price": slipped_exit,
+                **path_metrics,
             }
         )
         # CRIT-FIX C2: atomic close + account credit in one transaction
@@ -1458,6 +1995,60 @@ class PaperTrader:
         except Exception:
             pass
         self._closed_events.append(closed_event)
+        decision_id = str(trade_meta.get("decision_id") or trade.get("decision_id") or "").strip()
+        if decision_id:
+            hold_minutes = None
+            try:
+                opened_raw = trade.get("opened_at") or trade_meta.get("opened_at")
+                if opened_raw:
+                    opened_dt = datetime.fromisoformat(str(opened_raw).replace("Z", "+00:00"))
+                    if opened_dt.tzinfo is None:
+                        opened_dt = opened_dt.replace(tzinfo=timezone.utc)
+                    closed_dt = datetime.fromisoformat(str(closed_event["closed_at"]).replace("Z", "+00:00"))
+                    hold_minutes = max((closed_dt - opened_dt).total_seconds() / 60.0, 0.0)
+            except Exception:
+                hold_minutes = None
+            try:
+                decision_journal.record_stage_event(
+                    decision_id,
+                    stage="paper_close",
+                    status="paper_closed",
+                    reason=close_reason,
+                    confidence=trade_meta.get("confidence"),
+                    metadata={
+                        "paper_trade_id": trade.get("id"),
+                        "pnl": pnl,
+                        "return_pct": return_pct,
+                        "exit_price": slipped_exit,
+                        **path_metrics,
+                    },
+                )
+                decision_journal.update_decision_status(
+                    decision_id,
+                    final_status="paper_closed",
+                    firewall_decision="approved",
+                    metadata={"paper_trade_closed": True, "close_reason": close_reason},
+                )
+                decision_journal.record_decision_outcome(
+                    decision_id,
+                    outcome={
+                        "outcome_pnl": pnl,
+                        "outcome_return_pct": return_pct,
+                        "label_win": 1 if pnl > 0 else 0,
+                        "exit_reason": close_reason,
+                        "hold_minutes": hold_minutes,
+                        "max_favorable_r": realized_max_r,
+                        "max_adverse_r": realized_min_r,
+                        "metadata": {
+                            "close_reason": close_reason,
+                            "path_metrics": path_metrics,
+                            "fees_paid": round(total_fees, 4),
+                            "slippage_cost": total_slippage_cost,
+                        },
+                    },
+                )
+            except Exception:
+                pass
         return closed_event
 
     def drain_closed_events(self) -> List[Dict]:
@@ -1542,6 +2133,13 @@ class PaperTrader:
                 str(trade.get("side", "")),
                 float(leverage or 1),
                 stop_roe_pct,
+            )
+            self._update_trade_excursion(
+                trade,
+                current_price=current_price,
+                current_r=current_r,
+                risk_policy=risk_policy,
+                now_utc=now_utc,
             )
 
             if trade["side"] == "long":

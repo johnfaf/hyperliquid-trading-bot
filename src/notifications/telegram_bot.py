@@ -372,6 +372,29 @@ def notify_manual_close_detected(trade: Dict, exit_price: float):
     _send_message(text)
 
 
+def _write_local_kill_switch_log(payload: Dict) -> None:
+    """★ M29 FIX: guaranteed-local fallback for kill-switch alerts.
+
+    Telegram alerts are best-effort -- if Telegram is down or its creds
+    are missing during a kill-switch event, an operator who SSHs in
+    has no out-of-band record of when/why the switch tripped.  Append
+    a JSONL row to ``data/kill_switch_log/YYYYMMDD.jsonl`` so the local
+    filesystem always has the audit trail.  Errors here are swallowed
+    -- we never want this fallback to itself block the kill switch.
+    """
+    try:
+        import os
+        import json as _json
+        log_dir = os.path.join("data", "kill_switch_log")
+        os.makedirs(log_dir, exist_ok=True)
+        date_stamp = datetime.now(timezone.utc).strftime("%Y%m%d")
+        log_path = os.path.join(log_dir, f"{date_stamp}.jsonl")
+        with open(log_path, "a", encoding="utf-8") as fh:
+            fh.write(_json.dumps(payload, default=str) + "\n")
+    except Exception:
+        pass
+
+
 def notify_kill_switch_activated(reason: str, *, status_reason: str = "kill_switch_active") -> None:
     """Alert operators when the live kill switch trips.  C1.
 
@@ -379,7 +402,19 @@ def notify_kill_switch_activated(reason: str, *, status_reason: str = "kill_swit
     invocation, rolling-window drawdown (S3), fast-cycle failure escalation
     (S7), and the external KILL_SWITCH file.  Failures to send are swallowed
     so the kill switch itself cannot be blocked by a misconfigured Telegram.
+
+    ★ M29 FIX: always write a local JSONL row first so the audit trail
+    survives a Telegram outage.
     """
+    now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    _write_local_kill_switch_log({
+        "timestamp_utc": now_iso,
+        "event": "kill_switch_activated",
+        "reason": str(reason or "unspecified")[:500],
+        "status_reason": str(status_reason or "kill_switch_active")[:200],
+        "telegram_configured": bool(is_configured()),
+    })
+
     if not is_configured():
         return
     text = (

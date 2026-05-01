@@ -26,6 +26,7 @@ Note: Some endpoints (trades, pnl) use account_index (an integer) not
 the raw ETH address. We must first resolve address → account_index
 via the /account endpoint.
 """
+import json
 import time
 import logging
 import requests
@@ -72,6 +73,13 @@ class LighterAdapter(BaseExchangeAdapter):
     primary discovery — we find traders on Hyperliquid first, then check
     if they're also active on Lighter for cross-venue signal validation.
     """
+
+    # ★ H34 FIX: declare funding cadence per adapter so the cross-venue
+    # funding-arb scanner can normalize all rates to a per-hour basis
+    # before computing spreads.  Lighter uses an hourly funding cycle
+    # like Hyperliquid (verified against the docs at lighter.xyz/api).
+    # If their cadence ever changes, override this in config.
+    funding_period_hours: float = 1.0
 
     def __init__(self, config: Optional[Dict] = None):
         super().__init__(
@@ -132,7 +140,23 @@ class LighterAdapter(BaseExchangeAdapter):
                     return None
 
                 resp.raise_for_status()
-                data = resp.json()
+                # ★ M43 FIX: previously resp.json() bubbled out
+                # JSONDecodeError on 2xx responses unhandled -- the
+                # ``except requests.exceptions.*`` blocks below didn't
+                # cover it, so a malformed Lighter response crashed the
+                # whole scanner.  Catch JSONDecodeError explicitly and
+                # treat it the same as a network error: log, mark DOWN,
+                # bump error counter, return None.
+                try:
+                    data = resp.json()
+                except (ValueError, json.JSONDecodeError) as exc:
+                    if not quiet:
+                        logger.warning(
+                            "Lighter JSON parse error on %s: %s (body[:200]=%r)",
+                            path, exc, resp.text[:200] if hasattr(resp, "text") else "",
+                        )
+                    self._error_count += 1
+                    return None
 
                 # Update state on successful response
                 if self.state in (VenueState.INITIALIZED, VenueState.DOWN):
@@ -353,14 +377,49 @@ class LighterAdapter(BaseExchangeAdapter):
                 trades.get("data") or []
             )
 
-            for t in trade_list:
-                # Lighter trades may use account_index not raw address
-                for addr_field in ["taker_account_index", "maker_account_index",
-                                   "takerAddress", "taker", "makerAddress", "maker"]:
-                    addr = str(t.get(addr_field, ""))
-                    if not addr or addr == "0" or addr == "0x0000000000000000000000000000000000000000":
-                        continue
+            # ★ H35 FIX: previously the inner loop iterated all six address
+            # fields per trade and added to address_stats for each one that
+            # was present.  Same trade was double-counted (volume * 6,
+            # trade_count * 6) and -- because the field names referred to
+            # both raw addresses and account-index integers -- the same
+            # trader appeared as multiple phantom rows whenever both
+            # ``taker_account_index=5`` AND ``takerAddress="0xABC..."``
+            # were populated.  Lighter's leaderboard had duplicates with
+            # split volume.
+            #
+            # Fix: pick ONE canonical address per trade per side (taker /
+            # maker).  Prefer the explicit hex address fields over the
+            # account-index integers; bail on the first valid match.  Also
+            # only credit each side once per trade.
+            taker_priority = ["takerAddress", "taker", "taker_account_index"]
+            maker_priority = ["makerAddress", "maker", "maker_account_index"]
 
+            def _first_valid_address(payload: Dict, fields: List[str]) -> str:
+                for field in fields:
+                    raw = payload.get(field)
+                    if raw is None:
+                        continue
+                    addr = str(raw).strip()
+                    if not addr or addr in ("0", "0x0000000000000000000000000000000000000000"):
+                        continue
+                    return addr
+                return ""
+
+            for t in trade_list:
+                taker_addr = _first_valid_address(t, taker_priority)
+                maker_addr = _first_valid_address(t, maker_priority)
+
+                # Try different field names for trade size/price (compute once)
+                size = float(t.get("size", 0) or t.get("base_amount", 0) or
+                            t.get("amount", 0) or 0)
+                price = float(t.get("price", 0) or 0)
+                usd_amount = float(t.get("usd_amount", 0) or t.get("notional", 0) or 0)
+                if not usd_amount and size and price:
+                    usd_amount = size * price
+
+                for addr in {taker_addr, maker_addr}:
+                    if not addr:
+                        continue
                     if addr not in address_stats:
                         address_stats[addr] = {
                             "address": addr,
@@ -368,16 +427,6 @@ class LighterAdapter(BaseExchangeAdapter):
                             "trade_count": 0,
                             "coins_traded": set(),
                         }
-
-                    # Try different field names for trade size/price
-                    size = float(t.get("size", 0) or t.get("base_amount", 0) or
-                                t.get("amount", 0) or 0)
-                    price = float(t.get("price", 0) or 0)
-                    usd_amount = float(t.get("usd_amount", 0) or t.get("notional", 0) or 0)
-
-                    if not usd_amount and size and price:
-                        usd_amount = size * price
-
                     address_stats[addr]["total_volume"] += usd_amount
                     address_stats[addr]["trade_count"] += 1
                     address_stats[addr]["coins_traded"].add(coin)

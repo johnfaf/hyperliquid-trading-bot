@@ -7,6 +7,7 @@ paper-trade reset logic.  Keeps ``main.py`` focused on orchestration.
 Extracted from the bottom ~400 lines of the old monolithic main.py.
 """
 import argparse
+import json
 from datetime import datetime
 
 import config
@@ -265,6 +266,37 @@ def run_cache_clear(logger):
     print(f"Cleared {stats_before['total_candles']:,} candles ({stats_before['db_size_mb']:.1f} MB)")
 
 
+def run_db_audit_cli(args) -> int:
+    from src.data.db_audit import audit_exit_code, format_db_audit_report, run_db_audit
+
+    report = run_db_audit(
+        include_candle_cache=not args.db_audit_no_candle_cache,
+        include_code_scan=not args.db_audit_no_code_scan,
+    )
+    block_severity = str(args.db_audit_block_severity or config.READINESS_DB_AUDIT_BLOCK_SEVERITY)
+    if args.db_audit_json:
+        print(json.dumps(report.to_dict(block_severity=block_severity), indent=2, sort_keys=True))
+    else:
+        print(format_db_audit_report(report, block_severity=block_severity))
+    return audit_exit_code(report, block_severity=block_severity) if args.db_audit_strict else 0
+
+
+def run_db_repair_cli(args) -> int:
+    from src.data.db_audit import format_db_repair_report, run_db_repair
+
+    block_severity = str(args.db_audit_block_severity or config.READINESS_DB_AUDIT_BLOCK_SEVERITY)
+    report = run_db_repair(
+        include_candle_cache=not args.db_audit_no_candle_cache,
+        include_code_scan=not args.db_audit_no_code_scan,
+        repair_live_data=not args.db_repair_no_live_refresh,
+    )
+    if args.db_repair_json:
+        print(json.dumps(report.to_dict(block_severity=block_severity), indent=2, sort_keys=True))
+    else:
+        print(format_db_repair_report(report, block_severity=block_severity))
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # Argument parser
 # ---------------------------------------------------------------------------
@@ -298,6 +330,22 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cbt-no-cache", action="store_true")
     parser.add_argument("--cache-list", action="store_true")
     parser.add_argument("--cache-clear", action="store_true")
+    parser.add_argument("--db-audit", action="store_true",
+                        help="Run read-only database and app-structure audit")
+    parser.add_argument("--db-audit-json", action="store_true",
+                        help="Print --db-audit output as JSON")
+    parser.add_argument("--db-audit-strict", action="store_true",
+                        help="Exit non-zero if --db-audit finds blocking findings")
+    parser.add_argument("--db-audit-block-severity", type=str, default=None,
+                        choices=["low", "medium", "high", "critical"])
+    parser.add_argument("--db-audit-no-candle-cache", action="store_true")
+    parser.add_argument("--db-audit-no-code-scan", action="store_true")
+    parser.add_argument("--db-repair", action="store_true",
+                        help="Run safe database auto-repair and then re-audit")
+    parser.add_argument("--db-repair-json", action="store_true",
+                        help="Print --db-repair output as JSON")
+    parser.add_argument("--db-repair-no-live-refresh", action="store_true",
+                        help="Skip network-backed candle/regime refresh during --db-repair")
     parser.add_argument("--core-only", action="store_true",
                         help="Run with fundable-core profile only (minimal subsystems)")
     return parser

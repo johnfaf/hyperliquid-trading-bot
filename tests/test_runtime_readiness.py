@@ -35,6 +35,7 @@ def _healthy_registry():
 def test_evaluate_readiness_reports_ready_runtime(monkeypatch):
     monkeypatch.setattr(readiness, "_probe_db_readable", lambda: (True, ""))
     monkeypatch.setattr(readiness, "_probe_db_writable", lambda ttl_s=None: (True, ""))
+    monkeypatch.setattr(readiness, "_probe_db_audit", lambda ttl_s=None: (True, {"ok": True}, []))
     monkeypatch.setattr(readiness.db, "get_db_path", lambda: "test.db")
 
     snapshot = readiness.evaluate_readiness(
@@ -53,6 +54,7 @@ def test_evaluate_readiness_reports_ready_runtime(monkeypatch):
 def test_evaluate_readiness_flags_live_deploy_blockers(monkeypatch):
     monkeypatch.setattr(readiness, "_probe_db_readable", lambda: (True, ""))
     monkeypatch.setattr(readiness, "_probe_db_writable", lambda ttl_s=None: (True, ""))
+    monkeypatch.setattr(readiness, "_probe_db_audit", lambda ttl_s=None: (True, {"ok": True}, []))
     monkeypatch.setattr(readiness.db, "get_db_path", lambda: "test.db")
 
     snapshot = readiness.evaluate_readiness(
@@ -80,6 +82,7 @@ def test_evaluate_readiness_flags_live_deploy_blockers(monkeypatch):
 def test_evaluate_readiness_flags_zero_free_margin(monkeypatch):
     monkeypatch.setattr(readiness, "_probe_db_readable", lambda: (True, ""))
     monkeypatch.setattr(readiness, "_probe_db_writable", lambda ttl_s=None: (True, ""))
+    monkeypatch.setattr(readiness, "_probe_db_audit", lambda ttl_s=None: (True, {"ok": True}, []))
     monkeypatch.setattr(readiness.db, "get_db_path", lambda: "test.db")
 
     snapshot = readiness.evaluate_readiness(
@@ -106,6 +109,7 @@ def test_evaluate_readiness_flags_zero_free_margin(monkeypatch):
 def test_evaluate_readiness_flags_stale_trading_heartbeat(monkeypatch):
     monkeypatch.setattr(readiness, "_probe_db_readable", lambda: (True, ""))
     monkeypatch.setattr(readiness, "_probe_db_writable", lambda ttl_s=None: (True, ""))
+    monkeypatch.setattr(readiness, "_probe_db_audit", lambda ttl_s=None: (True, {"ok": True}, []))
     monkeypatch.setattr(readiness.db, "get_db_path", lambda: "test.db")
 
     registry = _healthy_registry()
@@ -122,6 +126,31 @@ def test_evaluate_readiness_flags_stale_trading_heartbeat(monkeypatch):
     assert snapshot["ready"] is False
     assert "stale_trading_heartbeats" in snapshot["reasons"]
     assert "decision_firewall" in snapshot["checks"]["stale_trading_subsystems"]
+
+
+def test_evaluate_readiness_blocks_on_db_audit_findings(monkeypatch):
+    monkeypatch.setattr(readiness, "_probe_db_readable", lambda: (True, ""))
+    monkeypatch.setattr(readiness, "_probe_db_writable", lambda ttl_s=None: (True, ""))
+    monkeypatch.setattr(readiness.db, "get_db_path", lambda: "test.db")
+    monkeypatch.setattr(
+        readiness,
+        "_probe_db_audit",
+        lambda ttl_s=None: (
+            False,
+            {"ok": False, "blocking_finding_count": 1},
+            [{"check": "open_trades_missing_protection", "severity": "high"}],
+        ),
+    )
+
+    snapshot = readiness.evaluate_readiness(
+        container=_FakeContainer({"live_enabled": False}),
+        health_registry=_healthy_registry(),
+        stale_seconds=600,
+    )
+
+    assert snapshot["ready"] is False
+    assert snapshot["checks"]["db_audit_ok"] is False
+    assert "db_audit_high:open_trades_missing_protection" in snapshot["reasons"]
 
 
 def test_health_registry_heartbeat_recovers_from_stale_degradation():

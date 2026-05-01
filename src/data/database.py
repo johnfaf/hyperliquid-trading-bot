@@ -29,6 +29,26 @@ from src.core.env_utils import safe_env_float
 
 logger = logging.getLogger(__name__)
 _TRADER_ADDRESS_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
+_FIXTURE_ADDRESS_MARKERS = (
+    "alpha_momentum",
+    "bravo_reversion",
+    "charlie_swing",
+    "sample_data",
+    "seed_",
+)
+_FIXTURE_STRATEGY_MARKERS = (
+    "alpha_momentum",
+    "bravo_reversion",
+    "charlie_swing",
+    "sample_data",
+    "seed_",
+    "demo",
+    "fixture",
+)
+_LEARNING_SEED_TABLES = frozenset({
+    "continuous_learning_policies",
+    "source_inventory",
+})
 
 # Resolved once at import — config.py already tested writability
 _DB_PATH = config.DB_PATH
@@ -51,6 +71,74 @@ def _is_valid_trader_address(address) -> bool:
     if not isinstance(address, str):
         return False
     return bool(_TRADER_ADDRESS_RE.match(address.strip()))
+
+
+def is_valid_trader_address(address) -> bool:
+    """Public wrapper used by source filters outside the DB module."""
+    return _is_valid_trader_address(address)
+
+
+def _loads_json_dict(raw) -> dict:
+    if isinstance(raw, dict):
+        return dict(raw)
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+        return dict(parsed) if isinstance(parsed, dict) else {}
+    except Exception:
+        return {}
+
+
+def _looks_like_fixture_address(address) -> bool:
+    text = str(address or "").strip().lower()
+    if not text:
+        return True
+    return any(marker in text for marker in _FIXTURE_ADDRESS_MARKERS)
+
+
+def _strategy_parameters(strategy: dict) -> dict:
+    return _loads_json_dict((strategy or {}).get("parameters"))
+
+
+def strategy_quarantine_reason(strategy: dict) -> Optional[str]:
+    """Return why a strategy must not be used for live selection, or None."""
+    strategy = dict(strategy or {})
+    params = _strategy_parameters(strategy)
+    name = str(strategy.get("name") or "").strip().lower()
+    description = str(strategy.get("description") or "").strip().lower()
+    strategy_type = str(strategy.get("strategy_type") or "").strip().lower()
+    combined = " ".join([name, description, json.dumps(params, sort_keys=True).lower()])
+
+    if strategy_type == "retired_placeholder" or params.get("auto_repaired"):
+        return "auto_repaired_placeholder"
+    if any(marker in combined for marker in _FIXTURE_STRATEGY_MARKERS):
+        return "fixture_or_demo_strategy"
+
+    source_wallet = (
+        params.get("source_wallet")
+        or params.get("trader_address")
+        or params.get("source_trader")
+    )
+    if not source_wallet:
+        return "missing_source_wallet"
+    if not _is_valid_trader_address(str(source_wallet).strip()):
+        return "invalid_source_wallet"
+    try:
+        bot_score = float(params.get("source_wallet_bot_score", 0) or 0)
+    except (TypeError, ValueError):
+        bot_score = 0.0
+    try:
+        bot_threshold = float(getattr(config, "BOT_THRESHOLD", 3))
+    except (TypeError, ValueError):
+        bot_threshold = 3.0
+    if bot_score >= bot_threshold:
+        return "source_wallet_bot_like"
+    return None
+
+
+def is_strategy_live_eligible(strategy: dict) -> bool:
+    return strategy_quarantine_reason(strategy) is None
 
 
 def _merge_quarantine_metadata(metadata, *, reason: str) -> dict:
@@ -112,6 +200,79 @@ def table_exists(name: str) -> bool:
         return row is not None
 
 
+def _postgres_learning_seed_schema_ready() -> bool:
+    """Return True when Postgres has the tables needed by startup seeding."""
+    if config.DB_BACKEND not in ("postgres", "dualwrite"):
+        return True
+
+    conn = None
+    try:
+        from src.data.db.postgres import (
+            get_connection as get_pg_connection,
+            get_postgres_config_error,
+            return_connection as return_pg_connection,
+        )
+
+        config_error = get_postgres_config_error(config.DB_BACKEND, config.POSTGRES_DSN)
+        if config_error:
+            logger.debug("Continuous-learning Postgres schema check skipped: %s", config_error)
+            return False
+
+        table_names = tuple(sorted(_LEARNING_SEED_TABLES))
+        placeholders = ", ".join(["%s"] * len(table_names))
+        conn = get_pg_connection()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT table_name FROM information_schema.tables "
+            "WHERE table_schema = 'public' "
+            f"AND table_name IN ({placeholders})",
+            table_names,
+        )
+        rows = cur.fetchall()
+        existing = {
+            (row.get("table_name") if hasattr(row, "get") else row[0])
+            for row in rows
+        }
+        return _LEARNING_SEED_TABLES.issubset(existing)
+    except Exception as exc:
+        logger.debug("Continuous-learning Postgres schema check failed: %s", exc)
+        return False
+    finally:
+        if conn is not None:
+            try:
+                return_pg_connection(conn)
+            except Exception:
+                pass
+
+
+def _seed_continuous_learning_defaults() -> None:
+    """Seed Phase 0 policy and source inventory without blocking startup."""
+    try:
+        from src.learning.policy_registry import ensure_champion_policy
+        from src.learning.source_inventory import seed_source_inventory
+
+        mirror_to_postgres = True
+        if config.DB_BACKEND in ("postgres", "dualwrite"):
+            schema_ready = _postgres_learning_seed_schema_ready()
+            if config.DB_BACKEND == "postgres" and not schema_ready:
+                logger.warning(
+                    "Continuous-learning default seed skipped: Postgres learning "
+                    "schema is missing. Check pending migrations before trading."
+                )
+                return
+            if config.DB_BACKEND == "dualwrite" and not schema_ready:
+                mirror_to_postgres = False
+                logger.warning(
+                    "Continuous-learning Postgres schema unavailable; seeding "
+                    "SQLite only until migrations succeed."
+                )
+
+        ensure_champion_policy(mirror_to_postgres=mirror_to_postgres)
+        seed_source_inventory(mirror_to_postgres=mirror_to_postgres)
+    except Exception as exc:
+        logger.debug("Continuous-learning default seed skipped: %s", exc)
+
+
 def init_db():
     """Create all tables if they don't exist.
 
@@ -124,6 +285,8 @@ def init_db():
         init_postgres_schema()
 
     if _is_pg():
+        _seed_continuous_learning_defaults()
+        quarantine_contaminated_runtime_data()
         return
 
     # H5 (audit): pre-migrate an existing SQLite database to add the
@@ -303,6 +466,15 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_audit_action ON audit_trail(action);
         CREATE INDEX IF NOT EXISTS idx_audit_coin ON audit_trail(coin);
         """)
+        try:
+            from src.learning.schema import ensure_sqlite_schema
+
+            ensure_sqlite_schema(conn)
+        except Exception as exc:
+            logger.debug("Continuous-learning SQLite schema skipped: %s", exc)
+
+    _seed_continuous_learning_defaults()
+    quarantine_contaminated_runtime_data()
 
 
 # ─── Trader CRUD ───────────────────────────────────────────────
@@ -406,6 +578,112 @@ def quarantine_invalid_traders() -> list[str]:
             len(invalid),
         )
     return invalid
+
+
+def quarantine_invalid_golden_wallets() -> list[str]:
+    """Disconnect malformed or fixture golden-wallet rows from live use."""
+    if not table_exists("golden_wallets"):
+        return []
+    quarantined: list[str] = []
+    with get_connection() as conn:
+        try:
+            rows = conn.execute(
+                "SELECT address FROM golden_wallets "
+                "WHERE is_golden = ? OR connected_to_live = ?",
+                (True, True),
+            ).fetchall()
+        except Exception as exc:
+            logger.debug("quarantine_invalid_golden_wallets skipped: %s", exc)
+            return []
+
+        for row in rows:
+            address = str(row["address"] if hasattr(row, "keys") else row[0] or "").strip()
+            if _is_valid_trader_address(address) and not _looks_like_fixture_address(address):
+                continue
+            try:
+                conn.execute(
+                    "UPDATE golden_wallets "
+                    "SET connected_to_live = ?, is_golden = ?, bot_score = ? "
+                    "WHERE address = ?",
+                    (False, False, 10, address),
+                )
+            except Exception:
+                conn.execute(
+                    "UPDATE golden_wallets SET connected_to_live = ?, is_golden = ? "
+                    "WHERE address = ?",
+                    (False, False, address),
+                )
+            quarantined.append(address)
+
+    if quarantined:
+        logger.warning(
+            "Quarantined %d invalid/fixture golden wallet row(s) from live use",
+            len(quarantined),
+        )
+    return quarantined
+
+
+def quarantine_invalid_strategies() -> list[dict]:
+    """Deactivate active strategies that are seeded, synthetic, or untraceable."""
+    if not table_exists("strategies"):
+        return []
+    now = datetime.now(timezone.utc).isoformat()
+    quarantined: list[dict] = []
+    with get_connection() as conn:
+        try:
+            rows = conn.execute(
+                "SELECT * FROM strategies WHERE active = ?",
+                (True,),
+            ).fetchall()
+        except Exception as exc:
+            logger.debug("quarantine_invalid_strategies skipped: %s", exc)
+            return []
+
+        for row in rows:
+            strategy = dict(row)
+            reason = strategy_quarantine_reason(strategy)
+            if not reason:
+                continue
+            conn.execute(
+                "UPDATE strategies SET active = ?, current_score = ?, last_scored = ? "
+                "WHERE id = ?",
+                (False, 0.0, now, strategy.get("id")),
+            )
+            quarantined.append({
+                "id": strategy.get("id"),
+                "name": strategy.get("name"),
+                "reason": reason,
+            })
+
+    if quarantined:
+        logger.warning(
+            "Quarantined %d invalid/fixture active strategy row(s): %s",
+            len(quarantined),
+            ", ".join(str(item["name"]) for item in quarantined[:5]),
+        )
+    return quarantined
+
+
+def quarantine_contaminated_runtime_data() -> dict:
+    """Run all runtime data quarantines used before strategy/live selection."""
+    summary = {
+        "invalid_traders": [],
+        "invalid_golden_wallets": [],
+        "invalid_strategies": [],
+    }
+    try:
+        summary["invalid_traders"] = quarantine_invalid_traders()
+    except Exception as exc:
+        logger.debug("Invalid trader quarantine skipped: %s", exc)
+    try:
+        summary["invalid_golden_wallets"] = quarantine_invalid_golden_wallets()
+    except Exception as exc:
+        logger.debug("Invalid golden-wallet quarantine skipped: %s", exc)
+    try:
+        summary["invalid_strategies"] = quarantine_invalid_strategies()
+    except Exception as exc:
+        logger.debug("Invalid strategy quarantine skipped: %s", exc)
+    return summary
 
 
 def _get_sqlite_strategy_row(strategy_id):
@@ -633,17 +911,136 @@ def update_strategy_score(strategy_id, score):
         """, (score, now, strategy_id))
 
 
-def get_active_strategies():
-    with get_connection() as conn:
+def get_active_strategies(validated_only: bool = True):
+    with get_connection(for_read=True) as conn:
         rows = conn.execute(
             "SELECT * FROM strategies WHERE active = ? ORDER BY current_score DESC",
             (True,),
         ).fetchall()
-    return [dict(r) for r in rows]
+    strategies = [dict(r) for r in rows]
+    if not validated_only:
+        return strategies
+
+    valid = []
+    rejected = []
+    for strategy in strategies:
+        reason = strategy_quarantine_reason(strategy)
+        if reason:
+            rejected.append((strategy.get("name"), reason))
+            continue
+        valid.append(strategy)
+    if rejected:
+        logger.warning(
+            "Filtered %d active strategy row(s) from live selection: %s",
+            len(rejected),
+            ", ".join(f"{name}:{reason}" for name, reason in rejected[:5]),
+        )
+    return valid
+
+
+def get_strategy_runtime_status() -> dict:
+    """Return strategy table health without weakening live eligibility checks."""
+    if not table_exists("strategies"):
+        return {
+            "table_exists": False,
+            "total": 0,
+            "active_raw": 0,
+            "active_valid": 0,
+            "active_invalid": 0,
+            "inactive_valid": 0,
+            "inactive_invalid": 0,
+            "invalid_reasons": {},
+        }
+
+    with get_connection(for_read=True) as conn:
+        rows = conn.execute("SELECT * FROM strategies").fetchall()
+
+    status = {
+        "table_exists": True,
+        "total": 0,
+        "active_raw": 0,
+        "active_valid": 0,
+        "active_invalid": 0,
+        "inactive_valid": 0,
+        "inactive_invalid": 0,
+        "invalid_reasons": {},
+    }
+    for row in rows:
+        strategy = dict(row)
+        status["total"] += 1
+        is_active = bool(strategy.get("active"))
+        reason = strategy_quarantine_reason(strategy)
+        if is_active:
+            status["active_raw"] += 1
+            if reason:
+                status["active_invalid"] += 1
+            else:
+                status["active_valid"] += 1
+        elif reason:
+            status["inactive_invalid"] += 1
+        else:
+            status["inactive_valid"] += 1
+        if reason:
+            reasons = status["invalid_reasons"]
+            reasons[reason] = int(reasons.get(reason, 0)) + 1
+    return status
+
+
+def recover_valid_inactive_strategies(limit: int = None) -> list[dict]:
+    """Reactivate a small set of valid inactive strategies after quarantine.
+
+    The contamination guard intentionally deactivates seeded/demo/bot-like
+    strategy rows.  A separate failure mode showed up in live logs: once every
+    active row is quarantined, valid rows that were inactive from a previous
+    scoring pass never get rescored, leaving the strategy engine permanently
+    empty.  This recovery path only reactivates rows that still pass
+    ``strategy_quarantine_reason`` and therefore keeps the live-data guardrail
+    intact.
+    """
+    if not table_exists("strategies"):
+        return []
+    if limit is None:
+        limit = max(1, int(getattr(config, "MIN_ACTIVE_STRATEGIES", 5) or 5))
+    limit = max(1, int(limit))
+
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT * FROM strategies
+            WHERE active = ?
+            ORDER BY current_score DESC, discovered_at DESC
+            """,
+            (False,),
+        ).fetchall()
+
+        recovered: list[dict] = []
+        for row in rows:
+            strategy = dict(row)
+            if strategy_quarantine_reason(strategy):
+                continue
+            recovered.append(strategy)
+            if len(recovered) >= limit:
+                break
+
+        if not recovered:
+            return []
+
+        now = datetime.now(timezone.utc).isoformat()
+        for strategy in recovered:
+            conn.execute(
+                "UPDATE strategies SET active = ?, last_scored = ? WHERE id = ?",
+                (True, now, strategy["id"]),
+            )
+
+    logger.warning(
+        "Recovered %d valid inactive strategy row(s) for rescoring after active set went empty",
+        len(recovered),
+    )
+    return recovered
 
 
 def get_strategy(strategy_id):
-    with get_connection() as conn:
+    with get_connection(for_read=True) as conn:
         row = conn.execute("SELECT * FROM strategies WHERE id = ?", (strategy_id,)).fetchone()
     return dict(row) if row else None
 
@@ -665,7 +1062,7 @@ def save_strategy_score(strategy_id, score, pnl_score=0, win_rate_score=0,
 
 
 def get_strategy_score_history(strategy_id, limit=30):
-    with get_connection() as conn:
+    with get_connection(for_read=True) as conn:
         rows = conn.execute("""
             SELECT * FROM strategy_scores
             WHERE strategy_id = ?
@@ -763,6 +1160,22 @@ def update_paper_account(balance, total_pnl, total_trades, winning_trades):
             raise LookupError("paper_account singleton row (id=1) does not exist")
 
 
+def _normalize_trade_side_value(side) -> str:
+    raw = side.value if hasattr(side, "value") else side
+    return str(raw or "").strip().lower()
+
+
+def _normalize_coin_value(coin) -> str:
+    return str(coin or "").strip().upper()
+
+
+def _same_side_open_trade_limit() -> int:
+    try:
+        return max(1, int(getattr(config, "FIREWALL_MAX_SAME_SIDE_POSITIONS_PER_COIN", 2) or 2))
+    except (TypeError, ValueError):
+        return 2
+
+
 def open_paper_trade(strategy_id, coin, side, entry_price, size, leverage=1,
                      stop_loss=None, take_profit=None, metadata=None,
                      idempotency_key: Optional[str] = None):
@@ -803,6 +1216,29 @@ def open_paper_trade(strategy_id, coin, side, entry_price, size, leverage=1,
                     key[:40], existing["id"],
                 )
                 return int(existing["id"])
+
+        normalized_coin = _normalize_coin_value(coin)
+        normalized_side = _normalize_trade_side_value(side)
+        same_side_limit = _same_side_open_trade_limit()
+        same_side_count_row = conn.execute(
+            """
+            SELECT COUNT(*) AS c
+            FROM paper_trades
+            WHERE LOWER(COALESCE(status, '')) = 'open'
+              AND UPPER(COALESCE(coin, '')) = ?
+              AND LOWER(COALESCE(side, '')) = ?
+            """,
+            (normalized_coin, normalized_side),
+        ).fetchone()
+        same_side_count = int(
+            (same_side_count_row["c"] if hasattr(same_side_count_row, "keys") else same_side_count_row[0])
+            or 0
+        )
+        if same_side_count >= same_side_limit:
+            raise ValueError(
+                f"Pyramiding blocked for {normalized_coin} {normalized_side}: "
+                f"{same_side_count} open positions already exist (limit={same_side_limit})"
+            )
 
         try:
             return _insert_and_get_id(conn, """
@@ -1195,19 +1631,73 @@ def backup_to_json(filepath: str = None):
         try:
             with get_connection() as conn:
                 if table_exists("golden_wallets"):
-                    rows = conn.execute(
-                        "SELECT * FROM golden_wallets ORDER BY penalised_pnl DESC"
-                    ).fetchall()
+                    include_curves = bool(
+                        getattr(config, "HL_BOT_BACKUP_INCLUDE_EQUITY_CURVES", False)
+                    )
+                    columns = [
+                        "address",
+                        "bot_score",
+                        "total_fills",
+                        "raw_pnl",
+                        "penalised_pnl",
+                        "max_drawdown_pct",
+                        "penalised_max_drawdown_pct",
+                        "sharpe_ratio",
+                        "win_rate",
+                        "trades_per_day",
+                        "is_golden",
+                        "coins_traded",
+                        "best_coin",
+                        "worst_coin",
+                        "evaluated_at",
+                        "connected_to_live",
+                    ]
+                    if include_curves:
+                        columns.extend([
+                            "raw_equity_curve",
+                            "penalised_equity_curve",
+                            "equity_timestamps",
+                        ])
+                    max_wallets = int(
+                        getattr(config, "HL_BOT_BACKUP_MAX_GOLDEN_WALLETS", 200) or 0
+                    )
+                    sql = (
+                        "SELECT " + ", ".join(columns) +
+                        " FROM golden_wallets ORDER BY penalised_pnl DESC"
+                    )
+                    params = ()
+                    if max_wallets > 0:
+                        sql += " LIMIT ?"
+                        params = (max_wallets,)
+                    rows = conn.execute(sql, params).fetchall()
                     data["golden_wallets"] = [dict(r) for r in rows]
 
                 if table_exists("wallet_fills"):
-                    # Only backup fills from golden wallets (not all fills)
-                    rows = conn.execute("""
-                        SELECT wf.* FROM wallet_fills wf
-                        JOIN golden_wallets gw ON wf.wallet_address = gw.address
-                        WHERE gw.is_golden = 1
-                        ORDER BY wf.time_ms
-                    """).fetchall()
+                    # Only backup fills from golden wallets (not all fills).
+                    # Cap newest rows by default: this file is written every
+                    # reporting cycle, and unbounded wallet_fills made live
+                    # backups hundreds of MB with no execution benefit.
+                    max_fills = int(
+                        getattr(config, "HL_BOT_BACKUP_MAX_WALLET_FILLS", 5000) or 0
+                    )
+                    if max_fills > 0:
+                        rows = conn.execute("""
+                            SELECT * FROM (
+                                SELECT wf.* FROM wallet_fills wf
+                                JOIN golden_wallets gw ON wf.wallet_address = gw.address
+                                WHERE gw.is_golden = 1
+                                ORDER BY wf.time_ms DESC
+                                LIMIT ?
+                            ) recent_fills
+                            ORDER BY time_ms
+                        """, (max_fills,)).fetchall()
+                    else:
+                        rows = conn.execute("""
+                            SELECT wf.* FROM wallet_fills wf
+                            JOIN golden_wallets gw ON wf.wallet_address = gw.address
+                            WHERE gw.is_golden = 1
+                            ORDER BY wf.time_ms
+                        """).fetchall()
                     data["wallet_fills"] = [dict(r) for r in rows]
 
                 if table_exists("calibration_records"):
@@ -1223,7 +1713,7 @@ def backup_to_json(filepath: str = None):
         # deploys.  Truncated bot_backup.json has caused real data loss.
         tmp_path = f"{filepath}.tmp"
         with open(tmp_path, "w") as f:
-            json.dump(data, f)
+            json.dump(data, f, separators=(",", ":"), default=str)
             f.flush()
             try:
                 os.fsync(f.fileno())

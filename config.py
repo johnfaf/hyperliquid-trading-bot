@@ -82,16 +82,74 @@ else:
     DB_BACKEND = _raw_db_backend
 POSTGRES_POOL_MIN = int(os.environ.get("POSTGRES_POOL_MIN", 2))
 POSTGRES_POOL_MAX = int(os.environ.get("POSTGRES_POOL_MAX", 10))
+POSTGRES_POOL_TIMEOUT_SEC = float(os.environ.get("POSTGRES_POOL_TIMEOUT_SEC", 3.0))
+POSTGRES_CONNECT_TIMEOUT_SEC = int(float(os.environ.get("POSTGRES_CONNECT_TIMEOUT_SEC", 3)))
 POSTGRES_STATEMENT_TIMEOUT_MS = int(os.environ.get("POSTGRES_STATEMENT_TIMEOUT_MS", 5000))
 POSTGRES_APP_NAME = os.environ.get("POSTGRES_APP_NAME", "hyperliquid-bot").strip()
+
+# Runtime DB audit/readiness guardrails. The audit is read-only; readiness
+# blocks when findings at or above READINESS_DB_AUDIT_BLOCK_SEVERITY are found.
+READINESS_DB_AUDIT_ENABLED = os.environ.get(
+    "READINESS_DB_AUDIT_ENABLED", "true"
+).lower() in ("true", "1", "yes")
+READINESS_DB_AUDIT_TTL_S = int(os.environ.get("READINESS_DB_AUDIT_TTL_S", 300))
+READINESS_DB_AUDIT_BLOCK_SEVERITY = os.environ.get(
+    "READINESS_DB_AUDIT_BLOCK_SEVERITY", "high"
+).strip().lower()
+if READINESS_DB_AUDIT_BLOCK_SEVERITY not in {"low", "medium", "high", "critical"}:
+    READINESS_DB_AUDIT_BLOCK_SEVERITY = "high"
+DB_AUDIT_PENDING_DECISION_MAX_AGE_MINUTES = float(
+    os.environ.get("DB_AUDIT_PENDING_DECISION_MAX_AGE_MINUTES", 30.0)
+)
+DB_AUDIT_REGIME_MAX_AGE_HOURS = float(
+    os.environ.get("DB_AUDIT_REGIME_MAX_AGE_HOURS", 24.0)
+)
+DB_AUDIT_NON_ACTIVE_REGIME_RETENTION_DAYS = float(
+    os.environ.get("DB_AUDIT_NON_ACTIVE_REGIME_RETENTION_DAYS", 7.0)
+)
+DB_AUDIT_SOURCE_STALE_MULTIPLIER = float(
+    os.environ.get("DB_AUDIT_SOURCE_STALE_MULTIPLIER", 2.0)
+)
+SOURCE_HEALTH_SNAPSHOT_INTERVAL_S = int(
+    os.environ.get("SOURCE_HEALTH_SNAPSHOT_INTERVAL_S", 60)
+)
+DB_AUDIT_MIN_CANDLE_COINS = int(os.environ.get("DB_AUDIT_MIN_CANDLE_COINS", 2))
+DB_AUDIT_DUALWRITE_HEALTH_WINDOW_S = float(
+    os.environ.get("DB_AUDIT_DUALWRITE_HEALTH_WINDOW_S", 300.0)
+)
+DB_AUDIT_DUALWRITE_MAX_FAILURES = int(
+    os.environ.get("DB_AUDIT_DUALWRITE_MAX_FAILURES", 5)
+)
+DB_SAFE_AUTO_REPAIR_ON_BOOT = os.environ.get(
+    "DB_SAFE_AUTO_REPAIR_ON_BOOT", "true"
+).lower() in ("true", "1", "yes")
+DB_REPAIR_KEEP_MISSING_SOURCE_STRATEGIES = int(
+    os.environ.get("DB_REPAIR_KEEP_MISSING_SOURCE_STRATEGIES", 500)
+)
+DB_REPAIR_STARTUP_STRATEGY_PRUNE_LIMIT = int(
+    os.environ.get("DB_REPAIR_STARTUP_STRATEGY_PRUNE_LIMIT", 1000)
+)
+BOOT_DB_AUDIT_INCLUDE_CANDLE_CACHE = os.environ.get(
+    "BOOT_DB_AUDIT_INCLUDE_CANDLE_CACHE", "false"
+).lower() in ("true", "1", "yes")
 
 # ─── Feature Store (Postgres-only, auto-enabled when POSTGRES_DSN set) ─
 FEATURE_STORE_COINS = os.environ.get("FEATURE_STORE_COINS", "").strip()
 FEATURE_STORE_MAX_COINS = int(os.environ.get("FEATURE_STORE_MAX_COINS", 30))
+FEATURE_STORE_BOOTSTRAP_TOP_COINS = int(os.environ.get("FEATURE_STORE_BOOTSTRAP_TOP_COINS", 8))
 FEATURE_STORE_BACKFILL_5M_DAYS = int(os.environ.get("FEATURE_STORE_BACKFILL_5M_DAYS", 7))
 FEATURE_STORE_BACKFILL_1H_DAYS = int(os.environ.get("FEATURE_STORE_BACKFILL_1H_DAYS", 30))
 FEATURE_STORE_BACKFILL_4H_DAYS = int(os.environ.get("FEATURE_STORE_BACKFILL_4H_DAYS", 90))
 FEATURE_STORE_BACKFILL_1D_DAYS = int(os.environ.get("FEATURE_STORE_BACKFILL_1D_DAYS", 365))
+
+# Runtime backup size guard.  Wallet fills are the largest backup component;
+# keeping the newest rows preserves redeploy continuity without writing a
+# hundreds-of-MB JSON file on every reporting cycle.  Set 0 to disable capping.
+HL_BOT_BACKUP_MAX_WALLET_FILLS = int(os.environ.get("HL_BOT_BACKUP_MAX_WALLET_FILLS", 5000))
+HL_BOT_BACKUP_MAX_GOLDEN_WALLETS = int(os.environ.get("HL_BOT_BACKUP_MAX_GOLDEN_WALLETS", 200))
+HL_BOT_BACKUP_INCLUDE_EQUITY_CURVES = os.environ.get(
+    "HL_BOT_BACKUP_INCLUDE_EQUITY_CURVES", "false"
+).lower() in ("true", "1", "yes")
 
 # Dynamic risk policy engine
 RISK_POLICY_DEFAULT_REWARD_MULTIPLE = float(
@@ -172,6 +230,21 @@ RISK_POLICY_FIXED_R_TARGET = float(
 RISK_POLICY_HYBRID_MIN_R_FLOOR = float(
     os.environ.get("RISK_POLICY_HYBRID_MIN_R_FLOOR", 5.0)
 )
+RISK_POLICY_SHORT_CAUTION_ENABLED = os.environ.get(
+    "RISK_POLICY_SHORT_CAUTION_ENABLED", "true"
+).lower() in ("true", "1", "yes")
+RISK_POLICY_SHORT_CAUTION_CONFIDENCE_THRESHOLD = float(
+    os.environ.get("RISK_POLICY_SHORT_CAUTION_CONFIDENCE_THRESHOLD", 0.60)
+)
+RISK_POLICY_SHORT_CAUTION_MAX_REWARD_MULTIPLE = float(
+    os.environ.get("RISK_POLICY_SHORT_CAUTION_MAX_REWARD_MULTIPLE", 3.0)
+)
+RISK_POLICY_SHORT_CAUTION_TIME_LIMIT_MULTIPLIER = float(
+    os.environ.get("RISK_POLICY_SHORT_CAUTION_TIME_LIMIT_MULTIPLIER", 0.75)
+)
+RISK_POLICY_SHORT_CAUTION_BREAKEVEN_AT_R = float(
+    os.environ.get("RISK_POLICY_SHORT_CAUTION_BREAKEVEN_AT_R", 0.65)
+)
 
 # ─── Macro Regime Overlay ────────────────────────────────────────
 # Protective regime that scrapes external macro sources and adjusts risk posture
@@ -246,6 +319,24 @@ PAPER_TRADING_SLIPPAGE_MAX_BPS = float(os.environ.get("PAPER_TRADING_SLIPPAGE_MA
 PAPER_TRADING_FUNDING_ENABLED = os.environ.get(
     "PAPER_TRADING_FUNDING_ENABLED", "true"
 ).lower() in ("true", "1", "yes")
+PAPER_EXECUTION_MAX_TRADES_PER_CYCLE = int(
+    os.environ.get("PAPER_EXECUTION_MAX_TRADES_PER_CYCLE", 3)
+)
+TRADE_QUALITY_FEE_EV_GATE_ENABLED = os.environ.get(
+    "TRADE_QUALITY_FEE_EV_GATE_ENABLED", "true"
+).lower() in ("true", "1", "yes")
+TRADE_QUALITY_MIN_EDGE_COST_MULTIPLE = float(
+    os.environ.get("TRADE_QUALITY_MIN_EDGE_COST_MULTIPLE", 1.5)
+)
+TRADE_QUALITY_EXPECTED_SLIPPAGE_BPS = float(
+    os.environ.get("TRADE_QUALITY_EXPECTED_SLIPPAGE_BPS", PAPER_TRADING_SLIPPAGE_MAX_BPS)
+)
+TRADE_QUALITY_SHORT_MIN_CONFIDENCE = float(
+    os.environ.get("TRADE_QUALITY_SHORT_MIN_CONFIDENCE", 0.55)
+)
+TRADE_QUALITY_STRONG_SHORT_CONFIRMATION = os.environ.get(
+    "TRADE_QUALITY_STRONG_SHORT_CONFIRMATION", "true"
+).lower() in ("true", "1", "yes")
 
 # Live trading wallet / secret-management controls.
 # Agent-wallet-only mode: signer key must be for a delegated agent wallet, and
@@ -269,6 +360,7 @@ LIVE_TRADING_DUAL_CONTROL_CONFIRM = os.environ.get(
 # The helper logs a warning and falls back to the module default rather
 # than raising ValueError at import time.
 from src.core.env_utils import (  # noqa: E402 -- must follow sys.path setup above
+    safe_env_bool as _safe_env_bool,
     safe_env_float as _safe_env_float,
     safe_env_int as _safe_env_int,
 )
@@ -319,6 +411,22 @@ LIVE_CANARY_MAX_SIGNALS_PER_DAY = _safe_env_int(
 LIVE_MAX_ORDERS_PER_SOURCE_PER_DAY = int(
     os.environ.get("LIVE_MAX_ORDERS_PER_SOURCE_PER_DAY", 0)
 )
+LIVE_RISK_SIZING_ENABLED = _safe_env_bool("LIVE_RISK_SIZING_ENABLED", True)
+LIVE_RISK_PER_TRADE_PCT = _safe_env_float(
+    "LIVE_RISK_PER_TRADE_PCT", 0.0075, lo=0.0, hi=0.25,
+)
+LIVE_MAX_MARGIN_PER_ORDER_PCT = _safe_env_float(
+    "LIVE_MAX_MARGIN_PER_ORDER_PCT", 0.12, lo=0.0, hi=1.0,
+)
+LIVE_MIN_MARGIN_PER_ORDER_USD = _safe_env_float(
+    "LIVE_MIN_MARGIN_PER_ORDER_USD", 0.0, lo=0.0, hi=1_000_000.0,
+)
+LIVE_DYNAMIC_SOURCE_CAPS_ALLOW_STATIC_EXPANSION = _safe_env_bool(
+    "LIVE_DYNAMIC_SOURCE_CAPS_ALLOW_STATIC_EXPANSION", False,
+)
+LIVE_ORDER_HYGIENE_AUDIT_INTERVAL_CYCLES = _safe_env_int(
+    "LIVE_ORDER_HYGIENE_AUDIT_INTERVAL_CYCLES", 5, lo=1, hi=100_000,
+)
 LIVE_MIN_ORDER_TOP_TIER_ENABLED = os.environ.get(
     "LIVE_MIN_ORDER_TOP_TIER_ENABLED", "true"
 ).lower() in ("true", "1", "yes")
@@ -331,6 +439,12 @@ LIVE_MIN_ORDER_TOP_TIER_MAX_BUMP_MULTIPLIER = float(
 LIVE_MIN_ORDER_ALLOW_DEGRADED_SOURCES = os.environ.get(
     "LIVE_MIN_ORDER_ALLOW_DEGRADED_SOURCES", "false"
 ).lower() in ("true", "1", "yes")
+LIVE_MIN_ORDER_ALLOW_POLICY_ERROR_FLOORUP = os.environ.get(
+    "LIVE_MIN_ORDER_ALLOW_POLICY_ERROR_FLOORUP", "false"
+).lower() in ("true", "1", "yes")
+LIVE_MIN_ORDER_SHORT_MIN_CONFIDENCE = float(
+    os.environ.get("LIVE_MIN_ORDER_SHORT_MIN_CONFIDENCE", 0.75)
+)
 LIVE_MIN_ORDER_SAME_SIDE_MERGE_ENABLED = os.environ.get(
     "LIVE_MIN_ORDER_SAME_SIDE_MERGE_ENABLED", "true"
 ).lower() in ("true", "1", "yes")
@@ -358,6 +472,27 @@ COPY_TRADER_AUTO_PAUSE_BLOCK_WIN_RATE = float(
 )
 COPY_TRADER_AUTO_PAUSE_BLOCK_NET_PNL = float(
     os.environ.get("COPY_TRADER_AUTO_PAUSE_BLOCK_NET_PNL", -25.0)
+)
+COPY_TRADER_SOURCE_SIDE_GUARD_ENABLED = os.environ.get(
+    "COPY_TRADER_SOURCE_SIDE_GUARD_ENABLED", "true"
+).lower() in ("true", "1", "yes")
+COPY_TRADER_SOURCE_SIDE_MIN_CLOSED_TRADES = int(
+    os.environ.get("COPY_TRADER_SOURCE_SIDE_MIN_CLOSED_TRADES", 3)
+)
+COPY_TRADER_SOURCE_SIDE_DEGRADE_WIN_RATE = float(
+    os.environ.get("COPY_TRADER_SOURCE_SIDE_DEGRADE_WIN_RATE", 0.45)
+)
+COPY_TRADER_SOURCE_SIDE_BLOCK_WIN_RATE = float(
+    os.environ.get("COPY_TRADER_SOURCE_SIDE_BLOCK_WIN_RATE", 0.35)
+)
+COPY_TRADER_SOURCE_SIDE_BLOCK_NET_PNL = float(
+    os.environ.get("COPY_TRADER_SOURCE_SIDE_BLOCK_NET_PNL", -0.25)
+)
+COPY_TRADER_SOURCE_SIDE_CONFIDENCE_MULTIPLIER = float(
+    os.environ.get("COPY_TRADER_SOURCE_SIDE_CONFIDENCE_MULTIPLIER", 0.75)
+)
+COPY_TRADER_SOURCE_SIDE_SIZE_MULTIPLIER = float(
+    os.environ.get("COPY_TRADER_SOURCE_SIDE_SIZE_MULTIPLIER", 0.50)
 )
 LIVE_EXTERNAL_KILL_SWITCH_FILE = os.environ.get("LIVE_EXTERNAL_KILL_SWITCH_FILE", "").strip()
 LIVE_KILL_SWITCH_STATE_FILE = os.environ.get("LIVE_KILL_SWITCH_STATE_FILE", "/data/live_kill_switch_state.json").strip()
@@ -457,6 +592,24 @@ SHORT_HARDENING_CONFIDENCE_MULTIPLIER = float(
     os.environ.get("SHORT_HARDENING_CONFIDENCE_MULTIPLIER", 0.80)
 )
 SHORT_HARDENING_SIZE_MULTIPLIER = float(os.environ.get("SHORT_HARDENING_SIZE_MULTIPLIER", 0.50))
+SHORT_HARDENING_SOURCE_GUARD_ENABLED = os.environ.get(
+    "SHORT_HARDENING_SOURCE_GUARD_ENABLED", "true"
+).lower() in ("true", "1", "yes")
+SHORT_HARDENING_SOURCE_MIN_CLOSED_TRADES = int(
+    os.environ.get("SHORT_HARDENING_SOURCE_MIN_CLOSED_TRADES", 3)
+)
+SHORT_HARDENING_SOURCE_BLOCK_NET_PNL = float(
+    os.environ.get("SHORT_HARDENING_SOURCE_BLOCK_NET_PNL", -0.25)
+)
+SHORT_HARDENING_COIN_GUARD_ENABLED = os.environ.get(
+    "SHORT_HARDENING_COIN_GUARD_ENABLED", "true"
+).lower() in ("true", "1", "yes")
+SHORT_HARDENING_COIN_MIN_CLOSED_TRADES = int(
+    os.environ.get("SHORT_HARDENING_COIN_MIN_CLOSED_TRADES", 4)
+)
+SHORT_HARDENING_COIN_BLOCK_NET_PNL = float(
+    os.environ.get("SHORT_HARDENING_COIN_BLOCK_NET_PNL", -0.25)
+)
 FIREWALL_COIN_COOLDOWN_SECONDS = int(os.environ.get("FIREWALL_COIN_COOLDOWN_SECONDS", 180))
 FIREWALL_SAME_SIDE_COOLDOWN_SECONDS = int(
     os.environ.get("FIREWALL_SAME_SIDE_COOLDOWN_SECONDS", 900)
@@ -517,6 +670,24 @@ SOURCE_POLICY_WARMUP_MIN_CONFIDENCE = float(
 )
 SOURCE_POLICY_DEGRADED_MIN_CONFIDENCE = float(
     os.environ.get("SOURCE_POLICY_DEGRADED_MIN_CONFIDENCE", 0.55)
+)
+SOURCE_POLICY_DYNAMIC_CAPS_ENABLED = _safe_env_bool(
+    "SOURCE_POLICY_DYNAMIC_CAPS_ENABLED", True,
+)
+SOURCE_POLICY_ACTIVE_MIN_SIGNALS_PER_DAY = _safe_env_int(
+    "SOURCE_POLICY_ACTIVE_MIN_SIGNALS_PER_DAY", 3, lo=0, hi=100_000,
+)
+SOURCE_POLICY_ACTIVE_MAX_SIGNALS_PER_DAY = _safe_env_int(
+    "SOURCE_POLICY_ACTIVE_MAX_SIGNALS_PER_DAY", 8, lo=0, hi=100_000,
+)
+SOURCE_POLICY_STRONG_MIN_CLOSED_TRADES = _safe_env_int(
+    "SOURCE_POLICY_STRONG_MIN_CLOSED_TRADES", 12, lo=1, hi=100_000,
+)
+SOURCE_POLICY_STRONG_WIN_RATE = _safe_env_float(
+    "SOURCE_POLICY_STRONG_WIN_RATE", 0.55, lo=0.0, hi=1.0,
+)
+SOURCE_POLICY_STRONG_RECENT_PNL_FLOOR = _safe_env_float(
+    "SOURCE_POLICY_STRONG_RECENT_PNL_FLOOR", 0.0, lo=-1_000_000.0, hi=1_000_000.0,
 )
 
 # Runtime readiness / incident monitoring.
@@ -624,6 +795,17 @@ POLYMARKET_MIN_LIQUIDITY = float(
 )  # $1k min liquidity
 POLYMARKET_MAX_MARKETS_PER_SCAN = int(
     os.environ.get("POLYMARKET_MAX_MARKETS_PER_SCAN", 100)
+)
+POLYMARKET_TRADE_BACKFILL_SOURCE = str(
+    os.environ.get("POLYMARKET_TRADE_BACKFILL_SOURCE", "data_api") or "data_api"
+).strip().lower()
+if POLYMARKET_TRADE_BACKFILL_SOURCE not in {"data_api", "clob"}:
+    POLYMARKET_TRADE_BACKFILL_SOURCE = "data_api"
+POLYMARKET_TRADE_BACKFILL_TAKER_ONLY = os.environ.get(
+    "POLYMARKET_TRADE_BACKFILL_TAKER_ONLY", "false"
+).lower() in ("true", "1", "yes")
+POLYMARKET_TRADE_BACKFILL_LIMIT_PER_MARKET = int(
+    os.environ.get("POLYMARKET_TRADE_BACKFILL_LIMIT_PER_MARKET", 200)
 )
 
 # ─── Options Flow Integration ───────────────────────────────
@@ -749,11 +931,20 @@ def _validate_config_bounds() -> None:
         ("SOURCE_POLICY_DEGRADED_SIZE_MULTIPLIER", 0.0, 1.0, 0.60),
         ("SOURCE_POLICY_WARMUP_MIN_CONFIDENCE", 0.0, 1.0, 0.45),
         ("SOURCE_POLICY_DEGRADED_MIN_CONFIDENCE", 0.0, 1.0, 0.55),
+        ("SOURCE_POLICY_ACTIVE_MIN_SIGNALS_PER_DAY", 0, 100_000, 3),
+        ("SOURCE_POLICY_ACTIVE_MAX_SIGNALS_PER_DAY", 0, 100_000, 8),
+        ("SOURCE_POLICY_STRONG_MIN_CLOSED_TRADES", 1, 100_000, 12),
+        ("SOURCE_POLICY_STRONG_WIN_RATE", 0.0, 1.0, 0.55),
+        ("SOURCE_POLICY_STRONG_RECENT_PNL_FLOOR", -1_000_000.0, 1_000_000.0, 0.0),
         ("TRADING_CYCLE_INTERVAL", 10, 86_400, 900),
         ("DISCOVERY_CYCLE_INTERVAL", 60, 2_592_000, 86400),
         ("POLYMARKET_SCAN_INTERVAL", 10, 3600, 180),
         ("POLYMARKET_MAX_MARKETS_PER_SCAN", 10, 10_000, 100),
+        ("POLYMARKET_TRADE_BACKFILL_LIMIT_PER_MARKET", 1, 10_000, 200),
         ("OPTIONS_FLOW_SCAN_INTERVAL", 10, 3600, 120),
+        ("FEATURE_STORE_BOOTSTRAP_TOP_COINS", 0, 100, 8),
+        ("HL_BOT_BACKUP_MAX_WALLET_FILLS", 0, 1_000_000, 5000),
+        ("HL_BOT_BACKUP_MAX_GOLDEN_WALLETS", 0, 100_000, 200),
         ("RISK_POLICY_DEFAULT_REWARD_MULTIPLE", 0.5, 20.0, 3.25),
         ("RISK_POLICY_MIN_REWARD_MULTIPLE", 0.1, 10.0, 1.75),
         ("RISK_POLICY_MAX_REWARD_MULTIPLE", 0.1, 50.0, 4.5),
@@ -815,13 +1006,19 @@ def _validate_config_bounds() -> None:
         ("XGBOOST_CRASH_THRESHOLD", -1.0, 0.0, -0.18),
         ("FUNDING_NEGATIVE_THRESHOLD", -1.0, 0.0, -0.001),
         ("FUNDING_POSITIVE_THRESHOLD", 0.0, 1.0, 0.003),
+        ("DB_AUDIT_NON_ACTIVE_REGIME_RETENTION_DAYS", 0.0, 3650.0, 7.0),
         ("POLYMARKET_MIN_VOLUME", 0.0, 1e9, 10_000.0),
         ("POLYMARKET_MIN_LIQUIDITY", 0.0, 1e9, 1_000.0),
         ("LIVE_CANARY_MAX_ORDER_USD", 10.0, 1_000_000.0, 25.0),
         ("LIVE_CANARY_MAX_SIGNALS_PER_DAY", 1, 100_000, 25),
         ("LIVE_MAX_ORDERS_PER_SOURCE_PER_DAY", 0, 100_000, 0),
+        ("LIVE_RISK_PER_TRADE_PCT", 0.0, 0.25, 0.0075),
+        ("LIVE_MAX_MARGIN_PER_ORDER_PCT", 0.0, 1.0, 0.12),
+        ("LIVE_MIN_MARGIN_PER_ORDER_USD", 0.0, 1_000_000.0, 0.0),
+        ("LIVE_ORDER_HYGIENE_AUDIT_INTERVAL_CYCLES", 1, 100_000, 5),
         ("LIVE_MIN_ORDER_TOP_TIER_MIN_CONFIDENCE", 0.0, 1.0, 0.72),
         ("LIVE_MIN_ORDER_TOP_TIER_MAX_BUMP_MULTIPLIER", 1.0, 10.0, 1.35),
+        ("LIVE_MIN_ORDER_SHORT_MIN_CONFIDENCE", 0.0, 1.0, 0.75),
         ("LIVE_MIN_ORDER_SAME_SIDE_MAX_BUMP_MULTIPLIER", 1.0, 10.0, 2.5),
         ("LIVE_ANALYTICS_LOOKBACK_TRADES", 10, 5_000, 200),
         ("COPY_TRADER_MAX_CONCURRENT_TRADES", 0, 100, 2),
@@ -830,6 +1027,12 @@ def _validate_config_bounds() -> None:
         ("COPY_TRADER_AUTO_PAUSE_DEGRADE_WIN_RATE", 0.0, 1.0, 0.40),
         ("COPY_TRADER_AUTO_PAUSE_BLOCK_WIN_RATE", 0.0, 1.0, 0.25),
         ("COPY_TRADER_AUTO_PAUSE_BLOCK_NET_PNL", -1_000_000.0, 1_000_000.0, -25.0),
+        ("COPY_TRADER_SOURCE_SIDE_MIN_CLOSED_TRADES", 1, 5_000, 3),
+        ("COPY_TRADER_SOURCE_SIDE_DEGRADE_WIN_RATE", 0.0, 1.0, 0.45),
+        ("COPY_TRADER_SOURCE_SIDE_BLOCK_WIN_RATE", 0.0, 1.0, 0.35),
+        ("COPY_TRADER_SOURCE_SIDE_BLOCK_NET_PNL", -1_000_000.0, 1_000_000.0, -0.25),
+        ("COPY_TRADER_SOURCE_SIDE_CONFIDENCE_MULTIPLIER", 0.0, 1.0, 0.75),
+        ("COPY_TRADER_SOURCE_SIDE_SIZE_MULTIPLIER", 0.0, 1.0, 0.50),
         ("SHORT_HARDENING_LOOKBACK_TRADES", 10, 5_000, 120),
         ("SHORT_HARDENING_MIN_CLOSED_TRADES", 1, 1_000, 12),
         ("SHORT_HARDENING_DEGRADE_WIN_RATE", 0.0, 1.0, 0.48),
@@ -837,6 +1040,18 @@ def _validate_config_bounds() -> None:
         ("SHORT_HARDENING_BLOCK_NET_PNL", -1_000_000.0, 1_000_000.0, -0.5),
         ("SHORT_HARDENING_CONFIDENCE_MULTIPLIER", 0.0, 1.0, 0.80),
         ("SHORT_HARDENING_SIZE_MULTIPLIER", 0.0, 1.0, 0.50),
+        ("SHORT_HARDENING_SOURCE_MIN_CLOSED_TRADES", 1, 1_000, 3),
+        ("SHORT_HARDENING_SOURCE_BLOCK_NET_PNL", -1_000_000.0, 1_000_000.0, -0.25),
+        ("SHORT_HARDENING_COIN_MIN_CLOSED_TRADES", 1, 1_000, 4),
+        ("SHORT_HARDENING_COIN_BLOCK_NET_PNL", -1_000_000.0, 1_000_000.0, -0.25),
+        ("PAPER_EXECUTION_MAX_TRADES_PER_CYCLE", 0, 100, 3),
+        ("TRADE_QUALITY_MIN_EDGE_COST_MULTIPLE", 0.0, 100.0, 1.5),
+        ("TRADE_QUALITY_EXPECTED_SLIPPAGE_BPS", 0.0, 1_000.0, PAPER_TRADING_SLIPPAGE_MAX_BPS),
+        ("TRADE_QUALITY_SHORT_MIN_CONFIDENCE", 0.0, 1.0, 0.55),
+        ("RISK_POLICY_SHORT_CAUTION_CONFIDENCE_THRESHOLD", 0.0, 1.0, 0.60),
+        ("RISK_POLICY_SHORT_CAUTION_MAX_REWARD_MULTIPLE", 1.0, 20.0, 3.0),
+        ("RISK_POLICY_SHORT_CAUTION_TIME_LIMIT_MULTIPLIER", 0.1, 2.0, 0.75),
+        ("RISK_POLICY_SHORT_CAUTION_BREAKEVEN_AT_R", 0.1, 5.0, 0.65),
         ("READINESS_STALE_SECONDS", 30, 86_400, 600),
         ("READINESS_DB_WRITE_TTL_S", 1, 3_600, 60),
         ("READINESS_ALERT_COOLDOWN_S", 30, 86_400, 900),
@@ -878,6 +1093,15 @@ def _validate_config_bounds() -> None:
             "clamping pause threshold down to the degrade threshold."
         )
         globals()["SOURCE_POLICY_PAUSE_WEIGHT"] = float(SOURCE_POLICY_DEGRADE_WEIGHT)
+
+    if SOURCE_POLICY_ACTIVE_MAX_SIGNALS_PER_DAY < SOURCE_POLICY_ACTIVE_MIN_SIGNALS_PER_DAY:
+        _warn_config(
+            "SOURCE_POLICY_ACTIVE_MAX_SIGNALS_PER_DAY is below "
+            "SOURCE_POLICY_ACTIVE_MIN_SIGNALS_PER_DAY; raising active max to active min."
+        )
+        globals()["SOURCE_POLICY_ACTIVE_MAX_SIGNALS_PER_DAY"] = int(
+            SOURCE_POLICY_ACTIVE_MIN_SIGNALS_PER_DAY
+        )
 
     if COPY_TRADER_AUTO_PAUSE_BLOCK_WIN_RATE > COPY_TRADER_AUTO_PAUSE_DEGRADE_WIN_RATE:
         _warn_config(

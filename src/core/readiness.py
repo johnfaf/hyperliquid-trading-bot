@@ -21,6 +21,7 @@ from src.data import database as db
 logger = logging.getLogger(__name__)
 
 _DB_WRITE_PROBE_CACHE: Dict[str, Any] = {"ts": 0.0, "ok": False, "error": ""}
+_DB_AUDIT_CACHE: Dict[str, Any] = {"ts": 0.0, "ok": True, "report": {}, "blockers": []}
 
 
 def _probe_db_readable() -> tuple[bool, str]:
@@ -66,6 +67,48 @@ def _probe_db_writable(ttl_s: Optional[int] = None) -> tuple[bool, str]:
         return False, error
 
 
+def _probe_db_audit(ttl_s: Optional[int] = None) -> tuple[bool, Dict[str, Any], list]:
+    if not bool(getattr(config, "READINESS_DB_AUDIT_ENABLED", True)):
+        return True, {"enabled": False, "ok": True, "finding_count": 0}, []
+
+    ttl = max(5, int(ttl_s or getattr(config, "READINESS_DB_AUDIT_TTL_S", 300)))
+    now = time.time()
+    if now - float(_DB_AUDIT_CACHE.get("ts", 0.0) or 0.0) < ttl:
+        return (
+            bool(_DB_AUDIT_CACHE.get("ok", True)),
+            dict(_DB_AUDIT_CACHE.get("report", {}) or {}),
+            list(_DB_AUDIT_CACHE.get("blockers", []) or []),
+        )
+
+    block_severity = str(getattr(config, "READINESS_DB_AUDIT_BLOCK_SEVERITY", "high")).lower()
+    try:
+        from src.data.db_audit import run_db_audit
+
+        report = run_db_audit(include_candle_cache=True, include_code_scan=False)
+        payload = report.to_dict(block_severity=block_severity)
+        blockers = [finding.to_dict() for finding in report.findings_at_or_above(block_severity)]
+        ok = not blockers
+    except Exception as exc:
+        payload = {
+            "enabled": True,
+            "ok": False,
+            "error": str(exc),
+            "finding_count": 1,
+        }
+        blockers = [
+            {
+                "check": "db_audit_runtime",
+                "severity": "critical",
+                "message": "Database audit failed to run.",
+                "details": {"error": str(exc)},
+            }
+        ]
+        ok = False
+
+    _DB_AUDIT_CACHE.update({"ts": now, "ok": ok, "report": payload, "blockers": blockers})
+    return ok, payload, blockers
+
+
 def evaluate_readiness(
     container: Optional[Any] = None,
     health_registry: Optional[Any] = None,
@@ -103,6 +146,15 @@ def evaluate_readiness(
         reasons.append(f"db_read_failed:{db_read_error[:160]}")
     if not db_writable:
         reasons.append(f"db_write_failed:{db_write_error[:160]}")
+
+    db_audit_ok, db_audit_report, db_audit_blockers = _probe_db_audit()
+    checks["db_audit_ok"] = db_audit_ok
+    checks["db_audit"] = db_audit_report
+    if not db_audit_ok:
+        for finding in db_audit_blockers[:5]:
+            check = str(finding.get("check", "unknown"))
+            severity = str(finding.get("severity", "unknown"))
+            reasons.append(f"db_audit_{severity}:{check}")
 
     # Health registry / subsystem readiness
     subsystem_safe = None
@@ -182,7 +234,7 @@ def evaluate_readiness(
         if free_margin is not None and free_margin <= 0:
             reasons.append("live_free_margin_zero")
 
-    ready = bool(db_readable and db_writable and subsystem_safe and not stale_trading)
+    ready = bool(db_readable and db_writable and db_audit_ok and subsystem_safe and not stale_trading)
     live_ready = bool(
         ready
         and live_requested

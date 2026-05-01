@@ -51,3 +51,21 @@ def test_detect_leaderboard_schema_cache_is_thread_safe():
     assert len(results) == 8
     assert all(entries == payload["leaderboardRows"] for entries, _ in results)
     assert trader_discovery._leaderboard_schema_key == "leaderboardRows"
+
+
+def test_parse_leaderboard_masks_display_names():
+    payload = {
+        "leaderboardRows": [
+            {
+                "ethAddress": "0x1234567890abcdef1234567890abcdef12345678",
+                "displayName": "Alice Trader",
+                "accountValue": "123.4",
+            }
+        ]
+    }
+
+    discovery = TraderDiscovery.__new__(TraderDiscovery)
+    traders = discovery._parse_leaderboard(payload)
+
+    assert len(traders) == 1
+    assert traders[0]["metadata"]["display_name"] == "A***r"

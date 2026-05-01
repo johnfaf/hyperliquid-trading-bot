@@ -61,6 +61,17 @@ def _discover_migrations() -> List[tuple]:
     return results
 
 
+def _read_migration_sql(path: str) -> str:
+    """Read a migration file, accepting accidental UTF-8 BOMs.
+
+    A BOM before the first SQL token makes Postgres reject the migration at
+    line 1/column 1.  ``utf-8-sig`` strips it while leaving normal UTF-8 files
+    unchanged; the extra ``lstrip`` handles already-decoded test doubles.
+    """
+    with open(path, "r", encoding="utf-8-sig") as f:
+        return f.read().lstrip("\ufeff")
+
+
 def _migration_transaction(conn):
     """Return a transaction context manager for the current connection."""
     if hasattr(conn, "transaction"):
@@ -88,8 +99,7 @@ def run_migrations() -> int:
 
         for version, fname, path in pending:
             logger.info("Applying migration %s: %s", version, fname)
-            with open(path, "r") as f:
-                sql = f.read()
+            sql = _read_migration_sql(path)
 
             with _migration_transaction(conn):
                 cur = conn.cursor()

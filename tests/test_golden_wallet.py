@@ -220,9 +220,10 @@ class TestApplyExecutionPenalties:
         assert penalised[0].penalised_price < 50000.0
 
     def test_delay_applied(self):
+        from src.discovery.golden_wallet import EXECUTION_DELAY_MS
         fill = _make_fill(time_ms=1_000_000)
         penalised = apply_execution_penalties([fill])
-        assert penalised[0].delayed_time_ms == 1_000_100
+        assert penalised[0].delayed_time_ms == 1_000_000 + EXECUTION_DELAY_MS
 
     def test_closing_fill_pnl_reduced(self):
         """A profitable closing fill should have lower penalised PnL."""
@@ -448,6 +449,80 @@ class TestIncrementalWalletMerging:
 
 
 # ─── Leaderboard schema caching (trader_discovery) ───────────────
+
+
+def test_dualwrite_syncs_missing_golden_wallet_parent_before_fills(monkeypatch):
+    address = "0x" + "1" * 40
+    row = {
+        "address": address,
+        "bot_score": 1,
+        "total_fills": 12,
+        "raw_pnl": 100.0,
+        "penalised_pnl": 80.0,
+        "max_drawdown_pct": 5.0,
+        "penalised_max_drawdown_pct": 6.0,
+        "sharpe_ratio": 1.2,
+        "win_rate": 55.0,
+        "trades_per_day": 2.0,
+        "is_golden": 1,
+        "coins_traded": '["BTC"]',
+        "best_coin": "BTC",
+        "worst_coin": "ETH",
+        "raw_equity_curve": "[1,2]",
+        "penalised_equity_curve": "[1,1.8]",
+        "equity_timestamps": "[1000,2000]",
+        "evaluated_at": "2026-04-29T00:00:00+00:00",
+        "connected_to_live": 0,
+        "avg_hold_time_hours": 3.5,
+        "last_fill_sync_time": 123456,
+    }
+
+    class ReadCursor:
+        def execute(self, sql, params):
+            assert params == (address,)
+            return self
+
+        def fetchone(self):
+            return row
+
+    class ReadContext:
+        def __enter__(self):
+            return ReadCursor()
+
+        def __exit__(self, *args):
+            return False
+
+    class PgConn:
+        def __init__(self):
+            self.calls = []
+            self.committed = False
+
+        def execute(self, sql, params):
+            self.calls.append((sql, params))
+
+        def commit(self):
+            self.committed = True
+
+        def rollback(self):
+            pass
+
+    pg = PgConn()
+    returned = []
+    monkeypatch.setattr(golden_wallet.db, "get_backend_name", lambda: "dualwrite")
+    monkeypatch.setattr(golden_wallet.db, "get_connection", lambda for_read=False: ReadContext())
+    monkeypatch.setattr("src.data.db.postgres.get_connection", lambda: pg)
+    monkeypatch.setattr("src.data.db.postgres.return_connection", lambda conn: returned.append(conn))
+
+    golden_wallet._ensure_postgres_wallet_parent(address)
+
+    assert pg.committed is True
+    assert returned == [pg]
+    sql, params = pg.calls[0]
+    assert "avg_hold_time_hours" in sql
+    assert "last_fill_sync_time" in sql
+    assert params[0] == address
+    assert params[-2:] == (3.5, 123456)
+
 
 class TestLeaderboardSchemaDetection:
     def test_detects_leaderboard_rows_key(self):

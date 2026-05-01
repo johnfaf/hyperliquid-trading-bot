@@ -83,6 +83,19 @@ class RiskPolicyEngine:
         self.rr_mode = raw_mode
         self.fixed_r_target = float(cfg.get("fixed_r_target", 5.0))
         self.hybrid_min_r_floor = float(cfg.get("hybrid_min_r_floor", 5.0))
+        self.short_caution_enabled = bool(cfg.get("short_caution_enabled", True))
+        self.short_caution_confidence_threshold = float(
+            cfg.get("short_caution_confidence_threshold", 0.60)
+        )
+        self.short_caution_max_reward_multiple = float(
+            cfg.get("short_caution_max_reward_multiple", 3.0)
+        )
+        self.short_caution_time_limit_multiplier = float(
+            cfg.get("short_caution_time_limit_multiplier", 0.75)
+        )
+        self.short_caution_breakeven_at_r = float(
+            cfg.get("short_caution_breakeven_at_r", 0.65)
+        )
         self.default_reward_multiple = float(cfg.get("default_reward_multiple", 3.25))
         self.min_reward_multiple = float(cfg.get("min_reward_multiple", 1.75))
         self.max_reward_multiple = float(cfg.get("max_reward_multiple", 4.5))
@@ -142,6 +155,26 @@ class RiskPolicyEngine:
         source_quality = self._extract_source_quality(signal, source_policy)
         source_key = self._source_key(signal)
         profile = self.source_profiles.get(source_key, self.source_profiles["strategy"])
+        side = signal.side.value if hasattr(signal.side, "value") else str(signal.side)
+        side = str(side or "").strip().lower()
+        short_policy_statuses = []
+        context = dict(signal.context or {})
+        for policy in context.get("short_side_policies", []) or []:
+            if isinstance(policy, dict):
+                short_policy_statuses.append(str(policy.get("status", "") or "").lower())
+        copy_policy = context.get("copy_source_side_policy")
+        if isinstance(copy_policy, dict):
+            short_policy_statuses.append(str(copy_policy.get("status", "") or "").lower())
+        short_caution = (
+            self.short_caution_enabled
+            and self.rr_mode == "dynamic_bounded"
+            and side == "short"
+            and (
+                signal.confidence <= self.short_caution_confidence_threshold
+                or any(status in {"degraded", "blocked"} for status in short_policy_statuses)
+                or regime in {"trending_up", "bullish"}
+            )
+        )
 
         base_stop_roe_pct = max(signal.risk.resolve_roe_stop_loss_pct(leverage), self.min_stop_roe_pct)
         atr_stop_roe_pct = volatility_pct * leverage * self.atr_stop_multiplier
@@ -228,6 +261,13 @@ class RiskPolicyEngine:
                     rationale.append(
                         f"rr_mode=hybrid_min_5r:dynamic={reward_multiple:.2f}R"
                     )
+            elif short_caution:
+                capped_reward = min(reward_multiple, self.short_caution_max_reward_multiple)
+                if capped_reward < reward_multiple:
+                    rationale.append(
+                        f"short_caution:target_cap={capped_reward:.2f}R"
+                    )
+                    reward_multiple = capped_reward
         take_profit_roe_pct = stop_roe_pct * reward_multiple
 
         # H11: effective min/max R bounds depend on rr_mode.  fixed_5r and
@@ -300,12 +340,18 @@ class RiskPolicyEngine:
             time_limit_hours = min(72.0, time_limit_hours + 4.0)
         if stop_price_pct >= self.max_stop_price_pct * 0.9:
             time_limit_hours = min(time_limit_hours, max(6.0, self.default_time_limit_hours))
+        if short_caution:
+            time_limit_hours = max(2.0, time_limit_hours * self.short_caution_time_limit_multiplier)
+            rationale.append("short_caution:shorter_time_stop")
 
         breakeven_at_r = float(profile.get("breakeven_at_r", self.default_break_even_at_r))
         if signal.confidence >= 0.80:
             breakeven_at_r += 0.15
         elif regime in {"crash", "volatile"}:
             breakeven_at_r = max(0.5, breakeven_at_r - 0.25)
+        if short_caution:
+            breakeven_at_r = min(breakeven_at_r, self.short_caution_breakeven_at_r)
+            rationale.append("short_caution:earlier_breakeven")
 
         trail_after_r = max(
             breakeven_at_r + 0.20,

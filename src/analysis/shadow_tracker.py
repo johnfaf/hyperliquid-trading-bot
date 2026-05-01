@@ -169,9 +169,27 @@ class ShadowTracker:
                     pnl = (entry - exit_p) * size
 
             if pnl_pct is None and pnl is not None:
+                # ★ M30 FIX: previously divided pnl by (entry * size), which
+                # gives notional ROI ignoring leverage.  In the rest of the
+                # codebase pnl_pct is read as ROE-on-margin (account-level),
+                # not ROI-on-notional, so consumers were comparing two
+                # different units.  Use leverage-aware notional so this
+                # number is comparable to the leverage-adjusted return_pct
+                # produced by trading_cycle._process_closed_trades and
+                # ws_position_monitor / paper_trader close events.  When
+                # leverage is missing or invalid, fall back to 1.0 so the
+                # math degrades to the previous behaviour rather than
+                # crashing.
                 entry = trade_dict.get("entry_price", 0)
                 size = trade_dict.get("size", 1)
-                pnl_pct = (pnl / (entry * size)) * 100 if entry != 0 else 0
+                try:
+                    leverage = float(trade_dict.get("leverage", 1) or 1)
+                except (TypeError, ValueError):
+                    leverage = 1.0
+                if leverage <= 0:
+                    leverage = 1.0
+                notional = entry * size * leverage
+                pnl_pct = (pnl / notional) * 100 if notional > 0 else 0
 
             # Normalize timestamps. Postgres TIMESTAMPTZ rejects "" — callers sometimes
             # pass empty-string defaults when the source dict lacks opened_at/closed_at,

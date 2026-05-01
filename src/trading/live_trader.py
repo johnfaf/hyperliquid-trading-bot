@@ -85,6 +85,33 @@ from src.trading.scaling_tiers import (
 logger = logging.getLogger(__name__)
 
 
+def _derive_missing_live_drawdown_cap(
+    *,
+    max_daily_loss: float,
+    max_position_size: float,
+    max_order_usd: float,
+    min_order_usd: float,
+) -> float:
+    """Derive a conservative rolling drawdown cap when the env var is absent.
+
+    This does not replace an explicit operator cap. It only prevents a live
+    deployment from running uncapped when the per-tier/per-order limits already
+    define a tighter safety envelope.
+    """
+    candidates = []
+    if max_daily_loss > 0:
+        candidates.append(float(max_daily_loss) * 0.25)
+    if max_position_size > 0:
+        candidates.append(float(max_position_size) * 0.10)
+    if max_order_usd > 0:
+        candidates.append(float(max_order_usd) * 0.25)
+    if not candidates:
+        return 0.0
+    default_min_cap = max(1.0, float(min_order_usd) * 0.10) if min_order_usd > 0 else 1.0
+    min_cap = _safe_env_float("LIVE_MIN_DRAWDOWN_CAP_USD", default_min_cap, lo=0.0, hi=1e6)
+    return max(float(min_cap), min(candidates))
+
+
 class OrderType(str, Enum):
     """Order types supported by Hyperliquid."""
     LIMIT_GTC = "Gtc"         # Good Till Canceled limit
@@ -521,7 +548,7 @@ class LiveTrader:
             # explicitly moves to T4.
             self.canary_mode = self.active_tier.name != "T4"
             self.kelly_dampen = float(self.active_tier.kelly_dampen)
-            logger.warning(
+            logger.info(
                 "LIVE_TIER=%s (%s) active: max_order_usd=$%.2f, "
                 "max_daily_loss=$%.2f, max_position_size=$%.2f, "
                 "max_signals_per_day=%s, kelly_dampen=%.2f",
@@ -556,6 +583,21 @@ class LiveTrader:
         self.max_orders_per_source_per_day = int(
             getattr(config, "LIVE_MAX_ORDERS_PER_SOURCE_PER_DAY", 0)
         )
+        self.risk_sizing_enabled = bool(
+            getattr(config, "LIVE_RISK_SIZING_ENABLED", True)
+        )
+        self.live_risk_per_trade_pct = float(
+            getattr(config, "LIVE_RISK_PER_TRADE_PCT", 0.0075)
+        )
+        self.live_max_margin_per_order_pct = float(
+            getattr(config, "LIVE_MAX_MARGIN_PER_ORDER_PCT", 0.12)
+        )
+        self.live_min_margin_per_order_usd = float(
+            getattr(config, "LIVE_MIN_MARGIN_PER_ORDER_USD", 0.0)
+        )
+        self.dynamic_source_caps_allow_static_expansion = bool(
+            getattr(config, "LIVE_DYNAMIC_SOURCE_CAPS_ALLOW_STATIC_EXPANSION", False)
+        )
         self.min_order_top_tier_enabled = bool(
             getattr(config, "LIVE_MIN_ORDER_TOP_TIER_ENABLED", True)
         )
@@ -567,6 +609,12 @@ class LiveTrader:
         )
         self.min_order_allow_degraded_sources = bool(
             getattr(config, "LIVE_MIN_ORDER_ALLOW_DEGRADED_SOURCES", False)
+        )
+        self.min_order_allow_policy_error_floorup = bool(
+            getattr(config, "LIVE_MIN_ORDER_ALLOW_POLICY_ERROR_FLOORUP", False)
+        )
+        self.min_order_short_min_confidence = float(
+            getattr(config, "LIVE_MIN_ORDER_SHORT_MIN_CONFIDENCE", 0.75)
         )
         self.min_order_same_side_merge_enabled = bool(
             getattr(config, "LIVE_MIN_ORDER_SAME_SIDE_MERGE_ENABLED", True)
@@ -642,6 +690,8 @@ class LiveTrader:
         )
         self._last_hash_cleanup_ts = 0.0
         self._HASH_CLEANUP_INTERVAL = 60.0  # periodic cleanup every 60s
+        self._order_dedup_reconcile_required = False
+        self._order_dedup_unresolved_restored = 0
         self._nonce_lock = threading.Lock()
         self._last_nonce = 0
         self._exchange_leverage_cache: Dict[str, int] = {}
@@ -701,8 +751,11 @@ class LiveTrader:
             "LIVE_PROTECTIVE_REPEAT_MAX", 1.0, lo=1.0, hi=20.0,
         ))
         self._protective_attempt_history: Dict[str, Deque[float]] = defaultdict(deque)
+        self._protective_churn_quarantined_coins: Dict[str, Dict[str, Any]] = {}
         self._protective_churn_trips = 0
         self._last_orphan_protection_summary: Dict[str, Any] = {}
+        self._last_order_hygiene_audit: Dict[str, Any] = {}
+        self._last_sizing_explanation: Dict[str, Any] = {}
         self._last_order_visibility_status: Dict[str, Any] = {
             "source": "frontendOpenOrders",
             "ok": None,
@@ -742,9 +795,41 @@ class LiveTrader:
         # by snapshot_balance().  0 / unset disables the check.
         # C6: drawdown envs go through the same safe parser — bad input
         # must fail closed (disable the check) rather than raise.
+        raw_max_drawdown = os.environ.get("LIVE_MAX_DRAWDOWN_USD")
         self._max_drawdown_usd = _safe_env_float(
             "LIVE_MAX_DRAWDOWN_USD", 0.0, lo=0.0, hi=1e8,
         )
+        live_dual_control_effective = bool(
+            getattr(config, "LIVE_TRADING_ENABLED", False)
+            and getattr(config, "LIVE_TRADING_DUAL_CONTROL_CONFIRM", False)
+        )
+        if (
+            self.live_requested
+            and live_dual_control_effective
+            and (raw_max_drawdown is None or str(raw_max_drawdown).strip() == "")
+            and self._max_drawdown_usd <= 0
+        ):
+            derived_cap = _derive_missing_live_drawdown_cap(
+                max_daily_loss=self.max_daily_loss,
+                max_position_size=self.max_position_size,
+                max_order_usd=self.max_order_usd,
+                min_order_usd=self.min_order_usd,
+            )
+            if derived_cap > 0:
+                self._max_drawdown_usd = derived_cap
+                logger.warning(
+                    "LIVE_MAX_DRAWDOWN_USD is unset; using conservative derived "
+                    "rolling drawdown cap $%.2f from current tier/order limits. "
+                    "Set LIVE_MAX_DRAWDOWN_USD explicitly before scaling.",
+                    self._max_drawdown_usd,
+                )
+        if self.live_requested and live_dual_control_effective and self._max_drawdown_usd <= 0:
+            logger.critical(
+                "LIVE_MAX_DRAWDOWN_USD must be > 0 when live dual-control is enabled; "
+                "forcing dry_run to prevent uncapped rolling drawdown exposure."
+            )
+            self.dry_run = True
+            self.status_reason = "live_drawdown_cap_required"
         self._drawdown_window_s = _safe_env_float(
             "LIVE_DRAWDOWN_WINDOW_S", 24 * 3600.0, lo=300.0, hi=30 * 86_400.0,
         )
@@ -759,9 +844,14 @@ class LiveTrader:
         # E7: restore recent order-dedup hashes so a restart within the dedup
         # window doesn't re-ship an order that may have already executed.
         self._load_persisted_order_dedup_cache()
+        self._load_persisted_protective_churn_quarantine()
+        # Restore fallback-protection attempts too.  Without this, every
+        # redeploy forgets that it already placed a rescue SL/TP bracket for
+        # the same position and can stack duplicate protective orders.
+        self._load_persisted_protective_attempt_history()
 
         logger.info(
-            f"LiveTrader initialized: dry_run={dry_run}, "
+            f"LiveTrader initialized: dry_run={self.dry_run}, "
             f"max_daily_loss=${self.max_daily_loss:.2f}, "
             f"max_position_size=${self.max_position_size:.2f}, "
             f"max_order_usd=${self.max_order_usd:.2f}"
@@ -775,7 +865,7 @@ class LiveTrader:
         # set but LIVE_TRADING_DUAL_CONTROL_CONFIRM missing) hard to spot.
         live_requested_flag = bool(getattr(config, "LIVE_TRADING_ENABLED", False))
         dual_control_flag = bool(getattr(config, "LIVE_TRADING_DUAL_CONTROL_CONFIRM", False))
-        if not dry_run:
+        if not self.dry_run:
             logger.info("=" * 60)
             logger.info("LIVE TRADING MODE ACTIVE — real orders will be sent to Hyperliquid")
             logger.info("=" * 60)
@@ -805,7 +895,8 @@ class LiveTrader:
             self.dry_run = True
             self.status_reason = "missing_agent_wallet_signer"
         elif self.live_requested and self.dry_run:
-            self.status_reason = "dry_run_forced"
+            if self.status_reason != "live_drawdown_cap_required":
+                self.status_reason = "dry_run_forced"
         elif self.live_requested:
             self.status_reason = "live_ready"
         else:
@@ -1060,13 +1151,73 @@ class LiveTrader:
                 payload = json.load(handle)
             if isinstance(payload, dict) and payload.get("active"):
                 reason = str(payload.get("reason") or f"persisted:{path}")
+                if reason.startswith("protective_order_churn:"):
+                    coin = reason.split(":", 1)[1] or "UNKNOWN"
+                    self._quarantine_protective_churn_coin(
+                        coin,
+                        key=f"legacy_persisted_kill_switch:{reason}",
+                        source="legacy_kill_switch_state",
+                        persist=True,
+                    )
+                    logger.warning(
+                        "Auto-clearing legacy persisted protective-order churn "
+                        "kill switch (%s). New entries for %s remain blocked, "
+                        "but other coins may trade.",
+                        reason,
+                        self._normalize_coin_key(coin),
+                    )
+                    self._persist_kill_switch_state(False, f"coin_quarantine:{reason}")
+                    return
+                if self._should_auto_clear_persisted_kill_switch(reason):
+                    logger.warning(
+                        "Auto-clearing stale persisted kill switch (%s): "
+                        "dualwrite is healthy in this process.",
+                        reason,
+                    )
+                    self._persist_kill_switch_state(False, f"auto_cleared:{reason}")
+                    return
                 with self._state_lock:
                     self.kill_switch_active = True
                     self._kill_switch_reason = reason
                     self.status_reason = "persisted_kill_switch"
-                logger.critical("Persisted kill switch restored (%s)", reason)
+                logger.warning(
+                    "Persisted kill switch restored (%s). New live entries remain "
+                    "blocked until an operator clears the persisted state.",
+                    reason,
+                )
         except Exception as exc:
             logger.warning("Failed to load kill-switch state from %s: %s", path, exc)
+
+    def _should_auto_clear_persisted_kill_switch(self, reason: str) -> bool:
+        """Return True for healed, machine-detectable persisted kill switches.
+
+        Only the stale ``dualwrite_unhealthy`` case can clear itself here.
+        Legacy ``protective_order_churn:<coin>`` states are handled in
+        _load_persisted_kill_switch_state by converting the global stop into
+        a coin-level quarantine. Manual, external-file and daily-loss kill
+        switches stay sticky until an operator clears them.
+        """
+        reason = str(reason or "")
+        if not reason.startswith("dualwrite_unhealthy:"):
+            return False
+        try:
+            if db.get_backend_name() != "dualwrite":
+                return False
+            if not db.dualwrite_is_healthy(
+                window_s=self._dualwrite_health_window_s,
+                max_failures=self._dualwrite_health_max_failures,
+            ):
+                return False
+            from src.data.db.postgres import check_health as pg_check_health
+
+            return bool(pg_check_health())
+        except Exception as exc:
+            logger.warning(
+                "Could not verify stale dualwrite kill switch is healed; "
+                "keeping persisted kill switch active: %s",
+                exc,
+            )
+            return False
 
     # ── H5: persistent canary counters ──────────────────────────
     _SOURCE_ORDERS_TODAY_KEY = "live_source_orders_today"
@@ -1136,7 +1287,11 @@ class LiveTrader:
     # ``_reserve_entry_slot`` bundles the read/compare/increment under a
     # single ``_state_lock`` acquisition, and ``_release_entry_slot`` is
     # called on any failure path between reservation and commit.
-    def _reserve_entry_slot(self, source_key: str):
+    def _reserve_entry_slot(
+        self,
+        source_key: str,
+        source_policy: Optional[Dict[str, Any]] = None,
+    ):
         """Atomically check canary + per-source caps and reserve a slot.
 
         Returns a tuple (reserved: bool, reason: str).  When ``reserved`` is
@@ -1152,12 +1307,13 @@ class LiveTrader:
                     return False, (
                         f"canary_cap:{total}/{self.canary_max_signals_per_day}"
                     )
-            if self.max_orders_per_source_per_day > 0:
+            effective_source_cap = self._effective_live_source_cap(source_policy)
+            if effective_source_cap > 0:
                 used = self._source_orders_today.get(source_key, 0)
-                if used >= self.max_orders_per_source_per_day:
+                if used >= effective_source_cap:
                     self._incr_entry_metric("rejected_source_cap")
                     return False, (
-                        f"source_cap:{used}/{self.max_orders_per_source_per_day}"
+                        f"source_cap:{used}/{effective_source_cap}"
                     )
             # Reserve: bump counter under the lock so the next concurrent
             # signal sees the reserved slot and cannot race past the cap.
@@ -1222,13 +1378,23 @@ class LiveTrader:
                 suspicious,
             )
         if suspicious:
-            logger.critical(
+            self._order_dedup_reconcile_required = True
+            self._order_dedup_unresolved_restored = suspicious
+            logger.warning(
                 "%d order(s) from the prior run are in unresolved state "
-                "(in_flight/timeout/post_exception).  A reconcile_positions "
-                "sweep is required before new orders ship, and any orphaned "
-                "fills must be manually protected.",
+                "(in_flight/timeout/post_exception). New entries will remain "
+                "blocked until startup reconciliation confirms positions and "
+                "open orders are safe.",
                 suspicious,
             )
+
+    @staticmethod
+    def _is_unresolved_dedup_payload(payload: Any) -> bool:
+        return isinstance(payload, dict) and payload.get("status") in {
+            "in_flight",
+            "timeout",
+            "post_exception",
+        }
 
     def _persist_order_dedup_cache(self) -> None:
         """Best-effort write of the current dedup cache to bot_state."""
@@ -1243,6 +1409,75 @@ class LiveTrader:
             db.set_bot_state(self._ORDER_DEDUP_STATE_KEY, snapshot)
         except Exception as exc:
             logger.debug("Failed to persist dedup cache: %s", exc)
+
+    def _resolve_startup_order_dedup_reconcile(
+        self,
+        *,
+        positions: Optional[List[Dict[str, Any]]],
+        protection_summary: Optional[Dict[str, Any]],
+    ) -> None:
+        """Clear restored unresolved order markers after a safe startup sweep."""
+        if not self._order_dedup_reconcile_required:
+            return
+
+        summary = dict(protection_summary or {})
+        if summary and (
+            summary.get("status") != "ok"
+            or int(summary.get("failed", 0) or 0) > 0
+            or int(summary.get("cancel_failed", 0) or 0) > 0
+            or int(summary.get("churn_blocked", 0) or 0) > 0
+        ):
+            logger.critical(
+                "Startup order-dedup reconcile remains blocked: orphan "
+                "protection summary is not clean: %s",
+                summary,
+            )
+            return
+
+        open_orders = self.get_open_orders(force_fresh=True)
+        if open_orders is None:
+            logger.critical(
+                "Startup order-dedup reconcile remains blocked: open orders "
+                "are unavailable after position reconciliation."
+            )
+            return
+
+        unknown_open_orders = []
+        for order in open_orders:
+            if not isinstance(order, dict):
+                continue
+            if self._classify_protective_leg(order) is None:
+                unknown_open_orders.append(order)
+
+        if unknown_open_orders:
+            logger.critical(
+                "Startup order-dedup reconcile remains blocked: %d non-protective "
+                "open order(s) are still resting on the exchange.",
+                len(unknown_open_orders),
+            )
+            return
+
+        cleared = 0
+        with self._order_dedup_lock:
+            unresolved_hashes = [
+                action_hash
+                for action_hash, (_ts, payload) in self._recent_order_hashes.items()
+                if self._is_unresolved_dedup_payload(payload)
+            ]
+            for action_hash in unresolved_hashes:
+                self._recent_order_hashes.pop(action_hash, None)
+                cleared += 1
+
+        self._persist_order_dedup_cache()
+        self._order_dedup_reconcile_required = False
+        self._order_dedup_unresolved_restored = 0
+        logger.info(
+            "Startup reconciliation cleared %d unresolved restored order dedup "
+            "marker(s); positions=%d open_orders=%d.",
+            cleared,
+            len(positions or []),
+            len(open_orders),
+        )
 
     # ── S3: rolling drawdown tracking ──────────────────────────
     def _record_equity_sample(self, equity: Optional[float]) -> None:
@@ -1349,6 +1584,37 @@ class LiveTrader:
             return bool(getattr(self, "kill_switch_active", False))
         with lock:
             return bool(self.kill_switch_active)
+
+    def get_kill_switch_state(self) -> Dict[str, Any]:
+        """Return a thread-safe snapshot of the sticky kill-switch state."""
+        lock = getattr(self, "_state_lock", None)
+        if lock is None:
+            return {
+                "active": bool(getattr(self, "kill_switch_active", False)),
+                "reason": getattr(self, "_kill_switch_reason", "") or None,
+                "status_reason": getattr(self, "status_reason", "") or None,
+            }
+        with lock:
+            return {
+                "active": bool(self.kill_switch_active),
+                "reason": self._kill_switch_reason or None,
+                "status_reason": self.status_reason or None,
+            }
+
+    def get_safety_stop_reason(self) -> str:
+        """Return the active live-entry stop reason for operator logs."""
+        state = self.get_kill_switch_state()
+        if state.get("active"):
+            reason = str(state.get("reason") or state.get("status_reason") or "active")
+            return f"kill_switch_active:{reason}"
+        return "daily_loss_limit_exceeded"
+
+    def _safety_stop_rejection_code(self) -> str:
+        """Map the current safety stop to the public rejection code."""
+        reason = self.get_safety_stop_reason()
+        if "daily_loss_limit" in reason:
+            return "daily_loss_exceeded"
+        return "kill_switch_active"
 
     def _coerce_signal(self, signal: Union[TradeSignal, Dict[str, Any]]) -> TradeSignal:
         """Accept either TradeSignal or execution dict for safer live mirroring."""
@@ -1831,6 +2097,224 @@ class LiveTrader:
         policy.setdefault("blocked", False)
         return policy
 
+    def _effective_live_source_cap(self, policy: Optional[Dict[str, Any]]) -> int:
+        """Combine static live source caps with allocator-driven caps."""
+        configured_cap = int(self.max_orders_per_source_per_day or 0)
+        policy = dict(policy or {})
+        policy_cap = int(policy.get("max_signals_per_day", 0) or 0)
+        if configured_cap > 0 and policy_cap > 0:
+            status = str(policy.get("status", "") or "").strip().lower()
+            if (
+                self.dynamic_source_caps_allow_static_expansion
+                and status == "active"
+                and policy_cap > configured_cap
+            ):
+                return policy_cap
+            return min(configured_cap, policy_cap)
+        return configured_cap or policy_cap
+
+    @staticmethod
+    def _resolve_signal_stop_roe_pct(signal: TradeSignal) -> float:
+        """Resolve the signal stop distance in margin/ROE space."""
+        risk = getattr(signal, "risk", None)
+        leverage = max(float(getattr(signal, "leverage", 1.0) or 1.0), 1.0)
+        if risk is not None and hasattr(risk, "resolve_roe_stop_loss_pct"):
+            try:
+                stop_roe = float(risk.resolve_roe_stop_loss_pct(leverage))
+                if stop_roe > 0:
+                    return stop_roe
+            except Exception:
+                pass
+
+        context = getattr(signal, "context", {}) or {}
+        if isinstance(context, dict):
+            risk_policy = context.get("risk_policy", {}) or {}
+            if isinstance(risk_policy, dict):
+                try:
+                    stop_roe = float(risk_policy.get("stop_roe_pct", 0.0) or 0.0)
+                    if stop_roe > 0:
+                        return stop_roe
+                except (TypeError, ValueError):
+                    pass
+
+        return max(float(getattr(config, "PAPER_TRADING_STOP_LOSS_PCT", 0.05) or 0.05), 0.001)
+
+    def _store_sizing_explanation(self, explanation: Dict[str, Any]) -> None:
+        explanation = dict(explanation)
+        explanation.setdefault("timestamp", datetime.now(timezone.utc).isoformat())
+        with self._state_lock:
+            self._last_sizing_explanation = explanation
+
+    def _apply_risk_based_live_sizing(
+        self,
+        signal: TradeSignal,
+        *,
+        source_policy: Optional[Dict[str, Any]] = None,
+    ) -> TradeSignal:
+        """Size live entries from risk-at-stop instead of token price distance.
+
+        The target notional is derived from:
+          equity * LIVE_RISK_PER_TRADE_PCT / signal_stop_roe
+        then bounded by free margin and the existing hard order cap.
+        """
+        if not self.risk_sizing_enabled:
+            self._store_sizing_explanation({"enabled": False, "reason": "disabled"})
+            return signal
+
+        coin = str(getattr(signal, "coin", "") or "")
+        def _fail_closed(reason: str, **extra: Any) -> TradeSignal:
+            explanation = {
+                "enabled": True,
+                "coin": coin,
+                "reason": reason,
+                "blocked": True,
+                **extra,
+            }
+            self._store_sizing_explanation(explanation)
+            logger.warning(
+                "Live risk sizing blocked %s entry: %s %s",
+                coin or "(unknown)",
+                reason,
+                extra,
+            )
+            adjusted_signal = copy.deepcopy(signal)
+            adjusted_signal.size = 0.0
+            adjusted_signal.position_pct = 0.0
+            context = dict(adjusted_signal.context or {})
+            context["live_sizing"] = explanation
+            adjusted_signal.context = context
+            return adjusted_signal
+
+        mid = self._get_mid_price(coin)
+        if not mid or mid <= 0:
+            if not self.dry_run:
+                return _fail_closed("mid_unavailable")
+            self._store_sizing_explanation({"enabled": True, "coin": coin, "reason": "mid_unavailable"})
+            return signal
+
+        equity = self.get_account_value()
+        free_margin = self.get_free_margin()
+        if equity is None or equity <= 0:
+            equity = free_margin
+        if free_margin is None or free_margin <= 0:
+            if not self.dry_run:
+                return _fail_closed(
+                    "free_margin_unavailable",
+                    equity=equity,
+                    free_margin=free_margin,
+                )
+            free_margin = equity
+        if equity is None or equity <= 0 or free_margin is None or free_margin <= 0:
+            if not self.dry_run:
+                return _fail_closed(
+                    "margin_unavailable",
+                    equity=equity,
+                    free_margin=free_margin,
+                )
+            self._store_sizing_explanation(
+                {"enabled": True, "coin": coin, "reason": "margin_unavailable", "equity": equity, "free_margin": free_margin}
+            )
+            return signal
+
+        leverage = max(float(getattr(signal, "leverage", 1.0) or 1.0), 1.0)
+        # ★ H33 FIX: previously the floor was 0.001 (= 0.1% ROE).  With
+        # target_margin = risk_budget / stop_roe, a $100 risk_budget at the
+        # 0.001 floor produces a $100,000 target margin -- 1000x the
+        # intended risk.  A signal with a malformed/missing stop got sized
+        # roughly that much above ceiling.  Raise the floor to 0.01 (1% ROE
+        # min stop) so a corrupt signal can blow through risk-per-trade by
+        # at most 10x rather than 1000x, and log loudly when the floor is
+        # actually hit so the bad signals surface in production logs.
+        raw_stop_roe_pct = float(self._resolve_signal_stop_roe_pct(signal))
+        stop_roe_pct = max(raw_stop_roe_pct, 0.01)
+        if raw_stop_roe_pct < 0.01:
+            logger.warning(
+                "Signal stop_roe_pct=%.6f below safety floor (0.01) for %s -- "
+                "applying floor.  This usually indicates a missing or "
+                "malformed risk_policy.stop_roe_pct upstream.",
+                raw_stop_roe_pct, getattr(signal, "coin", "?"),
+            )
+        confidence = max(0.0, min(float(getattr(signal, "confidence", 0.5) or 0.5), 1.0))
+        policy = dict(source_policy or {})
+        source_multiplier = max(0.0, float(policy.get("size_multiplier", 1.0) or 1.0))
+        confidence_multiplier = 0.50 + (0.50 * confidence)
+        risk_budget_usd = (
+            float(equity)
+            * max(float(self.live_risk_per_trade_pct or 0.0), 0.0)
+            * confidence_multiplier
+            * source_multiplier
+        )
+        max_margin_usd = float(free_margin) * max(float(self.live_max_margin_per_order_pct or 0.0), 0.0)
+        if max_margin_usd <= 0:
+            max_margin_usd = float(free_margin)
+
+        target_margin_usd = risk_budget_usd / stop_roe_pct if stop_roe_pct > 0 else 0.0
+        target_margin_usd = min(target_margin_usd, max_margin_usd, float(free_margin))
+        if self.live_min_margin_per_order_usd > 0:
+            target_margin_usd = max(target_margin_usd, min(self.live_min_margin_per_order_usd, max_margin_usd))
+
+        target_notional_usd = max(0.0, target_margin_usd * leverage)
+        if self.max_order_usd and self.max_order_usd > 0:
+            target_notional_usd = min(target_notional_usd, float(self.max_order_usd))
+            target_margin_usd = target_notional_usd / leverage
+
+        if target_notional_usd <= 0:
+            self._store_sizing_explanation(
+                {
+                    "enabled": True,
+                    "coin": coin,
+                    "reason": "zero_target_notional",
+                    "equity": round(float(equity), 4),
+                    "free_margin": round(float(free_margin), 4),
+                    "stop_roe_pct": round(stop_roe_pct, 6),
+                }
+            )
+            return signal
+
+        pre_size = float(getattr(signal, "size", 0.0) or 0.0)
+        pre_notional = pre_size * mid
+        adjusted = copy.deepcopy(signal)
+        adjusted.size = target_notional_usd / mid
+        adjusted.position_pct = target_margin_usd / max(float(equity), 1e-9)
+
+        explanation = {
+            "enabled": True,
+            "reason": "risk_at_stop",
+            "coin": coin,
+            "side": self._signal_side_value(adjusted),
+            "mid": round(float(mid), 6),
+            "equity": round(float(equity), 4),
+            "free_margin": round(float(free_margin), 4),
+            "leverage": round(leverage, 4),
+            "stop_roe_pct": round(stop_roe_pct, 6),
+            "risk_per_trade_pct": round(float(self.live_risk_per_trade_pct or 0.0), 6),
+            "risk_budget_usd": round(risk_budget_usd, 4),
+            "confidence_multiplier": round(confidence_multiplier, 4),
+            "source_multiplier": round(source_multiplier, 4),
+            "max_margin_usd": round(max_margin_usd, 4),
+            "target_margin_usd": round(target_margin_usd, 4),
+            "target_notional_usd": round(target_notional_usd, 4),
+            "pre_notional_usd": round(pre_notional, 4),
+            "size": round(float(adjusted.size or 0.0), 10),
+        }
+        context = dict(adjusted.context or {})
+        context["live_sizing"] = explanation
+        adjusted.context = context
+        self._store_sizing_explanation(explanation)
+        logger.info(
+            "Live risk sizing %s %s: margin=$%.2f notional=$%.2f "
+            "(risk=$%.2f, stop=%.2f%% ROE, lev=%.1fx, pre=$%.2f)",
+            coin,
+            self._signal_side_value(adjusted),
+            target_margin_usd,
+            target_notional_usd,
+            risk_budget_usd,
+            stop_roe_pct * 100.0,
+            leverage,
+            pre_notional,
+        )
+        return adjusted
+
     def _find_same_side_position(
         self,
         signal: TradeSignal,
@@ -1990,9 +2474,21 @@ class LiveTrader:
         try:
             if db.get_backend_name() != "dualwrite":
                 return False
-        except Exception:
+        except Exception as exc:
             # If the backend can't be introspected we don't want the
             # check itself to crash the trading loop — fail open.
+            # ★ M40 FIX: previously failed silently, hiding how often the
+            # dualwrite health gate was disabled by an introspection bug.
+            # Increment a counter and log a WARN so operators see the
+            # frequency of fail-opens and can investigate before they
+            # cumulatively erode the H4 protection.
+            self._dualwrite_introspection_fail_count = getattr(
+                self, "_dualwrite_introspection_fail_count", 0
+            ) + 1
+            logger.warning(
+                "dualwrite backend introspection failed (fail-open count=%d): %s",
+                self._dualwrite_introspection_fail_count, exc,
+            )
             return False
         try:
             healthy = db.dualwrite_is_healthy(
@@ -2095,6 +2591,7 @@ class LiveTrader:
                 return
             active_coins = []
             unprotected = []
+            protection_summary: Optional[Dict[str, Any]] = None
 
             for pos in exchange_positions:
                 coin = pos.get("coin", "")
@@ -2135,9 +2632,15 @@ class LiveTrader:
                 # of bugs where verify_fill crashed (float(dict) leverage)
                 # and SL/TP placement was skipped — leaving real money
                 # on the exchange with no downside protection.
-                self.protect_orphaned_positions(unprotected)
+                protection_summary = self.protect_orphaned_positions(unprotected)
             else:
                 logger.info("Reconciliation: no open positions on exchange (clean state)")
+                protection_summary = {"status": "ok", "protected": 0, "skipped": 0, "failed": 0}
+
+            self._resolve_startup_order_dedup_reconcile(
+                positions=exchange_positions,
+                protection_summary=protection_summary,
+            )
 
         except Exception as e:
             logger.error(f"Position reconciliation failed: {e}")
@@ -2162,6 +2665,195 @@ class LiveTrader:
     ) -> str:
         return f"{str(coin).upper()}:{side}:{entry_price:.8g}:{size:.8g}"
 
+    _PROTECTIVE_ATTEMPT_STATE_KEY = "live_protective_attempt_history"
+    _PROTECTIVE_CHURN_QUARANTINE_STATE_KEY = "live_protective_churn_quarantine"
+
+    @staticmethod
+    def _normalize_coin_key(coin: Any) -> str:
+        return str(coin or "").strip().upper()
+
+    def _persist_protective_churn_quarantine(self) -> None:
+        """Persist coin-level protective churn quarantine across restarts."""
+        try:
+            with self._state_lock:
+                quarantined = dict(getattr(self, "_protective_churn_quarantined_coins", {}) or {})
+            db.set_bot_state(
+                self._PROTECTIVE_CHURN_QUARANTINE_STATE_KEY,
+                {
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                    "coins": quarantined,
+                },
+            )
+        except Exception as exc:
+            logger.debug("Failed to persist protective churn quarantine: %s", exc)
+
+    def _load_persisted_protective_churn_quarantine(self) -> None:
+        """Restore coin-level quarantine without globally stopping live trading."""
+        try:
+            snapshot = db.get_bot_state(self._PROTECTIVE_CHURN_QUARANTINE_STATE_KEY)
+        except Exception as exc:
+            logger.debug("Failed to load protective churn quarantine: %s", exc)
+            return
+        if not isinstance(snapshot, dict):
+            return
+        raw = snapshot.get("coins", snapshot)
+        if not isinstance(raw, dict):
+            return
+        restored = {}
+        for coin, payload in raw.items():
+            coin_key = self._normalize_coin_key(coin)
+            if not coin_key:
+                continue
+            restored[coin_key] = dict(payload or {}) if isinstance(payload, dict) else {}
+        if not restored:
+            return
+        with self._state_lock:
+            self._protective_churn_quarantined_coins.update(restored)
+            self._protective_churn_trips = max(
+                int(getattr(self, "_protective_churn_trips", 0) or 0),
+                len(restored),
+            )
+        logger.warning(
+            "Restored protective-order churn quarantine for coin(s): %s. "
+            "Those coins are blocked from new live entries until protection is healthy.",
+            ", ".join(sorted(restored)),
+        )
+
+    def _quarantine_protective_churn_coin(
+        self,
+        coin: str,
+        key: str,
+        *,
+        source: str = "orphan_protection",
+        persist: bool = True,
+    ) -> bool:
+        coin_key = self._normalize_coin_key(coin)
+        if not coin_key:
+            return False
+        now = datetime.now(timezone.utc).isoformat()
+        with self._state_lock:
+            quarantined = getattr(self, "_protective_churn_quarantined_coins", {})
+            already = coin_key in quarantined
+            quarantined[coin_key] = {
+                "reason": f"protective_order_churn:{coin_key}",
+                "attempt_key": key,
+                "source": source,
+                "updated_at": now,
+            }
+            self._protective_churn_quarantined_coins = quarantined
+            if not already:
+                self._protective_churn_trips = int(getattr(self, "_protective_churn_trips", 0) or 0) + 1
+        if persist:
+            self._persist_protective_churn_quarantine()
+        return not already
+
+    def _clear_protective_churn_quarantine(self, coin: str, reason: str) -> None:
+        coin_key = self._normalize_coin_key(coin)
+        if not coin_key:
+            return
+        with self._state_lock:
+            quarantined = getattr(self, "_protective_churn_quarantined_coins", {})
+            removed = quarantined.pop(coin_key, None)
+        if removed is None:
+            return
+        logger.warning(
+            "Cleared protective-order churn quarantine for %s: %s",
+            coin_key,
+            reason,
+        )
+        self._persist_protective_churn_quarantine()
+
+    def _is_protective_churn_quarantined(self, coin: Any) -> bool:
+        coin_key = self._normalize_coin_key(coin)
+        if not coin_key:
+            return False
+        with self._state_lock:
+            return coin_key in getattr(self, "_protective_churn_quarantined_coins", {})
+
+    def _release_absent_protective_churn_quarantines(self, positions: List[Dict[str, Any]]) -> None:
+        active = {self._normalize_coin_key(pos.get("coin")) for pos in positions if pos.get("coin")}
+        with self._state_lock:
+            quarantined = set(getattr(self, "_protective_churn_quarantined_coins", {}).keys())
+        for coin in sorted(quarantined - active):
+            self._clear_protective_churn_quarantine(coin, "position_absent")
+
+    def _load_persisted_protective_attempt_history(self) -> None:
+        """Restore recent fallback SL/TP attempts from bot_state.
+
+        This is the restart-safe half of the protective churn guard.  If a
+        fresh process cannot classify existing exchange orders, it must not
+        blindly stack another fallback bracket for the same unchanged position.
+        """
+        try:
+            snapshot = db.get_bot_state(self._PROTECTIVE_ATTEMPT_STATE_KEY)
+        except Exception as exc:
+            logger.debug("Failed to load protective attempt history: %s", exc)
+            return
+        if not isinstance(snapshot, dict):
+            return
+
+        raw_attempts = snapshot.get("attempts", snapshot)
+        if not isinstance(raw_attempts, dict):
+            return
+
+        now = time.time()
+        cutoff = now - self._protective_repeat_window_s
+        restored_keys = 0
+        restored_attempts = 0
+        with self._state_lock:
+            for key, values in raw_attempts.items():
+                if not isinstance(key, str):
+                    continue
+                if isinstance(values, dict):
+                    values = values.get("timestamps", [])
+                if not isinstance(values, list):
+                    continue
+                filtered: List[float] = []
+                for value in values:
+                    try:
+                        ts = float(value)
+                    except (TypeError, ValueError):
+                        continue
+                    # Keep only plausible timestamps inside the current guard
+                    # window.  A small future allowance tolerates clock skew.
+                    if cutoff <= ts <= now + 60.0:
+                        filtered.append(ts)
+                if not filtered:
+                    continue
+                self._protective_attempt_history[key] = deque(sorted(filtered))
+                restored_keys += 1
+                restored_attempts += len(filtered)
+        if restored_attempts:
+            logger.warning(
+                "Restored %d recent protective fallback attempt(s) across %d "
+                "position key(s); duplicate fallback brackets will be blocked.",
+                restored_attempts,
+                restored_keys,
+            )
+
+    def _persist_protective_attempt_history(self) -> None:
+        """Best-effort persistence for restart-safe protective churn guard."""
+        try:
+            now = time.time()
+            cutoff = now - self._protective_repeat_window_s
+            with self._state_lock:
+                attempts = {
+                    key: [float(ts) for ts in history if ts >= cutoff]
+                    for key, history in self._protective_attempt_history.items()
+                    if any(ts >= cutoff for ts in history)
+                }
+            db.set_bot_state(
+                self._PROTECTIVE_ATTEMPT_STATE_KEY,
+                {
+                    "window_s": self._protective_repeat_window_s,
+                    "max_attempts": self._protective_repeat_max,
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                    "attempts": attempts,
+                },
+            )
+        except Exception as exc:
+            logger.debug("Failed to persist protective attempt history: %s", exc)
+
     def _protective_repeat_blocked(self, key: str) -> bool:
         now = time.time()
         cutoff = now - self._protective_repeat_window_s
@@ -2179,26 +2871,27 @@ class LiveTrader:
             while history and history[0] < cutoff:
                 history.popleft()
             history.append(now)
+        self._persist_protective_attempt_history()
 
     def _trip_protective_churn_guard(self, coin: str, key: str) -> None:
-        with self._state_lock:
-            self._protective_churn_trips += 1
+        first_trip = self._quarantine_protective_churn_coin(coin, key)
         logger.critical(
             "PROTECTIVE ORDER CHURN GUARD: %s still appears unprotected after "
             "%d fallback placement(s) in %.0fs (key=%s). Refusing to stack "
-            "another SL/TP pair and activating kill switch.",
+            "another SL/TP pair. New live entries for this coin are quarantined; "
+            "other coins may continue trading.",
             coin,
             self._protective_repeat_max,
             self._protective_repeat_window_s,
             key,
         )
-        try:
-            self.activate_kill_switch(
-                f"protective_order_churn:{coin}",
-                status_reason="protective_order_churn",
+        if first_trip:
+            logger.critical(
+                "Protective churn quarantine active for %s. Manual intervention "
+                "is required unless a later hygiene sweep sees valid SL + TP "
+                "or the position disappears.",
+                self._normalize_coin_key(coin),
             )
-        except Exception as exc:
-            logger.critical("activate_kill_switch failed during protective churn guard: %s", exc)
 
     def protect_orphaned_positions(
         self,
@@ -2243,9 +2936,11 @@ class LiveTrader:
             })
 
         if not positions:
+            self._release_absent_protective_churn_quarantines([])
             return self._store_orphan_protection_summary(
                 {"status": "ok", "protected": 0, "skipped": 0, "failed": 0}
             )
+        self._release_absent_protective_churn_quarantines(positions)
 
         # One fetch of open orders, then index by coin for O(1) lookup.
         # P0-3: orphan protection also reasons about WHICH legs (SL vs TP)
@@ -2390,6 +3085,7 @@ class LiveTrader:
             has_tp = bool(valid_tp)
 
             if has_sl and has_tp:
+                self._clear_protective_churn_quarantine(coin, "valid_sl_tp_detected")
                 logger.info(
                     "protect_orphaned_positions: %s already has valid SL + TP "
                     "(sl_oid=%s tp_oid=%s), skipping",
@@ -2462,6 +3158,7 @@ class LiveTrader:
             if protective_record_key and (sl_ok or tp_ok):
                 self._record_protective_attempt(protective_record_key)
             if sl_ok and tp_ok:
+                self._clear_protective_churn_quarantine(coin, "fallback_protection_verified")
                 protected += 1
                 logger.info(
                     "Orphan protection complete for %s: "
@@ -2495,6 +3192,54 @@ class LiveTrader:
         ):
             logger.warning("Orphan protection summary: %s", summary)
         return self._store_orphan_protection_summary(summary)
+
+    def audit_live_order_hygiene(self, *, repair: bool = True) -> Dict[str, Any]:
+        """Audit live protective orders and optionally repair drift.
+
+        The repair path intentionally reuses ``protect_orphaned_positions`` so
+        the audit cannot disagree with the actual safety mechanism.  The
+        returned summary is stored separately for dashboard/runtime visibility.
+        """
+        if repair:
+            summary = self.protect_orphaned_positions()
+        else:
+            positions = self.get_positions(force_fresh=True)
+            open_orders = self.get_open_orders(force_fresh=True)
+            if positions is None or open_orders is None:
+                summary = {
+                    "status": "degraded",
+                    "reason": "positions_or_orders_unavailable",
+                    "positions": None if positions is None else len(positions),
+                    "open_orders": None if open_orders is None else len(open_orders),
+                }
+            else:
+                protective_orders = [
+                    order for order in open_orders
+                    if self._classify_protective_leg(order) is not None
+                ]
+                summary = {
+                    "status": "ok",
+                    "positions": len(positions),
+                    "open_orders": len(open_orders),
+                    "protective_orders": len(protective_orders),
+                }
+
+        summary = dict(summary or {})
+        summary["audit"] = "live_order_hygiene"
+        summary["repair"] = bool(repair)
+        summary["timestamp"] = datetime.now(timezone.utc).isoformat()
+        with self._state_lock:
+            self._last_order_hygiene_audit = summary
+        if (
+            str(summary.get("status", "")).lower() not in {"ok", "skipped"}
+            or int(summary.get("failed", 0) or 0) > 0
+            or int(summary.get("cancel_failed", 0) or 0) > 0
+            or int(summary.get("stale_cancelled", 0) or 0) > 0
+        ):
+            logger.warning("Live order hygiene audit: %s", summary)
+        else:
+            logger.info("Live order hygiene audit: %s", summary)
+        return summary
 
     @staticmethod
     def _shadow_trade_metadata(trade: Dict[str, Any]) -> Dict[str, Any]:
@@ -2793,6 +3538,9 @@ class LiveTrader:
         is_position_tpsl = bool(order.get("isPositionTpsl") or order.get("is_position_tpsl"))
         reduce_only = bool(order.get("reduceOnly") or order.get("reduce_only") or is_position_tpsl)
         order_type = str(order.get("orderType") or order.get("type") or "").lower()
+        trigger_condition = str(
+            order.get("triggerCondition") or order.get("trigger_condition") or ""
+        ).lower()
 
         leg: Optional[str] = None
         trigger_px_raw: Any = None
@@ -2815,22 +3563,44 @@ class LiveTrader:
             elif "take" in order_type or "profit" in order_type:
                 leg = "tp"
 
+        # Side: prefer boolean "b" (our wire format), fall back to "side" string.
+        side = None
+        if "b" in order and isinstance(order.get("b"), bool):
+            side = "buy" if order["b"] else "sell"
+        else:
+            for side_key in ("side", "direction", "action"):
+                if not isinstance(order.get(side_key), str):
+                    continue
+                raw_side = order[side_key].strip().lower()
+                if raw_side in ("buy", "b", "bid") or "close short" in raw_side:
+                    side = "buy"
+                    break
+                if raw_side in ("sell", "s", "a", "ask") or "close long" in raw_side:
+                    side = "sell"
+                    break
+
+        if leg is None and trigger_condition:
+            # Some Hyperliquid order views omit ``t.trigger.tpsl`` and expose
+            # only "Close Long/Short" plus "Price above/below".  Infer leg
+            # from close side + trigger direction:
+            #   close long  (sell): below=SL, above=TP
+            #   close short (buy):  above=SL, below=TP
+            if side == "sell":
+                if "price below" in trigger_condition:
+                    leg = "sl"
+                elif "price above" in trigger_condition:
+                    leg = "tp"
+            elif side == "buy":
+                if "price above" in trigger_condition:
+                    leg = "sl"
+                elif "price below" in trigger_condition:
+                    leg = "tp"
+
         if leg is None:
             # Not a recognised protective leg.  reduce-only alone isn't
             # enough to treat as an SL or TP: a plain reduce-only limit
             # won't fire automatically on adverse moves.
             return None
-
-        # Side: prefer boolean "b" (our wire format), fall back to "side" string.
-        side = None
-        if "b" in order and isinstance(order.get("b"), bool):
-            side = "buy" if order["b"] else "sell"
-        elif isinstance(order.get("side"), str):
-            raw_side = order["side"].strip().lower()
-            if raw_side in ("buy", "b", "bid"):
-                side = "buy"
-            elif raw_side in ("sell", "s", "a", "ask"):
-                side = "sell"
 
         size_raw = order.get("sz")
         try:
@@ -2950,6 +3720,39 @@ class LiveTrader:
                 continue
             if self.cancel_order(coin, int(oid)):
                 cancelled += 1
+        return cancelled
+
+    def _protective_order_oids(self, coin: str) -> set[int]:
+        """Return currently visible protective order ids for a coin."""
+        open_orders = self.get_open_orders(force_fresh=True)
+        if open_orders is None:
+            raise RuntimeError("open_orders_unavailable")
+        oids: set[int] = set()
+        for order in open_orders:
+            if not self._is_protective_order(order, coin=coin):
+                continue
+            oid = order.get("oid") or order.get("order_id") or order.get("id")
+            if oid is None:
+                continue
+            try:
+                oids.add(int(oid))
+            except (TypeError, ValueError):
+                logger.warning("Skipping protective order with non-integer oid for %s: %s", coin, order)
+        return oids
+
+    def _cancel_protective_order_oids(self, coin: str, oids: set[int]) -> int:
+        """Cancel a known set of protective orders without touching newly placed replacements."""
+        cancelled = 0
+        for oid in sorted(oids):
+            if self.cancel_order(coin, int(oid)):
+                cancelled += 1
+        if cancelled < len(oids):
+            logger.warning(
+                "Cancelled %d/%d stale protective order(s) for %s",
+                cancelled,
+                len(oids),
+                coin,
+            )
         return cancelled
 
     def _update_shadow_trade_risk_levels(
@@ -3123,7 +3926,7 @@ class LiveTrader:
                 continue
 
             try:
-                self._cancel_protective_orders(coin)
+                stale_protective_oids = self._protective_order_oids(coin)
                 sl_result, tp_result, attempts = self._place_protective_orders_with_retries(
                     coin,
                     close_side,
@@ -3137,6 +3940,12 @@ class LiveTrader:
                 continue
 
             if self._is_order_result_success(sl_result) and self._is_order_result_success(tp_result):
+                cancelled_stale = 0
+                if stale_protective_oids:
+                    cancelled_stale = self._cancel_protective_order_oids(
+                        coin,
+                        stale_protective_oids,
+                    )
                 updated += 1
                 self._update_shadow_trade_risk_levels(
                     shadow_trades,
@@ -3155,6 +3964,8 @@ class LiveTrader:
                             "take_profit": round(desired_tp, 8),
                             "current_r": round(current_r, 4),
                             "attempts": attempts,
+                            "stale_protective_cancelled": cancelled_stale,
+                            "stale_protective_seen": len(stale_protective_oids),
                             "updated_at": now_utc.isoformat(),
                         },
                     },
@@ -3168,6 +3979,25 @@ class LiveTrader:
                     sl_result,
                     tp_result,
                 )
+                if stale_protective_oids:
+                    logger.warning(
+                        "manage_open_positions: keeping %d existing protective order(s) "
+                        "for %s because replacement failed",
+                        len(stale_protective_oids),
+                        coin,
+                    )
+                    self._update_shadow_trade_risk_levels(
+                        shadow_trades,
+                        metadata_updates={
+                            "risk_event": "protective_update_failed_existing_retained",
+                            "live_risk_state": {
+                                "event": "protective_update_failed_existing_retained",
+                                "existing_protective_oids": sorted(stale_protective_oids),
+                                "updated_at": now_utc.isoformat(),
+                            },
+                        },
+                    )
+                    continue
                 close_result = self.close_position(coin)
                 self._update_shadow_trade_risk_levels(
                     shadow_trades,
@@ -3401,7 +4231,16 @@ class LiveTrader:
             return False
 
     def _get_mid_price(self, coin: str) -> Optional[float]:
-        """Get mid price from Hyperliquid."""
+        """Get mid price from Hyperliquid.
+
+        ★ M7 FIX: previously returned the raw price without invoking
+        ``_validate_price`` (which sits right below).  A corrupt API response
+        — zero, NaN, Inf, or a price that deviates >10% from the last
+        confirmed baseline — would flow straight into sizing and order
+        placement.  Now every price is validated before return; rejected
+        prices yield ``None`` so callers fall through their no-price paths
+        instead of submitting an order against bad data.
+        """
         try:
             mids = self.api_manager.post(
                 {"type": "allMids"},
@@ -3413,7 +4252,14 @@ class LiveTrader:
 
             price = mids.get(coin)
             if price:
-                return float(price)
+                try:
+                    price_f = float(price)
+                except (TypeError, ValueError):
+                    logger.error("Invalid mid price for %s: %r", coin, price)
+                    return None
+                if not self._validate_price(coin, price_f):
+                    return None
+                return price_f
         except Exception as e:
             logger.error(f"Failed to get mid price for {coin}: {e}")
 
@@ -3972,8 +4818,14 @@ class LiveTrader:
                 return {"status": "rejected", "reason": "kill_switch_active"}
 
             if self.check_daily_loss(refresh_from_fills=True):
-                logger.warning(f"Daily loss limit exceeded - rejecting market order {coin} {side}")
-                return {"status": "rejected", "reason": "daily_loss_exceeded"}
+                reason = self.get_safety_stop_reason()
+                logger.warning(
+                    "Live safety stop (%s) - rejecting market order %s %s",
+                    reason,
+                    coin,
+                    side,
+                )
+                return {"status": "rejected", "reason": self._safety_stop_rejection_code()}
 
         # Get asset index
         asset_idx = self._get_asset_index(coin)
@@ -4291,8 +5143,14 @@ class LiveTrader:
                 logger.warning(f"Kill switch active - rejecting limit order {coin}")
                 return {"status": "rejected", "reason": "kill_switch_active"}
             if self.check_daily_loss(refresh_from_fills=True):
-                logger.warning(f"Daily loss limit exceeded - rejecting limit order {coin} {side}")
-                return {"status": "rejected", "reason": "daily_loss_exceeded"}
+                reason = self.get_safety_stop_reason()
+                logger.warning(
+                    "Live safety stop (%s) - rejecting limit order %s %s",
+                    reason,
+                    coin,
+                    side,
+                )
+                return {"status": "rejected", "reason": self._safety_stop_rejection_code()}
 
         asset_idx = self._get_asset_index(coin)
         if asset_idx is None:
@@ -5000,6 +5858,24 @@ class LiveTrader:
                     type(data).__name__,
                 )
                 return None
+            if not orders:
+                try:
+                    fallback_data = self.api_manager.post(
+                        {"type": "openOrders", "user": self.public_address},
+                        priority=Priority.HIGH,
+                        timeout=10,
+                        force_fresh=force_fresh,
+                    )
+                    fallback_orders = self._extract_open_orders_response(fallback_data)
+                    if fallback_orders:
+                        logger.warning(
+                            "frontendOpenOrders returned 0 orders but openOrders "
+                            "returned %d; using fallback order view for safety.",
+                            len(fallback_orders),
+                        )
+                        orders = fallback_orders
+                except Exception as exc:
+                    logger.debug("openOrders fallback after empty frontend view failed: %s", exc)
             self._record_order_visibility_status(
                 ok=True,
                 order_count=len(orders),
@@ -5184,17 +6060,26 @@ class LiveTrader:
                 )
                 floor_metric = "min_notional_same_side_merges"
             else:
-                allowed_source_status = {"active", "unknown", "policy_error"}
+                allowed_source_status = {"active", "unknown"}
+                if self.min_order_allow_policy_error_floorup:
+                    allowed_source_status.add("policy_error")
                 if self.min_order_allow_degraded_sources:
                     allowed_source_status.update({"warmup", "degraded"})
+                side_value = self._signal_side_value(signal)
+                confidence = float(signal.confidence or 0.0)
+                side_floor_ok = (
+                    side_value != "short"
+                    or confidence >= self.min_order_short_min_confidence
+                )
                 if (
                     self.min_order_top_tier_enabled
-                    and float(signal.confidence or 0.0) >= self.min_order_top_tier_min_confidence
+                    and confidence >= self.min_order_top_tier_min_confidence
+                    and side_floor_ok
                     and policy_status in allowed_source_status
                     and bump_multiplier <= self.min_order_top_tier_max_bump_multiplier
                 ):
                     floor_reason = (
-                        f"top-tier signal (confidence {float(signal.confidence or 0.0):.0%}, "
+                        f"top-tier signal (confidence {confidence:.0%}, "
                         f"source status {policy_status})"
                     )
                     floor_metric = "min_notional_top_tier_floorups"
@@ -5275,8 +6160,23 @@ class LiveTrader:
         # External kill-switch takes precedence over any other gate.
         self._refresh_external_kill_switch()
         if self.check_daily_loss(refresh_from_fills=True):
-            self._incr_entry_metric("rejected_daily_loss")
-            logger.warning("Daily loss limit exceeded - rejecting signal")
+            reason = self.get_safety_stop_reason()
+            if self._safety_stop_rejection_code() == "daily_loss_exceeded":
+                self._incr_entry_metric("rejected_daily_loss")
+            else:
+                self._incr_entry_metric("rejected_kill_switch")
+            logger.warning("Live safety stop (%s) - rejecting signal", reason)
+            return None
+
+        if not self.dry_run and self._order_dedup_reconcile_required:
+            self._incr_entry_metric("rejected_order_dedup_reconcile_required")
+            logger.critical(
+                "Startup order-dedup reconcile is still required (%d unresolved "
+                "marker(s)); rejecting new live entry for %s until exchange "
+                "positions/open orders are reconciled.",
+                self._order_dedup_unresolved_restored,
+                signal.coin,
+            )
             return None
 
         if not bypass_firewall:
@@ -5310,6 +6210,14 @@ class LiveTrader:
             self._incr_entry_metric("rejected_kill_switch")
             logger.warning("Kill switch active - rejecting signal")
             return None
+        if not self.dry_run and self._is_protective_churn_quarantined(signal.coin):
+            self._incr_entry_metric("rejected_protective_churn_coin")
+            logger.critical(
+                "Protective-order churn quarantine active for %s - rejecting "
+                "new live entry for this coin while allowing other coins to trade",
+                signal.coin,
+            )
+            return None
 
         # H10 (audit): Canary/source caps apply to NEW live entries only.
         # The read-compare-increment sequence is executed atomically in
@@ -5322,9 +6230,12 @@ class LiveTrader:
         # at the success point to keep the counter incremented.
         _slot_reserved = False
         if not self.dry_run:
-            reserved, reserve_reason = self._reserve_entry_slot(source_key)
+            reserved, reserve_reason = self._reserve_entry_slot(
+                source_key,
+                source_policy=source_policy,
+            )
             if not reserved:
-                logger.warning(
+                logger.info(
                     "Entry cap reached (%s) - rejecting %s (source=%s)",
                     reserve_reason,
                     signal.coin,
@@ -5391,6 +6302,11 @@ class LiveTrader:
                     regime_data={"regime": signal.regime} if signal.regime else None,
                     source_policy=source_policy,
                 )
+
+            signal = self._apply_risk_based_live_sizing(
+                signal,
+                source_policy=source_policy,
+            )
 
             # Hard per-order $ cap — applied AFTER regime overlay and any paper→live
             # rescaling so nothing above max_order_usd ever hits the exchange.
@@ -5655,6 +6571,16 @@ class LiveTrader:
                     actual_fill_size,
                     protective_size,
                 )
+                if observed_position_size > actual_fill_size * 1.01 and not self.dry_run:
+                    logger.warning(
+                        "Existing same-side %s position detected. Keeping current "
+                        "protective orders live and placing protection only for "
+                        "the new fill size %.6f; total-position replacement is "
+                        "handled by manage_open_positions after new protection is verified.",
+                        coin,
+                        actual_fill_size,
+                    )
+                    protective_size = actual_fill_size
 
             # 2. Calculate stop loss and take profit prices from actual fill price when available.
             entry_anchor_price = exchange_reported_fill_price or verified_fill_price
@@ -5842,8 +6768,13 @@ class LiveTrader:
                 "total_entry_signals_today": int(sum(self._source_orders_today.values())),
                 "entry_metrics": dict(self._entry_metrics),
                 "orphan_protection": dict(self._last_orphan_protection_summary),
+                "order_hygiene_audit": dict(self._last_order_hygiene_audit),
+                "live_sizing": dict(self._last_sizing_explanation),
                 "order_visibility": dict(self._last_order_visibility_status),
                 "protective_churn_trips": self._protective_churn_trips,
+                "protective_churn_quarantined_coins": dict(
+                    getattr(self, "_protective_churn_quarantined_coins", {}) or {}
+                ),
             }
 
         return {
@@ -5880,7 +6811,21 @@ class LiveTrader:
             "order_dedup_window_s": self._ORDER_DEDUP_WINDOW,
             "order_visibility": state_snapshot["order_visibility"],
             "orphan_protection": state_snapshot["orphan_protection"],
+            "order_hygiene_audit": state_snapshot["order_hygiene_audit"],
+            "live_sizing": state_snapshot["live_sizing"],
+            "risk_sizing": {
+                "enabled": bool(self.risk_sizing_enabled),
+                "risk_per_trade_pct": float(self.live_risk_per_trade_pct),
+                "max_margin_per_order_pct": float(self.live_max_margin_per_order_pct),
+                "min_margin_per_order_usd": float(self.live_min_margin_per_order_usd),
+            },
+            "dynamic_source_caps_allow_static_expansion": bool(
+                self.dynamic_source_caps_allow_static_expansion
+            ),
             "protective_churn_trips": int(state_snapshot["protective_churn_trips"]),
+            "protective_churn_quarantined_coins": state_snapshot[
+                "protective_churn_quarantined_coins"
+            ],
             "protective_repeat_window_s": self._protective_repeat_window_s,
             "protective_repeat_max": self._protective_repeat_max,
             "fill_verify_blocking": self._fill_verify_blocking,

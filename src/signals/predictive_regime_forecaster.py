@@ -59,6 +59,25 @@ CRASH_THRESHOLD = -0.15
 BULLISH_THRESHOLD = 0.15
 
 
+def _arkham_env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, default) or default)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+# ★ M10 FIX: previously `score = data.get("net_flow", 0) / 1_000_000`,
+# an undocumented magic number assuming USD denomination and $1M
+# saturation.  If the API ever switches units (cents, ETH, sat), the
+# divisor silently breaks the score.  Make both saturation level and
+# the assumed unit configurable via env so we can recalibrate if
+# Arkham changes their schema.  Default unchanged so behaviour is
+# stable.
+ARKHAM_FLOW_SATURATION_USD = _arkham_env_float(
+    "ARKHAM_FLOW_SATURATION_USD", 1_000_000.0
+)
+
+
 class ArkhamClient:
     """
     Lightweight Arkham Intelligence API client.
@@ -99,9 +118,16 @@ class ArkhamClient:
             )
             resp.raise_for_status()
             data = resp.json()
-            # Normalize to -1.0 (outflow) → +1.0 (inflow)
-            score = data.get("net_flow", 0) / 1_000_000  # scale
-            return {"net_flow_score": max(min(score, 1.0), -1.0)}
+            # Normalize to -1.0 (outflow) → +1.0 (inflow).
+            # ★ M10: divisor is configurable (default 1M USD).  Document
+            # in the response so downstream consumers can audit the
+            # assumed unit if telemetry looks off.
+            saturation = ARKHAM_FLOW_SATURATION_USD or 1.0
+            score = data.get("net_flow", 0) / saturation
+            return {
+                "net_flow_score": max(min(score, 1.0), -1.0),
+                "saturation_usd": saturation,
+            }
         except Exception as e:
             logger.debug(f"Arkham flow query failed: {e}")
             return {"net_flow_score": 0.0}
@@ -143,6 +169,14 @@ class PredictiveRegimeForecaster:
         self._external_data_ttl = cfg.get("external_data_ttl", 600)  # 10 min staleness limit
         self._external_data_partial_ttl = cfg.get("external_data_partial_ttl", 1800)  # 30 min
 
+        # ★ H15 FIX: market-wide inputs (polymarket, options_flow, arkham) are
+        # shared across all coins, but the per-coin cache used to keep stale
+        # market data alive on coin A while coin B saw the fresh values.
+        # Bumping this counter on every market-wide update makes the cache
+        # check at the top of predict_regime() invalidate every coin's entry,
+        # so all coins re-derive against the same market snapshot.
+        self._market_data_version: int = 0
+
         self.api_manager = get_manager()
 
         logger.info("PredictiveRegimeForecaster V2 initialized (5-input model)")
@@ -159,6 +193,7 @@ class PredictiveRegimeForecaster:
         """
         self._polymarket_sentiment = sentiment
         self._polymarket_ts = time.time()
+        self._market_data_version += 1  # ★ H15: invalidate per-coin caches
         logger.debug(f"Polymarket sentiment updated: {sentiment.get('sentiment', '?')} "
                      f"(conf={sentiment.get('confidence', 0):.2f})")
 
@@ -171,6 +206,7 @@ class PredictiveRegimeForecaster:
         """
         self._options_convictions = convictions or []
         self._options_ts = time.time()
+        self._market_data_version += 1  # ★ H15: invalidate per-coin caches
         logger.debug(f"Options flow updated: {len(self._options_convictions)} convictions")
 
     def predict_regime(self, coin: str = "BTC") -> Dict:
@@ -198,11 +234,16 @@ class PredictiveRegimeForecaster:
         source_registry_version = self._source_registry_version()
 
         # Check cache
+        # ★ H15: also gate on market_data_version so that updates to the
+        # shared polymarket / options_flow inputs invalidate every coin's
+        # cached prediction in lockstep — preventing one coin from running
+        # with stale market data while another sees the fresh values.
         if coin in self.cache:
             cached = self.cache[coin]
             if (
                 now - cached.get("ts", 0) < self.cache_ttl
                 and cached.get("source_registry_version") == source_registry_version
+                and cached.get("market_data_version") == self._market_data_version
             ):
                 return cached["data"]
 
@@ -314,6 +355,7 @@ class PredictiveRegimeForecaster:
             "data": data,
             "ts": now,
             "source_registry_version": source_registry_version,
+            "market_data_version": self._market_data_version,  # ★ H15
         }
         inputs_str = "/".join(k for k in components if components[k] != 0.0) or "funding+book"
         logger.info(f"Forecaster {coin} -> {regime} (signal={signal:.3f}, "

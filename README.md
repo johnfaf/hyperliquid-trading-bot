@@ -177,8 +177,11 @@ The live path is intentionally conservative. Real order submission requires expl
 - **Protected entries:** fill verification compares the post-order position delta against the pre-entry baseline; existing positions cannot falsely verify a rejected entry.
 - **Naked-position defense:** SL/TP placement retries are bounded; if protective orders still fail, the bot retries an emergency close.
 - **Daily-loss fail-closed:** if live fill/PnL refresh fails, the kill switch activates instead of leaving the loss brake frozen.
+- **Rolling drawdown required:** deployable live mode refuses to arm unless `LIVE_MAX_DRAWDOWN_USD` is set above zero.
 - **Free-margin sizing:** live mirroring scales against available/free margin and uses `accountValue - totalMarginUsed` before falling back to `withdrawable`.
-- **Dashboard write auth:** sensitive POST endpoints such as order placement, paper reset, and close-all require `DASHBOARD_AUTH_TOKEN`.
+- **Dashboard hardening:** sensitive POST endpoints require `DASHBOARD_AUTH_TOKEN`, request bodies are size-capped, and auth cookies use signed sessions instead of the raw master token.
+- **Options dashboard lockdown:** the standalone options dashboard binds to localhost by default and refuses unauthenticated public bind unless explicitly overridden.
+- **Signed ML artifacts:** alpha model pickle artifacts require a valid HMAC sidecar before they are unpickled.
 - **Dual-write atomicity:** Postgres mirror writes no longer commit per statement; they commit through the owning DB transaction.
 
 ### Scaling Tiers
@@ -294,13 +297,20 @@ DISCOVERY_CYCLE_INTERVAL = 86400     # 24h  (env: DISCOVERY_CYCLE_INTERVAL)
 | `LIVE_MAX_POSITION_SIZE_USD` | `LIVE_MAX_ORDER_USD` | Operator per-coin notional ceiling; also accepts legacy `HL_MAX_POSITION_SIZE` |
 | `LIVE_MAX_DAILY_LOSS_USD` | `100` | Config default for live daily loss limit |
 | `HL_MAX_DAILY_LOSS` | `LIVE_MAX_DAILY_LOSS_USD` | LiveTrader override for the daily loss kill-switch threshold |
+| `LIVE_MAX_DRAWDOWN_USD` | `0` | Rolling drawdown kill-switch cap; must be `>0` when live dual-control is enabled |
 | `LIVE_CANARY_MODE` | `false` | Legacy live canary guardrail; ignored when `LIVE_TIER` is set |
 | `LIVE_CANARY_MAX_ORDER_USD` | `25` | Max order notional when legacy canary mode is enabled |
 | `LIVE_CANARY_MAX_SIGNALS_PER_DAY` | `25` | Daily live entry cap when legacy canary mode or tier caps are active |
 | `LIVE_MAX_ORDERS_PER_SOURCE_PER_DAY` | `0` | Per-source daily live entry cap (`0` disables cap) |
 | `LIVE_EXTERNAL_KILL_SWITCH_FILE` | _(none)_ | Optional file path for external kill switch; fast cycle also defaults to `/data/KILL_SWITCH` |
 | `LIVE_KILL_SWITCH_STATE_FILE` | `/data/live_kill_switch_state.json` | Sticky kill-switch state restored on restart |
-| `DASHBOARD_AUTH_TOKEN` | _(none)_ | Required for dashboard write actions (`/api/order`, close, close-all, paper reset) |
+| `DASHBOARD_AUTH_TOKEN` | _(none)_ | Required for dashboard write actions and public dashboard deployments |
+| `DASHBOARD_MAX_REQUEST_BODY_BYTES` | `65536` | Max dashboard POST body size before `413 Payload Too Large` |
+| `DASHBOARD_ALLOWED_ORIGINS` | localhost | Optional comma-separated CORS allowlist; wildcard origins are ignored |
+| `OPTIONS_DASHBOARD_HOST` | `127.0.0.1` | Standalone options dashboard bind host; public bind requires auth or an explicit unsafe override |
+| `OPTIONS_DASHBOARD_ENABLE_ORDER_ENDPOINT` | `false` | Keeps standalone `/api/order` disabled until live Deribit execution is implemented and reviewed |
+| `ALPHA_MODEL_ARTIFACT_HMAC_KEY` | _(none)_ | HMAC key for signed alpha model artifacts; required when signed-artifact enforcement is enabled |
+| `ALPHA_MODEL_REQUIRE_SIGNED_ARTIFACTS` | `true` | Skip alpha model pickle artifacts unless their sidecar signature verifies |
 | `HL_WALLET_MODE` | `agent_only` | Wallet mode; only agent-wallet signing is permitted |
 | `HL_PUBLIC_ADDRESS` | _(none)_ | Trading account address (master/vault) |
 | `HL_AGENT_PRIVATE_KEY` | _(none)_ | Agent wallet private key (only for `SECRET_MANAGER_PROVIDER=none`) |
@@ -326,8 +336,10 @@ DISCOVERY_CYCLE_INTERVAL = 86400     # 24h  (env: DISCOVERY_CYCLE_INTERVAL)
 - Real orders require both `LIVE_TRADING_ENABLED=true` and `LIVE_TRADING_DUAL_CONTROL_CONFIRM=true`.
 - Start with `LIVE_TIER=T0` or legacy canary mode, then advance one rung at a time only after the checklist in [docs/SCALING_RUNBOOK.md](docs/SCALING_RUNBOOK.md) passes.
 - `LIVE_TIER` caps are downward-only: raising `LIVE_TIER` alone cannot increase exposure if the operator env caps are lower.
+- `LIVE_MAX_DRAWDOWN_USD` must be set above zero before live dual-control can become deployable.
 - Creating `/data/KILL_SWITCH` is the quickest file-based emergency stop; remove it only after investigating and intentionally clearing the persisted kill-switch state.
 - Set `DASHBOARD_AUTH_TOKEN` before exposing the dashboard or using dashboard write actions.
+- Set `ALPHA_MODEL_ARTIFACT_HMAC_KEY` if the ML alpha pipeline should reuse saved model artifacts across restarts.
 - When live trading is deployable, exchange positions become the source of truth for exposure, decisioning, and health reporting.
 - The paper ledger remains as a shadow book for reporting and is reconciled back to exchange truth instead of driving live risk.
 - Paper-only paths such as standalone options-flow, liquidation-reversal, and arena champion execution are skipped while live trading is active so capital does not drift from the tracked book.

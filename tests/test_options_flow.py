@@ -111,18 +111,26 @@ class TestOptionsFlowScanner:
         assert result.get("is_unusual") is True
 
     def test_get_flow_signal_strong_conviction(self, scanner):
-        """get_flow_signal returns signal when conviction_pct >= configured gate."""
+        """get_flow_signal returns signal when conviction_pct >= configured gate.
+
+        L12: confidence is now down-weighted by sqrt(min(prints, 50) / 50)
+        so single-print signals don't read the same as 50-print signals.
+        Use total_prints=50 here so sample_weight=1.0 and confidence
+        equals raw_conviction (matching the pre-L12 behaviour).
+        """
         scanner.top_convictions = [{
             "ticker": "BTC",
             "direction": "BULLISH",
             "conviction_pct": 45,
             "net_flow": 1_000_000,
-            "total_prints": 12,
+            "total_prints": 50,
         }]
         signal = scanner.get_flow_signal("BTC")
         assert signal is not None
         assert signal.get("confidence") == pytest.approx(0.45)
         assert signal.get("side") == "long"
+        assert signal.get("raw_conviction") == pytest.approx(0.45)
+        assert signal.get("sample_weight") == pytest.approx(1.0)
 
     def test_get_flow_signal_weak_conviction(self, scanner):
         """get_flow_signal returns None when conviction_pct is below configured gate."""

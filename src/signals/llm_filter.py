@@ -95,7 +95,17 @@ class LLMFilter:
             "blocked_llm": 0,
             "llm_calls": 0,
             "llm_errors": 0,
+            # ★ M16 FIX: track every fail-open so dashboards can alarm when
+            # the LLM gate is silently disabled by upstream outages.
+            "fallback_count": 0,
+            "fallback_rate_limit": 0,
+            "fallback_api_error": 0,
         }
+        # M16: optional fail-closed mode for live operators who'd rather
+        # reject signals than ship them through an unverified gate.
+        self.fail_closed_on_llm_outage = bool(
+            cfg.get("fail_closed_on_llm_outage", False)
+        )
 
         if self._llm_enabled:
             try:
@@ -260,7 +270,19 @@ class LLMFilter:
         now = time.time()
         self._llm_call_timestamps = [t for t in self._llm_call_timestamps if now - t < 60]
         if len(self._llm_call_timestamps) >= self._llm_max_calls_per_min:
-            # Over rate limit — pass through with rule-based result
+            # Over rate limit — pass through with rule-based result.
+            # ★ M16: track and (optionally) fail-closed.
+            self.stats["fallback_count"] += 1
+            self.stats["fallback_rate_limit"] += 1
+            logger.warning(
+                "LLMFilter rate-limited (%d calls/min cap reached) -- "
+                "%s through rule-based result",
+                self._llm_max_calls_per_min,
+                "rejecting" if self.fail_closed_on_llm_outage else "passing",
+            )
+            if self.fail_closed_on_llm_outage:
+                self.stats["blocked_llm"] += 1
+                return False, 0.0, "LLM rate-limited (fail-closed)"
             self.stats["passed"] += 1
             return True, rule_confidence, rule_reason + " (LLM rate-limited)"
 
@@ -280,7 +302,17 @@ class LLMFilter:
 
         except Exception as e:
             self.stats["llm_errors"] += 1
-            logger.warning("LLMFilter Claude API error: %s -- falling back to rules", e)
+            # ★ M16: track and (optionally) fail-closed on API outage.
+            self.stats["fallback_count"] += 1
+            self.stats["fallback_api_error"] += 1
+            logger.warning(
+                "LLMFilter Claude API error: %s -- %s through rule-based result",
+                e,
+                "rejecting" if self.fail_closed_on_llm_outage else "falling back",
+            )
+            if self.fail_closed_on_llm_outage:
+                self.stats["blocked_llm"] += 1
+                return False, 0.0, f"LLM API error: {e} (fail-closed)"
             self.stats["passed"] += 1
             return True, rule_confidence, rule_reason + " (LLM fallback)"
 

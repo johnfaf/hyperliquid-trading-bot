@@ -69,6 +69,7 @@ from src.core.cycles.fast_cycle import (
     cancel_live_orders_once,
     start_kill_switch_watchdog,
     stop_kill_switch_watchdog,
+    DEFAULT_KILL_SWITCH_FILE,
 )
 from src.core.cycles.reporting_cycle import run_reporting
 from src.core.cycles.feature_cycle import run_feature_cycle, backfill_all as backfill_features, feature_store_is_empty
@@ -82,10 +83,34 @@ from cli import (
     run_candle_backtest,
     run_cache_list,
     run_cache_clear,
+    run_db_audit_cli,
+    run_db_repair_cli,
 )
 
 
 # ─── Bot Engine ────────────────────────────────────────────────
+
+def _strategy_pool_requires_startup_discovery() -> tuple[bool, dict]:
+    """Return whether startup should refresh trader/strategy discovery.
+
+    Startup previously only checked whether traders existed. After the
+    strategy-source guardrails quarantine contaminated rows, the DB can still
+    contain traders while every strategy is invalid. In that state waiting for
+    the daily discovery timer leaves the strategy engine empty for hours.
+    """
+    try:
+        status = db.get_strategy_runtime_status()
+    except Exception as exc:
+        return False, {"error": str(exc)}
+
+    total = int(status.get("total", 0) or 0)
+    active_valid = int(status.get("active_valid", 0) or 0)
+    inactive_valid = int(status.get("inactive_valid", 0) or 0)
+    if total <= 0:
+        return True, status
+    if active_valid <= 0 and inactive_valid <= 0:
+        return True, status
+    return False, status
 
 class HyperliquidResearchBot:
     """
@@ -110,6 +135,34 @@ class HyperliquidResearchBot:
         log_persistence_info(self.logger)
         validate_dependencies(self.logger)
         init_database(self.logger)
+        try:
+            from src.data.db_audit import format_db_audit_report, run_db_audit
+
+            include_candle_cache = bool(
+                getattr(config, "BOOT_DB_AUDIT_INCLUDE_CANDLE_CACHE", False)
+            )
+            self.logger.info(
+                "Running startup DB audit (candle_cache=%s)...",
+                include_candle_cache,
+            )
+            audit_report = run_db_audit(
+                include_candle_cache=include_candle_cache,
+                include_code_scan=False,
+            )
+            block_severity = getattr(config, "READINESS_DB_AUDIT_BLOCK_SEVERITY", "high")
+            if audit_report.findings_at_or_above(block_severity):
+                self.logger.warning(
+                    "Database audit found readiness blockers:\n%s",
+                    format_db_audit_report(audit_report, block_severity=block_severity),
+                )
+            else:
+                self.logger.info(
+                    "Database audit passed readiness threshold (%s): %d finding(s)",
+                    block_severity,
+                    len(audit_report.findings),
+                )
+        except Exception as exc:
+            self.logger.warning("Database audit skipped during boot: %s", exc)
 
         # ── Build subsystems ──
         effective_profile = profile or FULL_PROFILE
@@ -153,14 +206,34 @@ class HyperliquidResearchBot:
 
     def _register_background_tasks(self):
         """Register background scanner tasks with the supervised runner."""
+        defer_scanner_startup = os.environ.get(
+            "DEFER_STARTUP_SCANNER_TASKS",
+            "true",
+        ).strip().lower() not in {"0", "false", "no", "off"}
+        self._startup_background_task_names = ["bg-heartbeat"]
+        self._deferred_background_task_names = []
+        self._deferred_background_tasks_started = False
         heartbeat_interval = max(
             15.0,
             min(60.0, float(getattr(config, "READINESS_STALE_SECONDS", 600)) / 4.0),
+        )
+        heartbeat_startup_delay = max(
+            0.0,
+            float(os.environ.get("BG_HEARTBEAT_STARTUP_DELAY_S", "5")),
+        )
+        polymarket_startup_delay = max(
+            0.0,
+            float(os.environ.get("BG_POLYMARKET_STARTUP_DELAY_S", "20")),
+        )
+        options_startup_delay = max(
+            0.0,
+            float(os.environ.get("BG_OPTIONS_FLOW_STARTUP_DELAY_S", "40")),
         )
         self.task_runner.register(
             "bg-heartbeat",
             self._background_heartbeat,
             interval_seconds=heartbeat_interval,
+            initial_delay_seconds=heartbeat_startup_delay,
             max_retries=3,
         )
         health_registry.register("bg-heartbeat", affects_trading=False)
@@ -170,18 +243,82 @@ class HyperliquidResearchBot:
                 "bg-polymarket",
                 self._polymarket_scan,
                 interval_seconds=config.POLYMARKET_SCAN_INTERVAL,
+                initial_delay_seconds=polymarket_startup_delay,
                 max_retries=10,
             )
             health_registry.register("bg-polymarket", affects_trading=False)
+            if defer_scanner_startup:
+                self._deferred_background_task_names.append("bg-polymarket")
+            else:
+                self._startup_background_task_names.append("bg-polymarket")
 
         if self.container.options_scanner:
             self.task_runner.register(
                 "bg-options-flow",
                 self._options_scan,
                 interval_seconds=config.OPTIONS_FLOW_SCAN_INTERVAL,
+                initial_delay_seconds=options_startup_delay,
                 max_retries=10,
             )
             health_registry.register("bg-options-flow", affects_trading=False)
+            if defer_scanner_startup:
+                self._deferred_background_task_names.append("bg-options-flow")
+            else:
+                self._startup_background_task_names.append("bg-options-flow")
+
+        if not self._deferred_background_task_names:
+            self._deferred_background_tasks_started = True
+
+    def _start_boot_background_tasks(self) -> None:
+        """Start only the startup-safe background tasks.
+
+        The trading cycle already runs options/polymarket scans inline on boot.
+        Deferring those non-critical background scanners until the first trading
+        cycle completes avoids duplicate market scans and SQLite write
+        contention during startup.
+        """
+        start_one = getattr(self.task_runner, "start", None)
+        if not callable(start_one):
+            self.task_runner.start_all()
+            self._deferred_background_tasks_started = True
+            return
+
+        for name in self._startup_background_task_names:
+            start_one(name)
+
+        if self._deferred_background_task_names:
+            self.logger.info(
+                "Deferring non-critical background scanners until after the first "
+                "trading cycle: %s",
+                ", ".join(self._deferred_background_task_names),
+            )
+        else:
+            self._deferred_background_tasks_started = True
+
+    def _ensure_deferred_background_tasks_started(self) -> None:
+        """Start scanner tasks that were intentionally deferred during boot."""
+        if self._deferred_background_tasks_started:
+            return
+
+        start_one = getattr(self.task_runner, "start", None)
+        if not callable(start_one):
+            self._deferred_background_tasks_started = True
+            return
+
+        started = []
+        for name in self._deferred_background_task_names:
+            try:
+                start_one(name)
+                started.append(name)
+            except KeyError:
+                continue
+
+        self._deferred_background_tasks_started = True
+        if started:
+            self.logger.info(
+                "Started deferred background scanners after the first trading cycle: %s",
+                ", ".join(started),
+            )
 
     def _polymarket_scan(self):
         self.container.polymarket.scan_markets()
@@ -192,6 +329,12 @@ class HyperliquidResearchBot:
 
     def _background_heartbeat(self):
         heartbeat_active(self.container, health_registry)
+        try:
+            from src.learning.source_inventory import persist_source_health_snapshot
+
+            persist_source_health_snapshot(getattr(self.container, "data_source_registry", None))
+        except Exception as exc:
+            self.logger.debug("Source-health snapshot skipped: %s", exc)
 
     # ── Discovery timer persistence ───────────────────────────
 
@@ -398,6 +541,55 @@ class HyperliquidResearchBot:
             remaining = deadline - time.time()
             time.sleep(min(1.0, max(0.0, remaining)))
 
+    @staticmethod
+    def _kill_switch_file_path() -> str:
+        return (
+            os.environ.get("LIVE_EXTERNAL_KILL_SWITCH_FILE", "").strip()
+            or DEFAULT_KILL_SWITCH_FILE
+        )
+
+    def _wait_for_startup_kill_switch_clear(self) -> None:
+        """Pause startup while the external kill-switch file is present."""
+        path = self._kill_switch_file_path()
+        if not path:
+            return
+
+        warned = False
+        while self.running and os.path.exists(path):
+            try:
+                check_file_kill_switch(self.container)
+            except Exception as exc:
+                self.logger.warning("Startup kill-switch check failed: %s", exc)
+
+            if not warned:
+                self.logger.critical(
+                    "KILL_SWITCH active at startup (%s). Background tasks and "
+                    "trading loops are paused until the file is removed.",
+                    path,
+                )
+                warned = True
+
+            try:
+                self.runtime_config.poll(self.container)
+            except Exception as exc:
+                self.logger.warning(
+                    "Runtime config poll failed while startup kill switch is active: %s",
+                    exc,
+                )
+            time.sleep(1.0)
+
+        if warned and self.running:
+            # Reset the edge-trigger bookkeeping now that the file itself is
+            # gone, so a later real shutdown or future file-trigger can still
+            # dispatch order cancels exactly once.
+            setattr(self.container, "_file_kill_switch_triggered", False)
+            setattr(self.container, "_stop_requested", False)
+            setattr(self.container, "_shutdown_orders_cancelled", False)
+            self.logger.info(
+                "Startup KILL_SWITCH file cleared; resuming bot startup. "
+                "Persisted live-trader kill-switch state, if any, still applies."
+            )
+
     def run_once(self):
         """Run discovery + trading cycle (CLI --once)."""
         self._run_discovery()
@@ -465,52 +657,68 @@ class HyperliquidResearchBot:
         signal.signal(signal.SIGINT, signal_handler)
         signal.signal(signal.SIGTERM, signal_handler)
 
-        # ── Start supervised background tasks ──
-        self.task_runner.start_all()
+        self._wait_for_startup_kill_switch_clear()
 
-        self.logger.info("Bot starting continuous operation…")
-        self.logger.info("  Fast cycle:      every %ds", config.FAST_CYCLE_INTERVAL)
-        self.logger.info("  Trading cycle:   every %ds", config.TRADING_CYCLE_INTERVAL)
-        self.logger.info("  Discovery cycle: every %ds", config.DISCOVERY_CYCLE_INTERVAL)
-        sys.stdout.flush()
+        if self.running:
+            # Start supervised background tasks
+            self._start_boot_background_tasks()
 
-        # Initial discovery if needed
-        trader_count = 0
-        try:
-            trader_count = len(db.get_active_traders())
-        except Exception:
-            pass
+            self.logger.info("Bot starting continuous operation…")
+            self.logger.info("  Fast cycle:      every %ds", config.FAST_CYCLE_INTERVAL)
+            self.logger.info("  Trading cycle:   every %ds", config.TRADING_CYCLE_INTERVAL)
+            self.logger.info("  Discovery cycle: every %ds", config.DISCOVERY_CYCLE_INTERVAL)
+            sys.stdout.flush()
 
-        if trader_count == 0:
-            self.logger.info(
-                "No traders in DB — scheduling initial discovery in background "
-                "so trading cycles can continue."
-            )
-            self._start_discovery_async("startup_empty_trader_pool")
-        else:
-            restored_ts = self._restore_last_discovery_time()
-            if restored_ts and (time.time() - restored_ts) < config.DISCOVERY_CYCLE_INTERVAL:
-                self._last_discovery = restored_ts
-                remaining_h = (config.DISCOVERY_CYCLE_INTERVAL - (time.time() - restored_ts)) / 3600
-                self.logger.info("Restored discovery timer, next in %.1fh", remaining_h)
-            else:
-                self._last_discovery = time.time()
+            # Initial discovery if needed
+            trader_count = 0
+            try:
+                trader_count = len(db.get_active_traders())
+            except Exception:
+                pass
+
+            if trader_count == 0:
                 self.logger.info(
-                    "DB has %d traders — next discovery in %.0fh",
-                    trader_count, config.DISCOVERY_CYCLE_INTERVAL / 3600,
+                    "No traders in DB -- scheduling initial discovery in background "
+                    "so trading cycles can continue."
                 )
+                self._start_discovery_async("startup_empty_trader_pool")
+            else:
+                strategy_refresh_needed, strategy_status = _strategy_pool_requires_startup_discovery()
+                if strategy_refresh_needed:
+                    self.logger.warning(
+                        "Strategy pool has no valid rows (status=%s) -- scheduling "
+                        "startup discovery instead of waiting for the daily timer.",
+                        strategy_status,
+                    )
+                    self._start_discovery_async("startup_empty_strategy_pool")
+                restored_ts = self._restore_last_discovery_time()
+                if (
+                    not strategy_refresh_needed
+                    and restored_ts
+                    and (time.time() - restored_ts) < config.DISCOVERY_CYCLE_INTERVAL
+                ):
+                    self._last_discovery = restored_ts
+                    remaining_h = (config.DISCOVERY_CYCLE_INTERVAL - (time.time() - restored_ts)) / 3600
+                    self.logger.info("Restored discovery timer, next in %.1fh", remaining_h)
+                else:
+                    self._last_discovery = time.time()
+                    self.logger.info(
+                        "DB has %d traders; strategy_status=%s -- next scheduled "
+                        "discovery in %.0fh",
+                        trader_count, strategy_status, config.DISCOVERY_CYCLE_INTERVAL / 3600,
+                    )
 
-        # ── Independent kill-switch watchdog (P0-1) ──
-        # Polls /data/KILL_SWITCH on a 1s cadence regardless of what the
-        # main loop is doing.  Catches the case where a long trading cycle
-        # is mid-flight when the operator drops the file.
-        try:
-            watchdog_interval_s = float(
-                os.environ.get("LIVE_KILL_SWITCH_WATCHDOG_INTERVAL_S", "1.0")
-            )
-        except (TypeError, ValueError):
-            watchdog_interval_s = 1.0
-        start_kill_switch_watchdog(self.container, interval_s=watchdog_interval_s)
+            # Independent kill-switch watchdog (P0-1)
+            # Polls /data/KILL_SWITCH on a 1s cadence regardless of what the
+            # main loop is doing. Catches the case where a long trading cycle
+            # is mid-flight when the operator drops the file.
+            try:
+                watchdog_interval_s = float(
+                    os.environ.get("LIVE_KILL_SWITCH_WATCHDOG_INTERVAL_S", "1.0")
+                )
+            except (TypeError, ValueError):
+                watchdog_interval_s = 1.0
+            start_kill_switch_watchdog(self.container, interval_s=watchdog_interval_s)
 
         # ── Main loop ──
         while self.running:
@@ -526,6 +734,7 @@ class HyperliquidResearchBot:
                 # Tier 2: Trading (5 min)
                 if now - self._last_research >= config.TRADING_CYCLE_INTERVAL:
                     self._run_trading_cycle()
+                    self._ensure_deferred_background_tasks_started()
                     self._last_research = now
                 else:
                     # Tier 1: Fast (60s)
@@ -619,6 +828,12 @@ def main():
     if args.cache_clear:
         run_cache_clear(setup_logging())
         return
+
+    if args.db_repair:
+        sys.exit(run_db_repair_cli(args))
+
+    if args.db_audit:
+        sys.exit(run_db_audit_cli(args))
 
     if args.candle_backtest:
         run_candle_backtest(setup_logging(), args)

@@ -173,9 +173,9 @@ class TournamentEngine:
     """
 
     # What % of agents get eliminated each round
-    ELIMINATION_RATE = 0.0    # No elimination — all 9 agents always compete
+    ELIMINATION_RATE = 0.0    # No elimination; seed agents always compete
     PROMOTION_RATE = 0.10     # Top 10% become champions
-    MIN_AGENTS = 9            # All 9 seed agents always compete
+    MIN_AGENTS = 9            # Minimum scoreable agents needed for a full round
 
     def __init__(self):
         self.round_count = 0
@@ -260,12 +260,16 @@ class CapitalAllocator:
     Equal capital allocation for the 9 fixed arena agents.
     Each agent receives an equal share of the total pool ($10,000 each).
     No fitness-based weighting — agents compete on pure performance.
+
+    ★ H11 FIX: removed dead `MAX_SINGLE_AGENT` and `MIN_ALLOCATION`
+    constants that suggested fitness-based caps but were never read.
+    The docstring above is the truth: this is pure equal allocation.
+    Reintroduce those constants only when an actual fitness-weighted
+    allocator is implemented.
     """
 
     BASE_CAPITAL = 10_000.0   # Each of 9 agents gets equal share
     TOTAL_POOL = 90_000.0     # Total virtual capital: 9 agents × $10,000 each
-    MAX_SINGLE_AGENT = 0.25   # No single agent gets more than 25% of pool (not used with equal allocation)
-    MIN_ALLOCATION = 10_000.0 # Minimum capital for any active agent (not used with equal allocation)
 
     def __init__(self, total_pool: float = None):
         if total_pool:
@@ -307,13 +311,23 @@ class ConsensusEngine:
 
     Voting is weighted by each agent's ELO + track record.
     A signal needs >50% weighted approval to pass.
+
+    ★ H12 FIX: previously fell open to APPROVE with 70% confidence when
+    voters < MIN_VOTERS or total_weight <= 0. For live trading this meant
+    fresh deployments (all agents with <3 trades) produced 100% auto-approval
+    on every signal. Now fails CLOSED by default; can be overridden with
+    fail_open=True for explicit testing.
     """
 
     APPROVAL_THRESHOLD = 0.50   # Need 50%+ weighted votes to approve
     MIN_VOTERS = 3              # Need at least 3 agents to form consensus
 
-    def __init__(self):
+    def __init__(self, fail_open: bool = False):
         self.vote_history: List[Dict] = []
+        # ★ H12: default to fail-CLOSED (reject when quorum not reached).
+        # Set fail_open=True only for paper-mode testing or bootstrap periods.
+        self.fail_open = bool(fail_open)
+        self.insufficient_quorum_count = 0
 
     def get_consensus(self, signal: TradeSignal,
                        agents: List[ArenaAgent],
@@ -327,8 +341,25 @@ class ConsensusEngine:
         voters = self._select_voters(signal, agents)
 
         if len(voters) < self.MIN_VOTERS:
-            # Not enough voters — approve by default with reduced confidence
-            return True, signal.confidence * 0.7, []
+            # ★ H12 FIX: fail CLOSED by default. Previously returned
+            # (True, 0.7 * confidence) which silently approved every signal
+            # during bootstrap periods with no track-record voters.
+            self.insufficient_quorum_count += 1
+            if self.fail_open:
+                logger.warning(
+                    "Consensus: insufficient voters (%d < %d) for %s %s -- "
+                    "fail_open=True, approving with reduced confidence",
+                    len(voters), self.MIN_VOTERS,
+                    signal.side.value, signal.coin,
+                )
+                return True, signal.confidence * 0.7, []
+            logger.info(
+                "Consensus: insufficient voters (%d < %d) for %s %s -- "
+                "rejecting (fail-closed)",
+                len(voters), self.MIN_VOTERS,
+                signal.side.value, signal.coin,
+            )
+            return False, 0.0, []
 
         votes = []
         for agent in voters:
@@ -338,7 +369,21 @@ class ConsensusEngine:
         # Compute weighted consensus
         total_weight = sum(v.weight for v in votes)
         if total_weight <= 0:
-            return True, signal.confidence * 0.7, votes
+            # ★ H12 FIX: fail CLOSED when all voters have zero weight
+            self.insufficient_quorum_count += 1
+            if self.fail_open:
+                logger.warning(
+                    "Consensus: zero total weight for %s %s -- "
+                    "fail_open=True, approving with reduced confidence",
+                    signal.side.value, signal.coin,
+                )
+                return True, signal.confidence * 0.7, votes
+            logger.info(
+                "Consensus: zero total weight for %s %s -- "
+                "rejecting (fail-closed)",
+                signal.side.value, signal.coin,
+            )
+            return False, 0.0, votes
 
         weighted_approve = sum(
             v.weight * v.confidence for v in votes if v.vote == "approve"
@@ -754,15 +799,27 @@ class Backtester:
 
             tested_coins += 1
 
-            if agent.strategy_type == "lstm_direction" and self.lstm_agent:
-                try:
-                    self.lstm_agent.train(coin_candles)
-                except Exception as exc:
-                    logger.debug("LSTM backtest train skipped for %s: %s", coin, exc)
-
             train_end = int(n * train_pct)
             test_size = max(1, (n - train_end) // max(test_windows, 1))
             coin_trades = []
+
+            # ★ H13 FIX: train LSTM only on the TRAINING slice, not the full
+            # candle history. Previously `self.lstm_agent.train(coin_candles)`
+            # saw the entire series including test windows, invalidating the
+            # "out-of-sample" claim. Train on [:train_end] so the LSTM has
+            # never seen test-period data at prediction time.
+            if agent.strategy_type == "lstm_direction" and self.lstm_agent:
+                try:
+                    training_slice = coin_candles[:train_end]
+                    if len(training_slice) >= 50:
+                        self.lstm_agent.train(training_slice)
+                    else:
+                        logger.debug(
+                            "LSTM training slice for %s too short (%d < 50), skipping",
+                            coin, len(training_slice),
+                        )
+                except Exception as exc:
+                    logger.debug("LSTM backtest train skipped for %s: %s", coin, exc)
 
             for window in range(test_windows):
                 test_start = train_end + window * test_size
@@ -1146,11 +1203,12 @@ class Backtester:
         total_pnl = sum(pnls)
         win_rate = wins / len(trades)
 
-        # Sharpe
-        if len(returns) >= 5:
-            sharpe = np.mean(returns) / (np.std(returns) + 1e-8)
-        else:
-            sharpe = 0.0
+        # Sharpe.
+        # ★ H25 FIX: route through canonical helper so the Sharpe number
+        # this backtester emits matches replay_backtester / agent_scoring /
+        # golden_wallet definitions (sample stdev, no annualization).
+        from src.analysis.sharpe import sharpe_per_trade
+        sharpe = sharpe_per_trade(returns)
 
         # Max drawdown from equity curve
         peak = equity_curve[0]
@@ -1199,10 +1257,16 @@ class AlphaArena:
     4. On spawn: backtest new agents on historical data → only promote survivors
     """
 
-    MAX_AGENTS = 9               # Fixed at exactly 9 agents
+    SEED_STRATEGY_TYPES = [
+        "momentum_long", "momentum_short", "mean_reversion",
+        "breakout", "scalping", "swing_trading", "funding_arb",
+        "trend_following", "contrarian", "lstm_direction",
+    ]
+
+    MAX_AGENTS = len(SEED_STRATEGY_TYPES)
     TOURNAMENT_INTERVAL = 5      # Run tournament every N cycles
     SPAWN_INTERVAL = 0           # Disabled — no new agents spawned
-    SPAWN_COUNT = 0              # Disabled — only 9 seed agents
+    SPAWN_COUNT = 0              # Disabled; only fixed seed agents
 
     def __init__(
         self,
@@ -1284,6 +1348,18 @@ class AlphaArena:
                             summary TEXT
                         )
                     """)
+                    conn.execute("""
+                        CREATE TABLE IF NOT EXISTS arena_trade_events (
+                            event_id TEXT PRIMARY KEY,
+                            recorded_at TIMESTAMPTZ,
+                            trade_id TEXT,
+                            agent_id TEXT,
+                            strategy_type TEXT,
+                            pnl DOUBLE PRECISION,
+                            return_pct DOUBLE PRECISION,
+                            metadata TEXT DEFAULT '{}'
+                        )
+                    """)
                 else:
                     conn.execute("""
                         CREATE TABLE IF NOT EXISTS arena_agents (
@@ -1333,18 +1409,24 @@ class AlphaArena:
                             summary TEXT
                         )
                     """)
+                    conn.execute("""
+                        CREATE TABLE IF NOT EXISTS arena_trade_events (
+                            event_id TEXT PRIMARY KEY,
+                            recorded_at TEXT,
+                            trade_id TEXT,
+                            agent_id TEXT,
+                            strategy_type TEXT,
+                            pnl REAL,
+                            return_pct REAL,
+                            metadata TEXT DEFAULT '{}'
+                        )
+                    """)
         except Exception as e:
             logger.warning(f"Arena DB init error: {e}")
 
     def _seed_agents(self):
         """Create one seed agent per strategy type."""
-        strategy_types = [
-            "momentum_long", "momentum_short", "mean_reversion",
-            "breakout", "scalping", "swing_trading", "funding_arb",
-            "trend_following", "contrarian", "lstm_direction",
-        ]
-
-        for stype in strategy_types:
+        for stype in self.SEED_STRATEGY_TYPES:
             agent_id = f"seed_{stype}"
             if agent_id not in self.agents:
                 # Default balanced params
@@ -1412,8 +1494,8 @@ class AlphaArena:
             if rows:
                 logger.info(f"Loaded {len(rows)} agents from DB; kept {len(self.agents)} seed agents")
 
-            # Refill with seed agents if we have fewer than 9
-            if len(self.agents) < 9:
+            # Refill with seed agents if any fixed seed is missing.
+            if len(self.agents) < self.MAX_AGENTS:
                 self._seed_agents()
                 logger.info(f"Arena refilled to {len(self.agents)} seed agents")
 
@@ -1474,6 +1556,110 @@ class AlphaArena:
 
     # ─── Public API ────────────────────────────────────────────
 
+    def _save_round(self, rnd: TournamentRound):
+        """Persist a tournament round, including skipped rounds."""
+        try:
+            with db.get_connection() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO arena_rounds
+                    (round_id, started_at, ended_at, agents_entered, agents_eliminated,
+                     agents_promoted, agents_spawned, best_agent, best_fitness, summary)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(round_id) DO UPDATE SET
+                        started_at = EXCLUDED.started_at,
+                        ended_at = EXCLUDED.ended_at,
+                        agents_entered = EXCLUDED.agents_entered,
+                        agents_eliminated = EXCLUDED.agents_eliminated,
+                        agents_promoted = EXCLUDED.agents_promoted,
+                        agents_spawned = EXCLUDED.agents_spawned,
+                        best_agent = EXCLUDED.best_agent,
+                        best_fitness = EXCLUDED.best_fitness,
+                        summary = EXCLUDED.summary
+                    """,
+                    (
+                        rnd.round_id,
+                        rnd.started_at,
+                        rnd.ended_at,
+                        rnd.agents_entered,
+                        rnd.agents_eliminated,
+                        rnd.agents_promoted,
+                        rnd.agents_spawned,
+                        rnd.best_agent,
+                        rnd.best_fitness,
+                        rnd.summary,
+                    ),
+                )
+        except Exception as exc:
+            logger.warning("Arena round save error: %s", exc)
+
+    def _record_trade_event(
+        self,
+        agent: ArenaAgent,
+        pnl: float,
+        return_pct: float = 0.0,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Persist the per-agent trade outcome that changed Arena fitness."""
+        event_meta = dict(metadata or {})
+        trade_id = str(event_meta.get("trade_id") or event_meta.get("id") or "").strip()
+        if trade_id:
+            event_id = f"{agent.agent_id}:{trade_id}"
+        else:
+            event_id = f"{agent.agent_id}:{datetime.now(timezone.utc).timestamp():.6f}:{len(agent._returns)}"
+        try:
+            with db.get_connection() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO arena_trade_events
+                    (event_id, recorded_at, trade_id, agent_id, strategy_type,
+                     pnl, return_pct, metadata)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(event_id) DO UPDATE SET
+                        recorded_at = EXCLUDED.recorded_at,
+                        trade_id = EXCLUDED.trade_id,
+                        agent_id = EXCLUDED.agent_id,
+                        strategy_type = EXCLUDED.strategy_type,
+                        pnl = EXCLUDED.pnl,
+                        return_pct = EXCLUDED.return_pct,
+                        metadata = EXCLUDED.metadata
+                    """,
+                    (
+                        event_id,
+                        datetime.now(timezone.utc).isoformat(),
+                        trade_id or None,
+                        agent.agent_id,
+                        agent.strategy_type,
+                        float(pnl or 0.0),
+                        float(return_pct or 0.0),
+                        json.dumps(event_meta, sort_keys=True, default=str),
+                    ),
+                )
+        except Exception as exc:
+            logger.warning("Arena trade event save error: %s", exc)
+
+    def is_consensus_ready(self) -> bool:
+        """Return True once enough agents have realized outcomes to vote."""
+        min_voters = int(getattr(self.consensus, "MIN_VOTERS", 3) or 3)
+        ready = [
+            agent for agent in self.agents.values()
+            if agent.status != AgentStatus.ELIMINATED and agent.total_trades >= 3
+        ]
+        return len(ready) >= min_voters
+
+    def _backtest_refresh_due(self, candle_universe: Dict[str, List[Dict]]) -> bool:
+        if not candle_universe:
+            return False
+        if self.cycle_count % self.TOURNAMENT_INTERVAL == 0:
+            return True
+        active = [
+            agent for agent in self.agents.values()
+            if agent.status != AgentStatus.ELIMINATED
+        ]
+        # Cold-start repair: if seed agents have no persisted backtest stats,
+        # refresh immediately instead of waiting for cycle #5.
+        return any(int(agent.backtest_trades or 0) <= 0 for agent in active)
+
     def get_consensus_on_signal(self, signal: TradeSignal,
                                   features: Optional[Dict] = None) -> Tuple[bool, float]:
         """
@@ -1490,7 +1676,8 @@ class AlphaArena:
         return approved, consensus_conf
 
     def record_trade_result(self, agent_id: str, pnl: float,
-                              return_pct: float = 0.0):
+                              return_pct: float = 0.0,
+                              metadata: Optional[Dict[str, Any]] = None):
         """Record a trade outcome for a specific agent."""
         agent = self.agents.get(agent_id)
         if not agent:
@@ -1516,26 +1703,36 @@ class AlphaArena:
             # Fractional drawdown: how far below peak as a fraction of peak
             drawdowns = np.where(peak != 0, (peak - cumulative) / (np.abs(peak) + 1e-8), 0)
             agent.max_drawdown = float(np.max(drawdowns)) if len(drawdowns) > 0 else 0
+        self._record_trade_event(agent, pnl, return_pct, metadata=metadata)
 
     def record_trade_for_strategy(self, strategy_type: str, pnl: float,
-                                    return_pct: float = 0.0):
+                                    return_pct: float = 0.0,
+                                    metadata: Optional[Dict[str, Any]] = None):
         """Record outcome to ALL agents matching a strategy type."""
+        normalized_strategy = str(strategy_type or "").strip().lower()
         matched = [a for a in self.agents.values()
-                  if a.strategy_type == strategy_type
+                  if a.strategy_type == normalized_strategy
                   and a.status != AgentStatus.ELIMINATED]
 
+        if not matched:
+            logger.debug("Arena outcome skipped: no agent for strategy_type=%s", strategy_type)
+            return
+
+        event_meta = dict(metadata or {})
+        event_meta["strategy_type"] = normalized_strategy
         for agent in matched:
-            self.record_trade_result(agent.agent_id, pnl, return_pct)
+            self.record_trade_result(agent.agent_id, pnl, return_pct, metadata=event_meta)
+        self._save_agents()
 
     def run_cycle(self, historical_candles: Optional[Any] = None):
         """
-        Run one arena cycle with 9 fixed agents:
+        Run one arena cycle with fixed seed agents:
         1. If tournament interval: run tournament round
         2. Reallocate capital (equal allocation)
         3. Save state
 
-        Spawning is disabled — only the 9 seed agents exist.
-        No elimination — all 9 agents always compete.
+        Spawning is disabled; only fixed seed agents exist.
+        No elimination; seed agents always compete.
         """
         self.cycle_count += 1
 
@@ -1548,7 +1745,7 @@ class AlphaArena:
             except Exception as exc:
                 logger.debug("Arena LSTM training skipped: %s", exc)
 
-        if candle_universe and self.cycle_count % self.TOURNAMENT_INTERVAL == 0:
+        if self._backtest_refresh_due(candle_universe):
             tested_agents = 0
             for agent in self.agents.values():
                 if agent.status == AgentStatus.ELIMINATED:
@@ -1568,12 +1765,13 @@ class AlphaArena:
         # Tournament
         if self.cycle_count % self.TOURNAMENT_INTERVAL == 0:
             agents_list = list(self.agents.values())
-            self.tournament.run_round(agents_list)
+            rnd = self.tournament.run_round(agents_list)
+            self._save_round(rnd)
 
-        # Spawning disabled — all 9 seed agents remain fixed
+        # Spawning disabled; all seed agents remain fixed
         # (SPAWN_INTERVAL = 0 prevents this block from ever executing)
 
-        # Reallocate capital (equal allocation to all 9 agents)
+        # Reallocate capital (equal allocation to all seed agents)
         active = [a for a in self.agents.values()
                  if a.status != AgentStatus.ELIMINATED]
         self.allocator.reallocate(active)
@@ -1582,7 +1780,7 @@ class AlphaArena:
         self._save_agents()
 
         logger.info(f"Arena cycle #{self.cycle_count}: "
-                   f"{len(self.agents)} agents (fixed at 9) "
+                   f"{len(self.agents)} agents (fixed at {self.MAX_AGENTS}) "
                    f"({sum(1 for a in self.agents.values() if a.status == AgentStatus.CHAMPION)} champions, "
                    f"{sum(1 for a in self.agents.values() if a.status == AgentStatus.ACTIVE)} active, "
                    f"{sum(1 for a in self.agents.values() if a.status == AgentStatus.INCUBATING)} incubating)")
@@ -1629,6 +1827,8 @@ class AlphaArena:
             "max_elo": max((a.elo_rating for a in active), default=0),
             "avg_fitness": np.mean([a.fitness_score for a in active]) if active else 0,
             "total_arena_pnl": sum(a.total_pnl for a in active),
+            "total_backtest_pnl": sum(a.backtest_pnl for a in active),
+            "total_backtest_trades": sum(a.backtest_trades for a in active),
             "consensus_history": len(self.consensus.vote_history),
             "recent_votes": self.consensus.vote_history[-5:],
         }
