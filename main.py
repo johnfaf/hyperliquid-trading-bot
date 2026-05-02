@@ -88,6 +88,65 @@ from cli import (
 )
 
 
+# ─── Destructive CLI Guardrails ─────────────────────────────────
+
+def _bool_config(value) -> bool:
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _refuse_destructive_cli_if_live(action: str, args) -> bool:
+    if not _bool_config(getattr(config, "LIVE_TRADING_ENABLED", False)):
+        return False
+    if getattr(args, "i_understand_the_risks", False):
+        return False
+    print(
+        f"Refusing {action}: LIVE_TRADING_ENABLED=true. Stop live trading first "
+        "or rerun with --i-understand-the-risks if this is an intentional maintenance action."
+    )
+    return True
+
+
+def _confirm_destructive_cli_action(action: str, summary_lines: list[str]) -> bool:
+    print("")
+    print(f"DESTRUCTIVE ACTION: {action}")
+    for line in summary_lines:
+        print(f"  {line}")
+    print("This cannot be undone from the bot unless you have an external backup.")
+    try:
+        answer = input("Type yes to continue: ")
+    except EOFError:
+        answer = ""
+    if answer.strip().lower() != "yes":
+        print("Aborted.")
+        return False
+    return True
+
+
+def _paper_reset_summary(balance: float) -> dict[str, int | float]:
+    with db.get_connection(for_read=True) as conn:
+        row = conn.execute(
+            """
+            SELECT
+                COUNT(*) AS total_count,
+                SUM(CASE WHEN LOWER(COALESCE(status, '')) = 'open' THEN 1 ELSE 0 END) AS open_count
+            FROM paper_trades
+            """
+        ).fetchone()
+    total = int((row["total_count"] if isinstance(row, dict) else row[0]) or 0)
+    open_count = int((row["open_count"] if isinstance(row, dict) else row[1]) or 0)
+    return {
+        "open_count": open_count,
+        "closed_count": max(total - open_count, 0),
+        "reset_balance": float(balance),
+    }
+
+
+def _cache_clear_summary() -> dict:
+    from src.backtest.data_fetcher import DataFetcher
+
+    return DataFetcher().get_cache_stats()
+
+
 # ─── Bot Engine ────────────────────────────────────────────────
 
 def _strategy_pool_requires_startup_discovery() -> tuple[bool, dict]:
@@ -816,6 +875,18 @@ def main():
     if args.reset_paper:
         init_database(setup_logging())
         balance = args.reset_balance or config.PAPER_TRADING_INITIAL_BALANCE
+        if _refuse_destructive_cli_if_live("--reset-paper", args):
+            raise SystemExit(2)
+        summary = _paper_reset_summary(balance)
+        if not _confirm_destructive_cli_action(
+            "--reset-paper",
+            [
+                f"open paper trades to delete: {summary['open_count']}",
+                f"closed paper trades to delete: {summary['closed_count']}",
+                f"new paper balance: ${float(summary['reset_balance']):,.2f}",
+            ],
+        ):
+            raise SystemExit(2)
         result = db.reset_paper_trades(balance)
         print(f"Paper trades cleared ({result['open_deleted']} open + "
               f"{result['closed_deleted']} closed). Balance reset to ${balance:,.2f}")
@@ -826,6 +897,17 @@ def main():
         return
 
     if args.cache_clear:
+        if _refuse_destructive_cli_if_live("--cache-clear", args):
+            raise SystemExit(2)
+        stats_before = _cache_clear_summary()
+        if not _confirm_destructive_cli_action(
+            "--cache-clear",
+            [
+                f"cached candles to delete: {int(stats_before.get('total_candles', 0) or 0):,}",
+                f"cache size: {float(stats_before.get('db_size_mb', 0.0) or 0.0):.1f} MB",
+            ],
+        ):
+            raise SystemExit(2)
         run_cache_clear(setup_logging())
         return
 

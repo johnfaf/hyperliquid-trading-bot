@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List
@@ -32,6 +33,17 @@ def _stable_id(prefix: str, payload: Any) -> str:
 def _mean(values: Iterable[float]) -> float:
     data = [float(v) for v in values]
     return sum(data) / len(data) if data else 0.0
+
+
+def _binomial_cdf(k: int, n: int, p: float) -> float:
+    if n <= 0:
+        return 1.0
+    p = min(max(float(p), 0.0), 1.0)
+    k = min(max(int(k), 0), int(n))
+    total = 0.0
+    for x in range(k + 1):
+        total += math.comb(n, x) * (p ** x) * ((1.0 - p) ** (n - x))
+    return min(max(total, 0.0), 1.0)
 
 
 @dataclass
@@ -59,12 +71,14 @@ class ConservativeDecisionCalibrator:
         promote_win_rate: float = 0.55,
         max_boost: float = 1.15,
         min_multiplier: float = 0.50,
+        significance_alpha: float = 0.05,
     ):
         self.min_group_examples = int(min_group_examples)
         self.derisk_win_rate = float(derisk_win_rate)
         self.promote_win_rate = float(promote_win_rate)
         self.max_boost = float(max_boost)
         self.min_multiplier = float(min_multiplier)
+        self.significance_alpha = float(significance_alpha)
 
     @staticmethod
     def _group_key(example: LearningExample) -> str:
@@ -79,12 +93,21 @@ class ConservativeDecisionCalibrator:
         avg_pnl = _mean(item.outcome_pnl for item in labelled)
         avg_return = _mean(item.outcome_return_pct for item in labelled)
         win_rate = wins / len(labelled) if labelled else 0.0
+        derisk_p_value = (
+            _binomial_cdf(wins, len(labelled), self.derisk_win_rate)
+            if labelled and win_rate < self.derisk_win_rate
+            else 1.0
+        )
+        derisk_supported = derisk_p_value <= self.significance_alpha
         if len(labelled) < self.min_group_examples:
             multiplier = 0.75
             action = "collect_more_data"
-        elif win_rate < self.derisk_win_rate or avg_return < 0 or avg_pnl < 0:
+        elif derisk_supported:
             multiplier = self.min_multiplier
             action = "derisk"
+        elif win_rate < self.derisk_win_rate or avg_return < 0 or avg_pnl < 0:
+            multiplier = 1.0
+            action = "hold_insufficient_evidence"
         elif win_rate >= self.promote_win_rate and avg_return > 0 and avg_pnl > 0:
             multiplier = min(self.max_boost, 1.0 + (win_rate - self.promote_win_rate))
             action = "eligible_small_boost"
@@ -98,6 +121,8 @@ class ConservativeDecisionCalibrator:
             "win_rate": win_rate,
             "avg_pnl": avg_pnl,
             "avg_return_pct": avg_return,
+            "derisk_p_value": derisk_p_value,
+            "derisk_statistically_supported": derisk_supported,
             "confidence_multiplier": multiplier,
             "action": action,
             "executed_count": sum(1 for item in labelled if item.executed),
@@ -119,6 +144,7 @@ class ConservativeDecisionCalibrator:
             "min_group_examples": self.min_group_examples,
             "derisk_win_rate": self.derisk_win_rate,
             "promote_win_rate": self.promote_win_rate,
+            "significance_alpha": self.significance_alpha,
             "safe_output_only": True,
         }
         result = DecisionCalibratorResult(

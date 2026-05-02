@@ -31,27 +31,30 @@ def store_funding_points(rows: Iterable[Dict[str, Any]]) -> int:
     items = list(rows or [])
     if not items:
         return 0
+    params = [
+        (
+            str(row.get("source", "unknown") or "unknown"),
+            str(row.get("coin", "") or "").upper(),
+            int(row.get("timestamp_ms", 0) or 0),
+            float(row.get("funding_rate", 0.0) or 0.0),
+            row.get("annualized"),
+            _json(row.get("metadata", {})),
+        )
+        for row in items
+    ]
     with db.get_connection() as conn:
-        for row in items:
-            conn.execute(
-                """
-                INSERT INTO funding_history
-                (source, coin, timestamp_ms, funding_rate, annualized, metadata)
-                VALUES (?, ?, ?, ?, ?, ?)
-                ON CONFLICT(source, coin, timestamp_ms) DO UPDATE SET
-                    funding_rate = EXCLUDED.funding_rate,
-                    annualized = EXCLUDED.annualized,
-                    metadata = EXCLUDED.metadata
-                """,
-                (
-                    str(row.get("source", "unknown") or "unknown"),
-                    str(row.get("coin", "") or "").upper(),
-                    int(row.get("timestamp_ms", 0) or 0),
-                    float(row.get("funding_rate", 0.0) or 0.0),
-                    row.get("annualized"),
-                    _json(row.get("metadata", {})),
-                ),
-            )
+        conn.executemany(
+            """
+            INSERT INTO funding_history
+            (source, coin, timestamp_ms, funding_rate, annualized, metadata)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(source, coin, timestamp_ms) DO UPDATE SET
+                funding_rate = EXCLUDED.funding_rate,
+                annualized = EXCLUDED.annualized,
+                metadata = EXCLUDED.metadata
+            """,
+            params,
+        )
     return len(items)
 
 
@@ -62,27 +65,30 @@ def store_open_interest_points(rows: Iterable[Dict[str, Any]]) -> int:
     items = list(rows or [])
     if not items:
         return 0
+    params = [
+        (
+            str(row.get("source", "unknown") or "unknown"),
+            str(row.get("coin", "") or "").upper(),
+            int(row.get("timestamp_ms", 0) or 0),
+            float(row.get("open_interest", 0.0) or 0.0),
+            row.get("notional_usd"),
+            _json(row.get("metadata", {})),
+        )
+        for row in items
+    ]
     with db.get_connection() as conn:
-        for row in items:
-            conn.execute(
-                """
-                INSERT INTO open_interest_history
-                (source, coin, timestamp_ms, open_interest, notional_usd, metadata)
-                VALUES (?, ?, ?, ?, ?, ?)
-                ON CONFLICT(source, coin, timestamp_ms) DO UPDATE SET
-                    open_interest = EXCLUDED.open_interest,
-                    notional_usd = EXCLUDED.notional_usd,
-                    metadata = EXCLUDED.metadata
-                """,
-                (
-                    str(row.get("source", "unknown") or "unknown"),
-                    str(row.get("coin", "") or "").upper(),
-                    int(row.get("timestamp_ms", 0) or 0),
-                    float(row.get("open_interest", 0.0) or 0.0),
-                    row.get("notional_usd"),
-                    _json(row.get("metadata", {})),
-                ),
-            )
+        conn.executemany(
+            """
+            INSERT INTO open_interest_history
+            (source, coin, timestamp_ms, open_interest, notional_usd, metadata)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(source, coin, timestamp_ms) DO UPDATE SET
+                open_interest = EXCLUDED.open_interest,
+                notional_usd = EXCLUDED.notional_usd,
+                metadata = EXCLUDED.metadata
+            """,
+            params,
+        )
     return len(items)
 
 

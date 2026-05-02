@@ -760,37 +760,35 @@ class DecisionFirewall:
         if hasattr(signal, "activate_trace"):
             signal.activate_trace()
 
-        self._journal_record(
-            signal,
-            regime_data=regime_data,
-            account_balance=account_balance,
-            final_status="firewall_prescreen" if dry_run else "firewall_validation",
-            firewall_decision="pending",
-            metadata={
-                "dry_run": dry_run,
-                "ignore_position_limit": ignore_position_limit,
-            },
-        )
+        if not dry_run:
+            self._journal_record(
+                signal,
+                regime_data=regime_data,
+                account_balance=account_balance,
+                final_status="firewall_validation",
+                firewall_decision="pending",
+                metadata={
+                    "dry_run": dry_run,
+                    "ignore_position_limit": ignore_position_limit,
+                },
+            )
 
         if not dry_run:
             self.stats["total_signals"] += 1
 
         def _reject(reason_key, reason_msg):
             """Helper to reject + audit log in one step."""
-            self._journal_update(
-                signal,
-                final_status=(
-                    "firewall_prescreen_rejected"
-                    if dry_run
-                    else "rejected"
-                ),
-                firewall_decision="rejected",
-                rejection_reason=reason_msg,
-                metadata={
-                    "reason_key": reason_key,
-                    "dry_run": dry_run,
-                },
-            )
+            if not dry_run:
+                self._journal_update(
+                    signal,
+                    final_status="rejected",
+                    firewall_decision="rejected",
+                    rejection_reason=reason_msg,
+                    metadata={
+                        "reason_key": reason_key,
+                        "dry_run": dry_run,
+                    },
+                )
             if not dry_run:
                 self.stats[reason_key] += 1
                 try:
@@ -1104,13 +1102,14 @@ class DecisionFirewall:
             except Exception:
                 pass  # audit logging must never break the trading path
 
-        self._journal_update(
-            signal,
-            final_status="firewall_prescreen_approved" if dry_run else "approved",
-            firewall_decision="approved",
-            rejection_reason=None,
-            metadata={"dry_run": dry_run},
-        )
+        if not dry_run:
+            self._journal_update(
+                signal,
+                final_status="approved",
+                firewall_decision="approved",
+                rejection_reason=None,
+                metadata={"dry_run": dry_run},
+            )
 
         return True, "approved"
 

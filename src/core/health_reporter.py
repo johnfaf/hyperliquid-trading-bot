@@ -233,6 +233,15 @@ def write_health_report(
     report["pipeline"] = pipeline
 
     try:
+        from src.data import decision_journal
+
+        report["decision_journal"] = decision_journal.get_write_failure_stats()
+        if int(report["decision_journal"].get("total", 0) or 0) > 0:
+            warnings.append("decision_journal_write_failures")
+    except Exception as exc:
+        _record_collection_failure("decision_journal", exc)
+
+    try:
         if container.arena:
             arena_stats = container.arena.get_stats()
             report["arena"] = {

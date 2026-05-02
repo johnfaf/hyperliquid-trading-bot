@@ -55,6 +55,15 @@ def _normalize_private_key(raw: str) -> str:
     return "0x" + value
 
 
+def _sanitize_error_message(message: object) -> str:
+    text = str(message or "")
+    for env_name in ("VAULT_TOKEN", "HL_AGENT_PRIVATE_KEY", "AWS_KMS_CIPHERTEXT_B64"):
+        secret = os.environ.get(env_name, "").strip()
+        if secret:
+            text = text.replace(secret, "<redacted>")
+    return text[:500]
+
+
 def _load_from_env() -> Optional[str]:
     key = os.environ.get("HL_AGENT_PRIVATE_KEY", "").strip()
     if not key:
@@ -67,8 +76,6 @@ def _load_from_aws_kms() -> str:
     region = os.environ.get("AWS_KMS_REGION", "").strip()
     if not ciphertext_b64:
         raise SecretManagerError("AWS_KMS_CIPHERTEXT_B64 is required for aws_kms provider")
-    if not region:
-        raise SecretManagerError("AWS_KMS_REGION is required for aws_kms provider")
 
     try:
         import boto3
@@ -80,7 +87,8 @@ def _load_from_aws_kms() -> str:
     except Exception as exc:
         raise SecretManagerError(f"Invalid AWS_KMS_CIPHERTEXT_B64: {exc}") from exc
 
-    client = boto3.client("kms", region_name=region)
+    client_kwargs = {"region_name": region} if region else {}
+    client = boto3.client("kms", **client_kwargs)
     decrypt_kwargs = {"CiphertextBlob": blob}
     key_id = os.environ.get("AWS_KMS_KEY_ID", "").strip()
     if key_id:
@@ -111,7 +119,8 @@ def _load_from_hashicorp_vault() -> str:
         response.raise_for_status()
     except requests.RequestException as exc:
         raise SecretManagerError(
-            f"Vault request failed for path '{path}': {exc.__class__.__name__}"
+            f"Vault request failed for path '{path}': "
+            f"{exc.__class__.__name__}: {_sanitize_error_message(exc)}"
         ) from exc
     payload = response.json()
 

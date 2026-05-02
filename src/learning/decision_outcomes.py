@@ -101,6 +101,85 @@ def _fetch_future_close(
     return None
 
 
+def _fetch_candle_path(
+    conn: Any,
+    *,
+    coin: str,
+    start_ts_ms: int,
+    target_ts_ms: int,
+    timeframes: Iterable[str],
+) -> List[Dict[str, float]]:
+    for timeframe in timeframes:
+        try:
+            rows = conn.execute(
+                """
+                SELECT timestamp_ms, high, low, close
+                FROM candles
+                WHERE coin = ? AND timeframe = ? AND timestamp_ms > ? AND timestamp_ms <= ?
+                ORDER BY timestamp_ms ASC
+                """,
+                (coin, timeframe, int(start_ts_ms), int(target_ts_ms)),
+            ).fetchall()
+        except Exception:
+            rows = []
+        candles: List[Dict[str, float]] = []
+        for row in rows or []:
+            data = _row_dict(row)
+            high = _float(data.get("high"), None)
+            low = _float(data.get("low"), None)
+            close = _float(data.get("close"), None)
+            if high is None or low is None or close is None:
+                continue
+            if high <= 0 or low <= 0 or close <= 0:
+                continue
+            candles.append({"high": high, "low": low, "close": close})
+        if candles:
+            return candles
+    return []
+
+
+def _counterfactual_path_return(
+    decision: Dict[str, Any],
+    *,
+    side: str,
+    entry: float,
+    candles: List[Dict[str, float]],
+    horizon_return: float,
+) -> tuple[float, str]:
+    """Estimate the rejected trade outcome using stored SL/TP and intrahorizon bars.
+
+    If a wide candle crosses both SL and TP, assume the stop fired first. That is
+    deliberately conservative for calibration: it avoids teaching the firewall
+    that rejected trades were winners when OHLC data cannot prove the fill order.
+    """
+    sl = _float(decision.get("proposed_sl_price"), None)
+    tp = _float(decision.get("proposed_tp_price"), None)
+    if not candles or not sl or not tp or sl <= 0 or tp <= 0:
+        return float(horizon_return), "horizon_close"
+
+    for candle in candles:
+        high = float(candle.get("high", 0.0) or 0.0)
+        low = float(candle.get("low", 0.0) or 0.0)
+        if side == "long":
+            hit_sl = low <= sl
+            hit_tp = high >= tp
+            if hit_sl:
+                reason = "ambiguous_stop_first" if hit_tp else "stop_loss"
+                return (sl - entry) / entry, reason
+            if hit_tp:
+                return (tp - entry) / entry, "take_profit"
+        else:
+            hit_sl = high >= sl
+            hit_tp = low <= tp
+            if hit_sl:
+                reason = "ambiguous_stop_first" if hit_tp else "stop_loss"
+                return (entry - sl) / entry, reason
+            if hit_tp:
+                return (entry - tp) / entry, "take_profit"
+
+    return float(horizon_return), "horizon_close"
+
+
 def compute_forward_labels(
     decision: Dict[str, Any],
     *,
@@ -131,10 +210,11 @@ def compute_forward_labels(
             if not _table_exists(conn, "candles"):
                 return {}
             for horizon, delta_ms in HORIZONS_MS.items():
+                target_ts_ms = signal_ts_ms + delta_ms
                 close = _fetch_future_close(
                     conn,
                     coin=coin,
-                    target_ts_ms=signal_ts_ms + delta_ms,
+                    target_ts_ms=target_ts_ms,
                     timeframes=timeframes,
                 )
                 if close is None:
@@ -142,6 +222,22 @@ def compute_forward_labels(
                 raw_return = (close - entry) / entry
                 side_return = raw_return if side == "long" else -raw_return
                 labels[f"forward_return_{horizon}"] = side_return
+                candle_path = _fetch_candle_path(
+                    conn,
+                    coin=coin,
+                    start_ts_ms=signal_ts_ms,
+                    target_ts_ms=target_ts_ms,
+                    timeframes=timeframes,
+                )
+                path_return, exit_reason = _counterfactual_path_return(
+                    decision,
+                    side=side,
+                    entry=entry,
+                    candles=candle_path,
+                    horizon_return=side_return,
+                )
+                labels[f"counterfactual_return_{horizon}"] = path_return
+                labels[f"counterfactual_exit_{horizon}"] = exit_reason
     except Exception as exc:
         logger.debug("Forward label computation skipped for %s: %s", coin, exc)
         return {}
@@ -149,7 +245,10 @@ def compute_forward_labels(
     preferred = None
     for key in ("forward_return_4h", "forward_return_1h", "forward_return_15m", "forward_return_24h"):
         if labels.get(key) is not None:
-            preferred = labels[key]
+            horizon = key.rsplit("_", 1)[-1]
+            preferred = labels.get(f"counterfactual_return_{horizon}", labels[key])
+            labels["preferred_counterfactual_horizon"] = horizon
+            labels["preferred_counterfactual_exit"] = labels.get(f"counterfactual_exit_{horizon}")
             break
     if preferred is not None:
         labels["side_correct"] = 1 if float(preferred) > 0 else 0

@@ -316,6 +316,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--reset-paper", action="store_true",
                         help="Clear all paper trades and reset balance")
     parser.add_argument("--reset-balance", type=float, default=None)
+    parser.add_argument(
+        "--i-understand-the-risks",
+        action="store_true",
+        help="Allow destructive maintenance commands while live trading is enabled",
+    )
     parser.add_argument("--backtest", action="store_true")
     parser.add_argument("--bt-coins", type=str, default=None)
     parser.add_argument("--bt-start", type=str, default=None)

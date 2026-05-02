@@ -1,9 +1,9 @@
 """Backfill remaining medium-severity deployed DB audit items.
 
 This script reuses the app's existing historical-source and regime-refresh
-logic, but patches database access to a direct SQLite connection with an
-aggressive busy timeout. It is intended for one-off maintenance on a deployed
-volume when the main app process is alive and routed DB writes are too noisy.
+logic, but it must choose the target SQLite DB before importing app modules.
+That keeps the DB path explicit without monkey-patching the global database
+module in a process that might already be running worker threads.
 """
 
 from __future__ import annotations
@@ -11,9 +11,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import sqlite3
 import sys
-from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -21,46 +19,10 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-import config
-from src.backtest.data_fetcher import DataFetcher
-from src.data import database as db
-from src.data import db_audit
-
-
-@contextmanager
-def _sqlite_ctx(path: str, *, for_read: bool = False):
-    conn = sqlite3.connect(path, timeout=60.0)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA busy_timeout=60000")
-    conn.execute("PRAGMA foreign_keys=ON")
-    try:
-        yield conn
-        if not for_read:
-            conn.commit()
-    finally:
-        conn.close()
-
-
-class _PatchedDb:
-    def __init__(self, path: str):
-        self.path = path
-        self._orig_get_connection = db.get_connection
-        self._orig_get_backend_name = db.get_backend_name
-        self._orig_get_db_path = db.get_db_path
-
-    def __enter__(self):
-        db.get_connection = lambda for_read=False: _sqlite_ctx(self.path, for_read=for_read)
-        db.get_backend_name = lambda: "sqlite"
-        db.get_db_path = lambda: self.path
-        return self
-
-    def __exit__(self, exc_type, exc, tb):
-        db.get_connection = self._orig_get_connection
-        db.get_backend_name = self._orig_get_backend_name
-        db.get_db_path = self._orig_get_db_path
-
 
 def _fetch_candles(cache_dir: str) -> dict[str, Any]:
+    from src.backtest.data_fetcher import DataFetcher
+
     fetcher = DataFetcher(cache_dir=cache_dir)
     refreshed = []
     for coin in ("BTC", "ETH"):
@@ -70,16 +32,19 @@ def _fetch_candles(cache_dir: str) -> dict[str, Any]:
 
 
 def run(db_path: str, candle_cache_dir: str) -> dict[str, Any]:
+    _configure_target_db(db_path)
+
+    from src.data import db_audit
+
     actions: list[db_audit.DbRepairAction] = []
-    with _PatchedDb(db_path):
-        pre_audit = db_audit.run_db_audit(include_code_scan=False)
-        db_audit._repair_historical_sources(actions)
-        stale_non_active = list(
-            (pre_audit.checks.get("regime_history", {}) or {}).get("stale_other", [])
-        )
-        db_audit._repair_non_active_regime_history(actions, stale_non_active)
-        candle_result = _fetch_candles(candle_cache_dir)
-        post_audit = db_audit.run_db_audit(include_code_scan=False)
+    pre_audit = db_audit.run_db_audit(include_code_scan=False)
+    db_audit._repair_historical_sources(actions)
+    stale_non_active = list(
+        (pre_audit.checks.get("regime_history", {}) or {}).get("stale_other", [])
+    )
+    db_audit._repair_non_active_regime_history(actions, stale_non_active)
+    candle_result = _fetch_candles(candle_cache_dir)
+    post_audit = db_audit.run_db_audit(include_code_scan=False)
 
     return {
         "db_path": db_path,
@@ -89,6 +54,17 @@ def run(db_path: str, candle_cache_dir: str) -> dict[str, Any]:
         "actions": [action.to_dict() for action in actions],
         "candle_cache": candle_result,
     }
+
+
+def _configure_target_db(db_path: str) -> None:
+    loaded = [name for name in ("config", "src.data.database", "src.data.db.router") if name in sys.modules]
+    if loaded:
+        raise RuntimeError(
+            "Target DB must be configured before app database modules are imported; "
+            f"already loaded: {', '.join(loaded)}"
+        )
+    os.environ["HL_BOT_DB"] = str(Path(db_path).resolve())
+    os.environ["DB_BACKEND"] = "sqlite"
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -98,18 +98,22 @@ def run_migrations() -> int:
             return 0
 
         for version, fname, path in pending:
-            logger.info("Applying migration %s: %s", version, fname)
-            sql = _read_migration_sql(path)
+            try:
+                logger.info("Applying migration %s: %s", version, fname)
+                sql = _read_migration_sql(path)
 
-            with _migration_transaction(conn):
-                cur = conn.cursor()
-                cur.execute(sql)
-                cur.execute(
-                    "INSERT INTO schema_migrations (version, filename) VALUES (%s, %s)",
-                    (version, fname),
-                )
-            conn.commit()
-            logger.info("Migration %s applied successfully.", version)
+                with _migration_transaction(conn):
+                    cur = conn.cursor()
+                    cur.execute(sql)
+                    cur.execute(
+                        "INSERT INTO schema_migrations (version, filename) VALUES (%s, %s)",
+                        (version, fname),
+                    )
+                conn.commit()
+                logger.info("Migration %s applied successfully.", version)
+            except Exception:
+                logger.exception("Migration %s failed while applying %s", version, fname)
+                raise
 
         logger.info("Applied %d migration(s).", len(pending))
         return len(pending)
