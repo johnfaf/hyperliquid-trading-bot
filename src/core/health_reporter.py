@@ -158,6 +158,13 @@ def write_health_report(
         "version": "1.0",
     }
     warnings = []
+    collection_failures: list[dict[str, str]] = []
+
+    def _record_collection_failure(name: str, exc: Exception) -> None:
+        collection_failures.append({
+            "subsystem": name,
+            "error": f"{type(exc).__name__}: {exc}",
+        })
 
     try:
         live_active = is_live_trading_active(container)
@@ -186,20 +193,20 @@ def write_health_report(
     try:
         if container.signal_processor:
             pipeline["signal_processor"] = dict(container.signal_processor.stats)
-    except Exception:
-        pass
+    except Exception as exc:
+        _record_collection_failure("signal_processor", exc)
     try:
         if container.decision_engine:
             pipeline["decision_engine"] = dict(container.decision_engine.stats)
-    except Exception:
-        pass
+    except Exception as exc:
+        _record_collection_failure("decision_engine", exc)
     try:
         if container.options_scanner:
             pipeline["options_flow"] = {
                 "top_convictions": len(getattr(container.options_scanner, "top_convictions", []) or []),
             }
-    except Exception:
-        pass
+    except Exception as exc:
+        _record_collection_failure("options_scanner", exc)
     try:
         if getattr(container, "event_scanner", None):
             stats = container.event_scanner.get_stats()
@@ -211,8 +218,8 @@ def write_health_report(
                 "high_impact_next_24h": stats.get("high_impact_next_24h", 0),
                 "critical_incidents": stats.get("critical_incidents", 0),
             }
-    except Exception:
-        pass
+    except Exception as exc:
+        _record_collection_failure("event_scanner", exc)
     try:
         if container.kelly_sizer:
             all_stats = container.kelly_sizer.get_all_sizing_stats()
@@ -221,8 +228,8 @@ def write_health_report(
                 "strategies_tracked": len(all_stats),
                 "with_proven_edge": edge_count,
             }
-    except Exception:
-        pass
+    except Exception as exc:
+        _record_collection_failure("kelly_sizer", exc)
     report["pipeline"] = pipeline
 
     try:
@@ -235,8 +242,8 @@ def write_health_report(
                 "incubating": arena_stats.get("incubating", 0),
                 "total_pnl": round(arena_stats.get("total_pnl", 0), 2),
             }
-    except Exception:
-        pass
+    except Exception as exc:
+        _record_collection_failure("arena", exc)
 
     try:
         from src.data.hyperliquid_client import get_api_stats
@@ -251,8 +258,8 @@ def write_health_report(
                 "consecutive_429s": api_stats["bucket"]["consecutive_429s"],
                 "tokens_available": api_stats["bucket"]["tokens_available"],
             }
-    except Exception:
-        pass
+    except Exception as exc:
+        _record_collection_failure("api_stats", exc)
 
     if health_registry:
         try:
@@ -271,8 +278,8 @@ def write_health_report(
                 "all_healthy": len(stale_list) == 0,
                 "details": detailed,
             }
-        except Exception:
-            pass
+        except Exception as exc:
+            _record_collection_failure("health_registry", exc)
 
     try:
         report["readiness"] = evaluate_readiness(
@@ -290,20 +297,20 @@ def write_health_report(
                 report["copy_trading"] = {
                     "total_executed": getattr(container.copy_trader, "_copy_count", 0),
                 }
-    except Exception:
-        pass
+    except Exception as exc:
+        _record_collection_failure("copy_trader", exc)
 
     try:
         if getattr(container, "agent_scorer", None):
             report["source_scorecard"] = container.agent_scorer.get_scorecard()
-    except Exception:
-        pass
+    except Exception as exc:
+        _record_collection_failure("agent_scorer", exc)
 
     try:
         if getattr(container, "shadow_tracker", None):
             report["shadow_summary"] = container.shadow_tracker.get_summary(days=30)
-    except Exception:
-        pass
+    except Exception as exc:
+        _record_collection_failure("shadow_tracker", exc)
 
     try:
         if getattr(container, "live_trader", None):
@@ -330,8 +337,8 @@ def write_health_report(
                 "min_order_floorups": int(live_stats.get("min_order_floorups_today", 0) or 0),
                 "crash_safe_canary_order_usd": live_stats.get("crash_safe_canary_order_usd"),
             }
-    except Exception:
-        pass
+    except Exception as exc:
+        _record_collection_failure("live_trader", exc)
 
     try:
         monitor = getattr(container, "position_monitor", None)
@@ -346,8 +353,8 @@ def write_health_report(
                     "position_monitor_rest_only:"
                     f"{monitor_stats.get('transport_reason', 'unknown')}"
                 )
-    except Exception:
-        pass
+    except Exception as exc:
+        _record_collection_failure("position_monitor", exc)
 
     try:
         from src.data import database as db
@@ -356,10 +363,16 @@ def write_health_report(
             db.get_paper_trade_history(limit=getattr(config, "LIVE_ANALYTICS_LOOKBACK_TRADES", 200)),
             source_limit=8,
         )
-    except Exception:
-        pass
+    except Exception as exc:
+        _record_collection_failure("trade_analytics", exc)
 
     report["errors"] = list(_error_buffer[-20:])
+    if collection_failures:
+        report["collection_failures"] = {
+            "count": len(collection_failures),
+            "items": collection_failures[:20],
+        }
+        warnings.append(f"health_report_partial:{len(collection_failures)}_collector_failures")
     if warnings:
         report["warnings"] = sorted(set(str(w) for w in warnings if w))
 
@@ -375,7 +388,7 @@ def write_health_report(
             with open(fallback, "w") as handle:
                 json.dump(report, handle, indent=2, default=str)
             output_path = fallback
-        except Exception:
-            pass
+        except Exception as fallback_exc:
+            logger.warning("Failed to write fallback health report: %s", fallback_exc)
 
     return output_path

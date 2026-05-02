@@ -1306,7 +1306,7 @@ class AlphaArena:
                             name TEXT,
                             strategy_type TEXT,
                             status TEXT DEFAULT 'incubating',
-                            params TEXT DEFAULT '{}',
+                            params JSONB DEFAULT '{}'::jsonb,
                             capital_allocated DOUBLE PRECISION DEFAULT 1000,
                             total_pnl DOUBLE PRECISION DEFAULT 0,
                             total_trades INTEGER DEFAULT 0,
@@ -1458,6 +1458,17 @@ class AlphaArena:
             with db.get_connection(for_read=True) as conn:
                 rows = conn.execute("SELECT * FROM arena_agents").fetchall()
 
+            def _agent_params(raw):
+                if isinstance(raw, dict):
+                    return dict(raw)
+                if raw is None:
+                    return {}
+                try:
+                    parsed = json.loads(raw)
+                    return parsed if isinstance(parsed, dict) else {}
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    return {}
+
             # Load all agents from DB first
             for row in rows:
                 row = dict(row)
@@ -1466,7 +1477,7 @@ class AlphaArena:
                     name=row["name"],
                     strategy_type=row["strategy_type"],
                     status=AgentStatus(row.get("status", "active")),
-                    params=json.loads(row.get("params", "{}")),
+                    params=_agent_params(row.get("params")),
                     capital_allocated=row.get("capital_allocated", 1000),
                     total_pnl=row.get("total_pnl", 0),
                     total_trades=row.get("total_trades", 0),

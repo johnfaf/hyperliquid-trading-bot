@@ -6,6 +6,7 @@ don't need their own sys.path.insert hacks.
 """
 import sys
 import os
+import sqlite3
 
 # Add project root to path so `import config` and `from src.xxx` work
 _PROJECT_ROOT = os.path.join(os.path.dirname(__file__), "..")
@@ -16,25 +17,43 @@ if _PROJECT_ROOT not in sys.path:
 import pytest  # noqa: E402  -- must follow the sys.path shim above
 
 
-@pytest.fixture(autouse=True)
-def _reset_bot_state_kv():
-    """Ensure bot_state KV rows don't leak between tests.
+_RESET_TABLES = (
+    "decision_stage_events",
+    "decision_outcomes",
+    "shadow_trades",
+    "paper_trades",
+    "bot_state",
+)
 
-    The LiveTrader now persists canary/dedup state to the bot_state table
-    (H5, E7).  Without isolation, a prior test's rows would be loaded by
-    the next test's LiveTrader() and throw off counters.  We clear the
-    table before AND after each test so ordering doesn't matter.
+
+def _clear_test_state():
+    from src.data import database as _db
+
+    with _db.get_connection() as _conn:
+        for table in _RESET_TABLES:
+            try:
+                if _db.table_exists(table):
+                    _conn.execute(f"DELETE FROM {table}")
+            except sqlite3.OperationalError as exc:
+                if "no such table" in str(exc).lower():
+                    continue
+                raise
+
+
+@pytest.fixture(autouse=True)
+def _reset_persistent_runtime_state():
+    """Ensure persistent runtime rows do not leak between tests.
+
+    LiveTrader and learning/replay paths persist kill-switch, dedup, paper
+    trade, shadow, and decision state. Clear the volatile tables before and
+    after each test so ordering does not hide state bugs.
     """
     try:
-        from src.data import database as _db
-        with _db.get_connection() as _conn:
-            _conn.execute("DELETE FROM bot_state")
-    except Exception:
-        pass
+        _clear_test_state()
+    except Exception as exc:
+        pytest.fail(f"Could not reset persistent test DB state before test: {exc}")
     yield
     try:
-        from src.data import database as _db
-        with _db.get_connection() as _conn:
-            _conn.execute("DELETE FROM bot_state")
-    except Exception:
-        pass
+        _clear_test_state()
+    except Exception as exc:
+        pytest.fail(f"Could not reset persistent test DB state after test: {exc}")
