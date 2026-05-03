@@ -4588,6 +4588,41 @@ def test_live_trader_persists_kill_switch_across_restart_and_daily_reset(tmp_pat
     assert stats["kill_switch_reason"] == "operator_test"
 
 
+def test_operator_clear_kill_switch_clears_state_and_persists(tmp_path, monkeypatch):
+    """The dashboard operator-clear path must reset the in-memory flag,
+    reset the persisted state file, and emit a CRITICAL audit entry.
+    """
+    class FakeFirewall:
+        def validate(self, signal, **kwargs):
+            return True, "ok"
+
+    state_file = tmp_path / "sticky_kill.json"
+    monkeypatch.setenv("LIVE_KILL_SWITCH_STATE_FILE", str(state_file))
+    monkeypatch.setattr(config, "LIVE_KILL_SWITCH_STATE_FILE", str(state_file), raising=False)
+    monkeypatch.setattr(LiveTrader, "_load_credentials", _fake_live_credentials)
+    monkeypatch.setattr(LiveTrader, "_load_asset_index_map", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "reconcile_positions", lambda self: None)
+
+    trader = LiveTrader(firewall=FakeFirewall(), dry_run=False, max_order_usd=1_000_000)
+    trader.activate_kill_switch("manual_for_test", status_reason="manual_kill_switch")
+    assert trader.kill_switch_active is True
+
+    result = trader.operator_clear_kill_switch(
+        reason="post-incident: verified API restored",
+        operator="dashboard:opaque-cookie",
+    )
+    assert result["cleared"] is True
+    assert result["previous_active"] is True
+    assert result["previous_reason"] == "manual_for_test"
+    assert trader.kill_switch_active is False
+    assert trader._kill_switch_reason == ""
+
+    # Persisted state should now be inactive so a restart doesn't restore the kill.
+    persisted = json.loads(state_file.read_text(encoding="utf-8"))
+    assert persisted["active"] is False
+    assert "operator_cleared" in persisted["reason"]
+
+
 def test_legacy_daily_pnl_refresh_kill_switch_auto_clears_on_startup(tmp_path, monkeypatch):
     """A persisted ``daily_pnl_refresh_failed`` state from a previous run
     must auto-clear on startup so a single past blip does not permanently

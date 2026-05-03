@@ -107,3 +107,135 @@ def test_calibration_unavailable_when_component_not_set(monkeypatch, tmp_path):
     r = client.get("/api/calibration")
     assert r.status_code == 503
     assert r.json()["error"] == "calibration_unavailable"
+
+
+def test_subsystem_registry_imports_cleanly():
+    """Regression for the missing-``import os`` bug.
+
+    The v2 dashboard wiring lives in src.core.subsystem_registry. Even
+    when v2 is disabled, simply importing the module must succeed --
+    last week a typo there crash-looped every boot.
+    """
+    import importlib
+    mod = importlib.import_module("src.core.subsystem_registry")
+    assert hasattr(mod, "boot_subsystems") or hasattr(mod, "BootContext") or mod is not None
+
+
+def test_positions_endpoint_no_live_trader(client):
+    r = client.get("/api/positions")
+    assert r.status_code == 200
+    payload = r.json()
+    assert payload["live_available"] is False
+    assert payload["positions"] == []
+    assert payload["kill_switch"]["active"] is False
+
+
+def test_positions_page_renders_without_live_trader(client):
+    r = client.get("/positions")
+    assert r.status_code == 200
+    assert "Open positions" in r.text
+
+
+def test_clear_kill_switch_requires_live_trader(client):
+    r = client.post(
+        "/api/operator/clear_kill_switch",
+        data={"audit_reason": "investigating root cause"},
+    )
+    assert r.status_code == 503
+    assert r.json()["error"] == "live_trader_unavailable"
+
+
+def test_clear_kill_switch_rejects_short_reason(client):
+    # Inject a stub live_trader so we exercise the audit-reason gate
+    # without pulling in the full LiveTrader stack.
+    class _Stub:
+        def operator_clear_kill_switch(self, *, reason, operator):
+            return {"cleared": True, "previous_reason": None,
+                    "ts": "0", "operator": operator, "audit_reason": reason}
+    v2_state.set_components(live_trader=_Stub())
+    r = client.post(
+        "/api/operator/clear_kill_switch",
+        data={"audit_reason": "ok"},
+    )
+    assert r.status_code == 400
+    assert r.json()["error"] == "audit_reason_required"
+
+
+def test_clear_kill_switch_calls_through_with_audit_reason(client):
+    calls = []
+
+    class _Stub:
+        def operator_clear_kill_switch(self, *, reason, operator):
+            calls.append({"reason": reason, "operator": operator})
+            return {
+                "cleared": True,
+                "previous_active": True,
+                "previous_reason": "daily_pnl_refresh_failed",
+                "ts": "2026-05-03T00:00:00+00:00",
+                "operator": operator,
+                "audit_reason": reason,
+            }
+
+    v2_state.set_components(live_trader=_Stub())
+    r = client.post(
+        "/api/operator/clear_kill_switch",
+        data={"audit_reason": "userFills API recovered, verified by hand"},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is True
+    assert body["result"]["cleared"] is True
+    assert calls and calls[0]["reason"].startswith("userFills")
+
+
+def test_sources_endpoint_no_agent_scorer(client):
+    r = client.get("/api/sources")
+    assert r.status_code == 200
+    payload = r.json()
+    assert payload["available"] is False
+    assert payload["rows"] == []
+
+
+def test_sources_endpoint_aggregates_calibration(monkeypatch, tmp_path):
+    """The scoreboard rolls per-(source|side|regime) calibration into a
+    single source row. Verify the rollup matches the underlying
+    calibrator state.
+    """
+    monkeypatch.delenv("DASHBOARD_AUTH_TOKEN", raising=False)
+    v2_state.reset_components()
+    cal = CalibrationTracker(db_path=str(tmp_path / "cal.db"))
+    for _ in range(20):
+        cal.record("strategy:m", 0.7, True, side="long", regime="trend")
+        cal.record("strategy:m", 0.7, False, side="short", regime="trend")
+
+    class _Scorer:
+        def get_scorecard(self):
+            return [{
+                "source_key": "strategy:m",
+                "rank": 1, "status": "active",
+                "completed_trades": 40, "win_rate": 0.5,
+                "weighted_accuracy": 0.5, "dynamic_weight": 0.5,
+                "sharpe": 0.0, "avg_return": 0.0,
+                "recent_pnl": 0.0, "total_pnl": 0.0,
+                "last_trade_at": None,
+            }]
+
+    v2_state.set_components(agent_scorer=_Scorer(), calibration=cal)
+    app = create_app()
+    client = TestClient(app)
+    r = client.get("/api/sources")
+    assert r.status_code == 200
+    payload = r.json()
+    assert payload["available"] is True
+    assert len(payload["rows"]) == 1
+    row = payload["rows"][0]
+    assert row["source"] == "strategy:m"
+    assert row["calibration"]["subkeys"] == 2  # long+trend, short+trend
+    assert row["calibration"]["samples"] >= 30
+
+
+def test_sources_page_renders(client):
+    r = client.get("/sources")
+    assert r.status_code == 200
+    # Renders the "agent scorer not initialised" banner when no scorer is wired.
+    assert "Agent scorer is not initialised" in r.text or "Source scoreboard" in r.text

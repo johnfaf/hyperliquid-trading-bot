@@ -70,12 +70,16 @@ def create_app() -> FastAPI:
     from src.ui.v2.routers import calibration as calibration_router
     from src.ui.v2.routers import health as health_router
     from src.ui.v2.routers import pages as pages_router
+    from src.ui.v2.routers import positions as positions_router
+    from src.ui.v2.routers import sources as sources_router
     from src.ui.v2.routers import stream as stream_router
 
     app.include_router(health_router.router)
     app.include_router(auth_router.router)
     app.include_router(pages_router.router)
     app.include_router(calibration_router.router)
+    app.include_router(positions_router.router)
+    app.include_router(sources_router.router)
     app.include_router(stream_router.router)
 
     if _STATIC_DIR.exists():

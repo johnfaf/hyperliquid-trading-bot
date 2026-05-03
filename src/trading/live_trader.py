@@ -1635,6 +1635,61 @@ class LiveTrader:
                 "status_reason": self.status_reason or None,
             }
 
+    def operator_clear_kill_switch(self, *, reason: str, operator: str = "operator") -> Dict[str, Any]:
+        """Clear the sticky kill switch on explicit operator command.
+
+        Until now the only way to lift a sticky stop was deleting the
+        state file out-of-band. This method gives the v2 dashboard a
+        safe, audit-logged path:
+
+        * The previous kill-switch state is captured before the clear.
+        * The clear is logged at CRITICAL with the supplied reason and
+          operator identity so it appears in incident reviews.
+        * The persisted state file is overwritten with ``active=False``
+          so the bot won't restore the kill switch on next restart.
+        * If the underlying problem is still present (daily-loss limit
+          exceeded, dualwrite still unhealthy, daily-PnL refresh still
+          failing), the next cycle's safety checks will trip the
+          switch again -- this is the intended behaviour.
+
+        Returns a snapshot ``{cleared, previous_active, previous_reason,
+        ts, operator}``.
+        """
+        cleared_reason = (reason or "").strip() or "operator-cleared"
+        operator_id = (operator or "operator").strip() or "operator"
+        previous = self.get_kill_switch_state()
+        with self._state_lock:
+            self.kill_switch_active = False
+            self._kill_switch_reason = ""
+            self.status_reason = "operator_cleared"
+        logger.critical(
+            "Kill switch CLEARED by %s -- previous reason=%s, audit reason=%s",
+            operator_id,
+            previous.get("reason") or "(none)",
+            cleared_reason,
+        )
+        try:
+            self._persist_kill_switch_state(False, f"operator_cleared:{cleared_reason}")
+        except Exception as exc:
+            logger.warning("Failed to persist kill-switch clear: %s", exc)
+        try:
+            from src.notifications import telegram_bot as tg
+            tg.notify_kill_switch_cleared(
+                operator=operator_id,
+                previous_reason=previous.get("reason"),
+                audit_reason=cleared_reason,
+            )
+        except Exception as alert_exc:
+            logger.debug("Kill-switch clear Telegram alert skipped: %s", alert_exc)
+        return {
+            "cleared": True,
+            "previous_active": bool(previous.get("active")),
+            "previous_reason": previous.get("reason"),
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "operator": operator_id,
+            "audit_reason": cleared_reason,
+        }
+
     def get_safety_stop_reason(self) -> str:
         """Return the active live-entry stop reason for operator logs."""
         state = self.get_kill_switch_state()
