@@ -1180,11 +1180,20 @@ class LiveTrader:
                     self._persist_kill_switch_state(False, f"coin_quarantine:{reason}")
                     return
                 if self._should_auto_clear_persisted_kill_switch(reason):
-                    logger.warning(
-                        "Auto-clearing stale persisted kill switch (%s): "
-                        "dualwrite is healthy in this process.",
-                        reason,
-                    )
+                    if reason == "daily_pnl_refresh_failed":
+                        logger.warning(
+                            "Auto-clearing legacy persisted kill switch (%s). "
+                            "The current code requires a sustained userFills "
+                            "failure streak before failing closed; if the API "
+                            "is still degraded the kill switch will re-trip.",
+                            reason,
+                        )
+                    else:
+                        logger.warning(
+                            "Auto-clearing stale persisted kill switch (%s): "
+                            "dualwrite is healthy in this process.",
+                            reason,
+                        )
                     self._persist_kill_switch_state(False, f"auto_cleared:{reason}")
                     return
                 with self._state_lock:
@@ -1202,13 +1211,27 @@ class LiveTrader:
     def _should_auto_clear_persisted_kill_switch(self, reason: str) -> bool:
         """Return True for healed, machine-detectable persisted kill switches.
 
-        Only the stale ``dualwrite_unhealthy`` case can clear itself here.
+        Two stale cases can clear themselves here:
+
+        * ``dualwrite_unhealthy:*`` — auto-clears once the dualwrite mirror
+          and Postgres are healthy again.
+        * ``daily_pnl_refresh_failed`` — pre-threshold versions of this code
+          tripped the sticky kill switch on a *single* transient userFills
+          failure, which then permanently blocked live entries. The current
+          code requires a sustained failure streak
+          (``LIVE_DAILY_PNL_REFRESH_FAILURE_THRESHOLD``) before tripping, so
+          a single legacy failure no longer warrants a sticky stop. If the
+          underlying API is still broken, the threshold guard will re-trip
+          the switch after N consecutive failures.
+
         Legacy ``protective_order_churn:<coin>`` states are handled in
         _load_persisted_kill_switch_state by converting the global stop into
         a coin-level quarantine. Manual, external-file and daily-loss kill
         switches stay sticky until an operator clears them.
         """
         reason = str(reason or "")
+        if reason == "daily_pnl_refresh_failed":
+            return True
         if not reason.startswith("dualwrite_unhealthy:"):
             return False
         try:

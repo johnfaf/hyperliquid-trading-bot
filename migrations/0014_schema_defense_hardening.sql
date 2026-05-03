@@ -14,12 +14,22 @@ EXCEPTION WHEN others THEN
 END;
 $$;
 
+-- Postgres refuses to change a column's type while the existing default
+-- still points at the old type ("default for column X cannot be cast
+-- automatically to type jsonb"). Drop defaults first, then change type,
+-- then re-set the default in the new type.
 ALTER TABLE IF EXISTS arena_agents
-    ALTER COLUMN params TYPE JSONB USING _hl_try_jsonb(params),
+    ALTER COLUMN params DROP DEFAULT;
+ALTER TABLE IF EXISTS arena_agents
+    ALTER COLUMN params TYPE JSONB USING _hl_try_jsonb(params);
+ALTER TABLE IF EXISTS arena_agents
     ALTER COLUMN params SET DEFAULT '{}'::jsonb;
 
 ALTER TABLE IF EXISTS shadow_trades
-    ALTER COLUMN metadata_json TYPE JSONB USING _hl_try_jsonb(metadata_json),
+    ALTER COLUMN metadata_json DROP DEFAULT;
+ALTER TABLE IF EXISTS shadow_trades
+    ALTER COLUMN metadata_json TYPE JSONB USING _hl_try_jsonb(metadata_json);
+ALTER TABLE IF EXISTS shadow_trades
     ALTER COLUMN metadata_json SET DEFAULT '{}'::jsonb;
 
 DROP FUNCTION IF EXISTS _hl_try_jsonb(ANYELEMENT);

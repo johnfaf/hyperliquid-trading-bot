@@ -4588,6 +4588,40 @@ def test_live_trader_persists_kill_switch_across_restart_and_daily_reset(tmp_pat
     assert stats["kill_switch_reason"] == "operator_test"
 
 
+def test_legacy_daily_pnl_refresh_kill_switch_auto_clears_on_startup(tmp_path, monkeypatch):
+    """A persisted ``daily_pnl_refresh_failed`` state from a previous run
+    must auto-clear on startup so a single past blip does not permanently
+    block live entries. The threshold guard re-trips it if the API stays
+    broken.
+    """
+    class FakeFirewall:
+        def validate(self, signal, **kwargs):
+            return True, "ok"
+
+    state_file = tmp_path / "sticky_kill.json"
+    state_file.write_text(
+        json.dumps({
+            "active": True,
+            "reason": "daily_pnl_refresh_failed",
+            "updated_at": "2026-05-03T00:00:00+00:00",
+        }),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("LIVE_KILL_SWITCH_STATE_FILE", str(state_file))
+    monkeypatch.setattr(config, "LIVE_KILL_SWITCH_STATE_FILE", str(state_file), raising=False)
+    monkeypatch.setattr(LiveTrader, "_load_credentials", _fake_live_credentials)
+    monkeypatch.setattr(LiveTrader, "_load_asset_index_map", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "reconcile_positions", lambda self: None)
+
+    trader = LiveTrader(firewall=FakeFirewall(), dry_run=False, max_order_usd=1_000_000)
+    assert trader.kill_switch_active is False
+    assert trader._kill_switch_reason == ""
+
+    persisted = json.loads(state_file.read_text(encoding="utf-8"))
+    assert persisted["active"] is False
+    assert persisted["reason"].startswith("auto_cleared:daily_pnl_refresh_failed")
+
+
 def test_daily_pnl_refresh_failure_fails_closed(monkeypatch):
     class FakeFirewall:
         def validate(self, signal, **kwargs):
