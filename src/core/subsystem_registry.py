@@ -99,6 +99,7 @@ class SubsystemContainer:
     cross_venue_hedger: Any = None
     shadow_tracker: Any = None
     dashboard: Any = None
+    dashboard_v2: Any = None
     data_source_registry: Any = None
 
 
@@ -805,6 +806,40 @@ def build_subsystems(
             logger.info("  OK dashboard")
         except Exception as exc:
             logger.warning("  FAIL dashboard - %s", exc)
+
+    # ─── Dashboard v2 (FastAPI + HTMX) ────────────────────────
+    # Opt-in. Coexists with v1 on a separate port so operators can
+    # try it without losing the existing UI. Failures here never
+    # affect trading.
+    if os.environ.get("DASHBOARD_V2_ENABLED", "").strip().lower() in ("1", "true", "yes", "on"):
+        try:
+            from src.ui.v2 import set_components as _set_v2_components
+            from src.ui.v2 import start_server as _start_v2_server
+            _set_v2_components(
+                firewall=c.firewall,
+                calibration=c.calibration,
+                agent_scorer=c.agent_scorer,
+                kelly_sizer=c.kelly_sizer,
+                regime_detector=c.regime_detector,
+                arena=c.arena,
+                arena_incubator=c.arena_incubator,
+                decision_engine=c.decision_engine,
+                signal_processor=c.signal_processor,
+                multi_scanner=c.multi_scanner,
+                event_scanner=c.event_scanner,
+                shadow_tracker=c.shadow_tracker,
+                trade_memory=c.trade_memory,
+                llm_filter=c.llm_filter,
+                liquidation_strategy=c.liquidation_strategy,
+                options_scanner=c.options_scanner,
+                copy_trader=c.copy_trader,
+                live_trader=c.live_trader,
+                health_registry=health,
+            )
+            c.dashboard_v2 = _start_v2_server()
+            logger.info("  OK dashboard_v2")
+        except Exception as exc:
+            logger.warning("  FAIL dashboard_v2 - %s", exc)
 
     # ─── Telegram ─────────────────────────────────────────────
     try:

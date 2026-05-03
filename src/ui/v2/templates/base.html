@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en" class="bg-slate-950 text-slate-100">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>{{ title }} — Hyperliquid Bot</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://unpkg.com/htmx.org@1.9.12"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          fontFamily: {
+            mono: ['ui-monospace', 'SFMono-Regular', 'Menlo', 'monospace'],
+          },
+        },
+      },
+    };
+  </script>
+  <style>
+    body { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .bin-bar { transition: width 0.2s ease; }
+  </style>
+</head>
+<body class="min-h-screen">
+  <header class="border-b border-slate-800 bg-slate-900/80 backdrop-blur sticky top-0 z-10">
+    <div class="max-w-7xl mx-auto px-4 py-3 flex items-center gap-6">
+      <a href="/" class="font-bold text-emerald-400">HL Bot</a>
+      <nav class="flex gap-4 text-sm text-slate-300">
+        <a href="/" class="hover:text-white">Overview</a>
+        <a href="/calibration" class="hover:text-white">Calibration</a>
+      </nav>
+      <div class="flex-1"></div>
+      <span id="ws-status" class="text-xs px-2 py-0.5 rounded bg-slate-800 text-slate-400">ws: connecting</span>
+      <form action="/api/auth/logout" method="post" class="text-xs">
+        <button class="text-slate-400 hover:text-white">sign out</button>
+      </form>
+    </div>
+  </header>
+  <main class="max-w-7xl mx-auto px-4 py-6">
+    {% block content %}{% endblock %}
+  </main>
+  <script>
+    (function () {
+      const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+      const ws = new WebSocket(proto + '://' + location.host + '/ws');
+      const status = document.getElementById('ws-status');
+      ws.onopen = () => { status.textContent = 'ws: live'; status.className = 'text-xs px-2 py-0.5 rounded bg-emerald-900/60 text-emerald-300'; };
+      ws.onclose = () => { status.textContent = 'ws: closed'; status.className = 'text-xs px-2 py-0.5 rounded bg-rose-900/60 text-rose-300'; };
+      ws.onerror = () => { status.textContent = 'ws: error'; status.className = 'text-xs px-2 py-0.5 rounded bg-rose-900/60 text-rose-300'; };
+      ws.onmessage = (ev) => {
+        try {
+          const data = JSON.parse(ev.data);
+          // Trigger HTMX refresh on tagged sections.
+          if (data && data.kind) {
+            document.querySelectorAll('[data-ws-refresh-on]').forEach((el) => {
+              const kinds = (el.getAttribute('data-ws-refresh-on') || '').split(',').map(s => s.trim());
+              if (kinds.includes(data.kind)) {
+                htmx.trigger(el, 'wsEvent');
+              }
+            });
+          }
+        } catch (e) { /* ignore malformed */ }
+      };
+    })();
+  </script>
+</body>
+</html>

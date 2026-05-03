@@ -853,6 +853,14 @@ def run_trading_cycle(container, cycle_count: int) -> None:
 
         logger.info("Trading cycle #%d complete.", cycle_count)
 
+        # Notify the v2 dashboard's WS subscribers (no-op when v2 isn't
+        # running). Wrapped so a dashboard glitch never breaks trading.
+        try:
+            from src.ui.v2.events import publish_event
+            publish_event("cycle", cycle=cycle_count)
+        except Exception:
+            pass
+
     except Exception as exc:
         logger.error("Error in cycle #%d: %s", cycle_count, exc, exc_info=True)
 

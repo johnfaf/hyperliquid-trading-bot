@@ -1,0 +1,29 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
+  <div class="bg-slate-900 border border-slate-800 rounded-lg p-4">
+    <h2 class="text-sm uppercase tracking-wide text-slate-400">Overview</h2>
+    <p class="mt-2 text-slate-300 text-sm">
+      Welcome to the v2 dashboard. The Calibration tab is the first concrete page;
+      Positions, Traders, and Audit pages will land next.
+    </p>
+  </div>
+  <div class="bg-slate-900 border border-slate-800 rounded-lg p-4">
+    <h2 class="text-sm uppercase tracking-wide text-slate-400">Live link</h2>
+    <p class="mt-2 text-slate-300 text-sm">
+      WebSocket status appears in the header. Sections marked
+      <code class="text-emerald-300">data-ws-refresh-on</code> auto-refresh on
+      cycle events without polling.
+    </p>
+  </div>
+  <div class="bg-slate-900 border border-slate-800 rounded-lg p-4">
+    <h2 class="text-sm uppercase tracking-wide text-slate-400">Pages</h2>
+    <ul class="mt-2 space-y-1 text-sm">
+      <li><a href="/calibration" class="text-emerald-400 hover:underline">→ Calibration breakdown</a></li>
+      <li class="text-slate-500">→ Positions <span class="text-xs">(soon)</span></li>
+      <li class="text-slate-500">→ Traders <span class="text-xs">(soon)</span></li>
+      <li class="text-slate-500">→ Audit trail <span class="text-xs">(soon)</span></li>
+    </ul>
+  </div>
+</section>
+{% endblock %}
