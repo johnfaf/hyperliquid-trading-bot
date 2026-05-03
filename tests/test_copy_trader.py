@@ -92,20 +92,25 @@ class TestApplyRegimeWeight:
         expected = 0.80 * _NEUTRAL_COPY_CONFIDENCE_MULTIPLIER
         assert abs(result["confidence"] - expected) < 0.001
 
-    def test_bullish_boosts_confidence(self):
+    def test_bullish_boosts_size_not_confidence(self):
+        # Bullish weighting now goes through regime_size_modifier so the
+        # calibrator continues to see the source's true confidence and
+        # cannot be poisoned by saturating it at 1.0.
         ct = self._make_trader()
         ct.regime_forecaster.predict_regime.return_value = {"regime": "bullish"}
         signal = {"confidence": 0.80}
         result = ct._apply_regime_weight(signal, "BTC")
-        expected = min(0.80 * _BULLISH_COPY_CONFIDENCE_MULTIPLIER, 1.0)
-        assert abs(result["confidence"] - expected) < 0.001
+        assert abs(result["confidence"] - 0.80) < 0.001
+        expected_mod = _BULLISH_COPY_CONFIDENCE_MULTIPLIER  # starting from 1.0
+        assert abs(result["regime_size_modifier"] - expected_mod) < 0.001
 
-    def test_bullish_capped_at_1(self):
+    def test_bullish_size_modifier_clamped(self):
         ct = self._make_trader()
         ct.regime_forecaster.predict_regime.return_value = {"regime": "bullish"}
-        signal = {"confidence": 0.95}  # high enough that boost would exceed 1.0
+        signal = {"confidence": 0.95, "regime_size_modifier": 1.9}
         result = ct._apply_regime_weight(signal, "BTC")
-        assert result["confidence"] <= 1.0
+        assert result["regime_size_modifier"] <= 2.0
+        assert abs(result["confidence"] - 0.95) < 0.001
 
     def test_unknown_regime_unchanged(self):
         ct = self._make_trader()

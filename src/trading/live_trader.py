@@ -6227,6 +6227,17 @@ class LiveTrader:
             logger.warning("Live safety stop (%s) - rejecting signal", reason)
             return None
 
+        # Soft calibration pause: not sticky, just blocks live entries
+        # while global ECE is above the live-pause threshold. Set by
+        # the trading cycle (or any caller that touches calibration).
+        if getattr(self, "_calibration_live_paused_this_cycle", False):
+            self._incr_entry_metric("rejected_calibration_live_paused")
+            logger.warning(
+                "Live calibration pause - rejecting %s %s (global ECE above pause threshold)",
+                signal.side, signal.coin,
+            )
+            return None
+
         if not self.dry_run and self._order_dedup_reconcile_required:
             self._incr_entry_metric("rejected_order_dedup_reconcile_required")
             logger.critical(

@@ -476,6 +476,16 @@ def build_subsystems(
     if "calibration" in profile:
         from src.signals.calibration import CalibrationTracker
         c.calibration = _safe_init("calibration", CalibrationTracker, health, affects_trading=False)
+        # Wire the calibration tracker into the firewall now that both
+        # exist. The firewall is constructed earlier in the boot order
+        # (it doesn't *need* calibration -- treat it as optional). When
+        # present, the firewall uses it to quarantine miscalibrated
+        # sources at the source-policy gate.
+        if c.firewall is not None and c.calibration is not None:
+            try:
+                c.firewall.calibration = c.calibration
+            except Exception as exc:
+                logger.debug("Could not attach calibration to firewall: %s", exc)
 
     if "llm_filter" in profile:
         from src.signals.llm_filter import LLMFilter

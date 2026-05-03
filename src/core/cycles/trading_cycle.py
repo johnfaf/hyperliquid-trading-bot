@@ -535,6 +535,32 @@ def run_trading_cycle(container, cycle_count: int) -> None:
                 _live_safety_stop_reason(container.live_trader),
             )
 
+    # Soft calibration pause -- not sticky, recovers automatically when
+    # global ECE drops back below the threshold. Paper trading still
+    # runs through this cycle so the calibrator keeps learning.
+    cal = getattr(container, "calibration", None)
+    if (
+        cal is not None
+        and getattr(cal, "is_live_paused", None)
+        and container.live_trader
+        and not container.live_trader.dry_run
+    ):
+        try:
+            if cal.is_live_paused():
+                ece = cal.get_ece("global")
+                logger.warning(
+                    "LIVE PAUSE (calibration) -- global ECE=%.3f >= %.3f; "
+                    "skipping new live entries this cycle. Paper continues "
+                    "to feed the calibrator.",
+                    ece if ece is not None else float("nan"),
+                    cal.live_pause_ece,
+                )
+                container.live_trader._calibration_live_paused_this_cycle = True
+            else:
+                container.live_trader._calibration_live_paused_this_cycle = False
+        except Exception as exc:
+            logger.debug("Calibration live-pause check failed: %s", exc)
+
         # Sweep for orphaned positions (opened successfully but SL/TP
         # placement was skipped due to an upstream error like the
         # get_positions float(dict) crash).  Safe to call every cycle —

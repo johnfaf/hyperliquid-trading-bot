@@ -29,7 +29,11 @@ from src.analysis.features import FeatureEngine
 from src.signals.kelly_sizing import KellySizer
 from src.trading.trade_memory import TradeMemory
 from src.trading.portfolio_rotation import PortfolioRotationManager
-from src.signals.calibration import CalibrationTracker
+from src.signals.calibration import (
+    CalibrationTracker,
+    bucket_regime as _bucket_regime,
+    compose_calibration_key,
+)
 from src.signals.llm_filter import LLMFilter
 from src.signals.risk_policy import RiskPolicyEngine
 import random
@@ -642,6 +646,7 @@ class PaperTrader:
         _drop_counts = {"existing_position": 0, "no_signal": 0, "volume_reject": 0,
                         "schema_error": 0, "firewall": 0, "arena": 0, "memory": 0,
                         "llm_filter": 0, "ev_gate": 0, "execution_cap": 0,
+                        "calibration_quarantine": 0,
                         "missing_asset": 0, "other_error": 0}
         for strategy in strategies:
             try:
@@ -907,14 +912,24 @@ class PaperTrader:
                             if self.agent_scorer
                             else self._resolve_source_context(sig, {}).get("source_key", "strategy")
                         )
+                        cal_side = (sig.get("side") or "").lower()
+                        cal_regime = _bucket_regime(
+                            (regime_data or {}).get("overall_regime", "")
+                        )
                         adjusted = self.calibration.get_adjustment_factor(
-                            source_key, trade_signal.confidence
+                            source_key,
+                            trade_signal.confidence,
+                            side=cal_side,
+                            regime=cal_regime,
                         )
                         if abs(adjusted - trade_signal.confidence) > 0.05:
                             logger.debug(f"Calibration adjust {sig['coin']}: "
                                        f"{trade_signal.confidence:.2f} -> {adjusted:.2f}")
                         trade_signal.confidence = adjusted
-                        reliability_mult = self.calibration.get_reliability_multiplier(source_key)
+                        composed_key = compose_calibration_key(
+                            source_key, cal_side, cal_regime
+                        )
+                        reliability_mult = self.calibration.get_reliability_multiplier(composed_key)
                         if reliability_mult < 1.0:
                             before = trade_signal.confidence
                             trade_signal.confidence = max(0.05, trade_signal.confidence * reliability_mult)
@@ -925,6 +940,25 @@ class PaperTrader:
                                 trade_signal.confidence,
                                 reliability_mult,
                             )
+                        if self.calibration.is_quarantined(
+                            source_key, side=cal_side, regime=cal_regime
+                        ):
+                            _drop_counts["calibration_quarantine"] += 1
+                            logger.warning(
+                                "Calibration QUARANTINE %s %s (%s): source above ECE bar; "
+                                "routing to shadow only",
+                                sig["side"],
+                                sig["coin"],
+                                source_key,
+                            )
+                            self._journal_signal_final(
+                                trade_signal,
+                                sig,
+                                final_status="calibration_quarantined",
+                                stage="calibration",
+                                reason="quarantine_ece_above_threshold",
+                            )
+                            continue
                     except Exception as e:
                         logger.debug(f"Calibration error: {e}")
 
@@ -1918,6 +1952,7 @@ class PaperTrader:
                     pnl=pnl,
                     coin=trade["coin"],
                     side=trade["side"],
+                    regime=_bucket_regime(trade_meta.get("regime") or trade.get("regime")),
                 )
             except Exception:
                 pass
