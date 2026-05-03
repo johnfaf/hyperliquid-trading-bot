@@ -4603,10 +4603,62 @@ def test_daily_pnl_refresh_failure_fails_closed(monkeypatch):
 
     trader = LiveTrader(firewall=FakeFirewall(), dry_run=False, max_order_usd=1_000_000)
     trader.api_manager = BadApiManager()
+    threshold = trader._daily_pnl_refresh_failure_threshold
+    assert threshold >= 1
 
+    # Failures below the threshold must NOT trip the sticky kill switch -- a
+    # single transient userFills timeout should not permanently disable live
+    # trading.
+    for i in range(1, threshold):
+        assert trader.update_daily_pnl_from_fills() is False
+        assert trader.kill_switch_active is False, (
+            f"kill switch tripped early after {i}/{threshold} failures"
+        )
+
+    # The threshold-th consecutive failure fails closed.
     assert trader.update_daily_pnl_from_fills() is False
     assert trader.kill_switch_active is True
     assert trader._kill_switch_reason == "daily_pnl_refresh_failed"
+
+
+def test_daily_pnl_refresh_failure_streak_resets_on_success(monkeypatch):
+    class FakeFirewall:
+        def validate(self, signal, **kwargs):
+            return True, "ok"
+
+        def set_daily_losses(self, _):
+            pass
+
+    class FlakyApiManager:
+        def __init__(self):
+            self.calls = 0
+
+        def post(self, payload, *args, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("transient api blip")
+            if payload.get("type") == "userFills":
+                return []
+            return {}
+
+    monkeypatch.setattr(LiveTrader, "_load_credentials", _fake_live_credentials)
+    monkeypatch.setattr(LiveTrader, "_load_asset_index_map", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "reconcile_positions", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "get_positions", lambda self: [])
+    monkeypatch.setattr(LiveTrader, "check_daily_loss", lambda self, **kw: False)
+
+    trader = LiveTrader(firewall=FakeFirewall(), dry_run=False, max_order_usd=1_000_000)
+    trader.api_manager = FlakyApiManager()
+
+    # Transient failure increments streak but does not trip kill switch.
+    assert trader.update_daily_pnl_from_fills() is False
+    assert trader._daily_pnl_refresh_failure_streak == 1
+    assert trader.kill_switch_active is False
+
+    # Successful refresh clears the streak.
+    assert trader.update_daily_pnl_from_fills() is True
+    assert trader._daily_pnl_refresh_failure_streak == 0
+    assert trader.kill_switch_active is False
 
 
 def test_live_trader_source_day_cap_blocks_second_entry(monkeypatch):

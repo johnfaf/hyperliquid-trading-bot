@@ -704,6 +704,17 @@ class LiveTrader:
         self._price_history: Dict[str, float] = {}  # coin -> last known good mid
         self._price_seed_candidates: Dict[str, float] = {}  # coin -> untrusted first sample
 
+        # Daily-PnL refresh resilience: a single transient userFills failure
+        # used to trip the sticky kill switch immediately, which then blocked
+        # all live entries until an operator manually cleared the state file.
+        # We now require a streak of consecutive failures before failing
+        # closed, while still resetting the counter on the next success.
+        self._daily_pnl_refresh_failure_streak = 0
+        self._daily_pnl_refresh_failure_threshold = max(
+            1,
+            int(getattr(config, "LIVE_DAILY_PNL_REFRESH_FAILURE_THRESHOLD", 3) or 1),
+        )
+
         # Fill verification defaults:
         # - verify_fill() API remains blocking by default for backward compatibility.
         # - execute_signal() uses a separate non-blocking default to avoid cycle stalls.
@@ -4216,17 +4227,42 @@ class LiveTrader:
             if hasattr(self.firewall, "set_daily_losses"):
                 self.firewall.set_daily_losses(abs(min(current_daily_pnl, 0.0)))
 
+            # A successful refresh resets the failure streak so a later
+            # transient blip does not jump straight to the threshold.
+            if self._daily_pnl_refresh_failure_streak:
+                logger.info(
+                    "Daily PnL refresh recovered after %d consecutive failure(s)",
+                    self._daily_pnl_refresh_failure_streak,
+                )
+                self._daily_pnl_refresh_failure_streak = 0
+
             # Check if kill switch should trigger
             if trigger_check:
                 self.check_daily_loss(refresh_from_fills=False)
             return True
 
         except Exception as e:
-            logger.error("Failed to update daily PnL from fills: %s", e, exc_info=True)
-            if self.live_requested and not self.dry_run:
+            self._daily_pnl_refresh_failure_streak += 1
+            streak = self._daily_pnl_refresh_failure_streak
+            threshold = self._daily_pnl_refresh_failure_threshold
+            should_trip = (
+                self.live_requested
+                and not self.dry_run
+                and streak >= threshold
+            )
+            if should_trip:
+                logger.error(
+                    "Failed to update daily PnL from fills (%d consecutive failures, threshold=%d): %s",
+                    streak, threshold, e, exc_info=True,
+                )
                 self.activate_kill_switch(
                     "daily_pnl_refresh_failed",
                     status_reason="daily_pnl_unavailable",
+                )
+            else:
+                logger.warning(
+                    "Daily PnL refresh failed (%d/%d consecutive); will retry next cycle: %s",
+                    streak, threshold, e,
                 )
             return False
 

@@ -496,6 +496,12 @@ COPY_TRADER_SOURCE_SIDE_SIZE_MULTIPLIER = float(
 )
 LIVE_EXTERNAL_KILL_SWITCH_FILE = os.environ.get("LIVE_EXTERNAL_KILL_SWITCH_FILE", "").strip()
 LIVE_KILL_SWITCH_STATE_FILE = os.environ.get("LIVE_KILL_SWITCH_STATE_FILE", "/data/live_kill_switch_state.json").strip()
+# Number of consecutive userFills failures tolerated before the daily-PnL
+# refresh trips the sticky kill switch. A single transient API blip should
+# not permanently disable live trading; sustained outages still fail closed.
+LIVE_DAILY_PNL_REFRESH_FAILURE_THRESHOLD = max(
+    1, int(os.environ.get("LIVE_DAILY_PNL_REFRESH_FAILURE_THRESHOLD", "3"))
+)
 RUNTIME_CONFIG_OVERRIDE_FILE = os.environ.get("RUNTIME_CONFIG_OVERRIDE_FILE", "/data/config.json").strip()
 RUNTIME_CONFIG_POLL_SECONDS = int(os.environ.get("RUNTIME_CONFIG_POLL_SECONDS", 10))
 HL_WALLET_MODE = os.environ.get("HL_WALLET_MODE", "agent_only").strip().lower()
