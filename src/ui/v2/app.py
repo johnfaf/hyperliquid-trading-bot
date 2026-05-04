@@ -66,13 +66,16 @@ def create_app() -> FastAPI:
     )
 
     # Routers — each module owns a tightly-scoped slice of the app.
+    from src.ui.v2.routers import audit as audit_router
     from src.ui.v2.routers import auth as auth_router
+    from src.ui.v2.routers import backtest as backtest_router
     from src.ui.v2.routers import calibration as calibration_router
     from src.ui.v2.routers import health as health_router
     from src.ui.v2.routers import pages as pages_router
     from src.ui.v2.routers import positions as positions_router
     from src.ui.v2.routers import sources as sources_router
     from src.ui.v2.routers import stream as stream_router
+    from src.ui.v2.routers import traders as traders_router
 
     app.include_router(health_router.router)
     app.include_router(auth_router.router)
@@ -80,6 +83,9 @@ def create_app() -> FastAPI:
     app.include_router(calibration_router.router)
     app.include_router(positions_router.router)
     app.include_router(sources_router.router)
+    app.include_router(traders_router.router)
+    app.include_router(audit_router.router)
+    app.include_router(backtest_router.router)
     app.include_router(stream_router.router)
 
     if _STATIC_DIR.exists():

@@ -1,0 +1,110 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="grid grid-cols-1 md:grid-cols-3 gap-3 mb-6">
+  <div class="bg-slate-900 border border-slate-800 rounded p-4">
+    <h2 class="text-sm font-semibold text-slate-300">Run a backtest</h2>
+    <p class="mt-1 text-xs text-slate-500">
+      Triggers a golden-wallet scan followed by backtests over the discovered
+      strategies. One job at a time; v1 and v2 share the lock.
+    </p>
+    <form id="run-form"
+          hx-post="/api/backtest/run"
+          hx-trigger="submit"
+          hx-target="#run-result"
+          hx-swap="innerHTML"
+          class="mt-3 flex gap-2 items-end">
+      <div class="flex-1">
+        <label class="block text-[10px] uppercase text-slate-500">max wallets</label>
+        <input name="max_wallets" type="number" value="30" min="1" max="200"
+               class="w-full bg-slate-950 border border-slate-700 rounded px-2 py-1 text-xs" />
+      </div>
+      <button class="bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold py-1.5 px-3 rounded">Start</button>
+    </form>
+    <div id="run-result" class="mt-2 text-xs"></div>
+  </div>
+
+  <div class="bg-slate-900 border border-slate-800 rounded p-4 md:col-span-2"
+       hx-get="/api/backtest/status"
+       hx-trigger="load, every 5s"
+       hx-target="#status-pane"
+       hx-swap="innerHTML">
+    <h2 class="text-sm font-semibold text-slate-300">Job status</h2>
+    <div id="status-pane" class="mt-3 text-xs text-slate-300">Loading…</div>
+  </div>
+</section>
+
+<section>
+  <h2 class="text-sm font-semibold text-slate-300 mb-2">Recent backtest results</h2>
+  <div class="overflow-x-auto bg-slate-900 border border-slate-800 rounded">
+    <table class="w-full text-xs">
+      <thead class="bg-slate-950/60 text-slate-400">
+        <tr>
+          <th class="text-left py-2 px-3 font-medium">Trader</th>
+          <th class="text-right py-2 px-3 font-medium">Trades</th>
+          <th class="text-right py-2 px-3 font-medium">Win rate</th>
+          <th class="text-right py-2 px-3 font-medium">Total PnL</th>
+          <th class="text-left py-2 px-3 font-medium">Completed</th>
+        </tr>
+      </thead>
+      <tbody class="divide-y divide-slate-800">
+        {% for r in data.recent_results %}
+        <tr class="hover:bg-slate-800/40">
+          <td class="py-1.5 px-3 text-slate-300 font-mono">{{ (r.trader_address or '')[:12] }}…</td>
+          <td class="py-1.5 px-3 text-right text-slate-300">{{ r.trade_count or 0 }}</td>
+          <td class="py-1.5 px-3 text-right text-slate-400">
+            {% if r.win_rate is none %}—{% else %}{{ '%.0f%%'|format((r.win_rate or 0) * 100) }}{% endif %}
+          </td>
+          <td class="py-1.5 px-3 text-right font-mono
+            {% if r.total_pnl > 0 %}text-emerald-300
+            {% elif r.total_pnl < 0 %}text-rose-300
+            {% else %}text-slate-300{% endif %}">
+            ${{ '%+,.2f'|format(r.total_pnl or 0) }}
+          </td>
+          <td class="py-1.5 px-3 text-slate-500 font-mono">{{ (r.completed_at or '')[:19] }}</td>
+        </tr>
+        {% else %}
+        <tr><td colspan="5" class="py-6 text-center text-slate-500">No backtest results yet. Start a run above.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<script>
+  // Render the job-status JSON into a friendlier banner.
+  document.body.addEventListener('htmx:afterRequest', (ev) => {
+    if (ev.detail.requestConfig?.path === '/api/backtest/status' && ev.target.id === 'status-pane') {
+      let body;
+      try { body = JSON.parse(ev.target.textContent); } catch { return; }
+      const lines = [];
+      if (body.running) {
+        const elapsed = body.elapsed_s ? `${Math.round(body.elapsed_s)}s` : '?';
+        lines.push(`<div class="text-amber-300">⚙ Running (${elapsed} elapsed)</div>`);
+      } else if (body.last_error) {
+        lines.push(`<div class="text-rose-300">last error: ${body.last_error}</div>`);
+      } else if (body.last_result) {
+        const r = body.last_result;
+        lines.push(`<div class="text-emerald-300">✓ Last run: ${r.scanned_wallets} wallets scanned, ${r.backtests_run} backtests in ${Math.round(r.duration_s || 0)}s</div>`);
+      } else {
+        lines.push('<div class="text-slate-400">Idle. No run yet this session.</div>');
+      }
+      ev.target.innerHTML = lines.join('');
+    }
+    if (ev.detail.requestConfig?.path === '/api/backtest/run' && ev.target.id === 'run-result') {
+      let body;
+      try { body = JSON.parse(ev.target.textContent); } catch { body = {}; }
+      const xhr = ev.detail.xhr;
+      if (xhr.status >= 200 && xhr.status < 300) {
+        ev.target.className = 'mt-2 text-xs text-emerald-300';
+        ev.target.textContent = `Started (max_wallets=${body.max_wallets || '?'}). Status will poll every 5s.`;
+      } else if (xhr.status === 409) {
+        ev.target.className = 'mt-2 text-xs text-amber-300';
+        ev.target.textContent = 'Another backtest is already running.';
+      } else {
+        ev.target.className = 'mt-2 text-xs text-rose-300';
+        ev.target.textContent = body.error || body.message || 'Failed to start.';
+      }
+    }
+  });
+</script>
+{% endblock %}

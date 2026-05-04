@@ -1,0 +1,113 @@
+{% extends "base.html" %}
+{% block content %}
+{% if not data.available %}
+  <div class="bg-amber-900/30 border border-amber-700 rounded p-4 text-amber-200 text-sm">
+    Trader database is not initialised in this process.
+  </div>
+{% else %}
+{% set t = data.totals %}
+<section class="grid grid-cols-2 md:grid-cols-4 gap-3 mb-6">
+  <div class="bg-slate-900 border border-slate-800 rounded p-3">
+    <div class="text-[10px] uppercase tracking-wide text-slate-500">Active</div>
+    <div class="mt-1 text-2xl font-semibold text-emerald-300">{{ t.active or 0 }}</div>
+  </div>
+  <div class="bg-slate-900 border border-slate-800 rounded p-3">
+    <div class="text-[10px] uppercase tracking-wide text-slate-500">Suspect</div>
+    <div class="mt-1 text-2xl font-semibold text-amber-300">{{ t.suspect or 0 }}</div>
+    <div class="mt-1 text-[10px] text-slate-500">bot_score 1-2</div>
+  </div>
+  <div class="bg-slate-900 border border-slate-800 rounded p-3">
+    <div class="text-[10px] uppercase tracking-wide text-slate-500">Known bots</div>
+    <div class="mt-1 text-2xl font-semibold text-rose-300">{{ t.known_bots or 0 }}</div>
+    <div class="mt-1 text-[10px] text-slate-500">excluded from copy</div>
+  </div>
+  <div class="bg-slate-900 border border-slate-800 rounded p-3">
+    <div class="text-[10px] uppercase tracking-wide text-slate-500">Total tracked</div>
+    <div class="mt-1 text-2xl font-semibold text-slate-100">{{ t.total_tracked or 0 }}</div>
+  </div>
+</section>
+
+<section>
+  <div class="flex items-center justify-between mb-2">
+    <h2 class="text-sm font-semibold text-slate-300">Trader directory</h2>
+    <div class="text-xs text-slate-500">sorted by total PnL</div>
+  </div>
+  <div class="overflow-x-auto bg-slate-900 border border-slate-800 rounded">
+    <table class="w-full text-xs">
+      <thead class="bg-slate-950/60 text-slate-400">
+        <tr>
+          <th class="text-left py-2 px-3 font-medium">Address</th>
+          <th class="text-left py-2 px-3 font-medium">Bot</th>
+          <th class="text-right py-2 px-3 font-medium">Trades</th>
+          <th class="text-right py-2 px-3 font-medium">Win rate</th>
+          <th class="text-right py-2 px-3 font-medium">ROI</th>
+          <th class="text-right py-2 px-3 font-medium">Total PnL</th>
+          <th class="text-right py-2 px-3 font-medium">Account</th>
+          <th class="text-left py-2 px-3 font-medium">Action</th>
+        </tr>
+      </thead>
+      <tbody class="divide-y divide-slate-800">
+        {% for r in data.rows %}
+        <tr class="{% if r.bot_tone == 'bot' %}bg-rose-950/30{% elif r.bot_tone == 'suspect' %}bg-amber-950/20{% endif %} hover:bg-slate-800/40">
+          <td class="py-1.5 px-3 text-slate-300 font-mono">{{ r.address_short }}…</td>
+          <td class="py-1.5 px-3">
+            <span class="inline-block px-2 py-0.5 rounded text-[10px]
+              {% if r.bot_tone == 'bot' %}bg-rose-900/60 text-rose-200
+              {% elif r.bot_tone == 'suspect' %}bg-amber-900/60 text-amber-200
+              {% else %}bg-emerald-900/60 text-emerald-200{% endif %}">
+              {% if r.bot_tone == 'bot' %}BOT
+              {% elif r.bot_tone == 'suspect' %}SUSPECT
+              {% else %}HUMAN{% endif %}
+            </span>
+            <span class="text-[10px] text-slate-500 ml-1">score={{ r.bot_score }}</span>
+          </td>
+          <td class="py-1.5 px-3 text-right text-slate-300">{{ r.trade_count }}</td>
+          <td class="py-1.5 px-3 text-right text-slate-400">
+            {{ '%.0f%%'|format((r.win_rate or 0) * 100) }}
+          </td>
+          <td class="py-1.5 px-3 text-right
+            {% if r.roi_pct > 0 %}text-emerald-300
+            {% elif r.roi_pct < 0 %}text-rose-300
+            {% else %}text-slate-400{% endif %}">
+            {{ '%+.1f%%'|format(r.roi_pct) }}
+          </td>
+          <td class="py-1.5 px-3 text-right font-mono
+            {% if r.total_pnl > 0 %}text-emerald-300
+            {% elif r.total_pnl < 0 %}text-rose-300
+            {% else %}text-slate-300{% endif %}">
+            ${{ '%+,.0f'|format(r.total_pnl) }}
+          </td>
+          <td class="py-1.5 px-3 text-right text-slate-400 font-mono">
+            ${{ '%,.0f'|format(r.account_value) }}
+          </td>
+          <td class="py-1.5 px-3">
+            <form hx-post="/api/traders/{{ r.address }}/mark_bot"
+                  hx-trigger="submit"
+                  hx-confirm="Mark {{ r.address_short }}… as bot? Removed from active set."
+                  hx-swap="none"
+                  class="inline">
+              <button class="text-[10px] text-rose-400 hover:text-rose-300 underline-offset-2 hover:underline">mark bot</button>
+            </form>
+          </td>
+        </tr>
+        {% else %}
+        <tr><td colspan="8" class="py-6 text-center text-slate-500">No active traders.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<script>
+  // Reload after mark/restore so the operator sees the updated state.
+  document.body.addEventListener('htmx:afterRequest', (ev) => {
+    const url = ev.detail.requestConfig?.path || '';
+    if (url.match(/\/api\/traders\/.+\/(mark_bot|restore)$/)) {
+      if (ev.detail.xhr.status >= 200 && ev.detail.xhr.status < 300) {
+        setTimeout(() => location.reload(), 200);
+      }
+    }
+  });
+</script>
+{% endif %}
+{% endblock %}

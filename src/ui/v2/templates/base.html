@@ -31,8 +31,16 @@
         <a href="/positions" class="hover:text-white">Positions</a>
         <a href="/sources" class="hover:text-white">Sources</a>
         <a href="/calibration" class="hover:text-white">Calibration</a>
+        <a href="/traders" class="hover:text-white">Traders</a>
+        <a href="/audit" class="hover:text-white">Audit</a>
+        <a href="/backtest" class="hover:text-white">Backtest</a>
       </nav>
       <div class="flex-1"></div>
+      <span id="health-strip" class="text-xs px-2 py-0.5 rounded bg-slate-800 text-slate-400"
+            hx-get="/api/health/strip"
+            hx-trigger="load, every 30s, wsEvent from:body"
+            hx-swap="none"
+            data-ws-refresh-on="cycle,kill_switch">health: …</span>
       <span id="ws-status" class="text-xs px-2 py-0.5 rounded bg-slate-800 text-slate-400">ws: connecting</span>
       <form action="/api/auth/logout" method="post" class="text-xs">
         <button class="text-slate-400 hover:text-white">sign out</button>
@@ -65,6 +73,24 @@
         } catch (e) { /* ignore malformed */ }
       };
     })();
+
+    // Render the /api/health/strip JSON into the header pill.
+    document.body.addEventListener('htmx:afterRequest', (ev) => {
+      if (ev.detail.requestConfig?.path !== '/api/health/strip') return;
+      const el = document.getElementById('health-strip');
+      if (!el) return;
+      let body;
+      try { body = JSON.parse(ev.detail.xhr.responseText); } catch { return; }
+      const tones = {
+        green: 'bg-emerald-900/60 text-emerald-300',
+        amber: 'bg-amber-900/60 text-amber-300',
+        rose:  'bg-rose-900/60 text-rose-300',
+      };
+      const tone = tones[body.tone] || 'bg-slate-800 text-slate-400';
+      el.className = 'text-xs px-2 py-0.5 rounded ' + tone;
+      el.title = (body.reasons || []).join(' · ') || body.summary || '';
+      el.textContent = 'health: ' + (body.label || 'unknown');
+    });
   </script>
 </body>
 </html>

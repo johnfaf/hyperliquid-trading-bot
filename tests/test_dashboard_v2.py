@@ -239,3 +239,72 @@ def test_sources_page_renders(client):
     assert r.status_code == 200
     # Renders the "agent scorer not initialised" banner when no scorer is wired.
     assert "Agent scorer is not initialised" in r.text or "Source scoreboard" in r.text
+
+
+def test_traders_endpoint_smoke(client):
+    r = client.get("/api/traders")
+    assert r.status_code == 200
+    payload = r.json()
+    assert "rows" in payload
+    assert "totals" in payload
+
+
+def test_traders_page_renders(client):
+    r = client.get("/traders")
+    assert r.status_code == 200
+    assert "Trader directory" in r.text or "Trader database is not initialised" in r.text
+
+
+def test_audit_endpoint_smoke(client):
+    r = client.get("/api/audit")
+    assert r.status_code == 200
+    payload = r.json()
+    assert "kill_switch_log" in payload
+    assert "calibration_quarantines" in payload
+    assert "decisions" in payload
+    assert "counts" in payload
+
+
+def test_audit_endpoint_accepts_filters(client):
+    r = client.get("/api/audit?status=executed&decision_id=abc123&days=3&limit=10")
+    assert r.status_code == 200
+    payload = r.json()
+    assert payload["filters"]["status"] == "executed"
+    assert payload["filters"]["decision_id"] == "abc123"
+    assert payload["filters"]["days"] == 3
+    assert payload["filters"]["limit"] == 10
+
+
+def test_audit_page_renders(client):
+    r = client.get("/audit")
+    assert r.status_code == 200
+    assert "Audit" in r.text or "Decision snapshots" in r.text
+
+
+def test_backtest_status_endpoint(client):
+    r = client.get("/api/backtest/status")
+    assert r.status_code == 200
+    payload = r.json()
+    assert "running" in payload
+    assert "recent_results" in payload
+
+
+def test_backtest_run_requires_auth_when_token_set(monkeypatch, app):
+    monkeypatch.setenv("DASHBOARD_AUTH_TOKEN", "secret")
+    client = TestClient(app)
+    r = client.post("/api/backtest/run", data={"max_wallets": 5})
+    assert r.status_code == 401
+
+
+def test_backtest_page_renders(client):
+    r = client.get("/backtest")
+    assert r.status_code == 200
+    assert "Run a backtest" in r.text
+
+
+def test_health_strip_returns_a_tone(client):
+    r = client.get("/api/health/strip")
+    assert r.status_code == 200
+    payload = r.json()
+    assert payload["tone"] in {"green", "amber", "rose"}
+    assert "label" in payload
