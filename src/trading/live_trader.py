@@ -1655,6 +1655,18 @@ class LiveTrader:
                 tg.notify_kill_switch_activated(reason, status_reason=status_reason)
             except Exception as alert_exc:
                 logger.warning("Kill-switch Telegram alert skipped: %s", alert_exc)
+            # Notify v2 dashboard subscribers so the audit + positions tabs
+            # repaint without polling. No-op when v2 isn't running.
+            try:
+                from src.ui.v2.events import publish_event
+                publish_event(
+                    "kill_switch",
+                    transition="activated",
+                    reason=reason,
+                    status_reason=status_reason,
+                )
+            except Exception:
+                pass
         if persist:
             self._persist_kill_switch_state(True, reason)
 
@@ -1732,6 +1744,18 @@ class LiveTrader:
             )
         except Exception as alert_exc:
             logger.debug("Kill-switch clear Telegram alert skipped: %s", alert_exc)
+        # Push to v2 dashboard subscribers (audit feed updates live).
+        try:
+            from src.ui.v2.events import publish_event
+            publish_event(
+                "kill_switch",
+                transition="cleared",
+                operator=operator_id,
+                previous_reason=previous.get("reason"),
+                audit_reason=cleared_reason,
+            )
+        except Exception:
+            pass
         return {
             "cleared": True,
             "previous_active": bool(previous.get("active")),

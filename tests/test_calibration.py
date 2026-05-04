@@ -135,6 +135,30 @@ def test_interpolate_curve_clamps_outside_range():
     assert 0.30 <= mid <= 0.60
 
 
+def test_operator_clear_quarantine_lifts_ban_and_purges_records(tmp_path):
+    cal = CalibrationTracker(
+        db_path=str(tmp_path / "cal.db"),
+        quarantine_min_samples=20,
+        quarantine_ece=0.20,
+    )
+    for _ in range(50):
+        cal.record("strategy:bad", 0.85, False, side="long", regime="trend")
+    composed = compose_calibration_key("strategy:bad", "long", "trend")
+    assert cal.is_quarantined(composed) is True
+
+    result = cal.operator_clear_quarantine(
+        "strategy:bad", side="long", regime="trend",
+        audit_reason="post-incident audit",
+    )
+    assert result["cleared"] is True
+    assert result["key"] == composed
+    assert result["samples_removed"] >= 50
+    # Bins are reset to cold-start so the source is no longer quarantined.
+    assert cal.is_quarantined(composed) is False
+    # Persisted rows should be gone too.
+    assert cal._source_total(composed) == 0
+
+
 def test_time_decay_prefers_recent_outcomes(tmp_path):
     # Half-life=0 disables decay; the test just exercises that decay
     # affects the ECE calculation when enabled.

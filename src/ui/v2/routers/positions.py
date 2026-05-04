@@ -60,7 +60,114 @@ def _format_position(raw: Dict[str, Any]) -> Dict[str, Any]:
         "leverage": leverage,
         "notional": notional,
         "is_cross": bool(raw.get("is_cross", True)),
+        "sl_price": None,
+        "tp_price": None,
+        "mark_price": None,
     }
+
+
+def _attach_protective_legs(positions: List[Dict[str, Any]], live_trader: Any) -> None:
+    """Best-effort: tag each position with sl_price/tp_price from open orders."""
+    if live_trader is None:
+        return
+    open_orders = _safe_call(live_trader, "get_open_orders") or []
+    if not isinstance(open_orders, list):
+        return
+    classifier = getattr(live_trader, "_classify_protective_leg", None)
+    if classifier is None:
+        return
+    by_coin: Dict[str, Dict[str, float]] = {}
+    for order in open_orders:
+        try:
+            classified = classifier(order)
+        except Exception:
+            classified = None
+        if not classified:
+            continue
+        coin = str(classified.get("coin") or "").upper()
+        leg = classified.get("leg")
+        trigger_px = classified.get("trigger_px")
+        if not coin or leg not in ("sl", "tp") or trigger_px is None:
+            continue
+        by_coin.setdefault(coin, {})[leg] = float(trigger_px)
+    for pos in positions:
+        legs = by_coin.get(pos["coin"].upper())
+        if not legs:
+            continue
+        pos["sl_price"] = legs.get("sl")
+        pos["tp_price"] = legs.get("tp")
+
+
+def _attach_mark_prices(positions: List[Dict[str, Any]], live_trader: Any) -> None:
+    """Pull mid prices for each open coin so the spark can plot entry vs mark."""
+    if live_trader is None or not positions:
+        return
+    fn = getattr(live_trader, "_get_mid_price", None)
+    if fn is None:
+        return
+    for pos in positions:
+        try:
+            mid = fn(pos["coin"])
+        except Exception:
+            mid = None
+        if isinstance(mid, (int, float)) and mid > 0:
+            pos["mark_price"] = float(mid)
+
+
+def _recent_fills(live_trader: Any, limit: int = 25) -> List[Dict[str, Any]]:
+    """Fetch the bot's most recent fills for the operator ticker.
+
+    The trader holds the cached api_manager already used for daily-PnL
+    refreshes, so we reuse it. Failures degrade silently -- the ticker
+    just shows "no recent fills" rather than blocking the page.
+    """
+    if live_trader is None:
+        return []
+    api = getattr(live_trader, "api_manager", None)
+    address = getattr(live_trader, "public_address", None)
+    if api is None or not address:
+        return []
+    try:
+        from src.exchanges.api_manager import Priority  # type: ignore
+        priority = Priority.NORMAL
+    except Exception:
+        priority = None
+    try:
+        if priority is not None:
+            raw = api.post(
+                {"type": "userFills", "user": address},
+                priority=priority,
+                timeout=5,
+            )
+        else:
+            raw = api.post({"type": "userFills", "user": address}, timeout=5)
+    except Exception as exc:
+        logger.debug("recent_fills userFills failed: %s", exc)
+        return []
+    if not isinstance(raw, list):
+        return []
+    fills = sorted(
+        (f for f in raw if isinstance(f, dict)),
+        key=lambda f: f.get("time", 0),
+        reverse=True,
+    )[: max(1, int(limit or 25))]
+    out: List[Dict[str, Any]] = []
+    for f in fills:
+        ts = f.get("time")
+        try:
+            ts_ms = int(ts) if ts is not None else None
+        except (TypeError, ValueError):
+            ts_ms = None
+        out.append({
+            "ts_ms": ts_ms,
+            "coin": str(f.get("coin") or ""),
+            "side": str(f.get("side") or "").lower(),  # "B"=buy/long, "A"=sell/short
+            "size": float(f.get("sz") or f.get("size") or 0.0),
+            "price": float(f.get("px") or f.get("price") or 0.0),
+            "closed_pnl": float(f.get("closedPnl") or f.get("closed_pnl") or 0.0),
+            "fee": float(f.get("fee") or 0.0),
+        })
+    return out
 
 
 def _summary_payload() -> Dict[str, Any]:
@@ -76,6 +183,8 @@ def _summary_payload() -> Dict[str, Any]:
             for p in raw_positions
             if isinstance(p, dict) and abs(float(p.get("size") or 0.0)) > 0
         ]
+        _attach_protective_legs(positions, live_trader)
+        _attach_mark_prices(positions, live_trader)
 
     kill_state: Dict[str, Any] = {"active": False, "reason": None, "status_reason": None}
     if live_trader is not None:
@@ -135,6 +244,17 @@ async def positions_data(request: Request):
     if redirect is not None:
         return JSONResponse({"error": "auth_required"}, status_code=401)
     return JSONResponse(_summary_payload())
+
+
+@router.get("/api/fills/recent", response_class=JSONResponse)
+async def recent_fills(request: Request, limit: int = 25):
+    """Most-recent fills for the live ticker on the positions page."""
+    redirect = require_auth(request)
+    if redirect is not None:
+        return JSONResponse({"error": "auth_required"}, status_code=401)
+    components = get_components()
+    fills = _recent_fills(components.live_trader, limit=limit)
+    return JSONResponse({"fills": fills, "count": len(fills)})
 
 
 @router.post("/api/operator/clear_kill_switch")

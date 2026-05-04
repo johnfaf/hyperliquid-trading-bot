@@ -308,3 +308,55 @@ def test_health_strip_returns_a_tone(client):
     payload = r.json()
     assert payload["tone"] in {"green", "amber", "rose"}
     assert "label" in payload
+
+
+def test_clear_quarantine_requires_audit_reason(client):
+    r = client.post(
+        "/api/sources/clear_quarantine",
+        data={"key": "strategy:m|long|trend", "audit_reason": "x"},
+    )
+    assert r.status_code == 400
+    assert r.json()["error"] == "audit_reason_required"
+
+
+def test_clear_quarantine_requires_calibration(client):
+    v2_state.reset_components()
+    r = client.post(
+        "/api/sources/clear_quarantine",
+        data={"key": "strategy:m|long|trend", "audit_reason": "post-incident review"},
+    )
+    assert r.status_code == 503
+    assert r.json()["error"] == "calibration_unavailable"
+
+
+def test_clear_quarantine_drops_records(monkeypatch, tmp_path):
+    monkeypatch.delenv("DASHBOARD_AUTH_TOKEN", raising=False)
+    v2_state.reset_components()
+    cal = CalibrationTracker(
+        db_path=str(tmp_path / "cal.db"),
+        quarantine_min_samples=15,
+        quarantine_ece=0.20,
+    )
+    for _ in range(30):
+        cal.record("strategy:m", 0.9, False, side="long", regime="trend")
+    v2_state.set_components(calibration=cal)
+    app = create_app()
+    client = TestClient(app)
+    r = client.post(
+        "/api/sources/clear_quarantine",
+        data={"key": "strategy:m|long|trend", "audit_reason": "data quality fix"},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is True
+    assert body["result"]["cleared"] is True
+    # Source no longer tracked after clear.
+    assert cal._source_total("strategy:m|long|trend") == 0
+
+
+def test_recent_fills_endpoint_no_live_trader(client):
+    r = client.get("/api/fills/recent")
+    assert r.status_code == 200
+    payload = r.json()
+    assert payload["fills"] == []
+    assert payload["count"] == 0

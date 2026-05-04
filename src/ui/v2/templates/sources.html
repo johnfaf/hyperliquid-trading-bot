@@ -103,6 +103,10 @@
           <td class="py-1.5 px-3">
             {% if r.calibration.quarantined %}
               <span class="inline-block px-2 py-0.5 rounded bg-rose-900/60 text-rose-200 text-[10px]">QUARANTINED</span>
+              <button class="ml-1 text-[10px] text-rose-300 hover:text-white underline-offset-2 hover:underline"
+                      onclick="window.dispatchEvent(new CustomEvent('clear-quarantine', {detail: '{{ r.source }}'}))">
+                clear
+              </button>
             {% elif r.calibration.subkeys > 0 %}
               <span class="text-[10px] text-slate-500">{{ r.calibration.subkeys }} sub-keys</span>
             {% else %}
@@ -117,5 +121,71 @@
     </table>
   </div>
 </section>
+<dialog id="clear-quarantine-dialog" class="bg-slate-900 border border-rose-800 rounded text-slate-100 p-0 w-96 backdrop:bg-black/60">
+  <form method="dialog" id="clear-quarantine-form" class="p-4 space-y-3">
+    <h3 class="text-sm font-semibold text-rose-300">Clear calibration quarantine</h3>
+    <p class="text-xs text-slate-400">
+      This drops outcomes for <code id="clear-quarantine-key" class="text-slate-200 break-all"></code>
+      and rebuilds the global aggregate. The source returns to cold-start.
+    </p>
+    <input type="text" id="clear-quarantine-reason" placeholder="audit reason (4+ chars)"
+           required minlength="4"
+           class="w-full bg-slate-950 border border-slate-700 rounded px-2 py-1 text-xs" />
+    <div id="clear-quarantine-result" class="text-xs"></div>
+    <div class="flex justify-end gap-2">
+      <button value="cancel" class="text-xs text-slate-400 hover:text-white px-3 py-1">cancel</button>
+      <button id="clear-quarantine-submit" value="confirm"
+              class="text-xs bg-rose-700 hover:bg-rose-600 text-white px-3 py-1 rounded">Clear</button>
+    </div>
+  </form>
+</dialog>
+
+<script>
+  (function () {
+    const dialog = document.getElementById('clear-quarantine-dialog');
+    const keyEl = document.getElementById('clear-quarantine-key');
+    const reasonEl = document.getElementById('clear-quarantine-reason');
+    const resultEl = document.getElementById('clear-quarantine-result');
+    const submitBtn = document.getElementById('clear-quarantine-submit');
+    let activeKey = '';
+
+    window.addEventListener('clear-quarantine', (ev) => {
+      activeKey = ev.detail || '';
+      keyEl.textContent = activeKey;
+      reasonEl.value = '';
+      resultEl.textContent = '';
+      resultEl.className = 'text-xs';
+      dialog.showModal();
+    });
+
+    submitBtn.addEventListener('click', async (ev) => {
+      ev.preventDefault();
+      const reason = reasonEl.value.trim();
+      if (reason.length < 4 || !activeKey) {
+        resultEl.textContent = 'Reason must be at least 4 characters.';
+        resultEl.className = 'text-xs text-rose-300';
+        return;
+      }
+      const body = new URLSearchParams({key: activeKey, audit_reason: reason});
+      try {
+        const resp = await fetch('/api/sources/clear_quarantine', {
+          method: 'POST', body, headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+        });
+        const data = await resp.json().catch(() => ({}));
+        if (resp.ok) {
+          resultEl.textContent = 'Cleared. Reloading…';
+          resultEl.className = 'text-xs text-emerald-300';
+          setTimeout(() => location.reload(), 800);
+        } else {
+          resultEl.textContent = data.message || data.error || 'Clear failed.';
+          resultEl.className = 'text-xs text-rose-300';
+        }
+      } catch (e) {
+        resultEl.textContent = 'Network error.';
+        resultEl.className = 'text-xs text-rose-300';
+      }
+    });
+  })();
+</script>
 {% endif %}
 {% endblock %}

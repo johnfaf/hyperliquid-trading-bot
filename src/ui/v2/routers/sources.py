@@ -20,10 +20,10 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Form, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
-from src.ui.v2.auth import require_auth
+from src.ui.v2.auth import require_auth, verify_cookie
 from src.ui.v2.state import get_components
 
 logger = logging.getLogger(__name__)
@@ -144,6 +144,51 @@ async def sources_data(request: Request):
     if redirect is not None:
         return JSONResponse({"error": "auth_required"}, status_code=401)
     return JSONResponse(_summary_payload())
+
+
+@router.post("/api/sources/clear_quarantine")
+async def clear_quarantine(
+    request: Request,
+    key: str = Form(...),
+    audit_reason: str = Form(""),
+):
+    """Authenticated endpoint to lift a calibration quarantine on a
+    single (source, side, regime) key.
+
+    Drops the per-key bin counts, deletes the matching DB rows, and
+    rebuilds the global aggregate. The source returns to cold-start.
+    Requires a non-empty audit reason -- it lands in the v2 dashboard
+    audit log via the calibration tracker's WARNING log.
+    """
+    if not verify_cookie(request):
+        return JSONResponse({"error": "auth_required"}, status_code=401)
+    composed = (key or "").strip()
+    if not composed:
+        return JSONResponse({"error": "key_required"}, status_code=400)
+    reason = (audit_reason or "").strip()
+    if len(reason) < 4:
+        return JSONResponse(
+            {"error": "audit_reason_required",
+             "message": "Provide a short note (4+ chars) for the audit log."},
+            status_code=400,
+        )
+    cal = get_components().calibration
+    if cal is None:
+        return JSONResponse({"error": "calibration_unavailable"}, status_code=503)
+    try:
+        result = cal.operator_clear_quarantine(composed, audit_reason=reason)
+    except AttributeError:
+        return JSONResponse({"error": "operator_clear_unsupported"}, status_code=501)
+    except Exception as exc:
+        logger.error("clear_quarantine failed: %s", exc, exc_info=True)
+        return JSONResponse({"error": "clear_failed", "message": str(exc)}, status_code=500)
+    # Push to WS so the audit feed updates live.
+    try:
+        from src.ui.v2.events import publish_event
+        publish_event("calibration", transition="quarantine_cleared", key=composed, reason=reason)
+    except Exception:
+        pass
+    return JSONResponse({"ok": True, "result": result})
 
 
 @router.get("/sources", response_class=HTMLResponse)

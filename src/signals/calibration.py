@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import logging
 import math
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from datetime import datetime, timezone
 from collections import defaultdict
 
@@ -568,6 +568,75 @@ class CalibrationTracker:
         return 1.0
 
     # ── Operator / governance helpers ─────────────────────────────
+    def operator_clear_quarantine(self, source_key: str, *,
+                                  side: Optional[str] = None,
+                                  regime: Optional[str] = None,
+                                  audit_reason: str = "operator-cleared") -> Dict[str, Any]:
+        """Drop calibration outcomes for one (source, side, regime) key.
+
+        ``is_quarantined`` reads from accumulated bin counts; clearing
+        the bins forces the tracker back to cold-start, which both
+        lifts the quarantine and gives the source a fresh window to
+        re-prove itself. The DB rows are also pruned so a restart
+        doesn't restore the old state.
+
+        Returns ``{cleared, key, samples_removed, audit_reason}``.
+        """
+        composed = self._normalize_key(source_key, side=side, regime=regime)
+        samples_removed = self._source_total(composed)
+        # Drop in-memory state.
+        self._bins.pop(composed, None)
+        self._brier.pop(composed, None)
+        self._curve_cache.pop(composed, None)
+        self._curve_size_at_fit.pop(composed, None)
+        # Rebuild the global aggregate by replaying everything except the
+        # purged key. Cheaper than tracking per-source contribution to
+        # global, and only happens on rare operator action.
+        self._bins.pop("global", None)
+        self._brier.pop("global", None)
+        self._curve_cache.pop("global", None)
+        self._curve_size_at_fit.pop("global", None)
+        try:
+            self._delete_records(composed)
+        except Exception as exc:
+            logger.warning("Failed to delete calibration rows for %s: %s", composed, exc)
+        # Reload remaining records so global rebuilds correctly.
+        try:
+            self._load_from_db()
+        except Exception as exc:
+            logger.debug("Reload after quarantine clear failed: %s", exc)
+        logger.warning(
+            "Calibration QUARANTINE CLEARED for %s (samples_removed=%.0f, reason=%s)",
+            composed, samples_removed, audit_reason,
+        )
+        return {
+            "cleared": True,
+            "key": composed,
+            "samples_removed": samples_removed,
+            "audit_reason": audit_reason,
+        }
+
+    def _delete_records(self, source_key: str) -> None:
+        try:
+            if self._use_shared_db:
+                with db.get_connection() as conn:
+                    conn.execute(
+                        "DELETE FROM calibration_records WHERE source_key = ?",
+                        (source_key,),
+                    )
+            else:
+                import sqlite3
+                conn = sqlite3.connect(self.db_path)
+                conn.execute(
+                    "DELETE FROM calibration_records WHERE source_key = ?",
+                    (source_key,),
+                )
+                conn.commit()
+                conn.close()
+        except Exception as exc:
+            logger.debug("calibration_records delete failed: %s", exc)
+            raise
+
     def is_quarantined(self, source_key: str, *,
                        side: Optional[str] = None,
                        regime: Optional[str] = None) -> bool:

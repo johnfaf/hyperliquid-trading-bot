@@ -4,6 +4,15 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>{{ title }} — Hyperliquid Bot</title>
+  <script>
+    // Apply persisted theme BEFORE tailwind paints to avoid a flash.
+    (function () {
+      try {
+        const t = localStorage.getItem('hlbot-theme');
+        if (t === 'light') document.documentElement.classList.add('theme-light');
+      } catch (e) { /* localStorage may be unavailable */ }
+    })();
+  </script>
   <script src="https://cdn.tailwindcss.com"></script>
   <script src="https://unpkg.com/htmx.org@1.9.12"></script>
   <script>
@@ -20,6 +29,26 @@
   <style>
     body { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
     .bin-bar { transition: width 0.2s ease; }
+    /* Light theme: re-skin the slate palette on the <html> class.
+       We deliberately keep accent colours (emerald/rose/amber) consistent
+       across themes so risk signals retain their meaning. */
+    html.theme-light { background: #f8fafc; color: #0f172a; }
+    html.theme-light body { background: #f8fafc; color: #0f172a; }
+    html.theme-light .bg-slate-950 { background: #f8fafc !important; }
+    html.theme-light .bg-slate-900 { background: #ffffff !important; }
+    html.theme-light .bg-slate-900\/80 { background: rgba(255,255,255,0.85) !important; }
+    html.theme-light .bg-slate-950\/60 { background: #f1f5f9 !important; }
+    html.theme-light .border-slate-800 { border-color: #e2e8f0 !important; }
+    html.theme-light .border-slate-700 { border-color: #cbd5e1 !important; }
+    html.theme-light .text-slate-100 { color: #0f172a !important; }
+    html.theme-light .text-slate-200 { color: #1e293b !important; }
+    html.theme-light .text-slate-300 { color: #334155 !important; }
+    html.theme-light .text-slate-400 { color: #475569 !important; }
+    html.theme-light .text-slate-500 { color: #64748b !important; }
+    html.theme-light .text-slate-600 { color: #475569 !important; }
+    html.theme-light .hover\:bg-slate-800\/40:hover { background: #f1f5f9 !important; }
+    html.theme-light .bg-slate-800 { background: #e2e8f0 !important; }
+    html.theme-light .bg-slate-800\/40 { background: #f1f5f9 !important; }
   </style>
 </head>
 <body class="min-h-screen">
@@ -42,6 +71,9 @@
             hx-swap="none"
             data-ws-refresh-on="cycle,kill_switch">health: …</span>
       <span id="ws-status" class="text-xs px-2 py-0.5 rounded bg-slate-800 text-slate-400">ws: connecting</span>
+      <button id="theme-toggle" type="button"
+              class="text-xs px-2 py-0.5 rounded bg-slate-800 text-slate-400 hover:text-white"
+              title="Toggle dark/light">🌓</button>
       <form action="/api/auth/logout" method="post" class="text-xs">
         <button class="text-slate-400 hover:text-white">sign out</button>
       </form>
@@ -69,9 +101,23 @@
                 htmx.trigger(el, 'wsEvent');
               }
             });
+            // Page-level subscribers (sparkline + fills ticker live in
+            // their own pages and don't use HTMX swaps).
+            window.dispatchEvent(new CustomEvent('ws-event', {detail: data}));
           }
         } catch (e) { /* ignore malformed */ }
       };
+    })();
+
+    // Theme toggle. Persisted in localStorage; the inline script in
+    // <head> applies it before paint so reloads don't flash.
+    (function () {
+      const btn = document.getElementById('theme-toggle');
+      if (!btn) return;
+      btn.addEventListener('click', () => {
+        const isLight = document.documentElement.classList.toggle('theme-light');
+        try { localStorage.setItem('hlbot-theme', isLight ? 'light' : 'dark'); } catch (e) {}
+      });
     })();
 
     // Render the /api/health/strip JSON into the header pill.

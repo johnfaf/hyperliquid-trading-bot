@@ -120,6 +120,35 @@ def start_server(
     bind_port = int(port or os.environ.get("DASHBOARD_V2_PORT", "8081"))
 
     app = create_app()
+    # Tell uvicorn to mute its WebSocket lifecycle "INFO: connection open"
+    # writes -- on Railway those go to stderr and get misclassified as
+    # ERROR by the log shipper, polluting error dashboards. We only want
+    # warnings+ from uvicorn itself; access logs are off, app logs flow
+    # through the standard logger configured upstream.
+    quiet_loggers = {
+        "uvicorn": {"level": "WARNING"},
+        "uvicorn.error": {"level": "WARNING"},
+        "uvicorn.access": {"level": "WARNING"},
+    }
+    log_config = {
+        "version": 1,
+        "disable_existing_loggers": False,
+        "formatters": {
+            "default": {"format": "%(asctime)s %(levelname)s %(name)s: %(message)s"},
+        },
+        "handlers": {
+            "default": {
+                "class": "logging.StreamHandler",
+                "stream": "ext://sys.stdout",
+                "formatter": "default",
+            },
+        },
+        "loggers": {
+            name: {"handlers": ["default"], "level": cfg["level"], "propagate": False}
+            for name, cfg in quiet_loggers.items()
+        },
+        "root": {"handlers": ["default"], "level": "INFO"},
+    }
     config = uvicorn.Config(
         app,
         host=bind_host,
@@ -127,6 +156,7 @@ def start_server(
         log_level=log_level,
         access_log=False,
         loop="asyncio",
+        log_config=log_config,
     )
     server = uvicorn.Server(config)
 
