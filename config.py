@@ -537,7 +537,7 @@ CALIBRATION_QUARANTINE_MIN_SAMPLES = int(
 # When the global calibrator goes off the rails (ECE >= this), pause
 # live entries entirely. Paper trades continue to feed the calibrator.
 CALIBRATION_LIVE_PAUSE_ECE = float(
-    os.environ.get("CALIBRATION_LIVE_PAUSE_ECE", "0.35")
+    os.environ.get("CALIBRATION_LIVE_PAUSE_ECE", "0.50")
 )
 RUNTIME_CONFIG_OVERRIDE_FILE = os.environ.get("RUNTIME_CONFIG_OVERRIDE_FILE", "/data/config.json").strip()
 RUNTIME_CONFIG_POLL_SECONDS = int(os.environ.get("RUNTIME_CONFIG_POLL_SECONDS", 10))
