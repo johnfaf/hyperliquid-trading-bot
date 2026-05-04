@@ -1154,6 +1154,23 @@ class LiveTrader:
 
     def _load_persisted_kill_switch_state(self) -> None:
         """Restore sticky kill-switch state from the previous process."""
+        # When the operator has set LIVE_KILL_SWITCH_DISABLED, also clear
+        # any persisted active state so a later bypass-off doesn't bring
+        # back the previous trip from before the override. Without this,
+        # an operator who bypasses, fixes the upstream issue, then turns
+        # the bypass back off would silently re-inherit the old kill
+        # state.
+        if bool(getattr(config, "LIVE_KILL_SWITCH_DISABLED", False)):
+            logger.warning(
+                "LIVE_KILL_SWITCH_DISABLED=true -- skipping persisted kill-switch "
+                "restore. Active state file (if any) will be cleared on next "
+                "persist."
+            )
+            try:
+                self._persist_kill_switch_state(False, "operator_bypass_active")
+            except Exception:
+                pass
+            return
         path = self.kill_switch_state_file
         if not path or not os.path.exists(path):
             return
@@ -1580,6 +1597,16 @@ class LiveTrader:
             return True
         return False
 
+    def _kill_switch_globally_disabled(self) -> bool:
+        """Read the operator-controlled master bypass.
+
+        Checked at every gate so flipping ``LIVE_KILL_SWITCH_DISABLED`` in
+        env -> config-reload takes effect on the next cycle without a
+        process restart. Defaults to False so the bypass must be opted
+        into explicitly.
+        """
+        return bool(getattr(config, "LIVE_KILL_SWITCH_DISABLED", False))
+
     def activate_kill_switch(
         self,
         reason: str,
@@ -1594,8 +1621,27 @@ class LiveTrader:
         they aren't tailing logs.  C1.  Alert failures are swallowed — the
         kill switch must remain effective even when notifications are
         misconfigured.
+
+        When ``LIVE_KILL_SWITCH_DISABLED=true`` the activation is logged
+        but the in-memory flag, the persisted state file, and the
+        Telegram alert are all skipped -- live entries continue to flow.
+        Operators take full responsibility for safety while the bypass is
+        on.
         """
         reason = str(reason or "unspecified")
+        if self._kill_switch_globally_disabled():
+            logger.critical(
+                "Kill switch BYPASSED (LIVE_KILL_SWITCH_DISABLED=true) -- would have "
+                "tripped on (%s) status=%s; live entries continue.",
+                reason, status_reason,
+            )
+            with self._state_lock:
+                # Keep the public flag clean so all downstream gates see
+                # "not active" -- the bypass is the source of truth.
+                self.kill_switch_active = False
+                self._kill_switch_reason = ""
+                self.status_reason = "kill_switch_disabled_by_operator"
+            return
         changed = False
         with self._state_lock:
             changed = (not self.kill_switch_active) or self._kill_switch_reason != reason
@@ -1613,6 +1659,8 @@ class LiveTrader:
             self._persist_kill_switch_state(True, reason)
 
     def _kill_switch_is_active(self) -> bool:
+        if self._kill_switch_globally_disabled():
+            return False
         lock = getattr(self, "_state_lock", None)
         if lock is None:
             return bool(getattr(self, "kill_switch_active", False))
@@ -1621,18 +1669,21 @@ class LiveTrader:
 
     def get_kill_switch_state(self) -> Dict[str, Any]:
         """Return a thread-safe snapshot of the sticky kill-switch state."""
+        disabled = self._kill_switch_globally_disabled()
         lock = getattr(self, "_state_lock", None)
         if lock is None:
             return {
-                "active": bool(getattr(self, "kill_switch_active", False)),
+                "active": bool(getattr(self, "kill_switch_active", False)) and not disabled,
                 "reason": getattr(self, "_kill_switch_reason", "") or None,
                 "status_reason": getattr(self, "status_reason", "") or None,
+                "operator_bypass": disabled,
             }
         with lock:
             return {
-                "active": bool(self.kill_switch_active),
+                "active": bool(self.kill_switch_active) and not disabled,
                 "reason": self._kill_switch_reason or None,
                 "status_reason": self.status_reason or None,
+                "operator_bypass": disabled,
             }
 
     def operator_clear_kill_switch(self, *, reason: str, operator: str = "operator") -> Dict[str, Any]:

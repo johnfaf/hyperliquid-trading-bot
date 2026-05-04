@@ -496,6 +496,17 @@ COPY_TRADER_SOURCE_SIDE_SIZE_MULTIPLIER = float(
 )
 LIVE_EXTERNAL_KILL_SWITCH_FILE = os.environ.get("LIVE_EXTERNAL_KILL_SWITCH_FILE", "").strip()
 LIVE_KILL_SWITCH_STATE_FILE = os.environ.get("LIVE_KILL_SWITCH_STATE_FILE", "/data/live_kill_switch_state.json").strip()
+# Master kill-switch override. When true, every kill-switch trip is
+# logged but ignored: live entries continue to flow regardless of
+# daily-loss limit, dualwrite health, daily-PnL refresh failures,
+# external file flag, drawdown limit, or any other safety chain that
+# would normally stop trading. Use only when you are absolutely sure
+# (operator maintenance, infra outage you've already mitigated, etc.)
+# -- per-source firewall checks, position caps, and order-size limits
+# still apply, but the *sticky* gate is bypassed entirely.
+LIVE_KILL_SWITCH_DISABLED = os.environ.get(
+    "LIVE_KILL_SWITCH_DISABLED", "false"
+).strip().lower() in ("1", "true", "yes", "on")
 # Number of consecutive userFills failures tolerated before the daily-PnL
 # refresh trips the sticky kill switch. A single transient API blip should
 # not permanently disable live trading; sustained outages still fail closed.

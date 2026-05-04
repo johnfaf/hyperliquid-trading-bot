@@ -4588,6 +4588,67 @@ def test_live_trader_persists_kill_switch_across_restart_and_daily_reset(tmp_pat
     assert stats["kill_switch_reason"] == "operator_test"
 
 
+def test_live_kill_switch_disabled_bypasses_activation(tmp_path, monkeypatch):
+    """Setting LIVE_KILL_SWITCH_DISABLED=true must:
+      * make activate_kill_switch a no-op for live entries
+      * keep the public flag False
+      * persist active=False so a later bypass-off doesn't inherit a stale trip
+      * surface ``operator_bypass: True`` on get_kill_switch_state
+    """
+    class FakeFirewall:
+        def validate(self, signal, **kwargs):
+            return True, "ok"
+
+    state_file = tmp_path / "sticky_kill.json"
+    monkeypatch.setenv("LIVE_KILL_SWITCH_STATE_FILE", str(state_file))
+    monkeypatch.setattr(config, "LIVE_KILL_SWITCH_STATE_FILE", str(state_file), raising=False)
+    monkeypatch.setattr(config, "LIVE_KILL_SWITCH_DISABLED", True, raising=False)
+    monkeypatch.setattr(LiveTrader, "_load_credentials", _fake_live_credentials)
+    monkeypatch.setattr(LiveTrader, "_load_asset_index_map", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "reconcile_positions", lambda self: None)
+
+    trader = LiveTrader(firewall=FakeFirewall(), dry_run=False, max_order_usd=1_000_000)
+    trader.activate_kill_switch("ignored_for_test", status_reason="should_be_ignored")
+
+    assert trader._kill_switch_is_active() is False
+    assert trader.kill_switch_active is False
+    snapshot = trader.get_kill_switch_state()
+    assert snapshot["active"] is False
+    assert snapshot["operator_bypass"] is True
+
+    persisted = json.loads(state_file.read_text(encoding="utf-8"))
+    assert persisted["active"] is False
+
+
+def test_live_kill_switch_disabled_clears_persisted_state_on_load(tmp_path, monkeypatch):
+    """A pre-existing persisted active state must be cleared on boot when
+    LIVE_KILL_SWITCH_DISABLED is set, so the operator who fixed the
+    upstream issue and *then* turned the bypass back off doesn't inherit
+    the previous trip silently.
+    """
+    class FakeFirewall:
+        def validate(self, signal, **kwargs):
+            return True, "ok"
+
+    state_file = tmp_path / "sticky_kill.json"
+    state_file.write_text(
+        json.dumps({"active": True, "reason": "stale_trip", "updated_at": "2026-05-04T00:00:00+00:00"}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("LIVE_KILL_SWITCH_STATE_FILE", str(state_file))
+    monkeypatch.setattr(config, "LIVE_KILL_SWITCH_STATE_FILE", str(state_file), raising=False)
+    monkeypatch.setattr(config, "LIVE_KILL_SWITCH_DISABLED", True, raising=False)
+    monkeypatch.setattr(LiveTrader, "_load_credentials", _fake_live_credentials)
+    monkeypatch.setattr(LiveTrader, "_load_asset_index_map", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "reconcile_positions", lambda self: None)
+
+    trader = LiveTrader(firewall=FakeFirewall(), dry_run=False, max_order_usd=1_000_000)
+    assert trader.kill_switch_active is False
+    persisted = json.loads(state_file.read_text(encoding="utf-8"))
+    assert persisted["active"] is False
+    assert "operator_bypass" in persisted["reason"]
+
+
 def test_operator_clear_kill_switch_clears_state_and_persists(tmp_path, monkeypatch):
     """The dashboard operator-clear path must reset the in-memory flag,
     reset the persisted state file, and emit a CRITICAL audit entry.

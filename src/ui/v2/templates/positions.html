@@ -41,6 +41,9 @@
     {% elif d.dry_run %}
       <div class="mt-1 text-2xl font-semibold text-amber-300">DRY-RUN</div>
       <div class="mt-1 text-[10px] text-slate-500">paper only</div>
+    {% elif d.kill_switch.operator_bypass %}
+      <div class="mt-1 text-2xl font-semibold text-amber-300">BYPASS</div>
+      <div class="mt-1 text-[10px] text-amber-400">LIVE_KILL_SWITCH_DISABLED=true</div>
     {% elif d.kill_switch.active %}
       <div class="mt-1 text-2xl font-semibold text-rose-300">BLOCKED</div>
       <div class="mt-1 text-[10px] text-rose-400 break-all">{{ d.kill_switch.reason or d.kill_switch.status_reason }}</div>
@@ -53,6 +56,19 @@
     {% endif %}
   </div>
 </section>
+
+{% if d.kill_switch.operator_bypass %}
+<section class="mb-6 bg-amber-950/40 border border-amber-800 rounded p-4">
+  <h2 class="text-sm font-semibold text-amber-200">Kill switch DISABLED by operator</h2>
+  <p class="mt-1 text-xs text-amber-300/90">
+    <code class="text-amber-100">LIVE_KILL_SWITCH_DISABLED=true</code> is set. Every safety
+    trip (daily-loss, dualwrite health, daily-PnL refresh, drawdown, external file)
+    is logged but ignored. Per-source firewall checks, position caps, and
+    order-size limits still apply. Unset the variable and restart to re-enable
+    the sticky safety net.
+  </p>
+</section>
+{% endif %}
 
 {% if d.kill_switch.active %}
 <section class="mb-6 bg-rose-950/40 border border-rose-800 rounded p-4">
