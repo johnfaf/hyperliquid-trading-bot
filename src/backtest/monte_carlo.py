@@ -46,6 +46,9 @@ class MonteCarloConfig:
 
     # Trade sampling
     trades_per_path: int = 0                # 0 = match historical length
+    bootstrap_method: str = "stationary_block"  # stationary_block preserves streak autocorrelation
+    block_size: int = 10                    # Average block length for stationary bootstrap
+    trades_per_year: float = 0.0            # 0 = assume one simulated path is one year
     position_size_pct: float = 0.05         # 5% per trade
     max_leverage: float = 3.0
 
@@ -120,6 +123,31 @@ class MonteCarloSimulator:
     def __init__(self, config: Optional[MonteCarloConfig] = None):
         self.cfg = config or MonteCarloConfig()
 
+    @staticmethod
+    def _sample_returns(
+        trade_returns: np.ndarray,
+        *,
+        trades_per_path: int,
+        cfg: MonteCarloConfig,
+        rng: np.random.Generator,
+    ) -> np.ndarray:
+        """Sample returns while preserving some serial dependence by default."""
+        n = len(trade_returns)
+        method = str(getattr(cfg, "bootstrap_method", "stationary_block") or "stationary_block").lower()
+        if method == "iid" or n <= 1:
+            return rng.choice(trade_returns, size=trades_per_path, replace=True)
+
+        block_size = max(int(getattr(cfg, "block_size", 10) or 10), 1)
+        restart_probability = min(1.0, 1.0 / block_size)
+        sampled = np.empty(trades_per_path, dtype=float)
+        idx = int(rng.integers(0, n))
+        for i in range(trades_per_path):
+            if i == 0 or rng.random() < restart_probability:
+                idx = int(rng.integers(0, n))
+            sampled[i] = trade_returns[idx]
+            idx = (idx + 1) % n
+        return sampled
+
     def run(self, trade_returns: np.ndarray,
             config: Optional[MonteCarloConfig] = None) -> MonteCarloResult:
         """
@@ -159,8 +187,13 @@ class MonteCarloSimulator:
         rng = np.random.default_rng(42)
 
         for path in range(n_paths):
-            # Bootstrap trade returns with replacement
-            sampled = rng.choice(trade_returns, size=trades_per_path, replace=True)
+            # Stationary block bootstrap keeps win/loss streaks and autocorrelation.
+            sampled = self._sample_returns(
+                trade_returns,
+                trades_per_path=trades_per_path,
+                cfg=cfg,
+                rng=rng,
+            )
 
             # Inject crash events
             if cfg.include_crashes:
@@ -203,7 +236,12 @@ class MonteCarloSimulator:
             # Sharpe
             path_returns = np.diff(equity) / equity[:-1]
             if len(path_returns) > 1 and np.std(path_returns) > 0:
-                sharpe_ratios[path] = float(np.mean(path_returns) / np.std(path_returns) * np.sqrt(252))
+                trades_per_year = float(cfg.trades_per_year or trades_per_path)
+                sharpe_ratios[path] = float(
+                    np.mean(path_returns)
+                    / np.std(path_returns, ddof=1)
+                    * np.sqrt(max(trades_per_year, 1.0))
+                )
             else:
                 sharpe_ratios[path] = 0.0
 

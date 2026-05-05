@@ -25,7 +25,10 @@ from src.signals.agent_scoring import AgentScorer
 from src.signals.kelly_sizing import KellySizer
 from src.trading.trade_memory import TradeMemory
 from src.trading.portfolio_rotation import PortfolioRotationManager
-from src.signals.calibration import CalibrationTracker
+from src.signals.calibration import (
+    CalibrationTracker,
+    bucket_regime as _calibration_bucket_regime,
+)
 from src.signals.risk_policy import RiskPolicyEngine
 
 logger = logging.getLogger(__name__)
@@ -539,37 +542,40 @@ class CopyTrader:
         regime = regime_info.get("regime", "neutral")
         original_confidence = signal.get("confidence", 0.5)
 
-        # Apply regime multiplier to confidence
+        # Regime weighting policy: derisks (crash/neutral) move *confidence*
+        # because the calibrator sees them and folds them into the model.
+        # Bullish weighting now goes through *size* (regime_size_modifier),
+        # which the executor already applies. Multiplying confidence
+        # above its calibrated value pollutes the calibrator — we'd
+        # report 1.0 confidence whose true win rate is unchanged, which
+        # inflates ECE on every trade in a bullish regime. Sizing
+        # captures operator intent (more aggressive when conditions
+        # favour us) without corrupting the prediction signal.
         if regime == "crash":
-            # Keep copy trading de-risked during crashes without locking out
-            # genuinely strong candidates before the firewall/rotation layers.
             adjusted_confidence = original_confidence * _CRASH_COPY_CONFIDENCE_MULTIPLIER
             logger.info(
                 f"REGIME WEIGHT: crash detected for {coin}, "
                 f"reducing copy confidence {original_confidence:.2f} -> {adjusted_confidence:.2f}"
             )
+            signal["confidence"] = adjusted_confidence
         elif regime == "neutral":
-            # Slightly reduce during neutral regimes.
             adjusted_confidence = original_confidence * _NEUTRAL_COPY_CONFIDENCE_MULTIPLIER
             logger.debug(
                 f"REGIME WEIGHT: neutral regime for {coin}, "
                 f"reducing copy confidence {original_confidence:.2f} -> {adjusted_confidence:.2f}"
             )
+            signal["confidence"] = adjusted_confidence
         elif regime == "bullish":
-            # Increase aggressiveness during bullish regimes, capped at 1.0.
-            adjusted_confidence = min(
-                original_confidence * _BULLISH_COPY_CONFIDENCE_MULTIPLIER,
-                1.0,
+            existing_mod = float(signal.get("regime_size_modifier", 1.0) or 1.0)
+            new_mod = max(0.0, min(existing_mod * _BULLISH_COPY_CONFIDENCE_MULTIPLIER, 2.0))
+            signal["regime_size_modifier"] = new_mod
+            logger.info(
+                "REGIME WEIGHT: bullish detected for %s, "
+                "boosting regime size modifier %.2fx -> %.2fx "
+                "(confidence held at %.2f to keep calibration honest)",
+                coin, existing_mod, new_mod, original_confidence,
             )
-            if adjusted_confidence > original_confidence:
-                logger.info(
-                    f"REGIME WEIGHT: bullish detected for {coin}, "
-                    f"boosting copy confidence {original_confidence:.2f} -> {adjusted_confidence:.2f}"
-                )
-        else:
-            adjusted_confidence = original_confidence
 
-        signal["confidence"] = adjusted_confidence
         return signal
 
     def execute_copy_signals(self, signals: List[Dict],
@@ -1192,6 +1198,9 @@ class CopyTrader:
                     pnl=pnl,
                     coin=trade["coin"],
                     side=trade.get("side", ""),
+                    regime=_calibration_bucket_regime(
+                        meta.get("regime") or trade.get("regime")
+                    ),
                 )
             except Exception as hook_exc:
                 logger.warning("copy_trader post-close hook 'calibration' failed: %s", hook_exc)

@@ -245,9 +245,39 @@ def _fmt_kelly(stats):
 
 def _fmt_calibration(cal):
     global_ece = cal.get_ece("global")
+    global_brier = None
+    try:
+        global_brier = cal.get_brier("global")
+    except Exception:
+        global_brier = None
     ece_str = f"{global_ece:.3f}" if global_ece is not None else "N/A"
+    brier_str = f"{global_brier:.3f}" if global_brier is not None else "N/A"
     quality = cal._quality_label(global_ece)
-    return f"ECE={ece_str} ({quality}), {len(cal.get_all_stats())} sources tracked"
+    parts = [
+        f"ECE={ece_str}",
+        f"Brier={brier_str}",
+        f"({quality})",
+        f"{len(cal.get_all_stats())} sources tracked",
+    ]
+    quarantined = []
+    try:
+        quarantined = cal.get_quarantined_sources()
+    except Exception:
+        quarantined = []
+    if quarantined:
+        worst = quarantined[:3]
+        worst_str = ", ".join(
+            f"{q['source']}|{q['side']}|{q['regime']}(ECE={q['ece']:.2f},n={int(q['samples'])})"
+            for q in worst
+        )
+        parts.append(f"quarantined={len(quarantined)} [{worst_str}]")
+    if getattr(cal, "is_live_paused", None):
+        try:
+            if cal.is_live_paused():
+                parts.append("LIVE-PAUSED")
+        except Exception:
+            pass
+    return ", ".join(parts)
 
 
 def _fmt_multi(stats):

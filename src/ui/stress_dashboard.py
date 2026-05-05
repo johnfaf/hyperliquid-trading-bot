@@ -15,6 +15,16 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent.parent
 REPORTS_DIR = ROOT / "reports"
 
+
+def _max_report_files() -> int:
+    try:
+        return max(2, min(int(os.environ.get("STRESS_DASHBOARD_MAX_REPORT_FILES", "50")), 10_000))
+    except (TypeError, ValueError):
+        return 50
+
+
+MAX_REPORT_FILES = _max_report_files()
+
 logger = logging.getLogger("stress_dashboard")
 
 
@@ -66,12 +76,46 @@ def get_stress_dashboard_data() -> dict:
     }
 
 
+def _available_scenarios() -> set[str]:
+    from src.backtest.stress_scenarios import StressScenarioSuite
+
+    return set(StressScenarioSuite().to_dict().keys())
+
+
+def _validate_scenarios(scenarios) -> list[str] | None:
+    if scenarios is None:
+        return None
+    if not isinstance(scenarios, list):
+        raise ValueError("scenarios must be a list of scenario keys")
+    available = _available_scenarios()
+    invalid = [str(item) for item in scenarios if str(item) not in available]
+    if invalid:
+        raise ValueError(f"invalid stress scenario(s): {', '.join(invalid)}")
+    return [str(item) for item in scenarios]
+
+
+def _prune_old_reports(max_files: int = MAX_REPORT_FILES) -> None:
+    """Keep disk use bounded by deleting oldest JSON/HTML stress reports."""
+    for pattern in ("stress_test_*.json", "stress_test_*.html"):
+        paths = sorted(REPORTS_DIR.glob(pattern), key=lambda p: p.stat().st_mtime, reverse=True)
+        for path in paths[max_files:]:
+            try:
+                path.unlink()
+            except OSError as exc:
+                logger.warning("Could not prune old stress report %s: %s", path, exc)
+
+
 def run_stress_test(scenarios=None, use_seed=False) -> dict:
     """Run a stress test and return the report."""
     import sys
     sys.path.insert(0, str(ROOT))
 
     from src.backtest.stress_test import StressTestEngine, _load_fills_from_db, generate_html_report
+
+    try:
+        scenarios = _validate_scenarios(scenarios)
+    except ValueError as exc:
+        return {"error": str(exc), "has_data": False}
 
     # Load fills
     fills_raw = []
@@ -99,6 +143,7 @@ def run_stress_test(scenarios=None, use_seed=False) -> dict:
 
     html_path = str(REPORTS_DIR / f"stress_test_{ts}.html")
     generate_html_report(report, html_path)
+    _prune_old_reports()
 
     return {
         "has_data": True,

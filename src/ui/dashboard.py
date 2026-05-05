@@ -49,28 +49,15 @@ _options_scanner = None
 # Paths that are always open (health probes, Railway readiness checks, login)
 _AUTH_EXEMPT_PATHS = {"/api/health", "/api/ready", "/api/live_ready", "/login", "/api/auth/login"}
 _AUTH_COOKIE_NAME = "dashboard_auth"
-# H9 (audit): every mutating / compute-intensive POST endpoint must require
-# auth when DASHBOARD_AUTH_TOKEN is set.  When the token is not set and the
-# dashboard is bound publicly (e.g., Railway), any path in this set returns
-# 403 with a configuration hint instead of executing — this prevents
-# unauthenticated CPU/IO exhaustion, destructive cache clears, and external
-# API rate-limit abuse on the exchange's behalf.
-_AUTH_REQUIRED_POST_PATHS = {
-    # Finance / paper-book mutations
-    "/api/order",
-    "/api/paper/reset",
-    "/api/trade/close",
-    "/api/trade/close-all",
-    # Compute-intensive background jobs (DoS surface)
-    "/api/backtest/run",
-    "/api/candle-backtest/run",
-    "/api/stress/run",
-    # External API fetch (exchange rate-limit abuse surface)
-    "/api/candle-backtest/fetch",
-    # Destructive cache operations
-    "/api/candle-backtest/cache/clear",
-}
-
+# Dashboard security defaults are fail-closed:
+# - all POST routes require auth unless explicitly exempted above
+# - read-only routes require auth unless DASHBOARD_PUBLIC_READ=true is set
+# This prevents future endpoints from accidentally becoming public.
+_RATE_LIMIT_LOCK = threading.Lock()
+_RATE_LIMIT_BUCKETS: dict[str, tuple[float, float]] = {}
+_BACKTEST_JOB_LOCK = threading.Lock()
+_BACKTEST_JOB_RUNNING = False
+_BACKTEST_JOB_STARTED_AT: float | None = None
 
 def _dashboard_auth_token() -> str:
     """Read the dashboard auth token lazily so env changes apply immediately."""
@@ -84,11 +71,45 @@ def _dashboard_session_ttl_s() -> int:
         return 86400
 
 
+def _dashboard_public_read_enabled() -> bool:
+    return _truthy_env("DASHBOARD_PUBLIC_READ")
+
+
+def _dashboard_rate_limit_capacity() -> float:
+    try:
+        return max(5.0, min(float(os.environ.get("DASHBOARD_RATE_LIMIT_BURST", "120")), 10_000.0))
+    except (TypeError, ValueError):
+        return 120.0
+
+
+def _dashboard_rate_limit_per_minute() -> float:
+    try:
+        return max(5.0, min(float(os.environ.get("DASHBOARD_RATE_LIMIT_PER_MINUTE", "240")), 60_000.0))
+    except (TypeError, ValueError):
+        return 240.0
+
+
 def _max_request_body_bytes() -> int:
     try:
         return max(1024, min(int(os.environ.get("DASHBOARD_MAX_REQUEST_BODY_BYTES", "65536")), 2_000_000))
     except (TypeError, ValueError):
         return 65536
+
+
+def _rate_limit_allowed(key: str) -> bool:
+    """Token bucket per client identity to protect expensive dashboard routes."""
+    capacity = _dashboard_rate_limit_capacity()
+    refill_per_sec = _dashboard_rate_limit_per_minute() / 60.0
+    now = time.monotonic()
+    with _RATE_LIMIT_LOCK:
+        tokens, last_seen = _RATE_LIMIT_BUCKETS.get(key, (capacity, now))
+        elapsed = max(0.0, now - last_seen)
+        tokens = min(capacity, tokens + elapsed * refill_per_sec)
+        if tokens < 1.0:
+            _RATE_LIMIT_BUCKETS[key] = (tokens, now)
+            return False
+        _RATE_LIMIT_BUCKETS[key] = (tokens - 1.0, now)
+        return True
 
 
 def _secure_token_eq(supplied: str, expected: str) -> bool:
@@ -233,16 +254,25 @@ def _validate_dashboard_auth_configuration(host: str) -> None:
         return
     if _dashboard_auth_token():
         return
-    if _is_hosted_dashboard_environment():
+    public_read = _dashboard_public_read_enabled()
+    if _is_hosted_dashboard_environment() and not public_read:
         raise RuntimeError(
             "DASHBOARD_AUTH_TOKEN is required for hosted public dashboard access. "
-            "Set it in Railway Variables, then log in at /login with that token."
+            "Set it in Railway Variables, bind DASHBOARD_HOST=127.0.0.1, or "
+            "explicitly set DASHBOARD_PUBLIC_READ=true for read-only public exposure."
         )
-    logger.warning(
-        "Dashboard is binding publicly but DASHBOARD_AUTH_TOKEN is not set. "
-        "The dashboard will be publicly accessible WITHOUT authentication. "
-        "Set DASHBOARD_AUTH_TOKEN to secure it."
-    )
+    if public_read:
+        logger.warning(
+            "Dashboard is binding publicly with DASHBOARD_PUBLIC_READ=true and "
+            "DASHBOARD_AUTH_TOKEN unset. Read-only data is public; all POST routes "
+            "remain blocked until auth is configured."
+        )
+    else:
+        logger.warning(
+            "Dashboard is binding publicly without DASHBOARD_AUTH_TOKEN. "
+            "Non-health routes will fail closed until DASHBOARD_AUTH_TOKEN is set "
+            "or DASHBOARD_PUBLIC_READ=true is explicitly configured."
+        )
 
 
 def _get_db():
@@ -625,7 +655,7 @@ def set_live_trader(trader):
     _live_trader = trader
 
 
-def _close_paper_trade_at_market(trade_id: int) -> dict:
+def _close_paper_trade_at_market(trade_id: int, *, close_live: bool = True) -> dict:
     """
     Close a single paper trade at the current market price.
     If live trading is active, also closes the position on exchange.
@@ -686,7 +716,7 @@ def _close_paper_trade_at_market(trade_id: int) -> dict:
 
     # If live trading is active, also close the position on exchange
     live_close_result = None
-    if _live_trader:
+    if close_live and _live_trader:
         try:
             if hasattr(_live_trader, 'is_live_enabled') and _live_trader.is_live_enabled():
                 if hasattr(_live_trader, 'is_deployable') and _live_trader.is_deployable():
@@ -709,6 +739,85 @@ def _close_paper_trade_at_market(trade_id: int) -> dict:
         "exit_price": current_price,
         "pnl": pnl,
         "live_close": live_close_result,
+    }
+
+
+def _is_live_order_success(result: dict) -> bool:
+    if _live_trader and hasattr(_live_trader, "_is_order_result_success"):
+        try:
+            return bool(_live_trader._is_order_result_success(result))
+        except Exception:
+            pass
+    status = str((result or {}).get("status", "")).lower()
+    return status in {"ok", "success", "filled", "accepted"}
+
+
+def _live_trader_can_flatten() -> tuple[bool, str]:
+    if not _live_trader:
+        return False, "live_trader_not_attached"
+    try:
+        if hasattr(_live_trader, "is_live_enabled") and not _live_trader.is_live_enabled():
+            return False, "live_trading_disabled"
+        if hasattr(_live_trader, "is_deployable") and not _live_trader.is_deployable():
+            return False, "live_trader_not_deployable"
+    except Exception as exc:
+        return False, f"live_status_error:{type(exc).__name__}"
+    return True, "ok"
+
+
+def _close_all_live_positions() -> dict:
+    """Cancel live orders and flatten every exchange position visible now."""
+    can_flatten, reason = _live_trader_can_flatten()
+    if not can_flatten:
+        return {"status": "skipped", "reason": reason, "closed": 0, "errors": []}
+
+    errors: list[str] = []
+    cancelled = None
+    try:
+        if hasattr(_live_trader, "cancel_all_orders"):
+            cancelled = _live_trader.cancel_all_orders()
+    except Exception as exc:
+        errors.append(f"cancel_all_orders:{type(exc).__name__}:{exc}")
+
+    try:
+        positions = _live_trader.get_positions(force_fresh=True)
+    except Exception as exc:
+        return {
+            "status": "error",
+            "reason": f"positions_unavailable:{type(exc).__name__}",
+            "closed": 0,
+            "cancelled_orders": cancelled,
+            "errors": errors + [str(exc)],
+        }
+    if positions is None:
+        return {
+            "status": "error",
+            "reason": "positions_unavailable",
+            "closed": 0,
+            "cancelled_orders": cancelled,
+            "errors": errors,
+        }
+
+    closed = 0
+    attempted = 0
+    for pos in positions:
+        coin = str(pos.get("coin") or "").strip().upper()
+        size = abs(float(pos.get("size", pos.get("szi", 0)) or 0))
+        if not coin or size <= 0:
+            continue
+        attempted += 1
+        result = _live_trader.close_position(coin)
+        if _is_live_order_success(result):
+            closed += 1
+        else:
+            errors.append(f"{coin}:{(result or {}).get('message') or (result or {}).get('error') or result}")
+
+    return {
+        "status": "ok" if not errors else "partial",
+        "attempted": attempted,
+        "closed": closed,
+        "cancelled_orders": cancelled,
+        "errors": errors,
     }
 
 
@@ -1757,12 +1866,14 @@ async function closeAllTrades(){
   const count = (window.currentOpenTrades||[]).length;
   if(!count) return alert('No open positions to close.');
   if(!confirm(`Close ALL ${count} open position(s) at market price?`)) return;
+  const flattenLive = confirm('If live trading is attached, this will also cancel live orders and flatten ALL live Hyperliquid positions. Continue?');
+  if(!flattenLive) return;
   const btn = document.getElementById('btn-close-all');
   if(btn){btn.disabled=true;btn.textContent='Closing all...';}
   try {
     const resp = await fetch('/api/trade/close-all', {
       method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({})
+      body: JSON.stringify({include_live:true, confirm_live_close_all:'FLATTEN_LIVE'})
     });
     const d = await resp.json();
     if(d.status === 'ok'){
@@ -2080,18 +2191,41 @@ class DashboardHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         if parsed.path in _AUTH_EXEMPT_PATHS:
             return True  # Health probe - always open
+        client_host = "local"
+        try:
+            client_host = str((getattr(self, "client_address", None) or ["local"])[0])
+        except Exception:
+            client_host = "unknown"
+        if not _rate_limit_allowed(client_host):
+            self.send_response(429)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Retry-After", "15")
+            self._send_no_cache_headers()
+            self.end_headers()
+            self.wfile.write(b'{"error": "dashboard_rate_limited"}')
+            return False
         if not auth_token:
-            if self.command == "POST" and parsed.path in _AUTH_REQUIRED_POST_PATHS:
+            if self.command == "POST":
                 self.send_response(403)
                 self.send_header("Content-Type", "application/json")
                 self._send_no_cache_headers()
                 self.end_headers()
                 self.wfile.write(
                     b'{"error": "dashboard_write_auth_not_configured", '
-                    b'"hint": "Set DASHBOARD_AUTH_TOKEN before enabling dashboard write actions"}'
+                    b'"hint": "Set DASHBOARD_AUTH_TOKEN before enabling dashboard POST actions"}'
                 )
                 return False
-            return True  # Read-only dashboard remains open when auth is not configured.
+            if _dashboard_public_read_enabled() and self.command == "GET":
+                return True
+            self.send_response(403)
+            self.send_header("Content-Type", "application/json")
+            self._send_no_cache_headers()
+            self.end_headers()
+            self.wfile.write(
+                b'{"error": "dashboard_auth_not_configured", '
+                b'"hint": "Set DASHBOARD_AUTH_TOKEN, or set DASHBOARD_PUBLIC_READ=true for read-only access"}'
+            )
+            return False
         # Check Authorization header: "Bearer <token>"
         # Constant-time comparison defends against remote timing attacks that
         # leak the token one byte at a time.
@@ -2445,18 +2579,44 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._json_response({"error": str(e)}, code=500)
 
     def _handle_close_all_trades(self):
-        """Close all open paper trades at current market prices."""
+        """Close all open paper trades, and optionally flatten live exposure."""
         try:
             from src.data import database as db
+            body = self._read_json_body()
+            if body is None:
+                return
+            include_live = bool(body.get("include_live", True))
+            live_result = {"status": "skipped", "reason": "not_requested", "closed": 0, "errors": []}
+            can_flatten, live_reason = _live_trader_can_flatten()
+            if include_live and can_flatten:
+                if str(body.get("confirm_live_close_all") or "") != "FLATTEN_LIVE":
+                    self._json_response(
+                        {
+                            "status": "error",
+                            "error": "live_close_all_confirmation_required",
+                            "hint": "Send confirm_live_close_all='FLATTEN_LIVE' to flatten live Hyperliquid positions.",
+                        },
+                        code=409,
+                    )
+                    return
+                live_result = _close_all_live_positions()
+            elif include_live:
+                live_result = {"status": "skipped", "reason": live_reason, "closed": 0, "errors": []}
+
             open_trades = db.get_open_paper_trades()
             if not open_trades:
-                self._json_response({"status": "ok", "closed": 0, "message": "No open trades"})
+                self._json_response({
+                    "status": "ok",
+                    "closed": 0,
+                    "message": "No open paper trades",
+                    "live_close": live_result,
+                })
                 return
 
             closed = 0
             errors = []
             for trade in open_trades:
-                result = _close_paper_trade_at_market(trade["id"])
+                result = _close_paper_trade_at_market(trade["id"], close_live=False)
                 if result.get("status") == "ok":
                     closed += 1
                 else:
@@ -2467,6 +2627,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 "closed": closed,
                 "total": len(open_trades),
                 "errors": errors if errors else None,
+                "live_close": live_result,
             })
         except Exception as e:
             logger.error("Close all trades error: %s", e)
@@ -2571,9 +2732,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
             for key in ("position_size_pct", "max_leverage", "stop_loss_pct",
                          "take_profit_pct", "trailing_stop_pct", "fast_period",
                          "slow_period", "rsi_period", "rsi_overbought", "rsi_oversold",
-                         "bb_period", "bb_std"):
+                         "bb_period", "bb_std", "slippage_bps", "maker_fee_bps",
+                         "taker_fee_bps", "vwap_window"):
                 if key in body:
                     cfg_params[key] = float(body[key]) if "." in str(body[key]) else int(body[key])
+            cfg_params.setdefault("maker_fee_bps", float(config.PAPER_TRADING_MAKER_FEE_BPS))
+            cfg_params.setdefault("taker_fee_bps", float(config.PAPER_TRADING_TAKER_FEE_BPS))
             cfg_params["strategy"] = strategy
             cfg = CandleBacktestConfig(**cfg_params)
 
@@ -2679,9 +2843,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
             body = self._read_json_body()
             if body is None:
                 return
+            allowed_fields = {
+                "symbol", "coin", "side", "size", "quantity", "price",
+                "order_type", "reduce_only", "time_in_force",
+            }
+            safe_order = {key: body.get(key) for key in allowed_fields if key in body}
             self._json_response({
                 "status": "Order queued (Deribit API keys required for live execution)",
-                "order": body,
+                "order": safe_order,
             })
         except Exception as e:
             self._json_response({"status": f"Error: {e}"}, code=400)
@@ -2725,12 +2894,28 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def _handle_backtest_run(self):
         """Trigger a golden wallet scan + backtest run."""
+        global _BACKTEST_JOB_RUNNING, _BACKTEST_JOB_STARTED_AT  # noqa: PLW0603
         try:
             import threading
             from src.discovery.golden_wallet import run_golden_scan, init_golden_tables
             from src.backtest.backtest_engine import run_all_backtests, save_backtest_result, init_backtest_tables
 
+            with _BACKTEST_JOB_LOCK:
+                if _BACKTEST_JOB_RUNNING:
+                    self._json_response(
+                        {
+                            "status": "running",
+                            "error": "backtest_job_already_running",
+                            "started_at_epoch_s": _BACKTEST_JOB_STARTED_AT,
+                        },
+                        code=409,
+                    )
+                    return
+                _BACKTEST_JOB_RUNNING = True
+                _BACKTEST_JOB_STARTED_AT = time.time()
+
             def _run():
+                global _BACKTEST_JOB_RUNNING, _BACKTEST_JOB_STARTED_AT  # noqa: PLW0603
                 try:
                     init_golden_tables()
                     init_backtest_tables()
@@ -2741,11 +2926,18 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 except Exception as e:
                     import logging
                     logging.getLogger("backtest").error(f"Background scan error: {e}")
+                finally:
+                    with _BACKTEST_JOB_LOCK:
+                        _BACKTEST_JOB_RUNNING = False
+                        _BACKTEST_JOB_STARTED_AT = None
 
             t = threading.Thread(target=_run, daemon=True)
             t.start()
             self._json_response({"status": "started", "message": "Golden scan + backtest running in background. Refresh in a few minutes."})
         except Exception as e:
+            with _BACKTEST_JOB_LOCK:
+                _BACKTEST_JOB_RUNNING = False
+                _BACKTEST_JOB_STARTED_AT = None
             self._json_response({"error": str(e)}, code=500)
 
 

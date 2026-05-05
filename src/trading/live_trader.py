@@ -704,6 +704,17 @@ class LiveTrader:
         self._price_history: Dict[str, float] = {}  # coin -> last known good mid
         self._price_seed_candidates: Dict[str, float] = {}  # coin -> untrusted first sample
 
+        # Daily-PnL refresh resilience: a single transient userFills failure
+        # used to trip the sticky kill switch immediately, which then blocked
+        # all live entries until an operator manually cleared the state file.
+        # We now require a streak of consecutive failures before failing
+        # closed, while still resetting the counter on the next success.
+        self._daily_pnl_refresh_failure_streak = 0
+        self._daily_pnl_refresh_failure_threshold = max(
+            1,
+            int(getattr(config, "LIVE_DAILY_PNL_REFRESH_FAILURE_THRESHOLD", 3) or 1),
+        )
+
         # Fill verification defaults:
         # - verify_fill() API remains blocking by default for backward compatibility.
         # - execute_signal() uses a separate non-blocking default to avoid cycle stalls.
@@ -1143,6 +1154,23 @@ class LiveTrader:
 
     def _load_persisted_kill_switch_state(self) -> None:
         """Restore sticky kill-switch state from the previous process."""
+        # When the operator has set LIVE_KILL_SWITCH_DISABLED, also clear
+        # any persisted active state so a later bypass-off doesn't bring
+        # back the previous trip from before the override. Without this,
+        # an operator who bypasses, fixes the upstream issue, then turns
+        # the bypass back off would silently re-inherit the old kill
+        # state.
+        if bool(getattr(config, "LIVE_KILL_SWITCH_DISABLED", False)):
+            logger.warning(
+                "LIVE_KILL_SWITCH_DISABLED=true -- skipping persisted kill-switch "
+                "restore. Active state file (if any) will be cleared on next "
+                "persist."
+            )
+            try:
+                self._persist_kill_switch_state(False, "operator_bypass_active")
+            except Exception:
+                pass
+            return
         path = self.kill_switch_state_file
         if not path or not os.path.exists(path):
             return
@@ -1169,11 +1197,20 @@ class LiveTrader:
                     self._persist_kill_switch_state(False, f"coin_quarantine:{reason}")
                     return
                 if self._should_auto_clear_persisted_kill_switch(reason):
-                    logger.warning(
-                        "Auto-clearing stale persisted kill switch (%s): "
-                        "dualwrite is healthy in this process.",
-                        reason,
-                    )
+                    if reason == "daily_pnl_refresh_failed":
+                        logger.warning(
+                            "Auto-clearing legacy persisted kill switch (%s). "
+                            "The current code requires a sustained userFills "
+                            "failure streak before failing closed; if the API "
+                            "is still degraded the kill switch will re-trip.",
+                            reason,
+                        )
+                    else:
+                        logger.warning(
+                            "Auto-clearing stale persisted kill switch (%s): "
+                            "dualwrite is healthy in this process.",
+                            reason,
+                        )
                     self._persist_kill_switch_state(False, f"auto_cleared:{reason}")
                     return
                 with self._state_lock:
@@ -1191,13 +1228,27 @@ class LiveTrader:
     def _should_auto_clear_persisted_kill_switch(self, reason: str) -> bool:
         """Return True for healed, machine-detectable persisted kill switches.
 
-        Only the stale ``dualwrite_unhealthy`` case can clear itself here.
+        Two stale cases can clear themselves here:
+
+        * ``dualwrite_unhealthy:*`` — auto-clears once the dualwrite mirror
+          and Postgres are healthy again.
+        * ``daily_pnl_refresh_failed`` — pre-threshold versions of this code
+          tripped the sticky kill switch on a *single* transient userFills
+          failure, which then permanently blocked live entries. The current
+          code requires a sustained failure streak
+          (``LIVE_DAILY_PNL_REFRESH_FAILURE_THRESHOLD``) before tripping, so
+          a single legacy failure no longer warrants a sticky stop. If the
+          underlying API is still broken, the threshold guard will re-trip
+          the switch after N consecutive failures.
+
         Legacy ``protective_order_churn:<coin>`` states are handled in
         _load_persisted_kill_switch_state by converting the global stop into
         a coin-level quarantine. Manual, external-file and daily-loss kill
         switches stay sticky until an operator clears them.
         """
         reason = str(reason or "")
+        if reason == "daily_pnl_refresh_failed":
+            return True
         if not reason.startswith("dualwrite_unhealthy:"):
             return False
         try:
@@ -1546,6 +1597,16 @@ class LiveTrader:
             return True
         return False
 
+    def _kill_switch_globally_disabled(self) -> bool:
+        """Read the operator-controlled master bypass.
+
+        Checked at every gate so flipping ``LIVE_KILL_SWITCH_DISABLED`` in
+        env -> config-reload takes effect on the next cycle without a
+        process restart. Defaults to False so the bypass must be opted
+        into explicitly.
+        """
+        return bool(getattr(config, "LIVE_KILL_SWITCH_DISABLED", False))
+
     def activate_kill_switch(
         self,
         reason: str,
@@ -1560,8 +1621,27 @@ class LiveTrader:
         they aren't tailing logs.  C1.  Alert failures are swallowed — the
         kill switch must remain effective even when notifications are
         misconfigured.
+
+        When ``LIVE_KILL_SWITCH_DISABLED=true`` the activation is logged
+        but the in-memory flag, the persisted state file, and the
+        Telegram alert are all skipped -- live entries continue to flow.
+        Operators take full responsibility for safety while the bypass is
+        on.
         """
         reason = str(reason or "unspecified")
+        if self._kill_switch_globally_disabled():
+            logger.critical(
+                "Kill switch BYPASSED (LIVE_KILL_SWITCH_DISABLED=true) -- would have "
+                "tripped on (%s) status=%s; live entries continue.",
+                reason, status_reason,
+            )
+            with self._state_lock:
+                # Keep the public flag clean so all downstream gates see
+                # "not active" -- the bypass is the source of truth.
+                self.kill_switch_active = False
+                self._kill_switch_reason = ""
+                self.status_reason = "kill_switch_disabled_by_operator"
+            return
         changed = False
         with self._state_lock:
             changed = (not self.kill_switch_active) or self._kill_switch_reason != reason
@@ -1575,10 +1655,24 @@ class LiveTrader:
                 tg.notify_kill_switch_activated(reason, status_reason=status_reason)
             except Exception as alert_exc:
                 logger.warning("Kill-switch Telegram alert skipped: %s", alert_exc)
+            # Notify v2 dashboard subscribers so the audit + positions tabs
+            # repaint without polling. No-op when v2 isn't running.
+            try:
+                from src.ui.v2.events import publish_event
+                publish_event(
+                    "kill_switch",
+                    transition="activated",
+                    reason=reason,
+                    status_reason=status_reason,
+                )
+            except Exception:
+                pass
         if persist:
             self._persist_kill_switch_state(True, reason)
 
     def _kill_switch_is_active(self) -> bool:
+        if self._kill_switch_globally_disabled():
+            return False
         lock = getattr(self, "_state_lock", None)
         if lock is None:
             return bool(getattr(self, "kill_switch_active", False))
@@ -1587,19 +1681,89 @@ class LiveTrader:
 
     def get_kill_switch_state(self) -> Dict[str, Any]:
         """Return a thread-safe snapshot of the sticky kill-switch state."""
+        disabled = self._kill_switch_globally_disabled()
         lock = getattr(self, "_state_lock", None)
         if lock is None:
             return {
-                "active": bool(getattr(self, "kill_switch_active", False)),
+                "active": bool(getattr(self, "kill_switch_active", False)) and not disabled,
                 "reason": getattr(self, "_kill_switch_reason", "") or None,
                 "status_reason": getattr(self, "status_reason", "") or None,
+                "operator_bypass": disabled,
             }
         with lock:
             return {
-                "active": bool(self.kill_switch_active),
+                "active": bool(self.kill_switch_active) and not disabled,
                 "reason": self._kill_switch_reason or None,
                 "status_reason": self.status_reason or None,
+                "operator_bypass": disabled,
             }
+
+    def operator_clear_kill_switch(self, *, reason: str, operator: str = "operator") -> Dict[str, Any]:
+        """Clear the sticky kill switch on explicit operator command.
+
+        Until now the only way to lift a sticky stop was deleting the
+        state file out-of-band. This method gives the v2 dashboard a
+        safe, audit-logged path:
+
+        * The previous kill-switch state is captured before the clear.
+        * The clear is logged at CRITICAL with the supplied reason and
+          operator identity so it appears in incident reviews.
+        * The persisted state file is overwritten with ``active=False``
+          so the bot won't restore the kill switch on next restart.
+        * If the underlying problem is still present (daily-loss limit
+          exceeded, dualwrite still unhealthy, daily-PnL refresh still
+          failing), the next cycle's safety checks will trip the
+          switch again -- this is the intended behaviour.
+
+        Returns a snapshot ``{cleared, previous_active, previous_reason,
+        ts, operator}``.
+        """
+        cleared_reason = (reason or "").strip() or "operator-cleared"
+        operator_id = (operator or "operator").strip() or "operator"
+        previous = self.get_kill_switch_state()
+        with self._state_lock:
+            self.kill_switch_active = False
+            self._kill_switch_reason = ""
+            self.status_reason = "operator_cleared"
+        logger.critical(
+            "Kill switch CLEARED by %s -- previous reason=%s, audit reason=%s",
+            operator_id,
+            previous.get("reason") or "(none)",
+            cleared_reason,
+        )
+        try:
+            self._persist_kill_switch_state(False, f"operator_cleared:{cleared_reason}")
+        except Exception as exc:
+            logger.warning("Failed to persist kill-switch clear: %s", exc)
+        try:
+            from src.notifications import telegram_bot as tg
+            tg.notify_kill_switch_cleared(
+                operator=operator_id,
+                previous_reason=previous.get("reason"),
+                audit_reason=cleared_reason,
+            )
+        except Exception as alert_exc:
+            logger.debug("Kill-switch clear Telegram alert skipped: %s", alert_exc)
+        # Push to v2 dashboard subscribers (audit feed updates live).
+        try:
+            from src.ui.v2.events import publish_event
+            publish_event(
+                "kill_switch",
+                transition="cleared",
+                operator=operator_id,
+                previous_reason=previous.get("reason"),
+                audit_reason=cleared_reason,
+            )
+        except Exception:
+            pass
+        return {
+            "cleared": True,
+            "previous_active": bool(previous.get("active")),
+            "previous_reason": previous.get("reason"),
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "operator": operator_id,
+            "audit_reason": cleared_reason,
+        }
 
     def get_safety_stop_reason(self) -> str:
         """Return the active live-entry stop reason for operator logs."""
@@ -4216,17 +4380,42 @@ class LiveTrader:
             if hasattr(self.firewall, "set_daily_losses"):
                 self.firewall.set_daily_losses(abs(min(current_daily_pnl, 0.0)))
 
+            # A successful refresh resets the failure streak so a later
+            # transient blip does not jump straight to the threshold.
+            if self._daily_pnl_refresh_failure_streak:
+                logger.info(
+                    "Daily PnL refresh recovered after %d consecutive failure(s)",
+                    self._daily_pnl_refresh_failure_streak,
+                )
+                self._daily_pnl_refresh_failure_streak = 0
+
             # Check if kill switch should trigger
             if trigger_check:
                 self.check_daily_loss(refresh_from_fills=False)
             return True
 
         except Exception as e:
-            logger.error("Failed to update daily PnL from fills: %s", e, exc_info=True)
-            if self.live_requested and not self.dry_run:
+            self._daily_pnl_refresh_failure_streak += 1
+            streak = self._daily_pnl_refresh_failure_streak
+            threshold = self._daily_pnl_refresh_failure_threshold
+            should_trip = (
+                self.live_requested
+                and not self.dry_run
+                and streak >= threshold
+            )
+            if should_trip:
+                logger.error(
+                    "Failed to update daily PnL from fills (%d consecutive failures, threshold=%d): %s",
+                    streak, threshold, e, exc_info=True,
+                )
                 self.activate_kill_switch(
                     "daily_pnl_refresh_failed",
                     status_reason="daily_pnl_unavailable",
+                )
+            else:
+                logger.warning(
+                    "Daily PnL refresh failed (%d/%d consecutive); will retry next cycle: %s",
+                    streak, threshold, e,
                 )
             return False
 
@@ -6166,6 +6355,17 @@ class LiveTrader:
             else:
                 self._incr_entry_metric("rejected_kill_switch")
             logger.warning("Live safety stop (%s) - rejecting signal", reason)
+            return None
+
+        # Soft calibration pause: not sticky, just blocks live entries
+        # while global ECE is above the live-pause threshold. Set by
+        # the trading cycle (or any caller that touches calibration).
+        if getattr(self, "_calibration_live_paused_this_cycle", False):
+            self._incr_entry_metric("rejected_calibration_live_paused")
+            logger.warning(
+                "Live calibration pause - rejecting %s %s (global ECE above pause threshold)",
+                signal.side, signal.coin,
+            )
             return None
 
         if not self.dry_run and self._order_dedup_reconcile_required:

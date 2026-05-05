@@ -29,6 +29,16 @@ from typing import List, Dict, Tuple
 
 logger = logging.getLogger("candle_backtester")
 
+MS_PER_YEAR = 365.25 * 24 * 60 * 60 * 1000
+TIMEFRAME_MS = {
+    "1m": 60_000,
+    "5m": 300_000,
+    "15m": 900_000,
+    "1h": 3_600_000,
+    "4h": 14_400_000,
+    "1d": 86_400_000,
+}
+
 
 # ─── Config ──────────────────────────────────────────────────────
 
@@ -73,6 +83,7 @@ class CandleBacktestConfig:
 
     # VWAP params
     vwap_std: float = 1.5               # Std devs for VWAP bands
+    vwap_window: int = 50               # Rolling VWAP window in candles
 
     # Ichimoku params
     ichi_tenkan: int = 9
@@ -149,8 +160,11 @@ def _rsi(close: np.ndarray, period: int = 14) -> np.ndarray:
     for i in range(period, len(delta)):
         avg_gain = (avg_gain * (period - 1) + gains[i]) / period
         avg_loss = (avg_loss * (period - 1) + losses[i]) / period
-        rs = avg_gain / avg_loss if avg_loss > 0 else 100
-        out[i + 1] = 100 - (100 / (1 + rs))
+        if avg_loss == 0:
+            out[i + 1] = 100.0 if avg_gain > 0 else 50.0
+        else:
+            rs = avg_gain / avg_loss
+            out[i + 1] = 100 - (100 / (1 + rs))
 
     return out
 
@@ -184,10 +198,33 @@ def _bollinger(close: np.ndarray, period: int = 20,
     # Rolling std
     std = np.full_like(close, np.nan)
     for i in range(period - 1, len(close)):
-        std[i] = np.std(close[i - period + 1:i + 1])
+        std[i] = np.std(close[i - period + 1:i + 1], ddof=1 if period > 1 else 0)
     upper = mid + std_mult * std
     lower = mid - std_mult * std
     return upper, mid, lower
+
+
+def _infer_interval_ms(timestamps: np.ndarray, tf: str = "") -> float:
+    """Infer candle interval from timestamps, falling back to timeframe label."""
+    if len(timestamps) > 2:
+        diffs = np.diff(timestamps.astype(np.float64))
+        diffs = diffs[np.isfinite(diffs) & (diffs > 0)]
+        if len(diffs) > 0:
+            return float(np.median(diffs))
+    return float(TIMEFRAME_MS.get(str(tf or "").lower(), TIMEFRAME_MS["1h"]))
+
+
+def _bars_per_year(timestamps: np.ndarray, tf: str = "") -> float:
+    interval_ms = max(_infer_interval_ms(timestamps, tf), 1.0)
+    return MS_PER_YEAR / interval_ms
+
+
+def _holding_hours(timestamps: np.ndarray, entry_idx: int, exit_idx: int, fallback_candles: int) -> float:
+    if 0 <= entry_idx < len(timestamps) and 0 <= exit_idx < len(timestamps):
+        delta_ms = int(timestamps[exit_idx]) - int(timestamps[entry_idx])
+        if delta_ms > 0:
+            return delta_ms / 3_600_000.0
+    return max(float(fallback_candles), 0.0)
 
 
 # ─── Strategy Signal Generators ──────────────────────────────────
@@ -303,24 +340,29 @@ def _signals_vwap(close: np.ndarray, high: np.ndarray, low: np.ndarray,
                   volume: np.ndarray, cfg: CandleBacktestConfig) -> np.ndarray:
     """VWAP mean reversion: buy below lower band, sell above upper band."""
     typical = (high + low + close) / 3.0
-    cum_vol = np.cumsum(volume)
-    cum_tp_vol = np.cumsum(typical * volume)
+    window_len = max(int(getattr(cfg, "vwap_window", 50) or 50), 2)
+    rolling_vwap = np.full(len(close), np.nan)
+    upper_band = np.full(len(close), np.nan)
+    lower_band = np.full(len(close), np.nan)
     signals = np.zeros(len(close), dtype=np.int8)
 
-    for i in range(20, len(close)):
-        if cum_vol[i] == 0:
+    for i in range(window_len - 1, len(close)):
+        start = max(0, i - window_len + 1)
+        vol_window = volume[start:i + 1]
+        vol_sum = float(np.sum(vol_window))
+        if vol_sum <= 0:
             continue
-        vwap = cum_tp_vol[i] / cum_vol[i]
-        # Rolling std of (close - vwap)
-        window = close[max(0, i - 50):i + 1]
-        vwap_window = cum_tp_vol[max(0, i - 50):i + 1] / np.maximum(cum_vol[max(0, i - 50):i + 1], 1e-10)
-        dev = np.std(window - vwap_window)
-        upper = vwap + cfg.vwap_std * dev
-        lower = vwap - cfg.vwap_std * dev
+        vwap = float(np.sum(typical[start:i + 1] * vol_window) / vol_sum)
+        dev = float(np.std(close[start:i + 1] - vwap, ddof=1 if i - start >= 1 else 0))
+        rolling_vwap[i] = vwap
+        upper_band[i] = vwap + cfg.vwap_std * dev
+        lower_band[i] = vwap - cfg.vwap_std * dev
 
-        if close[i] <= lower and close[i - 1] > lower:
+        if i == 0 or np.isnan(lower_band[i - 1]) or np.isnan(upper_band[i - 1]):
+            continue
+        if close[i] <= lower_band[i] and close[i - 1] > lower_band[i - 1]:
             signals[i] = 1   # Below lower VWAP band → long
-        elif close[i] >= upper and close[i - 1] < upper:
+        elif close[i] >= upper_band[i] and close[i - 1] < upper_band[i - 1]:
             signals[i] = -1  # Above upper VWAP band → short
     return signals
 
@@ -769,15 +811,18 @@ class CandleBacktester:
         pos_entry = 0.0
         pos_size = 0.0
         pos_entry_idx = 0
+        pos_entry_fee = 0.0
+        pos_entry_notional = 0.0
         pos_trail_high = 0.0
         pos_trail_low = float("inf")
 
         fee_rate = cfg.taker_fee_bps / 10_000
         slip_rate = cfg.slippage_bps / 10_000
-        total_fees = 0.0
+        leverage = max(float(cfg.max_leverage or 0.0), 0.0)
 
         for i in range(len(close)):
             price = close[i]
+            exited_this_bar = False
 
             # Check exits on existing position
             if pos_side != 0:
@@ -790,15 +835,21 @@ class CandleBacktester:
                 # Check TP/SL/trailing
                 exit_reason = None
                 exit_price = price
+                intrabar_ambiguous = False
 
                 if pos_side == 1:  # Long
                     pnl_pct = (price - pos_entry) / pos_entry
-                    if low[i] <= pos_entry * (1 - cfg.stop_loss_pct):
+                    stop_price = pos_entry * (1 - cfg.stop_loss_pct)
+                    take_profit_price = pos_entry * (1 + cfg.take_profit_pct)
+                    hit_stop = low[i] <= stop_price
+                    hit_take_profit = high[i] >= take_profit_price
+                    intrabar_ambiguous = hit_stop and hit_take_profit
+                    if hit_stop:
                         exit_reason = "stop_loss"
-                        exit_price = pos_entry * (1 - cfg.stop_loss_pct)
-                    elif high[i] >= pos_entry * (1 + cfg.take_profit_pct):
+                        exit_price = stop_price
+                    elif hit_take_profit:
                         exit_reason = "take_profit"
-                        exit_price = pos_entry * (1 + cfg.take_profit_pct)
+                        exit_price = take_profit_price
                     elif cfg.trailing_stop_pct > 0 and pos_trail_high > 0:
                         trail_trigger = pos_trail_high * (1 - cfg.trailing_stop_pct)
                         if low[i] <= trail_trigger and pnl_pct > cfg.trailing_stop_pct:
@@ -806,12 +857,17 @@ class CandleBacktester:
                             exit_price = trail_trigger
                 else:  # Short
                     pnl_pct = (pos_entry - price) / pos_entry
-                    if high[i] >= pos_entry * (1 + cfg.stop_loss_pct):
+                    stop_price = pos_entry * (1 + cfg.stop_loss_pct)
+                    take_profit_price = pos_entry * (1 - cfg.take_profit_pct)
+                    hit_stop = high[i] >= stop_price
+                    hit_take_profit = low[i] <= take_profit_price
+                    intrabar_ambiguous = hit_stop and hit_take_profit
+                    if hit_stop:
                         exit_reason = "stop_loss"
-                        exit_price = pos_entry * (1 + cfg.stop_loss_pct)
-                    elif low[i] <= pos_entry * (1 - cfg.take_profit_pct):
+                        exit_price = stop_price
+                    elif hit_take_profit:
                         exit_reason = "take_profit"
-                        exit_price = pos_entry * (1 - cfg.take_profit_pct)
+                        exit_price = take_profit_price
                     elif cfg.trailing_stop_pct > 0 and pos_trail_low < float("inf"):
                         trail_trigger = pos_trail_low * (1 + cfg.trailing_stop_pct)
                         if high[i] >= trail_trigger and pnl_pct > cfg.trailing_stop_pct:
@@ -827,23 +883,24 @@ class CandleBacktester:
                     # Apply slippage on exit
                     if pos_side == 1:
                         exit_price *= (1 - slip_rate)
-                        pnl = (exit_price - pos_entry) * pos_size * cfg.max_leverage
+                        gross_pnl = (exit_price - pos_entry) * pos_size * leverage
                     else:
                         exit_price *= (1 + slip_rate)
-                        pnl = (pos_entry - exit_price) * pos_size * cfg.max_leverage
+                        gross_pnl = (pos_entry - exit_price) * pos_size * leverage
 
-                    fee = abs(pos_size * exit_price * fee_rate)
-                    pnl -= fee
-                    total_fees += fee
+                    exit_notional = abs(pos_size * exit_price * leverage)
+                    fee = exit_notional * fee_rate
 
                     # Funding charges
+                    funding = 0.0
                     if cfg.funding_enabled:
                         hold_candles = i - pos_entry_idx
-                        # Approximate: assume each candle is one period
-                        funding = pos_size * pos_entry * cfg.funding_rate_8h * (hold_candles / 8)
-                        pnl -= funding
+                        hold_hours = _holding_hours(timestamps, pos_entry_idx, i, hold_candles)
+                        funding = pos_entry_notional * cfg.funding_rate_8h * (hold_hours / 8.0)
 
-                    balance += pnl
+                    exit_cash_pnl = gross_pnl - fee - funding
+                    trade_net_pnl = exit_cash_pnl - pos_entry_fee
+                    balance += exit_cash_pnl
                     trades.append({
                         "entry_idx": pos_entry_idx,
                         "exit_idx": i,
@@ -851,9 +908,15 @@ class CandleBacktester:
                         "entry_price": pos_entry,
                         "exit_price": exit_price,
                         "size": pos_size,
-                        "pnl": pnl,
-                        "pnl_pct": pnl / (pos_entry * pos_size) * 100 if pos_size > 0 else 0,
+                        "notional_entry": pos_entry_notional,
+                        "notional_exit": exit_notional,
+                        "entry_fee": pos_entry_fee,
+                        "exit_fee": fee,
+                        "funding": funding,
+                        "pnl": trade_net_pnl,
+                        "pnl_pct": trade_net_pnl / (pos_entry * pos_size) * 100 if pos_size > 0 else 0,
                         "exit_reason": exit_reason,
+                        "intrabar_ambiguous": intrabar_ambiguous,
                         "hold_candles": i - pos_entry_idx,
                         "entry_ts": int(timestamps[pos_entry_idx]) if pos_entry_idx < len(timestamps) else 0,
                         "exit_ts": int(timestamps[i]),
@@ -862,9 +925,12 @@ class CandleBacktester:
                     pos_side = 0
                     pos_entry = 0
                     pos_size = 0
+                    pos_entry_fee = 0
+                    pos_entry_notional = 0
+                    exited_this_bar = True
 
             # Open new position on signal (if flat)
-            if pos_side == 0 and signals[i] != 0:
+            if pos_side == 0 and not exited_this_bar and signals[i] != 0:
                 pos_side = int(signals[i])
                 # Apply slippage on entry
                 if pos_side == 1:
@@ -877,28 +943,41 @@ class CandleBacktester:
                 pos_trail_high = high[i]
                 pos_trail_low = low[i]
 
-                fee = abs(pos_size * pos_entry * fee_rate)
-                balance -= fee
-                total_fees += fee
+                pos_entry_notional = abs(pos_size * pos_entry * leverage)
+                pos_entry_fee = pos_entry_notional * fee_rate
+                balance -= pos_entry_fee
 
             # Track equity
             unrealized = 0.0
             if pos_side == 1:
-                unrealized = (price - pos_entry) * pos_size * cfg.max_leverage
+                unrealized = (price - pos_entry) * pos_size * leverage
             elif pos_side == -1:
-                unrealized = (pos_entry - price) * pos_size * cfg.max_leverage
+                unrealized = (pos_entry - price) * pos_size * leverage
             equity.append(balance + unrealized)
 
         # Force close if still in position
         if pos_side != 0:
             final_price = close[-1]
             if pos_side == 1:
-                pnl = (final_price - pos_entry) * pos_size * cfg.max_leverage
+                final_price *= (1 - slip_rate)
+                gross_pnl = (final_price - pos_entry) * pos_size * leverage
             else:
-                pnl = (pos_entry - final_price) * pos_size * cfg.max_leverage
-            fee = abs(pos_size * final_price * fee_rate)
-            pnl -= fee
-            balance += pnl
+                final_price *= (1 + slip_rate)
+                gross_pnl = (pos_entry - final_price) * pos_size * leverage
+            exit_notional = abs(pos_size * final_price * leverage)
+            fee = exit_notional * fee_rate
+            hold_candles = len(close) - 1 - pos_entry_idx
+            hold_hours = _holding_hours(timestamps, pos_entry_idx, len(close) - 1, hold_candles)
+            funding = (
+                pos_entry_notional * cfg.funding_rate_8h * (hold_hours / 8.0)
+                if cfg.funding_enabled
+                else 0.0
+            )
+            exit_cash_pnl = gross_pnl - fee - funding
+            trade_net_pnl = exit_cash_pnl - pos_entry_fee
+            balance += exit_cash_pnl
+            if equity:
+                equity[-1] = balance
             trades.append({
                 "entry_idx": pos_entry_idx,
                 "exit_idx": len(close) - 1,
@@ -906,9 +985,15 @@ class CandleBacktester:
                 "entry_price": pos_entry,
                 "exit_price": final_price,
                 "size": pos_size,
-                "pnl": pnl,
-                "pnl_pct": pnl / (pos_entry * pos_size) * 100 if pos_size > 0 else 0,
+                "notional_entry": pos_entry_notional,
+                "notional_exit": exit_notional,
+                "entry_fee": pos_entry_fee,
+                "exit_fee": fee,
+                "funding": funding,
+                "pnl": trade_net_pnl,
+                "pnl_pct": trade_net_pnl / (pos_entry * pos_size) * 100 if pos_size > 0 else 0,
                 "exit_reason": "end_of_data",
+                "intrabar_ambiguous": False,
                 "hold_candles": len(close) - 1 - pos_entry_idx,
                 "entry_ts": int(timestamps[pos_entry_idx]) if pos_entry_idx < len(timestamps) else 0,
                 "exit_ts": int(timestamps[-1]),
@@ -939,25 +1024,37 @@ class CandleBacktester:
         max_dd = float(np.max(drawdown)) * 100 if len(drawdown) > 0 else 0
 
         # Returns for Sharpe/Sortino
+        annualization = _bars_per_year(timestamps, tf)
         if len(equity) > 1:
             returns = np.diff(equity) / equity[:-1]
             returns = returns[np.isfinite(returns)]
 
-            if len(returns) > 1 and np.std(returns) > 0:
-                sharpe = float(np.mean(returns) / np.std(returns) * np.sqrt(252))
+            std = np.std(returns, ddof=1) if len(returns) > 1 else 0.0
+            if len(returns) > 1 and std > 0:
+                sharpe = float(np.mean(returns) / std * np.sqrt(annualization))
             else:
                 sharpe = 0.0
 
             downside = returns[returns < 0]
-            if len(downside) > 0 and np.std(downside) > 0:
-                sortino = float(np.mean(returns) / np.std(downside) * np.sqrt(252))
+            downside_std = np.std(downside, ddof=1) if len(downside) > 1 else 0.0
+            if len(downside) > 1 and downside_std > 0:
+                sortino = float(np.mean(returns) / downside_std * np.sqrt(annualization))
             else:
                 sortino = 0.0
         else:
             sharpe = sortino = 0.0
 
         # Calmar ratio: annualized return / max drawdown
-        calmar = total_pnl_pct / max_dd if max_dd > 0 else 0.0
+        years = 0.0
+        if len(timestamps) > 1:
+            years = max((float(timestamps[-1]) - float(timestamps[0])) / MS_PER_YEAR, 0.0)
+        if years > 0 and cfg.initial_balance > 0 and equity[-1] > 0:
+            annual_return_pct = ((float(equity[-1]) / cfg.initial_balance) ** (1.0 / years) - 1.0) * 100.0
+        elif years > 0:
+            annual_return_pct = -100.0
+        else:
+            annual_return_pct = total_pnl_pct
+        calmar = annual_return_pct / max_dd if max_dd > 0 else 0.0
 
         # Profit factor
         gross_profit = float(np.sum(pnls[pnls > 0])) if len(pnls) > 0 else 0
@@ -972,8 +1069,8 @@ class CandleBacktester:
 
         # Total fees
         total_fees = sum(
-            abs(t["size"] * t["entry_price"] * cfg.taker_fee_bps / 10_000) +
-            abs(t["size"] * t["exit_price"] * cfg.taker_fee_bps / 10_000)
+            float(t.get("entry_fee", abs(t["size"] * t["entry_price"] * cfg.max_leverage * cfg.taker_fee_bps / 10_000))) +
+            float(t.get("exit_fee", abs(t["size"] * t["exit_price"] * cfg.max_leverage * cfg.taker_fee_bps / 10_000)))
             for t in trades
         )
 

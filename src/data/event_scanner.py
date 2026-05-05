@@ -168,7 +168,7 @@ class EventScanner:
             "updated_at": _utc_now().isoformat(),
         }
 
-    def _classify_event(self, title: str, source: str) -> Dict:
+    def _classify_event(self, title: str, source: str, summary: str = "") -> Dict:
         """Classify a news/calendar event title into category + severity.
 
         ★ M25 FIX: previously broke on the FIRST matching rule, so an event
@@ -201,12 +201,13 @@ class EventScanner:
             category = "central_bank"
             severity = "high"
 
+        inferred_assets = self._infer_assets(title, summary, source)
         return {
             "category": category,
             "severity": severity,
             "severity_rank": SEVERITY_RANK[severity],
             "is_core": is_core,
-            "assets": list(DEFAULT_ASSETS),
+            "assets": inferred_assets or list(DEFAULT_ASSETS),
             "tags": tags[:3],
         }
 
@@ -256,7 +257,7 @@ class EventScanner:
         if not title:
             return None
 
-        classification = self._classify_event(title, source)
+        classification = self._classify_event(title, source, summary)
         if classification["severity"] == "low" and not classification["is_core"]:
             return None
         if classification["severity"] == "medium" and not self.include_medium:
@@ -268,7 +269,9 @@ class EventScanner:
         minutes_until = int((reference_ts - now).total_seconds() // 60) if reference_ts > now else 0
         status = "upcoming" if event_time and event_time > now else "recent"
 
-        dedupe_key = f"{source}|{title.lower()}|{reference_ts.isoformat()}"
+        title_key = re.sub(r"\s+", " ", title.lower()).strip()
+        reference_key = link or reference_ts.replace(second=0, microsecond=0).isoformat()
+        dedupe_key = f"{source}|{title_key}|{reference_key}"
         return {
             "id": dedupe_key,
             "source": source,
@@ -309,6 +312,8 @@ class EventScanner:
             return None
         try:
             if "VALUE=DATE" in params:
+                # BLS all-day dates are US release dates; midnight ET is the
+                # least surprising source-specific anchor for this feed.
                 dt = datetime.strptime(raw_value, "%Y%m%d")
                 return dt.replace(tzinfo=ET_TZ).astimezone(timezone.utc)
             if raw_value.endswith("Z"):

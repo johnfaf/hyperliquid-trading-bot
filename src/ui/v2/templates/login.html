@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en" class="bg-slate-950 text-slate-100">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>{{ title }} — Hyperliquid Bot</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>body { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }</style>
+</head>
+<body class="min-h-screen flex items-center justify-center px-4">
+  <form method="post" action="/api/auth/login" class="w-full max-w-sm bg-slate-900 border border-slate-800 rounded-lg p-6 shadow-xl">
+    <h1 class="text-lg font-semibold mb-4 text-emerald-400">Hyperliquid Bot Dashboard</h1>
+    {% if error %}
+      <div class="mb-3 text-sm text-rose-300 bg-rose-900/40 border border-rose-800 rounded px-3 py-2">{{ error }}</div>
+    {% endif %}
+    <label class="block text-xs text-slate-400 mb-1">Access token</label>
+    <input
+      name="token"
+      type="password"
+      autocomplete="current-password"
+      class="w-full bg-slate-950 border border-slate-700 rounded px-3 py-2 text-sm focus:outline-none focus:border-emerald-500"
+      autofocus
+    />
+    <button class="mt-4 w-full bg-emerald-600 hover:bg-emerald-500 text-white text-sm font-semibold py-2 rounded">
+      Sign in
+    </button>
+    <p class="mt-3 text-xs text-slate-500">
+      Token comes from the <code class="text-slate-300">DASHBOARD_AUTH_TOKEN</code> env var.
+    </p>
+  </form>
+</body>
+</html>

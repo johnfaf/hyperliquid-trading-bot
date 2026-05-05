@@ -16,6 +16,19 @@ from src.data import database as db
 logger = logging.getLogger(__name__)
 
 
+def _text(value, default: str = "") -> str:
+    if value is None:
+        return default
+    return str(value)
+
+
+def _num(value, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
 class Reporter:
     """Generates reports and summaries."""
 
@@ -83,10 +96,13 @@ class Reporter:
             report.append("| Coin | Side | Entry | Size | Leverage | SL | TP |")
             report.append("|------|------|-------|------|----------|----|----|")
             for t in open_trades:
+                coin = _text(t.get("coin"), "?")
+                side = _text(t.get("side"), "?").upper()
                 report.append(
-                    f"| {t['coin']} | {t['side'].upper()} | ${t['entry_price']:,.2f} | "
-                    f"{t['size']:.4f} | {t['leverage']}x | ${t['stop_loss'] or 0:,.2f} | "
-                    f"${t['take_profit'] or 0:,.2f} |"
+                    f"| {coin} | {side} | ${_num(t.get('entry_price')):,.2f} | "
+                    f"{_num(t.get('size')):.4f} | {_num(t.get('leverage'), 1):g}x | "
+                    f"${_num(t.get('stop_loss')):,.2f} | "
+                    f"${_num(t.get('take_profit')):,.2f} |"
                 )
             report.append("")
 
@@ -97,10 +113,14 @@ class Reporter:
             report.append("| Coin | Side | Entry | Exit | PnL | Leverage |")
             report.append("|------|------|-------|------|-----|----------|")
             for t in closed:
-                pnl_str = f"${t['pnl']:+,.2f}" if t['pnl'] else "$0"
+                coin = _text(t.get("coin"), "?")
+                side = _text(t.get("side"), "?").upper()
+                pnl = _num(t.get("pnl"))
+                pnl_str = f"${pnl:+,.2f}" if pnl else "$0"
                 report.append(
-                    f"| {t['coin']} | {t['side'].upper()} | ${t['entry_price']:,.2f} | "
-                    f"${t['exit_price'] or 0:,.2f} | {pnl_str} | {t['leverage']}x |"
+                    f"| {coin} | {side} | ${_num(t.get('entry_price')):,.2f} | "
+                    f"${_num(t.get('exit_price')):,.2f} | {pnl_str} | "
+                    f"{_num(t.get('leverage'), 1):g}x |"
                 )
             report.append("")
 

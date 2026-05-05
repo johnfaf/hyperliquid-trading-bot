@@ -134,6 +134,7 @@ def analyse_timeframe(fills: List[Dict], timeframe: Timeframe) -> TimeframeRepor
     if not fills:
         return TimeframeReport(timeframe=timeframe.value, total_periods=0, active_periods=0)
 
+    fills = sorted(fills, key=lambda f: f["time_ms"])
     window_ms = TIMEFRAME_MS[timeframe]
     min_time = fills[0]["time_ms"]
     max_time = fills[-1]["time_ms"]
@@ -144,11 +145,19 @@ def analyse_timeframe(fills: List[Dict], timeframe: Timeframe) -> TimeframeRepor
 
     periods = []
     current = period_start
+    idx = 0
+    n_fills = len(fills)
 
     while current < period_end:
         next_boundary = current + window_ms
-        # Get fills in this window
-        bucket = [f for f in fills if current <= f["time_ms"] < next_boundary]
+        bucket = []
+        while idx < n_fills and fills[idx]["time_ms"] < current:
+            idx += 1
+        scan_idx = idx
+        while scan_idx < n_fills and fills[scan_idx]["time_ms"] < next_boundary:
+            bucket.append(fills[scan_idx])
+            scan_idx += 1
+        idx = scan_idx
 
         if bucket:
             closing = [f for f in bucket if f["penalised_pnl"] != 0]
@@ -219,7 +228,7 @@ def analyse_by_coin(fills: List[Dict]) -> Dict[str, Dict]:
             coins[c]["pen_pnl"] += f["penalised_pnl"]
             if f["penalised_pnl"] > 0:
                 coins[c]["wins"] += 1
-            else:
+            elif f["penalised_pnl"] < 0:
                 coins[c]["losses"] += 1
 
     # Round and add win_rate

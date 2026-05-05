@@ -11,7 +11,9 @@ import json
 import logging
 import os
 import threading
+import time
 import uuid
+from collections import Counter
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
@@ -22,6 +24,40 @@ logger = logging.getLogger(__name__)
 _SCHEMA_LOCK = threading.Lock()
 _SCHEMA_READY = False
 _SCHEMA_WARNED = False
+_WRITE_FAILURE_LOCK = threading.Lock()
+_WRITE_FAILURES: Counter[str] = Counter()
+_WRITE_FAILURE_LAST_LOG: dict[str, float] = {}
+_WRITE_FAILURE_LOG_INTERVAL_S = 60.0
+
+
+def _record_write_failure(area: str, exc: Exception) -> None:
+    now = time.time()
+    with _WRITE_FAILURE_LOCK:
+        _WRITE_FAILURES[str(area)] += 1
+        count = int(_WRITE_FAILURES[str(area)])
+        last_log = float(_WRITE_FAILURE_LAST_LOG.get(str(area), 0.0) or 0.0)
+        should_log = now - last_log >= _WRITE_FAILURE_LOG_INTERVAL_S
+        if should_log:
+            _WRITE_FAILURE_LAST_LOG[str(area)] = now
+    if should_log:
+        logger.warning(
+            "Decision journal %s failed (%d total): %s: %s",
+            area,
+            count,
+            type(exc).__name__,
+            exc,
+        )
+
+
+def get_write_failure_stats() -> Dict[str, Any]:
+    with _WRITE_FAILURE_LOCK:
+        by_area = dict(_WRITE_FAILURES)
+        last_log = dict(_WRITE_FAILURE_LAST_LOG)
+    return {
+        "total": int(sum(by_area.values())),
+        "by_area": by_area,
+        "last_log_ts": last_log,
+    }
 
 
 POSTGRES_DECISION_SNAPSHOT_DDL = """
@@ -154,7 +190,7 @@ def ensure_schema_ready(force: bool = False) -> bool:
                     with db.get_connection() as conn:
                         ensure_sqlite_schema(conn)
                 except Exception as exc:
-                    logger.debug("Decision journal SQLite schema ensure skipped: %s", exc)
+                    _record_write_failure("sqlite_schema_ensure", exc)
 
             if config.DB_BACKEND in ("postgres", "dualwrite"):
                 from src.data.db.postgres import get_connection, return_connection
@@ -176,7 +212,7 @@ def ensure_schema_ready(force: bool = False) -> bool:
             _SCHEMA_READY = True
             return True
         except Exception as exc:
-            logger.debug("Decision journal schema ensure failed: %s", exc)
+            _record_write_failure("schema_ensure", exc)
             return False
 
 
@@ -421,7 +457,7 @@ def record_decision_snapshot(
             )
         return decision_id
     except Exception as exc:
-        logger.debug("Decision snapshot write skipped: %s", exc)
+        _record_write_failure("snapshot_write", exc)
         return None
 
 
@@ -487,7 +523,7 @@ def update_decision_status(
                 )
         return True
     except Exception as exc:
-        logger.debug("Decision status update skipped: %s", exc)
+        _record_write_failure("status_update", exc)
         return False
 
 
@@ -534,7 +570,7 @@ def link_paper_trade(
                 )
         return True
     except Exception as exc:
-        logger.debug("Decision paper-trade link skipped: %s", exc)
+        _record_write_failure("paper_trade_link", exc)
         return False
 
 
@@ -582,7 +618,7 @@ def record_stage_event(
             )
         return True
     except Exception as exc:
-        logger.debug("Decision stage event write skipped: %s", exc)
+        _record_write_failure("stage_event_write", exc)
         return False
 
 
@@ -868,5 +904,5 @@ def record_decision_outcome(
             )
         return True
     except Exception as exc:
-        logger.debug("Decision outcome write skipped: %s", exc)
+        _record_write_failure("outcome_write", exc)
         return False

@@ -16,9 +16,12 @@ Scenarios modeled from actual Hyperliquid / crypto events:
 """
 
 import copy
+import os
 import random
 from dataclasses import dataclass, field, asdict
 from typing import List, Dict, Optional, Tuple
+
+BASE_STRESS_SLIPPAGE_BPS = float(os.environ.get("HL_GOLDEN_FEE_SLIPPAGE_BPS", 15.0))
 
 
 # ─── Scenario Configuration ───────────────────────────────────────
@@ -64,7 +67,7 @@ class LiquidityDrainConfig:
     enabled: bool = True
     name: str = "Liquidity Evaporation"
     # Slippage dynamics
-    normal_slippage_bps: float = 4.5      # normal: 4.5 bps
+    normal_slippage_bps: float = BASE_STRESS_SLIPPAGE_BPS
     crisis_slippage_bps: float = 150.0    # crisis: 150 bps (1.5%)
     drain_duration_hours: int = 48        # 2 days of thin books
     ramp_up_hours: int = 6                # books thin over 6h
@@ -200,7 +203,7 @@ def inject_flash_crash(fills: list, cfg: FlashCrashConfig,
             crash_price = trough_price + (recovery_price - trough_price) * progress
 
         # Apply panic slippage
-        slippage = cfg.panic_slippage_mult * 4.5 / 10_000
+        slippage = cfg.panic_slippage_mult * BASE_STRESS_SLIPPAGE_BPS / 10_000
         f["original_price"] = round(crash_price, 6)
         if f["side"] == "buy":
             f["penalised_price"] = round(crash_price * (1 + slippage), 6)
@@ -214,7 +217,7 @@ def inject_flash_crash(fills: list, cfg: FlashCrashConfig,
         t = t_start + int(rng.uniform(0, t_duration * 0.4))  # front-loaded
         progress = min(1.0, (t - t_start) / max(1, t_trough - t_start))
         price = ref_price - (ref_price - trough_price) * progress
-        slippage = cfg.panic_slippage_mult * 4.5 / 10_000
+        slippage = cfg.panic_slippage_mult * BASE_STRESS_SLIPPAGE_BPS / 10_000
 
         fill = {
             "wallet_address": "0xstress_flash_crash",

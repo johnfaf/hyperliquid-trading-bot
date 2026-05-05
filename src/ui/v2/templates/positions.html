@@ -1,0 +1,315 @@
+{% extends "base.html" %}
+{% block content %}
+{% set d = data %}
+<section class="grid grid-cols-2 md:grid-cols-4 gap-3 mb-6"
+         data-ws-refresh-on="cycle,kill_switch,calibration"
+         hx-get="/positions?fragment=summary"
+         hx-trigger="wsEvent from:body, every 15s"
+         hx-swap="none">
+  <div class="bg-slate-900 border border-slate-800 rounded p-3">
+    <div class="text-[10px] uppercase tracking-wide text-slate-500">Open positions</div>
+    <div class="mt-1 text-2xl font-semibold text-slate-100">{{ d.totals.count }}</div>
+    <div class="mt-1 text-[10px] text-slate-500">
+      notional ${{ '%.0f'|format(d.totals.notional) }}
+    </div>
+  </div>
+  <div class="bg-slate-900 border border-slate-800 rounded p-3">
+    <div class="text-[10px] uppercase tracking-wide text-slate-500">Unrealized PnL</div>
+    <div class="mt-1 text-2xl font-semibold {% if d.totals.unrealized_pnl > 0 %}text-emerald-300{% elif d.totals.unrealized_pnl < 0 %}text-rose-300{% else %}text-slate-200{% endif %}">
+      ${{ '%+.2f'|format(d.totals.unrealized_pnl) }}
+    </div>
+    <div class="mt-1 text-[10px] text-slate-500">across all open positions</div>
+  </div>
+  <div class="bg-slate-900 border border-slate-800 rounded p-3">
+    <div class="text-[10px] uppercase tracking-wide text-slate-500">Daily PnL</div>
+    {% if d.daily.pnl is none %}
+      <div class="mt-1 text-2xl font-semibold text-slate-500">—</div>
+    {% else %}
+      <div class="mt-1 text-2xl font-semibold {% if d.daily.pnl > 0 %}text-emerald-300{% elif d.daily.pnl < 0 %}text-rose-300{% else %}text-slate-200{% endif %}">
+        ${{ '%+.2f'|format(d.daily.pnl) }}
+      </div>
+    {% endif %}
+    {% if d.daily.max_loss %}
+      <div class="mt-1 text-[10px] text-slate-500">limit -${{ '%.0f'|format(d.daily.max_loss) }}</div>
+    {% endif %}
+  </div>
+  <div class="bg-slate-900 border border-slate-800 rounded p-3">
+    <div class="text-[10px] uppercase tracking-wide text-slate-500">Live status</div>
+    {% if not d.live_available %}
+      <div class="mt-1 text-2xl font-semibold text-slate-500">N/A</div>
+      <div class="mt-1 text-[10px] text-slate-500">no live trader wired</div>
+    {% elif d.dry_run %}
+      <div class="mt-1 text-2xl font-semibold text-amber-300">DRY-RUN</div>
+      <div class="mt-1 text-[10px] text-slate-500">paper only</div>
+    {% elif d.kill_switch.operator_bypass %}
+      <div class="mt-1 text-2xl font-semibold text-amber-300">BYPASS</div>
+      <div class="mt-1 text-[10px] text-amber-400">LIVE_KILL_SWITCH_DISABLED=true</div>
+    {% elif d.kill_switch.active %}
+      <div class="mt-1 text-2xl font-semibold text-rose-300">BLOCKED</div>
+      <div class="mt-1 text-[10px] text-rose-400 break-all">{{ d.kill_switch.reason or d.kill_switch.status_reason }}</div>
+    {% elif d.calibration.live_paused %}
+      <div class="mt-1 text-2xl font-semibold text-amber-300">PAUSED</div>
+      <div class="mt-1 text-[10px] text-amber-400">global ECE high</div>
+    {% else %}
+      <div class="mt-1 text-2xl font-semibold text-emerald-300">LIVE</div>
+      <div class="mt-1 text-[10px] text-slate-500">accepting entries</div>
+    {% endif %}
+  </div>
+</section>
+
+{% if d.kill_switch.operator_bypass %}
+<section class="mb-6 bg-amber-950/40 border border-amber-800 rounded p-4">
+  <h2 class="text-sm font-semibold text-amber-200">Kill switch DISABLED by operator</h2>
+  <p class="mt-1 text-xs text-amber-300/90">
+    <code class="text-amber-100">LIVE_KILL_SWITCH_DISABLED=true</code> is set. Every safety
+    trip (daily-loss, dualwrite health, daily-PnL refresh, drawdown, external file)
+    is logged but ignored. Per-source firewall checks, position caps, and
+    order-size limits still apply. Unset the variable and restart to re-enable
+    the sticky safety net.
+  </p>
+</section>
+{% endif %}
+
+{% if d.kill_switch.active %}
+<section class="mb-6 bg-rose-950/40 border border-rose-800 rounded p-4">
+  <div class="flex items-start gap-4">
+    <div class="flex-1">
+      <h2 class="text-sm font-semibold text-rose-200">Sticky kill switch is engaged</h2>
+      <p class="mt-1 text-xs text-rose-300/90">
+        Reason: <code class="text-rose-200 break-all">{{ d.kill_switch.reason or d.kill_switch.status_reason }}</code><br>
+        Live entries will not ship until cleared. Use this only after you have understood and resolved the
+        underlying cause -- the next cycle's safety check will re-trip the switch if the problem persists.
+      </p>
+    </div>
+    <form id="clear-form"
+          hx-post="/api/operator/clear_kill_switch"
+          hx-trigger="submit"
+          hx-target="#clear-result"
+          hx-swap="innerHTML"
+          class="flex flex-col gap-2 w-72">
+      <input
+        name="audit_reason"
+        placeholder="why are you clearing? (audit log)"
+        required
+        minlength="4"
+        class="bg-slate-950 border border-slate-700 rounded px-2 py-1 text-xs focus:outline-none focus:border-rose-500"
+      />
+      <button class="bg-rose-700 hover:bg-rose-600 text-white text-xs font-semibold py-1.5 rounded">
+        Clear kill switch
+      </button>
+      <div id="clear-result" class="text-xs"></div>
+    </form>
+  </div>
+</section>
+{% endif %}
+
+<section class="mb-6">
+  <div class="flex items-center justify-between mb-2">
+    <h2 class="text-sm font-semibold text-slate-300">Open positions</h2>
+    <div class="text-xs text-slate-500">exchange truth, refreshed each cycle</div>
+  </div>
+  <div class="overflow-x-auto bg-slate-900 border border-slate-800 rounded">
+    <table class="w-full text-xs">
+      <thead class="bg-slate-950/60 text-slate-400">
+        <tr>
+          <th class="text-left py-2 px-3 font-medium">Coin</th>
+          <th class="text-left py-2 px-3 font-medium">Side</th>
+          <th class="text-right py-2 px-3 font-medium">Size</th>
+          <th class="text-right py-2 px-3 font-medium">Entry</th>
+          <th class="text-right py-2 px-3 font-medium">Mark</th>
+          <th class="text-left py-2 px-3 font-medium">SL ◀ Mark ▶ TP</th>
+          <th class="text-right py-2 px-3 font-medium">Notional</th>
+          <th class="text-right py-2 px-3 font-medium">Lev</th>
+          <th class="text-left py-2 px-3 font-medium">Margin</th>
+          <th class="text-right py-2 px-3 font-medium">Unrealized</th>
+        </tr>
+      </thead>
+      <tbody class="divide-y divide-slate-800">
+        {% for p in d.positions %}
+        <tr class="hover:bg-slate-800/40">
+          <td class="py-1.5 px-3 text-slate-200 font-semibold">{{ p.coin }}</td>
+          <td class="py-1.5 px-3">
+            <span class="inline-block px-2 py-0.5 rounded text-[10px] {% if p.side == 'long' %}bg-emerald-900/60 text-emerald-200{% else %}bg-rose-900/60 text-rose-200{% endif %}">
+              {{ p.side|upper }}
+            </span>
+          </td>
+          <td class="py-1.5 px-3 text-right text-slate-300 font-mono">{{ '%.4f'|format(p.size) }}</td>
+          <td class="py-1.5 px-3 text-right text-slate-400 font-mono">${{ '%.2f'|format(p.entry_price) }}</td>
+          <td class="py-1.5 px-3 text-right text-slate-300 font-mono">
+            {% if p.mark_price %}${{ '%.2f'|format(p.mark_price) }}{% else %}—{% endif %}
+          </td>
+          <td class="py-1.5 px-3 w-48"
+              data-sl="{{ p.sl_price if p.sl_price is not none else '' }}"
+              data-tp="{{ p.tp_price if p.tp_price is not none else '' }}"
+              data-entry="{{ p.entry_price }}"
+              data-mark="{{ p.mark_price if p.mark_price is not none else p.entry_price }}"
+              data-side="{{ p.side }}">
+            {% if p.sl_price or p.tp_price %}
+              <div class="position-spark relative h-2 bg-slate-800 rounded">
+                <div class="absolute inset-y-0 bg-emerald-700/30 rounded sl-tp-band"></div>
+                <div class="absolute top-1/2 -translate-y-1/2 w-px h-3 bg-slate-400 entry-marker" title="entry"></div>
+                <div class="absolute top-1/2 -translate-y-1/2 w-1.5 h-1.5 rounded-full bg-amber-300 mark-marker" title="mark"></div>
+              </div>
+              <div class="flex justify-between text-[9px] text-slate-500 mt-1 font-mono">
+                <span>{% if p.sl_price %}SL ${{ '%.2f'|format(p.sl_price) }}{% else %}— SL{% endif %}</span>
+                <span>{% if p.tp_price %}TP ${{ '%.2f'|format(p.tp_price) }}{% else %}TP —{% endif %}</span>
+              </div>
+            {% else %}
+              <div class="text-[10px] text-rose-300">⚠ unprotected</div>
+            {% endif %}
+          </td>
+          <td class="py-1.5 px-3 text-right text-slate-300 font-mono">${{ '%.0f'|format(p.notional) }}</td>
+          <td class="py-1.5 px-3 text-right text-slate-400">{{ '%.0fx'|format(p.leverage) }}</td>
+          <td class="py-1.5 px-3 text-slate-500">{{ 'cross' if p.is_cross else 'isolated' }}</td>
+          <td class="py-1.5 px-3 text-right font-mono {% if p.unrealized_pnl > 0 %}text-emerald-300{% elif p.unrealized_pnl < 0 %}text-rose-300{% else %}text-slate-300{% endif %}">
+            ${{ '%+.2f'|format(p.unrealized_pnl) }}
+          </td>
+        </tr>
+        {% else %}
+        <tr><td colspan="10" class="py-6 text-center text-slate-500">No open positions.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section class="mt-6">
+  <div class="flex items-center justify-between mb-2">
+    <h2 class="text-sm font-semibold text-slate-300">Recent fills</h2>
+    <div class="text-xs text-slate-500">
+      <span id="fills-status" class="text-slate-500">loading…</span>
+    </div>
+  </div>
+  <div class="bg-slate-900 border border-slate-800 rounded">
+    <ul id="fills-ticker" class="divide-y divide-slate-800 max-h-72 overflow-y-auto text-xs"></ul>
+  </div>
+</section>
+
+<script>
+  // ── SL/TP sparkline rendering ──────────────────────────────────
+  // Each row's data-* attributes drive a tiny inline bar that shows
+  // where mark sits between SL and TP. We do this client-side rather
+  // than precomputing widths so the bar updates when only mark changes
+  // via WS refresh.
+  function renderSparks() {
+    document.querySelectorAll('.position-spark').forEach((bar) => {
+      const cell = bar.closest('td');
+      if (!cell) return;
+      const sl = parseFloat(cell.dataset.sl);
+      const tp = parseFloat(cell.dataset.tp);
+      const entry = parseFloat(cell.dataset.entry);
+      const mark = parseFloat(cell.dataset.mark);
+      const side = (cell.dataset.side || 'long').toLowerCase();
+      // Compose [low, high] range from SL/TP/entry/mark; missing legs
+      // are inferred as ±1% from entry just so the marker has a track.
+      const candidates = [sl, tp, entry, mark].filter((v) => Number.isFinite(v));
+      if (!candidates.length) return;
+      let lo = Math.min(...candidates);
+      let hi = Math.max(...candidates);
+      if (lo === hi) { lo *= 0.99; hi *= 1.01; }
+      const pct = (v) => Math.max(0, Math.min(100, ((v - lo) / (hi - lo)) * 100));
+      const band = bar.querySelector('.sl-tp-band');
+      const entryMarker = bar.querySelector('.entry-marker');
+      const markMarker = bar.querySelector('.mark-marker');
+      // Band spans SL→TP (so the operator sees the protected envelope).
+      if (band && Number.isFinite(sl) && Number.isFinite(tp)) {
+        const left = Math.min(pct(sl), pct(tp));
+        const right = Math.max(pct(sl), pct(tp));
+        band.style.left = `${left}%`;
+        band.style.width = `${right - left}%`;
+      } else if (band) {
+        band.style.display = 'none';
+      }
+      if (entryMarker && Number.isFinite(entry)) {
+        entryMarker.style.left = `calc(${pct(entry)}% - 0.5px)`;
+      }
+      if (markMarker && Number.isFinite(mark)) {
+        markMarker.style.left = `calc(${pct(mark)}% - 3px)`;
+        // Recolor mark by which side of entry it landed on, scoped to side.
+        const winning = side === 'long' ? mark > entry : mark < entry;
+        markMarker.classList.remove('bg-amber-300', 'bg-emerald-300', 'bg-rose-300');
+        markMarker.classList.add(winning ? 'bg-emerald-300' : 'bg-rose-300');
+      }
+    });
+  }
+  renderSparks();
+  document.body.addEventListener('htmx:afterSwap', renderSparks);
+
+  // ── Recent-fills ticker ────────────────────────────────────────
+  // Polls /api/fills/recent every 8s; bumped to immediately on a
+  // ``cycle`` WS event so the ticker reflects new fills the moment
+  // the trading cycle records them.
+  async function refreshFillsTicker() {
+    const status = document.getElementById('fills-status');
+    const list = document.getElementById('fills-ticker');
+    if (!list) return;
+    try {
+      const resp = await fetch('/api/fills/recent?limit=25');
+      if (!resp.ok) {
+        if (status) status.textContent = `error ${resp.status}`;
+        return;
+      }
+      const data = await resp.json();
+      const fills = data.fills || [];
+      if (status) status.textContent = `${fills.length} fills`;
+      list.innerHTML = fills.map((f) => {
+        const ts = f.ts_ms ? new Date(f.ts_ms).toISOString().slice(11, 19) : '—';
+        const sideTag = f.side === 'B' ? 'BUY'
+                      : f.side === 'A' ? 'SELL'
+                      : (f.side || '').toUpperCase();
+        const sideClass = (f.side === 'B' || f.side === 'long')
+          ? 'bg-emerald-900/60 text-emerald-200'
+          : 'bg-rose-900/60 text-rose-200';
+        const pnlClass = f.closed_pnl > 0 ? 'text-emerald-300'
+                       : f.closed_pnl < 0 ? 'text-rose-300'
+                       : 'text-slate-400';
+        const pnlStr = f.closed_pnl
+          ? `${f.closed_pnl > 0 ? '+' : ''}${f.closed_pnl.toFixed(2)}`
+          : '';
+        return `
+          <li class="py-1.5 px-3 flex items-center gap-3 hover:bg-slate-800/40">
+            <span class="text-slate-500 font-mono text-[10px] w-16">${ts}</span>
+            <span class="font-semibold text-slate-200 w-16">${f.coin}</span>
+            <span class="inline-block px-1.5 py-0.5 rounded text-[10px] ${sideClass}">${sideTag}</span>
+            <span class="text-slate-300 font-mono text-[11px] flex-1">${f.size.toFixed(4)} @ $${f.price.toFixed(2)}</span>
+            <span class="font-mono ${pnlClass}">${pnlStr}</span>
+          </li>`;
+      }).join('') || '<li class="py-3 px-3 text-center text-slate-500">No recent fills.</li>';
+    } catch (e) {
+      if (status) status.textContent = 'network error';
+    }
+  }
+  refreshFillsTicker();
+  setInterval(refreshFillsTicker, 8000);
+  document.body.addEventListener('htmx:afterSwap', () => { /* no-op */ });
+  // WS-driven refresh: any cycle event triggers an immediate ticker poll.
+  window.addEventListener('ws-event', (ev) => {
+    const kind = (ev.detail && ev.detail.kind) || '';
+    if (kind === 'cycle' || kind === 'fill') {
+      refreshFillsTicker();
+    }
+  });
+
+  // Render the JSON response inline so the operator sees the audit
+  // entry rather than a raw dump.
+  document.body.addEventListener('htmx:afterRequest', (ev) => {
+    if (!ev.target.id || ev.target.id !== 'clear-form') return;
+    const xhr = ev.detail.xhr;
+    const result = document.getElementById('clear-result');
+    if (!result) return;
+    if (xhr.status >= 200 && xhr.status < 300) {
+      result.className = 'text-xs text-emerald-300';
+      result.textContent = 'Cleared. Reload to confirm.';
+      setTimeout(() => location.reload(), 1500);
+    } else {
+      let msg = 'Clear failed.';
+      try {
+        const body = JSON.parse(xhr.responseText);
+        msg = body.message || body.error || msg;
+      } catch (e) { /* leave default */ }
+      result.className = 'text-xs text-rose-300';
+      result.textContent = msg;
+    }
+  });
+</script>
+{% endblock %}

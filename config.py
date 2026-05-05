@@ -343,10 +343,10 @@ TRADE_QUALITY_STRONG_SHORT_CONFIRMATION = os.environ.get(
 # HL_PUBLIC_ADDRESS points to the trading account (master/vault) being managed.
 LIVE_TRADING_ENABLED = os.environ.get(
     "LIVE_TRADING_ENABLED", "false"
-).lower() in ("true", "1", "yes")
+).strip().lower() in ("true", "1", "yes")
 LIVE_TRADING_DUAL_CONTROL_CONFIRM = os.environ.get(
     "LIVE_TRADING_DUAL_CONTROL_CONFIRM", "false"
-).lower() in ("true", "1", "yes")
+).strip().lower() in ("true", "1", "yes")
 
 # ─── Live Order Caps (cautious bootstrap) ─────────────────────
 # Hyperliquid enforces a $10 minimum notional per order on both perps and
@@ -496,6 +496,60 @@ COPY_TRADER_SOURCE_SIDE_SIZE_MULTIPLIER = float(
 )
 LIVE_EXTERNAL_KILL_SWITCH_FILE = os.environ.get("LIVE_EXTERNAL_KILL_SWITCH_FILE", "").strip()
 LIVE_KILL_SWITCH_STATE_FILE = os.environ.get("LIVE_KILL_SWITCH_STATE_FILE", "/data/live_kill_switch_state.json").strip()
+# Master kill-switch override. When true, every kill-switch trip is
+# logged but ignored: live entries continue to flow regardless of
+# daily-loss limit, dualwrite health, daily-PnL refresh failures,
+# external file flag, drawdown limit, or any other safety chain that
+# would normally stop trading. Use only when you are absolutely sure
+# (operator maintenance, infra outage you've already mitigated, etc.)
+# -- per-source firewall checks, position caps, and order-size limits
+# still apply, but the *sticky* gate is bypassed entirely.
+LIVE_KILL_SWITCH_DISABLED = os.environ.get(
+    "LIVE_KILL_SWITCH_DISABLED", "false"
+).strip().lower() in ("1", "true", "yes", "on")
+# Number of consecutive userFills failures tolerated before the daily-PnL
+# refresh trips the sticky kill switch. A single transient API blip should
+# not permanently disable live trading; sustained outages still fail closed.
+LIVE_DAILY_PNL_REFRESH_FAILURE_THRESHOLD = max(
+    1, int(os.environ.get("LIVE_DAILY_PNL_REFRESH_FAILURE_THRESHOLD", "3"))
+)
+
+# Confidence calibration controls.
+# Older outcomes get exponentially down-weighted with this half-life so
+# the calibrator tracks the current strategy stack rather than the
+# all-time history. Set to 0 to disable decay entirely.
+CALIBRATION_HALF_LIFE_DAYS = float(
+    os.environ.get("CALIBRATION_HALF_LIFE_DAYS", "30")
+)
+# Per-source minimum outcomes before we trust calibrated confidence at
+# all. Below this threshold, predictions are capped to the cold-start
+# prior (CALIBRATION_COLDSTART_PRIOR) so an uncalibrated source cannot
+# emit aggressive confidences.
+CALIBRATION_MIN_OUTCOMES = int(
+    os.environ.get("CALIBRATION_MIN_OUTCOMES", "30")
+)
+CALIBRATION_COLDSTART_PRIOR = float(
+    os.environ.get("CALIBRATION_COLDSTART_PRIOR", "0.50")
+)
+# Above this minimum we still apply Bayesian shrinkage; we only trust
+# the empirical isotonic fit once a source crosses this many outcomes.
+CALIBRATION_ISOTONIC_MIN_OUTCOMES = int(
+    os.environ.get("CALIBRATION_ISOTONIC_MIN_OUTCOMES", "100")
+)
+# Auto-quarantine sources whose ECE crosses this threshold once they
+# have at least CALIBRATION_QUARANTINE_MIN_SAMPLES outcomes. Quarantined
+# sources are routed to shadow only until ECE recovers.
+CALIBRATION_QUARANTINE_ECE = float(
+    os.environ.get("CALIBRATION_QUARANTINE_ECE", "0.25")
+)
+CALIBRATION_QUARANTINE_MIN_SAMPLES = int(
+    os.environ.get("CALIBRATION_QUARANTINE_MIN_SAMPLES", "50")
+)
+# When the global calibrator goes off the rails (ECE >= this), pause
+# live entries entirely. Paper trades continue to feed the calibrator.
+CALIBRATION_LIVE_PAUSE_ECE = float(
+    os.environ.get("CALIBRATION_LIVE_PAUSE_ECE", "0.50")
+)
 RUNTIME_CONFIG_OVERRIDE_FILE = os.environ.get("RUNTIME_CONFIG_OVERRIDE_FILE", "/data/config.json").strip()
 RUNTIME_CONFIG_POLL_SECONDS = int(os.environ.get("RUNTIME_CONFIG_POLL_SECONDS", 10))
 HL_WALLET_MODE = os.environ.get("HL_WALLET_MODE", "agent_only").strip().lower()
@@ -586,8 +640,8 @@ SHORT_HARDENING_ENABLED = os.environ.get("SHORT_HARDENING_ENABLED", "true").lowe
 SHORT_HARDENING_LOOKBACK_TRADES = int(os.environ.get("SHORT_HARDENING_LOOKBACK_TRADES", 120))
 SHORT_HARDENING_MIN_CLOSED_TRADES = int(os.environ.get("SHORT_HARDENING_MIN_CLOSED_TRADES", 12))
 SHORT_HARDENING_DEGRADE_WIN_RATE = float(os.environ.get("SHORT_HARDENING_DEGRADE_WIN_RATE", 0.48))
-SHORT_HARDENING_BLOCK_WIN_RATE = float(os.environ.get("SHORT_HARDENING_BLOCK_WIN_RATE", 0.40))
-SHORT_HARDENING_BLOCK_NET_PNL = float(os.environ.get("SHORT_HARDENING_BLOCK_NET_PNL", -0.5))
+SHORT_HARDENING_BLOCK_WIN_RATE = float(os.environ.get("SHORT_HARDENING_BLOCK_WIN_RATE", 0.30))
+SHORT_HARDENING_BLOCK_NET_PNL = float(os.environ.get("SHORT_HARDENING_BLOCK_NET_PNL", -25.0))
 SHORT_HARDENING_CONFIDENCE_MULTIPLIER = float(
     os.environ.get("SHORT_HARDENING_CONFIDENCE_MULTIPLIER", 0.80)
 )
@@ -654,7 +708,7 @@ SOURCE_POLICY_DEGRADE_WEIGHT = float(
     os.environ.get("SOURCE_POLICY_DEGRADE_WEIGHT", 0.32)
 )
 SOURCE_POLICY_WARMUP_MAX_SIGNALS_PER_DAY = int(
-    os.environ.get("SOURCE_POLICY_WARMUP_MAX_SIGNALS_PER_DAY", 1)
+    os.environ.get("SOURCE_POLICY_WARMUP_MAX_SIGNALS_PER_DAY", 4)
 )
 SOURCE_POLICY_DEGRADED_MAX_SIGNALS_PER_DAY = int(
     os.environ.get("SOURCE_POLICY_DEGRADED_MAX_SIGNALS_PER_DAY", 1)
@@ -925,7 +979,7 @@ def _validate_config_bounds() -> None:
         ("SOURCE_POLICY_KEEP_TOP_N", 1, 1000, 5),
         ("SOURCE_POLICY_PAUSE_WEIGHT", 0.0, 1.0, 0.12),
         ("SOURCE_POLICY_DEGRADE_WEIGHT", 0.0, 1.0, 0.32),
-        ("SOURCE_POLICY_WARMUP_MAX_SIGNALS_PER_DAY", 0, 100_000, 1),
+        ("SOURCE_POLICY_WARMUP_MAX_SIGNALS_PER_DAY", 0, 100_000, 4),
         ("SOURCE_POLICY_DEGRADED_MAX_SIGNALS_PER_DAY", 0, 100_000, 1),
         ("SOURCE_POLICY_WARMUP_SIZE_MULTIPLIER", 0.0, 1.0, 0.75),
         ("SOURCE_POLICY_DEGRADED_SIZE_MULTIPLIER", 0.0, 1.0, 0.60),
@@ -1036,8 +1090,8 @@ def _validate_config_bounds() -> None:
         ("SHORT_HARDENING_LOOKBACK_TRADES", 10, 5_000, 120),
         ("SHORT_HARDENING_MIN_CLOSED_TRADES", 1, 1_000, 12),
         ("SHORT_HARDENING_DEGRADE_WIN_RATE", 0.0, 1.0, 0.48),
-        ("SHORT_HARDENING_BLOCK_WIN_RATE", 0.0, 1.0, 0.40),
-        ("SHORT_HARDENING_BLOCK_NET_PNL", -1_000_000.0, 1_000_000.0, -0.5),
+        ("SHORT_HARDENING_BLOCK_WIN_RATE", 0.0, 1.0, 0.30),
+        ("SHORT_HARDENING_BLOCK_NET_PNL", -1_000_000.0, 1_000_000.0, -25.0),
         ("SHORT_HARDENING_CONFIDENCE_MULTIPLIER", 0.0, 1.0, 0.80),
         ("SHORT_HARDENING_SIZE_MULTIPLIER", 0.0, 1.0, 0.50),
         ("SHORT_HARDENING_SOURCE_MIN_CLOSED_TRADES", 1, 1_000, 3),

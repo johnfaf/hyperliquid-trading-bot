@@ -9,7 +9,7 @@ import logging
 import requests
 import time
 from datetime import datetime, timezone
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -427,6 +427,38 @@ def notify_kill_switch_activated(reason: str, *, status_reason: str = "kill_swit
     )
     _send_message(text)
 
+
+def notify_kill_switch_cleared(
+    *, operator: str, previous_reason: Optional[str] = None,
+    audit_reason: Optional[str] = None,
+) -> None:
+    """Alert operators when an authorised user clears the sticky kill switch.
+
+    Counterpart to ``notify_kill_switch_activated``. The local JSONL
+    audit log records every clear regardless of Telegram configuration
+    so the trail is intact even if alerts are dropped.
+    """
+    now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    _write_local_kill_switch_log({
+        "timestamp_utc": now_iso,
+        "event": "kill_switch_cleared",
+        "operator": str(operator or "operator")[:100],
+        "previous_reason": str(previous_reason or "")[:500],
+        "audit_reason": str(audit_reason or "")[:500],
+        "telegram_configured": bool(is_configured()),
+    })
+    if not is_configured():
+        return
+    text = (
+        f"\u2705 <b>KILL SWITCH CLEARED</b>\n"
+        f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+        f"<b>Operator:</b> {str(operator or 'operator')[:80]}\n"
+        f"<b>Previous reason:</b> {str(previous_reason or '(none)')[:180]}\n"
+        f"<b>Audit reason:</b> {str(audit_reason or '(none)')[:180]}\n"
+        f"<b>Impact:</b> Live entries can resume; the next safety check that fails will re-trip the switch.\n"
+        f"\n\u23F0 {now_iso}"
+    )
+    _send_message(text)
 
 
 def notify_strong_signal(coin: str, side: str, reasons: List[str], confidence: float):

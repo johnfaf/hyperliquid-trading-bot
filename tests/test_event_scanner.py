@@ -200,6 +200,26 @@ def test_parse_statuspage_feed_extracts_crypto_incident():
     assert "BTC" in incidents[0]["assets"]
 
 
+def test_macro_event_asset_inference_does_not_broadcast_specific_coin():
+    scanner = EventScanner({"recent_hours": 96})
+    recent_pub = format_datetime(datetime.now(timezone.utc) - timedelta(hours=2))
+    rss = f"""<?xml version="1.0"?>
+    <rss><channel>
+      <item>
+        <title>USDC depeg risk update</title>
+        <link>https://example.com/usdc</link>
+        <pubDate>{recent_pub}</pubDate>
+        <description>USDC liquidity conditions are stressed</description>
+      </item>
+    </channel></rss>
+    """
+
+    events = scanner._parse_rss_feed(rss, "Federal Reserve")
+
+    assert len(events) == 1
+    assert events[0]["assets"] == ["USDC"]
+
+
 def test_parse_rss_feed_accepts_utf8_bom():
     scanner = EventScanner({"recent_hours": 96})
     recent_pub = format_datetime(datetime.now(timezone.utc) - timedelta(hours=2))

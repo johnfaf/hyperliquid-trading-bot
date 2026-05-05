@@ -16,7 +16,6 @@ import argparse
 import json
 import os
 import sqlite3
-import sys
 import time
 from datetime import datetime, timezone
 from typing import Any
@@ -77,6 +76,13 @@ def _fk_summary(conn: sqlite3.Connection) -> list[dict[str, Any]]:
         {"table": table, "parent": parent, "count": count}
         for (table, parent), count in sorted(summary.items(), key=lambda item: item[1], reverse=True)
     ]
+
+
+def _backup_sqlite(conn: sqlite3.Connection, path: str) -> str:
+    backup_path = f"{path}.backup.{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
+    with sqlite3.connect(backup_path) as backup:
+        conn.backup(backup)
+    return backup_path
 
 
 def _ensure_schema_migrations(conn: sqlite3.Connection) -> bool:
@@ -257,19 +263,25 @@ def _repair_paper_account(conn: sqlite3.Connection) -> dict[str, Any]:
     }
 
 
-def run(path: str) -> dict[str, Any]:
+def run(path: str, *, apply: bool = False, backup: bool = True) -> dict[str, Any]:
     conn = _connect(path)
     try:
         before = _fk_summary(conn)
         lock_attempt = _wait_for_immediate(conn)
+        backup_path = _backup_sqlite(conn, path) if apply and backup else None
         created_schema_migrations = _ensure_schema_migrations(conn)
         repaired_traders = _repair_orphan_traders(conn)
         repaired_strategies = _repair_orphan_strategies(conn)
         paper_account = _repair_paper_account(conn)
-        conn.commit()
+        if apply:
+            conn.commit()
+        else:
+            conn.rollback()
         after = _fk_summary(conn)
         return {
             "db_path": path,
+            "mode": "apply" if apply else "dry_run",
+            "backup_path": backup_path,
             "lock_attempt": lock_attempt,
             "created_schema_migrations": created_schema_migrations,
             "repaired_traders": repaired_traders,
@@ -292,13 +304,20 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Repair blocking live SQLite audit findings.")
     parser.add_argument("--db-path", default=None, help="SQLite DB path (defaults to HL_BOT_DB or /data/bot.db)")
     parser.add_argument("--json", action="store_true", help="Print machine-readable JSON output")
+    parser.add_argument("--apply", action="store_true", help="Commit repairs. Without this flag the script only previews and rolls back.")
+    parser.add_argument("--no-backup", action="store_true", help="Do not create a timestamped SQLite backup before --apply.")
     args = parser.parse_args(argv)
 
-    result = run(_db_path(args.db_path))
+    result = run(_db_path(args.db_path), apply=args.apply, backup=not args.no_backup)
     if args.json:
         print(json.dumps(result, indent=2, sort_keys=True))
     else:
         print(f"db_path: {result['db_path']}")
+        print(f"mode: {result['mode']}")
+        if result.get("backup_path"):
+            print(f"backup_path: {result['backup_path']}")
+        if not args.apply:
+            print("dry_run: no changes committed; re-run with --apply to write repairs")
         print(f"lock_attempt: {result['lock_attempt']}")
         print(f"created_schema_migrations: {result['created_schema_migrations']}")
         print(f"repaired_traders: {result['repaired_traders']}")

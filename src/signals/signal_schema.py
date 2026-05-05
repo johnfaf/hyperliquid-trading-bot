@@ -230,9 +230,9 @@ class TradeSignal:
         # max-position-pct check (configurable) is the real guardrail.
         if self.position_pct <= 0 or self.position_pct > 0.50:
             return False
-        if self.leverage < 1 or self.leverage > 20:
+        if self.leverage < 1:
             return False
-        if self.entry_price < 0:
+        if self.entry_price <= 0:
             return False
         return True
 

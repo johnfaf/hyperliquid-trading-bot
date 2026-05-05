@@ -277,8 +277,10 @@ def store_markets(raw_markets: Iterable[Dict[str, Any]], observed_at_ms: Optiona
             best_bid = _float(_first(market, ("bestBid", "best_bid"), None))
             best_ask = _float(_first(market, ("bestAsk", "best_ask"), None))
             spread_bps = None
-            if best_bid is not None and best_ask is not None and probability and probability > 0:
-                spread_bps = max(0.0, (best_ask - best_bid) / probability * 10_000)
+            if best_bid is not None and best_ask is not None:
+                mid = (best_bid + best_ask) / 2.0
+                if mid > 0:
+                    spread_bps = max(0.0, (best_ask - best_bid) / mid * 10_000)
 
             conn.execute(
                 """
@@ -309,36 +311,39 @@ def store_markets(raw_markets: Iterable[Dict[str, Any]], observed_at_ms: Optiona
                     raw_json,
                 ),
             )
-            conn.execute(
-                """
-                INSERT INTO polymarket_market_snapshots
-                (market_id, observed_at_ms, probability, volume, volume_24h,
-                 liquidity, best_bid, best_ask, spread_bps, raw_market)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(market_id, observed_at_ms) DO UPDATE SET
-                    probability = EXCLUDED.probability,
-                    volume = EXCLUDED.volume,
-                    volume_24h = EXCLUDED.volume_24h,
-                    liquidity = EXCLUDED.liquidity,
-                    best_bid = EXCLUDED.best_bid,
-                    best_ask = EXCLUDED.best_ask,
-                    spread_bps = EXCLUDED.spread_bps,
-                    raw_market = EXCLUDED.raw_market
-                """,
-                (
+            snapshot_observed = observed
+            for _attempt in range(1000):
+                cur = conn.execute(
+                    """
+                    INSERT INTO polymarket_market_snapshots
+                    (market_id, observed_at_ms, probability, volume, volume_24h,
+                     liquidity, best_bid, best_ask, spread_bps, raw_market)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(market_id, observed_at_ms) DO NOTHING
+                    """,
+                    (
+                        market_id,
+                        snapshot_observed,
+                        probability,
+                        volume,
+                        volume_24h,
+                        liquidity,
+                        best_bid,
+                        best_ask,
+                        spread_bps,
+                        raw_json,
+                    ),
+                )
+                if getattr(cur, "rowcount", 0) != 0:
+                    break
+                snapshot_observed += 1
+            else:
+                logger.warning(
+                    "Polymarket snapshot collision window exhausted for market_id=%s observed=%s",
                     market_id,
                     observed,
-                    probability,
-                    volume,
-                    volume_24h,
-                    liquidity,
-                    best_bid,
-                    best_ask,
-                    spread_bps,
-                    raw_json,
-                ),
-            )
-            for token in _extract_tokens(market, market_id, observed):
+                )
+            for token in _extract_tokens(market, market_id, snapshot_observed):
                 conn.execute(
                     """
                     INSERT INTO polymarket_tokens
@@ -361,7 +366,7 @@ def store_markets(raw_markets: Iterable[Dict[str, Any]], observed_at_ms: Optiona
                         token["last_seen_ms"],
                     ),
                 )
-            for point in _extract_price_points(market, market_id, observed):
+            for point in _extract_price_points(market, market_id, snapshot_observed):
                 conn.execute(
                     """
                     INSERT INTO polymarket_price_points

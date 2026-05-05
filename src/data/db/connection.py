@@ -266,6 +266,14 @@ class ConnectionAdapter:
                 return self._conn.execute(sql, params)
             return self._conn.execute(sql)
 
+    def executemany(self, sql: str, seq_of_params) -> CursorAdapter:
+        translated = _translate_sql(sql, self.backend)
+        if self.backend == "postgres":
+            cur = self._conn.cursor()
+            cur.executemany(translated, list(seq_of_params or []))
+            return CursorAdapter(cur)
+        return self._conn.executemany(sql, list(seq_of_params or []))
+
     def executescript(self, sql: str):
         """Execute a multi-statement script.
 
@@ -315,10 +323,9 @@ class _DualWriteStats:
     tell a healed outage from an ongoing one.
     """
 
-    # Cap the failure-timestamp deque so a long outage cannot grow the
-    # memory footprint without bound.  Any value here above the
-    # ``max_failures`` threshold is sufficient for the health check.
-    _MAX_FAILURE_TIMESTAMPS: int = 1024
+    # Keep enough history for incident review without capping the reported
+    # 5-minute count during a heavy outage.
+    _MAX_FAILURE_RETENTION_S: float = 24 * 60 * 60
 
     def __init__(self):
         self._lock = threading.Lock()
@@ -326,9 +333,12 @@ class _DualWriteStats:
         self.pg_writes_failed: int = 0
         self.pg_last_error: str = ""
         self.pg_last_error_ts: float = 0.0
-        self._recent_failures: deque[float] = deque(
-            maxlen=self._MAX_FAILURE_TIMESTAMPS
-        )
+        self._recent_failures: deque[float] = deque()
+
+    def _prune_locked(self, now: float) -> None:
+        cutoff = now - self._MAX_FAILURE_RETENTION_S
+        while self._recent_failures and self._recent_failures[0] < cutoff:
+            self._recent_failures.popleft()
 
     def record_ok(self):
         with self._lock:
@@ -341,16 +351,18 @@ class _DualWriteStats:
             self.pg_last_error = err[:200]
             self.pg_last_error_ts = now
             self._recent_failures.append(now)
+            self._prune_locked(now)
 
     def recent_failures(self, window_s: float) -> int:
         """Return the number of mirror failures seen in the last ``window_s`` seconds.
 
         Counts non-destructively so concurrent callers using different
-        windows don't steal each other's history — the deque's
-        ``maxlen`` already bounds memory on a long outage.
+        windows don't steal each other's history. Old timestamps are pruned
+        by retention age, not by a count cap that hides outage volume.
         """
         cutoff = time.time() - float(window_s)
         with self._lock:
+            self._prune_locked(time.time())
             return sum(1 for ts in self._recent_failures if ts >= cutoff)
 
     def is_healthy(self, *, window_s: float = 300.0, max_failures: int = 5) -> bool:
@@ -364,7 +376,9 @@ class _DualWriteStats:
         return self.recent_failures(window_s) <= int(max_failures)
 
     def snapshot(self) -> dict:
+        now = time.time()
         with self._lock:
+            self._prune_locked(now)
             return {
                 "pg_writes_ok": self.pg_writes_ok,
                 "pg_writes_failed": self.pg_writes_failed,
@@ -372,7 +386,7 @@ class _DualWriteStats:
                 "pg_last_error_ts": self.pg_last_error_ts,
                 "recent_failures_5m": sum(
                     1 for ts in self._recent_failures
-                    if ts >= time.time() - 300.0
+                    if ts >= now - 300.0
                 ),
             }
 
@@ -509,6 +523,64 @@ class DualWriteAdapter:
         self._mirror_to_pg(sql, params, sqlite_result=result)
 
         return result  # SQLite cursor — callers see .lastrowid / .rowcount
+
+    def executemany(self, sql: str, seq_of_params):
+        """Execute a batch on SQLite, then mirror the same batch to Postgres."""
+        params_list = list(seq_of_params or [])
+        if not params_list:
+            return self._sq.executemany(sql, params_list)
+        insert_match = _INSERT_VALUES_RE.match(sql or "")
+        if insert_match:
+            columns = [
+                _clean_identifier(col).lower()
+                for col in insert_match.group("columns").strip().split(",")
+            ]
+            table = _clean_identifier(insert_match.group("table"))
+            if "id" not in columns and self._sqlite_table_has_integer_id_pk(table):
+                result = None
+                for params in params_list:
+                    result = self.execute(sql, params)
+                return result
+
+        result = self._sq.executemany(sql, params_list)
+        if self._should_skip_pg_mirror(sql) or not params_list:
+            return result
+
+        try:
+            pg_sql = None
+            pg_params = []
+            for params in params_list:
+                prepared_sql, prepared_params = self._prepare_pg_mirror(
+                    sql,
+                    params,
+                    sqlite_result=None,
+                )
+                if prepared_sql is None:
+                    continue
+                translated = _translate_sql(prepared_sql, "postgres")
+                if pg_sql is None:
+                    pg_sql = translated
+                elif translated != pg_sql:
+                    raise RuntimeError("batch mirror produced inconsistent SQL")
+                pg_params.append(prepared_params or ())
+            if pg_sql and pg_params:
+                cur = self._pg.cursor()
+                cur.executemany(pg_sql, pg_params)
+                for _ in pg_params:
+                    dualwrite_stats.record_ok()
+        except Exception as exc:
+            err_str = f"{type(exc).__name__}: {exc}"
+            dualwrite_stats.record_fail(err_str)
+            logger.warning(
+                "Dualwrite Postgres batch mirror failed: %s | SQL: %s",
+                err_str[:120],
+                sql[:80],
+            )
+            try:
+                self._pg.rollback()
+            except Exception:
+                pass
+        return result
 
     def executescript(self, sql: str):
         """Execute DDL on SQLite only.  Postgres DDL is via migrations."""

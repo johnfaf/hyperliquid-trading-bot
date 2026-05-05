@@ -12,7 +12,14 @@ boto3>=1.34.0
 psycopg[binary]>=3.1.0
 psycopg_pool>=3.1.0
 
-# Dashboard uses stdlib http.server — no Flask needed
+# ─── Dashboard ────────────────────────────────────────────────
+# v1 dashboard uses stdlib http.server. v2 dashboard (src/ui/v2)
+# is a FastAPI app with HTMX/Jinja templates and WebSocket live
+# updates. Both coexist; v2 is opt-in via DASHBOARD_V2_ENABLED.
+fastapi>=0.110.0
+uvicorn[standard]>=0.27.0
+jinja2>=3.1.0
+python-multipart>=0.0.9
 
 # ─── XGBoost Regime Forecaster ────────────────────────────────
 # ML-powered regime prediction (walk-forward trained on bot history)

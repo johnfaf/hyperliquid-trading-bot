@@ -451,6 +451,8 @@ class LighterAdapter(BaseExchangeAdapter):
                 avg_position_size=stats["total_volume"] / max(stats["trade_count"], 1),
                 raw_data={
                     "total_volume": stats["total_volume"],
+                    "volume_30d_usd": stats["total_volume"],
+                    "pnl_window": "volume_scan_no_pnl",
                     "coins_traded": list(stats["coins_traded"]),
                     "discovery_method": "volume_scan",
                 },

@@ -35,6 +35,29 @@ from .cross_venue import CrossVenueConfirmation, CrossVenueSignal, FundingArbitr
 logger = logging.getLogger(__name__)
 
 
+def _trader_rank_key(trader: NormalizedTrader) -> tuple:
+    """Rank across venues without directly comparing incompatible PnL windows."""
+    raw = trader.raw_data or {}
+
+    def _float(value, default: float = 0.0) -> float:
+        try:
+            return float(value or default)
+        except (TypeError, ValueError):
+            return default
+
+    pnl_30d = _float(trader.pnl_30d or raw.get("pnl_30d_usd"))
+    pnl_7d = _float(trader.pnl_7d or raw.get("pnl_7d_usd"))
+    volume_30d = _float(raw.get("volume_30d_usd") or raw.get("total_volume"))
+    lifetime_pnl = _float(trader.pnl_total or raw.get("pnl_total_usd"))
+    return (
+        pnl_30d,
+        pnl_7d,
+        volume_30d,
+        int(trader.trade_count_30d or 0),
+        lifetime_pnl,
+    )
+
+
 @dataclass
 class ScanResult:
     """Result of a multi-exchange scan cycle."""
@@ -197,7 +220,7 @@ class MultiExchangeScanner:
 
         sorted_traders = sorted(
             all_traders.values(),
-            key=lambda t: (t.pnl_total, t.trade_count_30d),
+            key=_trader_rank_key,
             reverse=True,
         )[:limit]
 

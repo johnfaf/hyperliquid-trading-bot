@@ -618,8 +618,35 @@ class PortfolioRotationManager:
         fee_rate = max(config.PAPER_TRADING_TAKER_FEE_BPS, 0.0) / 10_000
         slippage_rate = max(self.expected_slippage_bps, 0.0) / 10_000
         roundtrip_cost_rate = (fee_rate + slippage_rate) * 2.0
-        cost_penalty = roundtrip_cost_rate * self.transaction_cost_weight
+        funding_cost_rate = self._funding_cost_rate(victim_trade, candidate_signal)
+        cost_penalty = (roundtrip_cost_rate + funding_cost_rate) * self.transaction_cost_weight
         return max(self.replacement_threshold + self.churn_penalty + cost_penalty, self.replacement_threshold)
+
+    def _funding_cost_rate(self, victim_trade: Dict, candidate_signal) -> float:
+        metadata = self._metadata(victim_trade)
+        funding_rate = self._first_float(
+            getattr(candidate_signal, "funding_rate", None),
+            getattr(candidate_signal, "coin_funding_rate", None),
+            metadata.get("funding_rate"),
+            metadata.get("entry_funding_rate"),
+            victim_trade.get("funding_rate"),
+            default=0.0,
+        )
+        if funding_rate == 0.0:
+            return 0.0
+        hours_held = max(self._age_minutes(str(victim_trade.get("opened_at", "") or "")) / 60.0, 0.0)
+        return abs(float(funding_rate)) * hours_held
+
+    @staticmethod
+    def _first_float(*values, default: float = 0.0) -> float:
+        for value in values:
+            if value in (None, ""):
+                continue
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                continue
+        return float(default)
 
     def _trade_notional(self, trade: Dict) -> float:
         entry = float(trade.get("entry_price", 0) or 0)

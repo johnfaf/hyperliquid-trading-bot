@@ -5,6 +5,7 @@ import sqlite3
 from src.backtest.stress_test import DecisionStressTestEngine
 from src.data import database as db
 from src.data import decision_journal
+from src.data.historical_market_data import store_funding_points, store_open_interest_points
 from src.learning.conservative_calibrator import ConservativeDecisionCalibrator
 from src.learning.dataset_builder import DecisionDatasetBuilder, DatasetBuildResult, LearningExample
 from src.learning.decision_outcomes import compute_forward_labels
@@ -162,6 +163,45 @@ def test_forward_labels_read_feature_store_candles(monkeypatch):
     assert round(labels["missed_profit_usd"], 2) == 3.0
 
 
+def test_forward_labels_use_sl_tp_path_not_only_horizon_close(monkeypatch):
+    conn = _memory_db(monkeypatch)
+    for ts, high, low, close in [
+        (1776765900000, 101.0, 99.0, 100.5),
+        (1776766200000, 102.0, 94.0, 101.0),
+        (1776766500000, 103.0, 99.0, 101.0),
+    ]:
+        conn.execute(
+            """
+            INSERT INTO candles
+            (coin, timeframe, timestamp_ms, open, high, low, close, volume)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            ("BTC", "5m", ts, 100.0, high, low, close, 10.0),
+        )
+    conn.commit()
+
+    labels = compute_forward_labels(
+        {
+            "decision_id": "d_stop_first",
+            "coin": "BTC",
+            "side": "long",
+            "created_at": "2026-04-21T10:00:00+00:00",
+            "entry_price": 100.0,
+            "proposed_size_usd": 50.0,
+            "proposed_leverage": 3.0,
+            "proposed_sl_price": 95.0,
+            "proposed_tp_price": 110.0,
+        },
+        primary_timeframes=("5m",),
+    )
+
+    assert round(labels["forward_return_15m"], 4) == 0.01
+    assert round(labels["counterfactual_return_15m"], 4) == -0.05
+    assert labels["counterfactual_exit_15m"] == "stop_loss"
+    assert labels["would_have_won"] == 0
+    assert labels["missed_profit_usd"] == 0.0
+
+
 def test_conservative_calibrator_and_decision_stress_persist(monkeypatch):
     conn = _memory_db(monkeypatch)
     examples = [
@@ -205,3 +245,51 @@ def test_conservative_calibrator_and_decision_stress_persist(monkeypatch):
     assert report.decision_count == 1
     assert report.scenarios[0].scenario_key == "flash_crash"
     assert report.scenarios[0].stressed_pnl < report.baseline_pnl
+
+
+def test_conservative_calibrator_does_not_derisk_noisy_small_sample():
+    examples = [
+        LearningExample(
+            decision_id=f"n{idx}",
+            coin="BTC",
+            side="long",
+            source="strategy",
+            created_at=f"2026-04-21T11:{idx:02d}:00+00:00",
+            features={"momentum": 1.0},
+            confidence=0.7,
+            executed=True,
+            label_win=1 if idx < 8 else 0,
+            outcome_pnl=1.0,
+            paper_trade_id=idx,
+            source_key="strategy:noisy",
+            strategy_type="momentum",
+            outcome_return_pct=0.001,
+        )
+        for idx in range(20)
+    ]
+    dataset = DatasetBuildResult("ds_noisy", examples, ["momentum"], {"rows": 20})
+
+    result = ConservativeDecisionCalibrator(min_group_examples=20).fit(dataset, persist=False)
+
+    stats = result.source_stats["strategy:noisy|long"]
+    assert stats["win_rate"] == 0.4
+    assert stats["action"] == "hold_insufficient_evidence"
+    assert stats["derisk_statistically_supported"] is False
+
+
+def test_historical_market_data_batch_stores(monkeypatch):
+    conn = _memory_db(monkeypatch)
+
+    assert store_funding_points([
+        {"source": "hl", "coin": "btc", "timestamp_ms": 1, "funding_rate": 0.001},
+        {"source": "hl", "coin": "eth", "timestamp_ms": 1, "funding_rate": -0.002},
+    ]) == 2
+    assert store_open_interest_points([
+        {"source": "hl", "coin": "btc", "timestamp_ms": 1, "open_interest": 100.0},
+        {"source": "hl", "coin": "eth", "timestamp_ms": 1, "open_interest": 200.0},
+    ]) == 2
+
+    funding_count = conn.execute("SELECT COUNT(*) AS n FROM funding_history").fetchone()["n"]
+    oi_count = conn.execute("SELECT COUNT(*) AS n FROM open_interest_history").fetchone()["n"]
+    assert funding_count == 2
+    assert oi_count == 2

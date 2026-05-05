@@ -192,11 +192,17 @@ class ContinuousLearningOrchestrator:
                 manual_approval=manual_approval,
                 persist=persist,
             )
-            attribution = FeatureAttributionAnalyzer().analyze(
-                dataset,
-                candidate_policy_id=improvement.best_candidate_policy_id,
-                persist=persist,
-            )
+            attribution_payload: Dict[str, Any] = {
+                "skipped": True,
+                "reason": f"promotion_decision:{promotion_decision.decision}",
+            }
+            if promotion_decision.approved:
+                attribution = FeatureAttributionAnalyzer().analyze(
+                    dataset,
+                    candidate_policy_id=improvement.best_candidate_policy_id,
+                    persist=persist,
+                )
+                attribution_payload = attribution.to_dict()
             shadow_plan = ShadowPeriodPlanner().plan(
                 improvement.best_candidate_policy_id,
                 persist=persist,
@@ -209,7 +215,7 @@ class ContinuousLearningOrchestrator:
                 evaluation=evaluation,
                 promotion_decision=promotion_decision,
                 quality_report=quality.to_dict(),
-                attribution=attribution.to_dict(),
+                attribution=attribution_payload,
                 shadow_plan=shadow_plan,
                 rollback_check=rollback_check,
                 persist=persist,
@@ -220,7 +226,7 @@ class ContinuousLearningOrchestrator:
                     "challenger_backtest": challenger.to_dict(),
                     "shadow_evaluation": evaluation.to_dict(),
                     "promotion_decision": promotion_decision.to_dict(),
-                    "feature_attribution": attribution.to_dict(),
+                    "feature_attribution": attribution_payload,
                     "shadow_plan": shadow_plan.to_dict(),
                     "rollback_check": rollback_check.to_dict(),
                     "promotion_package": package.to_dict(),

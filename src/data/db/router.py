@@ -40,13 +40,18 @@ def _sqlite_connect() -> sqlite3.Connection:
     db_path = config.DB_PATH
     db_dir = os.path.dirname(os.path.abspath(db_path))
     min_free = safe_env_float("DB_MIN_FREE_MB", 100.0, lo=1.0, hi=100_000.0)
-    usage = shutil.disk_usage(db_dir)
-    free_mb = usage.free / (1024 * 1024)
-    if free_mb < min_free:
-        raise RuntimeError(
-            f"Insufficient disk space for DB: {free_mb:.1f}MB free "
-            f"(minimum {min_free:.1f}MB)"
-        )
+    try:
+        usage = shutil.disk_usage(db_dir)
+        free_mb = usage.free / (1024 * 1024)
+        if free_mb < min_free:
+            raise RuntimeError(
+                f"Insufficient disk space for DB: {free_mb:.1f}MB free "
+                f"(minimum {min_free:.1f}MB)"
+            )
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        logger.warning("Could not determine SQLite disk usage for %s: %s", db_dir, exc)
 
     busy_timeout_ms = int(
         safe_env_float("DB_BUSY_TIMEOUT_MS", 15_000.0, lo=1_000.0, hi=600_000.0)

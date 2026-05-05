@@ -11,6 +11,7 @@ Provides a single source of truth for:
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
@@ -22,6 +23,8 @@ logger = logging.getLogger(__name__)
 
 _DB_WRITE_PROBE_CACHE: Dict[str, Any] = {"ts": 0.0, "ok": False, "error": ""}
 _DB_AUDIT_CACHE: Dict[str, Any] = {"ts": 0.0, "ok": True, "report": {}, "blockers": []}
+_DB_WRITE_PROBE_CACHE_LOCK = threading.Lock()
+_DB_AUDIT_CACHE_LOCK = threading.Lock()
 
 
 def _probe_db_readable() -> tuple[bool, str]:
@@ -36,10 +39,11 @@ def _probe_db_readable() -> tuple[bool, str]:
 def _probe_db_writable(ttl_s: Optional[int] = None) -> tuple[bool, str]:
     ttl = max(1, int(ttl_s or config.READINESS_DB_WRITE_TTL_S))
     now = time.time()
-    if now - float(_DB_WRITE_PROBE_CACHE.get("ts", 0.0) or 0.0) < ttl:
-        return bool(_DB_WRITE_PROBE_CACHE.get("ok", False)), str(
-            _DB_WRITE_PROBE_CACHE.get("error", "") or ""
-        )
+    with _DB_WRITE_PROBE_CACHE_LOCK:
+        if now - float(_DB_WRITE_PROBE_CACHE.get("ts", 0.0) or 0.0) < ttl:
+            return bool(_DB_WRITE_PROBE_CACHE.get("ok", False)), str(
+                _DB_WRITE_PROBE_CACHE.get("error", "") or ""
+            )
 
     try:
         with db.get_connection() as conn:
@@ -59,11 +63,13 @@ def _probe_db_writable(ttl_s: Optional[int] = None) -> tuple[bool, str]:
                 """,
                 (datetime.now(timezone.utc).isoformat(),),
             )
-        _DB_WRITE_PROBE_CACHE.update({"ts": now, "ok": True, "error": ""})
+        with _DB_WRITE_PROBE_CACHE_LOCK:
+            _DB_WRITE_PROBE_CACHE.update({"ts": now, "ok": True, "error": ""})
         return True, ""
     except Exception as exc:
         error = str(exc)
-        _DB_WRITE_PROBE_CACHE.update({"ts": now, "ok": False, "error": error})
+        with _DB_WRITE_PROBE_CACHE_LOCK:
+            _DB_WRITE_PROBE_CACHE.update({"ts": now, "ok": False, "error": error})
         return False, error
 
 
@@ -73,12 +79,13 @@ def _probe_db_audit(ttl_s: Optional[int] = None) -> tuple[bool, Dict[str, Any], 
 
     ttl = max(5, int(ttl_s or getattr(config, "READINESS_DB_AUDIT_TTL_S", 300)))
     now = time.time()
-    if now - float(_DB_AUDIT_CACHE.get("ts", 0.0) or 0.0) < ttl:
-        return (
-            bool(_DB_AUDIT_CACHE.get("ok", True)),
-            dict(_DB_AUDIT_CACHE.get("report", {}) or {}),
-            list(_DB_AUDIT_CACHE.get("blockers", []) or []),
-        )
+    with _DB_AUDIT_CACHE_LOCK:
+        if now - float(_DB_AUDIT_CACHE.get("ts", 0.0) or 0.0) < ttl:
+            return (
+                bool(_DB_AUDIT_CACHE.get("ok", True)),
+                dict(_DB_AUDIT_CACHE.get("report", {}) or {}),
+                list(_DB_AUDIT_CACHE.get("blockers", []) or []),
+            )
 
     block_severity = str(getattr(config, "READINESS_DB_AUDIT_BLOCK_SEVERITY", "high")).lower()
     try:
@@ -105,7 +112,8 @@ def _probe_db_audit(ttl_s: Optional[int] = None) -> tuple[bool, Dict[str, Any], 
         ]
         ok = False
 
-    _DB_AUDIT_CACHE.update({"ts": now, "ok": ok, "report": payload, "blockers": blockers})
+    with _DB_AUDIT_CACHE_LOCK:
+        _DB_AUDIT_CACHE.update({"ts": now, "ok": ok, "report": payload, "blockers": blockers})
     return ok, payload, blockers
 
 

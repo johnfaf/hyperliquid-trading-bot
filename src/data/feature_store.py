@@ -118,11 +118,32 @@ def store_candles(coin: str, timeframe: str, candles: List[dict]) -> int:
             "open=EXCLUDED.open, high=EXCLUDED.high, low=EXCLUDED.low, "
             "close=EXCLUDED.close, volume=EXCLUDED.volume"
         )
-        rows = [
-            (coin, timeframe, int(c["t"]), float(c["o"]), float(c["h"]),
-             float(c["l"]), float(c["c"]), float(c.get("v", 0)))
-            for c in candles
-        ]
+        rows = []
+        malformed = 0
+        for c in candles:
+            try:
+                timestamp_ms = int(c["t"])
+                open_px = float(c["o"])
+                high_px = float(c["h"])
+                low_px = float(c["l"])
+                close_px = float(c["c"])
+                volume = float(c.get("v", 0) or 0)
+                values = (open_px, high_px, low_px, close_px, volume)
+                if timestamp_ms <= 0 or any(not math.isfinite(v) for v in values):
+                    raise ValueError("non-finite candle value")
+                rows.append((coin, timeframe, timestamp_ms, open_px, high_px, low_px, close_px, volume))
+            except (KeyError, TypeError, ValueError) as exc:
+                malformed += 1
+                logger.debug("Skipping malformed candle for %s/%s: %s", coin, timeframe, exc)
+        if malformed:
+            logger.warning(
+                "store_candles(%s/%s) skipped %d malformed candle(s)",
+                coin,
+                timeframe,
+                malformed,
+            )
+        if not rows:
+            return 0
         cur.executemany(sql, rows)
         conn.commit()
         return len(rows)
@@ -527,11 +548,21 @@ def store_features(coin: str, timeframe: str, timestamp_ms: int,
             "ON CONFLICT (coin, timeframe, timestamp_ms, feature_name) "
             "DO UPDATE SET value=EXCLUDED.value"
         )
-        rows = [
-            (coin, timeframe, timestamp_ms, name, float(val))
-            for name, val in features.items()
-            if val is not None and not math.isnan(val)
-        ]
+        rows = []
+        for name, val in features.items():
+            if val is None:
+                continue
+            try:
+                parsed = float(val)
+            except (TypeError, ValueError):
+                logger.debug("Skipping non-numeric feature %s/%s %s=%r", coin, timeframe, name, val)
+                continue
+            if not math.isfinite(parsed):
+                logger.debug("Skipping non-finite feature %s/%s %s=%r", coin, timeframe, name, val)
+                continue
+            rows.append((coin, timeframe, timestamp_ms, name, parsed))
+        if not rows:
+            return 0
         cur.executemany(sql, rows)
         conn.commit()
         return len(rows)

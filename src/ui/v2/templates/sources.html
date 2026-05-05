@@ -1,0 +1,191 @@
+{% extends "base.html" %}
+{% block content %}
+{% if not data.available %}
+  <div class="bg-amber-900/30 border border-amber-700 rounded p-4 text-amber-200 text-sm">
+    Agent scorer is not initialised in this process; the source scoreboard requires it.
+  </div>
+{% else %}
+{% set t = data.totals %}
+<section class="grid grid-cols-2 md:grid-cols-5 gap-3 mb-6"
+         data-ws-refresh-on="cycle,calibration"
+         hx-get="/sources?fragment=summary"
+         hx-trigger="wsEvent from:body, every 30s"
+         hx-swap="none">
+  <div class="bg-slate-900 border border-slate-800 rounded p-3">
+    <div class="text-[10px] uppercase tracking-wide text-slate-500">Active</div>
+    <div class="mt-1 text-2xl font-semibold text-emerald-300">{{ t.active or 0 }}</div>
+  </div>
+  <div class="bg-slate-900 border border-slate-800 rounded p-3">
+    <div class="text-[10px] uppercase tracking-wide text-slate-500">Warmup</div>
+    <div class="mt-1 text-2xl font-semibold text-amber-300">{{ t.warmup or 0 }}</div>
+    <div class="mt-1 text-[10px] text-slate-500">capped + size-derisked</div>
+  </div>
+  <div class="bg-slate-900 border border-slate-800 rounded p-3">
+    <div class="text-[10px] uppercase tracking-wide text-slate-500">Degraded</div>
+    <div class="mt-1 text-2xl font-semibold text-orange-300">{{ t.degraded or 0 }}</div>
+    <div class="mt-1 text-[10px] text-slate-500">low rank or losing</div>
+  </div>
+  <div class="bg-slate-900 border border-slate-800 rounded p-3">
+    <div class="text-[10px] uppercase tracking-wide text-slate-500">Paused</div>
+    <div class="mt-1 text-2xl font-semibold text-rose-300">{{ t.paused or 0 }}</div>
+    <div class="mt-1 text-[10px] text-slate-500">blocked by allocator</div>
+  </div>
+  <div class="bg-slate-900 border border-slate-800 rounded p-3">
+    <div class="text-[10px] uppercase tracking-wide text-slate-500">Total</div>
+    <div class="mt-1 text-2xl font-semibold text-slate-100">{{ data.rows|length }}</div>
+    <div class="mt-1 text-[10px] text-slate-500">tracked sources</div>
+  </div>
+</section>
+
+<section>
+  <div class="flex items-center justify-between mb-2">
+    <h2 class="text-sm font-semibold text-slate-300">Source scoreboard</h2>
+    <div class="text-xs text-slate-500">sorted by status, then rank</div>
+  </div>
+  <div class="overflow-x-auto bg-slate-900 border border-slate-800 rounded">
+    <table class="w-full text-xs">
+      <thead class="bg-slate-950/60 text-slate-400">
+        <tr>
+          <th class="text-left py-2 px-3 font-medium">#</th>
+          <th class="text-left py-2 px-3 font-medium">Source</th>
+          <th class="text-left py-2 px-3 font-medium">Status</th>
+          <th class="text-right py-2 px-3 font-medium">Trades</th>
+          <th class="text-right py-2 px-3 font-medium">Win rate</th>
+          <th class="text-right py-2 px-3 font-medium">Weight</th>
+          <th class="text-right py-2 px-3 font-medium">Sharpe</th>
+          <th class="text-right py-2 px-3 font-medium">Recent PnL</th>
+          <th class="text-right py-2 px-3 font-medium">ECE</th>
+          <th class="text-right py-2 px-3 font-medium">Samples</th>
+          <th class="text-left py-2 px-3 font-medium">Calibration</th>
+        </tr>
+      </thead>
+      <tbody class="divide-y divide-slate-800">
+        {% for r in data.rows %}
+        <tr class="{% if r.calibration.quarantined %}bg-rose-950/30{% endif %} hover:bg-slate-800/40">
+          <td class="py-1.5 px-3 text-slate-500">{{ r.rank if r.rank is not none else '—' }}</td>
+          <td class="py-1.5 px-3 text-slate-200 font-mono">{{ r.source }}</td>
+          <td class="py-1.5 px-3">
+            <span class="inline-block px-2 py-0.5 rounded text-[10px]
+              {% if r.status == 'active' %}bg-emerald-900/60 text-emerald-200
+              {% elif r.status == 'warmup' %}bg-amber-900/60 text-amber-200
+              {% elif r.status == 'degraded' %}bg-orange-900/60 text-orange-200
+              {% elif r.status == 'paused' %}bg-rose-900/60 text-rose-200
+              {% else %}bg-slate-800 text-slate-300{% endif %}">
+              {{ (r.status or 'unknown')|upper }}
+            </span>
+          </td>
+          <td class="py-1.5 px-3 text-right text-slate-300">{{ r.completed or 0 }}</td>
+          <td class="py-1.5 px-3 text-right text-slate-400">
+            {% if r.win_rate is none %}—{% else %}{{ '%.0f%%'|format((r.win_rate or 0) * 100) }}{% endif %}
+          </td>
+          <td class="py-1.5 px-3 text-right text-slate-400">
+            {% if r.dynamic_weight is none %}—{% else %}{{ '%.2f'|format(r.dynamic_weight) }}{% endif %}
+          </td>
+          <td class="py-1.5 px-3 text-right text-slate-400">
+            {% if r.sharpe is none %}—{% else %}{{ '%.2f'|format(r.sharpe) }}{% endif %}
+          </td>
+          <td class="py-1.5 px-3 text-right font-mono
+            {% if r.recent_pnl is not none and r.recent_pnl > 0 %}text-emerald-300
+            {% elif r.recent_pnl is not none and r.recent_pnl < 0 %}text-rose-300
+            {% else %}text-slate-400{% endif %}">
+            {% if r.recent_pnl is none %}—{% else %}${{ '%+.2f'|format(r.recent_pnl) }}{% endif %}
+          </td>
+          <td class="py-1.5 px-3 text-right
+            {% if r.calibration.ece is none %}text-slate-500
+            {% elif r.calibration.ece >= 0.25 %}text-rose-300
+            {% elif r.calibration.ece >= 0.15 %}text-amber-300
+            {% else %}text-emerald-300{% endif %}">
+            {% if r.calibration.ece is none %}—{% else %}{{ '%.3f'|format(r.calibration.ece) }}{% endif %}
+          </td>
+          <td class="py-1.5 px-3 text-right text-slate-400">
+            {% if r.calibration.samples is none %}—{% else %}{{ '%.0f'|format(r.calibration.samples) }}{% endif %}
+          </td>
+          <td class="py-1.5 px-3">
+            {% if r.calibration.quarantined %}
+              <span class="inline-block px-2 py-0.5 rounded bg-rose-900/60 text-rose-200 text-[10px]">QUARANTINED</span>
+              <button class="ml-1 text-[10px] text-rose-300 hover:text-white underline-offset-2 hover:underline"
+                      onclick="window.dispatchEvent(new CustomEvent('clear-quarantine', {detail: '{{ r.source }}'}))">
+                clear
+              </button>
+            {% elif r.calibration.subkeys > 0 %}
+              <span class="text-[10px] text-slate-500">{{ r.calibration.subkeys }} sub-keys</span>
+            {% else %}
+              <span class="text-[10px] text-slate-600">cold</span>
+            {% endif %}
+          </td>
+        </tr>
+        {% else %}
+        <tr><td colspan="11" class="py-6 text-center text-slate-500">No sources tracked yet.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+<dialog id="clear-quarantine-dialog" class="bg-slate-900 border border-rose-800 rounded text-slate-100 p-0 w-96 backdrop:bg-black/60">
+  <form method="dialog" id="clear-quarantine-form" class="p-4 space-y-3">
+    <h3 class="text-sm font-semibold text-rose-300">Clear calibration quarantine</h3>
+    <p class="text-xs text-slate-400">
+      This drops outcomes for <code id="clear-quarantine-key" class="text-slate-200 break-all"></code>
+      and rebuilds the global aggregate. The source returns to cold-start.
+    </p>
+    <input type="text" id="clear-quarantine-reason" placeholder="audit reason (4+ chars)"
+           required minlength="4"
+           class="w-full bg-slate-950 border border-slate-700 rounded px-2 py-1 text-xs" />
+    <div id="clear-quarantine-result" class="text-xs"></div>
+    <div class="flex justify-end gap-2">
+      <button value="cancel" class="text-xs text-slate-400 hover:text-white px-3 py-1">cancel</button>
+      <button id="clear-quarantine-submit" value="confirm"
+              class="text-xs bg-rose-700 hover:bg-rose-600 text-white px-3 py-1 rounded">Clear</button>
+    </div>
+  </form>
+</dialog>
+
+<script>
+  (function () {
+    const dialog = document.getElementById('clear-quarantine-dialog');
+    const keyEl = document.getElementById('clear-quarantine-key');
+    const reasonEl = document.getElementById('clear-quarantine-reason');
+    const resultEl = document.getElementById('clear-quarantine-result');
+    const submitBtn = document.getElementById('clear-quarantine-submit');
+    let activeKey = '';
+
+    window.addEventListener('clear-quarantine', (ev) => {
+      activeKey = ev.detail || '';
+      keyEl.textContent = activeKey;
+      reasonEl.value = '';
+      resultEl.textContent = '';
+      resultEl.className = 'text-xs';
+      dialog.showModal();
+    });
+
+    submitBtn.addEventListener('click', async (ev) => {
+      ev.preventDefault();
+      const reason = reasonEl.value.trim();
+      if (reason.length < 4 || !activeKey) {
+        resultEl.textContent = 'Reason must be at least 4 characters.';
+        resultEl.className = 'text-xs text-rose-300';
+        return;
+      }
+      const body = new URLSearchParams({key: activeKey, audit_reason: reason});
+      try {
+        const resp = await fetch('/api/sources/clear_quarantine', {
+          method: 'POST', body, headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+        });
+        const data = await resp.json().catch(() => ({}));
+        if (resp.ok) {
+          resultEl.textContent = 'Cleared. Reloading…';
+          resultEl.className = 'text-xs text-emerald-300';
+          setTimeout(() => location.reload(), 800);
+        } else {
+          resultEl.textContent = data.message || data.error || 'Clear failed.';
+          resultEl.className = 'text-xs text-rose-300';
+        }
+      } catch (e) {
+        resultEl.textContent = 'Network error.';
+        resultEl.className = 'text-xs text-rose-300';
+      }
+    });
+  })();
+</script>
+{% endif %}
+{% endblock %}

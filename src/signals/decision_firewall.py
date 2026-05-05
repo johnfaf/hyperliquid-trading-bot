@@ -61,6 +61,11 @@ class DecisionFirewall:
             cfg.get("max_signals_per_source_per_day", 0)
         )
         self.agent_scorer = cfg.get("agent_scorer")
+        # Calibration tracker — when wired in, sources whose calibration
+        # has gone off the rails get gated as if they were "warmup" by
+        # the source allocator. Optional; the firewall behaves the same
+        # as before when this is None.
+        self.calibration = cfg.get("calibration")
         self.event_scanner = cfg.get("event_scanner")
         self.event_risk_enabled = bool(cfg.get("event_risk_enabled", True))
         self.short_hardening_enabled = bool(cfg.get("short_hardening_enabled", True))
@@ -575,6 +580,33 @@ class DecisionFirewall:
         source_key: str,
         dry_run: bool = False,
     ) -> Tuple[bool, str, Dict]:
+        # Calibration-quality gate. A source above the auto-quarantine
+        # ECE bar is treated as paused for live entries — its outcomes
+        # still flow into the calibrator (paper continues), so it can
+        # rejoin once the calibration recovers.
+        if self.calibration is not None:
+            try:
+                side_bucket = (signal.side or "").lower() if hasattr(signal, "side") else None
+                regime_bucket = None
+                if isinstance(getattr(signal, "regime", None), str):
+                    from src.signals.calibration import bucket_regime
+                    regime_bucket = bucket_regime(signal.regime)
+                if self.calibration.is_quarantined(
+                    source_key, side=side_bucket, regime=regime_bucket
+                ):
+                    return False, (
+                        f"Calibration quarantine for {source_key} "
+                        f"(side={side_bucket or 'any'}, regime={regime_bucket or 'any'}): "
+                        "ECE above auto-quarantine threshold"
+                    ), {
+                        "source_key": source_key,
+                        "status": "calibration_quarantine",
+                        "max_signals_per_day": 0,
+                        "size_multiplier": 0.0,
+                    }
+            except Exception as exc:
+                logger.debug("Calibration quarantine check failed for %s: %s", source_key, exc)
+
         if not self.agent_scorer:
             return True, "", {
                 "source_key": source_key,
@@ -760,37 +792,35 @@ class DecisionFirewall:
         if hasattr(signal, "activate_trace"):
             signal.activate_trace()
 
-        self._journal_record(
-            signal,
-            regime_data=regime_data,
-            account_balance=account_balance,
-            final_status="firewall_prescreen" if dry_run else "firewall_validation",
-            firewall_decision="pending",
-            metadata={
-                "dry_run": dry_run,
-                "ignore_position_limit": ignore_position_limit,
-            },
-        )
+        if not dry_run:
+            self._journal_record(
+                signal,
+                regime_data=regime_data,
+                account_balance=account_balance,
+                final_status="firewall_validation",
+                firewall_decision="pending",
+                metadata={
+                    "dry_run": dry_run,
+                    "ignore_position_limit": ignore_position_limit,
+                },
+            )
 
         if not dry_run:
             self.stats["total_signals"] += 1
 
         def _reject(reason_key, reason_msg):
             """Helper to reject + audit log in one step."""
-            self._journal_update(
-                signal,
-                final_status=(
-                    "firewall_prescreen_rejected"
-                    if dry_run
-                    else "rejected"
-                ),
-                firewall_decision="rejected",
-                rejection_reason=reason_msg,
-                metadata={
-                    "reason_key": reason_key,
-                    "dry_run": dry_run,
-                },
-            )
+            if not dry_run:
+                self._journal_update(
+                    signal,
+                    final_status="rejected",
+                    firewall_decision="rejected",
+                    rejection_reason=reason_msg,
+                    metadata={
+                        "reason_key": reason_key,
+                        "dry_run": dry_run,
+                    },
+                )
             if not dry_run:
                 self.stats[reason_key] += 1
                 try:
@@ -1104,13 +1134,14 @@ class DecisionFirewall:
             except Exception:
                 pass  # audit logging must never break the trading path
 
-        self._journal_update(
-            signal,
-            final_status="firewall_prescreen_approved" if dry_run else "approved",
-            firewall_decision="approved",
-            rejection_reason=None,
-            metadata={"dry_run": dry_run},
-        )
+        if not dry_run:
+            self._journal_update(
+                signal,
+                final_status="approved",
+                firewall_decision="approved",
+                rejection_reason=None,
+                metadata={"dry_run": dry_run},
+            )
 
         return True, "approved"
 

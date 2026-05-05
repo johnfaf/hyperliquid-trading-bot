@@ -14,6 +14,7 @@ Provides both HTML and JSON API endpoints:
 import json
 import sqlite3
 import os
+import re
 import sys
 from typing import Dict, Optional
 
@@ -21,6 +22,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import config
 
 WEEKDAY_NAMES = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+_ETH_ADDRESS_RE = re.compile(r"^0x[a-fA-F0-9]{40}$")
 
 
 def _get_db():
@@ -83,6 +85,9 @@ def get_backtest_dashboard_data() -> Dict:
 
 def get_wallet_detail(address: str) -> Optional[Dict]:
     """Get full backtest detail for one wallet."""
+    address = str(address or "").strip()
+    if not _ETH_ADDRESS_RE.fullmatch(address):
+        return None
     conn = _get_db()
     try:
         # Wallet info
@@ -535,7 +540,15 @@ function exportCSV() {
 
 function pnlClass(v) { return v >= 0 ? 'pnl-pos' : 'pnl-neg'; }
 function fmt(v, d=0) { return v >= 0 ? '+$' + v.toFixed(d).replace(/\\B(?=(\\d{3})+(?!\\d))/g,',') : '-$' + Math.abs(v).toFixed(d).replace(/\\B(?=(\\d{3})+(?!\\d))/g,','); }
-function shortAddr(a) { return a.slice(0,6) + '...' + a.slice(-4); }
+function escHtml(v) {
+  return String(v ?? '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+}
+function escAttr(v) { return escHtml(v); }
+function isEthAddress(a) { return /^0x[a-fA-F0-9]{40}$/.test(String(a || '')); }
+function shortAddr(a) {
+  const text = String(a || '');
+  return isEthAddress(text) ? text.slice(0,6) + '...' + text.slice(-4) : 'invalid';
+}
 
 function renderOverview() {
   if (!DATA) return;
@@ -550,8 +563,8 @@ function renderOverview() {
   // Wallets table
   const tbody = document.querySelector('#wallets-table tbody');
   tbody.innerHTML = DATA.wallets.map(w => `
-    <tr class="clickable" onclick="showDetail('${w.address}')">
-      <td><code>${shortAddr(w.address)}</code></td>
+    <tr class="clickable" data-address="${escAttr(w.address)}">
+      <td><code>${escHtml(shortAddr(w.address))}</code></td>
       <td>${w.is_golden ? '<span class=\\"badge badge-gold\\">GOLDEN</span>' : '<span class=\\"badge badge-red\\">Not Golden</span>'}</td>
       <td class="${pnlClass(w.raw_pnl)}">${fmt(w.raw_pnl)}</td>
       <td class="${pnlClass(w.penalised_pnl)}">${fmt(w.penalised_pnl)}</td>
@@ -562,6 +575,9 @@ function renderOverview() {
       <td>${w.trades_per_day.toFixed(1)}</td>
     </tr>
   `).join('');
+  tbody.querySelectorAll('tr[data-address]').forEach(row => {
+    row.addEventListener('click', () => showDetail(row.dataset.address || ''));
+  });
 
   renderTfTable();
 }
@@ -578,7 +594,7 @@ function renderTfTable() {
   const tbody = document.querySelector('#tf-table tbody');
   tbody.innerHTML = rows.map(r => `
     <tr>
-      <td><code>${shortAddr(r.address)}</code></td>
+      <td><code>${escHtml(shortAddr(r.address))}</code></td>
       <td>${r.active_periods}</td>
       <td class="${pnlClass(r.total_penalised_pnl)}">${fmt(r.total_penalised_pnl)}</td>
       <td class="${pnlClass(r.avg_period_pnl)}">${fmt(r.avg_period_pnl,2)}</td>
@@ -601,8 +617,12 @@ document.getElementById('tf-tabs').addEventListener('click', e => {
 
 // Detail view
 async function showDetail(address) {
+  if (!isEthAddress(address)) {
+    alert('Invalid wallet address');
+    return;
+  }
   try {
-    const r = await fetch('/api/backtest/wallet?address=' + address);
+    const r = await fetch('/api/backtest/wallet?address=' + encodeURIComponent(address));
     DETAIL = await r.json();
     renderDetail();
     document.getElementById('overview-page').style.display = 'none';

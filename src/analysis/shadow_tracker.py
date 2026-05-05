@@ -72,7 +72,7 @@ class ShadowTracker:
                     exit_ts TIMESTAMPTZ,
                     regime_at_entry TEXT,
                     confidence DOUBLE PRECISION DEFAULT 1.0,
-                    metadata_json TEXT DEFAULT '{}'
+                    metadata_json JSONB DEFAULT '{}'::jsonb
                 );
                 CREATE INDEX IF NOT EXISTS idx_shadow_source ON shadow_trades(signal_source);
                 CREATE INDEX IF NOT EXISTS idx_shadow_entry_ts ON shadow_trades(entry_ts);

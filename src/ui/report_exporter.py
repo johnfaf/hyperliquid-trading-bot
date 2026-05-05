@@ -28,6 +28,28 @@ def _ensure_reports_dir(output_dir: Optional[str] = None) -> str:
     return output_dir
 
 
+def _csv_safe_cell(value):
+    """Prevent spreadsheet formula execution when CSVs are opened in Excel/Sheets."""
+    if not isinstance(value, str):
+        return value
+    if value and (value[0] in {"=", "+", "-", "@", "\t", "\r", "\n"} or value[0].isspace()):
+        return "'" + value
+    return value
+
+
+def _csv_safe_row(row: Dict) -> Dict:
+    return {key: _csv_safe_cell(value) for key, value in row.items()}
+
+
+def _parse_iso_datetime(raw) -> Optional[datetime]:
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+
+
 def _calculate_sharpe_ratio(trades: List[Dict]) -> float:
     """Calculate Sharpe ratio from trade history.
 
@@ -617,11 +639,15 @@ def export_csv_trades(output_dir: str = None) -> str:
                 if strategy:
                     strategy_type = strategy.get("strategy_type", "N/A")
 
-            opened = datetime.fromisoformat(trade.get("opened_at", ""))
-            closed = datetime.fromisoformat(trade.get("closed_at", ""))
-            duration = (closed - opened).total_seconds() / 3600
+            opened = _parse_iso_datetime(trade.get("opened_at", ""))
+            closed = _parse_iso_datetime(trade.get("closed_at", ""))
+            duration = (
+                (closed - opened).total_seconds() / 3600
+                if opened is not None and closed is not None
+                else None
+            )
 
-            writer.writerow({
+            writer.writerow(_csv_safe_row({
                 "id": trade.get("id", ""),
                 "strategy_type": strategy_type,
                 "coin": trade.get("coin", ""),
@@ -632,8 +658,8 @@ def export_csv_trades(output_dir: str = None) -> str:
                 "leverage": trade.get("leverage", 1),
                 "opened_at": trade.get("opened_at", ""),
                 "closed_at": trade.get("closed_at", ""),
-                "duration_hours": f"{duration:.2f}"
-            })
+                "duration_hours": f"{duration:.2f}" if duration is not None else "",
+            }))
 
     logger.info(f"Trades CSV exported to {filepath}")
     return filepath

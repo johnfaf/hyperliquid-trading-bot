@@ -144,6 +144,7 @@ def test_dashboard_public_url_override_wins(monkeypatch):
 def test_hosted_public_dashboard_requires_auth_token(monkeypatch):
     monkeypatch.setenv("RAILWAY_PUBLIC_DOMAIN", "bot.up.railway.app")
     monkeypatch.delenv("DASHBOARD_AUTH_TOKEN", raising=False)
+    monkeypatch.delenv("DASHBOARD_PUBLIC_READ", raising=False)
 
     with pytest.raises(RuntimeError, match="DASHBOARD_AUTH_TOKEN"):
         dashboard._validate_dashboard_auth_configuration("0.0.0.0")
@@ -159,6 +160,7 @@ def test_local_public_dashboard_can_warn_without_auth_token(monkeypatch):
 
 def test_dashboard_write_endpoints_require_configured_auth_token(monkeypatch):
     monkeypatch.delenv("DASHBOARD_AUTH_TOKEN", raising=False)
+    monkeypatch.delenv("DASHBOARD_PUBLIC_READ", raising=False)
     handler = _make_dashboard_handler(path="/api/trade/close-all", command="POST")
 
     allowed = handler._check_auth()
@@ -166,6 +168,31 @@ def test_dashboard_write_endpoints_require_configured_auth_token(monkeypatch):
     assert allowed is False
     assert ("status", 403) in handler._responses
     assert b"dashboard_write_auth_not_configured" in handler.wfile.getvalue()
+
+
+def test_dashboard_read_endpoints_fail_closed_without_auth_or_public_read(monkeypatch):
+    monkeypatch.delenv("DASHBOARD_AUTH_TOKEN", raising=False)
+    monkeypatch.delenv("DASHBOARD_PUBLIC_READ", raising=False)
+    handler = _make_dashboard_handler(path="/api/runtime-health", command="GET")
+
+    allowed = handler._check_auth()
+
+    assert allowed is False
+    assert ("status", 403) in handler._responses
+    assert b"dashboard_auth_not_configured" in handler.wfile.getvalue()
+
+
+def test_dashboard_public_read_opt_in_allows_get_but_not_post(monkeypatch):
+    monkeypatch.delenv("DASHBOARD_AUTH_TOKEN", raising=False)
+    monkeypatch.setenv("DASHBOARD_PUBLIC_READ", "true")
+
+    read_handler = _make_dashboard_handler(path="/api/runtime-health", command="GET")
+    write_handler = _make_dashboard_handler(path="/api/backtest/run", command="POST")
+
+    assert read_handler._check_auth() is True
+    assert write_handler._check_auth() is False
+    assert ("status", 403) in write_handler._responses
+    assert b"dashboard_write_auth_not_configured" in write_handler.wfile.getvalue()
 
 
 @pytest.mark.parametrize(
@@ -191,6 +218,7 @@ def test_dashboard_all_mutating_post_endpoints_require_auth_token(monkeypatch, p
     with auth disabled exposes backtest spinners, cache wipes, and
     exchange-API fetch loops to the public internet."""
     monkeypatch.delenv("DASHBOARD_AUTH_TOKEN", raising=False)
+    monkeypatch.delenv("DASHBOARD_PUBLIC_READ", raising=False)
     handler = _make_dashboard_handler(path=path, command="POST")
 
     allowed = handler._check_auth()
