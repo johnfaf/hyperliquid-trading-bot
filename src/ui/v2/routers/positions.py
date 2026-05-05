@@ -14,10 +14,10 @@ the full LiveTrader stack.
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from fastapi import APIRouter, Form, Request
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 
 from src.ui.v2.auth import require_auth, verify_cookie
 from src.ui.v2.state import get_components

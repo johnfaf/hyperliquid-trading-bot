@@ -18,7 +18,7 @@ If a particular subsystem isn't initialised the row falls back to
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from fastapi import APIRouter, Form, Request
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -44,7 +44,6 @@ def _aggregate_calibration_for_source(cal, source: str) -> Dict[str, Any]:
     try:
         from src.signals.calibration import (
             decompose_calibration_key,
-            compose_calibration_key,
         )
         all_stats = cal.get_all_stats()
     except Exception:

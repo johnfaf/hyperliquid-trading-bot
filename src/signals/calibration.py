@@ -752,8 +752,8 @@ def _pool_adjacent_violators(values: List[float], weights: List[float]) -> List[
             del blocks[i]
             i -= 1
     out: List[float] = []
-    for m, _w, l in blocks:
-        out.extend([m] * int(l))
+    for m, _w, length in blocks:
+        out.extend([m] * int(length))
     return out
 
 

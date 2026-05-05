@@ -5,8 +5,6 @@ spinning up uvicorn so tests stay fast and deterministic.
 """
 from __future__ import annotations
 
-import os
-from pathlib import Path
 
 import pytest
 
