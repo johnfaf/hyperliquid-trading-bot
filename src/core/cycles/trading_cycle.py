@@ -325,6 +325,115 @@ def _apply_macro_regime_overlay(container, regime_data: dict) -> dict:
     return regime_data
 
 
+def _float_or_default(value, default=0.0) -> float:
+    try:
+        out = float(value)
+        return out if out == out else float(default)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _apply_global_momentum_override(container, regime_data: dict) -> dict:
+    """Block countertrend entries when the major coins agree directionally."""
+    if not getattr(config, "GLOBAL_MOMENTUM_OVERRIDE_ENABLED", True):
+        return regime_data
+    if not regime_data or not isinstance(regime_data, dict):
+        return regime_data
+
+    per_coin = regime_data.get("per_coin", {})
+    if not isinstance(per_coin, dict) or not per_coin:
+        return regime_data
+
+    core_coins = [
+        str(coin).upper()
+        for coin in getattr(config, "GLOBAL_MOMENTUM_CORE_COINS", ["BTC", "ETH", "SOL"])
+        if str(coin).strip()
+    ]
+    min_agree = int(getattr(config, "GLOBAL_MOMENTUM_MIN_AGREEING_COINS", 2))
+    min_conf = float(getattr(config, "GLOBAL_MOMENTUM_MIN_CONFIDENCE", 0.55))
+    min_momentum = float(getattr(config, "GLOBAL_MOMENTUM_MIN_MOMENTUM", 0.003))
+    min_volume_ratio = float(getattr(config, "GLOBAL_MOMENTUM_MIN_VOLUME_RATIO", 0.80))
+
+    bullish = []
+    bearish = []
+    for coin in core_coins:
+        item = dict(per_coin.get(coin, {}) or {})
+        if not item:
+            continue
+        confidence = _float_or_default(item.get("confidence"), 0.0)
+        if confidence <= 0:
+            confidence = _float_or_default(item.get("regime_confidence"), 0.0)
+        momentum = _float_or_default(item.get("momentum"), 0.0)
+        volume_ratio = _float_or_default(item.get("volume_ratio"), 1.0)
+        regime = str(item.get("regime") or "").lower()
+        if confidence < min_conf or volume_ratio < min_volume_ratio:
+            continue
+        if momentum >= min_momentum or regime in {"trending_up", "bullish"}:
+            bullish.append(coin)
+        elif momentum <= -min_momentum or regime in {"trending_down", "bearish"}:
+            bearish.append(coin)
+
+    direction = ""
+    agreeing = []
+    block_side = ""
+    if len(bullish) >= min_agree and len(bullish) > len(bearish):
+        direction = "up"
+        agreeing = bullish
+        block_side = "short"
+    elif len(bearish) >= min_agree and len(bearish) > len(bullish):
+        direction = "down"
+        agreeing = bearish
+        block_side = "long"
+
+    if not direction:
+        return regime_data
+
+    guidance = copy.deepcopy(regime_data.get("strategy_guidance", {}) or {})
+    pause = set(guidance.get("pause", []) or [])
+    activate = set(guidance.get("activate", []) or [])
+    if direction == "up":
+        pause.update({"momentum_short", "contrarian", "mean_reversion", "scalping", "short_momentum"})
+        activate.update({"momentum_long", "trend_following", "breakout"})
+    else:
+        pause.update({"momentum_long", "trend_following", "breakout", "contrarian", "mean_reversion", "scalping"})
+        activate.update({"momentum_short", "short_momentum"})
+
+    guidance["pause"] = sorted(pause)
+    guidance["activate"] = sorted(activate)
+    regime_data["strategy_guidance"] = guidance
+    regime_data["countertrend_block_side"] = block_side
+    regime_data["global_momentum_override"] = {
+        "direction": direction,
+        "block_side": block_side,
+        "agreeing_coins": agreeing,
+        "min_agreeing_coins": min_agree,
+    }
+
+    logger.warning(
+        "  GLOBAL MOMENTUM OVERRIDE: %s across %s -- blocking %s entries",
+        direction.upper(),
+        ",".join(agreeing),
+        block_side,
+    )
+
+    if (
+        bool(getattr(config, "GLOBAL_MOMENTUM_CLOSE_COUNTERTREND", False))
+        and is_live_trading_active(container)
+        and getattr(container, "live_trader", None)
+    ):
+        try:
+            for pos in get_execution_open_positions(container):
+                coin = str(pos.get("coin") or "").upper()
+                side = str(pos.get("side") or "").strip().lower()
+                if coin and side == block_side:
+                    container.live_trader.close_position(coin)
+                    logger.warning("  GLOBAL MOMENTUM: closed countertrend %s %s", side, coin)
+        except Exception as exc:
+            logger.warning("  Global momentum close-countertrend failed: %s", exc)
+
+    return regime_data
+
+
 def _run_hedger(container, regime_data):
     """Cross-venue hedging — auto-hedge on crash regime."""
     hedger = container.cross_venue_hedger
@@ -409,9 +518,10 @@ def _drawdown_from_reference(account_balance: float, baseline: float = 10_000.0)
 def _get_dynamic_sizing(container, strategy_key: str, account_balance: float,
                         signal_confidence: float, regime_data=None, coin: str = "",
                         volatility: float = 0.02):
-    """Use the RL sizer when available, otherwise fall back to Kelly."""
+    """Use Kelly by default; RL sizing is shadow-only unless explicitly enabled."""
     rl_sizer = getattr(container, "rl_sizer", None)
-    if rl_sizer:
+    rl_apply_enabled = bool(getattr(config, "RL_SIZER_APPLY_TO_ORDERS", False))
+    if rl_sizer and rl_apply_enabled:
         regime = "unknown"
         if regime_data:
             per_coin = dict(regime_data.get("per_coin", {}).get(coin, {}) or {})
@@ -428,6 +538,12 @@ def _get_dynamic_sizing(container, strategy_key: str, account_balance: float,
                 float(getattr(config, "PAPER_TRADING_INITIAL_BALANCE", 10_000.0)),
             ),
         )
+    elif rl_sizer and not getattr(container, "_rl_sizer_shadow_logged", False):
+        logger.info("  RL sizer is shadow-only; Kelly/default sizing controls live orders")
+        try:
+            container._rl_sizer_shadow_logged = True
+        except Exception:
+            pass
 
     kelly_sizer = getattr(container, "kelly_sizer", None)
     if kelly_sizer:
@@ -661,6 +777,7 @@ def run_trading_cycle(container, cycle_count: int) -> None:
 
         # ── Phase 3d3: Macro Regime Overlay ──
         regime_data = _apply_macro_regime_overlay(container, regime_data)
+        regime_data = _apply_global_momentum_override(container, regime_data)
 
         # Cross-venue hedging
         _run_hedger(container, regime_data)
@@ -1523,6 +1640,11 @@ def _run_alpha_arena(container, regime_data):
                                 context={
                                     "features": {},
                                     "atr_pct": sig.get("atr_pct", 0.0),
+                                    "volatility": sig.get("atr_pct", 0.0),
+                                    "failure_cases": list(sig.get("failure_cases") or []),
+                                    "invalidation_price": sig.get("invalidation_price"),
+                                    "validation_warnings": list(sig.get("validation_warnings") or []),
+                                    "arena_validation_passed": bool(sig.get("validation_passed", False)),
                                 },
                                 regime=regime_data.get("overall_regime", "") if regime_data else "",
                             )
@@ -1623,6 +1745,10 @@ def _run_alpha_arena(container, regime_data):
                                         "agent_fitness": sig["agent_fitness"],
                                         "agent_elo": sig["agent_elo"],
                                         "confidence": conf,
+                                        "failure_cases": list(sig.get("failure_cases") or []),
+                                        "invalidation_price": sig.get("invalidation_price"),
+                                        "validation_warnings": list(sig.get("validation_warnings") or []),
+                                        "arena_validation_passed": bool(sig.get("validation_passed", False)),
                                         "risk_policy": dict((live_signal.context or {}).get("risk_policy", {}) or {}),
                                     },
                                 )

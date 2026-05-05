@@ -21,6 +21,7 @@ from src.core.cycles.trading_cycle import (
     _execute_signal_live,
     _execute_lcrs_signals,
     _execute_options_flow_trades,
+    _get_dynamic_sizing,
     _live_safety_stop_reason,
     _process_closed_trades,
     _run_alpha_arena,
@@ -63,6 +64,49 @@ def _fake_live_credentials(self):
     self.agent_wallet_address = self.signer.address
     self.public_address = "0x2222222222222222222222222222222222222222"
     self.status_reason = "credentials_loaded"
+
+
+def test_live_trader_extracts_resting_order_ids_from_hyperliquid_statuses():
+    result = {
+        "response": {
+            "data": {
+                "statuses": [
+                    {"resting": {"oid": "123"}},
+                    {"filled": {"oid": "ignored"}},
+                    {"resting": {"order_id": 456}},
+                    {"resting": {"id": "789"}},
+                ]
+            }
+        }
+    }
+
+    assert LiveTrader._extract_resting_order_ids(result) == [123, 456, 789]
+
+
+def test_trading_cycle_keeps_rl_sizer_shadow_only_by_default(monkeypatch):
+    class _Sizing:
+        position_pct = 0.03
+        position_usd = 300.0
+
+    class _Kelly:
+        def __init__(self):
+            self.called = False
+
+        def get_sizing(self, **kwargs):
+            self.called = True
+            return _Sizing()
+
+    class _RL:
+        def get_sizing(self, **kwargs):
+            raise AssertionError("RL sizing must not control orders while shadow-only")
+
+    container = types.SimpleNamespace(kelly_sizer=_Kelly(), rl_sizer=_RL())
+    monkeypatch.setattr(config, "RL_SIZER_APPLY_TO_ORDERS", False, raising=False)
+
+    sizing = _get_dynamic_sizing(container, "momentum", 10_000.0, 0.7)
+
+    assert sizing.position_pct == pytest.approx(0.03)
+    assert container.kelly_sizer.called is True
 
 
 def test_shadow_mode_allows_missing_rotation_threshold_envs(monkeypatch):

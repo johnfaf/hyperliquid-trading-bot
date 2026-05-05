@@ -9,7 +9,11 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-from src.learning.dataset_builder import DatasetBuildResult, LearningExample
+from src.learning.dataset_builder import (
+    DatasetBuildResult,
+    DecisionDatasetBuilder,
+    LearningExample,
+)
 from src.learning.policy_registry import CHAMPION_POLICY_ID
 
 
@@ -304,6 +308,30 @@ class DecisionReplayBacktester:
             parameters=policy.to_dict(),
             passed=passed,
         )
+        if persist:
+            self.record_result(result)
+        return result
+
+    def run_date_range(
+        self,
+        *,
+        start: Optional[str],
+        end: Optional[str],
+        policy: ReplayPolicy,
+        limit: int = 5000,
+        persist: bool = True,
+        use_outcomes: bool = True,
+    ) -> ReplayBacktestResult:
+        """Build and replay the exact decisions made inside a timestamp window."""
+        dataset = DecisionDatasetBuilder().build(
+            limit=limit,
+            min_created_at=start,
+            max_created_at=end,
+            persist=persist,
+            use_outcomes=use_outcomes,
+        )
+        result = self.run(dataset, policy, persist=False)
+        result.metrics.setdefault("date_range", {"start": start, "end": end})
         if persist:
             self.record_result(result)
         return result

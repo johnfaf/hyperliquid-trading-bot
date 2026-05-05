@@ -11,7 +11,7 @@ class MockSignal:
     def __init__(self, coin="BTC", side_val="long", confidence=0.5,
                  leverage=3, size=0.1, entry_price=50000,
                  position_pct=0.05, strategy_type="momentum",
-                 source_accuracy=0.0):
+                 source_accuracy=0.0, context=None):
         self.coin = coin
         self.side = MagicMock()
         self.side.value = side_val
@@ -24,6 +24,7 @@ class MockSignal:
         self.source_accuracy = source_accuracy
         self.regime_size_modifier = 1.0
         self.source = "test"
+        self.context = dict(context or {})
 
     def validate(self):
         return True
@@ -306,6 +307,98 @@ def test_firewall_same_side_position_limit_blocks_stacking(mock_db):
 
     assert passed is False
     assert "pyramiding" in reason.lower()
+
+
+@patch("src.signals.decision_firewall.db")
+def test_firewall_blocks_losing_same_side_averaging(mock_db):
+    """A new same-side entry cannot add to a losing position without explicit thesis update."""
+    mock_db.get_open_paper_trades.return_value = [
+        {"coin": "BTC", "side": "long", "size": 1, "entry_price": 100.0, "leverage": 5},
+    ]
+    mock_db.get_paper_account.return_value = {"balance": 1000000}
+    mock_db.audit_log = MagicMock()
+
+    from src.signals.decision_firewall import DecisionFirewall
+
+    fw = DecisionFirewall(
+        {
+            "block_losing_averaging": True,
+            "averaging_max_loss_roe_pct": 0.05,
+            "cooldown_seconds": 0,
+            "same_side_cooldown_seconds": 0,
+            "enable_predictive_derisk": False,
+            "funding_risk_enabled": False,
+        }
+    )
+
+    passed, reason = fw.validate(MockSignal(coin="BTC", side_val="long", entry_price=98.0))
+
+    assert passed is False
+    assert "average-down" in reason.lower()
+    assert fw.get_stats()["rejected_pyramiding"] == 1
+
+
+@patch("src.signals.decision_firewall.db")
+def test_firewall_allows_losing_scale_in_with_new_information(mock_db):
+    mock_db.get_open_paper_trades.return_value = [
+        {"coin": "BTC", "side": "long", "size": 1, "entry_price": 100.0, "leverage": 5},
+    ]
+    mock_db.get_paper_account.return_value = {"balance": 1000000}
+    mock_db.audit_log = MagicMock()
+
+    from src.signals.decision_firewall import DecisionFirewall
+
+    fw = DecisionFirewall(
+        {
+            "block_losing_averaging": True,
+            "averaging_max_loss_roe_pct": 0.05,
+            "cooldown_seconds": 0,
+            "same_side_cooldown_seconds": 0,
+            "enable_predictive_derisk": False,
+            "funding_risk_enabled": False,
+        }
+    )
+
+    signal = MockSignal(
+        coin="BTC",
+        side_val="long",
+        entry_price=98.0,
+        context={"new_information": True},
+    )
+    passed, reason = fw.validate(signal)
+
+    assert passed is True
+    assert reason == "approved"
+
+
+@patch("src.signals.decision_firewall.db")
+def test_firewall_rejects_chasing_extended_entry_location(mock_db):
+    mock_db.get_open_paper_trades.return_value = []
+    mock_db.get_paper_account.return_value = {"balance": 1000000}
+    mock_db.audit_log = MagicMock()
+
+    from src.signals.decision_firewall import DecisionFirewall
+
+    fw = DecisionFirewall(
+        {
+            "entry_location_filter_enabled": True,
+            "entry_max_price_extension_pct": 0.03,
+            "entry_max_atr_extension": 1.5,
+            "enable_predictive_derisk": False,
+            "funding_risk_enabled": False,
+        }
+    )
+    signal = MockSignal(
+        coin="BTC",
+        side_val="long",
+        context={"distance_from_vwap_pct": 0.05, "atr_pct": 0.01},
+    )
+
+    passed, reason = fw.validate(signal)
+
+    assert passed is False
+    assert "entry too extended" in reason.lower()
+    assert fw.get_stats()["rejected_entry_location"] == 1
 
 
 @patch("src.signals.decision_firewall.db")

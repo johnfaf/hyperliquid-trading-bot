@@ -452,6 +452,18 @@ LIVE_MIN_ORDER_SAME_SIDE_MAX_BUMP_MULTIPLIER = float(
     os.environ.get("LIVE_MIN_ORDER_SAME_SIDE_MAX_BUMP_MULTIPLIER", 2.5)
 )
 LIVE_ANALYTICS_LOOKBACK_TRADES = int(os.environ.get("LIVE_ANALYTICS_LOOKBACK_TRADES", 200))
+LIVE_ENTRY_EXECUTION_MODE = os.environ.get(
+    "LIVE_ENTRY_EXECUTION_MODE", "maker_then_market"
+).strip().lower()
+LIVE_MAKER_ENTRY_OFFSET_BPS = _safe_env_float(
+    "LIVE_MAKER_ENTRY_OFFSET_BPS", 1.0, lo=0.0, hi=100.0,
+)
+LIVE_MAKER_ENTRY_TIMEOUT_S = _safe_env_float(
+    "LIVE_MAKER_ENTRY_TIMEOUT_S", 2.5, lo=0.0, hi=30.0,
+)
+LIVE_MAKER_ENTRY_FALLBACK_TO_MARKET = _safe_env_bool(
+    "LIVE_MAKER_ENTRY_FALLBACK_TO_MARKET", True,
+)
 COPY_TRADER_ENABLED = os.environ.get(
     "COPY_TRADER_ENABLED", "true"
 ).lower() in ("true", "1", "yes")
@@ -692,6 +704,46 @@ FIREWALL_MAX_AGGREGATE_EXPOSURE = float(
 FIREWALL_MAX_AGGREGATE_MARGIN_PCT = float(
     os.environ.get("FIREWALL_MAX_AGGREGATE_MARGIN_PCT", 0.60)
 )
+FIREWALL_BLOCK_LOSING_AVERAGING = _safe_env_bool(
+    "FIREWALL_BLOCK_LOSING_AVERAGING", True
+)
+FIREWALL_AVERAGING_MAX_LOSS_ROE_PCT = float(
+    os.environ.get("FIREWALL_AVERAGING_MAX_LOSS_ROE_PCT", 0.015)
+)
+FIREWALL_ENTRY_LOCATION_FILTER_ENABLED = os.environ.get(
+    "FIREWALL_ENTRY_LOCATION_FILTER_ENABLED", "true"
+).lower() in ("true", "1", "yes")
+FIREWALL_ENTRY_MAX_ATR_EXTENSION = float(
+    os.environ.get("FIREWALL_ENTRY_MAX_ATR_EXTENSION", 1.8)
+)
+FIREWALL_ENTRY_MAX_PRICE_EXTENSION_PCT = float(
+    os.environ.get("FIREWALL_ENTRY_MAX_PRICE_EXTENSION_PCT", 0.035)
+)
+
+# Cross-asset momentum override: when core majors break out together, block
+# countertrend entries and pause mean-reversion-style fades. Auto-closing
+# countertrend live positions is available but off by default.
+GLOBAL_MOMENTUM_OVERRIDE_ENABLED = _safe_env_bool(
+    "GLOBAL_MOMENTUM_OVERRIDE_ENABLED", True
+)
+GLOBAL_MOMENTUM_CORE_COINS = _parse_coin_list(
+    os.environ.get("GLOBAL_MOMENTUM_CORE_COINS", "BTC,ETH,SOL")
+)
+GLOBAL_MOMENTUM_MIN_AGREEING_COINS = int(
+    os.environ.get("GLOBAL_MOMENTUM_MIN_AGREEING_COINS", 2)
+)
+GLOBAL_MOMENTUM_MIN_CONFIDENCE = float(
+    os.environ.get("GLOBAL_MOMENTUM_MIN_CONFIDENCE", 0.58)
+)
+GLOBAL_MOMENTUM_MIN_MOMENTUM = float(
+    os.environ.get("GLOBAL_MOMENTUM_MIN_MOMENTUM", 0.006)
+)
+GLOBAL_MOMENTUM_MIN_VOLUME_RATIO = float(
+    os.environ.get("GLOBAL_MOMENTUM_MIN_VOLUME_RATIO", 0.75)
+)
+GLOBAL_MOMENTUM_CLOSE_COUNTERTREND = _safe_env_bool(
+    "GLOBAL_MOMENTUM_CLOSE_COUNTERTREND", False
+)
 
 # Per-source capital allocator / throttling.
 SOURCE_POLICY_ENABLED = os.environ.get(
@@ -789,6 +841,15 @@ if not ARENA_COIN_UNIVERSE:
 ARENA_MAX_COINS = int(os.environ.get("ARENA_MAX_COINS", 3))
 ARENA_INTERVAL = os.environ.get("ARENA_INTERVAL", "1h").strip() or "1h"
 ARENA_LOOKBACK_HOURS = int(os.environ.get("ARENA_LOOKBACK_HOURS", 720))
+ARENA_REQUIRE_CONTRARIAN_VALIDATION = _safe_env_bool(
+    "ARENA_REQUIRE_CONTRARIAN_VALIDATION", True
+)
+ARENA_HIGH_CONFIDENCE_THRESHOLD = float(
+    os.environ.get("ARENA_HIGH_CONFIDENCE_THRESHOLD", 0.80)
+)
+ARENA_UNVALIDATED_CONFIDENCE_CAP = float(
+    os.environ.get("ARENA_UNVALIDATED_CONFIDENCE_CAP", 0.74)
+)
 
 # Options-flow conviction gate (0-100).
 OPTIONS_FLOW_MIN_CONVICTION_PCT = float(
@@ -826,6 +887,7 @@ LSTM_MODEL_DIR = os.environ.get("LSTM_MODEL_DIR", "models/lstm_direction")
 
 # ─── RL Position Sizer ──────────────────────────────────────
 ENABLE_RL_SIZER = os.environ.get("ENABLE_RL_SIZER", "true").lower() in ("true", "1", "yes")
+RL_SIZER_APPLY_TO_ORDERS = _safe_env_bool("RL_SIZER_APPLY_TO_ORDERS", False)
 RL_SIZER_RETRAIN_INTERVAL = int(os.environ.get("RL_SIZER_RETRAIN_INTERVAL", 43200))  # 12 hours
 RL_SIZER_TRAINING_EPISODES = int(os.environ.get("RL_SIZER_TRAINING_EPISODES", 500))
 RL_SIZER_MODEL_DIR = os.environ.get("RL_SIZER_MODEL_DIR", "models/rl_sizer")
@@ -1075,6 +1137,8 @@ def _validate_config_bounds() -> None:
         ("LIVE_MIN_ORDER_SHORT_MIN_CONFIDENCE", 0.0, 1.0, 0.75),
         ("LIVE_MIN_ORDER_SAME_SIDE_MAX_BUMP_MULTIPLIER", 1.0, 10.0, 2.5),
         ("LIVE_ANALYTICS_LOOKBACK_TRADES", 10, 5_000, 200),
+        ("LIVE_MAKER_ENTRY_OFFSET_BPS", 0.0, 100.0, 1.0),
+        ("LIVE_MAKER_ENTRY_TIMEOUT_S", 0.0, 30.0, 2.5),
         ("COPY_TRADER_MAX_CONCURRENT_TRADES", 0, 100, 2),
         ("COPY_TRADER_MAX_NEW_TRADES_PER_CYCLE", 0, 100, 1),
         ("COPY_TRADER_AUTO_PAUSE_MIN_CLOSED_TRADES", 1, 5_000, 6),
@@ -1098,6 +1162,13 @@ def _validate_config_bounds() -> None:
         ("SHORT_HARDENING_SOURCE_BLOCK_NET_PNL", -1_000_000.0, 1_000_000.0, -0.25),
         ("SHORT_HARDENING_COIN_MIN_CLOSED_TRADES", 1, 1_000, 4),
         ("SHORT_HARDENING_COIN_BLOCK_NET_PNL", -1_000_000.0, 1_000_000.0, -0.25),
+        ("FIREWALL_AVERAGING_MAX_LOSS_ROE_PCT", 0.0, 1.0, 0.015),
+        ("FIREWALL_ENTRY_MAX_ATR_EXTENSION", 0.0, 20.0, 1.8),
+        ("FIREWALL_ENTRY_MAX_PRICE_EXTENSION_PCT", 0.0, 1.0, 0.035),
+        ("GLOBAL_MOMENTUM_MIN_AGREEING_COINS", 1, 20, 2),
+        ("GLOBAL_MOMENTUM_MIN_CONFIDENCE", 0.0, 1.0, 0.58),
+        ("GLOBAL_MOMENTUM_MIN_MOMENTUM", 0.0, 1.0, 0.006),
+        ("GLOBAL_MOMENTUM_MIN_VOLUME_RATIO", 0.0, 100.0, 0.75),
         ("PAPER_EXECUTION_MAX_TRADES_PER_CYCLE", 0, 100, 3),
         ("TRADE_QUALITY_MIN_EDGE_COST_MULTIPLE", 0.0, 100.0, 1.5),
         ("TRADE_QUALITY_EXPECTED_SLIPPAGE_BPS", 0.0, 1_000.0, PAPER_TRADING_SLIPPAGE_MAX_BPS),
@@ -1106,6 +1177,8 @@ def _validate_config_bounds() -> None:
         ("RISK_POLICY_SHORT_CAUTION_MAX_REWARD_MULTIPLE", 1.0, 20.0, 3.0),
         ("RISK_POLICY_SHORT_CAUTION_TIME_LIMIT_MULTIPLIER", 0.1, 2.0, 0.75),
         ("RISK_POLICY_SHORT_CAUTION_BREAKEVEN_AT_R", 0.1, 5.0, 0.65),
+        ("ARENA_HIGH_CONFIDENCE_THRESHOLD", 0.0, 1.0, 0.80),
+        ("ARENA_UNVALIDATED_CONFIDENCE_CAP", 0.0, 1.0, 0.74),
         ("READINESS_STALE_SECONDS", 30, 86_400, 600),
         ("READINESS_DB_WRITE_TTL_S", 1, 3_600, 60),
         ("READINESS_ALERT_COOLDOWN_S", 30, 86_400, 900),
@@ -1119,6 +1192,13 @@ def _validate_config_bounds() -> None:
     if ALPHA_TIMEFRAME not in {"1h"}:
         _warn_config(f"Invalid ALPHA_TIMEFRAME={ALPHA_TIMEFRAME!r}; using '1h'.")
         globals()["ALPHA_TIMEFRAME"] = "1h"
+
+    if LIVE_ENTRY_EXECUTION_MODE not in {"market", "maker_only", "maker_then_market"}:
+        _warn_config(
+            f"Invalid LIVE_ENTRY_EXECUTION_MODE={LIVE_ENTRY_EXECUTION_MODE!r}; "
+            "using 'maker_then_market'."
+        )
+        globals()["LIVE_ENTRY_EXECUTION_MODE"] = "maker_then_market"
 
     if LIVE_MAX_ORDER_USD < LIVE_MIN_ORDER_USD:
         _warn_config(

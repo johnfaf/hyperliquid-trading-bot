@@ -28,6 +28,7 @@ from enum import Enum
 
 import numpy as np
 
+import config
 import sys
 import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -901,6 +902,58 @@ class Backtester:
 
         return result
 
+    @staticmethod
+    def _contrarian_validation(
+        *,
+        side: str,
+        current_price: float,
+        sma_fast: float,
+        sma_slow: float,
+        rsi: float,
+        atr_pct: float,
+        returns: np.ndarray,
+    ) -> Dict[str, Any]:
+        """Attach falsifiable failure cases to high-confidence Arena signals."""
+        risk_band = max(float(atr_pct or 0.0) * 1.5, 0.01)
+        if str(side).lower() == "long":
+            invalidation_price = current_price * (1.0 - risk_band)
+            failure_cases = [
+                f"Fast SMA crosses below slow SMA ({sma_fast:.4g} <= {sma_slow:.4g})",
+                "RSI closes back below 50 after entry",
+                f"Price closes below invalidation {invalidation_price:.6g}",
+            ]
+            warnings = []
+            if sma_fast <= sma_slow:
+                warnings.append("trend_not_aligned")
+            if rsi >= 72:
+                warnings.append("long_chasing_overbought_rsi")
+        else:
+            invalidation_price = current_price * (1.0 + risk_band)
+            failure_cases = [
+                f"Fast SMA crosses above slow SMA ({sma_fast:.4g} >= {sma_slow:.4g})",
+                "RSI closes back above 50 after entry",
+                f"Price closes above invalidation {invalidation_price:.6g}",
+            ]
+            warnings = []
+            if sma_fast >= sma_slow:
+                warnings.append("trend_not_aligned")
+            if rsi <= 28:
+                warnings.append("short_chasing_oversold_rsi")
+
+        if len(returns) >= 14:
+            recent_vol = float(np.std(returns[-5:]))
+            prior_vol = float(np.std(returns[-14:-5])) if len(returns[-14:-5]) else recent_vol
+            if prior_vol > 0 and recent_vol > prior_vol * 1.75:
+                warnings.append("volatility_expansion")
+
+        return {
+            "failure_cases": failure_cases,
+            "invalidation_price": invalidation_price,
+            "validation_warnings": warnings,
+            "validation_passed": len(failure_cases) >= 3 and invalidation_price > 0,
+            "risk_band_pct": risk_band,
+        }
+
     def _agent_generate_signal(self, agent: ArenaAgent,
                                  bars: List[Dict],
                                  current_bar: Dict,
@@ -1038,12 +1091,22 @@ class Backtester:
 
         # Apply confidence threshold from agent params
         if side and confidence >= conf_threshold:
+            validation = self._contrarian_validation(
+                side=side,
+                current_price=float(current_price),
+                sma_fast=float(sma_fast),
+                sma_slow=float(sma_slow),
+                rsi=float(rsi),
+                atr_pct=float(atr_pct),
+                returns=returns,
+            )
             return {
                 "coin": coin,
                 "side": side,
                 "confidence": confidence,
                 "price": current_price,
                 "atr_pct": atr_pct,
+                **validation,
             }
 
         return None
@@ -1075,6 +1138,10 @@ class Backtester:
                 "features": {},
                 "atr_pct": float(signal.get("atr_pct", 0.02) or 0.02),
                 "volatility": float(signal.get("atr_pct", 0.02) or 0.02),
+                "failure_cases": list(signal.get("failure_cases") or []),
+                "invalidation_price": signal.get("invalidation_price"),
+                "validation_warnings": list(signal.get("validation_warnings") or []),
+                "arena_validation_passed": bool(signal.get("validation_passed", False)),
             },
         )
         if self.risk_policy_engine:
@@ -1929,6 +1996,17 @@ class AlphaArena:
                 base_conf = best_signal["confidence"]
                 fitness_mult = min(1.0 + agent.fitness_score, 1.3)
                 adjusted_conf = min(base_conf * fitness_mult, 0.95)
+                failure_cases = list(best_signal.get("failure_cases") or [])
+                validation_passed = bool(best_signal.get("validation_passed")) and len(failure_cases) >= 3
+                if (
+                    bool(getattr(config, "ARENA_REQUIRE_CONTRARIAN_VALIDATION", True))
+                    and adjusted_conf >= float(getattr(config, "ARENA_HIGH_CONFIDENCE_THRESHOLD", 0.70))
+                    and not validation_passed
+                ):
+                    adjusted_conf = min(
+                        adjusted_conf,
+                        float(getattr(config, "ARENA_UNVALIDATED_CONFIDENCE_CAP", 0.64)),
+                    )
 
                 signals.append({
                     "coin": best_signal["coin"],
@@ -1945,6 +2023,10 @@ class AlphaArena:
                     "agent_sharpe": round(agent.sharpe_ratio, 3),
                     "price": best_signal["price"],
                     "atr_pct": best_signal.get("atr_pct", 0.02),
+                    "failure_cases": failure_cases,
+                    "invalidation_price": best_signal.get("invalidation_price"),
+                    "validation_warnings": list(best_signal.get("validation_warnings") or []),
+                    "validation_passed": validation_passed,
                 })
 
             except Exception as e:

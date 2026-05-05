@@ -58,7 +58,7 @@
             {% if r.total_pnl > 0 %}text-emerald-300
             {% elif r.total_pnl < 0 %}text-rose-300
             {% else %}text-slate-300{% endif %}">
-            ${{ '%+,.2f'|format(r.total_pnl or 0) }}
+            ${{ "{:+,.2f}".format(r.total_pnl or 0) }}
           </td>
           <td class="py-1.5 px-3 text-slate-500 font-mono">{{ (r.completed_at or '')[:19] }}</td>
         </tr>

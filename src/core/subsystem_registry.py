@@ -422,6 +422,21 @@ def build_subsystems(
             "max_same_side_positions_per_coin": int(
                 getattr(_fw_cfg, "FIREWALL_MAX_SAME_SIDE_POSITIONS_PER_COIN", 2)
             ),
+            "block_losing_averaging": bool(
+                getattr(_fw_cfg, "FIREWALL_BLOCK_LOSING_AVERAGING", True)
+            ),
+            "averaging_max_loss_roe_pct": float(
+                getattr(_fw_cfg, "FIREWALL_AVERAGING_MAX_LOSS_ROE_PCT", 0.015)
+            ),
+            "entry_location_filter_enabled": bool(
+                getattr(_fw_cfg, "FIREWALL_ENTRY_LOCATION_FILTER_ENABLED", True)
+            ),
+            "entry_max_atr_extension": float(
+                getattr(_fw_cfg, "FIREWALL_ENTRY_MAX_ATR_EXTENSION", 1.8)
+            ),
+            "entry_max_price_extension_pct": float(
+                getattr(_fw_cfg, "FIREWALL_ENTRY_MAX_PRICE_EXTENSION_PCT", 0.035)
+            ),
             "canary_mode": bool(getattr(_fw_cfg, "FIREWALL_CANARY_MODE", False)),
             "canary_max_positions": int(getattr(_fw_cfg, "FIREWALL_CANARY_MAX_POSITIONS", 2)),
             # AUDIT M1 — leveraged-notional cap + margin cap are independent

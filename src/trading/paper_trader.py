@@ -181,6 +181,24 @@ class PaperTrader:
             "atr_pct": sig.get("atr_pct"),
             "volatility": sig.get("volatility"),
             "expected_return": sig.get("expected_return"),
+            "decision_attribution": {
+                "source": sig.get("source"),
+                "source_key": sig.get("source_key"),
+                "strategy_id": (sig.get("strategy") or {}).get("id")
+                if isinstance(sig.get("strategy"), dict)
+                else sig.get("strategy_id"),
+                "strategy_type": sig.get("strategy_type")
+                or ((sig.get("strategy") or {}).get("strategy_type") if isinstance(sig.get("strategy"), dict) else None),
+                "strategy_name": (sig.get("strategy") or {}).get("name")
+                if isinstance(sig.get("strategy"), dict)
+                else sig.get("strategy_name"),
+                "reason": sig.get("reason"),
+                "volume_confirmed": sig.get("volume_confirmed"),
+                "options_flow_aligned": sig.get("options_flow_aligned"),
+                "polymarket_probability": sig.get("polymarket_probability"),
+                "agent_id": sig.get("agent_id"),
+                "agent_name": sig.get("agent_name"),
+            },
         }
         if regime_data:
             context["regime"] = regime_data.get("overall_regime", "")

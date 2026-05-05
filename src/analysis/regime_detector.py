@@ -19,7 +19,7 @@ import copy
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 from collections import defaultdict
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from enum import Enum
 
 import numpy as np
@@ -103,6 +103,8 @@ class RegimeState:
     trend_direction: float  # Positive = up, negative = down
     momentum: float         # Rate of change
     timestamp: str
+    lookback_mode: str = "normal"
+    lookback_periods: Dict[str, int] = field(default_factory=dict)
 
     def to_dict(self) -> Dict:
         d = asdict(self)
@@ -132,6 +134,38 @@ class RegimeDetector:
         logger.info("RegimeDetector initialized")
 
     # ─── Core Detection ───────────────────────────────────────
+
+    def _dynamic_lookbacks(
+        self,
+        highs: np.ndarray,
+        lows: np.ndarray,
+        closes: np.ndarray,
+    ) -> Tuple[str, Dict[str, int]]:
+        """Shorten/lengthen indicator windows based on current volatility."""
+        fast_atr_pct = self._calculate_atr_pct(highs, lows, closes, period=5)
+        if fast_atr_pct >= 0.035:
+            return "high_vol_fast", {
+                "adx": 8,
+                "atr": 8,
+                "volume": 12,
+                "trend": 10,
+                "momentum": 5,
+            }
+        if 0.0 < fast_atr_pct <= 0.010:
+            return "low_vol_slow", {
+                "adx": 21,
+                "atr": 21,
+                "volume": 30,
+                "trend": 30,
+                "momentum": 14,
+            }
+        return "normal", {
+            "adx": 14,
+            "atr": 14,
+            "volume": 20,
+            "trend": 20,
+            "momentum": 10,
+        }
 
     def detect_regime(self, coin: str, candles: Optional[List[Dict]] = None) -> RegimeState:
         """
@@ -166,12 +200,15 @@ class RegimeDetector:
         lows = np.array([c["low"] for c in candles], dtype=float)
         volumes = np.array([c.get("volume", 0) for c in candles], dtype=float)
 
-        # Calculate indicators
-        adx = self._calculate_adx(highs, lows, closes, period=14)
-        atr_pct = self._calculate_atr_pct(highs, lows, closes, period=14)
-        volume_ratio = self._calculate_volume_ratio(volumes, period=20)
-        trend_dir = self._calculate_trend_direction(closes, period=20)
-        momentum = self._calculate_momentum(closes, period=10)
+        # Calculate indicators with volatility-adaptive lookbacks. High-volatility
+        # markets need faster reaction; low-volatility chop benefits from longer
+        # smoothing so a single candle does not flip the whole bot.
+        lookback_mode, lookbacks = self._dynamic_lookbacks(highs, lows, closes)
+        adx = self._calculate_adx(highs, lows, closes, period=lookbacks["adx"])
+        atr_pct = self._calculate_atr_pct(highs, lows, closes, period=lookbacks["atr"])
+        volume_ratio = self._calculate_volume_ratio(volumes, period=lookbacks["volume"])
+        trend_dir = self._calculate_trend_direction(closes, period=lookbacks["trend"])
+        momentum = self._calculate_momentum(closes, period=lookbacks["momentum"])
 
         # Classify regime
         regime, confidence = self._classify_regime(
@@ -187,6 +224,8 @@ class RegimeDetector:
             trend_direction=round(trend_dir, 4),
             momentum=round(momentum, 4),
             timestamp=datetime.now(timezone.utc).isoformat(),
+            lookback_mode=lookback_mode,
+            lookback_periods=dict(lookbacks),
         )
 
         # Cache and log
@@ -198,7 +237,8 @@ class RegimeDetector:
 
         logger.debug(f"Regime {coin}: {regime.value} (confidence={confidence:.0%}, "
                      f"ADX={adx:.1f}, ATR%={atr_pct:.2%}, vol_ratio={volume_ratio:.1f}x, "
-                     f"trend={trend_dir:+.3f}, momentum={momentum:+.3f})")
+                     f"trend={trend_dir:+.3f}, momentum={momentum:+.3f}, "
+                     f"lookback={lookback_mode})")
 
         return state
 

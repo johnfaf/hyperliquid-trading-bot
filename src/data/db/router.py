@@ -3,9 +3,9 @@ Database backend router.
 
 Routes connections based on ``config.DB_BACKEND``:
 
-  - ``sqlite``    — all ops go to SQLite (default, current behaviour)
-  - ``dualwrite`` — writes go to both SQLite and Postgres; reads from SQLite
-  - ``postgres``  — all ops go to Postgres
+  - ``sqlite``    - all ops go to SQLite (default, current behaviour)
+  - ``dualwrite`` - writes go to both SQLite and Postgres; reads from SQLite
+  - ``postgres``  - all ops go to Postgres
 
 The router exposes a single ``get_connection()`` context manager that
 returns a :class:`ConnectionAdapter` the rest of ``database.py`` can use
@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 _SQLITE_WRITE_LOCK = threading.RLock()
 
 
-# ─── SQLite helpers ─────────────────────────────────────────────
+# SQLite helpers
 
 def _sqlite_connect() -> sqlite3.Connection:
     """Open a fresh SQLite connection with WAL, FK checks, and busy_timeout."""
@@ -84,7 +84,7 @@ def _sqlite_write_guard(enabled: bool):
         yield
 
 
-# ─── Postgres helpers ──────────────────────────────────────────
+# Postgres helpers
 
 def _pg_connect():
     """Get a Postgres connection from the pool."""
@@ -97,7 +97,7 @@ def _pg_return(conn):
     return_connection(conn)
 
 
-# ─── Unified context manager ───────────────────────────────────
+# Unified context manager
 
 @contextmanager
 def get_connection(*, for_read: bool = False):
@@ -176,7 +176,7 @@ def get_connection(*, for_read: bool = False):
                     raw_sq.close()
                     _pg_return(pg_raw)
             else:
-                # Postgres unavailable — degrade to SQLite-only
+                # Postgres unavailable - degrade to SQLite-only
                 adapter = ConnectionAdapter(raw_sq, "sqlite")
                 try:
                     yield adapter
@@ -221,55 +221,17 @@ def is_dualwrite_active() -> bool:
 
 
 def _quiet_postgres_server_logs() -> None:
-    """Silence noisy routine Postgres log output.
+    """No-op placeholder for the old app-side Postgres log mutator.
 
-    Railway's log ingestion tags anything Postgres writes to stderr as
-    'error' severity, so routine LOG-level messages (checkpoints every
-    5 minutes, every connection open/close) flood the Railway logs UI
-    as fake errors. Turning these off cuts noise without losing any
-    information that matters for debugging.
-
-    Wrapped in try/except: if the connecting role lacks privileges to
-    run ALTER SYSTEM (non-superuser), we silently skip. Only runs once
-    per process — check the flag below.
+    Runtime code must not mutate cluster-wide database settings. Managed
+    Postgres log verbosity belongs in provider settings or an explicit
+    operator-run maintenance script, not inside the trading process. Keeping
+    this function as a no-op preserves the init call site while preventing
+    poisoned transactions and surprise global DB changes during boot.
     """
-    try:
-        from src.data.db.postgres import get_connection as get_pg_connection
-        from src.data.db.postgres import return_connection as return_pg_connection
-    except Exception:
-        return
-
-    conn = None
-    try:
-        conn = get_pg_connection()
-        with conn.cursor() as cur:
-            # Each is safe to run on every boot; ALTER SYSTEM is idempotent.
-            for stmt in (
-                "ALTER SYSTEM SET log_checkpoints = off",
-                "ALTER SYSTEM SET log_connections = off",
-                "ALTER SYSTEM SET log_disconnections = off",
-            ):
-                try:
-                    cur.execute(stmt)
-                except Exception as exc:
-                    # Permissions issue or unsupported option — not fatal.
-                    logger.debug("Postgres quiet-log skip: %s (%s)", stmt, exc)
-            try:
-                cur.execute("SELECT pg_reload_conf()")
-            except Exception as exc:
-                logger.debug("Postgres pg_reload_conf skip: %s", exc)
-        conn.commit()
-        logger.info("Postgres routine-log chatter silenced (checkpoints/connections)")
-    except Exception as exc:
-        # Typically "permission denied" on managed Postgres without super.
-        # Harmless — the logs stay noisy but nothing is broken.
-        logger.debug("Could not quiet Postgres server logs: %s", exc)
-    finally:
-        if conn is not None:
-            try:
-                return_pg_connection(conn)
-            except Exception:
-                pass
+    logger.debug(
+        "Postgres routine-log configuration is managed outside the bot process"
+    )
 
 
 def init_postgres_schema() -> None:
@@ -301,6 +263,5 @@ def init_postgres_schema() -> None:
         else:
             run_migrations()
 
-        # After migrations succeed, silence routine Postgres log chatter so
-        # Railway's log UI isn't flooded with checkpoint/connection noise.
+        # Database server log policy is managed outside the bot process.
         _quiet_postgres_server_logs()

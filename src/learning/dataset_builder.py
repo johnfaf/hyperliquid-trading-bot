@@ -129,7 +129,12 @@ class DecisionDatasetBuilder:
     def __init__(self, source_policy_id: str = CHAMPION_POLICY_ID):
         self.source_policy_id = source_policy_id
 
-    def _load_rows(self, limit: int = 5000, min_created_at: Optional[str] = None) -> List[Dict[str, Any]]:
+    def _load_rows(
+        self,
+        limit: int = 5000,
+        min_created_at: Optional[str] = None,
+        max_created_at: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
         from src.data import database as db
 
         where = "WHERE ds.final_status IN ('paper_opened', 'paper_closed', 'approved', 'rejected', 'firewall_prescreen_rejected', 'firewall_prescreen_approved')"
@@ -137,6 +142,9 @@ class DecisionDatasetBuilder:
         if min_created_at:
             where += " AND ds.created_at >= ?"
             params.append(min_created_at)
+        if max_created_at:
+            where += " AND ds.created_at <= ?"
+            params.append(max_created_at)
         params.append(int(limit))
         with db.get_connection(for_read=True) as conn:
             rows = conn.execute(
@@ -157,6 +165,7 @@ class DecisionDatasetBuilder:
         self,
         limit: int = 5000,
         min_created_at: Optional[str] = None,
+        max_created_at: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         from src.data import database as db
 
@@ -165,6 +174,9 @@ class DecisionDatasetBuilder:
         if min_created_at:
             where += " AND created_at >= ?"
             params.append(min_created_at)
+        if max_created_at:
+            where += " AND created_at <= ?"
+            params.append(max_created_at)
         params.append(int(limit))
         try:
             with db.get_connection(for_read=True) as conn:
@@ -315,14 +327,27 @@ class DecisionDatasetBuilder:
         self,
         limit: int = 5000,
         min_created_at: Optional[str] = None,
+        max_created_at: Optional[str] = None,
         persist: bool = True,
         use_outcomes: bool = True,
     ) -> DatasetBuildResult:
-        outcome_rows = self._load_outcome_rows(limit=limit, min_created_at=min_created_at) if use_outcomes else []
+        outcome_rows = (
+            self._load_outcome_rows(
+                limit=limit,
+                min_created_at=min_created_at,
+                max_created_at=max_created_at,
+            )
+            if use_outcomes
+            else []
+        )
         if outcome_rows:
             examples = [self._row_to_outcome_example(row) for row in outcome_rows]
         else:
-            rows = self._load_rows(limit=limit, min_created_at=min_created_at)
+            rows = self._load_rows(
+                limit=limit,
+                min_created_at=min_created_at,
+                max_created_at=max_created_at,
+            )
             examples = [self._row_to_example(row) for row in rows]
         feature_names = sorted({name for item in examples for name in item.features})
         quality = self._quality(examples, feature_names)
@@ -333,6 +358,8 @@ class DecisionDatasetBuilder:
                 "count": len(examples),
                 "first": examples[-1].decision_id if examples else "",
                 "last": examples[0].decision_id if examples else "",
+                "min_created_at": min_created_at or "",
+                "max_created_at": max_created_at or "",
                 "feature_names": feature_names,
             },
         )

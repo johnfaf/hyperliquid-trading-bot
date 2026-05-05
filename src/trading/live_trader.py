@@ -733,6 +733,24 @@ class LiveTrader:
             0.1,
             float(os.environ.get("LIVE_FILL_VERIFY_POLL_S", "1.0")),
         )
+        self.entry_execution_mode = str(
+            getattr(config, "LIVE_ENTRY_EXECUTION_MODE", "maker_then_market")
+        ).strip().lower()
+        if self.entry_execution_mode not in {"market", "maker_only", "maker_then_market"}:
+            logger.warning(
+                "Invalid LIVE_ENTRY_EXECUTION_MODE=%r; using maker_then_market",
+                self.entry_execution_mode,
+            )
+            self.entry_execution_mode = "maker_then_market"
+        self.maker_entry_offset_bps = float(
+            getattr(config, "LIVE_MAKER_ENTRY_OFFSET_BPS", 1.0) or 0.0
+        )
+        self.maker_entry_timeout_s = float(
+            getattr(config, "LIVE_MAKER_ENTRY_TIMEOUT_S", 2.5) or 0.0
+        )
+        self.maker_entry_fallback_to_market = bool(
+            getattr(config, "LIVE_MAKER_ENTRY_FALLBACK_TO_MARKET", True)
+        )
 
         # Emergency exit retries for transient API/network failures.
         self._emergency_close_retries = max(
@@ -4617,6 +4635,21 @@ class LiveTrader:
         return None
 
     @classmethod
+    def _extract_resting_order_ids(cls, result: Optional[Dict]) -> List[int]:
+        """Return order ids that were accepted but are still resting."""
+        out: List[int] = []
+        for entry in cls._extract_inner_order_statuses(result):
+            resting = entry.get("resting")
+            if not isinstance(resting, dict):
+                continue
+            oid = resting.get("oid") or resting.get("order_id") or resting.get("id")
+            try:
+                out.append(int(oid))
+            except (TypeError, ValueError):
+                continue
+        return out
+
+    @classmethod
     def _is_order_result_success(cls, result: Optional[Dict]) -> bool:
         """Best-effort classification of exchange responses into success/failure.
 
@@ -5307,7 +5340,8 @@ class LiveTrader:
         return None
 
     def place_limit_order(self, coin: str, side: str, size: float, price: float,
-                          leverage: float = 1, reduce_only: bool = False) -> Dict:
+                          leverage: float = 1, reduce_only: bool = False,
+                          post_only: bool = False) -> Dict:
         """
         Place a limit order on Hyperliquid.
 
@@ -5318,6 +5352,7 @@ class LiveTrader:
             price: Limit price
             leverage: Leverage (default 1)
             reduce_only: Only reduce position (default False)
+            post_only: Use add-liquidity-only tif for maker entries
 
         Returns:
             Order result dict
@@ -5404,10 +5439,11 @@ class LiveTrader:
             return {"status": "rejected", "reason": "size_rounds_to_zero"}
 
         # H1: exchange-level cloid for retry idempotency.
+        tif = OrderType.LIMIT_ALO.value if post_only else OrderType.LIMIT_GTC.value
         time_bucket = int(time.time())
         cloid = self._make_cloid(
             "limit", coin, side.lower(), wire_size, wire_price,
-            bool(reduce_only), OrderType.LIMIT_GTC.value, time_bucket,
+            bool(reduce_only), tif, time_bucket,
         )
         order = {
             "a": asset_idx,
@@ -5415,7 +5451,7 @@ class LiveTrader:
             "p": wire_price,
             "s": wire_size,
             "r": reduce_only,
-            "t": {"limit": {"tif": OrderType.LIMIT_GTC.value}},
+            "t": {"limit": {"tif": tif}},
             "c": cloid,
         }
 
@@ -5425,8 +5461,27 @@ class LiveTrader:
             "grouping": "na"
         }
 
-        logger.info(f"Placing limit order: {coin} {side} {size} @ ${price:.2f} (notional: ${notional:.2f}) cloid={cloid[:10]}…")
+        logger.info(
+            "Placing %s limit order: %s %s %.6f @ $%.2f (notional: $%.2f) cloid=%s",
+            "post-only" if post_only else "GTC",
+            coin, side, size, price, notional, cloid[:10],
+        )
         result = self._post_order(action)
+        if isinstance(result, dict):
+            result = dict(result)
+            result["requested_size"] = float(size)
+            result["submitted_size"] = float(size)
+            result["submitted_notional"] = float(notional)
+            result["wire_size"] = wire_size
+            result["wire_price"] = wire_price
+            result["entry_order_type"] = "post_only_limit" if post_only else "limit"
+            result["resting_oids"] = self._extract_resting_order_ids(result)
+            reported_fill_size = self._extract_reported_fill_size(result)
+            if reported_fill_size is not None:
+                result["exchange_reported_fill_size"] = reported_fill_size
+            reported_fill_price = self._extract_reported_fill_price(result)
+            if reported_fill_price is not None:
+                result["exchange_reported_fill_price"] = reported_fill_price
 
         if self._is_order_result_success(result) and not self.dry_run:
             self.orders_today += 1
@@ -6312,6 +6367,152 @@ class LiveTrader:
 
         return signal
 
+    def _maker_entry_price(self, coin: str, side: str) -> Optional[float]:
+        """Return a non-crossing maker price near mid for an entry order."""
+        mid = self._get_mid_price(coin)
+        if not mid or mid <= 0:
+            return None
+        offset = max(0.0, float(self.maker_entry_offset_bps or 0.0)) / 10_000.0
+        if self._normalize_order_side(side) == "buy":
+            return mid * (1.0 - offset)
+        return mid * (1.0 + offset)
+
+    def _place_entry_order(
+        self,
+        coin: str,
+        side: str,
+        size: float,
+        *,
+        leverage: float,
+        baseline_position_size: float = 0.0,
+    ) -> Dict[str, Any]:
+        """Place a live entry using maker-first policy when configured."""
+        mode = self.entry_execution_mode
+        if mode == "market":
+            result = self.place_market_order(
+                coin, side, size, leverage=leverage, reduce_only=False
+            )
+            if isinstance(result, dict):
+                result = dict(result)
+                result.setdefault("entry_order_type", "market")
+            return result
+
+        limit_price = self._maker_entry_price(coin, side)
+        if not limit_price or limit_price <= 0:
+            logger.warning(
+                "Maker entry price unavailable for %s %s; %s",
+                coin,
+                side,
+                "falling back to market" if mode == "maker_then_market" else "rejecting",
+            )
+            if mode == "maker_then_market" and self.maker_entry_fallback_to_market:
+                fallback = self.place_market_order(
+                    coin, side, size, leverage=leverage, reduce_only=False
+                )
+                if isinstance(fallback, dict):
+                    fallback = dict(fallback)
+                    fallback["entry_order_type"] = "maker_fallback_market"
+                return fallback
+            return {"status": "rejected", "reason": "maker_price_unavailable"}
+
+        self._incr_entry_metric("maker_entry_attempts")
+        maker_result = self.place_limit_order(
+            coin,
+            side,
+            size,
+            limit_price,
+            leverage=leverage,
+            reduce_only=False,
+            post_only=True,
+        )
+        if not self._is_order_result_success(maker_result):
+            self._incr_entry_metric("maker_entry_rejected")
+            if mode == "maker_then_market" and self.maker_entry_fallback_to_market:
+                logger.warning(
+                    "Maker entry rejected for %s %s; falling back to market: %s",
+                    coin, side, maker_result,
+                )
+                fallback = self.place_market_order(
+                    coin, side, size, leverage=leverage, reduce_only=False
+                )
+                if isinstance(fallback, dict):
+                    fallback = dict(fallback)
+                    fallback["maker_entry_result"] = maker_result
+                    fallback["entry_order_type"] = "maker_fallback_market"
+                return fallback
+            return maker_result
+
+        if self.dry_run:
+            return maker_result
+
+        maker_fill_size = self._coerce_float(
+            (maker_result or {}).get("exchange_reported_fill_size"), 0.0
+        )
+        submitted_size = self._coerce_float(
+            (maker_result or {}).get("submitted_size"),
+            size,
+        )
+        if maker_fill_size > 0:
+            self._incr_entry_metric("maker_entry_immediate_fills")
+            return maker_result
+
+        resting_oids = self._extract_resting_order_ids(maker_result)
+        if resting_oids and self.maker_entry_timeout_s > 0:
+            logger.info(
+                "Maker entry resting for %s %s oid(s)=%s; waiting %.2fs before fallback policy",
+                coin, side, resting_oids, self.maker_entry_timeout_s,
+            )
+            time.sleep(self.maker_entry_timeout_s)
+
+        if resting_oids and not self.dry_run:
+            fill_check = self.verify_fill(
+                coin,
+                side,
+                submitted_size,
+                timeout=max(0.1, min(1.0, self._fill_verify_poll_s)),
+                poll_interval=max(0.1, min(1.0, self._fill_verify_poll_s)),
+                blocking=False,
+                baseline_position_size=baseline_position_size,
+            )
+            if fill_check:
+                self._incr_entry_metric("maker_entry_resting_fills")
+                maker_result = dict(maker_result)
+                maker_result["maker_fill_check"] = fill_check
+                maker_result["exchange_reported_fill_size"] = fill_check.get("size", submitted_size)
+                if fill_check.get("entry_price"):
+                    maker_result["exchange_reported_fill_price"] = fill_check.get("entry_price")
+                return maker_result
+
+        # If the maker order is still only resting, cancel it before any
+        # fallback so we do not leave a stale entry order behind.
+        for oid in resting_oids:
+            try:
+                self.cancel_order(coin, oid)
+            except Exception as exc:
+                logger.warning("Failed to cancel resting maker entry %s %s oid=%s: %s", coin, side, oid, exc)
+
+        if mode == "maker_only" or not self.maker_entry_fallback_to_market:
+            self._incr_entry_metric("maker_entry_unfilled")
+            return {
+                "status": "resting_cancelled",
+                "reason": "maker_entry_unfilled",
+                "coin": coin,
+                "side": side,
+                "maker_entry_result": maker_result,
+                "entry_order_type": "post_only_limit",
+            }
+
+        self._incr_entry_metric("maker_entry_fallback_market")
+        logger.info("Maker entry unfilled for %s %s; falling back to market", coin, side)
+        fallback = self.place_market_order(
+            coin, side, size, leverage=leverage, reduce_only=False
+        )
+        if isinstance(fallback, dict):
+            fallback = dict(fallback)
+            fallback["maker_entry_result"] = maker_result
+            fallback["entry_order_type"] = "maker_fallback_market"
+        return fallback
+
     def execute_signal(
         self,
         signal: Union[TradeSignal, Dict[str, Any]],
@@ -6323,7 +6524,7 @@ class LiveTrader:
         Pipeline:
           1. Validate signal through DecisionFirewall (unless bypassed)
           2. Check kill switch and daily loss
-          3. Place market entry order
+          3. Place entry order (maker-first by default, market for fallback/emergency)
           4. Place stop loss trigger
           5. Place take profit trigger
           6. Return execution result
@@ -6551,11 +6752,15 @@ class LiveTrader:
                        f"(confidence={signal.confidence:.0%}, "
                        f"leverage={signal.leverage}x)")
 
-            # 1. Place market entry
-            entry_result = self.place_market_order(
-                coin, entry_side, size,
+            # 1. Place entry order.  Non-urgent entries use maker-first
+            # execution by default to reduce fee drag; emergency exits still
+            # use market/reduce-only paths elsewhere.
+            entry_result = self._place_entry_order(
+                coin,
+                entry_side,
+                size,
                 leverage=signal.leverage,
-                reduce_only=False
+                baseline_position_size=baseline_position_size,
             )
 
             if not self._is_order_result_success(entry_result):
@@ -7018,6 +7223,12 @@ class LiveTrader:
                 "risk_per_trade_pct": float(self.live_risk_per_trade_pct),
                 "max_margin_per_order_pct": float(self.live_max_margin_per_order_pct),
                 "min_margin_per_order_usd": float(self.live_min_margin_per_order_usd),
+            },
+            "entry_execution": {
+                "mode": self.entry_execution_mode,
+                "maker_offset_bps": float(self.maker_entry_offset_bps),
+                "maker_timeout_s": float(self.maker_entry_timeout_s),
+                "fallback_to_market": bool(self.maker_entry_fallback_to_market),
             },
             "dynamic_source_caps_allow_static_expansion": bool(
                 self.dynamic_source_caps_allow_static_expansion

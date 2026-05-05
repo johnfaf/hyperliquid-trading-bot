@@ -117,6 +117,19 @@ class DecisionFirewall:
         self.max_same_side_positions_per_coin = max(
             1, int(cfg.get("max_same_side_positions_per_coin", 2))
         )
+        self.block_losing_averaging = bool(cfg.get("block_losing_averaging", True))
+        self.averaging_max_loss_roe_pct = float(
+            cfg.get("averaging_max_loss_roe_pct", 0.015)
+        )
+        self.entry_location_filter_enabled = bool(
+            cfg.get("entry_location_filter_enabled", True)
+        )
+        self.entry_max_atr_extension = float(
+            cfg.get("entry_max_atr_extension", 1.8)
+        )
+        self.entry_max_price_extension_pct = float(
+            cfg.get("entry_max_price_extension_pct", 0.035)
+        )
         self.daily_loss_limit_pct = cfg.get("daily_loss_limit_pct", 0.03)
         if self.canary_mode:
             self.max_positions = min(self.max_positions, self.canary_max_positions)
@@ -214,6 +227,7 @@ class DecisionFirewall:
             "rejected_funding": 0,
             "rejected_event_risk": 0,
             "rejected_side_policy": 0,
+            "rejected_entry_location": 0,
             # LOW-FIX LOW-1: count audit-log write failures so ops can detect
             # when the audit trail is silently broken (DB full, locked, etc.)
             "audit_log_failures": 0,
@@ -387,17 +401,50 @@ class DecisionFirewall:
                     )
                 ),
             )
+            self.block_losing_averaging = bool(
+                overrides.get(
+                    "FIREWALL_BLOCK_LOSING_AVERAGING",
+                    self.block_losing_averaging,
+                )
+            )
+            self.averaging_max_loss_roe_pct = float(
+                overrides.get(
+                    "FIREWALL_AVERAGING_MAX_LOSS_ROE_PCT",
+                    self.averaging_max_loss_roe_pct,
+                )
+            )
+            self.entry_location_filter_enabled = bool(
+                overrides.get(
+                    "FIREWALL_ENTRY_LOCATION_FILTER_ENABLED",
+                    self.entry_location_filter_enabled,
+                )
+            )
+            self.entry_max_atr_extension = float(
+                overrides.get(
+                    "FIREWALL_ENTRY_MAX_ATR_EXTENSION",
+                    self.entry_max_atr_extension,
+                )
+            )
+            self.entry_max_price_extension_pct = float(
+                overrides.get(
+                    "FIREWALL_ENTRY_MAX_PRICE_EXTENSION_PCT",
+                    self.entry_max_price_extension_pct,
+                )
+            )
             self._side_policy_cache = {"ts": 0.0, "closed": [], "short": {}, "scoped": {}}
 
         logger.info(
             "DecisionFirewall runtime overrides applied: min_confidence=%s, source_cap=%s, "
-            "short_hardening=%s, event_risk=%s, coin_cooldown=%ss, same_side_cooldown=%ss",
+            "short_hardening=%s, event_risk=%s, coin_cooldown=%ss, "
+            "same_side_cooldown=%ss, block_losing_averaging=%s, entry_location_filter=%s",
             f"{self.min_confidence:.0%}",
             self.max_signals_per_source_per_day,
             self.short_hardening_enabled,
             self.event_risk_enabled,
             self.cooldown_seconds,
             self.same_side_cooldown_seconds,
+            self.block_losing_averaging,
+            self.entry_location_filter_enabled,
         )
 
     def _get_short_policy_cache(self) -> Dict[str, object]:
@@ -539,6 +586,204 @@ class DecisionFirewall:
                 self.short_hardening_size_multiplier,
                 policy.get("reason", "recent short underperformance"),
             )
+        return True, ""
+
+    @staticmethod
+    def _float_or_none(value: object) -> Optional[float]:
+        try:
+            if value is None:
+                return None
+            out = float(value)
+            return out if out == out else None
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _signal_context(signal: TradeSignal) -> Dict:
+        ctx = getattr(signal, "context", None)
+        return dict(ctx) if isinstance(ctx, dict) else {}
+
+    def _signal_reference_price(self, signal: TradeSignal) -> Optional[float]:
+        ctx = self._signal_context(signal)
+        features = ctx.get("features", {})
+        if not isinstance(features, dict):
+            features = {}
+        for key in (
+            "entry_price",
+            "price",
+            "current_price",
+            "mid_price",
+            "mark_price",
+            "last_price",
+        ):
+            value = self._float_or_none(getattr(signal, key, None))
+            if value and value > 0:
+                return value
+            value = self._float_or_none(ctx.get(key))
+            if value and value > 0:
+                return value
+            value = self._float_or_none(features.get(key))
+            if value and value > 0:
+                return value
+        return None
+
+    def _same_side_position_loss_roe(
+        self,
+        pos: Dict,
+        side_value: str,
+        current_price: Optional[float],
+        signal_leverage: float,
+    ) -> Optional[float]:
+        if not current_price or current_price <= 0:
+            return None
+        entry = (
+            self._float_or_none(pos.get("entry_price"))
+            or self._float_or_none(pos.get("entryPx"))
+            or self._float_or_none(pos.get("avg_entry_price"))
+            or self._float_or_none(pos.get("average_entry_price"))
+        )
+        if not entry or entry <= 0:
+            return None
+        leverage = (
+            self._float_or_none(pos.get("leverage"))
+            or self._float_or_none(pos.get("lev"))
+            or self._float_or_none(signal_leverage)
+            or 1.0
+        )
+        if side_value == "long":
+            return max(0.0, (entry - current_price) / entry * leverage)
+        if side_value == "short":
+            return max(0.0, (current_price - entry) / entry * leverage)
+        return None
+
+    def _apply_losing_averaging_guard(
+        self,
+        signal: TradeSignal,
+        same_side_positions: List[Dict],
+        side_value: str,
+    ) -> Tuple[bool, str]:
+        if not self.block_losing_averaging or not same_side_positions:
+            return True, ""
+        ctx = self._signal_context(signal)
+        if any(
+            bool(ctx.get(flag))
+            for flag in (
+                "scale_in_allowed",
+                "averaging_allowed",
+                "new_information",
+                "thesis_improved",
+            )
+        ):
+            return True, ""
+
+        current_price = self._signal_reference_price(signal)
+        losses = [
+            loss
+            for loss in (
+                self._same_side_position_loss_roe(
+                    pos,
+                    side_value,
+                    current_price,
+                    float(getattr(signal, "leverage", 1.0) or 1.0),
+                )
+                for pos in same_side_positions
+            )
+            if loss is not None
+        ]
+        if not losses:
+            return True, ""
+        max_loss = max(losses)
+        if max_loss >= self.averaging_max_loss_roe_pct:
+            return (
+                False,
+                f"Losing average-down blocked: existing {signal.coin} {side_value} "
+                f"is down {max_loss:.2%} ROE without new-information override "
+                f"(limit {self.averaging_max_loss_roe_pct:.2%})",
+            )
+        return True, ""
+
+    def _apply_entry_location_filter(
+        self,
+        signal: TradeSignal,
+        regime_data: Optional[Dict] = None,
+    ) -> Tuple[bool, str]:
+        if not self.entry_location_filter_enabled:
+            return True, ""
+
+        side_value = (
+            signal.side.value if hasattr(signal.side, "value") else str(signal.side)
+        ).strip().lower()
+        ctx = self._signal_context(signal)
+        features = ctx.get("features", {})
+        if not isinstance(features, dict):
+            features = {}
+        coin_regime = {}
+        if regime_data and isinstance(regime_data.get("per_coin"), dict):
+            coin_regime = dict(regime_data.get("per_coin", {}).get(signal.coin, {}) or {})
+
+        atr_pct = (
+            self._float_or_none(ctx.get("atr_pct"))
+            or self._float_or_none(features.get("atr_pct"))
+            or self._float_or_none(coin_regime.get("atr_pct"))
+            or self._float_or_none(ctx.get("volatility"))
+            or 0.0
+        )
+        threshold = max(
+            float(self.entry_max_price_extension_pct or 0.0),
+            float(atr_pct or 0.0) * float(self.entry_max_atr_extension or 0.0),
+        )
+        if threshold <= 0:
+            return True, ""
+
+        distances = []
+        for key in (
+            "distance_from_vwap_pct",
+            "vwap_distance_pct",
+            "distance_from_ma_pct",
+            "ma_distance_pct",
+            "ema_distance_pct",
+            "price_extension_pct",
+        ):
+            value = self._float_or_none(ctx.get(key))
+            if value is None:
+                value = self._float_or_none(features.get(key))
+            if value is not None:
+                distances.append((key, value))
+
+        current_price = self._signal_reference_price(signal)
+        if current_price and current_price > 0:
+            for key in ("vwap", "moving_average", "ma", "ema", "sma"):
+                anchor = self._float_or_none(ctx.get(key))
+                if anchor is None:
+                    anchor = self._float_or_none(features.get(key))
+                if anchor and anchor > 0:
+                    distances.append((f"price_vs_{key}", (current_price - anchor) / anchor))
+                    break
+
+        zscore = self._float_or_none(ctx.get("zscore"))
+        if zscore is None:
+            zscore = self._float_or_none(features.get("zscore"))
+        if zscore is not None:
+            z_limit = max(1.0, float(self.entry_max_atr_extension or 0.0))
+            if side_value == "long" and zscore > z_limit:
+                return False, f"Entry too extended for long: zscore={zscore:.2f} > {z_limit:.2f}"
+            if side_value == "short" and zscore < -z_limit:
+                return False, f"Entry too extended for short: zscore={zscore:.2f} < -{z_limit:.2f}"
+
+        for key, distance in distances:
+            if side_value == "long" and distance > threshold:
+                return (
+                    False,
+                    f"Entry too extended for long: {key}={distance:.2%} "
+                    f"> {threshold:.2%}",
+                )
+            if side_value == "short" and distance < -threshold:
+                return (
+                    False,
+                    f"Entry too extended for short: {key}={distance:.2%} "
+                    f"< -{threshold:.2%}",
+                )
+
         return True, ""
 
     def _apply_event_risk(self, signal: TradeSignal, dry_run: bool = False) -> Tuple[bool, str]:
@@ -869,6 +1114,13 @@ class DecisionFirewall:
         if not side_policy_ok:
             return _reject("rejected_side_policy", side_policy_reason)
 
+        entry_location_ok, entry_location_reason = self._apply_entry_location_filter(
+            signal,
+            regime_data=regime_data,
+        )
+        if not entry_location_ok:
+            return _reject("rejected_entry_location", entry_location_reason)
+
         # 2. Minimum confidence
         if signal.confidence < self.min_confidence:
             return _reject("rejected_confidence",
@@ -925,6 +1177,13 @@ class DecisionFirewall:
                 f"Pyramiding blocked: {signal.coin} already has "
                 f"{len(same_side_positions)} {side_value} positions",
             )
+        averaging_ok, averaging_reason = self._apply_losing_averaging_guard(
+            signal,
+            same_side_positions,
+            side_value,
+        )
+        if not averaging_ok:
+            return _reject("rejected_pyramiding", averaging_reason)
 
         # 5b. Aggregate portfolio exposure — hard cap across ALL positions
         # AUDIT M1 — two independent caps apply:
@@ -1265,6 +1524,11 @@ class DecisionFirewall:
             "coin_cooldown_seconds": int(self.cooldown_seconds),
             "same_side_cooldown_seconds": int(self.same_side_cooldown_seconds),
             "max_same_side_positions_per_coin": int(self.max_same_side_positions_per_coin),
+            "block_losing_averaging": bool(self.block_losing_averaging),
+            "averaging_max_loss_roe_pct": float(self.averaging_max_loss_roe_pct),
+            "entry_location_filter_enabled": bool(self.entry_location_filter_enabled),
+            "entry_max_atr_extension": float(self.entry_max_atr_extension),
+            "entry_max_price_extension_pct": float(self.entry_max_price_extension_pct),
             "max_signals_per_source_per_day": int(self.max_signals_per_source_per_day),
             "source_signal_counts": dict(self._source_signal_counts),
             "source_policies": self.agent_scorer.get_scorecard() if self.agent_scorer else [],
