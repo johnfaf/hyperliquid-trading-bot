@@ -12,6 +12,7 @@ pytest.importorskip("fastapi")
 pytest.importorskip("starlette")
 
 from fastapi.testclient import TestClient
+from starlette.websockets import WebSocketDisconnect
 
 from src.signals.calibration import CalibrationTracker
 from src.ui.v2 import state as v2_state
@@ -102,6 +103,36 @@ def test_dashboard_summary_fragments_render_without_full_layout(client):
         assert r.status_code == 200
         assert marker in r.text
         assert "<html" not in r.text
+
+
+def test_dashboard_websocket_connects_without_auth_token(client):
+    with client.websocket_connect("/ws") as ws:
+        assert ws.receive_json() == {"kind": "hello", "ok": True}
+
+
+def test_dashboard_websocket_honors_public_read(monkeypatch):
+    monkeypatch.setenv("DASHBOARD_AUTH_TOKEN", "secret123")
+    monkeypatch.setenv("DASHBOARD_PUBLIC_READ", "true")
+    v2_state.reset_components()
+    app = create_app()
+    with TestClient(app) as authed_read_client:
+        with authed_read_client.websocket_connect("/ws") as ws:
+            assert ws.receive_json() == {"kind": "hello", "ok": True}
+
+
+def test_dashboard_websocket_rejects_when_private_and_no_cookie(monkeypatch):
+    monkeypatch.setenv("DASHBOARD_AUTH_TOKEN", "secret123")
+    monkeypatch.delenv("DASHBOARD_PUBLIC_READ", raising=False)
+    v2_state.reset_components()
+    app = create_app()
+    with TestClient(app) as private_client:
+        try:
+            with private_client.websocket_connect("/ws") as ws:
+                ws.receive_json()
+        except WebSocketDisconnect as exc:
+            assert exc.code == 4401
+        else:  # pragma: no cover - defensive assertion clarity
+            raise AssertionError("private websocket accepted without auth cookie")
 
 
 def test_login_redirect_when_token_required_and_no_cookie(monkeypatch, app):

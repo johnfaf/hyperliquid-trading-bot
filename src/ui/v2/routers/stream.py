@@ -13,7 +13,7 @@ import logging
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
-from src.ui.v2.auth import verify_cookie
+from src.ui.v2.auth import read_access_allowed
 from src.ui.v2.events import get_bus
 
 logger = logging.getLogger(__name__)
@@ -24,7 +24,8 @@ router = APIRouter()
 @router.websocket("/ws")
 async def stream_events(websocket: WebSocket):
     # Reuse the cookie auth so the WS doesn't get used as an auth bypass.
-    if not verify_cookie(websocket):
+    if not read_access_allowed(websocket):
+        logger.info("dashboard websocket rejected: auth_required")
         await websocket.close(code=4401)
         return
     await websocket.accept()

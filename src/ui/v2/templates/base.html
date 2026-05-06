@@ -75,28 +75,79 @@
   <script>
     (function () {
       const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-      const ws = new WebSocket(proto + '://' + location.host + '/ws');
       const status = document.getElementById('ws-status');
-      ws.onopen = () => { status.textContent = 'ws: live'; status.className = 'text-xs px-2 py-0.5 rounded bg-emerald-900/60 text-emerald-300'; };
-      ws.onclose = () => { status.textContent = 'ws: closed'; status.className = 'text-xs px-2 py-0.5 rounded bg-rose-900/60 text-rose-300'; };
-      ws.onerror = () => { status.textContent = 'ws: error'; status.className = 'text-xs px-2 py-0.5 rounded bg-rose-900/60 text-rose-300'; };
-      ws.onmessage = (ev) => {
+      let socket = null;
+      let retry = 0;
+      let stopped = false;
+
+      function setStatus(label, tone) {
+        if (!status) return;
+        const classes = {
+          live: 'bg-emerald-900/60 text-emerald-300',
+          warn: 'bg-amber-900/60 text-amber-300',
+          down: 'bg-rose-900/60 text-rose-300',
+          idle: 'bg-slate-800 text-slate-400',
+        };
+        status.textContent = label;
+        status.className = 'text-xs px-2 py-0.5 rounded ' + (classes[tone] || classes.idle);
+      }
+
+      function scheduleReconnect() {
+        if (stopped) return;
+        const delayMs = Math.min(30000, 1000 * Math.pow(2, retry));
+        retry = Math.min(retry + 1, 5);
+        setStatus(`ws: reconnect ${Math.round(delayMs / 1000)}s`, 'warn');
+        setTimeout(connect, delayMs);
+      }
+
+      function connect() {
+        if (stopped) return;
+        setStatus('ws: connecting', 'idle');
         try {
-          const data = JSON.parse(ev.data);
-          // Trigger HTMX refresh on tagged sections.
-          if (data && data.kind) {
-            document.querySelectorAll('[data-ws-refresh-on]').forEach((el) => {
-              const kinds = (el.getAttribute('data-ws-refresh-on') || '').split(',').map(s => s.trim());
-              if (kinds.includes(data.kind)) {
-                htmx.trigger(el, 'wsEvent');
-              }
-            });
-            // Page-level subscribers (sparkline + fills ticker live in
-            // their own pages and don't use HTMX swaps).
-            window.dispatchEvent(new CustomEvent('ws-event', {detail: data}));
+          socket = new WebSocket(proto + '://' + location.host + '/ws');
+        } catch (e) {
+          scheduleReconnect();
+          return;
+        }
+        socket.onopen = () => {
+          retry = 0;
+          setStatus('ws: live', 'live');
+        };
+        socket.onclose = (ev) => {
+          if (stopped) return;
+          if (ev && ev.code === 4401) {
+            setStatus('ws: auth required', 'down');
+            return;
           }
-        } catch (e) { /* ignore malformed */ }
-      };
+          scheduleReconnect();
+        };
+        socket.onerror = () => {
+          setStatus('ws: error', 'down');
+        };
+        socket.onmessage = (ev) => {
+          try {
+            const data = JSON.parse(ev.data);
+            // Trigger HTMX refresh on tagged sections.
+            if (data && data.kind) {
+              document.querySelectorAll('[data-ws-refresh-on]').forEach((el) => {
+                const kinds = (el.getAttribute('data-ws-refresh-on') || '').split(',').map(s => s.trim());
+                if (kinds.includes(data.kind)) {
+                  htmx.trigger(el, 'wsEvent');
+                }
+              });
+              // Page-level subscribers (sparkline + fills ticker live in
+              // their own pages and don't use HTMX swaps).
+              window.dispatchEvent(new CustomEvent('ws-event', {detail: data}));
+            }
+          } catch (e) { /* ignore malformed */ }
+        };
+      }
+
+      window.addEventListener('beforeunload', () => {
+        stopped = true;
+        if (socket) socket.close();
+      });
+      connect();
     })();
 
     // Give page-local scripts a chance to clean up intervals/listeners before SPA swaps.
