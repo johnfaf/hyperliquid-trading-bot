@@ -3140,6 +3140,28 @@ class DashboardHandler(BaseHTTPRequestHandler):
             import threading
             from src.discovery.golden_wallet import run_golden_scan, init_golden_tables
             from src.backtest.backtest_engine import run_all_backtests, save_backtest_result, init_backtest_tables
+            max_wallets = 30
+            raw_body = self._read_request_body()
+            if raw_body is None:
+                return
+            try:
+                parsed = urlparse(self.path)
+                query_params = parse_qs(parsed.query)
+                submitted = query_params.get("max_wallets", [None])[0]
+                if raw_body:
+                    content_type = (self.headers.get("Content-Type") or "").lower()
+                    if "application/json" in content_type:
+                        body = json.loads(raw_body.decode("utf-8", errors="ignore") or "{}")
+                        if isinstance(body, dict):
+                            submitted = body.get("max_wallets", submitted)
+                    else:
+                        form = parse_qs(raw_body.decode("utf-8", errors="ignore"))
+                        submitted = form.get("max_wallets", [submitted])[0]
+                if submitted is not None:
+                    max_wallets = int(submitted)
+            except Exception:
+                max_wallets = 30
+            max_wallets = max(1, min(max_wallets, 200))
 
             with _BACKTEST_JOB_LOCK:
                 if _BACKTEST_JOB_RUNNING:
@@ -3160,7 +3182,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 try:
                     init_golden_tables()
                     init_backtest_tables()
-                    run_golden_scan(max_wallets=30)
+                    run_golden_scan(max_wallets=max_wallets)
                     results = run_all_backtests()
                     for r in results:
                         save_backtest_result(r)
@@ -3174,7 +3196,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
             t = threading.Thread(target=_run, daemon=True)
             t.start()
-            self._json_response({"status": "started", "message": "Golden scan + backtest running in background. Refresh in a few minutes."})
+            self._json_response({
+                "status": "started",
+                "max_wallets": max_wallets,
+                "message": "Golden scan + backtest running in background. Refresh in a few minutes.",
+            })
         except Exception as e:
             with _BACKTEST_JOB_LOCK:
                 _BACKTEST_JOB_RUNNING = False

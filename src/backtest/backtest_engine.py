@@ -9,17 +9,13 @@ Used by the backtest dashboard to show granular performance heatmaps.
 """
 import logging
 import json
-import sqlite3
-import os
-import sys
 import statistics
 from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional
 from enum import Enum
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-import config
+from src.data import database as db
 
 logger = logging.getLogger("backtest_engine")
 
@@ -106,23 +102,14 @@ class BacktestResult:
 
 # ─── Database helpers ────────────────────────────────────────────
 
-def _get_db():
-    conn = sqlite3.connect(config.DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
 def _load_fills(address: str) -> List[Dict]:
     """Load penalised fills from DB."""
-    conn = _get_db()
-    try:
+    with db.get_connection(for_read=True) as conn:
         rows = conn.execute(
             "SELECT * FROM wallet_fills WHERE wallet_address = ? ORDER BY time_ms",
             (address,)
         ).fetchall()
         return [dict(r) for r in rows]
-    finally:
-        conn.close()
 
 
 # ─── Core analysis ───────────────────────────────────────────────
@@ -320,14 +307,11 @@ def run_backtest(address: str) -> Optional[BacktestResult]:
 
 def run_all_backtests() -> List[BacktestResult]:
     """Run backtests for all evaluated wallets (golden and non-golden)."""
-    conn = _get_db()
-    try:
+    with db.get_connection(for_read=True) as conn:
         rows = conn.execute(
             "SELECT address FROM golden_wallets ORDER BY penalised_pnl DESC"
         ).fetchall()
         addresses = [r["address"] for r in rows]
-    finally:
-        conn.close()
 
     if not addresses:
         logger.warning("No evaluated wallets found. Run golden scan first.")
@@ -350,8 +334,7 @@ def run_all_backtests() -> List[BacktestResult]:
 
 def init_backtest_tables():
     """Create backtest results table."""
-    conn = _get_db()
-    try:
+    with db.get_connection() as conn:
         conn.executescript("""
         CREATE TABLE IF NOT EXISTS backtest_results (
             address TEXT NOT NULL,
@@ -395,14 +378,11 @@ def init_backtest_tables():
         );
         """)
         conn.commit()
-    finally:
-        conn.close()
 
 
 def save_backtest_result(result: BacktestResult):
     """Persist a complete backtest result."""
-    conn = _get_db()
-    try:
+    with db.get_connection() as conn:
         # Save timeframe results
         for tf_key, tf_report in result.timeframes.items():
             # Serialise periods with capped detail
@@ -421,12 +401,26 @@ def save_backtest_result(result: BacktestResult):
                 })
 
             conn.execute("""
-                INSERT OR REPLACE INTO backtest_results
+                INSERT INTO backtest_results
                 (address, timeframe, total_periods, active_periods, total_pnl,
                  total_penalised_pnl, avg_period_pnl, std_period_pnl,
                  best_period_pnl, worst_period_pnl, profitable_periods,
                  profitable_pct, consistency_score, periods_json, evaluated_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(address, timeframe) DO UPDATE SET
+                    total_periods = excluded.total_periods,
+                    active_periods = excluded.active_periods,
+                    total_pnl = excluded.total_pnl,
+                    total_penalised_pnl = excluded.total_penalised_pnl,
+                    avg_period_pnl = excluded.avg_period_pnl,
+                    std_period_pnl = excluded.std_period_pnl,
+                    best_period_pnl = excluded.best_period_pnl,
+                    worst_period_pnl = excluded.worst_period_pnl,
+                    profitable_periods = excluded.profitable_periods,
+                    profitable_pct = excluded.profitable_pct,
+                    consistency_score = excluded.consistency_score,
+                    periods_json = excluded.periods_json,
+                    evaluated_at = excluded.evaluated_at
             """, (
                 result.address, tf_key,
                 tf_report.total_periods, tf_report.active_periods,
@@ -442,10 +436,19 @@ def save_backtest_result(result: BacktestResult):
         # Save coin performance
         for coin, stats in result.coin_performance.items():
             conn.execute("""
-                INSERT OR REPLACE INTO backtest_coin_perf
+                INSERT INTO backtest_coin_perf
                 (address, coin, fills, closing, raw_pnl, pen_pnl,
                  volume, wins, losses, win_rate)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(address, coin) DO UPDATE SET
+                    fills = excluded.fills,
+                    closing = excluded.closing,
+                    raw_pnl = excluded.raw_pnl,
+                    pen_pnl = excluded.pen_pnl,
+                    volume = excluded.volume,
+                    wins = excluded.wins,
+                    losses = excluded.losses,
+                    win_rate = excluded.win_rate
             """, (
                 result.address, coin, stats["fills"], stats["closing"],
                 stats["raw_pnl"], stats["pen_pnl"], stats["volume"],
@@ -455,18 +458,20 @@ def save_backtest_result(result: BacktestResult):
         # Save hourly analysis
         for hour, pnl in result.hourly_pnl.items():
             conn.execute("""
-                INSERT OR REPLACE INTO backtest_time_analysis
+                INSERT INTO backtest_time_analysis
                 (address, analysis_type, bucket, pnl) VALUES (?, 'hour', ?, ?)
+                ON CONFLICT(address, analysis_type, bucket) DO UPDATE SET
+                    pnl = excluded.pnl
             """, (result.address, hour, pnl))
 
         # Save weekday analysis
         for day, pnl in result.daily_pnl.items():
             conn.execute("""
-                INSERT OR REPLACE INTO backtest_time_analysis
+                INSERT INTO backtest_time_analysis
                 (address, analysis_type, bucket, pnl) VALUES (?, 'weekday', ?, ?)
+                ON CONFLICT(address, analysis_type, bucket) DO UPDATE SET
+                    pnl = excluded.pnl
             """, (result.address, day, pnl))
 
         conn.commit()
         logger.info(f"Saved backtest results for {result.address[:10]}")
-    finally:
-        conn.close()

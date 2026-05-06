@@ -10,8 +10,7 @@
     <form id="run-form"
           hx-post="/api/backtest/run"
           hx-trigger="submit"
-          hx-target="#run-result"
-          hx-swap="innerHTML"
+          hx-swap="none"
           class="mt-3 flex gap-2 items-end">
       <div class="flex-1">
         <label class="block text-[10px] uppercase text-slate-500">max wallets</label>
@@ -26,8 +25,7 @@
   <div class="bg-slate-900 border border-slate-800 rounded p-4 md:col-span-2"
        hx-get="/api/backtest/status"
        hx-trigger="load, every 5s"
-       hx-target="#status-pane"
-       hx-swap="innerHTML">
+       hx-swap="none">
     <h2 class="text-sm font-semibold text-slate-300">Job status</h2>
     <div id="status-pane" class="mt-3 text-xs text-slate-300">Loading…</div>
   </div>
@@ -71,38 +69,69 @@
 </section>
 
 <script>
-  // Render the job-status JSON into a friendlier banner.
+  // Render the backtest JSON endpoints into operator-friendly status text.
+  const escapeBacktestHtml = (value) => String(value ?? '').replace(/[&<>"']/g, (ch) => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+  }[ch]));
+
   document.body.addEventListener('htmx:afterRequest', (ev) => {
-    if (ev.detail.requestConfig?.path === '/api/backtest/status' && ev.target.id === 'status-pane') {
+    const path = ev.detail.requestConfig?.path || '';
+    if (path === '/api/backtest/status') {
+      const pane = document.getElementById('status-pane');
+      if (!pane) return;
       let body;
-      try { body = JSON.parse(ev.target.textContent); } catch { return; }
+      try { body = JSON.parse(ev.detail.xhr.responseText); } catch { return; }
       const lines = [];
+      const progress = body.progress || {};
       if (body.running) {
         const elapsed = body.elapsed_s ? `${Math.round(body.elapsed_s)}s` : '?';
-        lines.push(`<div class="text-amber-300">⚙ Running (${elapsed} elapsed)</div>`);
+        const phase = escapeBacktestHtml(progress.phase || 'running');
+        lines.push(`<div class="text-amber-300">Running (${elapsed} elapsed) - ${phase}</div>`);
+        if (progress.max_wallets) {
+          lines.push(`<div class="text-slate-500 mt-1">wallets: requested ${progress.requested_max_wallets || progress.max_wallets}, capped ${progress.max_wallets}</div>`);
+        }
+        if (progress.scanned_wallets !== undefined) {
+          lines.push(`<div class="text-slate-400 mt-1">scan: ${progress.scanned_wallets} scanned, ${progress.golden_wallets || 0} golden</div>`);
+        }
+        if (progress.backtests_run !== undefined) {
+          lines.push(`<div class="text-slate-400 mt-1">backtests: ${progress.backtests_run}</div>`);
+        }
+        if (progress.scan_error) {
+          lines.push(`<div class="text-rose-300 mt-1">scan warning: ${escapeBacktestHtml(progress.scan_error)}</div>`);
+        }
       } else if (body.last_error) {
-        lines.push(`<div class="text-rose-300">last error: ${body.last_error}</div>`);
+        lines.push(`<div class="text-rose-300">last error: ${escapeBacktestHtml(body.last_error)}</div>`);
       } else if (body.last_result) {
         const r = body.last_result;
-        lines.push(`<div class="text-emerald-300">✓ Last run: ${r.scanned_wallets} wallets scanned, ${r.backtests_run} backtests in ${Math.round(r.duration_s || 0)}s</div>`);
+        lines.push(`<div class="text-emerald-300">Last run: ${r.scanned_wallets} wallets scanned, ${r.golden_wallets || 0} golden, ${r.backtests_run} backtests, ${r.results_saved || 0} saved in ${Math.round(r.duration_s || 0)}s</div>`);
+        if (r.requested_max_wallets !== r.max_wallets) {
+          lines.push(`<div class="text-slate-500 mt-1">wallet limit was capped from ${r.requested_max_wallets} to ${r.max_wallets}</div>`);
+        }
+        if (r.scan_error) {
+          lines.push(`<div class="text-rose-300 mt-1">scan warning: ${escapeBacktestHtml(r.scan_error)}</div>`);
+        }
       } else {
         lines.push('<div class="text-slate-400">Idle. No run yet this session.</div>');
       }
-      ev.target.innerHTML = lines.join('');
+      pane.innerHTML = lines.join('');
+      return;
     }
-    if (ev.detail.requestConfig?.path === '/api/backtest/run' && ev.target.id === 'run-result') {
+
+    if (path === '/api/backtest/run') {
+      const resultEl = document.getElementById('run-result');
+      if (!resultEl) return;
       let body;
-      try { body = JSON.parse(ev.target.textContent); } catch { body = {}; }
+      try { body = JSON.parse(ev.detail.xhr.responseText); } catch { body = {}; }
       const xhr = ev.detail.xhr;
       if (xhr.status >= 200 && xhr.status < 300) {
-        ev.target.className = 'mt-2 text-xs text-emerald-300';
-        ev.target.textContent = `Started (max_wallets=${body.max_wallets || '?'}). Status will poll every 5s.`;
+        resultEl.className = 'mt-2 text-xs text-emerald-300';
+        resultEl.textContent = `Started (requested=${body.requested_max_wallets || '?'}, max_wallets=${body.max_wallets || '?'}). Status will poll every 5s.`;
       } else if (xhr.status === 409) {
-        ev.target.className = 'mt-2 text-xs text-amber-300';
-        ev.target.textContent = 'Another backtest is already running.';
+        resultEl.className = 'mt-2 text-xs text-amber-300';
+        resultEl.textContent = 'Another backtest is already running.';
       } else {
-        ev.target.className = 'mt-2 text-xs text-rose-300';
-        ev.target.textContent = body.error || body.message || 'Failed to start.';
+        resultEl.className = 'mt-2 text-xs text-rose-300';
+        resultEl.textContent = body.error || body.message || 'Failed to start.';
       }
     }
   });
