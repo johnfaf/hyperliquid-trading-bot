@@ -47,3 +47,25 @@ def test_decision_engine_prescreens_more_than_execution_cap():
 
     assert len(result) == 3
     assert [item["_decision_coin"] for item in result] == ["BTC", "ETH", "SOL"]
+
+
+def test_decision_engine_uses_current_regime_before_stale_strategy_direction():
+    engine = DecisionEngine({"min_decision_score": 0.0})
+
+    result = engine.decide(
+        [
+            {
+                "id": 1,
+                "name": "stale long trend",
+                "strategy_type": "trend_following",
+                "current_score": 0.9,
+                "parameters": {"coins": ["BTC"], "direction": "long"},
+                "metrics": {},
+            }
+        ],
+        regime_data={"overall_regime": "trending_down", "overall_confidence": 0.85},
+        open_positions=[],
+    )
+
+    assert len(result) == 1
+    assert result[0]["_decision_side"] == "short"

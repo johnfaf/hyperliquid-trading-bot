@@ -299,8 +299,10 @@ class DecisionEngine:
         else:
             # breakout, trend_following, swing_trading, concentrated_bet,
             # scalping, funding_arb, delta_neutral, etc.
-            # — follow the regime when confident, else use stored param
-            direction = params.get("direction") or regime_default
+            # — follow the current regime when confident.  Stored direction
+            # is a fallback only, not a permanent long/short bias from an
+            # older market.
+            direction = regime_default
         strategy["_decision_side"] = direction
 
         diversity_bonus = 1.0 if target_coin not in open_coins else 0.0

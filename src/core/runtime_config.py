@@ -39,6 +39,13 @@ RUNTIME_OVERRIDE_SPECS: Dict[str, Dict[str, Any]] = {
     "SHORT_HARDENING_BLOCK_OVERRIDE_MIN_CONFIDENCE": {"type": "float", "min": 0.0, "max": 1.0},
     "SHORT_HARDENING_BLOCK_OVERRIDE_MIN_REGIME_CONFIDENCE": {"type": "float", "min": 0.0, "max": 1.0},
     "SHORT_HARDENING_BLOCK_OVERRIDE_SIZE_MULTIPLIER": {"type": "float", "min": 0.0, "max": 1.0},
+    "SHORT_HARDENING_MARKET_ADAPTIVE_OVERRIDE_ENABLED": {"type": "bool"},
+    "SHORT_HARDENING_MARKET_ADAPTIVE_MIN_MOMENTUM": {"type": "float", "min": 0.0, "max": 1.0},
+    "SHORT_HARDENING_MARKET_ADAPTIVE_SCOPED_SIZE_MULTIPLIER": {
+        "type": "float",
+        "min": 0.0,
+        "max": 1.0,
+    },
     "SHORT_HARDENING_SOURCE_GUARD_ENABLED": {"type": "bool"},
     "SHORT_HARDENING_SOURCE_MIN_CLOSED_TRADES": {"type": "int", "min": 1, "max": 1_000},
     "SHORT_HARDENING_SOURCE_BLOCK_NET_PNL": {

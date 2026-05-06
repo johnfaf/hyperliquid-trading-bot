@@ -44,3 +44,24 @@ def test_process_never_expands_strategy_count():
     )
 
     assert len(out) <= len(strategies)
+
+
+def test_regime_following_strategies_flip_short_in_confirmed_downtrend():
+    processor = SignalProcessor({"max_signals_out": 100})
+    strategies = [
+        _strategy("trend", "trend_following", 0.88, ["BTC"]),
+        _strategy("long", "momentum_long", 0.76, ["BTC"]),
+    ]
+
+    out = processor.process(
+        strategies,
+        regime_data={"overall_regime": "trending_down", "overall_confidence": 0.82},
+    )
+
+    assert len(out) == 1
+    assert out[0]["name"] == "trend"
+    assert processor._infer_direction(
+        "trend_following",
+        out[0],
+        regime_data={"overall_regime": "trending_down", "overall_confidence": 0.82},
+    ) == "short"

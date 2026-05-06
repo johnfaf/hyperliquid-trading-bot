@@ -410,6 +410,15 @@ def build_subsystems(
             "short_hardening_block_override_size_multiplier": float(
                 getattr(_fw_cfg, "SHORT_HARDENING_BLOCK_OVERRIDE_SIZE_MULTIPLIER", 0.35)
             ),
+            "short_hardening_market_adaptive_override_enabled": bool(
+                getattr(_fw_cfg, "SHORT_HARDENING_MARKET_ADAPTIVE_OVERRIDE_ENABLED", True)
+            ),
+            "short_hardening_market_adaptive_min_momentum": float(
+                getattr(_fw_cfg, "SHORT_HARDENING_MARKET_ADAPTIVE_MIN_MOMENTUM", 0.003)
+            ),
+            "short_hardening_market_adaptive_scoped_size_multiplier": float(
+                getattr(_fw_cfg, "SHORT_HARDENING_MARKET_ADAPTIVE_SCOPED_SIZE_MULTIPLIER", 0.25)
+            ),
             "short_hardening_source_guard_enabled": bool(
                 getattr(_fw_cfg, "SHORT_HARDENING_SOURCE_GUARD_ENABLED", True)
             ),

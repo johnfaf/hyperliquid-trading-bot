@@ -92,7 +92,7 @@ class SignalProcessor:
         dedup_count = 0
         if self.dedup_enabled:
             before_dedup = len(survivors)
-            survivors = self._deduplicate(survivors)
+            survivors = self._deduplicate(survivors, regime_data=regime_data)
             dedup_count = before_dedup - len(survivors)
             self.stats["deduped"] += dedup_count
             if dedup_count > 0:
@@ -184,7 +184,11 @@ class SignalProcessor:
 
     # ─── Step 2: Deduplication ──────────────────────────────────
 
-    def _deduplicate(self, strategies: List[Dict]) -> List[Dict]:
+    def _deduplicate(
+        self,
+        strategies: List[Dict],
+        regime_data: Optional[Dict] = None,
+    ) -> List[Dict]:
         """
         Merge strategies that are functionally identical:
           - Same coin + same implied direction = merge (regardless of strategy_type)
@@ -203,7 +207,7 @@ class SignalProcessor:
             strategy_type = s.get("strategy_type", s.get("type", ""))
 
             # Determine implied direction from strategy type
-            direction = self._infer_direction(strategy_type, s)
+            direction = self._infer_direction(strategy_type, s, regime_data=regime_data)
 
             # Get coins — try to extract from parameters
             params = s.get("parameters", "{}")
@@ -247,13 +251,46 @@ class SignalProcessor:
 
         return merged
 
-    def _infer_direction(self, strategy_type: str, strategy: Dict) -> str:
+    @staticmethod
+    def _regime_default_direction(params: Dict, regime_data: Optional[Dict]) -> str:
+        regime = str((regime_data or {}).get("overall_regime", "") or "").strip().lower()
+        try:
+            confidence = float((regime_data or {}).get("overall_confidence", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            confidence = 0.0
+        if confidence >= 0.60:
+            if regime in {"trending_down", "bearish", "crash"}:
+                return "short"
+            if regime in {"trending_up", "bullish"}:
+                return "long"
+        return params.get("direction", params.get("bias", "long"))
+
+    def _infer_direction(
+        self,
+        strategy_type: str,
+        strategy: Dict,
+        regime_data: Optional[Dict] = None,
+    ) -> str:
         """Infer long/short direction from strategy type."""
         import json
 
-        long_types = {"momentum_long", "trend_following", "breakout", "swing_trading"}
+        long_types = {"momentum_long"}
         short_types = {"momentum_short", "contrarian"}
         neutral_types = {"funding_arb", "delta_neutral", "diversified_portfolio"}
+        regime_following_types = {
+            "trend_following",
+            "breakout",
+            "swing_trading",
+            "concentrated_bet",
+            "scalping",
+        }
+
+        params = strategy.get("parameters", "{}")
+        if isinstance(params, str):
+            try:
+                params = json.loads(params)
+            except (json.JSONDecodeError, TypeError):
+                params = {}
 
         if strategy_type in long_types:
             return "long"
@@ -261,14 +298,11 @@ class SignalProcessor:
             return "short"
         elif strategy_type in neutral_types:
             return "neutral"
+        elif strategy_type in regime_following_types:
+            return self._regime_default_direction(params, regime_data)
         else:
-            # Try to get from parameters
-            params = strategy.get("parameters", "{}")
-            if isinstance(params, str):
-                try:
-                    params = json.loads(params)
-                except (json.JSONDecodeError, TypeError):
-                    params = {}
+            # Direction-agnostic/legacy strategies only use their stored bias
+            # unless the caller already wrote an explicit market-aware side.
             return params.get("direction", params.get("bias", "long"))
 
     # ─── Step 3: Conflict Resolution ────────────────────────────
@@ -316,7 +350,7 @@ class SignalProcessor:
             directions = set()
             for s in sigs:
                 strategy_type = s.get("strategy_type", s.get("type", ""))
-                d = self._infer_direction(strategy_type, s)
+                d = self._infer_direction(strategy_type, s, regime_data=regime_data)
                 directions.add(d)
 
             has_conflict = "long" in directions and "short" in directions
@@ -349,7 +383,8 @@ class SignalProcessor:
 
                 if favored:
                     kept = [s for s in sigs if self._infer_direction(
-                        s.get("strategy_type", s.get("type", "")), s) == favored]
+                        s.get("strategy_type", s.get("type", "")), s,
+                        regime_data=regime_data) == favored]
                     dropped = len(sigs) - len(kept)
                     if dropped > 0:
                         logger.debug(f"Conflict resolved for {coin}: keeping {favored} "
@@ -359,9 +394,11 @@ class SignalProcessor:
                     # No clear regime — use higher confidence fallback
                     best = max(sigs, key=lambda x: x.get("current_score", 0))
                     best_dir = self._infer_direction(
-                        best.get("strategy_type", best.get("type", "")), best)
+                        best.get("strategy_type", best.get("type", "")), best,
+                        regime_data=regime_data)
                     kept = [s for s in sigs if self._infer_direction(
-                        s.get("strategy_type", s.get("type", "")), s) == best_dir]
+                        s.get("strategy_type", s.get("type", "")), s,
+                        regime_data=regime_data) == best_dir]
                     logger.debug(f"Conflict resolved for {coin}: keeping {best_dir} "
                                 f"(highest confidence in ambiguous regime)")
                     resolved.extend(kept)
@@ -369,9 +406,11 @@ class SignalProcessor:
             elif self.conflict_resolution == "higher_confidence":
                 best = max(sigs, key=lambda x: x.get("current_score", 0))
                 best_dir = self._infer_direction(
-                    best.get("strategy_type", best.get("type", "")), best)
+                    best.get("strategy_type", best.get("type", "")), best,
+                    regime_data=regime_data)
                 kept = [s for s in sigs if self._infer_direction(
-                    s.get("strategy_type", s.get("type", "")), s) == best_dir]
+                    s.get("strategy_type", s.get("type", "")), s,
+                    regime_data=regime_data) == best_dir]
                 logger.debug(f"Conflict resolved for {coin}: keeping {best_dir} "
                             f"(higher confidence)")
                 resolved.extend(kept)

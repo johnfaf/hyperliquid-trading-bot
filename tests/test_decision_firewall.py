@@ -730,6 +730,68 @@ def test_firewall_allows_high_confidence_shorts_in_bearish_regime(mock_db):
 
 
 @patch("src.signals.decision_firewall.db")
+def test_firewall_market_adaptive_override_allows_scoped_short_block(mock_db):
+    mock_db.get_open_paper_trades.return_value = []
+    mock_db.get_paper_account.return_value = {"balance": 10000}
+    mock_db.get_paper_trade_history.return_value = [
+        {"coin": "BTC", "side": "short", "pnl": -0.7, "metadata": {"source_key": "test:momentum"}},
+        {"coin": "BTC", "side": "short", "pnl": -0.4, "metadata": {"source_key": "test:momentum"}},
+        {"coin": "BTC", "side": "short", "pnl": -0.2, "metadata": {"source_key": "test:momentum"}},
+        {"coin": "BTC", "side": "short", "pnl": 0.1, "metadata": {"source_key": "test:momentum"}},
+    ]
+    mock_db.audit_log = MagicMock()
+
+    from src.signals.decision_firewall import DecisionFirewall
+
+    fw = DecisionFirewall(
+        {
+            "short_hardening_enabled": True,
+            "short_hardening_min_closed_trades": 4,
+            "short_hardening_block_win_rate": 0.35,
+            "short_hardening_block_net_pnl": -1.0,
+            "short_hardening_source_guard_enabled": True,
+            "short_hardening_source_min_closed_trades": 3,
+            "short_hardening_source_block_net_pnl": -0.25,
+            "short_hardening_coin_guard_enabled": True,
+            "short_hardening_coin_min_closed_trades": 4,
+            "short_hardening_coin_block_net_pnl": -0.25,
+            "short_hardening_block_override_enabled": True,
+            "short_hardening_block_override_min_confidence": 0.70,
+            "short_hardening_block_override_min_regime_confidence": 0.60,
+            "short_hardening_block_override_size_multiplier": 0.35,
+            "short_hardening_market_adaptive_scoped_size_multiplier": 0.25,
+            "short_hardening_confidence_multiplier": 0.80,
+            "enable_predictive_derisk": False,
+            "funding_risk_enabled": False,
+        }
+    )
+    signal = MockSignal(side_val="short", confidence=0.85, size=0.2, position_pct=0.1)
+
+    passed, reason = fw.validate(
+        signal,
+        regime_data={
+            "overall_regime": "trending_down",
+            "overall_confidence": 0.75,
+            "per_coin": {
+                "BTC": {
+                    "regime": "trending_down",
+                    "confidence": 0.82,
+                    "momentum": -0.012,
+                    "trend_direction": -0.01,
+                }
+            },
+        },
+    )
+
+    assert passed is True
+    assert reason == "approved"
+    assert signal.size == pytest.approx(0.05)
+    assert signal.position_pct == pytest.approx(0.025)
+    assert signal.context["short_side_policy_override"]["scope"] == "scoped"
+    assert signal.context["short_side_policy_override"]["market_alignment"]["source"] == "coin:BTC"
+
+
+@patch("src.signals.decision_firewall.db")
 def test_firewall_derisks_shorts_when_recent_shorts_need_caution(mock_db):
     mock_db.get_open_paper_trades.return_value = []
     mock_db.get_paper_account.return_value = {"balance": 10000}
