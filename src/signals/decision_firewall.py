@@ -90,6 +90,18 @@ class DecisionFirewall:
         self.short_hardening_size_multiplier = float(
             cfg.get("short_hardening_size_multiplier", 0.50)
         )
+        self.short_hardening_block_override_enabled = bool(
+            cfg.get("short_hardening_block_override_enabled", True)
+        )
+        self.short_hardening_block_override_min_confidence = float(
+            cfg.get("short_hardening_block_override_min_confidence", 0.70)
+        )
+        self.short_hardening_block_override_min_regime_confidence = float(
+            cfg.get("short_hardening_block_override_min_regime_confidence", 0.60)
+        )
+        self.short_hardening_block_override_size_multiplier = float(
+            cfg.get("short_hardening_block_override_size_multiplier", 0.35)
+        )
         self.short_hardening_source_guard_enabled = bool(
             cfg.get("short_hardening_source_guard_enabled", True)
         )
@@ -360,6 +372,30 @@ class DecisionFirewall:
                     self.short_hardening_size_multiplier,
                 )
             )
+            self.short_hardening_block_override_enabled = bool(
+                overrides.get(
+                    "SHORT_HARDENING_BLOCK_OVERRIDE_ENABLED",
+                    self.short_hardening_block_override_enabled,
+                )
+            )
+            self.short_hardening_block_override_min_confidence = float(
+                overrides.get(
+                    "SHORT_HARDENING_BLOCK_OVERRIDE_MIN_CONFIDENCE",
+                    self.short_hardening_block_override_min_confidence,
+                )
+            )
+            self.short_hardening_block_override_min_regime_confidence = float(
+                overrides.get(
+                    "SHORT_HARDENING_BLOCK_OVERRIDE_MIN_REGIME_CONFIDENCE",
+                    self.short_hardening_block_override_min_regime_confidence,
+                )
+            )
+            self.short_hardening_block_override_size_multiplier = float(
+                overrides.get(
+                    "SHORT_HARDENING_BLOCK_OVERRIDE_SIZE_MULTIPLIER",
+                    self.short_hardening_block_override_size_multiplier,
+                )
+            )
             self.short_hardening_source_guard_enabled = bool(
                 overrides.get(
                     "SHORT_HARDENING_SOURCE_GUARD_ENABLED",
@@ -620,18 +656,140 @@ class DecisionFirewall:
 
         return policies
 
-    def _apply_side_policy(self, signal: TradeSignal) -> Tuple[bool, str]:
+    def _short_block_override(
+        self,
+        signal: TradeSignal,
+        blocking_policies: List[Dict],
+        regime_data: Optional[Dict] = None,
+    ) -> Tuple[bool, str, Dict]:
+        """Allow strong regime-aligned shorts through a global-only block."""
+        if not self.short_hardening_block_override_enabled:
+            return False, "short block override disabled", {}
+
+        scoped_block = next(
+            (
+                policy for policy in blocking_policies
+                if policy.get("scope")
+                or policy.get("coin")
+                or str(policy.get("source", "") or "").strip().lower() not in {"", "all"}
+            ),
+            None,
+        )
+        if scoped_block:
+            return False, scoped_block.get("reason", "Scoped short-side policy is blocked"), {}
+
+        try:
+            confidence = float(getattr(signal, "confidence", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            confidence = 0.0
+        if confidence < self.short_hardening_block_override_min_confidence:
+            return (
+                False,
+                f"short confidence {confidence:.0%} below override threshold "
+                f"{self.short_hardening_block_override_min_confidence:.0%}",
+                {},
+            )
+
+        context = getattr(signal, "context", {}) if isinstance(getattr(signal, "context", {}), dict) else {}
+        regime_payload = regime_data or {}
+        regime = (
+            str(regime_payload.get("overall_regime", "") or regime_payload.get("regime", "") or "")
+            or str(getattr(signal, "regime", "") or "")
+            or str(context.get("regime", "") or context.get("overall_regime", "") or "")
+        ).strip().lower()
+        bearish_regimes = {
+            "bear",
+            "bearish",
+            "downtrend",
+            "trend_down",
+            "trending_down",
+            "crash",
+            "panic",
+            "risk_off",
+        }
+        if regime not in bearish_regimes:
+            return False, f"short block override requires bearish regime, got {regime or 'unknown'}", {}
+
+        regime_conf_raw = (
+            regime_payload.get("overall_confidence")
+            if "overall_confidence" in regime_payload
+            else regime_payload.get("regime_confidence")
+        )
+        if regime_conf_raw is None:
+            regime_conf_raw = context.get("regime_confidence", context.get("overall_confidence"))
+        try:
+            regime_confidence = float(regime_conf_raw or 0.0)
+        except (TypeError, ValueError):
+            regime_confidence = 0.0
+        if regime_confidence < self.short_hardening_block_override_min_regime_confidence:
+            return (
+                False,
+                f"short block override requires regime confidence "
+                f"{self.short_hardening_block_override_min_regime_confidence:.0%}, "
+                f"got {regime_confidence:.0%}",
+                {},
+            )
+
+        meta = {
+            "status": "override",
+            "regime": regime,
+            "regime_confidence": regime_confidence,
+            "confidence": confidence,
+            "size_multiplier": self.short_hardening_block_override_size_multiplier,
+            "reason": "Global short-side block overridden by bearish regime confirmation",
+        }
+        return True, meta["reason"], meta
+
+    def _apply_side_policy(
+        self,
+        signal: TradeSignal,
+        regime_data: Optional[Dict] = None,
+    ) -> Tuple[bool, str]:
         side_val = signal.side.value if hasattr(signal.side, "value") else str(signal.side)
         if str(side_val).lower() != "short":
             return True, ""
 
         policies = [self._get_short_side_policy(), *self._get_scoped_short_policies(signal)]
-        blocking = next(
-            (policy for policy in policies if str(policy.get("status", "")).lower() == "blocked"),
-            None,
-        )
-        if blocking:
-            return False, blocking.get("reason", "Short-side guardrail blocked the signal")
+        blocking_policies = [
+            policy for policy in policies
+            if str(policy.get("status", "")).lower() == "blocked"
+        ]
+        if blocking_policies:
+            override_allowed, override_reason, override_meta = self._short_block_override(
+                signal,
+                blocking_policies,
+                regime_data=regime_data,
+            )
+            if not override_allowed:
+                blocking = blocking_policies[0]
+                return False, blocking.get("reason", "Short-side guardrail blocked the signal")
+
+            original_confidence = float(signal.confidence)
+            signal.confidence *= self.short_hardening_confidence_multiplier
+            signal.position_pct *= self.short_hardening_block_override_size_multiplier
+            if signal.size > 0:
+                signal.size *= self.short_hardening_block_override_size_multiplier
+            if isinstance(getattr(signal, "context", None), dict):
+                signal.context["short_side_policies"] = [
+                    {
+                        "status": p.get("status"),
+                        "reason": p.get("reason"),
+                        "metrics": p.get("metrics", {}),
+                        "scope": p.get("scope", "global_short"),
+                    }
+                    for p in policies
+                ]
+                signal.context["short_side_policy_override"] = dict(override_meta)
+            logger.warning(
+                "Short hardening override allowed %s: confidence %.0f%% -> %.0f%%, "
+                "size *= %.2f (%s)",
+                signal.coin,
+                original_confidence * 100,
+                signal.confidence * 100,
+                self.short_hardening_block_override_size_multiplier,
+                override_reason,
+            )
+            return True, ""
 
         degraded_policies = [
             policy for policy in policies
@@ -1263,7 +1421,7 @@ class DecisionFirewall:
         if not event_risk_ok:
             return _reject("rejected_event_risk", event_risk_reason)
 
-        side_policy_ok, side_policy_reason = self._apply_side_policy(signal)
+        side_policy_ok, side_policy_reason = self._apply_side_policy(signal, regime_data=regime_data)
         if not side_policy_ok:
             return _reject("rejected_side_policy", side_policy_reason)
 

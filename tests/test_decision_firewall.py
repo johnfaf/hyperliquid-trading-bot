@@ -686,6 +686,50 @@ def test_firewall_blocks_shorts_when_recent_shorts_are_bad(mock_db):
 
 
 @patch("src.signals.decision_firewall.db")
+def test_firewall_allows_high_confidence_shorts_in_bearish_regime(mock_db):
+    mock_db.get_open_paper_trades.return_value = []
+    mock_db.get_paper_account.return_value = {"balance": 10000}
+    mock_db.get_paper_trade_history.return_value = [
+        {"side": "short", "pnl": -0.7, "metadata": "{}"},
+        {"side": "short", "pnl": -0.4, "metadata": "{}"},
+        {"side": "short", "pnl": -0.2, "metadata": "{}"},
+        {"side": "short", "pnl": 0.1, "metadata": "{}"},
+    ]
+    mock_db.audit_log = MagicMock()
+
+    from src.signals.decision_firewall import DecisionFirewall
+
+    fw = DecisionFirewall(
+        {
+            "short_hardening_enabled": True,
+            "short_hardening_min_closed_trades": 4,
+            "short_hardening_block_win_rate": 0.35,
+            "short_hardening_block_net_pnl": -1.0,
+            "short_hardening_block_override_enabled": True,
+            "short_hardening_block_override_min_confidence": 0.70,
+            "short_hardening_block_override_min_regime_confidence": 0.60,
+            "short_hardening_block_override_size_multiplier": 0.35,
+            "short_hardening_confidence_multiplier": 0.80,
+            "enable_predictive_derisk": False,
+            "funding_risk_enabled": False,
+        }
+    )
+    signal = MockSignal(side_val="short", confidence=0.85, size=0.2, position_pct=0.1)
+
+    passed, reason = fw.validate(
+        signal,
+        regime_data={"overall_regime": "trending_down", "overall_confidence": 0.75},
+    )
+
+    assert passed is True
+    assert reason == "approved"
+    assert signal.confidence == pytest.approx(0.68)
+    assert signal.size == pytest.approx(0.07)
+    assert signal.position_pct == pytest.approx(0.035)
+    assert signal.context["short_side_policy_override"]["status"] == "override"
+
+
+@patch("src.signals.decision_firewall.db")
 def test_firewall_derisks_shorts_when_recent_shorts_need_caution(mock_db):
     mock_db.get_open_paper_trades.return_value = []
     mock_db.get_paper_account.return_value = {"balance": 10000}

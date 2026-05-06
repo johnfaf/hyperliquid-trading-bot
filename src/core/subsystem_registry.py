@@ -397,6 +397,18 @@ def build_subsystems(
             "short_hardening_size_multiplier": float(
                 getattr(_fw_cfg, "SHORT_HARDENING_SIZE_MULTIPLIER", 0.50)
             ),
+            "short_hardening_block_override_enabled": bool(
+                getattr(_fw_cfg, "SHORT_HARDENING_BLOCK_OVERRIDE_ENABLED", True)
+            ),
+            "short_hardening_block_override_min_confidence": float(
+                getattr(_fw_cfg, "SHORT_HARDENING_BLOCK_OVERRIDE_MIN_CONFIDENCE", 0.70)
+            ),
+            "short_hardening_block_override_min_regime_confidence": float(
+                getattr(_fw_cfg, "SHORT_HARDENING_BLOCK_OVERRIDE_MIN_REGIME_CONFIDENCE", 0.60)
+            ),
+            "short_hardening_block_override_size_multiplier": float(
+                getattr(_fw_cfg, "SHORT_HARDENING_BLOCK_OVERRIDE_SIZE_MULTIPLIER", 0.35)
+            ),
             "short_hardening_source_guard_enabled": bool(
                 getattr(_fw_cfg, "SHORT_HARDENING_SOURCE_GUARD_ENABLED", True)
             ),
