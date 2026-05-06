@@ -6,13 +6,24 @@ keep working when v2 is fronted by the same port.
 from __future__ import annotations
 
 import logging
+import os
 
 from fastapi import APIRouter
 from fastapi.responses import JSONResponse
 
+from src.ui.v2.cache import get_ttl
+
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+
+def _cache_ttl(name: str, default: float) -> float:
+    raw = os.environ.get(name, str(default))
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        return default
 
 
 @router.get("/api/health")
@@ -29,13 +40,14 @@ async def ready() -> JSONResponse:
     state at a glance.
     """
     try:
-        from src.core.readiness import evaluate_readiness
-        result = evaluate_readiness()
+        result = get_ttl(
+            "dashboard_ready",
+            _cache_ttl("DASHBOARD_V2_HEALTH_CACHE_SECONDS", 5.0),
+            _evaluate_readiness,
+        )
     except Exception as exc:
         logger.warning("readiness check failed: %s", exc)
-        return JSONResponse(
-            {"ready": False, "error": str(exc)}, status_code=503
-        )
+        return JSONResponse({"ready": False, "error": str(exc)}, status_code=503)
     return JSONResponse(result)
 
 
@@ -57,8 +69,11 @@ async def health_strip() -> JSONResponse:
     """
     payload: dict = {"tone": "amber", "label": "unknown", "summary": "no data", "reasons": []}
     try:
-        from src.core.readiness import evaluate_readiness
-        result = evaluate_readiness() or {}
+        result = get_ttl(
+            "dashboard_ready",
+            _cache_ttl("DASHBOARD_V2_HEALTH_CACHE_SECONDS", 5.0),
+            _evaluate_readiness,
+        ) or {}
     except Exception as exc:
         logger.warning("health strip readiness failed: %s", exc)
         return JSONResponse({
@@ -93,3 +108,9 @@ async def health_strip() -> JSONResponse:
             "reasons": reasons[:5],
         }
     return JSONResponse(payload)
+
+
+def _evaluate_readiness() -> dict:
+    from src.core.readiness import evaluate_readiness
+
+    return evaluate_readiness()

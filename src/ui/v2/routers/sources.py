@@ -21,17 +21,27 @@ from collections import defaultdict
 import json
 import logging
 import math
+import os
 from typing import Any, Dict, List
 
 from fastapi import APIRouter, Form, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from src.ui.v2.auth import require_auth, verify_cookie
+from src.ui.v2.cache import get_ttl, invalidate
 from src.ui.v2.state import get_components
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+
+def _cache_ttl(name: str, default: float) -> float:
+    raw = os.environ.get(name, str(default))
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        return default
 
 
 def _loads_dict(value: Any) -> Dict[str, Any]:
@@ -218,7 +228,7 @@ def _aggregate_calibration_for_source(cal, source: str) -> Dict[str, Any]:
     }
 
 
-def _summary_payload() -> Dict[str, Any]:
+def _build_summary_payload() -> Dict[str, Any]:
     components = get_components()
     scorer = components.agent_scorer
     cal = components.calibration
@@ -266,6 +276,16 @@ def _summary_payload() -> Dict[str, Any]:
         "totals": counts,
         "strategies": strategies,
     }
+
+
+def _summary_payload() -> Dict[str, Any]:
+    components = get_components()
+    key = ("sources_summary", id(components.agent_scorer), id(components.calibration))
+    return get_ttl(
+        key,
+        _cache_ttl("DASHBOARD_V2_SOURCES_CACHE_SECONDS", 10.0),
+        _build_summary_payload,
+    )
 
 
 @router.get("/api/sources", response_class=JSONResponse)
@@ -318,6 +338,9 @@ async def clear_quarantine(
         publish_event("calibration", transition="quarantine_cleared", key=composed, reason=reason)
     except Exception:
         pass
+    invalidate("sources_summary")
+    invalidate("calibration_summary")
+    invalidate("calibration_timeline")
     return JSONResponse({"ok": True, "result": result})
 
 
@@ -327,6 +350,12 @@ async def sources_page(request: Request):
     if redirect is not None:
         return redirect
     from src.ui.v2.app import get_templates
+    if request.query_params.get("fragment") == "summary":
+        return get_templates().TemplateResponse(
+            request,
+            "partials/sources_summary.html",
+            {"title": "Sources", "data": _summary_payload()},
+        )
     return get_templates().TemplateResponse(
         request,
         "sources.html",

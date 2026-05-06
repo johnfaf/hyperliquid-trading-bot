@@ -6,36 +6,7 @@
   </div>
 {% else %}
 {% set t = data.totals %}
-<section class="grid grid-cols-2 md:grid-cols-5 gap-3 mb-6"
-         data-ws-refresh-on="cycle,calibration"
-         hx-get="/sources?fragment=summary"
-         hx-trigger="wsEvent from:body, every 30s"
-         hx-swap="none">
-  <div class="bg-slate-900 border border-slate-800 rounded p-3">
-    <div class="text-[10px] uppercase tracking-wide text-slate-500">Active</div>
-    <div class="mt-1 text-2xl font-semibold text-emerald-300">{{ t.active or 0 }}</div>
-  </div>
-  <div class="bg-slate-900 border border-slate-800 rounded p-3">
-    <div class="text-[10px] uppercase tracking-wide text-slate-500">Warmup</div>
-    <div class="mt-1 text-2xl font-semibold text-amber-300">{{ t.warmup or 0 }}</div>
-    <div class="mt-1 text-[10px] text-slate-500">capped + size-derisked</div>
-  </div>
-  <div class="bg-slate-900 border border-slate-800 rounded p-3">
-    <div class="text-[10px] uppercase tracking-wide text-slate-500">Degraded</div>
-    <div class="mt-1 text-2xl font-semibold text-orange-300">{{ t.degraded or 0 }}</div>
-    <div class="mt-1 text-[10px] text-slate-500">low rank or losing</div>
-  </div>
-  <div class="bg-slate-900 border border-slate-800 rounded p-3">
-    <div class="text-[10px] uppercase tracking-wide text-slate-500">Paused</div>
-    <div class="mt-1 text-2xl font-semibold text-rose-300">{{ t.paused or 0 }}</div>
-    <div class="mt-1 text-[10px] text-slate-500">blocked by allocator</div>
-  </div>
-  <div class="bg-slate-900 border border-slate-800 rounded p-3">
-    <div class="text-[10px] uppercase tracking-wide text-slate-500">Total</div>
-    <div class="mt-1 text-2xl font-semibold text-slate-100">{{ data.rows|length }}</div>
-    <div class="mt-1 text-[10px] text-slate-500">tracked sources</div>
-  </div>
-</section>
+{% include "partials/sources_summary.html" %}
 
 <section>
   <div class="flex items-center justify-between mb-2">
@@ -141,6 +112,7 @@
 </dialog>
 
 <script>
+  if (window.__sourcesClearQuarantineHandler) window.removeEventListener('clear-quarantine', window.__sourcesClearQuarantineHandler);
   (function () {
     const dialog = document.getElementById('clear-quarantine-dialog');
     const keyEl = document.getElementById('clear-quarantine-key');
@@ -149,14 +121,15 @@
     const submitBtn = document.getElementById('clear-quarantine-submit');
     let activeKey = '';
 
-    window.addEventListener('clear-quarantine', (ev) => {
+    window.__sourcesClearQuarantineHandler = (ev) => {
       activeKey = ev.detail || '';
       keyEl.textContent = activeKey;
       reasonEl.value = '';
       resultEl.textContent = '';
       resultEl.className = 'text-xs';
       dialog.showModal();
-    });
+    };
+    window.addEventListener('clear-quarantine', window.__sourcesClearQuarantineHandler);
 
     submitBtn.addEventListener('click', async (ev) => {
       ev.preventDefault();
@@ -185,6 +158,9 @@
         resultEl.className = 'text-xs text-rose-300';
       }
     });
+    window.addEventListener('dashboard:before-page-swap', () => {
+      if (window.__sourcesClearQuarantineHandler) window.removeEventListener('clear-quarantine', window.__sourcesClearQuarantineHandler);
+    }, {once: true});
   })();
 </script>
 {% endif %}

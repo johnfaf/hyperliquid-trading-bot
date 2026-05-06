@@ -1,0 +1,35 @@
+{% if not data.available %}
+<section id="sources-summary" class="mb-6 bg-amber-900/30 border border-amber-700 rounded p-4 text-amber-200 text-sm">Agent scorer is not initialised in this process; the source scoreboard requires it.</section>
+{% else %}
+{% set t = data.totals %}
+<section id="sources-summary" class="grid grid-cols-2 md:grid-cols-5 gap-3 mb-6"
+         data-ws-refresh-on="cycle,calibration"
+         hx-get="/sources?fragment=summary"
+         hx-trigger="wsEvent, every 30s"
+         hx-swap="outerHTML">
+  <div class="bg-slate-900 border border-slate-800 rounded p-3">
+    <div class="text-[10px] uppercase tracking-wide text-slate-500">Active</div>
+    <div class="mt-1 text-2xl font-semibold text-emerald-300">{{ t.active or 0 }}</div>
+  </div>
+  <div class="bg-slate-900 border border-slate-800 rounded p-3">
+    <div class="text-[10px] uppercase tracking-wide text-slate-500">Warmup</div>
+    <div class="mt-1 text-2xl font-semibold text-amber-300">{{ t.warmup or 0 }}</div>
+    <div class="mt-1 text-[10px] text-slate-500">capped + size-derisked</div>
+  </div>
+  <div class="bg-slate-900 border border-slate-800 rounded p-3">
+    <div class="text-[10px] uppercase tracking-wide text-slate-500">Degraded</div>
+    <div class="mt-1 text-2xl font-semibold text-orange-300">{{ t.degraded or 0 }}</div>
+    <div class="mt-1 text-[10px] text-slate-500">low rank or losing</div>
+  </div>
+  <div class="bg-slate-900 border border-slate-800 rounded p-3">
+    <div class="text-[10px] uppercase tracking-wide text-slate-500">Paused</div>
+    <div class="mt-1 text-2xl font-semibold text-rose-300">{{ t.paused or 0 }}</div>
+    <div class="mt-1 text-[10px] text-slate-500">blocked by allocator</div>
+  </div>
+  <div class="bg-slate-900 border border-slate-800 rounded p-3">
+    <div class="text-[10px] uppercase tracking-wide text-slate-500">Total</div>
+    <div class="mt-1 text-2xl font-semibold text-slate-100">{{ data.rows|length }}</div>
+    <div class="mt-1 text-[10px] text-slate-500">tracked sources</div>
+  </div>
+</section>
+{% endif %}

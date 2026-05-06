@@ -47,6 +47,16 @@ def test_index_serves_dashboard_when_no_token_configured(client):
     r = client.get("/")
     assert r.status_code == 200
     assert "Calibration breakdown" in r.text
+    assert "/static/dashboard.css" in r.text
+    assert "cdn.tailwindcss.com" not in r.text
+    assert 'id="page-main"' in r.text
+    assert "hx-boost" in r.text
+
+
+def test_dashboard_responses_include_timing_header(client):
+    r = client.get("/api/health")
+    assert r.status_code == 200
+    assert "x-response-time-ms" in r.headers
 
 
 def test_calibration_data_returns_summary(client):
@@ -79,6 +89,19 @@ def test_calibration_page_renders(client):
     r = client.get("/calibration")
     assert r.status_code == 200
     assert "Per-source calibration" in r.text
+
+
+def test_dashboard_summary_fragments_render_without_full_layout(client):
+    cases = {
+        "/positions?fragment=summary": 'id="positions-summary"',
+        "/sources?fragment=summary": 'id="sources-summary"',
+        "/calibration?fragment=summary": 'id="calibration-summary"',
+    }
+    for path, marker in cases.items():
+        r = client.get(path)
+        assert r.status_code == 200
+        assert marker in r.text
+        assert "<html" not in r.text
 
 
 def test_login_redirect_when_token_required_and_no_cookie(monkeypatch, app):

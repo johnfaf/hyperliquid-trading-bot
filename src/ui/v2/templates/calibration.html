@@ -6,46 +6,7 @@
   </div>
 {% else %}
 {% set g = data.global %}
-<section class="grid grid-cols-2 md:grid-cols-5 gap-3 mb-6"
-         data-ws-refresh-on="cycle,calibration"
-         hx-get="/calibration?fragment=summary"
-         hx-trigger="wsEvent from:body, every 30s"
-         hx-swap="none">
-  <div class="bg-slate-900 border border-slate-800 rounded p-3">
-    <div class="text-[10px] uppercase tracking-wide text-slate-500">Global ECE</div>
-    <div class="mt-1 text-2xl font-semibold {% if g.ece is none %}text-slate-500{% elif g.ece >= 0.20 %}text-rose-300{% elif g.ece >= 0.10 %}text-amber-300{% else %}text-emerald-300{% endif %}">
-      {% if g.ece is none %}—{% else %}{{ '%.3f'|format(g.ece) }}{% endif %}
-    </div>
-    <div class="mt-1 text-[10px] text-slate-500">target &lt; 0.10</div>
-  </div>
-  <div class="bg-slate-900 border border-slate-800 rounded p-3">
-    <div class="text-[10px] uppercase tracking-wide text-slate-500">Brier</div>
-    <div class="mt-1 text-2xl font-semibold {% if g.brier is none %}text-slate-500{% else %}text-slate-200{% endif %}">
-      {% if g.brier is none %}—{% else %}{{ '%.3f'|format(g.brier) }}{% endif %}
-    </div>
-    <div class="mt-1 text-[10px] text-slate-500">lower = better</div>
-  </div>
-  <div class="bg-slate-900 border border-slate-800 rounded p-3">
-    <div class="text-[10px] uppercase tracking-wide text-slate-500">Sources</div>
-    <div class="mt-1 text-2xl font-semibold text-slate-200">{{ g.n_sources }}</div>
-    <div class="mt-1 text-[10px] text-slate-500">tracked keys</div>
-  </div>
-  <div class="bg-slate-900 border border-slate-800 rounded p-3">
-    <div class="text-[10px] uppercase tracking-wide text-slate-500">Quarantined</div>
-    <div class="mt-1 text-2xl font-semibold {% if g.n_quarantined > 0 %}text-rose-300{% else %}text-emerald-300{% endif %}">{{ g.n_quarantined }}</div>
-    <div class="mt-1 text-[10px] text-slate-500">ECE ≥ {{ '%.2f'|format(g.thresholds.quarantine_ece or 0) }}</div>
-  </div>
-  <div class="bg-slate-900 border border-slate-800 rounded p-3">
-    <div class="text-[10px] uppercase tracking-wide text-slate-500">Live status</div>
-    {% if g.live_paused %}
-      <div class="mt-1 text-2xl font-semibold text-rose-300">PAUSED</div>
-      <div class="mt-1 text-[10px] text-rose-400">global ECE ≥ {{ '%.2f'|format(g.thresholds.live_pause_ece or 0) }}</div>
-    {% else %}
-      <div class="mt-1 text-2xl font-semibold text-emerald-300">ACTIVE</div>
-      <div class="mt-1 text-[10px] text-slate-500">live entries flowing</div>
-    {% endif %}
-  </div>
-</section>
+{% include "partials/calibration_summary.html" %}
 
 <section class="mb-6">
   <div class="flex items-center justify-between mb-2">
@@ -133,6 +94,9 @@
 </section>
 
 <script>
+  if (window.__calibrationWsHandler) window.removeEventListener('ws-event', window.__calibrationWsHandler);
+  if (window.__calibrationCurveSwapHandler) document.body.removeEventListener('htmx:afterSwap', window.__calibrationCurveSwapHandler);
+
   async function renderEceTimeline() {
     const el = document.getElementById('ece-timeline');
     if (!el) return;
@@ -203,14 +167,15 @@
     }
   }
   renderEceTimeline();
-  window.addEventListener('ws-event', (ev) => {
+  window.__calibrationWsHandler = (ev) => {
     if (ev.detail && (ev.detail.kind === 'calibration' || ev.detail.kind === 'cycle')) {
       renderEceTimeline();
     }
-  });
+  };
+  window.addEventListener('ws-event', window.__calibrationWsHandler);
 
   // Render the curve JSON into a tiny bar chart whenever HTMX swaps it in.
-  document.body.addEventListener('htmx:afterSwap', (ev) => {
+  window.__calibrationCurveSwapHandler = (ev) => {
     if (ev.target.id !== 'curve') return;
     let payload;
     try { payload = JSON.parse(ev.target.textContent); } catch { return; }
@@ -236,7 +201,12 @@
         </div>`;
     }).join('');
     ev.target.innerHTML = rows;
-  });
+  };
+  document.body.addEventListener('htmx:afterSwap', window.__calibrationCurveSwapHandler);
+  window.addEventListener('dashboard:before-page-swap', () => {
+    if (window.__calibrationWsHandler) window.removeEventListener('ws-event', window.__calibrationWsHandler);
+    if (window.__calibrationCurveSwapHandler) document.body.removeEventListener('htmx:afterSwap', window.__calibrationCurveSwapHandler);
+  }, {once: true});
 </script>
 {% endif %}
 {% endblock %}

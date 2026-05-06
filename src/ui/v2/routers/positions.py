@@ -14,17 +14,27 @@ the full LiveTrader stack.
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any, Dict, List
 
 from fastapi import APIRouter, Form, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from src.ui.v2.auth import require_auth, verify_cookie
+from src.ui.v2.cache import get_ttl, invalidate
 from src.ui.v2.state import get_components
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+
+def _cache_ttl(name: str, default: float) -> float:
+    raw = os.environ.get(name, str(default))
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        return default
 
 
 def _safe_call(obj: Any, name: str, *args, **kwargs):
@@ -170,7 +180,7 @@ def _recent_fills(live_trader: Any, limit: int = 25) -> List[Dict[str, Any]]:
     return out
 
 
-def _summary_payload() -> Dict[str, Any]:
+def _build_summary_payload() -> Dict[str, Any]:
     components = get_components()
     live_trader = components.live_trader
     cal = components.calibration
@@ -238,6 +248,25 @@ def _summary_payload() -> Dict[str, Any]:
     }
 
 
+def _summary_payload() -> Dict[str, Any]:
+    components = get_components()
+    key = ("positions_summary", id(components.live_trader), id(components.calibration))
+    return get_ttl(
+        key,
+        _cache_ttl("DASHBOARD_V2_POSITIONS_CACHE_SECONDS", 5.0),
+        _build_summary_payload,
+    )
+
+
+def _recent_fills_payload(live_trader: Any, limit: int) -> List[Dict[str, Any]]:
+    bounded_limit = max(1, min(int(limit or 25), 100))
+    return get_ttl(
+        ("recent_fills", id(live_trader), bounded_limit),
+        _cache_ttl("DASHBOARD_V2_FILLS_CACHE_SECONDS", 5.0),
+        lambda: _recent_fills(live_trader, limit=bounded_limit),
+    )
+
+
 @router.get("/api/positions", response_class=JSONResponse)
 async def positions_data(request: Request):
     redirect = require_auth(request)
@@ -253,7 +282,7 @@ async def recent_fills(request: Request, limit: int = 25):
     if redirect is not None:
         return JSONResponse({"error": "auth_required"}, status_code=401)
     components = get_components()
-    fills = _recent_fills(components.live_trader, limit=limit)
+    fills = _recent_fills_payload(components.live_trader, limit=limit)
     return JSONResponse({"fills": fills, "count": len(fills)})
 
 
@@ -293,6 +322,7 @@ async def clear_kill_switch(
         logger.error("operator_clear_kill_switch failed: %s", exc, exc_info=True)
         return JSONResponse({"error": "clear_failed", "message": str(exc)}, status_code=500)
 
+    invalidate("positions_summary")
     return JSONResponse({"ok": True, "result": result})
 
 
@@ -353,6 +383,8 @@ async def close_live_position(
             )
         except Exception:
             pass
+        invalidate("positions_summary")
+        invalidate("recent_fills")
         return JSONResponse(
             {
                 "ok": True,
@@ -375,6 +407,12 @@ async def positions_page(request: Request):
     if redirect is not None:
         return redirect
     from src.ui.v2.app import get_templates
+    if request.query_params.get("fragment") == "summary":
+        return get_templates().TemplateResponse(
+            request,
+            "partials/positions_summary.html",
+            {"title": "Positions", "data": _summary_payload()},
+        )
     return get_templates().TemplateResponse(
         request,
         "positions.html",

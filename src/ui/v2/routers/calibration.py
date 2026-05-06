@@ -13,6 +13,7 @@ from datetime import datetime, timedelta, timezone
 import json
 import logging
 import math
+import os
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Request
@@ -20,11 +21,20 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 
 from src.ui.v2.auth import require_auth
+from src.ui.v2.cache import get_ttl
 from src.ui.v2.state import get_components
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+
+def _cache_ttl(name: str, default: float) -> float:
+    raw = os.environ.get(name, str(default))
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        return default
 
 
 def _parse_ts(value: Any) -> Optional[datetime]:
@@ -259,6 +269,14 @@ def _summary_payload(cal) -> Dict[str, Any]:
     }
 
 
+def _cached_summary_payload(cal) -> Dict[str, Any]:
+    return get_ttl(
+        ("calibration_summary", id(cal)),
+        _cache_ttl("DASHBOARD_V2_CALIBRATION_CACHE_SECONDS", 10.0),
+        lambda: _summary_payload(cal),
+    )
+
+
 @router.get("/api/calibration", response_class=JSONResponse)
 async def calibration_data(request: Request):
     redirect = require_auth(request)
@@ -268,7 +286,7 @@ async def calibration_data(request: Request):
     cal = get_components().calibration
     if cal is None:
         return JSONResponse({"error": "calibration_unavailable"}, status_code=503)
-    return JSONResponse(_summary_payload(cal))
+    return JSONResponse(_cached_summary_payload(cal))
 
 
 @router.get("/api/calibration/curve", response_class=JSONResponse)
@@ -281,7 +299,12 @@ async def calibration_curve(request: Request, key: str = "global"):
     cal = get_components().calibration
     if cal is None:
         return JSONResponse({"error": "calibration_unavailable"}, status_code=503)
-    return JSONResponse({"key": key, "curve": _serialize_curve(cal, key)})
+    curve = get_ttl(
+        ("calibration_curve", id(cal), key),
+        _cache_ttl("DASHBOARD_V2_CALIBRATION_CACHE_SECONDS", 10.0),
+        lambda: _serialize_curve(cal, key),
+    )
+    return JSONResponse({"key": key, "curve": curve})
 
 
 @router.get("/api/calibration/timeline", response_class=JSONResponse)
@@ -290,7 +313,14 @@ async def calibration_timeline(request: Request, days: int = 21, top_sources: in
     redirect = require_auth(request)
     if redirect is not None:
         return JSONResponse({"error": "auth_required"}, status_code=401)
-    return JSONResponse(_ece_timeline_payload(days=days, top_sources=top_sources))
+    bounded_days = max(1, min(int(days or 21), 180))
+    bounded_top = max(1, min(int(top_sources or 8), 20))
+    payload = get_ttl(
+        ("calibration_timeline", bounded_days, bounded_top),
+        _cache_ttl("DASHBOARD_V2_CALIBRATION_TIMELINE_CACHE_SECONDS", 15.0),
+        lambda: _ece_timeline_payload(days=bounded_days, top_sources=bounded_top),
+    )
+    return JSONResponse(payload)
 
 
 @router.get("/calibration", response_class=HTMLResponse)
@@ -301,8 +331,18 @@ async def calibration_page(request: Request):
 
     cal = get_components().calibration
     payload: Optional[Dict[str, Any]] = (
-        _summary_payload(cal) if cal is not None else None
+        _cached_summary_payload(cal) if cal is not None else None
     )
+    if request.query_params.get("fragment") == "summary":
+        return _templates().TemplateResponse(
+            request,
+            "partials/calibration_summary.html",
+            {
+                "title": "Calibration",
+                "data": payload,
+                "available": cal is not None,
+            },
+        )
     return _templates().TemplateResponse(
         request,
         "calibration.html",

@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>{{ title }} — Hyperliquid Bot</title>
+  <title>{{ title }} - Hyperliquid Bot</title>
   <script>
     // Apply persisted theme BEFORE tailwind paints to avoid a flash.
     (function () {
@@ -13,19 +13,8 @@
       } catch (e) { /* localStorage may be unavailable */ }
     })();
   </script>
-  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="stylesheet" href="/static/dashboard.css" />
   <script src="https://unpkg.com/htmx.org@1.9.12"></script>
-  <script>
-    tailwind.config = {
-      theme: {
-        extend: {
-          fontFamily: {
-            mono: ['ui-monospace', 'SFMono-Regular', 'Menlo', 'monospace'],
-          },
-        },
-      },
-    };
-  </script>
   <style>
     body { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
     .bin-bar { transition: width 0.2s ease; }
@@ -55,7 +44,8 @@
   <header class="border-b border-slate-800 bg-slate-900/80 backdrop-blur sticky top-0 z-10">
     <div class="max-w-7xl mx-auto px-4 py-3 flex items-center gap-6">
       <a href="/" class="font-bold text-emerald-400">HL Bot</a>
-      <nav class="flex gap-4 text-sm text-slate-300">
+      <nav class="flex gap-4 text-sm text-slate-300"
+           hx-boost="true" hx-target="#page-main" hx-select="#page-main" hx-swap="outerHTML" hx-push-url="true">
         <a href="/" class="hover:text-white">Overview</a>
         <a href="/positions" class="hover:text-white">Positions</a>
         <a href="/sources" class="hover:text-white">Sources</a>
@@ -67,7 +57,7 @@
       <div class="flex-1"></div>
       <span id="health-strip" class="text-xs px-2 py-0.5 rounded bg-slate-800 text-slate-400"
             hx-get="/api/health/strip"
-            hx-trigger="load, every 30s, wsEvent from:body"
+            hx-trigger="load, every 30s, wsEvent"
             hx-swap="none"
             data-ws-refresh-on="cycle,kill_switch">health: …</span>
       <span id="ws-status" class="text-xs px-2 py-0.5 rounded bg-slate-800 text-slate-400">ws: connecting</span>
@@ -79,7 +69,7 @@
       </form>
     </div>
   </header>
-  <main class="max-w-7xl mx-auto px-4 py-6">
+  <main id="page-main" class="max-w-7xl mx-auto px-4 py-6">
     {% block content %}{% endblock %}
   </main>
   <script>
@@ -109,6 +99,13 @@
       };
     })();
 
+    // Give page-local scripts a chance to clean up intervals/listeners before SPA swaps.
+    document.body.addEventListener('htmx:beforeSwap', (ev) => {
+      if (ev.detail && ev.detail.target && ev.detail.target.id === 'page-main') {
+        window.dispatchEvent(new Event('dashboard:before-page-swap'));
+      }
+    });
+
     // Theme toggle. Persisted in localStorage; the inline script in
     // <head> applies it before paint so reloads don't flash.
     (function () {
@@ -134,7 +131,7 @@
       };
       const tone = tones[body.tone] || 'bg-slate-800 text-slate-400';
       el.className = 'text-xs px-2 py-0.5 rounded ' + tone;
-      el.title = (body.reasons || []).join(' · ') || body.summary || '';
+      el.title = (body.reasons || []).join(' | ') || body.summary || '';
       el.textContent = 'health: ' + (body.label || 'unknown');
     });
   </script>
