@@ -821,6 +821,98 @@ def _close_all_live_positions() -> dict:
     }
 
 
+def _live_chart_payload(coin: str = "BTC", interval: str = "1m", hours: int = 12) -> dict:
+    """Build candlestick + marker payload for the operator chart."""
+    from src.data.hyperliquid_client import get_candles
+
+    coin = str(coin or "BTC").strip().upper()
+    interval = str(interval or "1m").strip()
+    if interval not in {"1m", "5m", "15m", "1h", "4h", "1d"}:
+        interval = "1m"
+    try:
+        hours = max(1, min(int(hours or 12), 168))
+    except (TypeError, ValueError):
+        hours = 12
+
+    end_ms = int(time.time() * 1000)
+    start_ms = end_ms - hours * 3_600_000
+    raw = get_candles(coin, interval=interval, start_time=start_ms, end_time=end_ms) or []
+    candles = []
+    for c in raw:
+        try:
+            ts = int(c.get("t", c.get("T", 0)) or 0)
+            if ts <= 0:
+                continue
+            candle = {
+                "time": int(ts / 1000),
+                "open": float(c.get("o", c.get("O", 0)) or 0),
+                "high": float(c.get("h", c.get("H", 0)) or 0),
+                "low": float(c.get("l", c.get("L", 0)) or 0),
+                "close": float(c.get("c", c.get("C", 0)) or 0),
+            }
+            if candle["high"] < candle["low"] or candle["close"] <= 0:
+                continue
+            candles.append(candle)
+        except Exception:
+            continue
+
+    markers = []
+    with _get_db() as conn:
+        rows = conn.execute(
+            "SELECT id, coin, side, entry_price, stop_loss, take_profit, opened_at "
+            "FROM paper_trades WHERE status = 'open' AND coin = ?",
+            (coin,),
+        ).fetchall()
+    for row in rows:
+        trade = dict(row)
+        try:
+            opened_at = trade.get("opened_at") or ""
+            marker_time = int(datetime.fromisoformat(opened_at.replace("Z", "+00:00")).timestamp())
+        except Exception:
+            marker_time = candles[-1]["time"] if candles else int(time.time())
+        side = str(trade.get("side") or "").lower()
+        markers.append({
+            "time": marker_time,
+            "position": "belowBar" if side == "long" else "aboveBar",
+            "color": "#207f59" if side == "long" else "#b54d3f",
+            "shape": "arrowUp" if side == "long" else "arrowDown",
+            "text": f"{side.upper()} #{trade.get('id')}",
+        })
+
+    live_positions = []
+    live_orders = []
+    if _live_trader:
+        try:
+            positions = _live_trader.get_positions(force_fresh=True)
+        except TypeError:
+            positions = _live_trader.get_positions()
+        except Exception:
+            positions = []
+        for pos in positions or []:
+            if str(pos.get("coin") or "").upper() == coin:
+                live_positions.append(pos)
+        try:
+            orders = _live_trader.get_open_orders(force_fresh=True)
+        except TypeError:
+            orders = _live_trader.get_open_orders()
+        except Exception:
+            orders = []
+        for order in orders or []:
+            if str(order.get("coin") or order.get("asset") or "").upper() == coin:
+                live_orders.append(order)
+
+    return {
+        "coin": coin,
+        "interval": interval,
+        "hours": hours,
+        "candles": candles,
+        "markers": markers,
+        "live_positions": live_positions,
+        "live_orders": live_orders,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+
 def set_v2_components(firewall=None, regime_detector=None, arena=None,
                        agent_scorer=None, kelly_sizer=None, trade_memory=None,
                        calibration=None, llm_filter=None,
@@ -1115,6 +1207,14 @@ details[open] summary::after{content:'-'}
 .consensus-meta{display:block;margin-top:6px;color:var(--muted);font-size:.8rem;line-height:1.45}
 .agent-key{display:inline-block;max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .runtime-grid{display:grid;gap:12px}
+.chart-toolbar{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.chart-toolbar select,.chart-toolbar button{
+  border:1px solid var(--line);border-radius:999px;background:var(--panel-soft);color:var(--ink);
+  padding:8px 12px;font-size:.82rem;font-weight:700
+}
+.chart-wrap{height:430px;border:1px solid var(--line);border-radius:18px;background:#111814;overflow:hidden;position:relative}
+#live-candle-chart{height:100%;width:100%}
+.chart-status{position:absolute;left:14px;top:12px;z-index:2;padding:6px 9px;border-radius:999px;background:rgba(255,250,241,.88);color:var(--muted);font-size:.74rem;font-weight:700}
 @media (max-width: 1180px){
   .layout,.split-grid{grid-template-columns:1fr}
   .metric-band .grid{grid-template-columns:repeat(2,minmax(0,1fr))}
@@ -1131,6 +1231,7 @@ details[open] summary::after{content:'-'}
 }
 </style>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<script src="https://unpkg.com/lightweight-charts@4.2.3/dist/lightweight-charts.standalone.production.js"></script>
 </head>
 <body>
 <div class="page-shell">
@@ -1203,6 +1304,30 @@ details[open] summary::after{content:'-'}
         </div>
       </section>
     </aside>
+  </section>
+
+  <section class="section">
+    <div class="section-head">
+      <div>
+        <p class="section-tag">Market Tape</p>
+        <h2 class="section-title">Live Trading Chart</h2>
+      </div>
+      <div class="chart-toolbar">
+        <select id="chart-coin" onchange="loadLiveChart(true)"></select>
+        <select id="chart-interval" onchange="loadLiveChart(true)">
+          <option value="1m">1m</option>
+          <option value="5m">5m</option>
+          <option value="15m">15m</option>
+          <option value="1h">1h</option>
+          <option value="4h">4h</option>
+        </select>
+        <button onclick="loadLiveChart(true)">Refresh chart</button>
+      </div>
+    </div>
+    <div class="chart-wrap">
+      <div id="chart-status" class="chart-status">Loading candles...</div>
+      <div id="live-candle-chart"></div>
+    </div>
   </section>
 
   <section class="split-grid">
@@ -1481,6 +1606,7 @@ function connectWebSocket(){
         if(data.channel === 'allMids' && data.data && data.data.mids) {
           livePrices = data.data.mids;
           renderOpenTrades(window.currentOpenTrades || []);
+          updateLiveChartFromMid();
         }
       } catch(e) {
         console.error('WebSocket message error:', e);
@@ -1508,11 +1634,111 @@ function connectWebSocket(){
 
 let typeChart = null;
 let liveUpdateInterval = null;
+let liveCandleChart = null;
+let liveCandleSeries = null;
+let liveChartLastCandle = null;
+let liveChartLoadedOnce = false;
 
 function fmt(n, d=2){ return n != null ? Number(n).toLocaleString(undefined,{minimumFractionDigits:d,maximumFractionDigits:d}) : 'n/a' }
 function fmtUsd(n){ return n != null ? '$' + fmt(n) : 'n/a' }
 function pnlClass(n){ return n > 0 ? 'green' : n < 0 ? 'red' : '' }
 function shortAddr(a){ return a ? a.slice(0,6)+'...'+a.slice(-4) : 'n/a' }
+
+function selectedChartCoin(){
+  const el = document.getElementById('chart-coin');
+  return el && el.value ? el.value : 'BTC';
+}
+
+function refreshChartCoinOptions(d){
+  const el = document.getElementById('chart-coin');
+  if(!el) return;
+  const coins = new Set(['BTC','ETH','SOL']);
+  (d.open_trades || []).forEach(t => { if(t.coin) coins.add(String(t.coin).toUpperCase()); });
+  const regime = ((d.v2 || {}).regime || {});
+  Object.keys(regime).slice(0, 20).forEach(c => { if(c) coins.add(String(c).toUpperCase()); });
+  const current = el.value || 'BTC';
+  const ordered = Array.from(coins).sort((a,b) => ['BTC','ETH','SOL'].indexOf(a) - ['BTC','ETH','SOL'].indexOf(b) || a.localeCompare(b));
+  el.innerHTML = ordered.map(c => `<option value="${c}">${c}</option>`).join('');
+  el.value = ordered.includes(current) ? current : ordered[0];
+}
+
+function initLiveChart(){
+  const target = document.getElementById('live-candle-chart');
+  if(!target || liveCandleChart || !window.LightweightCharts) return;
+  liveCandleChart = LightweightCharts.createChart(target, {
+    layout: { background: { color: '#111814' }, textColor: '#d6cdc0' },
+    grid: { vertLines: { color: 'rgba(255,255,255,.06)' }, horzLines: { color: 'rgba(255,255,255,.06)' } },
+    rightPriceScale: { borderColor: 'rgba(255,255,255,.12)' },
+    timeScale: { borderColor: 'rgba(255,255,255,.12)', timeVisible: true, secondsVisible: false },
+    crosshair: { mode: 1 },
+  });
+  liveCandleSeries = liveCandleChart.addCandlestickSeries({
+    upColor: '#207f59',
+    downColor: '#b54d3f',
+    borderUpColor: '#207f59',
+    borderDownColor: '#b54d3f',
+    wickUpColor: '#6fcf97',
+    wickDownColor: '#e07a6e',
+  });
+  window.addEventListener('resize', () => {
+    const wrap = target.parentElement;
+    if(wrap && liveCandleChart) liveCandleChart.applyOptions({ width: wrap.clientWidth, height: wrap.clientHeight });
+  });
+}
+
+function updateLiveChartFromMid(){
+  if(!liveCandleSeries || !liveChartLastCandle) return;
+  const coin = selectedChartCoin();
+  const mid = livePrices[coin] ? Number(livePrices[coin]) : 0;
+  if(!Number.isFinite(mid) || mid <= 0) return;
+  const updated = {
+    ...liveChartLastCandle,
+    close: mid,
+    high: Math.max(liveChartLastCandle.high, mid),
+    low: Math.min(liveChartLastCandle.low, mid),
+  };
+  liveChartLastCandle = updated;
+  liveCandleSeries.update(updated);
+}
+
+async function loadLiveChart(force=false){
+  const status = document.getElementById('chart-status');
+  if(!force && liveChartLoadedOnce) return;
+  if(status) status.textContent = 'Loading candles...';
+  initLiveChart();
+  if(!liveCandleSeries) {
+    if(status) status.textContent = 'Chart library unavailable';
+    return;
+  }
+  try {
+    const coin = selectedChartCoin();
+    const interval = document.getElementById('chart-interval')?.value || '1m';
+    const resp = await fetch(`/api/live-chart?coin=${encodeURIComponent(coin)}&interval=${encodeURIComponent(interval)}&hours=12`);
+    const payload = await resp.json();
+    if(!resp.ok || payload.error) throw new Error(payload.error || 'chart_fetch_failed');
+    const candles = payload.candles || [];
+    liveCandleSeries.setData(candles);
+    liveChartLastCandle = candles.length ? candles[candles.length - 1] : null;
+    const markers = (payload.markers || []).map(m => ({
+      time: m.time,
+      position: m.position,
+      color: m.color,
+      shape: m.shape,
+      text: m.text,
+    }));
+    if(typeof liveCandleSeries.setMarkers === 'function') {
+      liveCandleSeries.setMarkers(markers);
+    } else if(window.LightweightCharts && typeof LightweightCharts.createSeriesMarkers === 'function') {
+      LightweightCharts.createSeriesMarkers(liveCandleSeries, markers);
+    }
+    liveCandleChart.timeScale().fitContent();
+    liveChartLoadedOnce = true;
+    if(status) status.textContent = `${payload.coin} ${payload.interval}: ${candles.length} candles`;
+  } catch(e) {
+    console.error('Live chart error:', e);
+    if(status) status.textContent = `Chart error: ${e.message}`;
+  }
+}
 
 function renderCards(d){
   const a = d.account;
@@ -1919,6 +2145,7 @@ async function refresh(){
     window.currentOpenTrades = d.open_trades;
     const wsStatus = ws && ws.readyState === WebSocket.OPEN ? '(live prices via WebSocket)' : '(WebSocket connecting...)';
     document.getElementById('update-time').textContent = new Date().toLocaleTimeString() + ' ' + wsStatus;
+    refreshChartCoinOptions(d);
     renderCards(d);
     renderOpenTrades(d.open_trades);
     renderStrategies(d.strategies);
@@ -1934,6 +2161,7 @@ async function refresh(){
     if(d.v2) renderV2(d.v2);
     if(d.runtime_health) renderRuntimeHealth(d.runtime_health);
     if(d.v2 && d.v2.arena) renderArena(d.v2.arena);
+    loadLiveChart(false);
   } catch(e) {
     console.error('Refresh error:', e);
   }
@@ -2445,6 +2673,19 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 data["runtime_health"] = runtime_snapshot
                 self._json_response(data)
             except Exception as e:
+                self._json_response({"error": str(e)}, code=500)
+
+        elif parsed.path == "/api/live-chart":
+            params = parse_qs(parsed.query)
+            try:
+                payload = _live_chart_payload(
+                    coin=params.get("coin", ["BTC"])[0],
+                    interval=params.get("interval", ["1m"])[0],
+                    hours=int(params.get("hours", ["12"])[0]),
+                )
+                self._json_response(payload)
+            except Exception as e:
+                logger.error("Live chart data error: %s", e)
                 self._json_response({"error": str(e)}, code=500)
 
         elif parsed.path == "/api/flow":

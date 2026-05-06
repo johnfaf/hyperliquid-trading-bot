@@ -21,6 +21,7 @@ This module is designed to slot into the existing pipeline:
 The scanner runs as part of the main cycle, providing enriched
 trader/strategy data to the existing pipeline.
 """
+import json
 import time
 import logging
 from typing import Dict, List, Optional
@@ -116,6 +117,7 @@ class MultiExchangeScanner:
         self._health_check_count = 0
         self._common_markets_checks = 0
         self._funding_scan_count = 0
+        self._injected_strategy_count = 0
 
         logger.info(f"MultiExchangeScanner initialized with {len(self.adapters)} venues: "
                     f"{list(self.adapters.keys())}")
@@ -238,6 +240,156 @@ class MultiExchangeScanner:
 
         self._trader_cache = {t.address.lower(): t for t in sorted_traders}
         return sorted_traders
+
+    def inject_lighter_strategies(
+        self,
+        *,
+        limit: int = 25,
+        min_volume_usd: float = 10_000.0,
+    ) -> Dict[str, int]:
+        """Persist Lighter volume leaders as strategy candidates.
+
+        This is intentionally explicit and config-gated.  Lighter does not
+        expose a Hyperliquid-style leaderboard, so these rows are tagged as
+        ``lighter_volume_leader`` strategies and should pass the normal
+        firewall/scoring path before they can trade.
+        """
+        if "lighter" not in self.adapters:
+            return {"scanned": 0, "inserted": 0, "updated": 0, "skipped": 0}
+
+        try:
+            from src.data import database as db
+        except Exception as exc:
+            logger.warning("Lighter strategy injection unavailable: %s", exc)
+            return {"scanned": 0, "inserted": 0, "updated": 0, "skipped": 0}
+
+        traders = self.adapters["lighter"].get_top_traders(limit=limit)
+        now = datetime.now(timezone.utc).isoformat()
+        inserted = 0
+        updated = 0
+        skipped = 0
+
+        with db.get_connection() as conn:
+            for trader in traders:
+                raw = dict(trader.raw_data or {})
+                volume = float(raw.get("volume_30d_usd") or raw.get("total_volume") or 0.0)
+                if volume < float(min_volume_usd or 0.0):
+                    skipped += 1
+                    continue
+
+                if getattr(db, "is_valid_trader_address", lambda _a: False)(trader.address):
+                    meta_json = json.dumps({
+                        "venue": "lighter",
+                        "strategy_injected": True,
+                        "discovery_method": raw.get("discovery_method", "volume_scan"),
+                    })
+                    conn.execute(
+                        """
+                        INSERT INTO traders (address, first_seen, last_updated, total_pnl,
+                                             roi_pct, account_value, win_rate, trade_count,
+                                             metadata, active)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(address) DO UPDATE SET
+                            last_updated = ?,
+                            total_pnl = ?,
+                            account_value = ?,
+                            win_rate = ?,
+                            trade_count = ?,
+                            metadata = ?,
+                            active = ?
+                        """,
+                        (
+                            trader.address,
+                            now,
+                            now,
+                            float(trader.pnl_total or 0.0),
+                            0.0,
+                            volume,
+                            float(trader.win_rate or 0.0),
+                            int(trader.trade_count_30d or 0),
+                            meta_json,
+                            True,
+                            now,
+                            float(trader.pnl_total or 0.0),
+                            volume,
+                            float(trader.win_rate or 0.0),
+                            int(trader.trade_count_30d or 0),
+                            meta_json,
+                            True,
+                        ),
+                    )
+
+                coins = raw.get("coins_traded") or []
+                if isinstance(coins, set):
+                    coins = sorted(coins)
+                elif isinstance(coins, str):
+                    coins = [coins]
+                name = f"lighter_volume_{str(trader.address).lower()[:18]}"
+                params = {
+                    "venue": "lighter",
+                    "source_trader": trader.address,
+                    "coins": coins,
+                    "coins_traded": coins,
+                    "volume_30d_usd": volume,
+                    "trade_count_30d": int(trader.trade_count_30d or 0),
+                    "discovery_method": raw.get("discovery_method", "volume_scan"),
+                    "injected_at": now,
+                }
+                row = conn.execute(
+                    "SELECT id FROM strategies WHERE name = ? AND strategy_type = ?",
+                    (name, "lighter_volume_leader"),
+                ).fetchone()
+                if row:
+                    conn.execute(
+                        "UPDATE strategies SET description = ?, parameters = ?, "
+                        "last_scored = ?, current_score = ?, total_pnl = ?, "
+                        "trade_count = ?, win_rate = ?, active = ? WHERE id = ?",
+                        (
+                            "Lighter volume-leader strategy candidate",
+                            json.dumps(params),
+                            now,
+                            min(1.0, max(0.0, volume / max(float(min_volume_usd or 1.0) * 10.0, 1.0))),
+                            float(trader.pnl_total or 0.0),
+                            int(trader.trade_count_30d or 0),
+                            float(trader.win_rate or 0.0),
+                            True,
+                            row["id"] if hasattr(row, "keys") else row[0],
+                        ),
+                    )
+                    updated += 1
+                else:
+                    conn.execute(
+                        """
+                        INSERT INTO strategies
+                        (name, description, strategy_type, parameters, discovered_at,
+                         last_scored, current_score, total_pnl, trade_count, win_rate,
+                         sharpe_ratio, active)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            name,
+                            "Lighter volume-leader strategy candidate",
+                            "lighter_volume_leader",
+                            json.dumps(params),
+                            now,
+                            now,
+                            min(1.0, max(0.0, volume / max(float(min_volume_usd or 1.0) * 10.0, 1.0))),
+                            float(trader.pnl_total or 0.0),
+                            int(trader.trade_count_30d or 0),
+                            float(trader.win_rate or 0.0),
+                            0.0,
+                            True,
+                        ),
+                    )
+                    inserted += 1
+
+        self._injected_strategy_count += inserted + updated
+        if inserted or updated:
+            logger.info(
+                "Lighter injected strategy candidates: inserted=%d updated=%d skipped=%d",
+                inserted, updated, skipped,
+            )
+        return {"scanned": len(traders), "inserted": inserted, "updated": updated, "skipped": skipped}
 
     # ─── Signal Confirmation ───────────────────────────────
 
@@ -423,6 +575,7 @@ class MultiExchangeScanner:
             "common_markets_checks": self._common_markets_checks,
             "funding_scan_count": self._funding_scan_count,
             "cached_traders": len(self._trader_cache),
+            "lighter_injected_strategy_count": self._injected_strategy_count,
         }
 
         # Per-venue stats with health state

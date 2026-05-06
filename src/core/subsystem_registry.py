@@ -71,6 +71,7 @@ class SubsystemContainer:
     # Trading
     copy_trader: Any = None
     live_trader: Any = None
+    lighter_live_trader: Any = None
     position_monitor: Any = None
 
     # Signals & analysis
@@ -763,6 +764,44 @@ def build_subsystems(
                     dependency_ready=False,
                     startup_status="WAITING_FOR_DEPENDENCIES",
                 )
+        if getattr(config, "LIVE_EXECUTION_VENUE", "hyperliquid") == "lighter":
+            from src.trading.lighter_live_trader import LighterLiveTrader
+
+            lighter_requested = bool(getattr(config, "LIGHTER_LIVE_TRADING_ENABLED", False))
+            lighter_confirmed = bool(getattr(config, "LIGHTER_LIVE_TRADING_DUAL_CONTROL_CONFIRM", False))
+            lighter_effective = lighter_requested and lighter_confirmed
+            c.lighter_live_trader = _safe_init(
+                "lighter_live_trader",
+                lambda: LighterLiveTrader(dry_run=not lighter_effective),
+                health,
+                affects_trading=lighter_effective,
+            )
+            if c.lighter_live_trader:
+                if not lighter_requested:
+                    health.set_status(
+                        "lighter_live_trader",
+                        SubsystemState.DISABLED,
+                        reason="LIGHTER_LIVE_TRADING_ENABLED=false",
+                        dependency_ready=False,
+                        startup_status="DISABLED",
+                    )
+                elif not lighter_confirmed:
+                    c.lighter_live_trader.status_reason = "lighter_dual_control_confirmation_missing"
+                    health.set_status(
+                        "lighter_live_trader",
+                        SubsystemState.DEGRADED,
+                        reason="LIGHTER_LIVE_TRADING_DUAL_CONTROL_CONFIRM=false",
+                        dependency_ready=False,
+                        startup_status="WAITING_FOR_OPERATOR_CONFIRMATION",
+                    )
+                elif not c.lighter_live_trader.is_deployable():
+                    health.set_status(
+                        "lighter_live_trader",
+                        SubsystemState.DEGRADED,
+                        reason=c.lighter_live_trader.get_stats().get("status_reason", "not deployable"),
+                        dependency_ready=False,
+                        startup_status="WAITING_FOR_DEPENDENCIES",
+                    )
 
     # ─── Cross-venue hedger ───────────────────────────────────
     if "cross_venue_hedger" in profile:
@@ -846,8 +885,13 @@ def build_subsystems(
                 health_registry=health,
                 copy_trader=c.copy_trader,
             )
-            if c.live_trader:
-                set_live_trader(c.live_trader)
+            execution_trader = (
+                c.lighter_live_trader
+                if getattr(config, "LIVE_EXECUTION_VENUE", "hyperliquid") == "lighter"
+                else c.live_trader
+            )
+            if execution_trader:
+                set_live_trader(execution_trader)
             c.dashboard = start_dashboard(options_scanner=c.options_scanner)
             logger.info("  OK dashboard")
         except Exception as exc:
@@ -939,6 +983,7 @@ _FIELD_TO_HEALTH_NAME: dict = {
     "copy_trader":            "copy_trader",
     "paper_trader":           "paper_trader",
     "live_trader":            "live_trader",
+    "lighter_live_trader":    "lighter_live_trader",
     "cross_venue_hedger":     "cross_venue_hedger",
     "shadow_tracker":         "shadow_tracker",
     "adaptive_bot_detector":  "adaptive_bot_detector",

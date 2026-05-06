@@ -82,10 +82,13 @@ class LighterAdapter(BaseExchangeAdapter):
     funding_period_hours: float = 1.0
 
     def __init__(self, config: Optional[Dict] = None):
+        config = config or {}
+        api_base = str(config.get("api_v1") or config.get("base_url") or LIGHTER_API_BASE).rstrip("/")
+        api_v1 = api_base if api_base.endswith("/api/v1") else f"{api_base}/api/v1"
         super().__init__(
             name="lighter",
-            base_url=LIGHTER_API_V1,
-            config=config or {},
+            base_url=api_v1,
+            config=config,
         )
         self._last_request_time = 0.0
         self._market_cache: Dict = {}

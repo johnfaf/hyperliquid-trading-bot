@@ -59,7 +59,21 @@ _HAS_PERSISTENT_VOLUME = DB_PATH.startswith("/data")
 # "dualwrite" — writes to both SQLite and Postgres, reads from SQLite
 # "postgres"  — all reads/writes go to Postgres
 _raw_db_backend = os.environ.get("DB_BACKEND", "sqlite").strip().lower()
-POSTGRES_DSN = os.environ.get("POSTGRES_DSN", "").strip()
+_POSTGRES_DSN_CANDIDATES = (
+    ("POSTGRES_DSN", os.environ.get("POSTGRES_DSN", "")),
+    # Railway exposes Postgres as DATABASE_URL by default.  Accept it so
+    # operators do not accidentally run SQLite after selecting Postgres.
+    ("DATABASE_URL", os.environ.get("DATABASE_URL", "")),
+    ("DATABASE_PRIVATE_URL", os.environ.get("DATABASE_PRIVATE_URL", "")),
+)
+POSTGRES_DSN_SOURCE = ""
+POSTGRES_DSN = ""
+for _dsn_name, _dsn_value in _POSTGRES_DSN_CANDIDATES:
+    _dsn_value = str(_dsn_value or "").strip()
+    if _dsn_value:
+        POSTGRES_DSN_SOURCE = _dsn_name
+        POSTGRES_DSN = _dsn_value
+        break
 # Auto-downgrade to sqlite if Postgres backends are requested but no DSN is set.
 # H3 (audit): we still downgrade so dev environments boot, but we record
 # the downgrade and emit a visible warning.  When live trading is enabled,
@@ -74,8 +88,8 @@ if _raw_db_backend in ("dualwrite", "postgres") and not POSTGRES_DSN:
     print(
         f"[config] WARNING: DB_BACKEND={_raw_db_backend!r} requested but "
         f"POSTGRES_DSN is empty -- downgrading to sqlite.  Live trading "
-        f"will REFUSE to start in this state (set POSTGRES_DSN or "
-        f"DB_BACKEND=sqlite).",
+        f"will REFUSE to start in this state (set POSTGRES_DSN, "
+        f"DATABASE_URL, or DB_BACKEND=sqlite).",
         file=_sys.stderr,
     )
 else:
@@ -886,7 +900,34 @@ SCORING_INTERVAL = 86400
 
 # ─── Multi-Exchange Scanner ────────────────────────────────────
 # Enable/disable secondary venues (Hyperliquid is always primary)
-LIGHTER_ENABLED = os.environ.get("LIGHTER_ENABLED", "true").lower() in ("true", "1", "yes")
+LIVE_EXECUTION_VENUE = os.environ.get("LIVE_EXECUTION_VENUE", "hyperliquid").strip().lower()
+if LIVE_EXECUTION_VENUE not in {"hyperliquid", "lighter"}:
+    LIVE_EXECUTION_VENUE = "hyperliquid"
+LIGHTER_ENABLED = os.environ.get("LIGHTER_ENABLED", "true").strip().lower() in ("true", "1", "yes")
+LIGHTER_STRATEGY_INJECTION_ENABLED = os.environ.get(
+    "LIGHTER_STRATEGY_INJECTION_ENABLED", "false"
+).strip().lower() in ("true", "1", "yes")
+LIGHTER_STRATEGY_INJECTION_LIMIT = _safe_env_int("LIGHTER_STRATEGY_INJECTION_LIMIT", 25, lo=1, hi=250)
+LIGHTER_STRATEGY_MIN_VOLUME_USD = _safe_env_float(
+    "LIGHTER_STRATEGY_MIN_VOLUME_USD", 10_000.0, lo=0.0, hi=100_000_000.0
+)
+LIGHTER_LIVE_TRADING_ENABLED = os.environ.get(
+    "LIGHTER_LIVE_TRADING_ENABLED", "false"
+).strip().lower() in ("true", "1", "yes")
+LIGHTER_LIVE_TRADING_DUAL_CONTROL_CONFIRM = os.environ.get(
+    "LIGHTER_LIVE_TRADING_DUAL_CONTROL_CONFIRM", "false"
+).strip().lower() in ("true", "1", "yes")
+LIGHTER_BASE_URL = os.environ.get("LIGHTER_BASE_URL", "https://mainnet.zklighter.elliot.ai").strip()
+LIGHTER_ACCOUNT_INDEX = _safe_env_int("LIGHTER_ACCOUNT_INDEX", -1, lo=-1, hi=10_000_000)
+LIGHTER_API_KEY_INDEX = _safe_env_int("LIGHTER_API_KEY_INDEX", 0, lo=0, hi=10_000)
+LIGHTER_PRIVATE_KEY = os.environ.get("LIGHTER_PRIVATE_KEY", "").strip()
+LIGHTER_L1_ADDRESS = os.environ.get("LIGHTER_L1_ADDRESS", "").strip()
+LIGHTER_MIN_ORDER_USD = _safe_env_float("LIGHTER_MIN_ORDER_USD", 1.0, lo=0.0, hi=10_000.0)
+LIGHTER_MAX_ORDER_USD = _safe_env_float("LIGHTER_MAX_ORDER_USD", 100.0, lo=1.0, hi=10_000_000.0)
+LIGHTER_DEFAULT_LEVERAGE = _safe_env_float("LIGHTER_DEFAULT_LEVERAGE", 5.0, lo=1.0, hi=50.0)
+LIGHTER_MAX_SLIPPAGE_BPS = _safe_env_float("LIGHTER_MAX_SLIPPAGE_BPS", 20.0, lo=0.0, hi=1000.0)
+LIGHTER_SIZE_DECIMALS_DEFAULT = _safe_env_int("LIGHTER_SIZE_DECIMALS_DEFAULT", 4, lo=0, hi=18)
+LIGHTER_PRICE_DECIMALS_DEFAULT = _safe_env_int("LIGHTER_PRICE_DECIMALS_DEFAULT", 2, lo=0, hi=18)
 
 # ─── Predictive Regime Forecaster ──────────────────────────────
 ENABLE_PREDICTIVE_FORECASTER = os.environ.get("ENABLE_PREDICTIVE_FORECASTER", "true").lower() in ("true", "1", "yes")

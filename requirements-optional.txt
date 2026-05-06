@@ -18,6 +18,10 @@ joblib>=1.3.0
 python-binance>=1.0.19
 pybit>=5.6.0
 
+# Lighter execution venue
+# Enable with LIVE_EXECUTION_VENUE=lighter plus LIGHTER_* credentials.
+lighter-sdk>=1.0.0
+
 # ─── Monte-Carlo Stress Testing ──────────────────────────────
 scipy>=1.11.0
 

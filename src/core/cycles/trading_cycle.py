@@ -1007,6 +1007,12 @@ def _run_multi_exchange_scan(container):
                         arb.short_venue, arb.short_funding_rate,
                         arb.funding_spread_annualized,
                     )
+            if getattr(config, "LIGHTER_STRATEGY_INJECTION_ENABLED", False):
+                injected = container.multi_scanner.inject_lighter_strategies(
+                    limit=int(getattr(config, "LIGHTER_STRATEGY_INJECTION_LIMIT", 25)),
+                    min_volume_usd=float(getattr(config, "LIGHTER_STRATEGY_MIN_VOLUME_USD", 10_000.0)),
+                )
+                logger.info("  Lighter strategy injection: %s", injected)
             cross_venue_data = {
                 "health": venue_health,
                 "common_markets": common_markets,
