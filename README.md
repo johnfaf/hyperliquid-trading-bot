@@ -176,6 +176,7 @@ The live path is intentionally conservative. Real order submission requires expl
 - **Bounded shutdown:** SIGINT/SIGTERM order cancellation and DB backup are time-bounded so shutdown cannot hang forever.
 - **Protected entries:** fill verification compares the post-order position delta against the pre-entry baseline; existing positions cannot falsely verify a rejected entry.
 - **Naked-position defense:** SL/TP placement retries are bounded; if protective orders still fail, the bot retries an emergency close.
+- **Regime reversal supervision:** confirmed opposite-regime readings can tighten live stops immediately. Actual close/reverse actions are separately gated by `REGIME_REVERSAL_CLOSE_ENABLED` and `REGIME_REVERSAL_REVERSE_ENABLED`.
 - **Daily-loss fail-closed:** if live fill/PnL refresh fails, the kill switch activates instead of leaving the loss brake frozen.
 - **Rolling drawdown required:** deployable live mode refuses to arm unless `LIVE_MAX_DRAWDOWN_USD` is set above zero.
 - **Free-margin sizing:** live mirroring scales against available/free margin and uses `accountValue - totalMarginUsed` before falling back to `withdrawable`.
@@ -302,6 +303,13 @@ DISCOVERY_CYCLE_INTERVAL = 86400     # 24h  (env: DISCOVERY_CYCLE_INTERVAL)
 | `LIVE_CANARY_MAX_ORDER_USD` | `25` | Max order notional when legacy canary mode is enabled |
 | `LIVE_CANARY_MAX_SIGNALS_PER_DAY` | `25` | Daily live entry cap when legacy canary mode or tier caps are active |
 | `LIVE_MAX_ORDERS_PER_SOURCE_PER_DAY` | `0` | Per-source daily live entry cap (`0` disables cap) |
+| `REGIME_REVERSAL_ENABLED` | `true` | Evaluate open live positions against the predictive regime forecaster |
+| `REGIME_REVERSAL_TIGHTEN_ENABLED` | `true` | Tighten SL/TP protection when a confirmed opposite regime appears |
+| `REGIME_REVERSAL_CLOSE_ENABLED` | `false` | Allow confirmed opposite regimes to close live positions before SL hit |
+| `REGIME_REVERSAL_REVERSE_ENABLED` | `false` | After a confirmed close, submit an opposite-side signal through live execution/firewall |
+| `REGIME_REVERSAL_CONFIRM_CYCLES` | `3` | Consecutive fast-cycle confirmations required before acting |
+| `REGIME_REVERSAL_MIN_CONFIDENCE` | `0.70` | Minimum forecaster confidence for tighten/close decisions |
+| `REGIME_REVERSAL_REVERSE_CONFIDENCE` | `0.82` | Higher confidence gate required for reverse entries |
 | `LIVE_EXTERNAL_KILL_SWITCH_FILE` | _(none)_ | Optional file path for external kill switch; fast cycle also defaults to `/data/KILL_SWITCH` |
 | `LIVE_KILL_SWITCH_STATE_FILE` | `/data/live_kill_switch_state.json` | Sticky kill-switch state restored on restart |
 | `DASHBOARD_AUTH_TOKEN` | _(none)_ | Required for dashboard write actions and public dashboard deployments |

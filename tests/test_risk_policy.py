@@ -7,6 +7,7 @@ from src.backtest.risk_policy_walkforward import validate_risk_policy_walkforwar
 from src.signals.risk_policy import RiskPolicyEngine
 from src.signals.signal_schema import SignalSide, SignalSource, TradeSignal
 from src.trading.live_trader import LiveTrader
+from src.trading.regime_reversal_manager import RegimeReversalDecision
 
 
 def _fake_live_credentials(self):
@@ -392,6 +393,102 @@ def test_live_manage_open_positions_trails_stop_using_shadow_policy(monkeypatch)
     assert stop_loss > 100.0
     assert take_profit == 105.0
     assert updates[0]["metadata_updates"]["risk_event"] == "trailing"
+
+
+def test_live_manage_open_positions_tightens_on_regime_reversal(monkeypatch):
+    updates = []
+    placed = []
+
+    class _FakeReversalManager:
+        def evaluate(self, **kwargs):
+            return RegimeReversalDecision(
+                action="tighten_stop",
+                reason="opposite_regime_confirmed_tighten_stop",
+                coin="ETH",
+                side="long",
+                reverse_side="short",
+                regime="crash",
+                confidence=0.82,
+                signal=-0.7,
+                confirmed_cycles=3,
+                stop_price=99.7,
+                metadata={"test": True},
+            )
+
+    monkeypatch.setattr(LiveTrader, "_load_credentials", _fake_live_credentials)
+    monkeypatch.setattr(LiveTrader, "_load_asset_index_map", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "reconcile_positions", lambda self: None)
+
+    trader = LiveTrader(firewall=_AllowAllFirewall(), dry_run=False, max_order_usd=1_000_000)
+    trader.regime_reversal_manager = _FakeReversalManager()
+
+    monkeypatch.setattr(
+        "src.trading.live_trader.db.get_open_paper_trades",
+        lambda: [
+            {
+                "id": 10,
+                "coin": "ETH",
+                "side": "long",
+                "entry_price": 100.0,
+                "size": 1.0,
+                "leverage": 5.0,
+                "opened_at": datetime.now(timezone.utc).isoformat(),
+                "metadata": {
+                    "risk_policy": {
+                        "stop_roe_pct": 0.05,
+                        "take_profit_roe_pct": 0.25,
+                        "reward_multiple": 5.0,
+                        "time_limit_hours": 24.0,
+                        "breakeven_at_r": 1.0,
+                        "breakeven_buffer_roe_pct": 0.005,
+                        "trail_after_r": 2.0,
+                        "trailing_enabled": True,
+                        "trailing_distance_roe_pct": 0.0375,
+                    }
+                },
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        trader,
+        "get_positions",
+        lambda **kw: [
+            {
+                "coin": "ETH",
+                "side": "long",
+                "size": 1.0,
+                "szi": 1.0,
+                "entry_price": 100.0,
+                "entryPx": 100.0,
+                "leverage": 5.0,
+            }
+        ],
+    )
+    monkeypatch.setattr(trader, "_get_mid_price", lambda coin: 100.0)
+    monkeypatch.setattr(trader, "_protective_order_oids", lambda coin: set())
+    monkeypatch.setattr(
+        trader,
+        "_place_protective_orders_with_retries",
+        lambda coin, close_side, size, sl_price, tp_price: (
+            placed.append((coin, close_side, size, sl_price, tp_price)) or {"status": "success"},
+            {"status": "success"},
+            1,
+        ),
+    )
+    monkeypatch.setattr(
+        trader,
+        "_update_shadow_trade_risk_levels",
+        lambda trades, **kwargs: updates.append(kwargs),
+    )
+    monkeypatch.setattr(trader, "_publish_regime_reversal_event", lambda *args, **kwargs: None)
+
+    summary = trader.manage_open_positions()
+
+    assert summary["updated"] == 1
+    assert summary["regime_reversal_tightened"] == 1
+    assert placed[0][3] == pytest.approx(99.7)
+    assert updates[0]["metadata_updates"]["risk_event"] == "regime_reversal_tighten"
+    assert updates[0]["metadata_updates"]["regime_reversal"]["reverse_side"] == "short"
 
 
 def test_live_manage_open_positions_closes_on_time_limit(monkeypatch):
