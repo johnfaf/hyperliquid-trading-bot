@@ -159,6 +159,8 @@ def test_forward_labels_read_feature_store_candles(monkeypatch):
     )
 
     assert round(labels["forward_return_15m"], 4) == 0.02
+    assert labels["data_gap_15m"] == 1
+    assert labels["data_coverage_15m"] < 1.0
     assert labels["would_have_won"] == 1
     assert round(labels["missed_profit_usd"], 2) == 3.0
 

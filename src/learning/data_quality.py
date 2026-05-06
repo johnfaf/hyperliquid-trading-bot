@@ -63,12 +63,14 @@ class DatasetQualityAuditor:
         # M11 in dataset_builder).
         min_positive_ratio: float = 0.20,
         max_positive_ratio: float = 0.80,
+        max_data_gap_ratio: float = 0.05,
     ):
         self.min_rows = int(min_rows)
         self.min_labelled = int(min_labelled)
         self.max_missing_feature_ratio = float(max_missing_feature_ratio)
         self.min_positive_ratio = float(min_positive_ratio)
         self.max_positive_ratio = float(max_positive_ratio)
+        self.max_data_gap_ratio = float(max_data_gap_ratio)
 
     @staticmethod
     def _feature_missing_ratio(examples: List[LearningExample], feature_names: List[str]) -> float:
@@ -84,6 +86,18 @@ class DatasetQualityAuditor:
         positives = sum(1 for item in labelled if item.label_win == 1)
         positive_ratio = positives / len(labelled) if labelled else 0.0
         missing_ratio = self._feature_missing_ratio(examples, list(dataset.feature_names or []))
+        data_gap_payloads: List[Dict[str, Any]] = []
+        try:
+            from src.learning.decision_replay_report import detect_example_data_gaps
+
+            data_gap_payloads = [
+                detect_example_data_gaps(item, required_feature_names=list(dataset.feature_names or []))
+                for item in examples
+            ]
+        except Exception:
+            data_gap_payloads = []
+        data_gap_count = sum(1 for item in data_gap_payloads if item.get("has_gap"))
+        data_gap_ratio = data_gap_count / len(examples) if examples else 0.0
         checks = {
             "min_rows": {
                 "passed": len(examples) >= self.min_rows,
@@ -106,6 +120,12 @@ class DatasetQualityAuditor:
                 "required_min": self.min_positive_ratio,
                 "required_max": self.max_positive_ratio,
             },
+            "data_gap_ratio": {
+                "passed": data_gap_ratio <= self.max_data_gap_ratio,
+                "actual": data_gap_ratio,
+                "required_max": self.max_data_gap_ratio,
+                "gap_count": data_gap_count,
+            },
         }
         failed = [name for name, payload in checks.items() if not payload["passed"]]
         status = "pass" if not failed else "fail"
@@ -116,6 +136,8 @@ class DatasetQualityAuditor:
             "positive_ratio": positive_ratio,
             "feature_count": len(dataset.feature_names or []),
             "missing_feature_ratio": missing_ratio,
+            "data_gap_ratio": data_gap_ratio,
+            "data_gap_count": data_gap_count,
             "failed_checks": failed,
         }
         report = DataQualityReport(

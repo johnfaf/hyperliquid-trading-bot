@@ -670,6 +670,32 @@ def _brief_json_items(value: Any, limit: int = 5) -> list[str]:
     return items
 
 
+def _source_health_items(value: Any, limit: int = 5) -> list[str]:
+    data = _loads(value)
+    if not data:
+        return []
+    items: list[str] = []
+
+    def walk(prefix: str, raw: Any) -> None:
+        if len(items) >= limit:
+            return
+        if isinstance(raw, dict):
+            status = str(raw.get("status") or raw.get("state") or "").strip()
+            if status:
+                if status.lower() not in {"up", "healthy", "ok"}:
+                    items.append(f"{prefix or raw.get('source', 'source')}={status}")
+                return
+            for key, child in raw.items():
+                walk(f"{prefix}.{key}" if prefix else str(key), child)
+            return
+        status = str(raw or "").strip()
+        if status and status.lower() not in {"up", "healthy", "ok"}:
+            items.append(f"{prefix}={status}")
+
+    walk("", data)
+    return items[:limit]
+
+
 def build_decision_explanation(
     decision: Dict[str, Any],
     *,
@@ -690,10 +716,24 @@ def build_decision_explanation(
     confidence_text = f", confidence={confidence:.2f}" if confidence is not None else ""
     parts.append(f"Opened candidate: {side} {coin} from {source_key}{confidence_text}.")
 
+    status_bits = []
+    for label, column in (
+        ("firewall", "firewall_decision"),
+        ("status", "final_status"),
+        ("reject", "rejection_reason"),
+    ):
+        val = decision.get(column)
+        if val not in (None, ""):
+            status_bits.append(f"{label}={val}")
+    if status_bits:
+        parts.append("Decision: " + ", ".join(status_bits) + ".")
+
     risk_bits = []
     for label, column in (
         ("SL_ROE", "proposed_sl_roe"),
         ("TP_ROE", "proposed_tp_roe"),
+        ("SL_price", "proposed_sl_price"),
+        ("TP_price", "proposed_tp_price"),
         ("size_usd", "proposed_size_usd"),
         ("lev", "proposed_leverage"),
     ):
@@ -706,6 +746,14 @@ def build_decision_explanation(
     feature_bits = _brief_json_items(decision.get("features"), limit=4)
     if feature_bits:
         parts.append("Key features: " + ", ".join(feature_bits) + ".")
+
+    regime_bits = _brief_json_items(decision.get("regime"), limit=3)
+    if regime_bits:
+        parts.append("Regime: " + ", ".join(regime_bits) + ".")
+
+    unhealthy_sources = _source_health_items(decision.get("source_health"), limit=5)
+    if unhealthy_sources:
+        parts.append("Data health: " + ", ".join(unhealthy_sources) + ".")
 
     if stage_summary:
         last_stage = stage_summary.get("last_stage")
@@ -823,18 +871,39 @@ def record_decision_outcome(
                 {
                     "raw_confidence": decision.get("raw_confidence"),
                     "calibrated_confidence": decision.get("calibrated_confidence"),
+                    "firewall_decision": decision.get("firewall_decision"),
+                    "final_status": decision.get("final_status"),
                     "proposed_size_usd": decision.get("proposed_size_usd"),
                     "proposed_position_pct": decision.get("proposed_position_pct"),
                     "proposed_leverage": decision.get("proposed_leverage"),
                     "proposed_sl_roe": decision.get("proposed_sl_roe"),
                     "proposed_tp_roe": decision.get("proposed_tp_roe"),
+                    "proposed_sl_price": decision.get("proposed_sl_price"),
+                    "proposed_tp_price": decision.get("proposed_tp_price"),
                     "rejection_reason": decision.get("rejection_reason"),
+                    "source_health": _loads(decision.get("source_health")),
                     "regime": _loads(decision.get("regime")),
                 }
             )
             outcome_meta = dict(outcome.get("metadata") or {})
             if paper_dict.get("metadata"):
                 outcome_meta["paper_metadata"] = _loads(paper_dict.get("metadata"))
+            forward_extra = {
+                key: value
+                for key, value in forward.items()
+                if key
+                not in {
+                    "forward_return_15m",
+                    "forward_return_1h",
+                    "forward_return_4h",
+                    "forward_return_24h",
+                    "would_have_won",
+                    "side_correct",
+                    "missed_profit_usd",
+                }
+            }
+            if forward_extra:
+                outcome_meta["forward_label_metadata"] = forward_extra
             stage_summary = _fetch_stage_summary(conn, decision_id)
             payload = {
                 "outcome_pnl": pnl_float,

@@ -8,6 +8,7 @@ trading side effects.
 from __future__ import annotations
 
 import logging
+import math
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional
 
@@ -138,6 +139,79 @@ def _fetch_candle_path(
     return []
 
 
+def _timeframe_ms(timeframe: str) -> Optional[int]:
+    text = str(timeframe or "").strip().lower()
+    try:
+        if text.endswith("m"):
+            return int(float(text[:-1]) * 60 * 1000)
+        if text.endswith("h"):
+            return int(float(text[:-1]) * 60 * 60 * 1000)
+        if text.endswith("d"):
+            return int(float(text[:-1]) * 24 * 60 * 60 * 1000)
+    except Exception:
+        return None
+    return None
+
+
+def _fetch_candle_path_with_coverage(
+    conn: Any,
+    *,
+    coin: str,
+    start_ts_ms: int,
+    target_ts_ms: int,
+    timeframes: Iterable[str],
+) -> tuple[List[Dict[str, float]], Dict[str, Any]]:
+    for timeframe in timeframes:
+        tf_ms = _timeframe_ms(str(timeframe))
+        try:
+            rows = conn.execute(
+                """
+                SELECT timestamp_ms, high, low, close
+                FROM candles
+                WHERE coin = ? AND timeframe = ? AND timestamp_ms > ? AND timestamp_ms <= ?
+                ORDER BY timestamp_ms ASC
+                """,
+                (coin, timeframe, int(start_ts_ms), int(target_ts_ms)),
+            ).fetchall()
+        except Exception:
+            rows = []
+        candles: List[Dict[str, float]] = []
+        timestamps: List[int] = []
+        for row in rows or []:
+            data = _row_dict(row)
+            high = _float(data.get("high"), None)
+            low = _float(data.get("low"), None)
+            close = _float(data.get("close"), None)
+            ts = _parse_ts_ms(data.get("timestamp_ms"))
+            if high is None or low is None or close is None or ts is None:
+                continue
+            if high <= 0 or low <= 0 or close <= 0:
+                continue
+            timestamps.append(int(ts))
+            candles.append({"high": high, "low": low, "close": close})
+        if candles:
+            expected = 1
+            if tf_ms and tf_ms > 0:
+                expected = max(1, int(math.ceil(max(target_ts_ms - start_ts_ms, 0) / tf_ms)))
+            latest_ts = max(timestamps) if timestamps else None
+            coverage = min(len(candles) / expected, 1.0) if expected else 1.0
+            stale_tail = bool(latest_ts is not None and tf_ms and latest_ts < target_ts_ms - (2 * tf_ms))
+            return candles, {
+                "timeframe": str(timeframe),
+                "expected_candles": expected,
+                "actual_candles": len(candles),
+                "coverage_ratio": coverage,
+                "stale_tail": stale_tail,
+            }
+    return [], {
+        "timeframe": "",
+        "expected_candles": 0,
+        "actual_candles": 0,
+        "coverage_ratio": 0.0,
+        "stale_tail": True,
+    }
+
+
 def _counterfactual_path_return(
     decision: Dict[str, Any],
     *,
@@ -222,13 +296,19 @@ def compute_forward_labels(
                 raw_return = (close - entry) / entry
                 side_return = raw_return if side == "long" else -raw_return
                 labels[f"forward_return_{horizon}"] = side_return
-                candle_path = _fetch_candle_path(
+                candle_path, coverage = _fetch_candle_path_with_coverage(
                     conn,
                     coin=coin,
                     start_ts_ms=signal_ts_ms,
                     target_ts_ms=target_ts_ms,
                     timeframes=timeframes,
                 )
+                labels[f"data_coverage_{horizon}"] = coverage.get("coverage_ratio", 0.0)
+                labels[f"data_gap_{horizon}"] = int(
+                    float(coverage.get("coverage_ratio", 0.0) or 0.0) < 0.80
+                    or bool(coverage.get("stale_tail"))
+                )
+                labels[f"data_coverage_detail_{horizon}"] = coverage
                 path_return, exit_reason = _counterfactual_path_return(
                     decision,
                     side=side,
