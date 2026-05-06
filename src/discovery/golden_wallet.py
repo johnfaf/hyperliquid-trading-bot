@@ -296,9 +296,10 @@ def _history_cutoff_ms() -> int:
 
 
 def _fill_identity(fill: Dict) -> Tuple:
+    side = hl.normalize_fill_side(fill.get("side", ""), fill.get("direction", ""))
     return (
         str(fill.get("coin", "")),
-        str(fill.get("side", "")),
+        side,
         int(fill.get("time", fill.get("time_ms", 0)) or 0),
         float(fill.get("price", fill.get("original_price", 0.0)) or 0.0),
         float(fill.get("size", 0.0) or 0.0),
@@ -309,9 +310,10 @@ def _fill_identity(fill: Dict) -> Tuple:
 
 
 def _stored_fill_to_raw(row: Dict) -> Dict:
+    side = hl.normalize_fill_side(row.get("side", ""), row.get("direction", ""))
     return {
         "coin": row.get("coin", ""),
-        "side": row.get("side", ""),
+        "side": side,
         "price": float(row.get("original_price", 0.0) or 0.0),
         "size": float(row.get("size", 0.0) or 0.0),
         "time": int(row.get("time_ms", 0) or 0),
@@ -323,9 +325,10 @@ def _stored_fill_to_raw(row: Dict) -> Dict:
 
 
 def _stored_fill_to_penalised(row: Dict) -> PenalisedFill:
+    side = hl.normalize_fill_side(row.get("side", ""), row.get("direction", ""))
     return PenalisedFill(
         coin=row.get("coin", ""),
-        side=row.get("side", ""),
+        side=side,
         original_price=float(row.get("original_price", 0.0) or 0.0),
         penalised_price=float(row.get("penalised_price", 0.0) or 0.0),
         size=float(row.get("size", 0.0) or 0.0),
@@ -382,7 +385,16 @@ def apply_execution_penalties(fills: List[Dict]) -> List[PenalisedFill]:
     penalised = []
 
     for f in fills:
-        side = f["side"]  # "buy" or "sell"
+        side = hl.normalize_fill_side(f.get("side", ""), f.get("direction", ""))
+        if side not in {"buy", "sell"}:
+            logger.warning(
+                "Skipping fill with unrecognized side=%r direction=%r coin=%s time=%s",
+                f.get("side"),
+                f.get("direction"),
+                f.get("coin"),
+                f.get("time"),
+            )
+            continue
         price = f["price"]
         size = f["size"]
         closed_pnl = f["closed_pnl"]
@@ -582,7 +594,7 @@ def compute_avg_hold_time_hours(fills: List[Dict]) -> float:
             continue
 
         direction = str(fill.get("direction", "") or "").strip().lower()
-        side = str(fill.get("side", "") or "").strip().lower()
+        side = hl.normalize_fill_side(fill.get("side", ""), direction)
         current_pos = float(position_by_coin.get(coin, 0.0) or 0.0)
 
         if ">" in direction:
@@ -1142,14 +1154,24 @@ def save_wallet_fills(address: str, penalised_fills: List[PenalisedFill]):
         # Clear old fills for this wallet
         conn.execute("DELETE FROM wallet_fills WHERE wallet_address = ?", (address,))
         for f in penalised_fills:
+            side = hl.normalize_fill_side(f.side, f.direction)
+            if side not in {"buy", "sell"}:
+                logger.warning(
+                    "Skipping wallet_fills insert for %s %s: invalid side=%r direction=%r",
+                    address[:10],
+                    f.coin,
+                    f.side,
+                    f.direction,
+                )
+                continue
             conn.execute("""
                 INSERT INTO wallet_fills
                 (wallet_address, coin, side, original_price, penalised_price,
                  size, time_ms, delayed_time_ms, closed_pnl, penalised_pnl,
-                 fee, is_liquidation, direction)
+                fee, is_liquidation, direction)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
-                address, f.coin, f.side, f.original_price, f.penalised_price,
+                address, f.coin, side, f.original_price, f.penalised_price,
                 f.size, f.time_ms, f.delayed_time_ms, f.closed_pnl,
                 f.penalised_pnl, f.fee, bool(f.is_liquidation),
                 f.direction,

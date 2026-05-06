@@ -78,6 +78,30 @@ def is_valid_trader_address(address) -> bool:
     return _is_valid_trader_address(address)
 
 
+def _normalize_wallet_fill_side(side, direction="") -> str:
+    raw = str(side or "").strip().lower()
+    if raw in {"b", "buy", "bid"}:
+        return "buy"
+    if raw in {"a", "ask", "s", "sell"}:
+        return "sell"
+    direction_text = str(direction or "").strip().lower()
+    if ">" in direction_text:
+        target = direction_text.split(">")[-1].strip()
+        if "long" in target:
+            return "buy"
+        if "short" in target:
+            return "sell"
+    if "open long" in direction_text or "close short" in direction_text:
+        return "buy"
+    if "open short" in direction_text or "close long" in direction_text:
+        return "sell"
+    if raw == "long":
+        return "buy"
+    if raw == "short":
+        return "sell"
+    return ""
+
+
 def _loads_json_dict(raw) -> dict:
     if isinstance(raw, dict):
         return dict(raw)
@@ -1871,6 +1895,19 @@ def restore_from_json(filepath: str = None):
                 with get_connection() as conn:
                     for fill in data["wallet_fills"]:
                         try:
+                            direction = fill.get("direction", "")
+                            side = _normalize_wallet_fill_side(fill.get("side", ""), direction)
+                            if side not in {"buy", "sell"}:
+                                fills_failures += 1
+                                if fills_failures <= 3:
+                                    logger.warning(
+                                        "Restore wallet_fills row skipped for %s %s: invalid side=%r direction=%r",
+                                        fill.get("wallet_address", "?"),
+                                        fill.get("coin", "?"),
+                                        fill.get("side", ""),
+                                        direction,
+                                    )
+                                continue
                             conn.execute("""
                                 INSERT INTO wallet_fills
                                 (wallet_address, coin, side, original_price,
@@ -1882,7 +1919,7 @@ def restore_from_json(filepath: str = None):
                             """, (
                                 fill["wallet_address"],
                                 fill.get("coin", ""),
-                                fill.get("side", ""),
+                                side,
                                 fill.get("original_price", 0),
                                 fill.get("penalised_price", 0),
                                 fill.get("size", 0),
@@ -1892,7 +1929,7 @@ def restore_from_json(filepath: str = None):
                                 fill.get("penalised_pnl", 0),
                                 fill.get("fee", 0),
                                 fill.get("is_liquidation", 0),
-                                fill.get("direction", ""),
+                                direction,
                             ))
                             fills_count += 1
                         except Exception as e:
