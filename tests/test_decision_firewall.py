@@ -956,3 +956,77 @@ def test_firewall_margin_cap_aggregates_over_existing_positions(mock_db):
     passed, reason = fw.validate(big)
     assert passed is False
     assert "aggregate margin" in reason.lower()
+
+
+@patch("src.signals.decision_firewall.db")
+def test_side_imbalance_guard_blocks_low_confidence_same_side(mock_db):
+    mock_db.get_paper_trade_history.return_value = [
+        {"side": "long"} for _ in range(12)
+    ]
+    mock_db.get_open_paper_trades.return_value = []
+
+    from src.signals.decision_firewall import DecisionFirewall
+
+    fw = DecisionFirewall(
+        {
+            "enable_predictive_derisk": False,
+            "funding_risk_enabled": False,
+            "entry_location_filter_enabled": False,
+            "cooldown_seconds": 0,
+            "same_side_cooldown_seconds": 0,
+            "min_confidence": 0.40,
+            "side_imbalance_max_share": 0.80,
+            "side_imbalance_confidence_bump": 0.15,
+            "side_imbalance_min_samples": 10,
+        }
+    )
+    signal = MockSignal(confidence=0.50, side_val="long", size=1.0, entry_price=100)
+
+    passed, reason = fw.validate(
+        signal,
+        open_positions=[],
+        account_balance=1_000_000,
+        dry_run=True,
+    )
+
+    assert passed is False
+    assert "side imbalance" in reason.lower()
+
+
+@patch("src.signals.decision_firewall.db")
+def test_side_imbalance_guard_derisks_high_confidence_same_side(mock_db):
+    mock_db.get_paper_trade_history.return_value = [
+        {"side": "long"} for _ in range(12)
+    ]
+    mock_db.get_open_paper_trades.return_value = []
+
+    from src.signals.decision_firewall import DecisionFirewall
+
+    fw = DecisionFirewall(
+        {
+            "enable_predictive_derisk": False,
+            "funding_risk_enabled": False,
+            "entry_location_filter_enabled": False,
+            "cooldown_seconds": 0,
+            "same_side_cooldown_seconds": 0,
+            "max_aggregate_exposure": 100.0,
+            "min_confidence": 0.40,
+            "side_imbalance_max_share": 0.80,
+            "side_imbalance_confidence_bump": 0.15,
+            "side_imbalance_min_samples": 10,
+            "side_imbalance_size_multiplier": 0.50,
+        }
+    )
+    signal = MockSignal(confidence=0.75, side_val="long", size=1.0, entry_price=100)
+
+    passed, reason = fw.validate(
+        signal,
+        open_positions=[],
+        account_balance=1_000_000,
+        dry_run=True,
+    )
+
+    assert passed is True
+    assert reason == "approved"
+    assert signal.size == pytest.approx(0.5)
+    assert signal.position_pct == pytest.approx(0.025)

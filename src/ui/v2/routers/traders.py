@@ -9,7 +9,9 @@ flag; the next discovery cycle picks up the change.
 """
 from __future__ import annotations
 
+import json
 import logging
+import re
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Form, Request
@@ -20,6 +22,19 @@ from src.ui.v2.auth import require_auth, verify_cookie
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+_ADDR_RE = re.compile(r"^0x[a-fA-F0-9]{40}$")
+
+
+def _loads_dict(value: Any) -> Dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = json.loads(value)
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            return {}
+    return {}
 
 
 def _bot_tone(score: Optional[float]) -> str:
@@ -88,12 +103,109 @@ def _summary_payload() -> Dict[str, Any]:
     return {"available": True, "rows": rows, "totals": totals}
 
 
+def _trader_detail_payload(address: str) -> Optional[Dict[str, Any]]:
+    try:
+        from src.data import database as db
+    except Exception as exc:
+        logger.warning("traders.detail: db unavailable: %s", exc)
+        return None
+
+    row = db.get_trader(address)
+    if not row:
+        return None
+    try:
+        known_bots = db.get_known_bot_addresses() or set()
+    except Exception:
+        known_bots = set()
+    trader = _format_trader(row, known_bots)
+    metadata = _loads_dict(row.get("metadata"))
+
+    fills: List[Dict[str, Any]] = []
+    snapshots: List[Dict[str, Any]] = []
+    try:
+        with db.get_connection(for_read=True) as conn:
+            if db.table_exists("wallet_fills"):
+                fills = [
+                    dict(r)
+                    for r in conn.execute(
+                        """
+                        SELECT coin, side, original_price, penalised_price, size,
+                               time_ms, delayed_time_ms, closed_pnl, penalised_pnl,
+                               fee, is_liquidation, direction
+                        FROM wallet_fills
+                        WHERE lower(wallet_address) = lower(?)
+                        ORDER BY time_ms DESC
+                        LIMIT 250
+                        """,
+                        (address,),
+                    ).fetchall()
+                ]
+            if db.table_exists("position_snapshots"):
+                snapshots = [
+                    dict(r)
+                    for r in conn.execute(
+                        """
+                        SELECT timestamp, coin, side, size, entry_price, leverage,
+                               unrealized_pnl, margin_used, metadata
+                        FROM position_snapshots
+                        WHERE lower(trader_address) = lower(?)
+                        ORDER BY timestamp DESC
+                        LIMIT 80
+                        """,
+                        (address,),
+                    ).fetchall()
+                ]
+    except Exception as exc:
+        logger.debug("trader detail fill/snapshot query failed for %s: %s", address[:10], exc)
+
+    bot_signals = {
+        "bot_score": trader.get("bot_score"),
+        "tone": trader.get("bot_tone"),
+        "known_bot": trader.get("is_known_bot"),
+        "metadata_flags": {
+            key: metadata.get(key)
+            for key in (
+                "bot_reasons",
+                "detector_reasons",
+                "bot_detector",
+                "source_wallet_bot_score",
+                "trades_per_day",
+                "same_ms_fill_count",
+                "arb_like_ratio",
+                "copy_like_ratio",
+            )
+            if key in metadata
+        },
+    }
+    return {
+        "trader": trader,
+        "metadata": metadata,
+        "fills": fills,
+        "snapshots": snapshots,
+        "bot_signals": bot_signals,
+    }
+
+
 @router.get("/api/traders", response_class=JSONResponse)
 async def traders_data(request: Request):
     redirect = require_auth(request)
     if redirect is not None:
         return JSONResponse({"error": "auth_required"}, status_code=401)
     return JSONResponse(_summary_payload())
+
+
+@router.get("/api/traders/{address}", response_class=JSONResponse)
+async def trader_detail(address: str, request: Request):
+    redirect = require_auth(request)
+    if redirect is not None:
+        return JSONResponse({"error": "auth_required"}, status_code=401)
+    clean = str(address or "").strip()
+    if not _ADDR_RE.match(clean):
+        return JSONResponse({"error": "invalid_address"}, status_code=400)
+    payload = _trader_detail_payload(clean)
+    if payload is None:
+        return JSONResponse({"error": "not_found"}, status_code=404)
+    return JSONResponse(payload)
 
 
 @router.post("/api/traders/{address}/mark_bot")

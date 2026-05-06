@@ -122,6 +122,7 @@
           <th class="text-right py-2 px-3 font-medium">Lev</th>
           <th class="text-left py-2 px-3 font-medium">Margin</th>
           <th class="text-right py-2 px-3 font-medium">Unrealized</th>
+          <th class="text-left py-2 px-3 font-medium">Override</th>
         </tr>
       </thead>
       <tbody class="divide-y divide-slate-800">
@@ -164,9 +165,27 @@
           <td class="py-1.5 px-3 text-right font-mono {% if p.unrealized_pnl > 0 %}text-emerald-300{% elif p.unrealized_pnl < 0 %}text-rose-300{% else %}text-slate-300{% endif %}">
             ${{ '%+.2f'|format(p.unrealized_pnl) }}
           </td>
+          <td class="py-1.5 px-3 min-w-60">
+            <form class="close-position-form flex items-center gap-1"
+                  hx-post="/api/operator/close_position"
+                  hx-trigger="submit"
+                  hx-swap="none"
+                  hx-confirm="Close live {{ p.coin }} position now? This sends a reduce-only market order.">
+              <input type="hidden" name="coin" value="{{ p.coin }}" />
+              <input name="audit_reason"
+                     placeholder="reason"
+                     required
+                     minlength="4"
+                     class="w-32 bg-slate-950 border border-slate-700 rounded px-2 py-1 text-[10px] focus:outline-none focus:border-rose-500" />
+              <button class="bg-rose-800 hover:bg-rose-700 text-white text-[10px] font-semibold px-2 py-1 rounded">
+                Close live
+              </button>
+              <span class="close-position-result text-[10px] text-slate-500"></span>
+            </form>
+          </td>
         </tr>
         {% else %}
-        <tr><td colspan="10" class="py-6 text-center text-slate-500">No open positions.</td></tr>
+        <tr><td colspan="11" class="py-6 text-center text-slate-500">No open positions.</td></tr>
         {% endfor %}
       </tbody>
     </table>
@@ -293,6 +312,25 @@
   // Render the JSON response inline so the operator sees the audit
   // entry rather than a raw dump.
   document.body.addEventListener('htmx:afterRequest', (ev) => {
+    if (ev.target && ev.target.classList && ev.target.classList.contains('close-position-form')) {
+      const xhr = ev.detail.xhr;
+      const result = ev.target.querySelector('.close-position-result');
+      if (!result) return;
+      if (xhr.status >= 200 && xhr.status < 300) {
+        result.className = 'close-position-result text-[10px] text-emerald-300';
+        result.textContent = 'sent';
+        setTimeout(() => location.reload(), 1500);
+      } else {
+        let msg = 'failed';
+        try {
+          const body = JSON.parse(xhr.responseText);
+          msg = body.message || body.error || msg;
+        } catch (e) { /* leave default */ }
+        result.className = 'close-position-result text-[10px] text-rose-300';
+        result.textContent = msg;
+      }
+      return;
+    }
     if (!ev.target.id || ev.target.id !== 'clear-form') return;
     const xhr = ev.detail.xhr;
     const result = document.getElementById('clear-result');

@@ -130,6 +130,24 @@ class DecisionFirewall:
         self.entry_max_price_extension_pct = float(
             cfg.get("entry_max_price_extension_pct", 0.035)
         )
+        self.side_imbalance_guard_enabled = bool(
+            cfg.get("side_imbalance_guard_enabled", True)
+        )
+        self.side_imbalance_lookback_trades = max(
+            10, int(cfg.get("side_imbalance_lookback_trades", 60))
+        )
+        self.side_imbalance_min_samples = max(
+            5, int(cfg.get("side_imbalance_min_samples", 12))
+        )
+        self.side_imbalance_max_share = min(
+            0.98, max(0.50, float(cfg.get("side_imbalance_max_share", 0.80)))
+        )
+        self.side_imbalance_confidence_bump = max(
+            0.0, float(cfg.get("side_imbalance_confidence_bump", 0.15))
+        )
+        self.side_imbalance_size_multiplier = min(
+            1.0, max(0.05, float(cfg.get("side_imbalance_size_multiplier", 0.50)))
+        )
         self.daily_loss_limit_pct = cfg.get("daily_loss_limit_pct", 0.03)
         if self.canary_mode:
             self.max_positions = min(self.max_positions, self.canary_max_positions)
@@ -228,6 +246,7 @@ class DecisionFirewall:
             "rejected_event_risk": 0,
             "rejected_side_policy": 0,
             "rejected_entry_location": 0,
+            "rejected_side_imbalance": 0,
             # LOW-FIX LOW-1: count audit-log write failures so ops can detect
             # when the audit trail is silently broken (DB full, locked, etc.)
             "audit_log_failures": 0,
@@ -430,6 +449,63 @@ class DecisionFirewall:
                     "FIREWALL_ENTRY_MAX_PRICE_EXTENSION_PCT",
                     self.entry_max_price_extension_pct,
                 )
+            )
+            self.side_imbalance_guard_enabled = bool(
+                overrides.get(
+                    "FIREWALL_SIDE_IMBALANCE_GUARD_ENABLED",
+                    self.side_imbalance_guard_enabled,
+                )
+            )
+            self.side_imbalance_lookback_trades = max(
+                10,
+                int(
+                    overrides.get(
+                        "FIREWALL_SIDE_IMBALANCE_LOOKBACK_TRADES",
+                        self.side_imbalance_lookback_trades,
+                    )
+                ),
+            )
+            self.side_imbalance_min_samples = max(
+                5,
+                int(
+                    overrides.get(
+                        "FIREWALL_SIDE_IMBALANCE_MIN_SAMPLES",
+                        self.side_imbalance_min_samples,
+                    )
+                ),
+            )
+            self.side_imbalance_max_share = min(
+                0.98,
+                max(
+                    0.50,
+                    float(
+                        overrides.get(
+                            "FIREWALL_SIDE_IMBALANCE_MAX_SHARE",
+                            self.side_imbalance_max_share,
+                        )
+                    ),
+                ),
+            )
+            self.side_imbalance_confidence_bump = max(
+                0.0,
+                float(
+                    overrides.get(
+                        "FIREWALL_SIDE_IMBALANCE_CONFIDENCE_BUMP",
+                        self.side_imbalance_confidence_bump,
+                    )
+                ),
+            )
+            self.side_imbalance_size_multiplier = min(
+                1.0,
+                max(
+                    0.05,
+                    float(
+                        overrides.get(
+                            "FIREWALL_SIDE_IMBALANCE_SIZE_MULTIPLIER",
+                            self.side_imbalance_size_multiplier,
+                        )
+                    ),
+                ),
             )
             self._side_policy_cache = {"ts": 0.0, "closed": [], "short": {}, "scoped": {}}
 
@@ -699,6 +775,83 @@ class DecisionFirewall:
                 f"Losing average-down blocked: existing {signal.coin} {side_value} "
                 f"is down {max_loss:.2%} ROE without new-information override "
                 f"(limit {self.averaging_max_loss_roe_pct:.2%})",
+            )
+        return True, ""
+
+    @staticmethod
+    def _normalize_side(side: object) -> str:
+        value = str(side or "").strip().lower()
+        if value in {"buy", "b", "long"}:
+            return "long"
+        if value in {"sell", "s", "a", "ask", "short"}:
+            return "short"
+        return value
+
+    def _apply_side_imbalance_guard(
+        self,
+        signal: TradeSignal,
+        side_value: str,
+        positions: List[Dict],
+    ) -> Tuple[bool, str]:
+        """Avoid runaway same-side books without forcing junk countertrades.
+
+        If the recent paper book is already overwhelmingly one-sided, new
+        same-side entries must clear a higher confidence bar. Strong signals
+        can still pass, but they get size-derisked so the bot does not keep
+        compounding a long-only or short-only tape.
+        """
+        if not self.side_imbalance_guard_enabled:
+            return True, ""
+
+        side_value = self._normalize_side(side_value)
+        if side_value not in {"long", "short"}:
+            return True, ""
+
+        sides: List[str] = []
+        for pos in positions or []:
+            side = self._normalize_side(pos.get("side"))
+            if side in {"long", "short"}:
+                sides.append(side)
+        try:
+            recent = db.get_paper_trade_history(limit=self.side_imbalance_lookback_trades)
+        except Exception as exc:
+            logger.debug("Side imbalance history lookup failed: %s", exc)
+            recent = []
+        for trade in recent or []:
+            side = self._normalize_side(trade.get("side"))
+            if side in {"long", "short"}:
+                sides.append(side)
+
+        total = len(sides)
+        if total < self.side_imbalance_min_samples:
+            return True, ""
+        same = sides.count(side_value)
+        share = same / total if total else 0.0
+        if share < self.side_imbalance_max_share:
+            return True, ""
+
+        required_confidence = min(
+            0.95,
+            float(self.min_confidence or 0.0) + self.side_imbalance_confidence_bump,
+        )
+        if float(getattr(signal, "confidence", 0.0) or 0.0) < required_confidence:
+            return (
+                False,
+                f"Side imbalance guard: {same}/{total} recent/open trades are {side_value}; "
+                f"requires {required_confidence:.0%} confidence for another {side_value} "
+                f"(got {signal.confidence:.0%})",
+            )
+
+        if self.side_imbalance_size_multiplier < 1.0:
+            signal.position_pct *= self.side_imbalance_size_multiplier
+            if signal.size > 0:
+                signal.size *= self.side_imbalance_size_multiplier
+            logger.info(
+                "Side imbalance derisked %s %s: share=%.0f%% size*=%.2f",
+                signal.coin,
+                side_value,
+                share * 100,
+                self.side_imbalance_size_multiplier,
             )
         return True, ""
 
@@ -1193,6 +1346,14 @@ class DecisionFirewall:
         #   (2) max_aggregate_margin_pct against *margin actually locked*
         #       (leverage-agnostic capital-at-risk view).
         # A signal must pass BOTH to be approved.
+        side_imbalance_ok, side_imbalance_reason = self._apply_side_imbalance_guard(
+            signal,
+            side_value,
+            positions,
+        )
+        if not side_imbalance_ok:
+            return _reject("rejected_side_imbalance", side_imbalance_reason)
+
         balance = account_balance
         if balance is None:
             account = db.get_paper_account()

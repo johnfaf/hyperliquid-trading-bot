@@ -17,11 +17,16 @@ import asyncio
 import contextlib
 import logging
 import time
+import threading
+from collections import deque
 from typing import Any, Dict, Optional, Set
 
 logger = logging.getLogger(__name__)
 
 _PER_CLIENT_QUEUE_MAX = 100
+_RECENT_EVENT_MAX = 500
+_recent_events = deque(maxlen=_RECENT_EVENT_MAX)
+_recent_events_lock = threading.RLock()
 
 
 class EventBus:
@@ -89,6 +94,16 @@ def get_bus() -> EventBus:
     return _bus
 
 
+def get_recent_events(limit: int = 100) -> list[Dict[str, Any]]:
+    """Return newest dashboard events from the in-memory replay buffer."""
+    try:
+        capped = max(1, min(int(limit or 100), _RECENT_EVENT_MAX))
+    except (TypeError, ValueError):
+        capped = 100
+    with _recent_events_lock:
+        return list(_recent_events)[-capped:]
+
+
 def publish_event(kind: str, **payload: Any) -> None:
     """Convenience wrapper used by the bot's cycles.
 
@@ -96,4 +111,6 @@ def publish_event(kind: str, **payload: Any) -> None:
     ``kill_switch``, ``calibration``, ...). Payload is opaque JSON.
     """
     event = {"kind": kind, "ts": time.time(), **payload}
+    with _recent_events_lock:
+        _recent_events.append(event)
     _bus.publish_threadsafe(event)

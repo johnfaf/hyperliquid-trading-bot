@@ -216,6 +216,62 @@ def test_risk_policy_engine_cautious_short_caps_target_and_moves_breakeven_earli
     assert "short_caution:shorter_time_stop" in policy.rationale
 
 
+def test_risk_policy_uses_data_quality_funding_memory_and_calibration():
+    engine = RiskPolicyEngine({"max_reward_multiple": 6.0})
+    healthy = TradeSignal(
+        coin="BTC",
+        side=SignalSide.LONG,
+        confidence=0.80,
+        source=SignalSource.STRATEGY,
+        reason="aligned high quality",
+        leverage=4,
+        source_accuracy=0.70,
+        context={
+            "atr_pct": 0.006,
+            "expected_return": 0.15,
+            "calibration_ece": 0.04,
+            "funding_rate": 0.0008,
+            "order_flow_imbalance": 0.35,
+        },
+    )
+    degraded = TradeSignal(
+        coin="BTC",
+        side=SignalSide.LONG,
+        confidence=0.80,
+        source=SignalSource.STRATEGY,
+        reason="same signal but degraded data",
+        leverage=4,
+        source_accuracy=0.70,
+        context={
+            "atr_pct": 0.006,
+            "expected_return": 0.15,
+            "calibration_ece": 0.26,
+            "funding_rate": -0.0012,
+            "spread_pct": 0.004,
+            "trade_memory": {"recommendation": "caution"},
+            "data_sources": {"polymarket": {"status": "degraded"}},
+            "order_flow_imbalance": -0.35,
+        },
+    )
+
+    healthy_policy = engine.resolve(
+        healthy,
+        regime_data={"regime": "trending_up", "confidence": 0.80},
+        source_policy={"quality": 0.70, "status": "healthy", "calibration": {"ece": 0.04}},
+    )
+    degraded_policy = engine.resolve(
+        degraded,
+        regime_data={"regime": "trending_up", "confidence": 0.80},
+        source_policy={"quality": 0.70, "status": "degraded", "calibration": {"ece": 0.26}},
+    )
+
+    assert degraded_policy.reward_multiple < healthy_policy.reward_multiple
+    assert degraded_policy.time_limit_hours < healthy_policy.time_limit_hours
+    assert degraded_policy.calibration_ece == pytest.approx(0.26)
+    assert degraded_policy.memory_recommendation == "caution"
+    assert any("data_degraded" in r for r in degraded_policy.rationale)
+
+
 def test_risk_policy_engine_caps_extreme_price_distance_even_with_low_leverage():
     engine = RiskPolicyEngine()
     signal = TradeSignal(

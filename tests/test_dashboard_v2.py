@@ -67,6 +67,14 @@ def test_calibration_curve_returns_bins(client):
     assert len(payload["curve"]) == 10  # N_BINS
 
 
+def test_calibration_timeline_endpoint_smoke(client):
+    r = client.get("/api/calibration/timeline?days=7&top_sources=3")
+    assert r.status_code == 200
+    payload = r.json()
+    assert "sources" in payload
+    assert "points" in payload
+
+
 def test_calibration_page_renders(client):
     r = client.get("/calibration")
     assert r.status_code == 200
@@ -186,12 +194,37 @@ def test_clear_kill_switch_calls_through_with_audit_reason(client):
     assert calls and calls[0]["reason"].startswith("userFills")
 
 
+def test_close_position_operator_override_calls_live_trader(client):
+    calls = []
+
+    class _Stub:
+        def cancel_all_orders_detailed(self, coin=None):
+            calls.append(("cancel", coin))
+            return {"success": True, "cancelled_count": 0}
+
+        def close_position(self, coin):
+            calls.append(("close", coin))
+            return {"status": "ok", "coin": coin}
+
+    v2_state.set_components(live_trader=_Stub())
+    r = client.post(
+        "/api/operator/close_position",
+        data={"coin": "btc", "audit_reason": "manual stuck sltp override"},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is True
+    assert body["coin"] == "BTC"
+    assert calls == [("cancel", "BTC"), ("close", "BTC"), ("cancel", "BTC")]
+
+
 def test_sources_endpoint_no_agent_scorer(client):
     r = client.get("/api/sources")
     assert r.status_code == 200
     payload = r.json()
     assert payload["available"] is False
     assert payload["rows"] == []
+    assert "strategies" in payload
 
 
 def test_sources_endpoint_aggregates_calibration(monkeypatch, tmp_path):
@@ -245,6 +278,12 @@ def test_traders_endpoint_smoke(client):
     payload = r.json()
     assert "rows" in payload
     assert "totals" in payload
+
+
+def test_trader_detail_rejects_invalid_address(client):
+    r = client.get("/api/traders/not-an-address")
+    assert r.status_code == 400
+    assert r.json()["error"] == "invalid_address"
 
 
 def test_traders_page_renders(client):
@@ -358,3 +397,13 @@ def test_recent_fills_endpoint_no_live_trader(client):
     payload = r.json()
     assert payload["fills"] == []
     assert payload["count"] == 0
+
+
+def test_recent_events_endpoint_replays_published_events(client):
+    from src.ui.v2.events import publish_event
+
+    publish_event("unit_test", message="hello")
+    r = client.get("/api/events/recent?limit=5")
+    assert r.status_code == 200
+    payload = r.json()
+    assert any(ev.get("kind") == "unit_test" for ev in payload["events"])

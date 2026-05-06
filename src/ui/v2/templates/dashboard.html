@@ -28,4 +28,80 @@
     </ul>
   </div>
 </section>
+
+<section class="bg-slate-900 border border-slate-800 rounded-lg p-4">
+  <div class="flex items-center justify-between mb-3">
+    <div>
+      <h2 class="text-sm uppercase tracking-wide text-slate-400">WS event log</h2>
+      <p class="mt-1 text-xs text-slate-500">Live tail of dashboard bus events plus the recent replay buffer.</p>
+    </div>
+    <span id="event-log-count" class="text-[10px] text-slate-500">loading...</span>
+  </div>
+  <div id="event-log" class="space-y-1 max-h-96 overflow-y-auto text-xs font-mono"></div>
+</section>
+
+<script>
+  (function () {
+    const list = document.getElementById('event-log');
+    const count = document.getElementById('event-log-count');
+    const maxRows = 120;
+    const rows = [];
+
+    function fmtTs(ts) {
+      if (!ts) return '--:--:--';
+      try { return new Date(ts * 1000).toISOString().slice(11, 19); }
+      catch { return '--:--:--'; }
+    }
+    function esc(value) {
+      return String(value ?? '').replace(/[&<>"']/g, (ch) => ({
+        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+      }[ch]));
+    }
+
+    function render() {
+      if (!list) return;
+      const html = rows.slice(-maxRows).reverse().map((ev) => {
+        const payload = Object.assign({}, ev);
+        delete payload.kind;
+        delete payload.ts;
+        const rendered = JSON.stringify(payload);
+        const safeRendered = esc(rendered);
+        const tone = ev.kind === 'kill_switch' ? 'text-rose-300'
+          : ev.kind === 'calibration' ? 'text-amber-300'
+          : ev.kind === 'cycle' ? 'text-emerald-300'
+          : 'text-slate-300';
+        return `
+          <div class="grid grid-cols-[4rem_8rem_1fr] gap-2 py-1 border-b border-slate-800/60">
+            <span class="text-slate-500">${fmtTs(ev.ts)}</span>
+            <span class="${tone}">${esc(ev.kind || 'unknown')}</span>
+            <span class="text-slate-400 truncate" title="${safeRendered}">${safeRendered}</span>
+          </div>`;
+      }).join('');
+      list.innerHTML = html || '<div class="py-6 text-center text-slate-500">No events yet.</div>';
+      if (count) count.textContent = `${rows.length} buffered`;
+    }
+
+    function addEvent(ev) {
+      if (!ev || !ev.kind || ev.kind === 'heartbeat' || ev.kind === 'hello') return;
+      rows.push(ev);
+      while (rows.length > maxRows) rows.shift();
+      render();
+    }
+
+    async function loadRecent() {
+      try {
+        const resp = await fetch('/api/events/recent?limit=120');
+        if (!resp.ok) return;
+        const data = await resp.json();
+        rows.splice(0, rows.length, ...(data.events || []));
+        render();
+      } catch (e) {
+        if (count) count.textContent = 'event replay unavailable';
+      }
+    }
+
+    window.addEventListener('ws-event', (ev) => addEvent(ev.detail));
+    loadRecent();
+  })();
+</script>
 {% endblock %}

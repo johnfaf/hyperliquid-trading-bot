@@ -437,6 +437,24 @@ def build_subsystems(
             "entry_max_price_extension_pct": float(
                 getattr(_fw_cfg, "FIREWALL_ENTRY_MAX_PRICE_EXTENSION_PCT", 0.035)
             ),
+            "side_imbalance_guard_enabled": bool(
+                getattr(_fw_cfg, "FIREWALL_SIDE_IMBALANCE_GUARD_ENABLED", True)
+            ),
+            "side_imbalance_lookback_trades": int(
+                getattr(_fw_cfg, "FIREWALL_SIDE_IMBALANCE_LOOKBACK_TRADES", 60)
+            ),
+            "side_imbalance_min_samples": int(
+                getattr(_fw_cfg, "FIREWALL_SIDE_IMBALANCE_MIN_SAMPLES", 12)
+            ),
+            "side_imbalance_max_share": float(
+                getattr(_fw_cfg, "FIREWALL_SIDE_IMBALANCE_MAX_SHARE", 0.80)
+            ),
+            "side_imbalance_confidence_bump": float(
+                getattr(_fw_cfg, "FIREWALL_SIDE_IMBALANCE_CONFIDENCE_BUMP", 0.15)
+            ),
+            "side_imbalance_size_multiplier": float(
+                getattr(_fw_cfg, "FIREWALL_SIDE_IMBALANCE_SIZE_MULTIPLIER", 0.50)
+            ),
             "canary_mode": bool(getattr(_fw_cfg, "FIREWALL_CANARY_MODE", False)),
             "canary_max_positions": int(getattr(_fw_cfg, "FIREWALL_CANARY_MAX_POSITIONS", 2)),
             # AUDIT M1 — leveraged-notional cap + margin cap are independent

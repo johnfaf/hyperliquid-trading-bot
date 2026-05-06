@@ -17,7 +17,10 @@ If a particular subsystem isn't initialised the row falls back to
 """
 from __future__ import annotations
 
+from collections import defaultdict
+import json
 import logging
+import math
 from typing import Any, Dict, List
 
 from fastapi import APIRouter, Form, Request
@@ -29,6 +32,132 @@ from src.ui.v2.state import get_components
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+
+def _loads_dict(value: Any) -> Dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = json.loads(value)
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return default
+    return out if math.isfinite(out) else default
+
+
+def _strategy_breakdown(limit: int = 25) -> List[Dict[str, Any]]:
+    """Aggregate recent decision outcomes by strategy_type for Sources."""
+    try:
+        from src.data import database as db
+
+        if db.table_exists("decision_outcomes"):
+            with db.get_connection(for_read=True) as conn:
+                rows = conn.execute(
+                    """
+                    SELECT strategy_type, source, source_key, side, action_taken,
+                           label_win, outcome_pnl, final_status, created_at
+                    FROM decision_outcomes
+                    ORDER BY created_at DESC
+                    LIMIT 5000
+                    """
+                ).fetchall()
+        elif db.table_exists("paper_trades"):
+            with db.get_connection(for_read=True) as conn:
+                rows = conn.execute(
+                    """
+                    SELECT pt.side, pt.pnl AS outcome_pnl, pt.status AS final_status,
+                           pt.metadata, s.strategy_type
+                    FROM paper_trades pt
+                    LEFT JOIN strategies s ON s.id = pt.strategy_id
+                    ORDER BY COALESCE(pt.closed_at, pt.opened_at) DESC
+                    LIMIT 5000
+                    """
+                ).fetchall()
+        else:
+            return []
+    except Exception as exc:
+        logger.debug("strategy breakdown query failed: %s", exc)
+        return []
+
+    acc: Dict[str, Dict[str, Any]] = defaultdict(
+        lambda: {
+            "strategy_type": "unknown",
+            "decisions": 0,
+            "executed": 0,
+            "wins": 0,
+            "labelled": 0,
+            "pnl": 0.0,
+            "longs": 0,
+            "shorts": 0,
+            "sources": set(),
+            "latest_status": "",
+        }
+    )
+    for row in rows:
+        item = dict(row)
+        metadata = _loads_dict(item.get("metadata"))
+        strategy = str(
+            item.get("strategy_type")
+            or metadata.get("strategy_type")
+            or "unknown"
+        ).strip().lower() or "unknown"
+        bucket = acc[strategy]
+        bucket["strategy_type"] = strategy
+        bucket["decisions"] += 1
+        if bool(item.get("action_taken")) or str(item.get("final_status") or "").lower() == "closed":
+            bucket["executed"] += 1
+        label = item.get("label_win")
+        try:
+            label_int = int(label)
+        except (TypeError, ValueError):
+            label_int = -1
+        if label_int in (0, 1):
+            bucket["labelled"] += 1
+            if label_int == 1:
+                bucket["wins"] += 1
+        pnl = _safe_float(item.get("outcome_pnl"), 0.0)
+        bucket["pnl"] += pnl
+        side = str(item.get("side") or "").strip().lower()
+        if side in {"long", "buy", "b"}:
+            bucket["longs"] += 1
+        elif side in {"short", "sell", "a"}:
+            bucket["shorts"] += 1
+        source = str(item.get("source_key") or item.get("source") or metadata.get("source_key") or "").strip()
+        if source:
+            bucket["sources"].add(source)
+        if not bucket["latest_status"]:
+            bucket["latest_status"] = str(item.get("final_status") or "")
+
+    rows_out: List[Dict[str, Any]] = []
+    for bucket in acc.values():
+        labelled = int(bucket["labelled"])
+        win_rate = (bucket["wins"] / labelled) if labelled else None
+        decisions = int(bucket["decisions"])
+        rows_out.append(
+            {
+                "strategy_type": bucket["strategy_type"],
+                "decisions": decisions,
+                "executed": int(bucket["executed"]),
+                "win_rate": win_rate,
+                "pnl": round(float(bucket["pnl"]), 6),
+                "avg_pnl": round(float(bucket["pnl"]) / max(1, decisions), 6),
+                "longs": int(bucket["longs"]),
+                "shorts": int(bucket["shorts"]),
+                "sources": len(bucket["sources"]),
+                "latest_status": bucket["latest_status"] or "unknown",
+            }
+        )
+    rows_out.sort(key=lambda r: (-r["decisions"], -abs(r["pnl"]), r["strategy_type"]))
+    return rows_out[: max(1, int(limit or 25))]
 
 
 def _aggregate_calibration_for_source(cal, source: str) -> Dict[str, Any]:
@@ -93,10 +222,11 @@ def _summary_payload() -> Dict[str, Any]:
     components = get_components()
     scorer = components.agent_scorer
     cal = components.calibration
+    strategies = _strategy_breakdown()
 
     rows: List[Dict[str, Any]] = []
     if scorer is None:
-        return {"available": False, "rows": [], "totals": {}}
+        return {"available": False, "rows": [], "totals": {}, "strategies": strategies}
 
     try:
         scorecard = scorer.get_scorecard() or []
@@ -134,6 +264,7 @@ def _summary_payload() -> Dict[str, Any]:
         "available": True,
         "rows": rows,
         "totals": counts,
+        "strategies": strategies,
     }
 
 

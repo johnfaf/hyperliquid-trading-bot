@@ -188,4 +188,51 @@
   })();
 </script>
 {% endif %}
+
+<section class="mt-6">
+  <div class="flex items-center justify-between mb-2">
+    <h2 class="text-sm font-semibold text-slate-300">Strategy breakdown</h2>
+    <div class="text-xs text-slate-500">recent decision outcomes grouped by strategy_type</div>
+  </div>
+  <div class="overflow-x-auto bg-slate-900 border border-slate-800 rounded">
+    <table class="w-full text-xs">
+      <thead class="bg-slate-950/60 text-slate-400">
+        <tr>
+          <th class="text-left py-2 px-3 font-medium">Strategy</th>
+          <th class="text-right py-2 px-3 font-medium">Decisions</th>
+          <th class="text-right py-2 px-3 font-medium">Executed</th>
+          <th class="text-right py-2 px-3 font-medium">Win rate</th>
+          <th class="text-right py-2 px-3 font-medium">PnL</th>
+          <th class="text-right py-2 px-3 font-medium">Avg PnL</th>
+          <th class="text-right py-2 px-3 font-medium">Longs</th>
+          <th class="text-right py-2 px-3 font-medium">Shorts</th>
+          <th class="text-right py-2 px-3 font-medium">Sources</th>
+          <th class="text-left py-2 px-3 font-medium">Latest</th>
+        </tr>
+      </thead>
+      <tbody class="divide-y divide-slate-800">
+        {% for s in data.strategies or [] %}
+        <tr class="hover:bg-slate-800/40">
+          <td class="py-1.5 px-3 text-slate-200 font-mono">{{ s.strategy_type }}</td>
+          <td class="py-1.5 px-3 text-right text-slate-300">{{ s.decisions }}</td>
+          <td class="py-1.5 px-3 text-right text-slate-400">{{ s.executed }}</td>
+          <td class="py-1.5 px-3 text-right text-slate-400">
+            {% if s.win_rate is none %}--{% else %}{{ '%.0f%%'|format(s.win_rate * 100) }}{% endif %}
+          </td>
+          <td class="py-1.5 px-3 text-right font-mono {% if s.pnl > 0 %}text-emerald-300{% elif s.pnl < 0 %}text-rose-300{% else %}text-slate-400{% endif %}">
+            ${{ '%+.2f'|format(s.pnl) }}
+          </td>
+          <td class="py-1.5 px-3 text-right text-slate-400 font-mono">${{ '%+.3f'|format(s.avg_pnl) }}</td>
+          <td class="py-1.5 px-3 text-right text-emerald-300">{{ s.longs }}</td>
+          <td class="py-1.5 px-3 text-right text-rose-300">{{ s.shorts }}</td>
+          <td class="py-1.5 px-3 text-right text-slate-400">{{ s.sources }}</td>
+          <td class="py-1.5 px-3 text-slate-500">{{ s.latest_status }}</td>
+        </tr>
+        {% else %}
+        <tr><td colspan="10" class="py-6 text-center text-slate-500">No strategy decision outcomes recorded yet.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
 {% endblock %}

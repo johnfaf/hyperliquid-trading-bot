@@ -296,6 +296,79 @@ async def clear_kill_switch(
     return JSONResponse({"ok": True, "result": result})
 
 
+@router.post("/api/operator/close_position")
+async def close_live_position(
+    request: Request,
+    coin: str = Form(...),
+    audit_reason: str = Form(""),
+):
+    """Authenticated operator override to flatten one live position.
+
+    This is intentionally one-coin-at-a-time and audit-reason gated: it is
+    meant for stuck SL/TP or emergency manual intervention, not routine
+    strategy execution.
+    """
+    if not verify_cookie(request):
+        return JSONResponse({"error": "auth_required"}, status_code=401)
+
+    target_coin = str(coin or "").strip().upper()
+    if not target_coin:
+        return JSONResponse({"error": "coin_required"}, status_code=400)
+    reason = (audit_reason or "").strip()
+    if len(reason) < 4:
+        return JSONResponse(
+            {
+                "error": "audit_reason_required",
+                "message": "Provide a short note explaining why (at least 4 chars).",
+            },
+            status_code=400,
+        )
+
+    live_trader = get_components().live_trader
+    if live_trader is None:
+        return JSONResponse({"error": "live_trader_unavailable"}, status_code=503)
+
+    operator = request.cookies.get("dashboard_v2_auth", "")[:16] or "dashboard"
+    try:
+        pre_cancel = _safe_call(live_trader, "cancel_all_orders_detailed", coin=target_coin)
+        result = live_trader.close_position(target_coin)
+        post_cancel = _safe_call(live_trader, "cancel_all_orders_detailed", coin=target_coin)
+        logger.warning(
+            "dashboard operator close_position coin=%s operator=%s reason=%s result=%s",
+            target_coin,
+            operator,
+            reason,
+            result,
+        )
+        try:
+            from src.ui.v2.events import publish_event
+
+            publish_event(
+                "operator",
+                action="close_position",
+                coin=target_coin,
+                operator=f"dashboard:{operator}",
+                reason=reason,
+                result=result,
+            )
+        except Exception:
+            pass
+        return JSONResponse(
+            {
+                "ok": True,
+                "coin": target_coin,
+                "result": result,
+                "pre_cancel": pre_cancel,
+                "post_cancel": post_cancel,
+            }
+        )
+    except AttributeError:
+        return JSONResponse({"error": "close_position_unsupported"}, status_code=501)
+    except Exception as exc:
+        logger.error("close_position override failed: %s", exc, exc_info=True)
+        return JSONResponse({"error": "close_failed", "message": str(exc)}, status_code=500)
+
+
 @router.get("/positions", response_class=HTMLResponse)
 async def positions_page(request: Request):
     redirect = require_auth(request)
