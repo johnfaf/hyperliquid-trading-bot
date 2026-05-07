@@ -53,6 +53,30 @@ REGIME_COMPATIBILITY = {
         "delta_neutral": 0.1,         # Pause — not useful in directional market
         "funding_arb": 0.15,          # Pause — funding direction uncertain
     },
+    "bearish": {
+        "momentum_short": 1.0,
+        "trend_following": 0.85,
+        "breakout": 0.65,
+        "scalping": 0.35,
+        "mean_reversion": 0.15,
+        "momentum_long": 0.03,
+        "swing_trading": 0.10,
+        "concentrated_bet": 0.10,
+        "delta_neutral": 0.20,
+        "funding_arb": 0.20,
+    },
+    "crash": {
+        "momentum_short": 0.85,
+        "trend_following": 0.65,
+        "breakout": 0.45,
+        "scalping": 0.20,
+        "mean_reversion": 0.05,
+        "momentum_long": 0.01,
+        "swing_trading": 0.05,
+        "concentrated_bet": 0.05,
+        "delta_neutral": 0.30,
+        "funding_arb": 0.20,
+    },
     "ranging": {
         "mean_reversion": 1.0,        # Perfect match
         "scalping": 0.9,              # Excellent (tight chop)

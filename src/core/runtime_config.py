@@ -60,6 +60,12 @@ RUNTIME_OVERRIDE_SPECS: Dict[str, Dict[str, Any]] = {
         "min": -1_000_000.0,
         "max": 1_000_000.0,
     },
+    "FIREWALL_MARKET_SIDE_GUARD_ENABLED": {"type": "bool"},
+    "FIREWALL_MARKET_SIDE_GUARD_MIN_CONFIDENCE": {"type": "float", "min": 0.0, "max": 1.0},
+    "BTC_MARKET_LEADER_GUARD_ENABLED": {"type": "bool"},
+    "BTC_MARKET_LEADER_MIN_CONFIDENCE": {"type": "float", "min": 0.0, "max": 1.0},
+    "BTC_MARKET_LEADER_MIN_MOMENTUM": {"type": "float", "min": 0.0, "max": 1.0},
+    "BTC_MARKET_LEADER_MIN_VOLUME_RATIO": {"type": "float", "min": 0.0, "max": 100.0},
     "EVENT_RISK_ENABLED": {"type": "bool"},
 }
 

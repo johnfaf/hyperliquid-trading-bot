@@ -133,6 +133,12 @@ class DecisionFirewall:
         self.short_hardening_coin_block_net_pnl = float(
             cfg.get("short_hardening_coin_block_net_pnl", -0.25)
         )
+        self.market_side_guard_enabled = bool(
+            cfg.get("market_side_guard_enabled", True)
+        )
+        self.market_side_guard_min_confidence = float(
+            cfg.get("market_side_guard_min_confidence", 0.60)
+        )
         self.canary_mode = bool(cfg.get("canary_mode", False))
         self.canary_max_positions = max(1, int(cfg.get("canary_max_positions", 2)))
         self.cooldown_seconds = int(cfg.get("cooldown_seconds", 180))
@@ -475,6 +481,18 @@ class DecisionFirewall:
                     self.short_hardening_coin_block_net_pnl,
                 )
             )
+            self.market_side_guard_enabled = bool(
+                overrides.get(
+                    "FIREWALL_MARKET_SIDE_GUARD_ENABLED",
+                    self.market_side_guard_enabled,
+                )
+            )
+            self.market_side_guard_min_confidence = float(
+                overrides.get(
+                    "FIREWALL_MARKET_SIDE_GUARD_MIN_CONFIDENCE",
+                    self.market_side_guard_min_confidence,
+                )
+            )
             self.cooldown_seconds = int(
                 overrides.get("FIREWALL_COIN_COOLDOWN_SECONDS", self.cooldown_seconds)
             )
@@ -585,7 +603,8 @@ class DecisionFirewall:
         logger.info(
             "DecisionFirewall runtime overrides applied: min_confidence=%s, source_cap=%s, "
             "short_hardening=%s, event_risk=%s, coin_cooldown=%ss, "
-            "same_side_cooldown=%ss, block_losing_averaging=%s, entry_location_filter=%s",
+            "same_side_cooldown=%ss, block_losing_averaging=%s, entry_location_filter=%s, "
+            "market_side_guard=%s",
             f"{self.min_confidence:.0%}",
             self.max_signals_per_source_per_day,
             self.short_hardening_enabled,
@@ -594,6 +613,7 @@ class DecisionFirewall:
             self.same_side_cooldown_seconds,
             self.block_losing_averaging,
             self.entry_location_filter_enabled,
+            self.market_side_guard_enabled,
         )
 
     def _get_short_policy_cache(self) -> Dict[str, object]:
@@ -796,7 +816,8 @@ class DecisionFirewall:
 
         forecaster_regime = str(regime_payload.get("forecaster_regime", "") or "").strip().lower()
         forecaster_conf = _float(regime_payload.get("forecaster_confidence"), 0.0)
-        if forecaster_regime:
+        forecaster_synthetic = bool(regime_payload.get("forecaster_synthetic_warm_start", False))
+        if forecaster_regime and not forecaster_synthetic:
             candidates.append(
                 {
                     "source": "forecaster",
@@ -944,13 +965,58 @@ class DecisionFirewall:
         }
         return True, meta["reason"], meta
 
+    def _apply_market_side_guard(
+        self,
+        signal: TradeSignal,
+        side: str,
+        regime_data: Optional[Dict] = None,
+    ) -> Tuple[bool, str]:
+        """Block entries that fight a strong current market-side read."""
+        if not self.market_side_guard_enabled:
+            return True, ""
+
+        side = str(side or "").strip().lower()
+        if side not in {"long", "short"}:
+            return True, ""
+
+        alignment = self._current_market_side_alignment(signal, side, regime_data=regime_data)
+        if isinstance(getattr(signal, "context", None), dict):
+            signal.context["market_side_alignment"] = dict(alignment)
+
+        if alignment.get("aligned"):
+            return True, ""
+
+        market_side = str(alignment.get("direction", "") or "").strip().lower()
+        try:
+            market_conf = float(alignment.get("confidence", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            market_conf = 0.0
+
+        opposite = "short" if side == "long" else "long"
+        if market_side == opposite and market_conf >= self.market_side_guard_min_confidence:
+            return (
+                False,
+                f"Current market read blocks {side}: {alignment.get('reason')}",
+            )
+        return True, ""
+
     def _apply_side_policy(
         self,
         signal: TradeSignal,
         regime_data: Optional[Dict] = None,
     ) -> Tuple[bool, str]:
         side_val = signal.side.value if hasattr(signal.side, "value") else str(signal.side)
-        if str(side_val).lower() != "short":
+        side_val = str(side_val or "").strip().lower()
+
+        market_ok, market_reason = self._apply_market_side_guard(
+            signal,
+            side_val,
+            regime_data=regime_data,
+        )
+        if not market_ok:
+            return False, market_reason
+
+        if side_val != "short":
             return True, ""
 
         policies = [self._get_short_side_policy(), *self._get_scoped_short_policies(signal)]
@@ -1586,6 +1652,11 @@ class DecisionFirewall:
                     metadata={
                         "reason_key": reason_key,
                         "dry_run": dry_run,
+                        "market_side_alignment": (
+                            dict(signal.context.get("market_side_alignment", {}))
+                            if isinstance(getattr(signal, "context", None), dict)
+                            else {}
+                        ),
                     },
                 )
             if not dry_run:
@@ -1929,7 +2000,14 @@ class DecisionFirewall:
                 final_status="approved",
                 firewall_decision="approved",
                 rejection_reason=None,
-                metadata={"dry_run": dry_run},
+                metadata={
+                    "dry_run": dry_run,
+                    "market_side_alignment": (
+                        dict(signal.context.get("market_side_alignment", {}))
+                        if isinstance(getattr(signal, "context", None), dict)
+                        else {}
+                    ),
+                },
             )
 
         return True, "approved"
@@ -2063,4 +2141,6 @@ class DecisionFirewall:
             "source_signal_counts": dict(self._source_signal_counts),
             "source_policies": self.agent_scorer.get_scorecard() if self.agent_scorer else [],
             "short_side_policy": self._get_short_side_policy(),
+            "market_side_guard_enabled": bool(self.market_side_guard_enabled),
+            "market_side_guard_min_confidence": float(self.market_side_guard_min_confidence),
         }

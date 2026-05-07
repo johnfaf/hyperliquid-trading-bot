@@ -56,6 +56,44 @@ def test_synthetic_forecaster_crash_cannot_override_detector():
     assert result["forecaster_synthetic_warm_start"] is True
 
 
+def test_btc_market_leader_blocks_longs_without_core_consensus(monkeypatch):
+    import config
+    from src.core.cycles.trading_cycle import _apply_global_momentum_override
+
+    monkeypatch.setattr(config, "GLOBAL_MOMENTUM_OVERRIDE_ENABLED", True)
+    monkeypatch.setattr(config, "GLOBAL_MOMENTUM_MIN_AGREEING_COINS", 2)
+    monkeypatch.setattr(config, "GLOBAL_MOMENTUM_MIN_CONFIDENCE", 0.58)
+    monkeypatch.setattr(config, "GLOBAL_MOMENTUM_MIN_MOMENTUM", 0.006)
+    monkeypatch.setattr(config, "GLOBAL_MOMENTUM_MIN_VOLUME_RATIO", 0.75)
+    monkeypatch.setattr(config, "BTC_MARKET_LEADER_GUARD_ENABLED", True)
+    monkeypatch.setattr(config, "BTC_MARKET_LEADER_COIN", "BTC")
+    monkeypatch.setattr(config, "BTC_MARKET_LEADER_MIN_CONFIDENCE", 0.58)
+    monkeypatch.setattr(config, "BTC_MARKET_LEADER_MIN_MOMENTUM", 0.003)
+    monkeypatch.setattr(config, "BTC_MARKET_LEADER_MIN_VOLUME_RATIO", 0.75)
+    monkeypatch.setattr(config, "GLOBAL_MOMENTUM_CLOSE_COUNTERTREND", False)
+
+    result = _apply_global_momentum_override(
+        None,
+        {
+            "overall_regime": "volatile",
+            "strategy_guidance": {"pause": [], "activate": []},
+            "per_coin": {
+                "BTC": {
+                    "regime": "crash",
+                    "confidence": 0.72,
+                    "momentum": -0.012,
+                    "volume_ratio": 1.1,
+                }
+            },
+        },
+    )
+
+    assert result["countertrend_block_side"] == "long"
+    assert result["global_momentum_override"]["reason"] == "btc_market_leader"
+    assert result["global_momentum_override"]["agreeing_coins"] == ["BTC"]
+    assert "momentum_long" in result["strategy_guidance"]["pause"]
+
+
 def test_macro_overlay_does_not_compound_global_trending_up_size_modifier():
     from src.analysis.regime_detector import REGIME_STRATEGY_MAP, Regime
     from src.core.cycles.trading_cycle import _apply_macro_regime_overlay

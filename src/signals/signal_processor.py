@@ -62,6 +62,22 @@ class SignalProcessor:
             "total_out": 0,
         }
 
+    @staticmethod
+    def _normalise_direction(value) -> str:
+        direction = str(value or "").strip().lower()
+        if direction in {"buy", "long"}:
+            return "long"
+        if direction in {"sell", "short"}:
+            return "short"
+        return "neutral"
+
+    @staticmethod
+    def _extract_coins(params: Dict) -> List[str]:
+        coins = params.get("coins") or params.get("coins_traded") or params.get("coin") or []
+        if isinstance(coins, str):
+            coins = [coins]
+        return [str(coin).upper() for coin in coins if str(coin or "").strip()]
+
     def process(self, strategies: List[Dict],
                 regime_data: Optional[Dict] = None) -> List[Dict]:
         """
@@ -217,9 +233,7 @@ class SignalProcessor:
                 except (json.JSONDecodeError, TypeError):
                     params = {}
 
-            coins = params.get("coins", params.get("coins_traded", []))
-            if isinstance(coins, str):
-                coins = [coins]
+            coins = self._extract_coins(params)
             coin_key = coins[0] if coins else "any"
 
             # CANONICAL KEY: (coin, direction) — ignore strategy_type
@@ -263,7 +277,7 @@ class SignalProcessor:
                 return "short"
             if regime in {"trending_up", "bullish"}:
                 return "long"
-        return params.get("direction", params.get("bias", "long"))
+        return SignalProcessor._normalise_direction(params.get("direction") or params.get("bias"))
 
     def _infer_direction(
         self,
@@ -303,7 +317,7 @@ class SignalProcessor:
         else:
             # Direction-agnostic/legacy strategies only use their stored bias
             # unless the caller already wrote an explicit market-aware side.
-            return params.get("direction", params.get("bias", "long"))
+            return self._normalise_direction(params.get("direction") or params.get("bias"))
 
     # ─── Step 3: Conflict Resolution ────────────────────────────
 
@@ -333,9 +347,7 @@ class SignalProcessor:
                 except (json.JSONDecodeError, TypeError):
                     params = {}
 
-            coins = params.get("coins", params.get("coins_traded", []))
-            if isinstance(coins, str):
-                coins = [coins]
+            coins = self._extract_coins(params)
 
             primary_coin = coins[0] if coins else None
             if primary_coin:
@@ -371,9 +383,9 @@ class SignalProcessor:
                     regime = regime_data.get("overall_regime", "").upper()
 
                 # Determine which side the regime favors
-                if regime in ("TRENDING_UP",):
+                if regime in ("TRENDING_UP", "BULLISH"):
                     favored = "long"
-                elif regime in ("TRENDING_DOWN",):
+                elif regime in ("TRENDING_DOWN", "BEARISH", "CRASH"):
                     favored = "short"
                 elif regime in ("RANGING", "VOLATILE", "LOW_LIQUIDITY"):
                     # In ranging/volatile, fall back to higher confidence

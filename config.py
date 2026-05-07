@@ -839,6 +839,29 @@ GLOBAL_MOMENTUM_MIN_VOLUME_RATIO = float(
 GLOBAL_MOMENTUM_CLOSE_COUNTERTREND = _safe_env_bool(
     "GLOBAL_MOMENTUM_CLOSE_COUNTERTREND", False
 )
+BTC_MARKET_LEADER_GUARD_ENABLED = _safe_env_bool(
+    "BTC_MARKET_LEADER_GUARD_ENABLED", True
+)
+BTC_MARKET_LEADER_COIN = os.environ.get("BTC_MARKET_LEADER_COIN", "BTC").strip().upper() or "BTC"
+BTC_MARKET_LEADER_MIN_CONFIDENCE = float(
+    os.environ.get("BTC_MARKET_LEADER_MIN_CONFIDENCE", GLOBAL_MOMENTUM_MIN_CONFIDENCE)
+)
+BTC_MARKET_LEADER_MIN_MOMENTUM = float(
+    os.environ.get("BTC_MARKET_LEADER_MIN_MOMENTUM", 0.003)
+)
+BTC_MARKET_LEADER_MIN_VOLUME_RATIO = float(
+    os.environ.get("BTC_MARKET_LEADER_MIN_VOLUME_RATIO", GLOBAL_MOMENTUM_MIN_VOLUME_RATIO)
+)
+
+# Directional market-side guard: blocks/de-risks entries fighting a strong
+# current market read. This closes the old asymmetry where short-side history
+# hardening could make shorts harder than longs during bearish BTC momentum.
+FIREWALL_MARKET_SIDE_GUARD_ENABLED = _safe_env_bool(
+    "FIREWALL_MARKET_SIDE_GUARD_ENABLED", True
+)
+FIREWALL_MARKET_SIDE_GUARD_MIN_CONFIDENCE = float(
+    os.environ.get("FIREWALL_MARKET_SIDE_GUARD_MIN_CONFIDENCE", 0.60)
+)
 
 # Per-source capital allocator / throttling.
 SOURCE_POLICY_ENABLED = os.environ.get(
@@ -1312,6 +1335,10 @@ def _validate_config_bounds() -> None:
         ("GLOBAL_MOMENTUM_MIN_CONFIDENCE", 0.0, 1.0, 0.58),
         ("GLOBAL_MOMENTUM_MIN_MOMENTUM", 0.0, 1.0, 0.006),
         ("GLOBAL_MOMENTUM_MIN_VOLUME_RATIO", 0.0, 100.0, 0.75),
+        ("BTC_MARKET_LEADER_MIN_CONFIDENCE", 0.0, 1.0, 0.58),
+        ("BTC_MARKET_LEADER_MIN_MOMENTUM", 0.0, 1.0, 0.003),
+        ("BTC_MARKET_LEADER_MIN_VOLUME_RATIO", 0.0, 100.0, 0.75),
+        ("FIREWALL_MARKET_SIDE_GUARD_MIN_CONFIDENCE", 0.0, 1.0, 0.60),
         ("PAPER_EXECUTION_MAX_TRADES_PER_CYCLE", 0, 100, 3),
         ("TRADE_QUALITY_MIN_EDGE_COST_MULTIPLE", 0.0, 100.0, 1.5),
         ("TRADE_QUALITY_EXPECTED_SLIPPAGE_BPS", 0.0, 1_000.0, PAPER_TRADING_SLIPPAGE_MAX_BPS),

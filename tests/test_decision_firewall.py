@@ -157,6 +157,36 @@ def test_regime_disagreement_blocks_countertrend_side(mock_db):
 
 
 @patch("src.signals.decision_firewall.db")
+def test_market_side_guard_blocks_longs_in_bearish_regime(mock_db):
+    mock_db.get_open_paper_trades.return_value = []
+    mock_db.get_paper_account.return_value = {"balance": 1000000}
+    mock_db.audit_log = MagicMock()
+
+    from src.signals.decision_firewall import DecisionFirewall
+
+    fw = DecisionFirewall({
+        "enable_predictive_derisk": False,
+        "funding_risk_enabled": False,
+        "cooldown_seconds": 0,
+        "same_side_cooldown_seconds": 0,
+        "market_side_guard_enabled": True,
+        "market_side_guard_min_confidence": 0.60,
+    })
+    signal = MockSignal(side_val="long", confidence=0.8, strategy_type="momentum_long")
+
+    passed, reason = fw.validate(
+        signal,
+        regime_data={"overall_regime": "bearish", "overall_confidence": 0.74},
+        open_positions=[],
+        account_balance=1000000,
+    )
+
+    assert passed is False
+    assert "blocks long" in reason.lower()
+    assert signal.context["market_side_alignment"]["direction"] == "short"
+
+
+@patch("src.signals.decision_firewall.db")
 def test_firewall_rejects_max_positions(mock_db):
     """Should reject when max positions reached."""
     mock_db.get_open_paper_trades.return_value = [

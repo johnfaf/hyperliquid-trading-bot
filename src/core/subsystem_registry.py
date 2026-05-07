@@ -437,6 +437,12 @@ def build_subsystems(
             "short_hardening_coin_block_net_pnl": float(
                 getattr(_fw_cfg, "SHORT_HARDENING_COIN_BLOCK_NET_PNL", -0.25)
             ),
+            "market_side_guard_enabled": bool(
+                getattr(_fw_cfg, "FIREWALL_MARKET_SIDE_GUARD_ENABLED", True)
+            ),
+            "market_side_guard_min_confidence": float(
+                getattr(_fw_cfg, "FIREWALL_MARKET_SIDE_GUARD_MIN_CONFIDENCE", 0.60)
+            ),
             "cooldown_seconds": int(getattr(_fw_cfg, "FIREWALL_COIN_COOLDOWN_SECONDS", 180)),
             "same_side_cooldown_seconds": int(
                 getattr(_fw_cfg, "FIREWALL_SAME_SIDE_COOLDOWN_SECONDS", 900)
