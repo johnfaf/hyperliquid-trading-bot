@@ -106,12 +106,20 @@ POSTGRES_APP_NAME = os.environ.get("POSTGRES_APP_NAME", "hyperliquid-bot").strip
 READINESS_DB_AUDIT_ENABLED = os.environ.get(
     "READINESS_DB_AUDIT_ENABLED", "true"
 ).lower() in ("true", "1", "yes")
+READINESS_DB_AUDIT_AUTO_REPAIR = os.environ.get(
+    "READINESS_DB_AUDIT_AUTO_REPAIR", "true"
+).lower() in ("true", "1", "yes")
 READINESS_DB_AUDIT_TTL_S = int(os.environ.get("READINESS_DB_AUDIT_TTL_S", 300))
 READINESS_DB_AUDIT_BLOCK_SEVERITY = os.environ.get(
     "READINESS_DB_AUDIT_BLOCK_SEVERITY", "high"
 ).strip().lower()
 if READINESS_DB_AUDIT_BLOCK_SEVERITY not in {"low", "medium", "high", "critical"}:
     READINESS_DB_AUDIT_BLOCK_SEVERITY = "high"
+DB_AUDIT_CANDLE_CACHE_MISSING_ACTIVE_SEVERITY = os.environ.get(
+    "DB_AUDIT_CANDLE_CACHE_MISSING_ACTIVE_SEVERITY", "medium"
+).strip().lower()
+if DB_AUDIT_CANDLE_CACHE_MISSING_ACTIVE_SEVERITY not in {"low", "medium", "high", "critical"}:
+    DB_AUDIT_CANDLE_CACHE_MISSING_ACTIVE_SEVERITY = "medium"
 DB_AUDIT_PENDING_DECISION_MAX_AGE_MINUTES = float(
     os.environ.get("DB_AUDIT_PENDING_DECISION_MAX_AGE_MINUTES", 30.0)
 )
@@ -886,6 +894,9 @@ SOURCE_POLICY_STRONG_RECENT_PNL_FLOOR = _safe_env_float(
 # Runtime readiness / incident monitoring.
 READINESS_STALE_SECONDS = int(os.environ.get("READINESS_STALE_SECONDS", 600))
 READINESS_DB_WRITE_TTL_S = int(os.environ.get("READINESS_DB_WRITE_TTL_S", 60))
+READINESS_REQUIRE_HEALTH_REGISTRY = os.environ.get(
+    "READINESS_REQUIRE_HEALTH_REGISTRY", "false"
+).lower() in ("true", "1", "yes")
 READINESS_ALERT_COOLDOWN_S = int(
     os.environ.get("READINESS_ALERT_COOLDOWN_S", 900)
 )

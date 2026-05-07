@@ -1012,11 +1012,17 @@ def _candle_cache_checks(
                 minimum=min_coin_count,
             )
         if missing_active:
+            severity = str(
+                getattr(config, "DB_AUDIT_CANDLE_CACHE_MISSING_ACTIVE_SEVERITY", "medium")
+                or "medium"
+            ).strip().lower()
+            if severity not in SEVERITY_ORDER:
+                severity = "medium"
             _add(
                 findings,
                 "candle_cache_missing_active_coins",
-                "high",
-                "Open/active coins are missing from the candle cache.",
+                severity,
+                "Open/active coins are missing from the candle cache; backtests may need to refresh data.",
                 missing_active_coins=missing_active,
             )
     finally:

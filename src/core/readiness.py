@@ -25,6 +25,15 @@ _DB_WRITE_PROBE_CACHE: Dict[str, Any] = {"ts": 0.0, "ok": False, "error": ""}
 _DB_AUDIT_CACHE: Dict[str, Any] = {"ts": 0.0, "ok": True, "report": {}, "blockers": []}
 _DB_WRITE_PROBE_CACHE_LOCK = threading.Lock()
 _DB_AUDIT_CACHE_LOCK = threading.Lock()
+_DB_AUDIT_SAFE_REPAIR_CHECKS = {
+    "paper_account_singleton",
+    "paper_account_trade_count",
+    "paper_account_winning_trades",
+    "paper_account_total_pnl",
+    "stale_pending_decisions",
+    "source_health_history",
+    "stale_non_active_regime_history",
+}
 
 
 def _probe_db_readable() -> tuple[bool, str]:
@@ -94,6 +103,28 @@ def _probe_db_audit(ttl_s: Optional[int] = None) -> tuple[bool, Dict[str, Any], 
         report = run_db_audit(include_candle_cache=True, include_code_scan=False)
         payload = report.to_dict(block_severity=block_severity)
         blockers = [finding.to_dict() for finding in report.findings_at_or_above(block_severity)]
+
+        if (
+            blockers
+            and bool(getattr(config, "READINESS_DB_AUDIT_AUTO_REPAIR", True))
+            and any(str(item.get("check", "")) in _DB_AUDIT_SAFE_REPAIR_CHECKS for item in blockers)
+        ):
+            try:
+                from src.data.db_audit import run_startup_safe_repair
+
+                actions = run_startup_safe_repair()
+                report = run_db_audit(include_candle_cache=True, include_code_scan=False)
+                payload = report.to_dict(block_severity=block_severity)
+                payload["auto_repair_actions"] = [action.to_dict() for action in actions]
+                blockers = [
+                    finding.to_dict()
+                    for finding in report.findings_at_or_above(block_severity)
+                ]
+                if not blockers:
+                    logger.info("Readiness DB audit auto-repair cleared blocking findings")
+            except Exception as repair_exc:
+                payload["auto_repair_error"] = str(repair_exc)
+                logger.warning("Readiness DB audit auto-repair failed: %s", repair_exc)
         ok = not blockers
     except Exception as exc:
         payload = {
@@ -115,6 +146,17 @@ def _probe_db_audit(ttl_s: Optional[int] = None) -> tuple[bool, Dict[str, Any], 
     with _DB_AUDIT_CACHE_LOCK:
         _DB_AUDIT_CACHE.update({"ts": now, "ok": ok, "report": payload, "blockers": blockers})
     return ok, payload, blockers
+
+
+def _resolve_health_registry(health_registry: Optional[Any]) -> tuple[Optional[Any], str]:
+    if health_registry is not None:
+        return health_registry, "provided"
+    try:
+        from src.core.health_registry import registry as global_registry
+
+        return global_registry, "global"
+    except Exception:
+        return None, "missing"
 
 
 def evaluate_readiness(
@@ -165,6 +207,7 @@ def evaluate_readiness(
             reasons.append(f"db_audit_{severity}:{check}")
 
     # Health registry / subsystem readiness
+    health_registry, health_registry_source = _resolve_health_registry(health_registry)
     subsystem_safe = None
     stale_trading = []
     at_risk_trading = []
@@ -174,6 +217,15 @@ def evaluate_readiness(
             stale_map = health_registry.check_stale(timeout_seconds=stale_s)
             statuses = health_registry.get_all()
             subsystem_safe = bool(health_registry.is_all_trading_safe())
+            checks["health_registry_present"] = True
+            checks["health_registry_source"] = health_registry_source
+            checks["health_registry_subsystem_count"] = len(statuses)
+            if (
+                not statuses
+                and bool(getattr(config, "READINESS_REQUIRE_HEALTH_REGISTRY", False))
+            ):
+                subsystem_safe = False
+                reasons.append("health_registry_unavailable")
             for name, status in statuses.items():
                 subsystem_states[name] = status.state.value
                 if status.affects_trading and stale_map.get(name):
@@ -186,8 +238,13 @@ def evaluate_readiness(
             subsystem_safe = False
             reasons.append(f"health_registry_error:{str(exc)[:160]}")
     else:
-        subsystem_safe = False
-        reasons.append("health_registry_unavailable")
+        require_registry = bool(getattr(config, "READINESS_REQUIRE_HEALTH_REGISTRY", False))
+        subsystem_safe = not require_registry
+        checks["health_registry_present"] = False
+        checks["health_registry_source"] = "missing"
+        checks["health_registry_subsystem_count"] = 0
+        if require_registry:
+            reasons.append("health_registry_unavailable")
 
     checks["subsystems_safe"] = bool(subsystem_safe)
     checks["stale_trading_subsystems"] = sorted(set(stale_trading))
