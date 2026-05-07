@@ -107,7 +107,18 @@ def test_dashboard_summary_fragments_render_without_full_layout(client):
 
 def test_dashboard_websocket_connects_without_auth_token(client):
     with client.websocket_connect("/ws") as ws:
-        assert ws.receive_json() == {"kind": "hello", "ok": True}
+        hello = ws.receive_json()
+        assert hello["kind"] == "hello"
+        assert hello["ok"] is True
+        assert "ts" in hello
+
+
+def test_dashboard_websocket_heartbeat_interval_is_below_common_proxy_idle(monkeypatch):
+    from src.ui.v2.routers import stream
+
+    monkeypatch.delenv("DASHBOARD_V2_WS_HEARTBEAT_SECONDS", raising=False)
+
+    assert stream._heartbeat_seconds() == 15.0
 
 
 def test_dashboard_websocket_honors_public_read(monkeypatch):
@@ -117,7 +128,9 @@ def test_dashboard_websocket_honors_public_read(monkeypatch):
     app = create_app()
     with TestClient(app) as authed_read_client:
         with authed_read_client.websocket_connect("/ws") as ws:
-            assert ws.receive_json() == {"kind": "hello", "ok": True}
+            hello = ws.receive_json()
+            assert hello["kind"] == "hello"
+            assert hello["ok"] is True
 
 
 def test_dashboard_websocket_rejects_when_private_and_no_cookie(monkeypatch):

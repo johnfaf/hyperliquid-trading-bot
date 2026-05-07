@@ -79,6 +79,8 @@
       let socket = null;
       let retry = 0;
       let stopped = false;
+      let lastMessageAt = 0;
+      let staleTimer = null;
 
       function setStatus(label, tone) {
         if (!status) return;
@@ -111,6 +113,7 @@
         }
         socket.onopen = () => {
           retry = 0;
+          lastMessageAt = Date.now();
           setStatus('ws: live', 'live');
         };
         socket.onclose = (ev) => {
@@ -125,6 +128,8 @@
           setStatus('ws: error', 'down');
         };
         socket.onmessage = (ev) => {
+          lastMessageAt = Date.now();
+          setStatus('ws: live', 'live');
           try {
             const data = JSON.parse(ev.data);
             // Trigger HTMX refresh on tagged sections.
@@ -145,8 +150,14 @@
 
       window.addEventListener('beforeunload', () => {
         stopped = true;
+        if (staleTimer) clearInterval(staleTimer);
         if (socket) socket.close();
       });
+      staleTimer = setInterval(() => {
+        if (stopped || !lastMessageAt || !socket || socket.readyState !== WebSocket.OPEN) return;
+        const idleMs = Date.now() - lastMessageAt;
+        if (idleMs > 45000) setStatus('ws: idle', 'warn');
+      }, 10000);
       connect();
     })();
 

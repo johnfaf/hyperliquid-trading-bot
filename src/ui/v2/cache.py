@@ -41,7 +41,7 @@ def get_ttl(key: Hashable, ttl_s: float, builder: Callable[[], Any]) -> Any:
     value = builder()
     if ttl > 0:
         with _LOCK:
-            _CACHE[key] = _CacheEntry(now + ttl, deepcopy(value))
+            _CACHE[key] = _CacheEntry(time.monotonic() + ttl, deepcopy(value))
     return deepcopy(value)
 
 

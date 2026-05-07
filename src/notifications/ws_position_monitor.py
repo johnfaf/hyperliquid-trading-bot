@@ -191,6 +191,10 @@ class PositionMonitor:
             self._idle_rest_only_interval_s,
             float(getattr(config, "POSITION_MONITOR_INACTIVE_REST_ONLY_S", 900.0)),
         )
+        self._inactive_active_reconnect_s = max(
+            1.0,
+            float(getattr(config, "POSITION_MONITOR_INACTIVE_ACTIVE_RECONNECT_S", 10.0)),
+        )
         self._rest_fallback_thread = None
         self._reconnect_delay_override_s: Optional[float] = None
         self._reconnect_reason: Optional[str] = None
@@ -487,6 +491,41 @@ class PositionMonitor:
             reason,
         )
 
+    def _has_active_cached_positions_locked(self) -> bool:
+        """Return True when REST/bootstrap saw positions that still need streaming."""
+        return bool(self._active_position_addresses) or any(
+            bool(positions) for positions in self._position_cache.values()
+        )
+
+    def _handle_inactive_close(self, reason: str) -> None:
+        """Handle Hyperliquid's idle close without hiding active positions.
+
+        Hyperliquid can close a quiet userEvents stream as "Inactive" even
+        while tracked traders still have open positions. Treat that as a
+        subscription refresh, not a 15-minute REST-only parking brake.
+        """
+        with self._lock:
+            has_active_positions = self._has_active_cached_positions_locked()
+            if has_active_positions:
+                self._transport_mode = "reconnecting"
+                self._transport_reason = reason
+                self._rest_only_until_ts = 0.0
+
+        if has_active_positions:
+            self._request_fast_reconnect(
+                reason,
+                delay_s=self._inactive_active_reconnect_s,
+                wake=False,
+            )
+            logger.info(
+                "PositionMonitor inactive stream has active cached positions; "
+                "refreshing subscription in %.1fs while REST fallback stays active",
+                self._inactive_active_reconnect_s,
+            )
+            return
+
+        self._schedule_idle_rest_only(reason)
+
     def _enter_idle_rest_only_mode(self, reason: str) -> None:
         """Pause websocket churn when no tracked traders currently have positions.
 
@@ -718,9 +757,16 @@ class PositionMonitor:
         expired = "expired" in error_text.lower()
         if self._running:
             if inactive:
-                logger.info(
-                    "PositionMonitor inactive WebSocket stream detected; relying on REST fallback"
-                )
+                with self._lock:
+                    has_active_positions = self._has_active_cached_positions_locked()
+                if has_active_positions:
+                    logger.info(
+                        "PositionMonitor inactive WebSocket stream detected; refreshing active subscription"
+                    )
+                else:
+                    logger.info(
+                        "PositionMonitor inactive WebSocket stream detected; relying on REST fallback"
+                    )
             elif expired:
                 logger.info(
                     "PositionMonitor WebSocket session expired; refreshing subscription"
@@ -733,7 +779,7 @@ class PositionMonitor:
         if expired:
             self._request_fast_reconnect("expired WebSocket session")
         elif inactive:
-            self._schedule_idle_rest_only("inactive userEvents stream")
+            self._handle_inactive_close("inactive userEvents stream")
 
     def _on_close(self, ws, close_status_code=None, close_msg=None) -> None:
         """Handle WebSocket closure."""
@@ -752,7 +798,7 @@ class PositionMonitor:
         if expired:
             self._request_fast_reconnect("expired WebSocket session")
         elif inactive:
-            self._schedule_idle_rest_only("inactive userEvents stream")
+            self._handle_inactive_close("inactive userEvents stream")
         if self._running:
             logger.info(f"PositionMonitor WebSocket closed (code={close_status_code})")
 

@@ -9,6 +9,7 @@ import logging
 import os
 
 from fastapi import APIRouter
+from starlette.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
 
 from src.ui.v2.cache import get_ttl
@@ -40,10 +41,10 @@ async def ready() -> JSONResponse:
     state at a glance.
     """
     try:
-        result = get_ttl(
+        result = await run_in_threadpool(
+            _cached_readiness,
             "dashboard_ready",
             _cache_ttl("DASHBOARD_V2_HEALTH_CACHE_SECONDS", 5.0),
-            _evaluate_readiness,
         )
     except Exception as exc:
         logger.warning("readiness check failed: %s", exc)
@@ -69,10 +70,13 @@ async def health_strip() -> JSONResponse:
     """
     payload: dict = {"tone": "amber", "label": "unknown", "summary": "no data", "reasons": []}
     try:
-        result = get_ttl(
-            "dashboard_ready",
-            _cache_ttl("DASHBOARD_V2_HEALTH_CACHE_SECONDS", 5.0),
-            _evaluate_readiness,
+        result = await run_in_threadpool(
+            _cached_readiness,
+            "dashboard_health_strip",
+            _cache_ttl(
+                "DASHBOARD_V2_HEALTH_STRIP_CACHE_SECONDS",
+                _cache_ttl("DASHBOARD_V2_HEALTH_CACHE_SECONDS", 5.0),
+            ),
         ) or {}
     except Exception as exc:
         logger.warning("health strip readiness failed: %s", exc)
@@ -108,6 +112,10 @@ async def health_strip() -> JSONResponse:
             "reasons": reasons[:5],
         }
     return JSONResponse(payload)
+
+
+def _cached_readiness(key: str, ttl_s: float) -> dict:
+    return get_ttl(key, ttl_s, _evaluate_readiness)
 
 
 def _evaluate_readiness() -> dict:

@@ -25,6 +25,7 @@ _DB_WRITE_PROBE_CACHE: Dict[str, Any] = {"ts": 0.0, "ok": False, "error": ""}
 _DB_AUDIT_CACHE: Dict[str, Any] = {"ts": 0.0, "ok": True, "report": {}, "blockers": []}
 _DB_WRITE_PROBE_CACHE_LOCK = threading.Lock()
 _DB_AUDIT_CACHE_LOCK = threading.Lock()
+_DB_AUDIT_BUILD_LOCK = threading.Lock()
 _DB_AUDIT_SAFE_REPAIR_CHECKS = {
     "paper_account_singleton",
     "paper_account_trade_count",
@@ -96,55 +97,67 @@ def _probe_db_audit(ttl_s: Optional[int] = None) -> tuple[bool, Dict[str, Any], 
                 list(_DB_AUDIT_CACHE.get("blockers", []) or []),
             )
 
-    block_severity = str(getattr(config, "READINESS_DB_AUDIT_BLOCK_SEVERITY", "high")).lower()
-    try:
-        from src.data.db_audit import run_db_audit
+    with _DB_AUDIT_BUILD_LOCK:
+        now = time.time()
+        with _DB_AUDIT_CACHE_LOCK:
+            if now - float(_DB_AUDIT_CACHE.get("ts", 0.0) or 0.0) < ttl:
+                return (
+                    bool(_DB_AUDIT_CACHE.get("ok", True)),
+                    dict(_DB_AUDIT_CACHE.get("report", {}) or {}),
+                    list(_DB_AUDIT_CACHE.get("blockers", []) or []),
+                )
 
-        report = run_db_audit(include_candle_cache=True, include_code_scan=False)
-        payload = report.to_dict(block_severity=block_severity)
-        blockers = [finding.to_dict() for finding in report.findings_at_or_above(block_severity)]
+        block_severity = str(getattr(config, "READINESS_DB_AUDIT_BLOCK_SEVERITY", "high")).lower()
+        try:
+            from src.data.db_audit import run_db_audit
 
-        if (
-            blockers
-            and bool(getattr(config, "READINESS_DB_AUDIT_AUTO_REPAIR", True))
-            and any(str(item.get("check", "")) in _DB_AUDIT_SAFE_REPAIR_CHECKS for item in blockers)
-        ):
-            try:
-                from src.data.db_audit import run_startup_safe_repair
+            report = run_db_audit(include_candle_cache=True, include_code_scan=False)
+            payload = report.to_dict(block_severity=block_severity)
+            blockers = [finding.to_dict() for finding in report.findings_at_or_above(block_severity)]
 
-                actions = run_startup_safe_repair()
-                report = run_db_audit(include_candle_cache=True, include_code_scan=False)
-                payload = report.to_dict(block_severity=block_severity)
-                payload["auto_repair_actions"] = [action.to_dict() for action in actions]
-                blockers = [
-                    finding.to_dict()
-                    for finding in report.findings_at_or_above(block_severity)
-                ]
-                if not blockers:
-                    logger.info("Readiness DB audit auto-repair cleared blocking findings")
-            except Exception as repair_exc:
-                payload["auto_repair_error"] = str(repair_exc)
-                logger.warning("Readiness DB audit auto-repair failed: %s", repair_exc)
-        ok = not blockers
-    except Exception as exc:
-        payload = {
-            "enabled": True,
-            "ok": False,
-            "error": str(exc),
-            "finding_count": 1,
-        }
-        blockers = [
-            {
-                "check": "db_audit_runtime",
-                "severity": "critical",
-                "message": "Database audit failed to run.",
-                "details": {"error": str(exc)},
+            if (
+                blockers
+                and bool(getattr(config, "READINESS_DB_AUDIT_AUTO_REPAIR", True))
+                and any(str(item.get("check", "")) in _DB_AUDIT_SAFE_REPAIR_CHECKS for item in blockers)
+            ):
+                try:
+                    from src.data.db_audit import run_startup_safe_repair
+
+                    actions = run_startup_safe_repair()
+                    report = run_db_audit(include_candle_cache=True, include_code_scan=False)
+                    payload = report.to_dict(block_severity=block_severity)
+                    payload["auto_repair_actions"] = [action.to_dict() for action in actions]
+                    blockers = [
+                        finding.to_dict()
+                        for finding in report.findings_at_or_above(block_severity)
+                    ]
+                    if not blockers:
+                        logger.info("Readiness DB audit auto-repair cleared blocking findings")
+                except Exception as repair_exc:
+                    payload["auto_repair_error"] = str(repair_exc)
+                    logger.warning("Readiness DB audit auto-repair failed: %s", repair_exc)
+            ok = not blockers
+        except Exception as exc:
+            payload = {
+                "enabled": True,
+                "ok": False,
+                "error": str(exc),
+                "finding_count": 1,
             }
-        ]
-        ok = False
+            blockers = [
+                {
+                    "check": "db_audit_runtime",
+                    "severity": "critical",
+                    "message": "Database audit failed to run.",
+                    "details": {"error": str(exc)},
+                }
+            ]
+            ok = False
 
-    with _DB_AUDIT_CACHE_LOCK:
-        _DB_AUDIT_CACHE.update({"ts": now, "ok": ok, "report": payload, "blockers": blockers})
+        with _DB_AUDIT_CACHE_LOCK:
+            _DB_AUDIT_CACHE.update(
+                {"ts": time.time(), "ok": ok, "report": payload, "blockers": blockers}
+            )
     return ok, payload, blockers
 
 
