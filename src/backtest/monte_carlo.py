@@ -136,6 +136,14 @@ class MonteCarloSimulator:
         method = str(getattr(cfg, "bootstrap_method", "stationary_block") or "stationary_block").lower()
         if method == "iid" or n <= 1:
             return rng.choice(trade_returns, size=trades_per_path, replace=True)
+        if method in {"block", "block_bootstrap"}:
+            block_size = max(int(getattr(cfg, "block_size", 10) or 10), 1)
+            chunks = []
+            while sum(len(chunk) for chunk in chunks) < trades_per_path:
+                start = int(rng.integers(0, n))
+                idx = (np.arange(block_size) + start) % n
+                chunks.append(trade_returns[idx])
+            return np.concatenate(chunks)[:trades_per_path]
 
         block_size = max(int(getattr(cfg, "block_size", 10) or 10), 1)
         restart_probability = min(1.0, 1.0 / block_size)

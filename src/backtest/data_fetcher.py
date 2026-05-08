@@ -246,21 +246,45 @@ class DataFetcher:
             if not raw:
                 break
 
+            malformed = 0
+            chunk_valid_last_ts = 0
             for c in raw:
-                ts = c.get("t", c.get("T", 0))
-                candle = Candle(
-                    timestamp_ms=int(ts),
-                    open=float(c.get("o", c.get("O", 0))),
-                    high=float(c.get("h", c.get("H", 0))),
-                    low=float(c.get("l", c.get("L", 0))),
-                    close=float(c.get("c", c.get("C", 0))),
-                    volume=float(c.get("v", c.get("V", 0))),
-                    coin=coin,
-                    timeframe=timeframe,
+                try:
+                    if not isinstance(c, dict):
+                        raise TypeError(f"expected dict, got {type(c).__name__}")
+                    ts = c.get("t", c.get("T", 0))
+                    candle = Candle(
+                        timestamp_ms=int(ts),
+                        open=float(c.get("o", c.get("O", 0))),
+                        high=float(c.get("h", c.get("H", 0))),
+                        low=float(c.get("l", c.get("L", 0))),
+                        close=float(c.get("c", c.get("C", 0))),
+                        volume=float(c.get("v", c.get("V", 0))),
+                        coin=coin,
+                        timeframe=timeframe,
+                    )
+                    if candle.timestamp_ms <= 0 or candle.high < candle.low or candle.close <= 0:
+                        raise ValueError("invalid OHLCV values")
+                    all_candles.append(candle)
+                    chunk_valid_last_ts = max(chunk_valid_last_ts, candle.timestamp_ms)
+                except Exception as exc:
+                    malformed += 1
+                    logger.debug(
+                        "Skipping malformed candle for %s %s chunk %s->%s: %s row=%r",
+                        coin, timeframe, chunk_start, chunk_end, exc, c,
+                    )
+            if malformed:
+                logger.warning(
+                    "Skipped %d malformed candle row(s) for %s %s chunk %s->%s",
+                    malformed, coin, timeframe, chunk_start, chunk_end,
                 )
-                all_candles.append(candle)
 
-            last_ts = int(raw[-1].get("t", raw[-1].get("T", 0)))
+            if chunk_valid_last_ts <= 0:
+                raise RuntimeError(
+                    f"Hyperliquid returned no valid candles for {coin} {timeframe} "
+                    f"chunk {chunk_start}->{chunk_end}"
+                )
+            last_ts = chunk_valid_last_ts
             chunk_start = last_ts + interval_ms
 
         # Deduplicate and sort

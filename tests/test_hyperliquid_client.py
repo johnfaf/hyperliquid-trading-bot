@@ -84,3 +84,38 @@ def test_get_user_state_skips_positions_with_invalid_entry_price(monkeypatch, ca
     assert state is not None
     assert state["positions"] == []
     assert "entryPx" in caplog.text
+
+
+def test_get_user_fills_normalizes_hyperliquid_side_codes(monkeypatch):
+    monkeypatch.setattr(
+        hl,
+        "_post",
+        lambda payload, priority=None, retries=3: [
+            {
+                "coin": "BTC",
+                "side": "B",
+                "px": "50000",
+                "sz": "0.1",
+                "time": "1",
+                "fee": "0.01",
+                "dir": "Open Long",
+                "closedPnl": "0",
+                "hash": "h1",
+            },
+            {
+                "coin": "BTC",
+                "side": "A",
+                "px": "50100",
+                "sz": "0.1",
+                "time": "2",
+                "fee": "0.01",
+                "dir": "Close Long",
+                "closedPnl": "10",
+                "hash": "h2",
+            },
+        ],
+    )
+
+    fills = hl.get_user_fills("0x1234567890abcdef1234567890abcdef12345678")
+
+    assert [f["side"] for f in fills] == ["buy", "sell"]

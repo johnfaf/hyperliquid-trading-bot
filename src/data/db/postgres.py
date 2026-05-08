@@ -62,8 +62,9 @@ def get_postgres_config_error(backend: str, dsn: str) -> str:
     dsn = (dsn or "").strip()
     if not dsn:
         return (
-            "POSTGRES_DSN is required when DB_BACKEND is 'postgres' or 'dualwrite'. "
-            "Set it to a managed Postgres connection string such as "
+            "A Postgres connection string is required when DB_BACKEND is "
+            "'postgres' or 'dualwrite'. Set POSTGRES_DSN or Railway's "
+            "DATABASE_URL/DATABASE_PRIVATE_URL to a managed Postgres string such as "
             "postgresql://user:pass@host:5432/dbname?sslmode=require"
         )
 
@@ -95,6 +96,7 @@ def _get_pool():
         config_error = get_postgres_config_error(config.DB_BACKEND, dsn)
         if config_error:
             raise RuntimeError(config_error)
+        dsn_host = _extract_dsn_host(dsn)
 
         try:
             from psycopg_pool import ConnectionPool
@@ -116,7 +118,9 @@ def _get_pool():
                 open=True,
             )
             logger.info(
-                "Postgres pool opened: min=%d max=%d app=%s",
+                "Postgres pool opened: host=%s source=%s min=%d max=%d app=%s",
+                dsn_host or "unknown",
+                getattr(config, "POSTGRES_DSN_SOURCE", "POSTGRES_DSN") or "POSTGRES_DSN",
                 config.POSTGRES_POOL_MIN,
                 config.POSTGRES_POOL_MAX,
                 config.POSTGRES_APP_NAME,

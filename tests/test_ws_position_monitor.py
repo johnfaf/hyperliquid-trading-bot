@@ -122,7 +122,25 @@ def test_transient_ws_close_error_detection_rejects_generic_error():
     assert not PositionMonitor._is_transient_ws_close_error("ssl cert verify failed")
 
 
-def test_on_error_logs_info_for_transient_inactive_close(caplog):
+def test_on_error_reconnects_quickly_for_inactive_active_stream(caplog):
+    monitor = PositionMonitor()
+    monitor._running = True
+    monitor._inactive_rest_only_interval_s = 123.0
+    monitor._inactive_active_reconnect_s = 7.0
+    monitor._active_position_addresses = {"0x" + "1" * 40}
+
+    with caplog.at_level(logging.INFO):
+        monitor._on_error(None, "fin=1 opcode=8 data=b'\\x03\\xe8Inactive' - goodbye")
+
+    wait, reason = monitor._consume_reconnect_wait()
+    assert wait == 7.0
+    assert reason == "inactive userEvents stream"
+    assert monitor.get_stats()["transport_mode"] == "reconnecting"
+    assert "refreshing active subscription" in caplog.text.lower()
+    assert "rest-only mode" not in caplog.text.lower()
+
+
+def test_on_error_uses_rest_only_for_inactive_flat_stream(caplog):
     monitor = PositionMonitor()
     monitor._running = True
     monitor._inactive_rest_only_interval_s = 123.0
@@ -133,6 +151,7 @@ def test_on_error_logs_info_for_transient_inactive_close(caplog):
     wait, reason = monitor._consume_reconnect_wait()
     assert wait == 123.0
     assert reason == "inactive userEvents stream"
+    assert monitor.get_stats()["transport_mode"] == "rest_only"
     assert "rest-only mode" in caplog.text.lower()
 
 
@@ -174,6 +193,23 @@ def test_on_close_inactive_requests_idle_rest_only_wait(caplog):
     assert monitor._subscribed_addresses == set()
     assert monitor._reconnect_wake_event.is_set() is False
     assert "rest-only mode" in caplog.text.lower()
+
+
+def test_on_close_inactive_with_active_positions_reconnects_quickly(caplog):
+    monitor = PositionMonitor()
+    monitor._running = True
+    monitor._inactive_rest_only_interval_s = 321.0
+    monitor._inactive_active_reconnect_s = 6.0
+    monitor._active_position_addresses = {"0x" + "4" * 40}
+
+    with caplog.at_level(logging.INFO):
+        monitor._on_close(None, None, "Inactive")
+
+    wait, reason = monitor._consume_reconnect_wait()
+    assert wait == 6.0
+    assert reason == "inactive userEvents stream"
+    assert monitor.get_stats()["transport_mode"] == "reconnecting"
+    assert "refreshing subscription" in caplog.text.lower()
 
 
 def test_note_disconnect_preserves_backoff_for_short_lived_flaps(monkeypatch):

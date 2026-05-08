@@ -70,6 +70,32 @@ def _safe_int(value: Any, default: int = 0) -> int:
         return default
 
 
+def normalize_fill_side(side: Any, direction: Any = "") -> str:
+    """Normalize Hyperliquid fill side codes to semantic buy/sell values."""
+    raw = str(side or "").strip().lower()
+    if raw in {"b", "buy", "bid"}:
+        return "buy"
+    if raw in {"a", "ask", "s", "sell"}:
+        return "sell"
+
+    direction_text = str(direction or "").strip().lower()
+    if ">" in direction_text:
+        target = direction_text.split(">")[-1].strip()
+        if "long" in target:
+            return "buy"
+        if "short" in target:
+            return "sell"
+    if "open long" in direction_text or "close short" in direction_text:
+        return "buy"
+    if "open short" in direction_text or "close long" in direction_text:
+        return "sell"
+    if raw == "long":
+        return "buy"
+    if raw == "short":
+        return "sell"
+    return ""
+
+
 def mask_display_name(value: Any) -> Optional[str]:
     """Return a fixed redaction for human-readable labels from public leaderboards."""
     if not isinstance(value, str):
@@ -323,16 +349,17 @@ def get_user_fills(address: str, start_time: Optional[int] = None):
     for fill in data:
         if not isinstance(fill, dict):
             continue
+        direction = fill.get("dir", "")
         fills.append({
             "coin": fill.get("coin", ""),
-            "side": fill.get("side", "").lower(),
+            "side": normalize_fill_side(fill.get("side", ""), direction),
             "price": _safe_float(fill.get("px", 0)),
             "size": _safe_float(fill.get("sz", 0)),
             "time": _safe_int(fill.get("time", 0)),
             "fee": _safe_float(fill.get("fee", 0)),
             "is_liquidation": fill.get("liquidation", False),
             "start_position": fill.get("startPosition", ""),
-            "direction": fill.get("dir", ""),
+            "direction": direction,
             "closed_pnl": _safe_float(fill.get("closedPnl", 0)),
             "hash": fill.get("hash", ""),
             "oid": _safe_int(fill.get("oid", 0)),

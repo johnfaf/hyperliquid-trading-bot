@@ -333,6 +333,93 @@ def _float_or_default(value, default=0.0) -> float:
         return float(default)
 
 
+_BULLISH_REGIMES = {"trending_up", "bullish", "bull", "uptrend", "trend_up", "risk_on"}
+_BEARISH_REGIMES = {
+    "trending_down",
+    "bearish",
+    "bear",
+    "downtrend",
+    "trend_down",
+    "crash",
+    "panic",
+    "risk_off",
+}
+
+
+def _normalise_coin_regime(item: dict) -> str:
+    return str(
+        item.get("regime")
+        or item.get("predicted_regime")
+        or item.get("overall_regime")
+        or ""
+    ).strip().lower()
+
+
+def _direction_from_coin_item(
+    item: dict,
+    *,
+    min_conf: float,
+    min_momentum: float,
+    min_volume_ratio: float,
+) -> str:
+    confidence = _float_or_default(item.get("confidence"), 0.0)
+    if confidence <= 0:
+        confidence = _float_or_default(item.get("regime_confidence"), 0.0)
+    momentum = _float_or_default(item.get("momentum"), 0.0)
+    trend_direction = _float_or_default(item.get("trend_direction"), 0.0)
+    volume_ratio = _float_or_default(item.get("volume_ratio"), 1.0)
+    regime = _normalise_coin_regime(item)
+
+    if confidence < min_conf or volume_ratio < min_volume_ratio:
+        return ""
+    if momentum >= min_momentum or trend_direction >= min_momentum or regime in _BULLISH_REGIMES:
+        return "up"
+    if momentum <= -min_momentum or trend_direction <= -min_momentum or regime in _BEARISH_REGIMES:
+        return "down"
+    return ""
+
+
+def _apply_directional_strategy_guidance(
+    regime_data: dict,
+    *,
+    direction: str,
+    block_side: str,
+    agreeing: list[str],
+    min_agree: int,
+    reason: str,
+) -> dict:
+    guidance = copy.deepcopy(regime_data.get("strategy_guidance", {}) or {})
+    pause = set(guidance.get("pause", []) or [])
+    activate = set(guidance.get("activate", []) or [])
+    if direction == "up":
+        pause.update({"momentum_short", "contrarian", "mean_reversion", "scalping", "short_momentum"})
+        activate.update({"momentum_long", "trend_following", "breakout"})
+    else:
+        pause.update({"momentum_long", "trend_following", "breakout", "contrarian", "mean_reversion", "scalping"})
+        activate.update({"momentum_short", "short_momentum"})
+
+    guidance["pause"] = sorted(pause)
+    guidance["activate"] = sorted(activate)
+    regime_data["strategy_guidance"] = guidance
+    regime_data["countertrend_block_side"] = block_side
+    regime_data["global_momentum_override"] = {
+        "direction": direction,
+        "block_side": block_side,
+        "agreeing_coins": agreeing,
+        "min_agreeing_coins": min_agree,
+        "reason": reason,
+    }
+
+    logger.warning(
+        "  GLOBAL MOMENTUM OVERRIDE: %s across %s -- blocking %s entries (%s)",
+        direction.upper(),
+        ",".join(agreeing),
+        block_side,
+        reason,
+    )
+    return regime_data
+
+
 def _apply_global_momentum_override(container, regime_data: dict) -> dict:
     """Block countertrend entries when the major coins agree directionally."""
     if not getattr(config, "GLOBAL_MOMENTUM_OVERRIDE_ENABLED", True):
@@ -360,17 +447,15 @@ def _apply_global_momentum_override(container, regime_data: dict) -> dict:
         item = dict(per_coin.get(coin, {}) or {})
         if not item:
             continue
-        confidence = _float_or_default(item.get("confidence"), 0.0)
-        if confidence <= 0:
-            confidence = _float_or_default(item.get("regime_confidence"), 0.0)
-        momentum = _float_or_default(item.get("momentum"), 0.0)
-        volume_ratio = _float_or_default(item.get("volume_ratio"), 1.0)
-        regime = str(item.get("regime") or "").lower()
-        if confidence < min_conf or volume_ratio < min_volume_ratio:
-            continue
-        if momentum >= min_momentum or regime in {"trending_up", "bullish"}:
+        item_direction = _direction_from_coin_item(
+            item,
+            min_conf=min_conf,
+            min_momentum=min_momentum,
+            min_volume_ratio=min_volume_ratio,
+        )
+        if item_direction == "up":
             bullish.append(coin)
-        elif momentum <= -min_momentum or regime in {"trending_down", "bearish"}:
+        elif item_direction == "down":
             bearish.append(coin)
 
     direction = ""
@@ -385,35 +470,35 @@ def _apply_global_momentum_override(container, regime_data: dict) -> dict:
         agreeing = bearish
         block_side = "long"
 
+    reason = "core_coin_consensus"
+    if not direction and bool(getattr(config, "BTC_MARKET_LEADER_GUARD_ENABLED", True)):
+        leader_coin = str(getattr(config, "BTC_MARKET_LEADER_COIN", "BTC") or "BTC").strip().upper()
+        leader_item = dict(per_coin.get(leader_coin, {}) or {})
+        if leader_item:
+            leader_direction = _direction_from_coin_item(
+                leader_item,
+                min_conf=float(getattr(config, "BTC_MARKET_LEADER_MIN_CONFIDENCE", min_conf)),
+                min_momentum=float(getattr(config, "BTC_MARKET_LEADER_MIN_MOMENTUM", 0.003)),
+                min_volume_ratio=float(
+                    getattr(config, "BTC_MARKET_LEADER_MIN_VOLUME_RATIO", min_volume_ratio)
+                ),
+            )
+            if leader_direction in {"up", "down"}:
+                direction = leader_direction
+                agreeing = [leader_coin]
+                block_side = "short" if leader_direction == "up" else "long"
+                reason = "btc_market_leader"
+
     if not direction:
         return regime_data
 
-    guidance = copy.deepcopy(regime_data.get("strategy_guidance", {}) or {})
-    pause = set(guidance.get("pause", []) or [])
-    activate = set(guidance.get("activate", []) or [])
-    if direction == "up":
-        pause.update({"momentum_short", "contrarian", "mean_reversion", "scalping", "short_momentum"})
-        activate.update({"momentum_long", "trend_following", "breakout"})
-    else:
-        pause.update({"momentum_long", "trend_following", "breakout", "contrarian", "mean_reversion", "scalping"})
-        activate.update({"momentum_short", "short_momentum"})
-
-    guidance["pause"] = sorted(pause)
-    guidance["activate"] = sorted(activate)
-    regime_data["strategy_guidance"] = guidance
-    regime_data["countertrend_block_side"] = block_side
-    regime_data["global_momentum_override"] = {
-        "direction": direction,
-        "block_side": block_side,
-        "agreeing_coins": agreeing,
-        "min_agreeing_coins": min_agree,
-    }
-
-    logger.warning(
-        "  GLOBAL MOMENTUM OVERRIDE: %s across %s -- blocking %s entries",
-        direction.upper(),
-        ",".join(agreeing),
-        block_side,
+    regime_data = _apply_directional_strategy_guidance(
+        regime_data,
+        direction=direction,
+        block_side=block_side,
+        agreeing=agreeing,
+        min_agree=min_agree,
+        reason=reason,
     )
 
     if (
@@ -1007,6 +1092,12 @@ def _run_multi_exchange_scan(container):
                         arb.short_venue, arb.short_funding_rate,
                         arb.funding_spread_annualized,
                     )
+            if getattr(config, "LIGHTER_STRATEGY_INJECTION_ENABLED", False):
+                injected = container.multi_scanner.inject_lighter_strategies(
+                    limit=int(getattr(config, "LIGHTER_STRATEGY_INJECTION_LIMIT", 25)),
+                    min_volume_usd=float(getattr(config, "LIGHTER_STRATEGY_MIN_VOLUME_USD", 10_000.0)),
+                )
+                logger.info("  Lighter strategy injection: %s", injected)
             cross_venue_data = {
                 "health": venue_health,
                 "common_markets": common_markets,

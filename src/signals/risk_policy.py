@@ -30,6 +30,10 @@ class ResolvedRiskPolicy:
     regime: str = "unknown"
     regime_confidence: float = 0.0
     source_quality: float = 0.5
+    calibration_ece: float = 0.0
+    funding_rate: float = 0.0
+    spread_pct: float = 0.0
+    memory_recommendation: str = ""
     rr_mode: str = "dynamic_bounded"  # H11: surface the active rr_mode
     rationale: list[str] = field(default_factory=list)
 
@@ -153,10 +157,17 @@ class RiskPolicyEngine:
         volatility_pct = self._extract_volatility(signal)
         expected_move_pct = self._extract_expected_move(signal)
         source_quality = self._extract_source_quality(signal, source_policy)
+        calibration_ece = self._extract_calibration_ece(signal, source_policy)
+        funding_rate = self._extract_funding_rate(signal, source_policy)
+        spread_pct = self._extract_spread_pct(signal)
+        memory_recommendation = self._extract_memory_recommendation(signal)
+        data_degraded = self._extract_data_degraded(signal, source_policy)
+        order_flow_imbalance = self._extract_order_flow_imbalance(signal)
         source_key = self._source_key(signal)
         profile = self.source_profiles.get(source_key, self.source_profiles["strategy"])
         side = signal.side.value if hasattr(signal.side, "value") else str(signal.side)
         side = str(side or "").strip().lower()
+        trend_alignment = self._side_regime_alignment(side, regime)
         short_policy_statuses = []
         context = dict(signal.context or {})
         for policy in context.get("short_side_policies", []) or []:
@@ -198,6 +209,25 @@ class RiskPolicyEngine:
             stop_multiplier *= 0.95
             rationale.append("high_confidence: slightly tighter stop")
 
+        if calibration_ece >= 0.20:
+            stop_multiplier *= 0.90
+            rationale.append(f"poor_calibration_ece={calibration_ece:.3f}: tighter stop")
+        elif calibration_ece > 0 and calibration_ece <= 0.08:
+            stop_multiplier *= 1.05
+            rationale.append("well_calibrated: allow normal noise")
+
+        if memory_recommendation in {"caution", "avoid", "block"}:
+            stop_multiplier *= 0.85
+            rationale.append(f"trade_memory={memory_recommendation}: tighter stop")
+
+        if data_degraded:
+            stop_multiplier *= 0.90
+            rationale.append("data_degraded: tighter stop")
+
+        if spread_pct >= 0.003:
+            stop_multiplier *= 1.10
+            rationale.append(f"wide_spread={spread_pct:.3%}: wider stop")
+
         stop_roe_pct = max(base_stop_roe_pct * stop_multiplier, atr_stop_roe_pct)
         stop_roe_pct = min(max(stop_roe_pct, self.min_stop_roe_pct), self.max_stop_roe_pct)
 
@@ -231,6 +261,60 @@ class RiskPolicyEngine:
                 reward_multiple += 0.5
             elif signal.confidence <= 0.45:
                 reward_multiple -= 0.75
+
+            if trend_alignment == "aligned":
+                reward_multiple += 0.35
+                rationale.append("side_regime_aligned")
+            elif trend_alignment == "countertrend":
+                reward_multiple -= 0.75
+                rationale.append("countertrend: smaller target")
+
+            if calibration_ece >= 0.20:
+                reward_multiple -= 0.75
+                rationale.append("poor calibration: smaller target")
+            elif calibration_ece > 0 and calibration_ece <= 0.08:
+                reward_multiple += 0.20
+
+            if memory_recommendation == "caution":
+                reward_multiple -= 0.50
+            elif memory_recommendation in {"avoid", "block"}:
+                reward_multiple -= 1.00
+
+            if data_degraded:
+                reward_multiple -= 0.50
+
+            if spread_pct >= 0.003:
+                reward_multiple -= 0.35
+
+            funding_against = (
+                (side == "long" and funding_rate < 0)
+                or (side == "short" and funding_rate > 0)
+            )
+            funding_favorable = (
+                (side == "long" and funding_rate > 0)
+                or (side == "short" and funding_rate < 0)
+            )
+            if abs(funding_rate) >= 0.0005 and funding_against:
+                reward_multiple -= 0.35
+                rationale.append(f"funding_against={funding_rate:.4%}")
+            elif abs(funding_rate) >= 0.0005 and funding_favorable:
+                reward_multiple += 0.15
+                rationale.append(f"funding_favorable={funding_rate:.4%}")
+
+            if order_flow_imbalance:
+                imbalance_against = (
+                    (side == "long" and order_flow_imbalance < -0.20)
+                    or (side == "short" and order_flow_imbalance > 0.20)
+                )
+                imbalance_with = (
+                    (side == "long" and order_flow_imbalance > 0.20)
+                    or (side == "short" and order_flow_imbalance < -0.20)
+                )
+                if imbalance_against:
+                    reward_multiple -= 0.35
+                    rationale.append(f"order_flow_against={order_flow_imbalance:.2f}")
+                elif imbalance_with:
+                    reward_multiple += 0.15
 
             if isinstance(source_policy, dict):
                 status = str(source_policy.get("status", "") or "").lower()
@@ -338,6 +422,14 @@ class RiskPolicyEngine:
             time_limit_hours = max(2.0, time_limit_hours - 4.0)
         elif regime in {"trending_up", "trending_down", "bullish", "bearish"}:
             time_limit_hours = min(72.0, time_limit_hours + 4.0)
+        if trend_alignment == "countertrend":
+            time_limit_hours = max(2.0, time_limit_hours * 0.65)
+        if data_degraded or memory_recommendation in {"caution", "avoid", "block"}:
+            time_limit_hours = max(2.0, time_limit_hours * 0.70)
+        if abs(funding_rate) >= 0.0005 and (
+            (side == "long" and funding_rate < 0) or (side == "short" and funding_rate > 0)
+        ):
+            time_limit_hours = max(2.0, time_limit_hours * 0.75)
         if stop_price_pct >= self.max_stop_price_pct * 0.9:
             time_limit_hours = min(time_limit_hours, max(6.0, self.default_time_limit_hours))
         if short_caution:
@@ -349,6 +441,10 @@ class RiskPolicyEngine:
             breakeven_at_r += 0.15
         elif regime in {"crash", "volatile"}:
             breakeven_at_r = max(0.5, breakeven_at_r - 0.25)
+        if trend_alignment == "countertrend" or data_degraded:
+            breakeven_at_r = max(0.45, breakeven_at_r - 0.20)
+        if memory_recommendation in {"caution", "avoid", "block"}:
+            breakeven_at_r = max(0.40, breakeven_at_r - 0.25)
         if short_caution:
             breakeven_at_r = min(breakeven_at_r, self.short_caution_breakeven_at_r)
             rationale.append("short_caution:earlier_breakeven")
@@ -383,6 +479,10 @@ class RiskPolicyEngine:
             regime=regime,
             regime_confidence=round(regime_confidence, 4),
             source_quality=round(source_quality, 4),
+            calibration_ece=round(calibration_ece, 6),
+            funding_rate=round(funding_rate, 8),
+            spread_pct=round(spread_pct, 6),
+            memory_recommendation=memory_recommendation,
             rr_mode=self.rr_mode,
             rationale=rationale,
         )
@@ -503,3 +603,138 @@ class RiskPolicyEngine:
         except (TypeError, ValueError):
             value = 0.0
         return value if value > 0 else 0.5
+
+    @staticmethod
+    def _context_features(signal: TradeSignal) -> tuple[Dict[str, Any], Dict[str, Any]]:
+        context = signal.context or {}
+        features = context.get("features", {})
+        if not isinstance(features, dict):
+            features = {}
+        return context, features
+
+    @staticmethod
+    def _float_candidate(*values: Any) -> float:
+        for value in values:
+            try:
+                out = float(value)
+            except (TypeError, ValueError):
+                continue
+            if out == out:
+                return out
+        return 0.0
+
+    @classmethod
+    def _extract_calibration_ece(
+        cls,
+        signal: TradeSignal,
+        source_policy: Optional[Dict[str, Any]],
+    ) -> float:
+        context, features = cls._context_features(signal)
+        if isinstance(source_policy, dict):
+            policy_cal = source_policy.get("calibration")
+            if isinstance(policy_cal, dict):
+                value = cls._float_candidate(policy_cal.get("ece"))
+                if value > 0:
+                    return value
+            value = cls._float_candidate(
+                source_policy.get("ece"),
+                source_policy.get("calibration_ece"),
+            )
+            if value > 0:
+                return value
+        value = cls._float_candidate(
+            context.get("calibration_ece"),
+            context.get("source_ece"),
+            features.get("calibration_ece"),
+        )
+        return max(0.0, value)
+
+    @classmethod
+    def _extract_funding_rate(
+        cls,
+        signal: TradeSignal,
+        source_policy: Optional[Dict[str, Any]],
+    ) -> float:
+        context, features = cls._context_features(signal)
+        return cls._float_candidate(
+            context.get("funding_rate"),
+            context.get("funding"),
+            features.get("funding_rate"),
+            features.get("funding"),
+            source_policy.get("funding_rate") if isinstance(source_policy, dict) else None,
+        )
+
+    @classmethod
+    def _extract_spread_pct(cls, signal: TradeSignal) -> float:
+        context, features = cls._context_features(signal)
+        spread = cls._float_candidate(
+            context.get("spread_pct"),
+            context.get("bid_ask_spread_pct"),
+            features.get("spread_pct"),
+            features.get("bid_ask_spread_pct"),
+        )
+        if spread > 1.0:
+            spread /= 10_000.0
+        return max(0.0, spread)
+
+    @classmethod
+    def _extract_order_flow_imbalance(cls, signal: TradeSignal) -> float:
+        context, features = cls._context_features(signal)
+        return cls._float_candidate(
+            context.get("order_flow_imbalance"),
+            context.get("ofi"),
+            features.get("order_flow_imbalance"),
+            features.get("ofi"),
+        )
+
+    @staticmethod
+    def _extract_memory_recommendation(signal: TradeSignal) -> str:
+        context = signal.context or {}
+        memory = context.get("trade_memory") or context.get("memory")
+        if isinstance(memory, dict):
+            rec = memory.get("recommendation") or memory.get("action")
+        else:
+            rec = (
+                context.get("trade_memory_recommendation")
+                or context.get("memory_recommendation")
+                or ""
+            )
+        return str(rec or "").strip().lower()
+
+    @staticmethod
+    def _extract_data_degraded(
+        signal: TradeSignal,
+        source_policy: Optional[Dict[str, Any]],
+    ) -> bool:
+        context = signal.context or {}
+        if isinstance(source_policy, dict):
+            status = str(source_policy.get("status") or "").strip().lower()
+            if status in {"degraded", "partial", "policy_error"}:
+                return True
+        if context.get("data_degraded") or context.get("partial_inputs"):
+            return True
+        data_sources = context.get("data_sources") or context.get("source_health")
+        if isinstance(data_sources, dict):
+            for value in data_sources.values():
+                status = str(
+                    value.get("status") if isinstance(value, dict) else value
+                ).strip().lower()
+                if status in {"down", "degraded", "partial", "stale"}:
+                    return True
+        return False
+
+    @staticmethod
+    def _side_regime_alignment(side: str, regime: str) -> str:
+        side = str(side or "").strip().lower()
+        regime = str(regime or "").strip().lower()
+        bullish = {"trending_up", "bullish", "uptrend"}
+        bearish = {"trending_down", "bearish", "downtrend"}
+        if side == "long" and regime in bullish:
+            return "aligned"
+        if side == "short" and regime in bearish:
+            return "aligned"
+        if side == "long" and regime in bearish:
+            return "countertrend"
+        if side == "short" and regime in bullish:
+            return "countertrend"
+        return "neutral"

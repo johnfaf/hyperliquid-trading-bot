@@ -91,3 +91,23 @@ def test_summary():
     assert "paths" in summary
     assert "mean_return" in summary
     assert "prob_positive" in summary
+
+
+def test_block_bootstrap_alias_runs():
+    """Explicit block bootstrap should run and preserve configured path size."""
+    mc = MonteCarloSimulator()
+    returns = np.array([0.02, 0.01, -0.04, -0.03, 0.015, 0.005])
+    result = mc.run(
+        returns,
+        MonteCarloConfig(
+            n_paths=25,
+            trades_per_path=18,
+            bootstrap_method="block_bootstrap",
+            block_size=3,
+            include_crashes=False,
+            include_funding_shocks=False,
+        ),
+    )
+
+    assert result.n_paths == 25
+    assert result.trades_per_path == 18

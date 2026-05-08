@@ -12,6 +12,7 @@ pytest.importorskip("fastapi")
 pytest.importorskip("starlette")
 
 from fastapi.testclient import TestClient
+from starlette.websockets import WebSocketDisconnect
 
 from src.signals.calibration import CalibrationTracker
 from src.ui.v2 import state as v2_state
@@ -47,6 +48,16 @@ def test_index_serves_dashboard_when_no_token_configured(client):
     r = client.get("/")
     assert r.status_code == 200
     assert "Calibration breakdown" in r.text
+    assert "/static/dashboard.css" in r.text
+    assert "cdn.tailwindcss.com" not in r.text
+    assert 'id="page-main"' in r.text
+    assert "hx-boost" in r.text
+
+
+def test_dashboard_responses_include_timing_header(client):
+    r = client.get("/api/health")
+    assert r.status_code == 200
+    assert "x-response-time-ms" in r.headers
 
 
 def test_calibration_data_returns_summary(client):
@@ -67,10 +78,74 @@ def test_calibration_curve_returns_bins(client):
     assert len(payload["curve"]) == 10  # N_BINS
 
 
+def test_calibration_timeline_endpoint_smoke(client):
+    r = client.get("/api/calibration/timeline?days=7&top_sources=3")
+    assert r.status_code == 200
+    payload = r.json()
+    assert "sources" in payload
+    assert "points" in payload
+
+
 def test_calibration_page_renders(client):
     r = client.get("/calibration")
     assert r.status_code == 200
     assert "Per-source calibration" in r.text
+
+
+def test_dashboard_summary_fragments_render_without_full_layout(client):
+    cases = {
+        "/positions?fragment=summary": 'id="positions-summary"',
+        "/sources?fragment=summary": 'id="sources-summary"',
+        "/calibration?fragment=summary": 'id="calibration-summary"',
+    }
+    for path, marker in cases.items():
+        r = client.get(path)
+        assert r.status_code == 200
+        assert marker in r.text
+        assert "<html" not in r.text
+
+
+def test_dashboard_websocket_connects_without_auth_token(client):
+    with client.websocket_connect("/ws") as ws:
+        hello = ws.receive_json()
+        assert hello["kind"] == "hello"
+        assert hello["ok"] is True
+        assert "ts" in hello
+
+
+def test_dashboard_websocket_heartbeat_interval_is_below_common_proxy_idle(monkeypatch):
+    from src.ui.v2.routers import stream
+
+    monkeypatch.delenv("DASHBOARD_V2_WS_HEARTBEAT_SECONDS", raising=False)
+
+    assert stream._heartbeat_seconds() == 15.0
+
+
+def test_dashboard_websocket_honors_public_read(monkeypatch):
+    monkeypatch.setenv("DASHBOARD_AUTH_TOKEN", "secret123")
+    monkeypatch.setenv("DASHBOARD_PUBLIC_READ", "true")
+    v2_state.reset_components()
+    app = create_app()
+    with TestClient(app) as authed_read_client:
+        with authed_read_client.websocket_connect("/ws") as ws:
+            hello = ws.receive_json()
+            assert hello["kind"] == "hello"
+            assert hello["ok"] is True
+
+
+def test_dashboard_websocket_rejects_when_private_and_no_cookie(monkeypatch):
+    monkeypatch.setenv("DASHBOARD_AUTH_TOKEN", "secret123")
+    monkeypatch.delenv("DASHBOARD_PUBLIC_READ", raising=False)
+    v2_state.reset_components()
+    app = create_app()
+    with TestClient(app) as private_client:
+        try:
+            with private_client.websocket_connect("/ws") as ws:
+                ws.receive_json()
+        except WebSocketDisconnect as exc:
+            assert exc.code == 4401
+        else:  # pragma: no cover - defensive assertion clarity
+            raise AssertionError("private websocket accepted without auth cookie")
 
 
 def test_login_redirect_when_token_required_and_no_cookie(monkeypatch, app):
@@ -186,12 +261,37 @@ def test_clear_kill_switch_calls_through_with_audit_reason(client):
     assert calls and calls[0]["reason"].startswith("userFills")
 
 
+def test_close_position_operator_override_calls_live_trader(client):
+    calls = []
+
+    class _Stub:
+        def cancel_all_orders_detailed(self, coin=None):
+            calls.append(("cancel", coin))
+            return {"success": True, "cancelled_count": 0}
+
+        def close_position(self, coin):
+            calls.append(("close", coin))
+            return {"status": "ok", "coin": coin}
+
+    v2_state.set_components(live_trader=_Stub())
+    r = client.post(
+        "/api/operator/close_position",
+        data={"coin": "btc", "audit_reason": "manual stuck sltp override"},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is True
+    assert body["coin"] == "BTC"
+    assert calls == [("cancel", "BTC"), ("close", "BTC"), ("cancel", "BTC")]
+
+
 def test_sources_endpoint_no_agent_scorer(client):
     r = client.get("/api/sources")
     assert r.status_code == 200
     payload = r.json()
     assert payload["available"] is False
     assert payload["rows"] == []
+    assert "strategies" in payload
 
 
 def test_sources_endpoint_aggregates_calibration(monkeypatch, tmp_path):
@@ -245,6 +345,12 @@ def test_traders_endpoint_smoke(client):
     payload = r.json()
     assert "rows" in payload
     assert "totals" in payload
+
+
+def test_trader_detail_rejects_invalid_address(client):
+    r = client.get("/api/traders/not-an-address")
+    assert r.status_code == 400
+    assert r.json()["error"] == "invalid_address"
 
 
 def test_traders_page_renders(client):
@@ -358,3 +464,13 @@ def test_recent_fills_endpoint_no_live_trader(client):
     payload = r.json()
     assert payload["fills"] == []
     assert payload["count"] == 0
+
+
+def test_recent_events_endpoint_replays_published_events(client):
+    from src.ui.v2.events import publish_event
+
+    publish_event("unit_test", message="hello")
+    r = client.get("/api/events/recent?limit=5")
+    assert r.status_code == 200
+    payload = r.json()
+    assert any(ev.get("kind") == "unit_test" for ev in payload["events"])

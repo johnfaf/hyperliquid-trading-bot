@@ -219,6 +219,26 @@ class TestApplyExecutionPenalties:
         penalised = apply_execution_penalties([fill])
         assert penalised[0].penalised_price < 50000.0
 
+    def test_hyperliquid_side_codes_are_normalized(self):
+        buy_fill = _make_fill("BTC", closed_pnl=0.0, time_ms=1000, side="B")
+        sell_fill = _make_fill("BTC", closed_pnl=100.0, time_ms=2000, side="A")
+
+        penalised = apply_execution_penalties([buy_fill, sell_fill])
+
+        assert [f.side for f in penalised] == ["buy", "sell"]
+        assert penalised[0].penalised_price > buy_fill["price"]
+        assert penalised[1].penalised_price < sell_fill["price"]
+
+    def test_unrecognized_side_is_skipped(self, caplog):
+        fill = _make_fill("BTC", closed_pnl=0.0, time_ms=1000, side="mystery")
+        fill["direction"] = ""
+
+        with caplog.at_level("WARNING", logger="golden_wallet"):
+            penalised = apply_execution_penalties([fill])
+
+        assert penalised == []
+        assert "unrecognized side" in caplog.text
+
     def test_delay_applied(self):
         from src.discovery.golden_wallet import EXECUTION_DELAY_MS
         fill = _make_fill(time_ms=1_000_000)

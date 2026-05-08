@@ -153,6 +153,98 @@ def test_evaluate_readiness_blocks_on_db_audit_findings(monkeypatch):
     assert "db_audit_high:open_trades_missing_protection" in snapshot["reasons"]
 
 
+def test_evaluate_readiness_tolerates_missing_registry_by_default(monkeypatch):
+    monkeypatch.setattr(readiness, "_probe_db_readable", lambda: (True, ""))
+    monkeypatch.setattr(readiness, "_probe_db_writable", lambda ttl_s=None: (True, ""))
+    monkeypatch.setattr(readiness, "_probe_db_audit", lambda ttl_s=None: (True, {"ok": True}, []))
+    monkeypatch.setattr(readiness, "_resolve_health_registry", lambda health_registry: (None, "missing"))
+    monkeypatch.setattr(readiness.config, "READINESS_REQUIRE_HEALTH_REGISTRY", False)
+    monkeypatch.setattr(readiness.db, "get_db_path", lambda: "test.db")
+
+    snapshot = readiness.evaluate_readiness(
+        container=_FakeContainer({"live_enabled": False}),
+        health_registry=None,
+        stale_seconds=600,
+    )
+
+    assert snapshot["ready"] is True
+    assert "health_registry_unavailable" not in snapshot["reasons"]
+    assert "trading_subsystems_not_safe" not in snapshot["reasons"]
+
+
+def test_evaluate_readiness_can_require_registry(monkeypatch):
+    monkeypatch.setattr(readiness, "_probe_db_readable", lambda: (True, ""))
+    monkeypatch.setattr(readiness, "_probe_db_writable", lambda ttl_s=None: (True, ""))
+    monkeypatch.setattr(readiness, "_probe_db_audit", lambda ttl_s=None: (True, {"ok": True}, []))
+    monkeypatch.setattr(readiness, "_resolve_health_registry", lambda health_registry: (None, "missing"))
+    monkeypatch.setattr(readiness.config, "READINESS_REQUIRE_HEALTH_REGISTRY", True)
+    monkeypatch.setattr(readiness.db, "get_db_path", lambda: "test.db")
+
+    snapshot = readiness.evaluate_readiness(
+        container=_FakeContainer({"live_enabled": False}),
+        health_registry=None,
+        stale_seconds=600,
+    )
+
+    assert snapshot["ready"] is False
+    assert "health_registry_unavailable" in snapshot["reasons"]
+    assert "trading_subsystems_not_safe" in snapshot["reasons"]
+
+
+def test_probe_db_audit_auto_repairs_safe_paper_account_findings(monkeypatch):
+    class _Finding:
+        def __init__(self, check):
+            self.check = check
+            self.severity = "high"
+
+        def to_dict(self):
+            return {"check": self.check, "severity": self.severity}
+
+    class _Report:
+        def __init__(self, findings):
+            self._findings = findings
+
+        def to_dict(self, *, block_severity="high"):
+            return {"ok": not self._findings, "block_severity": block_severity}
+
+        def findings_at_or_above(self, severity):
+            return list(self._findings)
+
+    class _Action:
+        def to_dict(self):
+            return {"action": "paper_account", "status": "applied"}
+
+    import src.data.db_audit as db_audit
+
+    calls = {"audit": 0, "repair": 0}
+
+    def fake_audit(include_candle_cache=True, include_code_scan=False):
+        calls["audit"] += 1
+        if calls["audit"] == 1:
+            return _Report([_Finding("paper_account_total_pnl")])
+        return _Report([])
+
+    def fake_repair():
+        calls["repair"] += 1
+        return [_Action()]
+
+    monkeypatch.setattr(db_audit, "run_db_audit", fake_audit)
+    monkeypatch.setattr(db_audit, "run_startup_safe_repair", fake_repair)
+    monkeypatch.setattr(readiness.config, "READINESS_DB_AUDIT_ENABLED", True)
+    monkeypatch.setattr(readiness.config, "READINESS_DB_AUDIT_AUTO_REPAIR", True)
+    monkeypatch.setattr(readiness.config, "READINESS_DB_AUDIT_TTL_S", 300)
+    monkeypatch.setattr(readiness.config, "READINESS_DB_AUDIT_BLOCK_SEVERITY", "high")
+    with readiness._DB_AUDIT_CACHE_LOCK:
+        readiness._DB_AUDIT_CACHE.update({"ts": 0.0, "ok": True, "report": {}, "blockers": []})
+
+    ok, payload, blockers = readiness._probe_db_audit(ttl_s=5)
+
+    assert ok is True
+    assert blockers == []
+    assert calls == {"audit": 2, "repair": 1}
+    assert payload["auto_repair_actions"] == [{"action": "paper_account", "status": "applied"}]
+
+
 def test_health_registry_heartbeat_recovers_from_stale_degradation():
     registry = SubsystemHealthRegistry()
     registry.register("decision_firewall", affects_trading=True)

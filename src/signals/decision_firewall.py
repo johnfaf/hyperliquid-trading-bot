@@ -90,6 +90,31 @@ class DecisionFirewall:
         self.short_hardening_size_multiplier = float(
             cfg.get("short_hardening_size_multiplier", 0.50)
         )
+        self.short_hardening_block_override_enabled = bool(
+            cfg.get("short_hardening_block_override_enabled", True)
+        )
+        self.short_hardening_block_override_min_confidence = float(
+            cfg.get("short_hardening_block_override_min_confidence", 0.70)
+        )
+        self.short_hardening_block_override_min_regime_confidence = float(
+            cfg.get("short_hardening_block_override_min_regime_confidence", 0.60)
+        )
+        self.short_hardening_block_override_size_multiplier = float(
+            cfg.get("short_hardening_block_override_size_multiplier", 0.35)
+        )
+        self.short_hardening_market_adaptive_override_enabled = bool(
+            cfg.get("short_hardening_market_adaptive_override_enabled", True)
+        )
+        self.short_hardening_market_adaptive_min_momentum = float(
+            cfg.get("short_hardening_market_adaptive_min_momentum", 0.003)
+        )
+        self.short_hardening_market_adaptive_scoped_size_multiplier = min(
+            1.0,
+            max(
+                0.05,
+                float(cfg.get("short_hardening_market_adaptive_scoped_size_multiplier", 0.25)),
+            ),
+        )
         self.short_hardening_source_guard_enabled = bool(
             cfg.get("short_hardening_source_guard_enabled", True)
         )
@@ -107,6 +132,12 @@ class DecisionFirewall:
         )
         self.short_hardening_coin_block_net_pnl = float(
             cfg.get("short_hardening_coin_block_net_pnl", -0.25)
+        )
+        self.market_side_guard_enabled = bool(
+            cfg.get("market_side_guard_enabled", True)
+        )
+        self.market_side_guard_min_confidence = float(
+            cfg.get("market_side_guard_min_confidence", 0.60)
         )
         self.canary_mode = bool(cfg.get("canary_mode", False))
         self.canary_max_positions = max(1, int(cfg.get("canary_max_positions", 2)))
@@ -129,6 +160,24 @@ class DecisionFirewall:
         )
         self.entry_max_price_extension_pct = float(
             cfg.get("entry_max_price_extension_pct", 0.035)
+        )
+        self.side_imbalance_guard_enabled = bool(
+            cfg.get("side_imbalance_guard_enabled", True)
+        )
+        self.side_imbalance_lookback_trades = max(
+            10, int(cfg.get("side_imbalance_lookback_trades", 60))
+        )
+        self.side_imbalance_min_samples = max(
+            5, int(cfg.get("side_imbalance_min_samples", 12))
+        )
+        self.side_imbalance_max_share = min(
+            0.98, max(0.50, float(cfg.get("side_imbalance_max_share", 0.80)))
+        )
+        self.side_imbalance_confidence_bump = max(
+            0.0, float(cfg.get("side_imbalance_confidence_bump", 0.15))
+        )
+        self.side_imbalance_size_multiplier = min(
+            1.0, max(0.05, float(cfg.get("side_imbalance_size_multiplier", 0.50)))
         )
         self.daily_loss_limit_pct = cfg.get("daily_loss_limit_pct", 0.03)
         if self.canary_mode:
@@ -228,6 +277,7 @@ class DecisionFirewall:
             "rejected_event_risk": 0,
             "rejected_side_policy": 0,
             "rejected_entry_location": 0,
+            "rejected_side_imbalance": 0,
             # LOW-FIX LOW-1: count audit-log write failures so ops can detect
             # when the audit trail is silently broken (DB full, locked, etc.)
             "audit_log_failures": 0,
@@ -341,6 +391,54 @@ class DecisionFirewall:
                     self.short_hardening_size_multiplier,
                 )
             )
+            self.short_hardening_block_override_enabled = bool(
+                overrides.get(
+                    "SHORT_HARDENING_BLOCK_OVERRIDE_ENABLED",
+                    self.short_hardening_block_override_enabled,
+                )
+            )
+            self.short_hardening_block_override_min_confidence = float(
+                overrides.get(
+                    "SHORT_HARDENING_BLOCK_OVERRIDE_MIN_CONFIDENCE",
+                    self.short_hardening_block_override_min_confidence,
+                )
+            )
+            self.short_hardening_block_override_min_regime_confidence = float(
+                overrides.get(
+                    "SHORT_HARDENING_BLOCK_OVERRIDE_MIN_REGIME_CONFIDENCE",
+                    self.short_hardening_block_override_min_regime_confidence,
+                )
+            )
+            self.short_hardening_block_override_size_multiplier = float(
+                overrides.get(
+                    "SHORT_HARDENING_BLOCK_OVERRIDE_SIZE_MULTIPLIER",
+                    self.short_hardening_block_override_size_multiplier,
+                )
+            )
+            self.short_hardening_market_adaptive_override_enabled = bool(
+                overrides.get(
+                    "SHORT_HARDENING_MARKET_ADAPTIVE_OVERRIDE_ENABLED",
+                    self.short_hardening_market_adaptive_override_enabled,
+                )
+            )
+            self.short_hardening_market_adaptive_min_momentum = float(
+                overrides.get(
+                    "SHORT_HARDENING_MARKET_ADAPTIVE_MIN_MOMENTUM",
+                    self.short_hardening_market_adaptive_min_momentum,
+                )
+            )
+            self.short_hardening_market_adaptive_scoped_size_multiplier = min(
+                1.0,
+                max(
+                    0.05,
+                    float(
+                        overrides.get(
+                            "SHORT_HARDENING_MARKET_ADAPTIVE_SCOPED_SIZE_MULTIPLIER",
+                            self.short_hardening_market_adaptive_scoped_size_multiplier,
+                        )
+                    ),
+                ),
+            )
             self.short_hardening_source_guard_enabled = bool(
                 overrides.get(
                     "SHORT_HARDENING_SOURCE_GUARD_ENABLED",
@@ -381,6 +479,18 @@ class DecisionFirewall:
                 overrides.get(
                     "SHORT_HARDENING_COIN_BLOCK_NET_PNL",
                     self.short_hardening_coin_block_net_pnl,
+                )
+            )
+            self.market_side_guard_enabled = bool(
+                overrides.get(
+                    "FIREWALL_MARKET_SIDE_GUARD_ENABLED",
+                    self.market_side_guard_enabled,
+                )
+            )
+            self.market_side_guard_min_confidence = float(
+                overrides.get(
+                    "FIREWALL_MARKET_SIDE_GUARD_MIN_CONFIDENCE",
+                    self.market_side_guard_min_confidence,
                 )
             )
             self.cooldown_seconds = int(
@@ -431,12 +541,70 @@ class DecisionFirewall:
                     self.entry_max_price_extension_pct,
                 )
             )
+            self.side_imbalance_guard_enabled = bool(
+                overrides.get(
+                    "FIREWALL_SIDE_IMBALANCE_GUARD_ENABLED",
+                    self.side_imbalance_guard_enabled,
+                )
+            )
+            self.side_imbalance_lookback_trades = max(
+                10,
+                int(
+                    overrides.get(
+                        "FIREWALL_SIDE_IMBALANCE_LOOKBACK_TRADES",
+                        self.side_imbalance_lookback_trades,
+                    )
+                ),
+            )
+            self.side_imbalance_min_samples = max(
+                5,
+                int(
+                    overrides.get(
+                        "FIREWALL_SIDE_IMBALANCE_MIN_SAMPLES",
+                        self.side_imbalance_min_samples,
+                    )
+                ),
+            )
+            self.side_imbalance_max_share = min(
+                0.98,
+                max(
+                    0.50,
+                    float(
+                        overrides.get(
+                            "FIREWALL_SIDE_IMBALANCE_MAX_SHARE",
+                            self.side_imbalance_max_share,
+                        )
+                    ),
+                ),
+            )
+            self.side_imbalance_confidence_bump = max(
+                0.0,
+                float(
+                    overrides.get(
+                        "FIREWALL_SIDE_IMBALANCE_CONFIDENCE_BUMP",
+                        self.side_imbalance_confidence_bump,
+                    )
+                ),
+            )
+            self.side_imbalance_size_multiplier = min(
+                1.0,
+                max(
+                    0.05,
+                    float(
+                        overrides.get(
+                            "FIREWALL_SIDE_IMBALANCE_SIZE_MULTIPLIER",
+                            self.side_imbalance_size_multiplier,
+                        )
+                    ),
+                ),
+            )
             self._side_policy_cache = {"ts": 0.0, "closed": [], "short": {}, "scoped": {}}
 
         logger.info(
             "DecisionFirewall runtime overrides applied: min_confidence=%s, source_cap=%s, "
             "short_hardening=%s, event_risk=%s, coin_cooldown=%ss, "
-            "same_side_cooldown=%ss, block_losing_averaging=%s, entry_location_filter=%s",
+            "same_side_cooldown=%ss, block_losing_averaging=%s, entry_location_filter=%s, "
+            "market_side_guard=%s",
             f"{self.min_confidence:.0%}",
             self.max_signals_per_source_per_day,
             self.short_hardening_enabled,
@@ -445,6 +613,7 @@ class DecisionFirewall:
             self.same_side_cooldown_seconds,
             self.block_losing_averaging,
             self.entry_location_filter_enabled,
+            self.market_side_guard_enabled,
         )
 
     def _get_short_policy_cache(self) -> Dict[str, object]:
@@ -544,18 +713,360 @@ class DecisionFirewall:
 
         return policies
 
-    def _apply_side_policy(self, signal: TradeSignal) -> Tuple[bool, str]:
+    def _current_market_side_alignment(
+        self,
+        signal: TradeSignal,
+        side: str,
+        regime_data: Optional[Dict] = None,
+    ) -> Dict:
+        """Return whether the requested side agrees with the current market read."""
+        side = str(side or "").strip().lower()
+        regime_payload = regime_data if isinstance(regime_data, dict) else {}
+        context = getattr(signal, "context", {}) if isinstance(getattr(signal, "context", {}), dict) else {}
+        coin = str(getattr(signal, "coin", "") or "").strip().upper()
+
+        bearish_regimes = {
+            "bear",
+            "bearish",
+            "downtrend",
+            "trend_down",
+            "trending_down",
+            "crash",
+            "panic",
+            "risk_off",
+        }
+        bullish_regimes = {
+            "bull",
+            "bullish",
+            "uptrend",
+            "trend_up",
+            "trending_up",
+            "risk_on",
+        }
+
+        def _float(value: object, default: float = 0.0) -> float:
+            try:
+                out = float(value)
+                return out if out == out else default
+            except (TypeError, ValueError):
+                return default
+
+        def _item_to_dict(value: object) -> Dict:
+            if isinstance(value, dict):
+                return dict(value)
+            to_dict = getattr(value, "to_dict", None)
+            if callable(to_dict):
+                try:
+                    return dict(to_dict() or {})
+                except Exception:
+                    return {}
+            return {}
+
+        candidates: List[Dict] = []
+        per_coin = regime_payload.get("per_coin", {})
+        if isinstance(per_coin, dict) and coin:
+            coin_payload = _item_to_dict(per_coin.get(coin))
+            if coin_payload:
+                candidates.append(
+                    {
+                        "source": f"coin:{coin}",
+                        "regime": str(coin_payload.get("regime", "") or "").strip().lower(),
+                        "confidence": _float(
+                            coin_payload.get("confidence", coin_payload.get("regime_confidence")),
+                            0.0,
+                        ),
+                        "momentum": _float(coin_payload.get("momentum"), 0.0),
+                        "trend_direction": _float(coin_payload.get("trend_direction"), 0.0),
+                    }
+                )
+
+        candidates.append(
+            {
+                "source": "overall",
+                "regime": str(
+                    regime_payload.get("overall_regime", "") or regime_payload.get("regime", "") or ""
+                ).strip().lower(),
+                "confidence": _float(
+                    regime_payload.get("overall_confidence", regime_payload.get("regime_confidence")),
+                    0.0,
+                ),
+                "momentum": _float(regime_payload.get("momentum"), 0.0),
+                "trend_direction": _float(regime_payload.get("trend_direction"), 0.0),
+            }
+        )
+
+        override = regime_payload.get("global_momentum_override")
+        if isinstance(override, dict):
+            direction = str(override.get("direction", "") or "").strip().lower()
+            if direction in {"up", "down"}:
+                candidates.append(
+                    {
+                        "source": "global_momentum",
+                        "regime": "trending_down" if direction == "down" else "trending_up",
+                        "confidence": max(
+                            self.short_hardening_block_override_min_regime_confidence,
+                            0.65,
+                        ),
+                        "momentum": -self.short_hardening_market_adaptive_min_momentum
+                        if direction == "down"
+                        else self.short_hardening_market_adaptive_min_momentum,
+                        "trend_direction": -1.0 if direction == "down" else 1.0,
+                    }
+                )
+
+        forecaster_regime = str(regime_payload.get("forecaster_regime", "") or "").strip().lower()
+        forecaster_conf = _float(regime_payload.get("forecaster_confidence"), 0.0)
+        forecaster_synthetic = bool(regime_payload.get("forecaster_synthetic_warm_start", False))
+        if forecaster_regime and not forecaster_synthetic:
+            candidates.append(
+                {
+                    "source": "forecaster",
+                    "regime": forecaster_regime,
+                    "confidence": forecaster_conf,
+                    "momentum": 0.0,
+                    "trend_direction": 0.0,
+                }
+            )
+
+        context_regime = str(context.get("regime", "") or context.get("overall_regime", "") or "").strip().lower()
+        if context_regime:
+            candidates.append(
+                {
+                    "source": "signal_context",
+                    "regime": context_regime,
+                    "confidence": _float(
+                        context.get("regime_confidence", context.get("overall_confidence")),
+                        0.0,
+                    ),
+                    "momentum": _float(context.get("momentum"), 0.0),
+                    "trend_direction": _float(context.get("trend_direction"), 0.0),
+                }
+            )
+
+        min_conf = self.short_hardening_block_override_min_regime_confidence
+        min_momentum = abs(self.short_hardening_market_adaptive_min_momentum)
+        best = {
+            "aligned": False,
+            "direction": "unknown",
+            "source": "",
+            "regime": "",
+            "confidence": 0.0,
+            "momentum": 0.0,
+            "reason": "no current market alignment found",
+        }
+
+        for candidate in candidates:
+            regime = str(candidate.get("regime", "") or "").strip().lower()
+            confidence = _float(candidate.get("confidence"), 0.0)
+            momentum = _float(candidate.get("momentum"), 0.0)
+            trend_direction = _float(candidate.get("trend_direction"), 0.0)
+            direction = "unknown"
+            if regime in bearish_regimes or momentum <= -min_momentum or trend_direction < -min_momentum:
+                direction = "short"
+            elif regime in bullish_regimes or momentum >= min_momentum or trend_direction > min_momentum:
+                direction = "long"
+
+            aligned = direction == side and confidence >= min_conf
+            if aligned:
+                return {
+                    "aligned": True,
+                    "direction": direction,
+                    "source": candidate.get("source", ""),
+                    "regime": regime or direction,
+                    "confidence": confidence,
+                    "momentum": momentum,
+                    "reason": (
+                        f"{candidate.get('source', 'market')} confirms {direction} "
+                        f"(regime={regime or 'momentum'}, confidence={confidence:.0%})"
+                    ),
+                }
+            if confidence > float(best.get("confidence", 0.0) or 0.0):
+                best = {
+                    "aligned": False,
+                    "direction": direction,
+                    "source": candidate.get("source", ""),
+                    "regime": regime,
+                    "confidence": confidence,
+                    "momentum": momentum,
+                    "reason": (
+                        f"best current read is {direction or 'unknown'} from "
+                        f"{candidate.get('source', 'market')} "
+                        f"(regime={regime or 'unknown'}, confidence={confidence:.0%})"
+                    ),
+                }
+
+        return best
+
+    def _short_block_override(
+        self,
+        signal: TradeSignal,
+        blocking_policies: List[Dict],
+        regime_data: Optional[Dict] = None,
+    ) -> Tuple[bool, str, Dict]:
+        """Allow strong regime-aligned shorts through a global-only block."""
+        if not self.short_hardening_block_override_enabled:
+            return False, "short block override disabled", {}
+
+        scoped_block = next(
+            (
+                policy for policy in blocking_policies
+                if policy.get("scope")
+                or policy.get("coin")
+                or str(policy.get("source", "") or "").strip().lower() not in {"", "all"}
+            ),
+            None,
+        )
+
+        try:
+            confidence = float(getattr(signal, "confidence", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            confidence = 0.0
+        if confidence < self.short_hardening_block_override_min_confidence:
+            return (
+                False,
+                f"short confidence {confidence:.0%} below override threshold "
+                f"{self.short_hardening_block_override_min_confidence:.0%}",
+                {},
+            )
+
+        alignment = self._current_market_side_alignment(
+            signal,
+            "short",
+            regime_data=regime_data,
+        )
+        if not alignment.get("aligned"):
+            if scoped_block:
+                return False, scoped_block.get("reason", "Scoped short-side policy is blocked"), {}
+            return False, f"short block override requires current bearish alignment: {alignment.get('reason')}", {}
+
+        if scoped_block and not self.short_hardening_market_adaptive_override_enabled:
+            return False, scoped_block.get("reason", "Scoped short-side policy is blocked"), {}
+
+        size_multiplier = self.short_hardening_block_override_size_multiplier
+        if scoped_block:
+            size_multiplier = min(
+                size_multiplier,
+                self.short_hardening_market_adaptive_scoped_size_multiplier,
+            )
+
+        meta = {
+            "status": "override",
+            "regime": alignment.get("regime", ""),
+            "regime_confidence": alignment.get("confidence", 0.0),
+            "confidence": confidence,
+            "size_multiplier": size_multiplier,
+            "scope": "scoped" if scoped_block else "global",
+            "market_alignment": dict(alignment),
+            "reason": (
+                "Short-side history block overridden by current bearish market alignment"
+                if scoped_block
+                else "Global short-side block overridden by current bearish market alignment"
+            ),
+        }
+        return True, meta["reason"], meta
+
+    def _apply_market_side_guard(
+        self,
+        signal: TradeSignal,
+        side: str,
+        regime_data: Optional[Dict] = None,
+    ) -> Tuple[bool, str]:
+        """Block entries that fight a strong current market-side read."""
+        if not self.market_side_guard_enabled:
+            return True, ""
+
+        side = str(side or "").strip().lower()
+        if side not in {"long", "short"}:
+            return True, ""
+
+        alignment = self._current_market_side_alignment(signal, side, regime_data=regime_data)
+        if isinstance(getattr(signal, "context", None), dict):
+            signal.context["market_side_alignment"] = dict(alignment)
+
+        if alignment.get("aligned"):
+            return True, ""
+
+        market_side = str(alignment.get("direction", "") or "").strip().lower()
+        try:
+            market_conf = float(alignment.get("confidence", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            market_conf = 0.0
+
+        opposite = "short" if side == "long" else "long"
+        if market_side == opposite and market_conf >= self.market_side_guard_min_confidence:
+            return (
+                False,
+                f"Current market read blocks {side}: {alignment.get('reason')}",
+            )
+        return True, ""
+
+    def _apply_side_policy(
+        self,
+        signal: TradeSignal,
+        regime_data: Optional[Dict] = None,
+    ) -> Tuple[bool, str]:
         side_val = signal.side.value if hasattr(signal.side, "value") else str(signal.side)
-        if str(side_val).lower() != "short":
+        side_val = str(side_val or "").strip().lower()
+
+        market_ok, market_reason = self._apply_market_side_guard(
+            signal,
+            side_val,
+            regime_data=regime_data,
+        )
+        if not market_ok:
+            return False, market_reason
+
+        if side_val != "short":
             return True, ""
 
         policies = [self._get_short_side_policy(), *self._get_scoped_short_policies(signal)]
-        blocking = next(
-            (policy for policy in policies if str(policy.get("status", "")).lower() == "blocked"),
-            None,
-        )
-        if blocking:
-            return False, blocking.get("reason", "Short-side guardrail blocked the signal")
+        blocking_policies = [
+            policy for policy in policies
+            if str(policy.get("status", "")).lower() == "blocked"
+        ]
+        if blocking_policies:
+            override_allowed, override_reason, override_meta = self._short_block_override(
+                signal,
+                blocking_policies,
+                regime_data=regime_data,
+            )
+            if not override_allowed:
+                blocking = blocking_policies[0]
+                return False, blocking.get("reason", "Short-side guardrail blocked the signal")
+
+            original_confidence = float(signal.confidence)
+            size_multiplier = float(
+                override_meta.get(
+                    "size_multiplier",
+                    self.short_hardening_block_override_size_multiplier,
+                )
+                or self.short_hardening_block_override_size_multiplier
+            )
+            signal.confidence *= self.short_hardening_confidence_multiplier
+            signal.position_pct *= size_multiplier
+            if signal.size > 0:
+                signal.size *= size_multiplier
+            if isinstance(getattr(signal, "context", None), dict):
+                signal.context["short_side_policies"] = [
+                    {
+                        "status": p.get("status"),
+                        "reason": p.get("reason"),
+                        "metrics": p.get("metrics", {}),
+                        "scope": p.get("scope", "global_short"),
+                    }
+                    for p in policies
+                ]
+                signal.context["short_side_policy_override"] = dict(override_meta)
+            logger.warning(
+                "Short hardening override allowed %s: confidence %.0f%% -> %.0f%%, "
+                "size *= %.2f (%s)",
+                signal.coin,
+                original_confidence * 100,
+                signal.confidence * 100,
+                size_multiplier,
+                override_reason,
+            )
+            return True, ""
 
         degraded_policies = [
             policy for policy in policies
@@ -699,6 +1210,83 @@ class DecisionFirewall:
                 f"Losing average-down blocked: existing {signal.coin} {side_value} "
                 f"is down {max_loss:.2%} ROE without new-information override "
                 f"(limit {self.averaging_max_loss_roe_pct:.2%})",
+            )
+        return True, ""
+
+    @staticmethod
+    def _normalize_side(side: object) -> str:
+        value = str(side or "").strip().lower()
+        if value in {"buy", "b", "long"}:
+            return "long"
+        if value in {"sell", "s", "a", "ask", "short"}:
+            return "short"
+        return value
+
+    def _apply_side_imbalance_guard(
+        self,
+        signal: TradeSignal,
+        side_value: str,
+        positions: List[Dict],
+    ) -> Tuple[bool, str]:
+        """Avoid runaway same-side books without forcing junk countertrades.
+
+        If the recent paper book is already overwhelmingly one-sided, new
+        same-side entries must clear a higher confidence bar. Strong signals
+        can still pass, but they get size-derisked so the bot does not keep
+        compounding a long-only or short-only tape.
+        """
+        if not self.side_imbalance_guard_enabled:
+            return True, ""
+
+        side_value = self._normalize_side(side_value)
+        if side_value not in {"long", "short"}:
+            return True, ""
+
+        sides: List[str] = []
+        for pos in positions or []:
+            side = self._normalize_side(pos.get("side"))
+            if side in {"long", "short"}:
+                sides.append(side)
+        try:
+            recent = db.get_paper_trade_history(limit=self.side_imbalance_lookback_trades)
+        except Exception as exc:
+            logger.debug("Side imbalance history lookup failed: %s", exc)
+            recent = []
+        for trade in recent or []:
+            side = self._normalize_side(trade.get("side"))
+            if side in {"long", "short"}:
+                sides.append(side)
+
+        total = len(sides)
+        if total < self.side_imbalance_min_samples:
+            return True, ""
+        same = sides.count(side_value)
+        share = same / total if total else 0.0
+        if share < self.side_imbalance_max_share:
+            return True, ""
+
+        required_confidence = min(
+            0.95,
+            float(self.min_confidence or 0.0) + self.side_imbalance_confidence_bump,
+        )
+        if float(getattr(signal, "confidence", 0.0) or 0.0) < required_confidence:
+            return (
+                False,
+                f"Side imbalance guard: {same}/{total} recent/open trades are {side_value}; "
+                f"requires {required_confidence:.0%} confidence for another {side_value} "
+                f"(got {signal.confidence:.0%})",
+            )
+
+        if self.side_imbalance_size_multiplier < 1.0:
+            signal.position_pct *= self.side_imbalance_size_multiplier
+            if signal.size > 0:
+                signal.size *= self.side_imbalance_size_multiplier
+            logger.info(
+                "Side imbalance derisked %s %s: share=%.0f%% size*=%.2f",
+                signal.coin,
+                side_value,
+                share * 100,
+                self.side_imbalance_size_multiplier,
             )
         return True, ""
 
@@ -1064,6 +1652,11 @@ class DecisionFirewall:
                     metadata={
                         "reason_key": reason_key,
                         "dry_run": dry_run,
+                        "market_side_alignment": (
+                            dict(signal.context.get("market_side_alignment", {}))
+                            if isinstance(getattr(signal, "context", None), dict)
+                            else {}
+                        ),
                     },
                 )
             if not dry_run:
@@ -1110,7 +1703,7 @@ class DecisionFirewall:
         if not event_risk_ok:
             return _reject("rejected_event_risk", event_risk_reason)
 
-        side_policy_ok, side_policy_reason = self._apply_side_policy(signal)
+        side_policy_ok, side_policy_reason = self._apply_side_policy(signal, regime_data=regime_data)
         if not side_policy_ok:
             return _reject("rejected_side_policy", side_policy_reason)
 
@@ -1193,6 +1786,14 @@ class DecisionFirewall:
         #   (2) max_aggregate_margin_pct against *margin actually locked*
         #       (leverage-agnostic capital-at-risk view).
         # A signal must pass BOTH to be approved.
+        side_imbalance_ok, side_imbalance_reason = self._apply_side_imbalance_guard(
+            signal,
+            side_value,
+            positions,
+        )
+        if not side_imbalance_ok:
+            return _reject("rejected_side_imbalance", side_imbalance_reason)
+
         balance = account_balance
         if balance is None:
             account = db.get_paper_account()
@@ -1399,7 +2000,14 @@ class DecisionFirewall:
                 final_status="approved",
                 firewall_decision="approved",
                 rejection_reason=None,
-                metadata={"dry_run": dry_run},
+                metadata={
+                    "dry_run": dry_run,
+                    "market_side_alignment": (
+                        dict(signal.context.get("market_side_alignment", {}))
+                        if isinstance(getattr(signal, "context", None), dict)
+                        else {}
+                    ),
+                },
             )
 
         return True, "approved"
@@ -1533,4 +2141,6 @@ class DecisionFirewall:
             "source_signal_counts": dict(self._source_signal_counts),
             "source_policies": self.agent_scorer.get_scorecard() if self.agent_scorer else [],
             "short_side_policy": self._get_short_side_policy(),
+            "market_side_guard_enabled": bool(self.market_side_guard_enabled),
+            "market_side_guard_min_confidence": float(self.market_side_guard_min_confidence),
         }

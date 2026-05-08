@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -242,6 +242,88 @@ class DecisionReplayBacktester:
             )
         return out
 
+    @staticmethod
+    def _candidate_score(metrics: Dict[str, Any]) -> float:
+        trades = max(float(metrics.get("trade_count", 0) or 0), 1.0)
+        avg_pnl = float(metrics.get("avg_pnl", 0.0) or 0.0)
+        max_dd_per_trade = float(metrics.get("max_drawdown", 0.0) or 0.0) / trades
+        profit_factor = min(float(metrics.get("profit_factor", 0.0) or 0.0), 10.0)
+        win_rate = float(metrics.get("win_rate", 0.0) or 0.0)
+        coverage = float(metrics.get("coverage_ratio", 0.0) or 0.0)
+        return avg_pnl - (0.50 * max_dd_per_trade) + (0.10 * profit_factor) + (0.05 * win_rate) + (0.02 * coverage)
+
+    def _threshold_grid(self, policy: ReplayPolicy) -> List[float]:
+        base = float(policy.min_confidence or 0.0)
+        raw = [base, 0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90]
+        return sorted({round(min(max(value, 0.0), 0.99), 4) for value in raw})
+
+    def _select_policy_on_train(
+        self,
+        train: List[LearningExample],
+        base_policy: ReplayPolicy,
+    ) -> Tuple[ReplayPolicy, Dict[str, Any]]:
+        best_policy = base_policy
+        best_metrics: Optional[Dict[str, Any]] = None
+        best_score = -1_000_000_000_000.0
+        for threshold in self._threshold_grid(base_policy):
+            candidate = replace(base_policy, min_confidence=threshold)
+            metrics = self._evaluate_policy(train, candidate)
+            if int(metrics.get("trade_count", 0) or 0) < max(1, self.min_trades):
+                score = -1_000_000_000_000.0
+            else:
+                score = self._candidate_score(metrics)
+            if best_metrics is None or score > best_score:
+                best_policy = candidate
+                best_metrics = metrics
+                best_score = score
+        best_metrics = best_metrics or self._evaluate_policy(train, best_policy)
+        return best_policy, {k: v for k, v in best_metrics.items() if k != "pnls"} | {"score": best_score}
+
+    def _walkforward_trained_metrics(
+        self,
+        examples: List[LearningExample],
+        policy: ReplayPolicy,
+        *,
+        windows: int = 4,
+    ) -> List[Dict[str, Any]]:
+        """Expanding-window walk-forward validation.
+
+        Each window trains only the confidence threshold on past decisions, then
+        evaluates the selected threshold on the next future slice.
+        """
+        ordered = sorted(examples, key=self._sort_key)
+        if len(ordered) < max(20, self.min_trades + self.min_test_trades + 2):
+            return []
+        window_count = min(max(int(windows), 1), 8)
+        test_size = max(self.min_test_trades, len(ordered) // (window_count + 2), 1)
+        initial_train = max(self.min_trades, int(math.floor(len(ordered) * self.train_fraction)) - test_size)
+        initial_train = min(max(initial_train, 1), len(ordered) - 1)
+        out: List[Dict[str, Any]] = []
+        for idx in range(window_count):
+            train_end = initial_train + idx * test_size
+            test_end = min(len(ordered), train_end + test_size)
+            if train_end >= len(ordered) or test_end <= train_end:
+                break
+            train = ordered[:train_end]
+            test = ordered[train_end:test_end]
+            if len(test) < 1:
+                continue
+            selected_policy, train_metrics = self._select_policy_on_train(train, policy)
+            test_metrics = self._evaluate_policy(test, selected_policy)
+            out.append(
+                {
+                    "window": idx + 1,
+                    "train_examples": len(train),
+                    "test_examples": len(test),
+                    "selected_policy": selected_policy.to_dict(),
+                    "selected_min_confidence": selected_policy.min_confidence,
+                    "train": train_metrics,
+                    "test": {k: v for k, v in test_metrics.items() if k != "pnls"},
+                    "passed": self._slice_passed(test_metrics, min_trades=max(1, self.min_test_trades)),
+                }
+            )
+        return out
+
     def _slice_passed(self, metrics: Dict[str, Any], *, min_trades: int) -> bool:
         return (
             int(metrics.get("trade_count", 0) or 0) >= min_trades
@@ -265,6 +347,17 @@ class DecisionReplayBacktester:
         test_passed = self._slice_passed(test_metrics, min_trades=self.min_test_trades)
         metrics = dict(test_metrics)
         metrics.pop("pnls", None)
+        decision_report: Dict[str, Any]
+        try:
+            from src.learning.decision_replay_report import build_decision_replay_report
+
+            decision_report = build_decision_replay_report(dataset, policy)
+        except Exception as exc:
+            decision_report = {
+                "data_quality": {"passed": False},
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+        data_quality_passed = bool(decision_report.get("data_quality", {}).get("passed", False))
         metrics.update({
             "train": {k: v for k, v in train_metrics.items() if k != "pnls"},
             "test": {k: v for k, v in test_metrics.items() if k != "pnls"},
@@ -278,10 +371,13 @@ class DecisionReplayBacktester:
                 "min_test_trades": self.min_test_trades,
                 "train_passed": train_passed,
                 "test_passed": test_passed,
+                "data_quality_passed": data_quality_passed,
             },
             "walk_forward": self._walkforward_metrics(dataset.examples, policy),
+            "walk_forward_trained": self._walkforward_trained_metrics(dataset.examples, policy),
+            "decision_replay_report": decision_report,
         })
-        passed = train_passed and test_passed
+        passed = train_passed and test_passed and data_quality_passed
         pnls = list(test_metrics["pnls"])
         result = ReplayBacktestResult(
             run_id=_stable_id(

@@ -67,6 +67,8 @@ jobs:
           tests/test_live_controls.py
           tests/test_options_flow.py
           tests/test_portfolio_rotation.py
+          tests/test_regime_reversal_manager.py
+          tests/test_risk_policy.py
           -v --tb=short
 
   safety:

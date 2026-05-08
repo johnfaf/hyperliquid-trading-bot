@@ -10,10 +10,12 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+import time
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
-from src.ui.v2.auth import verify_cookie
+from src.ui.v2.auth import read_access_allowed
 from src.ui.v2.events import get_bus
 
 logger = logging.getLogger(__name__)
@@ -21,23 +23,33 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
+def _heartbeat_seconds() -> float:
+    raw = os.environ.get("DASHBOARD_V2_WS_HEARTBEAT_SECONDS", "15")
+    try:
+        return max(5.0, float(raw))
+    except (TypeError, ValueError):
+        return 15.0
+
+
 @router.websocket("/ws")
 async def stream_events(websocket: WebSocket):
     # Reuse the cookie auth so the WS doesn't get used as an auth bypass.
-    if not verify_cookie(websocket):
+    if not read_access_allowed(websocket):
+        logger.info("dashboard websocket rejected: auth_required")
         await websocket.close(code=4401)
         return
     await websocket.accept()
     queue = await get_bus().subscribe()
+    heartbeat_s = _heartbeat_seconds()
     try:
-        await websocket.send_json({"kind": "hello", "ok": True})
+        await websocket.send_json({"kind": "hello", "ok": True, "ts": time.time()})
         while True:
             try:
-                event = await asyncio.wait_for(queue.get(), timeout=30.0)
+                event = await asyncio.wait_for(queue.get(), timeout=heartbeat_s)
             except asyncio.TimeoutError:
                 # Heartbeat -- prevents intermediate proxies from idling
                 # us out, and lets the client confirm the channel.
-                await websocket.send_json({"kind": "heartbeat"})
+                await websocket.send_json({"kind": "heartbeat", "ts": time.time()})
                 continue
             await websocket.send_text(json.dumps(event))
     except WebSocketDisconnect:

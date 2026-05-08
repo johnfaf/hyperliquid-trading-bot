@@ -33,13 +33,22 @@ _LOCAL_JOB_RUNNING = False
 _LOCAL_JOB_STARTED_AT: Optional[float] = None
 _LOCAL_JOB_RESULT: Optional[Dict[str, Any]] = None
 _LOCAL_JOB_ERROR: Optional[str] = None
+_LOCAL_JOB_PROGRESS: Dict[str, Any] = {"phase": "idle"}
+_LOCAL_JOB_MARKED_V1_RUNNING = False
+
+
+def _v1_module():
+    try:
+        from src.ui import dashboard as v1
+        return v1
+    except Exception:
+        return None
 
 
 def _v1_state() -> Optional[Dict[str, Any]]:
     """Best-effort read of v1's job state. Returns None when v1 is absent."""
-    try:
-        from src.ui import dashboard as v1
-    except Exception:
+    v1 = _v1_module()
+    if v1 is None:
         return None
     try:
         return {
@@ -48,6 +57,23 @@ def _v1_state() -> Optional[Dict[str, Any]]:
         }
     except Exception:
         return None
+
+
+def _shared_job_lock():
+    v1 = _v1_module()
+    return getattr(v1, "_BACKTEST_JOB_LOCK", _LOCAL_JOB_LOCK) if v1 is not None else _LOCAL_JOB_LOCK
+
+
+def _set_progress(phase: str, **fields: Any) -> None:
+    _LOCAL_JOB_PROGRESS.update({"phase": phase, "updated_at": time.time(), **fields})
+
+
+def _coerce_max_wallets(value: Any, default: int = 30) -> tuple[int, int]:
+    try:
+        requested = int(value if value is not None else default)
+    except (TypeError, ValueError):
+        requested = default
+    return requested, max(1, min(requested, 200))
 
 
 def _status_payload() -> Dict[str, Any]:
@@ -64,9 +90,17 @@ def _status_payload() -> Dict[str, Any]:
         with db.get_connection(for_read=True) as conn:
             try:
                 rows = conn.execute(
-                    "SELECT trader_address, total_pnl, win_rate, trade_count, "
-                    "completed_at FROM backtest_results "
-                    "ORDER BY completed_at DESC LIMIT 25"
+                    """
+                    SELECT address AS trader_address,
+                           active_periods AS trade_count,
+                           profitable_pct / 100.0 AS win_rate,
+                           total_penalised_pnl AS total_pnl,
+                           evaluated_at AS completed_at
+                    FROM backtest_results
+                    WHERE timeframe = '1d'
+                    ORDER BY evaluated_at DESC
+                    LIMIT 25
+                    """
                 ).fetchall()
                 recent_results = [dict(r) for r in rows]
             except Exception:
@@ -79,6 +113,7 @@ def _status_payload() -> Dict[str, Any]:
         "elapsed_s": elapsed,
         "last_result": _LOCAL_JOB_RESULT,
         "last_error": _LOCAL_JOB_ERROR,
+        "progress": dict(_LOCAL_JOB_PROGRESS),
         "recent_results": recent_results,
     }
 
@@ -97,57 +132,126 @@ async def backtest_run(request: Request, max_wallets: int = Form(30)):
         return JSONResponse({"error": "auth_required"}, status_code=401)
 
     global _LOCAL_JOB_RUNNING, _LOCAL_JOB_STARTED_AT, _LOCAL_JOB_RESULT, _LOCAL_JOB_ERROR
+    global _LOCAL_JOB_MARKED_V1_RUNNING
 
-    with _LOCAL_JOB_LOCK:
-        if _LOCAL_JOB_RUNNING:
+    requested, capped = _coerce_max_wallets(max_wallets)
+    lock = _shared_job_lock()
+    v1 = _v1_module()
+
+    with lock:
+        if _LOCAL_JOB_RUNNING or bool(getattr(v1, "_BACKTEST_JOB_RUNNING", False)):
             return JSONResponse(
-                {"status": "running", "started_at": _LOCAL_JOB_STARTED_AT},
+                {
+                    "status": "running",
+                    "started_at": _LOCAL_JOB_STARTED_AT or getattr(v1, "_BACKTEST_JOB_STARTED_AT", None),
+                    "progress": dict(_LOCAL_JOB_PROGRESS),
+                },
                 status_code=409,
             )
         _LOCAL_JOB_RUNNING = True
         _LOCAL_JOB_STARTED_AT = time.time()
         _LOCAL_JOB_RESULT = None
         _LOCAL_JOB_ERROR = None
-
-    capped = max(1, min(int(max_wallets or 30), 200))
+        _set_progress(
+            "queued",
+            requested_max_wallets=requested,
+            max_wallets=capped,
+            started_at=_LOCAL_JOB_STARTED_AT,
+        )
+        _LOCAL_JOB_MARKED_V1_RUNNING = False
+        if v1 is not None:
+            try:
+                setattr(v1, "_BACKTEST_JOB_RUNNING", True)
+                setattr(v1, "_BACKTEST_JOB_STARTED_AT", _LOCAL_JOB_STARTED_AT)
+                _LOCAL_JOB_MARKED_V1_RUNNING = True
+            except Exception:
+                _LOCAL_JOB_MARKED_V1_RUNNING = False
 
     def _run() -> None:
         global _LOCAL_JOB_RUNNING, _LOCAL_JOB_STARTED_AT, _LOCAL_JOB_RESULT, _LOCAL_JOB_ERROR
+        global _LOCAL_JOB_MARKED_V1_RUNNING
         started = _LOCAL_JOB_STARTED_AT
         try:
             from src.discovery.golden_wallet import run_golden_scan, init_golden_tables
             from src.backtest.backtest_engine import (
                 run_all_backtests, save_backtest_result, init_backtest_tables,
             )
+            _set_progress("init_tables")
             init_golden_tables()
             init_backtest_tables()
-            golden = run_golden_scan(max_wallets=capped) or []
+            _set_progress("golden_scan", requested_max_wallets=requested, max_wallets=capped)
+            golden_summary = run_golden_scan(max_wallets=capped) or {}
+            if isinstance(golden_summary, dict):
+                scanned_wallets = int(golden_summary.get("scanned") or 0)
+                golden_wallets = int(golden_summary.get("golden") or 0)
+                scan_error = golden_summary.get("error")
+            else:
+                scanned_wallets = len(golden_summary)
+                golden_wallets = 0
+                scan_error = None
+            _set_progress(
+                "backtest",
+                requested_max_wallets=requested,
+                max_wallets=capped,
+                scanned_wallets=scanned_wallets,
+                golden_wallets=golden_wallets,
+                scan_error=scan_error,
+            )
             results = run_all_backtests() or []
+            _set_progress(
+                "saving_results",
+                requested_max_wallets=requested,
+                max_wallets=capped,
+                scanned_wallets=scanned_wallets,
+                golden_wallets=golden_wallets,
+                backtests_run=len(results),
+            )
+            saved = 0
             for r in results:
                 try:
                     save_backtest_result(r)
+                    saved += 1
                 except Exception as save_exc:
-                    logger.debug("save_backtest_result failed: %s", save_exc)
+                    logger.warning("save_backtest_result failed: %s", save_exc)
             _LOCAL_JOB_RESULT = {
-                "scanned_wallets": len(golden),
+                "requested_max_wallets": requested,
+                "max_wallets": capped,
+                "scanned_wallets": scanned_wallets,
+                "golden_wallets": golden_wallets,
                 "backtests_run": len(results),
+                "results_saved": saved,
+                "scan_error": scan_error,
                 "duration_s": time.time() - (started or time.time()),
             }
+            _set_progress("complete", **_LOCAL_JOB_RESULT)
             logger.info(
-                "Dashboard backtest complete: %d wallets scanned, %d backtests",
-                len(golden), len(results),
+                "Dashboard backtest complete: %d wallets scanned, %d golden, %d backtests",
+                scanned_wallets, golden_wallets, len(results),
             )
         except Exception as exc:
             logger.error("Dashboard backtest failed: %s", exc, exc_info=True)
             _LOCAL_JOB_ERROR = str(exc)
+            _set_progress("error", error=str(exc))
         finally:
-            with _LOCAL_JOB_LOCK:
+            with lock:
                 _LOCAL_JOB_RUNNING = False
+                if _LOCAL_JOB_MARKED_V1_RUNNING and v1 is not None:
+                    try:
+                        setattr(v1, "_BACKTEST_JOB_RUNNING", False)
+                        setattr(v1, "_BACKTEST_JOB_STARTED_AT", None)
+                    except Exception:
+                        pass
+                _LOCAL_JOB_MARKED_V1_RUNNING = False
                 # Keep _LOCAL_JOB_STARTED_AT so the UI can show the last-run time.
 
     thread = threading.Thread(target=_run, name="dashboard-v2-backtest", daemon=True)
     thread.start()
-    return JSONResponse({"status": "started", "started_at": _LOCAL_JOB_STARTED_AT, "max_wallets": capped})
+    return JSONResponse({
+        "status": "started",
+        "started_at": _LOCAL_JOB_STARTED_AT,
+        "requested_max_wallets": requested,
+        "max_wallets": capped,
+    })
 
 
 @router.get("/backtest", response_class=HTMLResponse)

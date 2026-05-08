@@ -73,7 +73,7 @@ from src.core.api_manager import Priority, get_manager
 from src.core.secret_manager import SecretManagerError, load_agent_private_key
 from src.signals.decision_firewall import DecisionFirewall
 from src.signals.risk_policy import RiskPolicyEngine
-from src.signals.signal_schema import TradeSignal, signal_from_execution_dict
+from src.signals.signal_schema import RiskParams, SignalSide, SignalSource, TradeSignal, signal_from_execution_dict
 from src.core.env_utils import safe_env_float as _safe_env_float  # C6/C9 shared helper
 from src.trading.scaling_tiers import (
     ScalingTier,
@@ -81,6 +81,7 @@ from src.trading.scaling_tiers import (
     resolve_tier,
     summarize_tier,
 )
+from src.trading.regime_reversal_manager import RegimeReversalDecision, RegimeReversalManager
 
 logger = logging.getLogger(__name__)
 
@@ -634,6 +635,7 @@ class LiveTrader:
         self._kill_switch_reason: str = ""
         self.regime_forecaster = regime_forecaster
         self.risk_policy_engine = risk_policy_engine
+        self.regime_reversal_manager = RegimeReversalManager.from_config(config)
         self.status_reason = "dry_run_requested" if dry_run else "initializing"
 
         # API endpoints (must come early since _load_* methods need these)
@@ -3975,6 +3977,224 @@ class LiveTrader:
                     tuple(params),
                 )
 
+    def _publish_regime_reversal_event(
+        self,
+        decision: RegimeReversalDecision,
+        **payload: Any,
+    ) -> None:
+        """Best-effort dashboard notification for regime-reversal actions."""
+        try:
+            from src.ui.v2.events import publish_event
+            publish_event(
+                "regime_reversal",
+                action=decision.action,
+                coin=decision.coin,
+                side=decision.side,
+                reverse_side=decision.reverse_side,
+                regime=decision.regime,
+                confidence=decision.confidence,
+                reason=decision.reason,
+                confirmed_cycles=decision.confirmed_cycles,
+                **payload,
+            )
+        except Exception:
+            pass
+
+    def _position_still_open_same_side(
+        self,
+        coin: str,
+        side: str,
+        *,
+        min_size: float = 1e-12,
+    ) -> bool:
+        positions = self.get_positions(force_fresh=True)
+        if positions is None:
+            return True
+        for pos in positions:
+            pos_coin = str(pos.get("coin", "") or "").upper()
+            pos_side = str(pos.get("side", "") or "").strip().lower()
+            pos_size = abs(self._coerce_float(pos.get("size", pos.get("szi", 0)), 0.0))
+            if pos_coin == coin and pos_side == side and pos_size > min_size:
+                return True
+        return False
+
+    def _execute_regime_reversal_decision(
+        self,
+        *,
+        position: Dict[str, Any],
+        shadow_trades: List[Dict[str, Any]],
+        policy: Dict[str, Any],
+        decision: RegimeReversalDecision,
+        current_price: float,
+        leverage: float,
+        now_utc: datetime,
+    ) -> Dict[str, Any]:
+        """Close, and optionally reverse, a position after a confirmed regime flip."""
+        coin = decision.coin
+        side = decision.side
+        result: Dict[str, Any] = {
+            "closed": False,
+            "reversed": False,
+            "failed": False,
+            "reverse_result": None,
+        }
+
+        close_result = self._close_position_with_retries(coin, "regime_reversal")
+        close_ok = self._is_order_result_success(close_result)
+        if not close_ok:
+            logger.error(
+                "Regime reversal close failed for %s %s: %s",
+                coin,
+                side,
+                close_result,
+            )
+            result["failed"] = True
+            self._update_shadow_trade_risk_levels(
+                shadow_trades,
+                metadata_updates={
+                    "risk_event": "regime_reversal_close_failed",
+                    "regime_reversal": decision.to_dict(),
+                    "live_risk_state": {
+                        "event": "regime_reversal_close_failed",
+                        "close_result": close_result,
+                        "updated_at": now_utc.isoformat(),
+                    },
+                },
+            )
+            self._publish_regime_reversal_event(decision, status="close_failed")
+            return result
+
+        result["closed"] = True
+        try:
+            self.regime_reversal_manager.mark_action(coin, now=now_utc)
+        except Exception:
+            pass
+
+        cancelled_protective = 0
+        try:
+            cancelled_protective = self._cancel_protective_orders(coin)
+        except Exception as exc:
+            logger.warning(
+                "Regime reversal close succeeded for %s but protective cancel sweep failed: %s",
+                coin,
+                exc,
+            )
+
+        metadata_updates = {
+            "risk_event": decision.action,
+            "regime_reversal": decision.to_dict(),
+            "live_close_requested_at": now_utc.isoformat(),
+            "live_close_reason": decision.reason,
+            "live_risk_state": {
+                "event": decision.action,
+                "close_result": close_result,
+                "protective_cancelled_after_close": cancelled_protective,
+                "updated_at": now_utc.isoformat(),
+            },
+        }
+
+        if decision.action != "close_and_reverse":
+            self._update_shadow_trade_risk_levels(
+                shadow_trades,
+                metadata_updates=metadata_updates,
+            )
+            self._publish_regime_reversal_event(
+                decision,
+                status="closed",
+                protective_cancelled=cancelled_protective,
+            )
+            return result
+
+        if self._position_still_open_same_side(coin, side):
+            logger.warning(
+                "Regime reversal close for %s %s did not flatten on fresh position check; "
+                "skipping reverse entry.",
+                coin,
+                side,
+            )
+            result["failed"] = True
+            metadata_updates["live_risk_state"]["reverse_skipped"] = "close_not_flat"
+            self._update_shadow_trade_risk_levels(
+                shadow_trades,
+                metadata_updates=metadata_updates,
+            )
+            self._publish_regime_reversal_event(decision, status="reverse_skipped_close_not_flat")
+            return result
+
+        stop_roe_pct = max(self._coerce_float(policy.get("stop_roe_pct"), 0.0), 0.0)
+        take_profit_roe_pct = max(self._coerce_float(policy.get("take_profit_roe_pct"), 0.0), 0.0)
+        reward_multiple = (
+            take_profit_roe_pct / stop_roe_pct
+            if stop_roe_pct > 0 and take_profit_roe_pct > 0
+            else float(getattr(config, "RISK_POLICY_FIXED_R_TARGET", 5.0))
+        )
+        reverse_signal = TradeSignal(
+            coin=coin,
+            side=SignalSide(decision.reverse_side),
+            confidence=min(max(decision.confidence, 0.0), 1.0),
+            source=SignalSource.STRATEGY,
+            reason=(
+                f"Regime reversal from {side} to {decision.reverse_side}: "
+                f"{decision.regime} confidence={decision.confidence:.2f}"
+            ),
+            risk=RiskParams(
+                stop_loss_pct=stop_roe_pct or float(getattr(config, "RISK_POLICY_MIN_STOP_ROE_PCT", 0.01)),
+                take_profit_pct=take_profit_roe_pct or 0.0,
+                max_leverage=max(float(leverage or 1.0), 1.0),
+                trailing_stop=bool(policy.get("trailing_enabled", True)),
+                trailing_pct=max(self._coerce_float(policy.get("trailing_distance_roe_pct"), stop_roe_pct * 0.75), 0.0),
+                time_limit_hours=max(self._coerce_float(policy.get("time_limit_hours"), 18.0), 0.25),
+                risk_basis="roe",
+                reward_to_risk_ratio=max(reward_multiple, 1.0),
+                enforce_reward_to_risk=bool(stop_roe_pct > 0),
+                break_even_at_r=max(self._coerce_float(policy.get("breakeven_at_r"), 1.0), 0.0),
+                break_even_buffer_pct=max(self._coerce_float(policy.get("breakeven_buffer_roe_pct"), 0.005), 0.0),
+                trail_activate_at_r=max(self._coerce_float(policy.get("trail_after_r"), 2.0), 0.0),
+            ),
+            position_pct=min(
+                max(float(getattr(self.regime_reversal_manager.cfg, "reverse_position_pct", 0.03)), 0.001),
+                0.50,
+            ),
+            leverage=max(float(leverage or 1.0), 1.0),
+            size=0.0,
+            context={
+                "regime_reversal": decision.to_dict(),
+                "closed_position": {
+                    "coin": coin,
+                    "side": side,
+                    "entry_price": position.get("entry_price") or position.get("entryPx"),
+                    "closed_at": now_utc.isoformat(),
+                },
+            },
+            entry_price=float(current_price),
+            strategy_type="regime_reversal",
+            regime=decision.regime,
+        )
+
+        reverse_result = self.execute_signal(reverse_signal, bypass_firewall=False)
+        result["reverse_result"] = reverse_result
+        reverse_ok = self._is_order_result_success(reverse_result)
+        result["reversed"] = reverse_ok
+        metadata_updates["live_risk_state"]["reverse_result"] = reverse_result
+        metadata_updates["live_risk_state"]["reverse_status"] = "submitted" if reverse_ok else "rejected_or_failed"
+        self._update_shadow_trade_risk_levels(
+            shadow_trades,
+            metadata_updates=metadata_updates,
+        )
+        self._publish_regime_reversal_event(
+            decision,
+            status="reversed" if reverse_ok else "reverse_failed",
+            protective_cancelled=cancelled_protective,
+        )
+        if not reverse_ok:
+            logger.warning(
+                "Regime reversal closed %s %s but reverse entry was rejected/failed: %s",
+                coin,
+                side,
+                reverse_result,
+            )
+        return result
+
     def manage_open_positions(self) -> Dict[str, Any]:
         """Apply dynamic time-stop, breakeven, and trailing updates to live positions."""
         if self.dry_run:
@@ -3998,6 +4218,7 @@ class LiveTrader:
 
         now_utc = datetime.now(timezone.utc)
         managed = updated = closed = skipped = failed = 0
+        reversal_tightened = reversal_closed = reversal_reversed = reversal_failed = 0
 
         for position in positions:
             coin = str(position.get("coin", "") or "").upper()
@@ -4048,6 +4269,61 @@ class LiveTrader:
                 stop_roe_pct,
             )
             risk_event = "static"
+            reversal_metadata: Optional[Dict[str, Any]] = None
+            reversal_tighten_pending = False
+
+            reversal_manager = getattr(self, "regime_reversal_manager", None)
+            if reversal_manager is not None:
+                try:
+                    reversal_decision = reversal_manager.evaluate(
+                        position=position,
+                        shadow_trades=shadow_trades,
+                        policy={
+                            **dict(policy),
+                            "stop_roe_pct": stop_roe_pct,
+                            "take_profit_roe_pct": take_profit_roe_pct,
+                        },
+                        current_price=current_price,
+                        current_r=current_r,
+                        forecaster=self.regime_forecaster,
+                        now=now_utc,
+                    )
+                except Exception as exc:
+                    logger.warning("Regime reversal evaluation failed for %s: %s", coin, exc)
+                    reversal_decision = None
+
+                if reversal_decision is not None:
+                    if reversal_decision.action == "tighten_stop" and reversal_decision.stop_price:
+                        if side == "long":
+                            desired_sl = max(desired_sl, float(reversal_decision.stop_price))
+                        else:
+                            desired_sl = min(desired_sl, float(reversal_decision.stop_price))
+                        risk_event = "regime_reversal_tighten"
+                        reversal_tighten_pending = True
+                        reversal_metadata = reversal_decision.to_dict()
+                    elif reversal_decision.action in {"close_only", "close_and_reverse"}:
+                        action_result = self._execute_regime_reversal_decision(
+                            position=position,
+                            shadow_trades=shadow_trades,
+                            policy={
+                                **dict(policy),
+                                "stop_roe_pct": stop_roe_pct,
+                                "take_profit_roe_pct": take_profit_roe_pct,
+                            },
+                            decision=reversal_decision,
+                            current_price=current_price,
+                            leverage=leverage,
+                            now_utc=now_utc,
+                        )
+                        if action_result.get("closed"):
+                            closed += 1
+                            reversal_closed += 1
+                        if action_result.get("reversed"):
+                            reversal_reversed += 1
+                        if action_result.get("failed"):
+                            failed += 1
+                            reversal_failed += 1
+                        continue
 
             breakeven_at_r = self._coerce_float(policy.get("breakeven_at_r"), 1.0)
             breakeven_buffer_price_pct = self._coerce_float(
@@ -4129,6 +4405,8 @@ class LiveTrader:
                         stale_protective_oids,
                     )
                 updated += 1
+                if reversal_tighten_pending:
+                    reversal_tightened += 1
                 self._update_shadow_trade_risk_levels(
                     shadow_trades,
                     stop_loss=desired_sl,
@@ -4139,6 +4417,7 @@ class LiveTrader:
                             "stop_roe_pct": stop_roe_pct,
                             "take_profit_roe_pct": take_profit_roe_pct,
                         },
+                        **({"regime_reversal": reversal_metadata} if reversal_metadata else {}),
                         "risk_event": risk_event,
                         "live_risk_state": {
                             "event": risk_event,
@@ -4152,6 +4431,15 @@ class LiveTrader:
                         },
                     },
                 )
+                if reversal_metadata:
+                    self._publish_regime_reversal_event(
+                        RegimeReversalDecision(**{
+                            k: v for k, v in reversal_metadata.items()
+                            if k in RegimeReversalDecision.__dataclass_fields__
+                        }),
+                        status="tightened",
+                        stop_loss=round(desired_sl, 8),
+                    )
             else:
                 failed += 1
                 logger.error(
@@ -4205,6 +4493,10 @@ class LiveTrader:
             "closed": closed,
             "skipped": skipped,
             "failed": failed,
+            "regime_reversal_tightened": reversal_tightened,
+            "regime_reversal_closed": reversal_closed,
+            "regime_reversal_reversed": reversal_reversed,
+            "regime_reversal_failed": reversal_failed,
         }
 
     _PROTECTIVE_RESIZE_DELAY_S = 30.0  # Wait for remaining fills before resizing

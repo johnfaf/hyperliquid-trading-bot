@@ -1012,11 +1012,17 @@ def _candle_cache_checks(
                 minimum=min_coin_count,
             )
         if missing_active:
+            severity = str(
+                getattr(config, "DB_AUDIT_CANDLE_CACHE_MISSING_ACTIVE_SEVERITY", "medium")
+                or "medium"
+            ).strip().lower()
+            if severity not in SEVERITY_ORDER:
+                severity = "medium"
             _add(
                 findings,
                 "candle_cache_missing_active_coins",
-                "high",
-                "Open/active coins are missing from the candle cache.",
+                severity,
+                "Open/active coins are missing from the candle cache; backtests may need to refresh data.",
                 missing_active_coins=missing_active,
             )
     finally:
@@ -1252,6 +1258,52 @@ def _repair_orphan_position_snapshot_parents(actions: list[DbRepairAction]) -> N
             "orphan_position_snapshot_parents",
             "failed",
             "Could not backfill placeholder trader parents.",
+            error=str(exc),
+        )
+
+
+def _repair_wallet_fill_side_codes(actions: list[DbRepairAction]) -> None:
+    """Normalize legacy Hyperliquid fill side codes before Postgres mirroring."""
+    try:
+        with db.get_connection() as conn:
+            if not _table_exists(conn, "wallet_fills"):
+                _record_action(
+                    actions,
+                    "wallet_fill_side_codes",
+                    "skipped",
+                    "wallet_fills table is not present.",
+                )
+                return
+            repaired = 0
+            cur = conn.execute(
+                """
+                UPDATE wallet_fills
+                SET side = 'buy'
+                WHERE LOWER(side) IN ('b', 'bid', 'long')
+                """
+            )
+            repaired += max(int(getattr(cur, "rowcount", 0) or 0), 0)
+            cur = conn.execute(
+                """
+                UPDATE wallet_fills
+                SET side = 'sell'
+                WHERE LOWER(side) IN ('a', 'ask', 's', 'short')
+                """
+            )
+            repaired += max(int(getattr(cur, "rowcount", 0) or 0), 0)
+            _record_action(
+                actions,
+                "wallet_fill_side_codes",
+                "applied" if repaired else "skipped",
+                "Normalized legacy Hyperliquid wallet_fills side codes.",
+                repaired=repaired,
+            )
+    except Exception as exc:
+        _record_action(
+            actions,
+            "wallet_fill_side_codes",
+            "failed",
+            "Could not normalize wallet_fills side codes.",
             error=str(exc),
         )
 
@@ -2339,6 +2391,7 @@ def run_db_repair(
     _repair_invalid_strategy_bloat(actions)
     _repair_orphan_strategy_score_parents(actions)
     _repair_missing_source_wallet_strategy_bloat(actions)
+    _repair_wallet_fill_side_codes(actions)
     _repair_source_inventory(actions)
     _repair_paper_account(actions)
     _repair_open_trade_protection(actions)
@@ -2411,6 +2464,7 @@ def run_startup_safe_repair() -> list[DbRepairAction]:
     )
     _repair_invalid_strategy_bloat(actions, max_rows=startup_strategy_prune_limit)
     _repair_orphan_strategy_score_parents(actions, max_rows=startup_strategy_prune_limit)
+    _repair_wallet_fill_side_codes(actions)
     _repair_paper_account(actions)
     _repair_stale_pending_decisions(actions)
     _repair_source_health_history(actions)

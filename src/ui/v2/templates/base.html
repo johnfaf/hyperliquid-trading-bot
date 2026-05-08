@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>{{ title }} — Hyperliquid Bot</title>
+  <title>{{ title }} - Hyperliquid Bot</title>
   <script>
     // Apply persisted theme BEFORE tailwind paints to avoid a flash.
     (function () {
@@ -13,19 +13,8 @@
       } catch (e) { /* localStorage may be unavailable */ }
     })();
   </script>
-  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="stylesheet" href="/static/dashboard.css" />
   <script src="https://unpkg.com/htmx.org@1.9.12"></script>
-  <script>
-    tailwind.config = {
-      theme: {
-        extend: {
-          fontFamily: {
-            mono: ['ui-monospace', 'SFMono-Regular', 'Menlo', 'monospace'],
-          },
-        },
-      },
-    };
-  </script>
   <style>
     body { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
     .bin-bar { transition: width 0.2s ease; }
@@ -55,7 +44,8 @@
   <header class="border-b border-slate-800 bg-slate-900/80 backdrop-blur sticky top-0 z-10">
     <div class="max-w-7xl mx-auto px-4 py-3 flex items-center gap-6">
       <a href="/" class="font-bold text-emerald-400">HL Bot</a>
-      <nav class="flex gap-4 text-sm text-slate-300">
+      <nav class="flex gap-4 text-sm text-slate-300"
+           hx-boost="true" hx-target="#page-main" hx-select="#page-main" hx-swap="outerHTML" hx-push-url="true">
         <a href="/" class="hover:text-white">Overview</a>
         <a href="/positions" class="hover:text-white">Positions</a>
         <a href="/sources" class="hover:text-white">Sources</a>
@@ -67,7 +57,7 @@
       <div class="flex-1"></div>
       <span id="health-strip" class="text-xs px-2 py-0.5 rounded bg-slate-800 text-slate-400"
             hx-get="/api/health/strip"
-            hx-trigger="load, every 30s, wsEvent from:body"
+            hx-trigger="load, every 30s, wsEvent"
             hx-swap="none"
             data-ws-refresh-on="cycle,kill_switch">health: …</span>
       <span id="ws-status" class="text-xs px-2 py-0.5 rounded bg-slate-800 text-slate-400">ws: connecting</span>
@@ -79,35 +69,104 @@
       </form>
     </div>
   </header>
-  <main class="max-w-7xl mx-auto px-4 py-6">
+  <main id="page-main" class="max-w-7xl mx-auto px-4 py-6">
     {% block content %}{% endblock %}
   </main>
   <script>
     (function () {
       const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-      const ws = new WebSocket(proto + '://' + location.host + '/ws');
       const status = document.getElementById('ws-status');
-      ws.onopen = () => { status.textContent = 'ws: live'; status.className = 'text-xs px-2 py-0.5 rounded bg-emerald-900/60 text-emerald-300'; };
-      ws.onclose = () => { status.textContent = 'ws: closed'; status.className = 'text-xs px-2 py-0.5 rounded bg-rose-900/60 text-rose-300'; };
-      ws.onerror = () => { status.textContent = 'ws: error'; status.className = 'text-xs px-2 py-0.5 rounded bg-rose-900/60 text-rose-300'; };
-      ws.onmessage = (ev) => {
+      let socket = null;
+      let retry = 0;
+      let stopped = false;
+      let lastMessageAt = 0;
+      let staleTimer = null;
+
+      function setStatus(label, tone) {
+        if (!status) return;
+        const classes = {
+          live: 'bg-emerald-900/60 text-emerald-300',
+          warn: 'bg-amber-900/60 text-amber-300',
+          down: 'bg-rose-900/60 text-rose-300',
+          idle: 'bg-slate-800 text-slate-400',
+        };
+        status.textContent = label;
+        status.className = 'text-xs px-2 py-0.5 rounded ' + (classes[tone] || classes.idle);
+      }
+
+      function scheduleReconnect() {
+        if (stopped) return;
+        const delayMs = Math.min(30000, 1000 * Math.pow(2, retry));
+        retry = Math.min(retry + 1, 5);
+        setStatus(`ws: reconnect ${Math.round(delayMs / 1000)}s`, 'warn');
+        setTimeout(connect, delayMs);
+      }
+
+      function connect() {
+        if (stopped) return;
+        setStatus('ws: connecting', 'idle');
         try {
-          const data = JSON.parse(ev.data);
-          // Trigger HTMX refresh on tagged sections.
-          if (data && data.kind) {
-            document.querySelectorAll('[data-ws-refresh-on]').forEach((el) => {
-              const kinds = (el.getAttribute('data-ws-refresh-on') || '').split(',').map(s => s.trim());
-              if (kinds.includes(data.kind)) {
-                htmx.trigger(el, 'wsEvent');
-              }
-            });
-            // Page-level subscribers (sparkline + fills ticker live in
-            // their own pages and don't use HTMX swaps).
-            window.dispatchEvent(new CustomEvent('ws-event', {detail: data}));
+          socket = new WebSocket(proto + '://' + location.host + '/ws');
+        } catch (e) {
+          scheduleReconnect();
+          return;
+        }
+        socket.onopen = () => {
+          retry = 0;
+          lastMessageAt = Date.now();
+          setStatus('ws: live', 'live');
+        };
+        socket.onclose = (ev) => {
+          if (stopped) return;
+          if (ev && ev.code === 4401) {
+            setStatus('ws: auth required', 'down');
+            return;
           }
-        } catch (e) { /* ignore malformed */ }
-      };
+          scheduleReconnect();
+        };
+        socket.onerror = () => {
+          setStatus('ws: error', 'down');
+        };
+        socket.onmessage = (ev) => {
+          lastMessageAt = Date.now();
+          setStatus('ws: live', 'live');
+          try {
+            const data = JSON.parse(ev.data);
+            // Trigger HTMX refresh on tagged sections.
+            if (data && data.kind) {
+              document.querySelectorAll('[data-ws-refresh-on]').forEach((el) => {
+                const kinds = (el.getAttribute('data-ws-refresh-on') || '').split(',').map(s => s.trim());
+                if (kinds.includes(data.kind)) {
+                  htmx.trigger(el, 'wsEvent');
+                }
+              });
+              // Page-level subscribers (sparkline + fills ticker live in
+              // their own pages and don't use HTMX swaps).
+              window.dispatchEvent(new CustomEvent('ws-event', {detail: data}));
+            }
+          } catch (e) { /* ignore malformed */ }
+        };
+      }
+
+      window.addEventListener('beforeunload', () => {
+        stopped = true;
+        if (staleTimer) clearInterval(staleTimer);
+        if (socket) socket.close();
+      });
+      staleTimer = setInterval(() => {
+        if (stopped || !lastMessageAt || !socket || socket.readyState !== WebSocket.OPEN) return;
+        const idleMs = Date.now() - lastMessageAt;
+        if (idleMs > 45000) setStatus('ws: idle', 'warn');
+      }, 10000);
+      connect();
     })();
+
+    // Give page-local scripts a chance to clean up intervals/listeners before SPA swaps.
+    document.body.addEventListener('htmx:beforeSwap', (ev) => {
+      if (ev.detail && ev.detail.target && ev.detail.target.id === 'page-main') {
+        window.dispatchEvent(new Event('dashboard:before-page-swap'));
+      }
+    });
 
     // Theme toggle. Persisted in localStorage; the inline script in
     // <head> applies it before paint so reloads don't flash.
@@ -134,7 +193,7 @@
       };
       const tone = tones[body.tone] || 'bg-slate-800 text-slate-400';
       el.className = 'text-xs px-2 py-0.5 rounded ' + tone;
-      el.title = (body.reasons || []).join(' · ') || body.summary || '';
+      el.title = (body.reasons || []).join(' | ') || body.summary || '';
       el.textContent = 'health: ' + (body.label || 'unknown');
     });
   </script>

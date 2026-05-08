@@ -93,6 +93,61 @@ def _insert_rejected_decision(conn):
     )
 
 
+class _JournalSignal:
+    coin = "BTC"
+    side = "long"
+    source = "strategy"
+    strategy_type = "momentum_long"
+    strategy_id = 7
+    signal_id = "why_btc_long"
+    confidence = 0.72
+    entry_price = 100.0
+    size = 0.5
+    leverage = 3.0
+    position_pct = 0.05
+    reason = "Strategy: alpha_momentum_btc"
+    context = {
+        "decision_attribution": {
+            "source": "strategy",
+            "strategy_type": "momentum_long",
+            "strategy_name": "alpha_momentum_btc",
+        },
+        "market_side_alignment": {
+            "aligned": False,
+            "direction": "short",
+            "source": "global_momentum",
+        },
+    }
+
+
+def test_decision_snapshot_records_why_entered_metadata(monkeypatch):
+    conn = _memory_db(monkeypatch)
+
+    decision_journal.record_decision_snapshot(
+        _JournalSignal(),
+        regime_data={
+            "overall_regime": "bearish",
+            "overall_confidence": 0.74,
+            "countertrend_block_side": "long",
+            "global_momentum_override": {"reason": "btc_market_leader"},
+            "per_coin": {"BTC": {"regime": "crash", "confidence": 0.72}},
+        },
+        final_status="firewall_validation",
+        firewall_decision="pending",
+    )
+
+    row = conn.execute(
+        "SELECT metadata FROM decision_snapshots WHERE decision_id = ?",
+        ("why_btc_long",),
+    ).fetchone()
+    metadata = json.loads(row["metadata"])
+
+    assert metadata["why_entered"]["strategy_type"] == "momentum_long"
+    assert metadata["market_read"]["overall_regime"] == "bearish"
+    assert metadata["market_read"]["global_momentum_override"]["reason"] == "btc_market_leader"
+    assert metadata["market_read"]["market_side_alignment"]["direction"] == "short"
+
+
 def test_rejected_decision_gets_stage_outcome_and_dataset_label(monkeypatch):
     conn = _memory_db(monkeypatch)
     _insert_rejected_decision(conn)
@@ -159,6 +214,8 @@ def test_forward_labels_read_feature_store_candles(monkeypatch):
     )
 
     assert round(labels["forward_return_15m"], 4) == 0.02
+    assert labels["data_gap_15m"] == 1
+    assert labels["data_coverage_15m"] < 1.0
     assert labels["would_have_won"] == 1
     assert round(labels["missed_profit_usd"], 2) == 3.0
 

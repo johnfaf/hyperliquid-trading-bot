@@ -59,7 +59,21 @@ _HAS_PERSISTENT_VOLUME = DB_PATH.startswith("/data")
 # "dualwrite" — writes to both SQLite and Postgres, reads from SQLite
 # "postgres"  — all reads/writes go to Postgres
 _raw_db_backend = os.environ.get("DB_BACKEND", "sqlite").strip().lower()
-POSTGRES_DSN = os.environ.get("POSTGRES_DSN", "").strip()
+_POSTGRES_DSN_CANDIDATES = (
+    ("POSTGRES_DSN", os.environ.get("POSTGRES_DSN", "")),
+    # Railway exposes Postgres as DATABASE_URL by default.  Accept it so
+    # operators do not accidentally run SQLite after selecting Postgres.
+    ("DATABASE_URL", os.environ.get("DATABASE_URL", "")),
+    ("DATABASE_PRIVATE_URL", os.environ.get("DATABASE_PRIVATE_URL", "")),
+)
+POSTGRES_DSN_SOURCE = ""
+POSTGRES_DSN = ""
+for _dsn_name, _dsn_value in _POSTGRES_DSN_CANDIDATES:
+    _dsn_value = str(_dsn_value or "").strip()
+    if _dsn_value:
+        POSTGRES_DSN_SOURCE = _dsn_name
+        POSTGRES_DSN = _dsn_value
+        break
 # Auto-downgrade to sqlite if Postgres backends are requested but no DSN is set.
 # H3 (audit): we still downgrade so dev environments boot, but we record
 # the downgrade and emit a visible warning.  When live trading is enabled,
@@ -74,8 +88,8 @@ if _raw_db_backend in ("dualwrite", "postgres") and not POSTGRES_DSN:
     print(
         f"[config] WARNING: DB_BACKEND={_raw_db_backend!r} requested but "
         f"POSTGRES_DSN is empty -- downgrading to sqlite.  Live trading "
-        f"will REFUSE to start in this state (set POSTGRES_DSN or "
-        f"DB_BACKEND=sqlite).",
+        f"will REFUSE to start in this state (set POSTGRES_DSN, "
+        f"DATABASE_URL, or DB_BACKEND=sqlite).",
         file=_sys.stderr,
     )
 else:
@@ -92,12 +106,20 @@ POSTGRES_APP_NAME = os.environ.get("POSTGRES_APP_NAME", "hyperliquid-bot").strip
 READINESS_DB_AUDIT_ENABLED = os.environ.get(
     "READINESS_DB_AUDIT_ENABLED", "true"
 ).lower() in ("true", "1", "yes")
+READINESS_DB_AUDIT_AUTO_REPAIR = os.environ.get(
+    "READINESS_DB_AUDIT_AUTO_REPAIR", "true"
+).lower() in ("true", "1", "yes")
 READINESS_DB_AUDIT_TTL_S = int(os.environ.get("READINESS_DB_AUDIT_TTL_S", 300))
 READINESS_DB_AUDIT_BLOCK_SEVERITY = os.environ.get(
     "READINESS_DB_AUDIT_BLOCK_SEVERITY", "high"
 ).strip().lower()
 if READINESS_DB_AUDIT_BLOCK_SEVERITY not in {"low", "medium", "high", "critical"}:
     READINESS_DB_AUDIT_BLOCK_SEVERITY = "high"
+DB_AUDIT_CANDLE_CACHE_MISSING_ACTIVE_SEVERITY = os.environ.get(
+    "DB_AUDIT_CANDLE_CACHE_MISSING_ACTIVE_SEVERITY", "medium"
+).strip().lower()
+if DB_AUDIT_CANDLE_CACHE_MISSING_ACTIVE_SEVERITY not in {"low", "medium", "high", "critical"}:
+    DB_AUDIT_CANDLE_CACHE_MISSING_ACTIVE_SEVERITY = "medium"
 DB_AUDIT_PENDING_DECISION_MAX_AGE_MINUTES = float(
     os.environ.get("DB_AUDIT_PENDING_DECISION_MAX_AGE_MINUTES", 30.0)
 )
@@ -464,6 +486,40 @@ LIVE_MAKER_ENTRY_TIMEOUT_S = _safe_env_float(
 LIVE_MAKER_ENTRY_FALLBACK_TO_MARKET = _safe_env_bool(
     "LIVE_MAKER_ENTRY_FALLBACK_TO_MARKET", True,
 )
+
+# Regime reversal supervision for open LIVE positions.
+# Default mode is intentionally staged: detect confirmed opposite regimes and
+# tighten protection, but do not flatten/reverse real capital unless the
+# operator explicitly enables those higher-impact gates.
+REGIME_REVERSAL_ENABLED = _safe_env_bool("REGIME_REVERSAL_ENABLED", True)
+REGIME_REVERSAL_TIGHTEN_ENABLED = _safe_env_bool("REGIME_REVERSAL_TIGHTEN_ENABLED", True)
+REGIME_REVERSAL_CLOSE_ENABLED = _safe_env_bool("REGIME_REVERSAL_CLOSE_ENABLED", False)
+REGIME_REVERSAL_REVERSE_ENABLED = _safe_env_bool("REGIME_REVERSAL_REVERSE_ENABLED", False)
+REGIME_REVERSAL_REVERSE_ON_CRASH = _safe_env_bool("REGIME_REVERSAL_REVERSE_ON_CRASH", False)
+REGIME_REVERSAL_MIN_CONFIDENCE = _safe_env_float(
+    "REGIME_REVERSAL_MIN_CONFIDENCE", 0.70, lo=0.0, hi=1.0,
+)
+REGIME_REVERSAL_REVERSE_CONFIDENCE = _safe_env_float(
+    "REGIME_REVERSAL_REVERSE_CONFIDENCE", 0.82, lo=0.0, hi=1.0,
+)
+REGIME_REVERSAL_CONFIRM_CYCLES = _safe_env_int(
+    "REGIME_REVERSAL_CONFIRM_CYCLES", 3, lo=1, hi=100,
+)
+REGIME_REVERSAL_MIN_POSITION_AGE_SECONDS = _safe_env_int(
+    "REGIME_REVERSAL_MIN_POSITION_AGE_SECONDS", 180, lo=0, hi=86_400,
+)
+REGIME_REVERSAL_COOLDOWN_SECONDS = _safe_env_int(
+    "REGIME_REVERSAL_COOLDOWN_SECONDS", 900, lo=0, hi=86_400,
+)
+REGIME_REVERSAL_MAX_ACTIONS_PER_COIN_PER_DAY = _safe_env_int(
+    "REGIME_REVERSAL_MAX_ACTIONS_PER_COIN_PER_DAY", 2, lo=0, hi=100,
+)
+REGIME_REVERSAL_TIGHTEN_STOP_R_MULTIPLE = _safe_env_float(
+    "REGIME_REVERSAL_TIGHTEN_STOP_R_MULTIPLE", 0.35, lo=0.01, hi=2.0,
+)
+REGIME_REVERSAL_REVERSE_POSITION_PCT = _safe_env_float(
+    "REGIME_REVERSAL_REVERSE_POSITION_PCT", 0.03, lo=0.001, hi=0.50,
+)
 COPY_TRADER_ENABLED = os.environ.get(
     "COPY_TRADER_ENABLED", "true"
 ).lower() in ("true", "1", "yes")
@@ -658,6 +714,27 @@ SHORT_HARDENING_CONFIDENCE_MULTIPLIER = float(
     os.environ.get("SHORT_HARDENING_CONFIDENCE_MULTIPLIER", 0.80)
 )
 SHORT_HARDENING_SIZE_MULTIPLIER = float(os.environ.get("SHORT_HARDENING_SIZE_MULTIPLIER", 0.50))
+SHORT_HARDENING_BLOCK_OVERRIDE_ENABLED = os.environ.get(
+    "SHORT_HARDENING_BLOCK_OVERRIDE_ENABLED", "true"
+).lower() in ("true", "1", "yes")
+SHORT_HARDENING_BLOCK_OVERRIDE_MIN_CONFIDENCE = float(
+    os.environ.get("SHORT_HARDENING_BLOCK_OVERRIDE_MIN_CONFIDENCE", 0.70)
+)
+SHORT_HARDENING_BLOCK_OVERRIDE_MIN_REGIME_CONFIDENCE = float(
+    os.environ.get("SHORT_HARDENING_BLOCK_OVERRIDE_MIN_REGIME_CONFIDENCE", 0.60)
+)
+SHORT_HARDENING_BLOCK_OVERRIDE_SIZE_MULTIPLIER = float(
+    os.environ.get("SHORT_HARDENING_BLOCK_OVERRIDE_SIZE_MULTIPLIER", 0.35)
+)
+SHORT_HARDENING_MARKET_ADAPTIVE_OVERRIDE_ENABLED = os.environ.get(
+    "SHORT_HARDENING_MARKET_ADAPTIVE_OVERRIDE_ENABLED", "true"
+).lower() in ("true", "1", "yes")
+SHORT_HARDENING_MARKET_ADAPTIVE_MIN_MOMENTUM = float(
+    os.environ.get("SHORT_HARDENING_MARKET_ADAPTIVE_MIN_MOMENTUM", 0.003)
+)
+SHORT_HARDENING_MARKET_ADAPTIVE_SCOPED_SIZE_MULTIPLIER = float(
+    os.environ.get("SHORT_HARDENING_MARKET_ADAPTIVE_SCOPED_SIZE_MULTIPLIER", 0.25)
+)
 SHORT_HARDENING_SOURCE_GUARD_ENABLED = os.environ.get(
     "SHORT_HARDENING_SOURCE_GUARD_ENABLED", "true"
 ).lower() in ("true", "1", "yes")
@@ -719,6 +796,24 @@ FIREWALL_ENTRY_MAX_ATR_EXTENSION = float(
 FIREWALL_ENTRY_MAX_PRICE_EXTENSION_PCT = float(
     os.environ.get("FIREWALL_ENTRY_MAX_PRICE_EXTENSION_PCT", 0.035)
 )
+FIREWALL_SIDE_IMBALANCE_GUARD_ENABLED = _safe_env_bool(
+    "FIREWALL_SIDE_IMBALANCE_GUARD_ENABLED", True
+)
+FIREWALL_SIDE_IMBALANCE_LOOKBACK_TRADES = int(
+    os.environ.get("FIREWALL_SIDE_IMBALANCE_LOOKBACK_TRADES", 60)
+)
+FIREWALL_SIDE_IMBALANCE_MIN_SAMPLES = int(
+    os.environ.get("FIREWALL_SIDE_IMBALANCE_MIN_SAMPLES", 12)
+)
+FIREWALL_SIDE_IMBALANCE_MAX_SHARE = float(
+    os.environ.get("FIREWALL_SIDE_IMBALANCE_MAX_SHARE", 0.80)
+)
+FIREWALL_SIDE_IMBALANCE_CONFIDENCE_BUMP = float(
+    os.environ.get("FIREWALL_SIDE_IMBALANCE_CONFIDENCE_BUMP", 0.15)
+)
+FIREWALL_SIDE_IMBALANCE_SIZE_MULTIPLIER = float(
+    os.environ.get("FIREWALL_SIDE_IMBALANCE_SIZE_MULTIPLIER", 0.50)
+)
 
 # Cross-asset momentum override: when core majors break out together, block
 # countertrend entries and pause mean-reversion-style fades. Auto-closing
@@ -743,6 +838,29 @@ GLOBAL_MOMENTUM_MIN_VOLUME_RATIO = float(
 )
 GLOBAL_MOMENTUM_CLOSE_COUNTERTREND = _safe_env_bool(
     "GLOBAL_MOMENTUM_CLOSE_COUNTERTREND", False
+)
+BTC_MARKET_LEADER_GUARD_ENABLED = _safe_env_bool(
+    "BTC_MARKET_LEADER_GUARD_ENABLED", True
+)
+BTC_MARKET_LEADER_COIN = os.environ.get("BTC_MARKET_LEADER_COIN", "BTC").strip().upper() or "BTC"
+BTC_MARKET_LEADER_MIN_CONFIDENCE = float(
+    os.environ.get("BTC_MARKET_LEADER_MIN_CONFIDENCE", GLOBAL_MOMENTUM_MIN_CONFIDENCE)
+)
+BTC_MARKET_LEADER_MIN_MOMENTUM = float(
+    os.environ.get("BTC_MARKET_LEADER_MIN_MOMENTUM", 0.003)
+)
+BTC_MARKET_LEADER_MIN_VOLUME_RATIO = float(
+    os.environ.get("BTC_MARKET_LEADER_MIN_VOLUME_RATIO", GLOBAL_MOMENTUM_MIN_VOLUME_RATIO)
+)
+
+# Directional market-side guard: blocks/de-risks entries fighting a strong
+# current market read. This closes the old asymmetry where short-side history
+# hardening could make shorts harder than longs during bearish BTC momentum.
+FIREWALL_MARKET_SIDE_GUARD_ENABLED = _safe_env_bool(
+    "FIREWALL_MARKET_SIDE_GUARD_ENABLED", True
+)
+FIREWALL_MARKET_SIDE_GUARD_MIN_CONFIDENCE = float(
+    os.environ.get("FIREWALL_MARKET_SIDE_GUARD_MIN_CONFIDENCE", 0.60)
 )
 
 # Per-source capital allocator / throttling.
@@ -799,6 +917,9 @@ SOURCE_POLICY_STRONG_RECENT_PNL_FLOOR = _safe_env_float(
 # Runtime readiness / incident monitoring.
 READINESS_STALE_SECONDS = int(os.environ.get("READINESS_STALE_SECONDS", 600))
 READINESS_DB_WRITE_TTL_S = int(os.environ.get("READINESS_DB_WRITE_TTL_S", 60))
+READINESS_REQUIRE_HEALTH_REGISTRY = os.environ.get(
+    "READINESS_REQUIRE_HEALTH_REGISTRY", "false"
+).lower() in ("true", "1", "yes")
 READINESS_ALERT_COOLDOWN_S = int(
     os.environ.get("READINESS_ALERT_COOLDOWN_S", 900)
 )
@@ -822,7 +943,34 @@ SCORING_INTERVAL = 86400
 
 # ─── Multi-Exchange Scanner ────────────────────────────────────
 # Enable/disable secondary venues (Hyperliquid is always primary)
-LIGHTER_ENABLED = os.environ.get("LIGHTER_ENABLED", "true").lower() in ("true", "1", "yes")
+LIVE_EXECUTION_VENUE = os.environ.get("LIVE_EXECUTION_VENUE", "hyperliquid").strip().lower()
+if LIVE_EXECUTION_VENUE not in {"hyperliquid", "lighter"}:
+    LIVE_EXECUTION_VENUE = "hyperliquid"
+LIGHTER_ENABLED = os.environ.get("LIGHTER_ENABLED", "true").strip().lower() in ("true", "1", "yes")
+LIGHTER_STRATEGY_INJECTION_ENABLED = os.environ.get(
+    "LIGHTER_STRATEGY_INJECTION_ENABLED", "false"
+).strip().lower() in ("true", "1", "yes")
+LIGHTER_STRATEGY_INJECTION_LIMIT = _safe_env_int("LIGHTER_STRATEGY_INJECTION_LIMIT", 25, lo=1, hi=250)
+LIGHTER_STRATEGY_MIN_VOLUME_USD = _safe_env_float(
+    "LIGHTER_STRATEGY_MIN_VOLUME_USD", 10_000.0, lo=0.0, hi=100_000_000.0
+)
+LIGHTER_LIVE_TRADING_ENABLED = os.environ.get(
+    "LIGHTER_LIVE_TRADING_ENABLED", "false"
+).strip().lower() in ("true", "1", "yes")
+LIGHTER_LIVE_TRADING_DUAL_CONTROL_CONFIRM = os.environ.get(
+    "LIGHTER_LIVE_TRADING_DUAL_CONTROL_CONFIRM", "false"
+).strip().lower() in ("true", "1", "yes")
+LIGHTER_BASE_URL = os.environ.get("LIGHTER_BASE_URL", "https://mainnet.zklighter.elliot.ai").strip()
+LIGHTER_ACCOUNT_INDEX = _safe_env_int("LIGHTER_ACCOUNT_INDEX", -1, lo=-1, hi=10_000_000)
+LIGHTER_API_KEY_INDEX = _safe_env_int("LIGHTER_API_KEY_INDEX", 0, lo=0, hi=10_000)
+LIGHTER_PRIVATE_KEY = os.environ.get("LIGHTER_PRIVATE_KEY", "").strip()
+LIGHTER_L1_ADDRESS = os.environ.get("LIGHTER_L1_ADDRESS", "").strip()
+LIGHTER_MIN_ORDER_USD = _safe_env_float("LIGHTER_MIN_ORDER_USD", 1.0, lo=0.0, hi=10_000.0)
+LIGHTER_MAX_ORDER_USD = _safe_env_float("LIGHTER_MAX_ORDER_USD", 100.0, lo=1.0, hi=10_000_000.0)
+LIGHTER_DEFAULT_LEVERAGE = _safe_env_float("LIGHTER_DEFAULT_LEVERAGE", 5.0, lo=1.0, hi=50.0)
+LIGHTER_MAX_SLIPPAGE_BPS = _safe_env_float("LIGHTER_MAX_SLIPPAGE_BPS", 20.0, lo=0.0, hi=1000.0)
+LIGHTER_SIZE_DECIMALS_DEFAULT = _safe_env_int("LIGHTER_SIZE_DECIMALS_DEFAULT", 4, lo=0, hi=18)
+LIGHTER_PRICE_DECIMALS_DEFAULT = _safe_env_int("LIGHTER_PRICE_DECIMALS_DEFAULT", 2, lo=0, hi=18)
 
 # ─── Predictive Regime Forecaster ──────────────────────────────
 ENABLE_PREDICTIVE_FORECASTER = os.environ.get("ENABLE_PREDICTIVE_FORECASTER", "true").lower() in ("true", "1", "yes")
@@ -1139,6 +1287,14 @@ def _validate_config_bounds() -> None:
         ("LIVE_ANALYTICS_LOOKBACK_TRADES", 10, 5_000, 200),
         ("LIVE_MAKER_ENTRY_OFFSET_BPS", 0.0, 100.0, 1.0),
         ("LIVE_MAKER_ENTRY_TIMEOUT_S", 0.0, 30.0, 2.5),
+        ("REGIME_REVERSAL_MIN_CONFIDENCE", 0.0, 1.0, 0.70),
+        ("REGIME_REVERSAL_REVERSE_CONFIDENCE", 0.0, 1.0, 0.82),
+        ("REGIME_REVERSAL_CONFIRM_CYCLES", 1, 100, 3),
+        ("REGIME_REVERSAL_MIN_POSITION_AGE_SECONDS", 0, 86_400, 180),
+        ("REGIME_REVERSAL_COOLDOWN_SECONDS", 0, 86_400, 900),
+        ("REGIME_REVERSAL_MAX_ACTIONS_PER_COIN_PER_DAY", 0, 100, 2),
+        ("REGIME_REVERSAL_TIGHTEN_STOP_R_MULTIPLE", 0.01, 2.0, 0.35),
+        ("REGIME_REVERSAL_REVERSE_POSITION_PCT", 0.001, 0.50, 0.03),
         ("COPY_TRADER_MAX_CONCURRENT_TRADES", 0, 100, 2),
         ("COPY_TRADER_MAX_NEW_TRADES_PER_CYCLE", 0, 100, 1),
         ("COPY_TRADER_AUTO_PAUSE_MIN_CLOSED_TRADES", 1, 5_000, 6),
@@ -1158,6 +1314,11 @@ def _validate_config_bounds() -> None:
         ("SHORT_HARDENING_BLOCK_NET_PNL", -1_000_000.0, 1_000_000.0, -25.0),
         ("SHORT_HARDENING_CONFIDENCE_MULTIPLIER", 0.0, 1.0, 0.80),
         ("SHORT_HARDENING_SIZE_MULTIPLIER", 0.0, 1.0, 0.50),
+        ("SHORT_HARDENING_BLOCK_OVERRIDE_MIN_CONFIDENCE", 0.0, 1.0, 0.70),
+        ("SHORT_HARDENING_BLOCK_OVERRIDE_MIN_REGIME_CONFIDENCE", 0.0, 1.0, 0.60),
+        ("SHORT_HARDENING_BLOCK_OVERRIDE_SIZE_MULTIPLIER", 0.0, 1.0, 0.35),
+        ("SHORT_HARDENING_MARKET_ADAPTIVE_MIN_MOMENTUM", 0.0, 1.0, 0.003),
+        ("SHORT_HARDENING_MARKET_ADAPTIVE_SCOPED_SIZE_MULTIPLIER", 0.0, 1.0, 0.25),
         ("SHORT_HARDENING_SOURCE_MIN_CLOSED_TRADES", 1, 1_000, 3),
         ("SHORT_HARDENING_SOURCE_BLOCK_NET_PNL", -1_000_000.0, 1_000_000.0, -0.25),
         ("SHORT_HARDENING_COIN_MIN_CLOSED_TRADES", 1, 1_000, 4),
@@ -1165,10 +1326,19 @@ def _validate_config_bounds() -> None:
         ("FIREWALL_AVERAGING_MAX_LOSS_ROE_PCT", 0.0, 1.0, 0.015),
         ("FIREWALL_ENTRY_MAX_ATR_EXTENSION", 0.0, 20.0, 1.8),
         ("FIREWALL_ENTRY_MAX_PRICE_EXTENSION_PCT", 0.0, 1.0, 0.035),
+        ("FIREWALL_SIDE_IMBALANCE_LOOKBACK_TRADES", 10, 5_000, 60),
+        ("FIREWALL_SIDE_IMBALANCE_MIN_SAMPLES", 5, 5_000, 12),
+        ("FIREWALL_SIDE_IMBALANCE_MAX_SHARE", 0.50, 0.98, 0.80),
+        ("FIREWALL_SIDE_IMBALANCE_CONFIDENCE_BUMP", 0.0, 0.50, 0.15),
+        ("FIREWALL_SIDE_IMBALANCE_SIZE_MULTIPLIER", 0.05, 1.0, 0.50),
         ("GLOBAL_MOMENTUM_MIN_AGREEING_COINS", 1, 20, 2),
         ("GLOBAL_MOMENTUM_MIN_CONFIDENCE", 0.0, 1.0, 0.58),
         ("GLOBAL_MOMENTUM_MIN_MOMENTUM", 0.0, 1.0, 0.006),
         ("GLOBAL_MOMENTUM_MIN_VOLUME_RATIO", 0.0, 100.0, 0.75),
+        ("BTC_MARKET_LEADER_MIN_CONFIDENCE", 0.0, 1.0, 0.58),
+        ("BTC_MARKET_LEADER_MIN_MOMENTUM", 0.0, 1.0, 0.003),
+        ("BTC_MARKET_LEADER_MIN_VOLUME_RATIO", 0.0, 100.0, 0.75),
+        ("FIREWALL_MARKET_SIDE_GUARD_MIN_CONFIDENCE", 0.0, 1.0, 0.60),
         ("PAPER_EXECUTION_MAX_TRADES_PER_CYCLE", 0, 100, 3),
         ("TRADE_QUALITY_MIN_EDGE_COST_MULTIPLE", 0.0, 100.0, 1.5),
         ("TRADE_QUALITY_EXPECTED_SLIPPAGE_BPS", 0.0, 1_000.0, PAPER_TRADING_SLIPPAGE_MAX_BPS),

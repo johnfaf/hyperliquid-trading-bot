@@ -157,6 +157,36 @@ def test_regime_disagreement_blocks_countertrend_side(mock_db):
 
 
 @patch("src.signals.decision_firewall.db")
+def test_market_side_guard_blocks_longs_in_bearish_regime(mock_db):
+    mock_db.get_open_paper_trades.return_value = []
+    mock_db.get_paper_account.return_value = {"balance": 1000000}
+    mock_db.audit_log = MagicMock()
+
+    from src.signals.decision_firewall import DecisionFirewall
+
+    fw = DecisionFirewall({
+        "enable_predictive_derisk": False,
+        "funding_risk_enabled": False,
+        "cooldown_seconds": 0,
+        "same_side_cooldown_seconds": 0,
+        "market_side_guard_enabled": True,
+        "market_side_guard_min_confidence": 0.60,
+    })
+    signal = MockSignal(side_val="long", confidence=0.8, strategy_type="momentum_long")
+
+    passed, reason = fw.validate(
+        signal,
+        regime_data={"overall_regime": "bearish", "overall_confidence": 0.74},
+        open_positions=[],
+        account_balance=1000000,
+    )
+
+    assert passed is False
+    assert "blocks long" in reason.lower()
+    assert signal.context["market_side_alignment"]["direction"] == "short"
+
+
+@patch("src.signals.decision_firewall.db")
 def test_firewall_rejects_max_positions(mock_db):
     """Should reject when max positions reached."""
     mock_db.get_open_paper_trades.return_value = [
@@ -686,6 +716,112 @@ def test_firewall_blocks_shorts_when_recent_shorts_are_bad(mock_db):
 
 
 @patch("src.signals.decision_firewall.db")
+def test_firewall_allows_high_confidence_shorts_in_bearish_regime(mock_db):
+    mock_db.get_open_paper_trades.return_value = []
+    mock_db.get_paper_account.return_value = {"balance": 10000}
+    mock_db.get_paper_trade_history.return_value = [
+        {"side": "short", "pnl": -0.7, "metadata": "{}"},
+        {"side": "short", "pnl": -0.4, "metadata": "{}"},
+        {"side": "short", "pnl": -0.2, "metadata": "{}"},
+        {"side": "short", "pnl": 0.1, "metadata": "{}"},
+    ]
+    mock_db.audit_log = MagicMock()
+
+    from src.signals.decision_firewall import DecisionFirewall
+
+    fw = DecisionFirewall(
+        {
+            "short_hardening_enabled": True,
+            "short_hardening_min_closed_trades": 4,
+            "short_hardening_block_win_rate": 0.35,
+            "short_hardening_block_net_pnl": -1.0,
+            "short_hardening_block_override_enabled": True,
+            "short_hardening_block_override_min_confidence": 0.70,
+            "short_hardening_block_override_min_regime_confidence": 0.60,
+            "short_hardening_block_override_size_multiplier": 0.35,
+            "short_hardening_confidence_multiplier": 0.80,
+            "enable_predictive_derisk": False,
+            "funding_risk_enabled": False,
+        }
+    )
+    signal = MockSignal(side_val="short", confidence=0.85, size=0.2, position_pct=0.1)
+
+    passed, reason = fw.validate(
+        signal,
+        regime_data={"overall_regime": "trending_down", "overall_confidence": 0.75},
+    )
+
+    assert passed is True
+    assert reason == "approved"
+    assert signal.confidence == pytest.approx(0.68)
+    assert signal.size == pytest.approx(0.07)
+    assert signal.position_pct == pytest.approx(0.035)
+    assert signal.context["short_side_policy_override"]["status"] == "override"
+
+
+@patch("src.signals.decision_firewall.db")
+def test_firewall_market_adaptive_override_allows_scoped_short_block(mock_db):
+    mock_db.get_open_paper_trades.return_value = []
+    mock_db.get_paper_account.return_value = {"balance": 10000}
+    mock_db.get_paper_trade_history.return_value = [
+        {"coin": "BTC", "side": "short", "pnl": -0.7, "metadata": {"source_key": "test:momentum"}},
+        {"coin": "BTC", "side": "short", "pnl": -0.4, "metadata": {"source_key": "test:momentum"}},
+        {"coin": "BTC", "side": "short", "pnl": -0.2, "metadata": {"source_key": "test:momentum"}},
+        {"coin": "BTC", "side": "short", "pnl": 0.1, "metadata": {"source_key": "test:momentum"}},
+    ]
+    mock_db.audit_log = MagicMock()
+
+    from src.signals.decision_firewall import DecisionFirewall
+
+    fw = DecisionFirewall(
+        {
+            "short_hardening_enabled": True,
+            "short_hardening_min_closed_trades": 4,
+            "short_hardening_block_win_rate": 0.35,
+            "short_hardening_block_net_pnl": -1.0,
+            "short_hardening_source_guard_enabled": True,
+            "short_hardening_source_min_closed_trades": 3,
+            "short_hardening_source_block_net_pnl": -0.25,
+            "short_hardening_coin_guard_enabled": True,
+            "short_hardening_coin_min_closed_trades": 4,
+            "short_hardening_coin_block_net_pnl": -0.25,
+            "short_hardening_block_override_enabled": True,
+            "short_hardening_block_override_min_confidence": 0.70,
+            "short_hardening_block_override_min_regime_confidence": 0.60,
+            "short_hardening_block_override_size_multiplier": 0.35,
+            "short_hardening_market_adaptive_scoped_size_multiplier": 0.25,
+            "short_hardening_confidence_multiplier": 0.80,
+            "enable_predictive_derisk": False,
+            "funding_risk_enabled": False,
+        }
+    )
+    signal = MockSignal(side_val="short", confidence=0.85, size=0.2, position_pct=0.1)
+
+    passed, reason = fw.validate(
+        signal,
+        regime_data={
+            "overall_regime": "trending_down",
+            "overall_confidence": 0.75,
+            "per_coin": {
+                "BTC": {
+                    "regime": "trending_down",
+                    "confidence": 0.82,
+                    "momentum": -0.012,
+                    "trend_direction": -0.01,
+                }
+            },
+        },
+    )
+
+    assert passed is True
+    assert reason == "approved"
+    assert signal.size == pytest.approx(0.05)
+    assert signal.position_pct == pytest.approx(0.025)
+    assert signal.context["short_side_policy_override"]["scope"] == "scoped"
+    assert signal.context["short_side_policy_override"]["market_alignment"]["source"] == "coin:BTC"
+
+
+@patch("src.signals.decision_firewall.db")
 def test_firewall_derisks_shorts_when_recent_shorts_need_caution(mock_db):
     mock_db.get_open_paper_trades.return_value = []
     mock_db.get_paper_account.return_value = {"balance": 10000}
@@ -956,3 +1092,77 @@ def test_firewall_margin_cap_aggregates_over_existing_positions(mock_db):
     passed, reason = fw.validate(big)
     assert passed is False
     assert "aggregate margin" in reason.lower()
+
+
+@patch("src.signals.decision_firewall.db")
+def test_side_imbalance_guard_blocks_low_confidence_same_side(mock_db):
+    mock_db.get_paper_trade_history.return_value = [
+        {"side": "long"} for _ in range(12)
+    ]
+    mock_db.get_open_paper_trades.return_value = []
+
+    from src.signals.decision_firewall import DecisionFirewall
+
+    fw = DecisionFirewall(
+        {
+            "enable_predictive_derisk": False,
+            "funding_risk_enabled": False,
+            "entry_location_filter_enabled": False,
+            "cooldown_seconds": 0,
+            "same_side_cooldown_seconds": 0,
+            "min_confidence": 0.40,
+            "side_imbalance_max_share": 0.80,
+            "side_imbalance_confidence_bump": 0.15,
+            "side_imbalance_min_samples": 10,
+        }
+    )
+    signal = MockSignal(confidence=0.50, side_val="long", size=1.0, entry_price=100)
+
+    passed, reason = fw.validate(
+        signal,
+        open_positions=[],
+        account_balance=1_000_000,
+        dry_run=True,
+    )
+
+    assert passed is False
+    assert "side imbalance" in reason.lower()
+
+
+@patch("src.signals.decision_firewall.db")
+def test_side_imbalance_guard_derisks_high_confidence_same_side(mock_db):
+    mock_db.get_paper_trade_history.return_value = [
+        {"side": "long"} for _ in range(12)
+    ]
+    mock_db.get_open_paper_trades.return_value = []
+
+    from src.signals.decision_firewall import DecisionFirewall
+
+    fw = DecisionFirewall(
+        {
+            "enable_predictive_derisk": False,
+            "funding_risk_enabled": False,
+            "entry_location_filter_enabled": False,
+            "cooldown_seconds": 0,
+            "same_side_cooldown_seconds": 0,
+            "max_aggregate_exposure": 100.0,
+            "min_confidence": 0.40,
+            "side_imbalance_max_share": 0.80,
+            "side_imbalance_confidence_bump": 0.15,
+            "side_imbalance_min_samples": 10,
+            "side_imbalance_size_multiplier": 0.50,
+        }
+    )
+    signal = MockSignal(confidence=0.75, side_val="long", size=1.0, entry_price=100)
+
+    passed, reason = fw.validate(
+        signal,
+        open_positions=[],
+        account_balance=1_000_000,
+        dry_run=True,
+    )
+
+    assert passed is True
+    assert reason == "approved"
+    assert signal.size == pytest.approx(0.5)
+    assert signal.position_pct == pytest.approx(0.025)

@@ -67,7 +67,48 @@ class DecisionEngine:
             "total_no_trade": 0,
             "total_candidates": 0,
             "total_missing_asset": 0,
+            "total_missing_direction": 0,
         }
+
+    @staticmethod
+    def _normalise_params(params):
+        if isinstance(params, str):
+            import json
+            try:
+                return json.loads(params)
+            except (json.JSONDecodeError, TypeError):
+                return {}
+        return params if isinstance(params, dict) else {}
+
+    @staticmethod
+    def _extract_coins(params: Dict) -> List[str]:
+        coins = params.get("coins") or params.get("coins_traded") or params.get("coin") or []
+        if isinstance(coins, str):
+            coins = [coins]
+        return [str(coin).upper() for coin in coins if str(coin or "").strip()]
+
+    @staticmethod
+    def _normalise_direction(value) -> str:
+        direction = str(value or "").strip().lower()
+        if direction in {"buy", "long"}:
+            return "long"
+        if direction in {"sell", "short"}:
+            return "short"
+        return "neutral"
+
+    @classmethod
+    def _regime_default_direction(cls, params: Dict, regime_data: Optional[Dict]) -> str:
+        regime = str((regime_data or {}).get("overall_regime", "") or "").strip().lower()
+        try:
+            confidence = float((regime_data or {}).get("overall_confidence", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            confidence = 0.0
+        if confidence >= 0.60:
+            if regime in {"trending_down", "bearish", "crash"}:
+                return "short"
+            if regime in {"trending_up", "bullish"}:
+                return "long"
+        return cls._normalise_direction(params.get("direction") or params.get("bias"))
 
     def decide(self, strategies: List[Dict],
                regime_data: Optional[Dict] = None,
@@ -104,29 +145,21 @@ class DecisionEngine:
         # market the strategy never actually identified.
         valid_strategies = []
         for s in strategies:
-            params = s.get("parameters", {})
-            if isinstance(params, str):
-                import json
-                try:
-                    params = json.loads(params)
-                except (json.JSONDecodeError, TypeError):
-                    params = {}
-                # Persist parsed version so downstream doesn't re-parse
-                s["parameters"] = params
+            params = self._normalise_params(s.get("parameters", {}))
+            # Persist parsed version so downstream doesn't re-parse
+            s["parameters"] = params
 
-            coins = params.get("coins", params.get("coins_traded", []))
-            if isinstance(coins, str):
-                coins = [coins]
+            coins = self._extract_coins(params)
 
             # Fallback 1: extract from trader's current positions in metrics
-            if not coins or (coins and coins[0] == "unknown"):
+            if not coins or (coins and coins[0].lower() == "unknown"):
                 metrics = s.get("metrics", {})
                 traded_coins = metrics.get("coins", metrics.get("coins_traded", []))
                 if traded_coins and isinstance(traded_coins, list):
-                    coins = traded_coins
+                    coins = [str(coin).upper() for coin in traded_coins if str(coin or "").strip()]
                     params["coins"] = coins  # Persist so _compute_composite_score sees it
 
-            if not coins or (coins and coins[0] == "unknown"):
+            if not coins or (coins and coins[0].lower() == "unknown"):
                 strategy_type = s.get("strategy_type", s.get("type", ""))
                 s["_decision_skip_reason"] = "missing_asset"
                 self.stats["total_missing_asset"] += 1
@@ -220,8 +253,6 @@ class DecisionEngine:
         Compute a composite ranking score from multiple factors.
         Returns breakdown dict with individual component scores + total.
         """
-        import json
-
         strategy_type = strategy.get("strategy_type", strategy.get("type", ""))
         raw_score = strategy.get("current_score", 0)
 
@@ -243,15 +274,8 @@ class DecisionEngine:
                 regime_bonus = 0.3  # Neutral — neither activated nor paused
 
         # 3. Diversification bonus — prefer coins we DON'T already have
-        params = strategy.get("parameters", "{}")
-        if isinstance(params, str):
-            try:
-                params = json.loads(params)
-            except (json.JSONDecodeError, TypeError):
-                params = {}
-        coins = params.get("coins", params.get("coins_traded", []))
-        if isinstance(coins, str):
-            coins = [coins]
+        params = self._normalise_params(strategy.get("parameters", "{}"))
+        coins = self._extract_coins(params)
         target_coin = coins[0] if coins else "unknown"
 
         # Store for logging
@@ -271,15 +295,9 @@ class DecisionEngine:
         # (set by strategy_identifier) even if the regime is strongly trending.
         contrarian_types = {"mean_reversion", "contrarian", "fade", "counter_trend"}
 
-        # Derive regime direction bias (default for all non-explicit strategies)
-        overall_regime = (regime_data or {}).get("overall_regime", "unknown")
-        regime_conf    = (regime_data or {}).get("overall_confidence", 0.0)
-        if overall_regime == "trending_down" and regime_conf >= 0.6:
-            regime_default = "short"
-        elif overall_regime == "trending_up" and regime_conf >= 0.6:
-            regime_default = "long"
-        else:
-            regime_default = params.get("direction", "long")
+        # Derive regime direction bias. If neither the regime nor strategy
+        # explicitly says long/short, stay neutral instead of hiding it as long.
+        regime_default = self._regime_default_direction(params, regime_data)
 
         if strategy_type in long_types:
             direction = "long"
@@ -289,19 +307,24 @@ class DecisionEngine:
             # ★ H14: use the strategy's own direction, never the regime trend.
             # Fall back to "long" only if direction missing (shouldn't happen
             # after H17 fix ensures strategy_identifier sets direction).
-            direction = params.get("direction") or "long"
-            if not params.get("direction"):
+            direction = self._normalise_direction(params.get("direction") or params.get("bias"))
+            if direction == "neutral":
                 logger.warning(
                     "Contrarian strategy %s missing direction param -- "
-                    "defaulting to long. Check strategy_identifier.",
+                    "marking neutral/no-trade. Check strategy_identifier.",
                     strategy_type,
                 )
         else:
             # breakout, trend_following, swing_trading, concentrated_bet,
             # scalping, funding_arb, delta_neutral, etc.
-            # — follow the regime when confident, else use stored param
-            direction = params.get("direction") or regime_default
+            # — follow the current regime when confident.  Stored direction
+            # is a fallback only, not a permanent long/short bias from an
+            # older market.
+            direction = regime_default
         strategy["_decision_side"] = direction
+        if direction not in {"long", "short"}:
+            strategy["_decision_skip_reason"] = "missing_direction"
+            self.stats["total_missing_direction"] += 1
 
         diversity_bonus = 1.0 if target_coin not in open_coins else 0.0
 
@@ -332,6 +355,8 @@ class DecisionEngine:
             freshness * self.w_freshness +
             consensus * self.w_consensus
         )
+        if direction not in {"long", "short"}:
+            total = -1.0
 
         return {
             "total": round(total, 4),
@@ -352,7 +377,7 @@ class DecisionEngine:
         short_score = 0.0
 
         for s in scored:
-            direction = s.get("_decision_side", "long")
+            direction = s.get("_decision_side", "neutral")
             composite = s.get("_composite_score", 0)
 
             if direction == "long":

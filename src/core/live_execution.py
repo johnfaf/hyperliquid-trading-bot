@@ -87,6 +87,11 @@ def _paper_trade_id_for_client_order_id(client_order_id: str) -> Optional[int]:
 
 def get_live_trader(container):
     """Return the attached live trader, if any."""
+    venue = os.environ.get("LIVE_EXECUTION_VENUE", "hyperliquid").strip().lower()
+    if venue == "lighter":
+        lighter = getattr(container, "lighter_live_trader", None)
+        if lighter is not None:
+            return lighter
     return getattr(container, "live_trader", None)
 
 

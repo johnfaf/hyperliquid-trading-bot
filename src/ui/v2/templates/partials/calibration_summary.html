@@ -1,0 +1,45 @@
+{% if not available %}
+<section id="calibration-summary" class="mb-6 bg-amber-900/30 border border-amber-700 rounded p-4 text-amber-200 text-sm">Calibration tracker is not initialized in this process.</section>
+{% else %}
+{% set g = data.global %}
+<section id="calibration-summary" class="grid grid-cols-2 md:grid-cols-5 gap-3 mb-6"
+         data-ws-refresh-on="cycle,calibration"
+         hx-get="/calibration?fragment=summary"
+         hx-trigger="wsEvent, every 30s"
+         hx-swap="outerHTML">
+  <div class="bg-slate-900 border border-slate-800 rounded p-3">
+    <div class="text-[10px] uppercase tracking-wide text-slate-500">Global ECE</div>
+    <div class="mt-1 text-2xl font-semibold {% if g.ece is none %}text-slate-500{% elif g.ece >= 0.20 %}text-rose-300{% elif g.ece >= 0.10 %}text-amber-300{% else %}text-emerald-300{% endif %}">
+      {% if g.ece is none %}—{% else %}{{ '%.3f'|format(g.ece) }}{% endif %}
+    </div>
+    <div class="mt-1 text-[10px] text-slate-500">target &lt; 0.10</div>
+  </div>
+  <div class="bg-slate-900 border border-slate-800 rounded p-3">
+    <div class="text-[10px] uppercase tracking-wide text-slate-500">Brier</div>
+    <div class="mt-1 text-2xl font-semibold {% if g.brier is none %}text-slate-500{% else %}text-slate-200{% endif %}">
+      {% if g.brier is none %}—{% else %}{{ '%.3f'|format(g.brier) }}{% endif %}
+    </div>
+    <div class="mt-1 text-[10px] text-slate-500">lower = better</div>
+  </div>
+  <div class="bg-slate-900 border border-slate-800 rounded p-3">
+    <div class="text-[10px] uppercase tracking-wide text-slate-500">Sources</div>
+    <div class="mt-1 text-2xl font-semibold text-slate-200">{{ g.n_sources }}</div>
+    <div class="mt-1 text-[10px] text-slate-500">tracked keys</div>
+  </div>
+  <div class="bg-slate-900 border border-slate-800 rounded p-3">
+    <div class="text-[10px] uppercase tracking-wide text-slate-500">Quarantined</div>
+    <div class="mt-1 text-2xl font-semibold {% if g.n_quarantined > 0 %}text-rose-300{% else %}text-emerald-300{% endif %}">{{ g.n_quarantined }}</div>
+    <div class="mt-1 text-[10px] text-slate-500">ECE ≥ {{ '%.2f'|format(g.thresholds.quarantine_ece or 0) }}</div>
+  </div>
+  <div class="bg-slate-900 border border-slate-800 rounded p-3">
+    <div class="text-[10px] uppercase tracking-wide text-slate-500">Live status</div>
+    {% if g.live_paused %}
+      <div class="mt-1 text-2xl font-semibold text-rose-300">PAUSED</div>
+      <div class="mt-1 text-[10px] text-rose-400">global ECE ≥ {{ '%.2f'|format(g.thresholds.live_pause_ece or 0) }}</div>
+    {% else %}
+      <div class="mt-1 text-2xl font-semibold text-emerald-300">ACTIVE</div>
+      <div class="mt-1 text-[10px] text-slate-500">live entries flowing</div>
+    {% endif %}
+  </div>
+</section>
+{% endif %}

@@ -1455,11 +1455,10 @@ class PaperTrader:
         pre_decided_coin = strategy.get("_decision_coin", "")
 
         # Get target coins from strategy parameters
-        coins = params.get("coins", [])
-        if not coins:
-            coins = params.get("coins_traded", [])
+        coins = params.get("coins") or params.get("coins_traded") or params.get("coin") or []
         if isinstance(coins, str):
             coins = [coins]
+        coins = [str(coin).upper() for coin in coins if str(coin or "").strip()]
 
         if not coins:
             strategy["_decision_skip_reason"] = "missing_asset"
@@ -1499,14 +1498,20 @@ class PaperTrader:
 
         # Regime direction bias: when regime is confident use it as the default
         # for undirected strategies instead of blindly defaulting to "long".
-        _regime_str  = (regime_data or {}).get("overall_regime", "unknown")
+        _regime_str  = str((regime_data or {}).get("overall_regime", "unknown") or "unknown").strip().lower()
         _regime_conf = (regime_data or {}).get("overall_confidence", 0.0)
-        if _regime_str == "trending_down" and _regime_conf >= 0.6:
+        if _regime_str in {"trending_down", "bearish", "crash"} and _regime_conf >= 0.6:
             regime_default = "short"
-        elif _regime_str == "trending_up" and _regime_conf >= 0.6:
+        elif _regime_str in {"trending_up", "bullish"} and _regime_conf >= 0.6:
             regime_default = "long"
         else:
-            regime_default = params.get("direction", params.get("bias", "long"))
+            regime_default = str(params.get("direction") or params.get("bias") or "").strip().lower()
+            if regime_default in {"buy", "long"}:
+                regime_default = "long"
+            elif regime_default in {"sell", "short"}:
+                regime_default = "short"
+            else:
+                regime_default = ""
 
         if pre_decided in ("long", "short"):
             side = pre_decided
@@ -1516,12 +1521,30 @@ class PaperTrader:
             side = "short"
         elif strategy_type == "funding_arb":
             side = "short"  # Typically short to earn positive funding
+        elif strategy_type in ("mean_reversion", "fade", "counter_trend"):
+            side = str(params.get("direction") or params.get("bias") or "").strip().lower()
+            if side in {"buy", "long"}:
+                side = "long"
+            elif side in {"sell", "short"}:
+                side = "short"
+            else:
+                side = ""
         else:
             # breakout, trend_following, swing_trading, concentrated_bet,
-            # mean_reversion, scalping, delta_neutral, etc.
-            # — follow regime when confident (e.g. downside breakout = short in trending_down),
-            # else use stored param
-            side = params.get("direction") or regime_default
+            # scalping, delta_neutral, etc.
+            # — follow the current regime when confident.  Stored direction
+            # is only the fallback when the market read is unclear.
+            side = regime_default
+
+        if side not in {"long", "short"}:
+            strategy["_decision_skip_reason"] = "missing_direction"
+            logger.info(
+                "Skipping strategy %s: no executable side for %s in regime=%s",
+                strategy.get("name", strategy.get("id", "?")),
+                target_coin,
+                _regime_str,
+            )
+            return None
 
         # Determine leverage (capped by config)
         leverage = min(

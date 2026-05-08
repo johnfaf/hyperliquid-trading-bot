@@ -15,7 +15,7 @@ import hmac
 import logging
 import os
 import time
-from typing import Optional
+from typing import Any, Optional
 
 from fastapi import Request, Response
 from starlette.responses import RedirectResponse
@@ -96,6 +96,19 @@ def verify_cookie(request: Request) -> bool:
     if time.time() > issued_at + ttl:
         return False
     return True
+
+
+def read_access_allowed(request: Any) -> bool:
+    """Return whether a read-only dashboard channel may be opened.
+
+    HTTP GET routes use :func:`require_auth`, which intentionally allows
+    reads when ``DASHBOARD_PUBLIC_READ=true``. WebSockets are read-only in
+    v2 as well, so they must follow the same policy; otherwise the page can
+    render while the live event stream silently closes with 4401.
+    """
+    if _public_read_enabled():
+        return True
+    return verify_cookie(request)
 
 
 def login_with_token(submitted_token: str) -> bool:

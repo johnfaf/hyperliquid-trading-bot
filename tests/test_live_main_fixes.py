@@ -421,3 +421,27 @@ def test_paper_trader_preserves_synthetic_source_on_generated_signal(monkeypatch
 
     assert signal["source"] == "polymarket"
     assert signal["source_key"] == "polymarket:event_driven"
+
+
+def test_paper_trader_uses_current_regime_before_stale_strategy_direction(monkeypatch):
+    from src.trading.paper_trader import PaperTrader
+
+    monkeypatch.setattr(
+        "src.trading.paper_trader.db.get_paper_account",
+        lambda: {"balance": 10_000.0},
+    )
+    trader = PaperTrader()
+    signal = trader._generate_signal(
+        {
+            "id": 44,
+            "name": "stale long breakout",
+            "strategy_type": "breakout",
+            "source": "strategy",
+            "current_score": 0.72,
+            "parameters": {"coins": ["BTC"], "direction": "long"},
+        },
+        {"BTC": 100_000.0},
+        regime_data={"overall_regime": "trending_down", "overall_confidence": 0.85},
+    )
+
+    assert signal["side"] == "short"

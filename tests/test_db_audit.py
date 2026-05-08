@@ -112,6 +112,122 @@ def test_db_audit_detects_unprotected_open_trades_and_account_mismatch(monkeypat
     assert report.findings_at_or_above("high")
 
 
+def test_candle_cache_missing_active_coin_is_warning_by_default(monkeypatch, tmp_path):
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.executescript(
+        """
+        CREATE TABLE traders (address TEXT PRIMARY KEY);
+        CREATE TABLE strategies (id INTEGER PRIMARY KEY);
+        CREATE TABLE bot_state (key TEXT PRIMARY KEY, value TEXT);
+        CREATE TABLE paper_account (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            balance REAL NOT NULL,
+            total_pnl REAL DEFAULT 0,
+            total_trades INTEGER DEFAULT 0,
+            winning_trades INTEGER DEFAULT 0,
+            last_updated TEXT NOT NULL
+        );
+        CREATE TABLE paper_trades (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            strategy_id INTEGER,
+            opened_at TEXT NOT NULL,
+            closed_at TEXT,
+            coin TEXT NOT NULL,
+            side TEXT NOT NULL,
+            entry_price REAL NOT NULL,
+            exit_price REAL,
+            size REAL NOT NULL,
+            leverage REAL DEFAULT 1,
+            pnl REAL DEFAULT 0,
+            status TEXT DEFAULT 'open',
+            stop_loss REAL,
+            take_profit REAL,
+            metadata TEXT DEFAULT '{}'
+        );
+        CREATE TABLE audit_trail (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            action TEXT NOT NULL,
+            details TEXT DEFAULT '{}'
+        );
+        CREATE TABLE decision_snapshots (
+            decision_id TEXT PRIMARY KEY,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            coin TEXT,
+            firewall_decision TEXT,
+            final_status TEXT NOT NULL DEFAULT 'candidate'
+        );
+        CREATE TABLE source_inventory (
+            source_name TEXT PRIMARY KEY,
+            required INTEGER NOT NULL DEFAULT 0,
+            expected_freshness_seconds INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE data_source_health_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            observed_at TEXT NOT NULL,
+            source_name TEXT NOT NULL,
+            status TEXT NOT NULL,
+            freshness_seconds REAL,
+            reason TEXT
+        );
+        """
+    )
+    conn.execute(
+        "INSERT INTO paper_account "
+        "(id, balance, total_pnl, total_trades, winning_trades, last_updated) "
+        "VALUES (1, 10000, 0, 0, 0, '2026-04-23T00:00:00+00:00')"
+    )
+    conn.execute(
+        "INSERT INTO paper_trades "
+        "(opened_at, coin, side, entry_price, size, leverage, status, stop_loss, take_profit) "
+        "VALUES ('2026-04-23T00:00:00+00:00', 'BTC', 'long', 100000, 0.01, 5, 'open', 95000, 105000)"
+    )
+
+    db_path = tmp_path / "bot.db"
+    cache_path = tmp_path / "candle_cache.db"
+    cache = sqlite3.connect(cache_path)
+    try:
+        cache.execute(
+            """
+            CREATE TABLE candles (
+                coin TEXT,
+                timeframe TEXT,
+                timestamp_ms INTEGER,
+                open REAL,
+                high REAL,
+                low REAL,
+                close REAL,
+                volume REAL
+            )
+            """
+        )
+        cache.execute(
+            "INSERT INTO candles VALUES ('ETH', '1h', 1, 1, 1, 1, 1, 1)"
+        )
+        cache.commit()
+    finally:
+        cache.close()
+
+    monkeypatch.setattr(db, "get_backend_name", lambda: "sqlite")
+    monkeypatch.setattr(db, "get_db_path", lambda: str(db_path))
+    monkeypatch.setattr(db, "get_connection", lambda for_read=False: _connection_ctx(conn))
+    monkeypatch.setattr(
+        db_audit.config,
+        "DB_AUDIT_CANDLE_CACHE_MISSING_ACTIVE_SEVERITY",
+        "medium",
+    )
+
+    report = db_audit.run_db_audit(include_candle_cache=True, include_code_scan=False)
+    finding = next(f for f in report.findings if f.check == "candle_cache_missing_active_coins")
+
+    assert finding.severity == "medium"
+    assert "candle_cache_missing_active_coins" not in {
+        item.check for item in report.findings_at_or_above("high")
+    }
+
+
 def test_db_repair_backfills_safe_local_state(monkeypatch):
     conn = sqlite3.connect(":memory:")
     conn.row_factory = sqlite3.Row

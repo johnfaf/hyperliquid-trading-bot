@@ -71,6 +71,7 @@ class SubsystemContainer:
     # Trading
     copy_trader: Any = None
     live_trader: Any = None
+    lighter_live_trader: Any = None
     position_monitor: Any = None
 
     # Signals & analysis
@@ -397,6 +398,27 @@ def build_subsystems(
             "short_hardening_size_multiplier": float(
                 getattr(_fw_cfg, "SHORT_HARDENING_SIZE_MULTIPLIER", 0.50)
             ),
+            "short_hardening_block_override_enabled": bool(
+                getattr(_fw_cfg, "SHORT_HARDENING_BLOCK_OVERRIDE_ENABLED", True)
+            ),
+            "short_hardening_block_override_min_confidence": float(
+                getattr(_fw_cfg, "SHORT_HARDENING_BLOCK_OVERRIDE_MIN_CONFIDENCE", 0.70)
+            ),
+            "short_hardening_block_override_min_regime_confidence": float(
+                getattr(_fw_cfg, "SHORT_HARDENING_BLOCK_OVERRIDE_MIN_REGIME_CONFIDENCE", 0.60)
+            ),
+            "short_hardening_block_override_size_multiplier": float(
+                getattr(_fw_cfg, "SHORT_HARDENING_BLOCK_OVERRIDE_SIZE_MULTIPLIER", 0.35)
+            ),
+            "short_hardening_market_adaptive_override_enabled": bool(
+                getattr(_fw_cfg, "SHORT_HARDENING_MARKET_ADAPTIVE_OVERRIDE_ENABLED", True)
+            ),
+            "short_hardening_market_adaptive_min_momentum": float(
+                getattr(_fw_cfg, "SHORT_HARDENING_MARKET_ADAPTIVE_MIN_MOMENTUM", 0.003)
+            ),
+            "short_hardening_market_adaptive_scoped_size_multiplier": float(
+                getattr(_fw_cfg, "SHORT_HARDENING_MARKET_ADAPTIVE_SCOPED_SIZE_MULTIPLIER", 0.25)
+            ),
             "short_hardening_source_guard_enabled": bool(
                 getattr(_fw_cfg, "SHORT_HARDENING_SOURCE_GUARD_ENABLED", True)
             ),
@@ -414,6 +436,12 @@ def build_subsystems(
             ),
             "short_hardening_coin_block_net_pnl": float(
                 getattr(_fw_cfg, "SHORT_HARDENING_COIN_BLOCK_NET_PNL", -0.25)
+            ),
+            "market_side_guard_enabled": bool(
+                getattr(_fw_cfg, "FIREWALL_MARKET_SIDE_GUARD_ENABLED", True)
+            ),
+            "market_side_guard_min_confidence": float(
+                getattr(_fw_cfg, "FIREWALL_MARKET_SIDE_GUARD_MIN_CONFIDENCE", 0.60)
             ),
             "cooldown_seconds": int(getattr(_fw_cfg, "FIREWALL_COIN_COOLDOWN_SECONDS", 180)),
             "same_side_cooldown_seconds": int(
@@ -436,6 +464,24 @@ def build_subsystems(
             ),
             "entry_max_price_extension_pct": float(
                 getattr(_fw_cfg, "FIREWALL_ENTRY_MAX_PRICE_EXTENSION_PCT", 0.035)
+            ),
+            "side_imbalance_guard_enabled": bool(
+                getattr(_fw_cfg, "FIREWALL_SIDE_IMBALANCE_GUARD_ENABLED", True)
+            ),
+            "side_imbalance_lookback_trades": int(
+                getattr(_fw_cfg, "FIREWALL_SIDE_IMBALANCE_LOOKBACK_TRADES", 60)
+            ),
+            "side_imbalance_min_samples": int(
+                getattr(_fw_cfg, "FIREWALL_SIDE_IMBALANCE_MIN_SAMPLES", 12)
+            ),
+            "side_imbalance_max_share": float(
+                getattr(_fw_cfg, "FIREWALL_SIDE_IMBALANCE_MAX_SHARE", 0.80)
+            ),
+            "side_imbalance_confidence_bump": float(
+                getattr(_fw_cfg, "FIREWALL_SIDE_IMBALANCE_CONFIDENCE_BUMP", 0.15)
+            ),
+            "side_imbalance_size_multiplier": float(
+                getattr(_fw_cfg, "FIREWALL_SIDE_IMBALANCE_SIZE_MULTIPLIER", 0.50)
             ),
             "canary_mode": bool(getattr(_fw_cfg, "FIREWALL_CANARY_MODE", False)),
             "canary_max_positions": int(getattr(_fw_cfg, "FIREWALL_CANARY_MAX_POSITIONS", 2)),
@@ -733,6 +779,44 @@ def build_subsystems(
                     dependency_ready=False,
                     startup_status="WAITING_FOR_DEPENDENCIES",
                 )
+        if getattr(config, "LIVE_EXECUTION_VENUE", "hyperliquid") == "lighter":
+            from src.trading.lighter_live_trader import LighterLiveTrader
+
+            lighter_requested = bool(getattr(config, "LIGHTER_LIVE_TRADING_ENABLED", False))
+            lighter_confirmed = bool(getattr(config, "LIGHTER_LIVE_TRADING_DUAL_CONTROL_CONFIRM", False))
+            lighter_effective = lighter_requested and lighter_confirmed
+            c.lighter_live_trader = _safe_init(
+                "lighter_live_trader",
+                lambda: LighterLiveTrader(dry_run=not lighter_effective),
+                health,
+                affects_trading=lighter_effective,
+            )
+            if c.lighter_live_trader:
+                if not lighter_requested:
+                    health.set_status(
+                        "lighter_live_trader",
+                        SubsystemState.DISABLED,
+                        reason="LIGHTER_LIVE_TRADING_ENABLED=false",
+                        dependency_ready=False,
+                        startup_status="DISABLED",
+                    )
+                elif not lighter_confirmed:
+                    c.lighter_live_trader.status_reason = "lighter_dual_control_confirmation_missing"
+                    health.set_status(
+                        "lighter_live_trader",
+                        SubsystemState.DEGRADED,
+                        reason="LIGHTER_LIVE_TRADING_DUAL_CONTROL_CONFIRM=false",
+                        dependency_ready=False,
+                        startup_status="WAITING_FOR_OPERATOR_CONFIRMATION",
+                    )
+                elif not c.lighter_live_trader.is_deployable():
+                    health.set_status(
+                        "lighter_live_trader",
+                        SubsystemState.DEGRADED,
+                        reason=c.lighter_live_trader.get_stats().get("status_reason", "not deployable"),
+                        dependency_ready=False,
+                        startup_status="WAITING_FOR_DEPENDENCIES",
+                    )
 
     # ─── Cross-venue hedger ───────────────────────────────────
     if "cross_venue_hedger" in profile:
@@ -816,8 +900,13 @@ def build_subsystems(
                 health_registry=health,
                 copy_trader=c.copy_trader,
             )
-            if c.live_trader:
-                set_live_trader(c.live_trader)
+            execution_trader = (
+                c.lighter_live_trader
+                if getattr(config, "LIVE_EXECUTION_VENUE", "hyperliquid") == "lighter"
+                else c.live_trader
+            )
+            if execution_trader:
+                set_live_trader(execution_trader)
             c.dashboard = start_dashboard(options_scanner=c.options_scanner)
             logger.info("  OK dashboard")
         except Exception as exc:
@@ -909,6 +998,7 @@ _FIELD_TO_HEALTH_NAME: dict = {
     "copy_trader":            "copy_trader",
     "paper_trader":           "paper_trader",
     "live_trader":            "live_trader",
+    "lighter_live_trader":    "lighter_live_trader",
     "cross_venue_hedger":     "cross_venue_hedger",
     "shadow_tracker":         "shadow_tracker",
     "adaptive_bot_detector":  "adaptive_bot_detector",
