@@ -51,7 +51,7 @@ def test_copy_trader_rotation_prescreen_bypasses_capacity(monkeypatch):
 
     monkeypatch.setattr("src.trading.copy_trader.db.get_paper_account", lambda: account)
     monkeypatch.setattr("src.trading.copy_trader.db.get_open_paper_trades", lambda: list(open_trades))
-    monkeypatch.setattr("src.trading.copy_trader.db.get_paper_trade_history", lambda limit=250: [])
+    monkeypatch.setattr("src.trading.copy_trader.db.get_paper_trade_history", lambda limit=250, mode="any": [])
     monkeypatch.setattr("src.trading.copy_trader.hl.get_all_mids", lambda: {"BTC": 100.0})
 
     trader = CopyTrader(firewall=FakeFirewall())
@@ -133,7 +133,7 @@ def test_copy_trader_scale_out_signal_closes_source_reduce(monkeypatch):
 
     monkeypatch.setattr("src.trading.copy_trader.db.get_paper_account", lambda: {"balance": 10_000.0})
     monkeypatch.setattr("src.trading.copy_trader.db.get_open_paper_trades", lambda: [open_copy])
-    monkeypatch.setattr("src.trading.copy_trader.db.get_paper_trade_history", lambda limit=250: [])
+    monkeypatch.setattr("src.trading.copy_trader.db.get_paper_trade_history", lambda limit=250, mode="any": [])
     monkeypatch.setattr("src.trading.copy_trader.hl.get_all_mids", lambda: {"BTC": 101.0})
 
     trader = CopyTrader()
@@ -178,7 +178,7 @@ def test_copy_trader_auto_pauses_new_entries_when_copy_book_is_bad(monkeypatch):
     # which trips the gate, so bumped sample.
     monkeypatch.setattr(
         "src.trading.copy_trader.db.get_paper_trade_history",
-        lambda limit=250: [
+        lambda limit=250, mode="any": [
             {"side": "short", "pnl": -12.0, "metadata": {"source_key": "copy_trade:0xabc"}},
             {"side": "short", "pnl": -9.0, "metadata": {"source_key": "copy_trade:0xdef"}},
             {"side": "long", "pnl": -8.0, "metadata": {"source_key": "copy_trade:0xabc"}},
@@ -224,7 +224,7 @@ def test_copy_trader_hard_caps_concurrent_copy_positions(monkeypatch):
 
     monkeypatch.setattr("src.trading.copy_trader.db.get_paper_account", lambda: {"balance": 10_000.0})
     monkeypatch.setattr("src.trading.copy_trader.db.get_open_paper_trades", lambda: [open_copy])
-    monkeypatch.setattr("src.trading.copy_trader.db.get_paper_trade_history", lambda limit=250: [])
+    monkeypatch.setattr("src.trading.copy_trader.db.get_paper_trade_history", lambda limit=250, mode="any": [])
     monkeypatch.setattr("src.trading.copy_trader.hl.get_all_mids", lambda: {"BTC": 100.0, "SOL": 100.0})
 
     trader = CopyTrader()

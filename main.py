@@ -82,6 +82,7 @@ from cli import (
     run_cli_backtest,
     run_candle_backtest,
     run_cache_list,
+    run_diagnose_cli,
     run_cache_clear,
     run_db_audit_cli,
     run_db_repair_cli,
@@ -916,6 +917,9 @@ def main():
 
     if args.db_audit:
         sys.exit(run_db_audit_cli(args))
+
+    if args.diagnose or args.diagnose_json:
+        sys.exit(run_diagnose_cli(args))
 
     if args.candle_backtest:
         run_candle_backtest(setup_logging(), args)

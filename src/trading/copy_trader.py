@@ -232,7 +232,9 @@ class CopyTrader:
         if (now - cache_ts) < self._source_side_policy_cache_ttl_s:
             return list(self._source_side_policy_cache.get("closed") or [])
         try:
-            closed = db.get_paper_trade_history(limit=250)
+            closed = db.get_paper_trade_history(
+                limit=250, mode=db._resolve_history_mode_for_runtime()
+            )
         except Exception as exc:
             logger.debug("Copy source/side policy lookup failed: %s", exc)
             closed = []
@@ -403,7 +405,9 @@ class CopyTrader:
             return dict(self._copy_guardrail_status)
 
         try:
-            closed = db.get_paper_trade_history(limit=250)
+            closed = db.get_paper_trade_history(
+                limit=250, mode=db._resolve_history_mode_for_runtime()
+            )
             policy = evaluate_source_policy(
                 closed,
                 source_label="copy_trade",

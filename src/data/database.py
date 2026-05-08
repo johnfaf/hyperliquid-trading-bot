@@ -1515,13 +1515,91 @@ def get_open_paper_trades():
     return [dict(r) for r in rows]
 
 
-def get_paper_trade_history(limit=100):
+def get_paper_trade_history(limit=100, mode: str = "any"):
+    """Return closed paper_trades rows.
+
+    Args:
+        limit: max rows to return.
+        mode:
+          "any"    – all closed rows (default; legacy behaviour)
+          "live"   – only rows that were mirrored to live (metadata.live_mirror is true)
+          "paper"  – only rows that were paper-only (metadata.live_mirror is false/missing)
+
+    Filtering on metadata is done in Python after the SQL fetch because
+    metadata is JSON in both backends and SQLite/Postgres JSON-extract
+    syntaxes differ. The LIMIT is applied AFTER the filter so a small
+    requested limit returns up to N rows in the chosen mode (rather than
+    "fetch the most recent N globally and possibly return zero of the
+    requested mode").
+    """
+    mode = (mode or "any").strip().lower()
+    if mode not in {"any", "live", "paper"}:
+        mode = "any"
+
+    # If "any", we can take the fast path and apply the LIMIT in SQL.
+    if mode == "any":
+        with get_connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM paper_trades WHERE status = 'closed'
+                ORDER BY closed_at DESC LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    # For mode-filtered fetches, pull a wider window then filter in Python.
+    # 5x the requested limit is enough to cover typical live/paper ratios
+    # without scanning the whole history.
+    fetch_limit = max(int(limit) * 5, 500)
     with get_connection() as conn:
-        rows = conn.execute("""
+        rows = conn.execute(
+            """
             SELECT * FROM paper_trades WHERE status = 'closed'
             ORDER BY closed_at DESC LIMIT ?
-        """, (limit,)).fetchall()
-    return [dict(r) for r in rows]
+            """,
+            (fetch_limit,),
+        ).fetchall()
+
+    out: list[dict] = []
+    for r in rows:
+        d = dict(r)
+        meta_raw = d.get("metadata") or "{}"
+        if isinstance(meta_raw, str):
+            try:
+                meta = json.loads(meta_raw)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                meta = {}
+        elif isinstance(meta_raw, dict):
+            meta = meta_raw
+        else:
+            meta = {}
+        is_live = bool(meta.get("live_mirror"))
+        if mode == "live" and not is_live:
+            continue
+        if mode == "paper" and is_live:
+            continue
+        out.append(d)
+        if len(out) >= int(limit):
+            break
+    return out
+
+
+def _resolve_history_mode_for_runtime() -> str:
+    """Pick the right history-mode for adaptive firewall checks based on the
+    bot's current execution mode.
+
+    Returns:
+      "live"  – when LIVE_TRADING_ENABLED is true (firewall should evaluate
+                against live-mirrored history only, since paper-only trades
+                were taken under different sizing/risk and the policies
+                drawn from them don't transfer to live decisions)
+      "paper" – otherwise (paper-only history)
+    """
+    try:
+        return "live" if bool(getattr(config, "LIVE_TRADING_ENABLED", False)) else "paper"
+    except Exception:
+        return "any"
 
 
 def reset_paper_trades(initial_balance: float = None):

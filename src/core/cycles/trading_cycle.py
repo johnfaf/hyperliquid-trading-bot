@@ -546,16 +546,61 @@ def _run_hedger(container, regime_data):
 
 
 def _record_shadow_trade(container, closed_trade, pnl, return_pct, entry):
-    """Record a closed trade in the shadow tracker."""
+    """Record a closed trade in the shadow tracker.
+
+    The signal_source written here flows into the calibration tracker and
+    becomes a key in calibration_records. Earlier versions defaulted to
+    ``strategy:unknown`` whenever a row lacked ``strategy_type`` — that
+    polluted the calibration table with one fat untagged bucket which
+    logged as ``[strategy:unknown|_|any(ECE=0.47,n=83)]`` and was
+    quarantined for poor calibration. The fix:
+      1. Walk a fuller fallback chain (top-level field, then metadata).
+      2. If we still can't identify the source, log a WARNING so the
+         upstream pipeline gap is visible, and tag the trade with
+         ``strategy:untagged`` (distinct from ``unknown``) so the
+         existing calibration data isn't double-counted.
+    """
     tracker = container.shadow_tracker
     if not tracker:
         return
     try:
         meta = closed_trade.get("metadata") or {}
-        stype = closed_trade.get("strategy_type", "unknown")
-        source = meta.get("source", f"strategy:{stype}")
+        if isinstance(meta, str):
+            try:
+                import json as _json
+                meta = _json.loads(meta or "{}")
+            except (ValueError, TypeError):
+                meta = {}
+
+        # Prefer an explicit metadata.source if present (copy_trade:0xabc,
+        # options_flow, polymarket, etc.).
+        source = str(meta.get("source") or "").strip()
+        stype = (
+            str(closed_trade.get("strategy_type") or "").strip()
+            or str(meta.get("strategy_type") or "").strip()
+        )
+
+        if source:
+            signal_source = source
+        elif stype and stype.lower() != "unknown":
+            signal_source = f"strategy:{stype.lower()}"
+        else:
+            # Not fatal, but visible: a trade reached the shadow tracker
+            # without a tagged source. Tag it distinctly so calibration
+            # doesn't merge it with the legacy ``strategy:unknown`` bucket.
+            logger.warning(
+                "ShadowTracker: untagged trade (coin=%s, side=%s, pnl=%.3f, "
+                "metadata_keys=%s) — upstream pipeline did not set source/"
+                "strategy_type. Tagging as 'strategy:untagged'.",
+                closed_trade.get("coin", "?"),
+                closed_trade.get("side", "?"),
+                float(pnl or 0),
+                sorted(meta.keys()) if isinstance(meta, dict) else "non-dict-meta",
+            )
+            signal_source = "strategy:untagged"
+
         tracker.record_trade({
-            "signal_source": source,
+            "signal_source": signal_source,
             "coin": closed_trade.get("coin", "UNK"),
             "side": closed_trade.get("side", "long"),
             "entry_price": entry,

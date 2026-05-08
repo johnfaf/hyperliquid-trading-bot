@@ -1,4 +1,5 @@
 import logging
+import time
 
 from src.notifications.ws_position_monitor import (
     PositionMonitor,
@@ -384,3 +385,49 @@ def test_process_user_events_empty_positions_marks_trader_flat_and_idles(monkeyp
     assert address not in monitor._subscribed_addresses
     assert address not in monitor._active_position_addresses
     assert reasons == ["all tracked positions are flat"]
+
+
+def test_activity_filter_skips_recently_attempted_empty_wallets():
+    """Regression: empty wallets used to be re-bootstrapped on every reconnect
+    because `_last_active_ts` was only set when positions were found, leaving
+    them in the 'never observed' branch forever."""
+    monitor = PositionMonitor()
+    monitor._activity_filter_enabled = True
+    monitor._activity_lookback_s = 21600.0  # 6h
+    monitor._full_refresh_s = 86400.0       # 24h
+    monitor._last_full_refresh_ts = time.time()  # within full-refresh window
+
+    addr_active = "0x" + "a" * 40
+    addr_empty_recent = "0x" + "b" * 40
+    addr_empty_stale = "0x" + "c" * 40
+    addr_never_seen = "0x" + "d" * 40
+
+    now = time.time()
+    monitor._last_active_ts[addr_active] = now - 60       # active 1min ago
+    monitor._last_attempted_ts[addr_active] = now - 60
+    monitor._last_attempted_ts[addr_empty_recent] = now - 120     # attempted 2min ago, no pos
+    monitor._last_attempted_ts[addr_empty_stale] = now - 30000    # attempted 8h+ ago
+
+    addrs = [addr_active, addr_empty_recent, addr_empty_stale, addr_never_seen]
+    kept, skipped = monitor._filter_active_addresses(addrs)
+
+    assert addr_active in kept            # recently active -> include
+    assert addr_empty_recent not in kept   # attempted recently, came up empty -> skip
+    assert addr_empty_stale in kept       # stale empty -> retry
+    assert addr_never_seen in kept        # never tried -> baseline
+    assert skipped == 1
+
+
+def test_bootstrap_records_attempted_timestamp_for_empty_wallets(monkeypatch):
+    """The activity filter relies on _last_attempted_ts being set on every
+    bootstrap, including ones that came back empty. Otherwise empty wallets
+    sit in the 'never seen' branch and get re-bootstrapped every reconnect."""
+    monitor = PositionMonitor()
+    addr = "0x" + "9" * 40
+    monkeypatch.setattr(monitor, "_fetch_positions_snapshot", lambda _a: {})
+
+    monitor._bootstrap_positions(addr)
+
+    assert addr in monitor._last_attempted_ts
+    assert addr not in monitor._last_active_ts
+    assert addr not in monitor._active_position_addresses

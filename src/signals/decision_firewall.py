@@ -639,7 +639,10 @@ class DecisionFirewall:
             return dict(self._side_policy_cache)
 
         try:
-            closed = db.get_paper_trade_history(limit=self.short_hardening_lookback_trades)
+            closed = db.get_paper_trade_history(
+                limit=self.short_hardening_lookback_trades,
+                mode=db._resolve_history_mode_for_runtime(),
+            )
             policy = evaluate_short_side_policy(
                 closed,
                 min_trades=self.short_hardening_min_closed_trades,
@@ -1261,7 +1264,10 @@ class DecisionFirewall:
             if side in {"long", "short"}:
                 sides.append(side)
         try:
-            recent = db.get_paper_trade_history(limit=self.side_imbalance_lookback_trades)
+            recent = db.get_paper_trade_history(
+                limit=self.side_imbalance_lookback_trades,
+                mode=db._resolve_history_mode_for_runtime(),
+            )
         except Exception as exc:
             logger.debug("Side imbalance history lookup failed: %s", exc)
             recent = []

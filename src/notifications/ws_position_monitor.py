@@ -103,11 +103,16 @@ class PositionMonitor:
         self._active_position_addresses: Set[str] = set()
         self._quarantined_addresses: Dict[str, str] = {}
         self._reconnect_wake_event = threading.Event()
-        # Per-address timestamp of last bootstrap that returned positions.
-        # Used by the activity filter to skip wallets that have been empty
-        # for longer than POSITION_MONITOR_ACTIVITY_LOOKBACK_S between
-        # full-refresh windows.
+        # Per-address activity timestamps used by the activity filter.
+        #   _last_active_ts[addr]    = last bootstrap that RETURNED positions
+        #   _last_attempted_ts[addr] = last bootstrap attempt (regardless of
+        #                              outcome). Without this we'd treat
+        #                              every empty wallet as "never observed"
+        #                              forever and bootstrap them on every
+        #                              reconnect — which was the bug fixed
+        #                              by recording the attempt unconditionally.
         self._last_active_ts: Dict[str, float] = {}
+        self._last_attempted_ts: Dict[str, float] = {}
         self._last_full_refresh_ts: float = 0.0
         self._activity_filter_enabled = bool(
             getattr(config, "POSITION_MONITOR_ACTIVITY_FILTER_ENABLED", True)
@@ -1183,6 +1188,9 @@ class PositionMonitor:
             now = time.time()
             with self._lock:
                 self._position_cache[address] = positions
+                # Always record the attempt so the activity filter can age
+                # empty wallets out instead of re-polling them every reconnect.
+                self._last_attempted_ts[address] = now
                 if positions:
                     self._active_position_addresses.add(address)
                     self._last_active_ts[address] = now
@@ -1199,14 +1207,20 @@ class PositionMonitor:
         """Return the subset of addresses to bootstrap this pass and the count
         skipped by the activity filter.
 
-        Rules:
-          - If the filter is disabled, return all addresses unchanged.
-          - During a periodic full refresh window (every full_refresh_s) we
-            include every address so newly-active wallets aren't missed.
-          - Otherwise, include only addresses whose last_active_ts is fresher
-            than activity_lookback_s. Addresses we have never seen positions
-            for are included on the first pass and then skipped until the
-            next full refresh.
+        Rules (in order):
+          1. If the filter is disabled, return all addresses unchanged.
+          2. If we are inside a periodic full-refresh window (every
+             full_refresh_s), include every address so newly-active wallets
+             aren't missed.
+          3. Include addresses that have HAD positions within the last
+             activity_lookback_s window (real signal — they trade).
+          4. For addresses we have never observed with positions, include
+             them ONLY if we haven't tried bootstrapping them recently
+             (within activity_lookback_s). The previous logic always
+             included these on the "first pass" branch, but `_last_active_ts`
+             is only ever set when positions are found — so empty wallets
+             stayed in the "never observed" branch forever and got
+             bootstrapped on every reconnect.
         """
         if not self._activity_filter_enabled or not addresses:
             return list(addresses), 0
@@ -1217,13 +1231,22 @@ class PositionMonitor:
         kept: List[str] = []
         skipped = 0
         for addr in addresses:
-            last = self._last_active_ts.get(addr)
-            if last is None:
-                # Never observed — include once so we get a baseline.
+            last_active = self._last_active_ts.get(addr)
+            last_attempt = self._last_attempted_ts.get(addr)
+            # Recently active wallets always pass.
+            if last_active is not None and (now - last_active) <= self._activity_lookback_s:
                 kept.append(addr)
                 continue
-            if (now - last) <= self._activity_lookback_s:
+            # Never attempted yet -> include once for the baseline observation.
+            if last_attempt is None:
                 kept.append(addr)
-            else:
+                continue
+            # Attempted recently (and didn't return positions, otherwise the
+            # branch above would have caught it) -> skip until the lookback
+            # expires, then re-attempt.
+            if (now - last_attempt) <= self._activity_lookback_s:
                 skipped += 1
+                continue
+            # Stale attempt — give it another shot.
+            kept.append(addr)
         return kept, skipped

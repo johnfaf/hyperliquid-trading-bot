@@ -285,6 +285,202 @@ def run_db_audit_cli(args) -> int:
     return audit_exit_code(report, block_severity=block_severity) if args.db_audit_strict else 0
 
 
+def run_diagnose_cli(args) -> int:
+    """Print a diagnostic snapshot of the bot's state.
+
+    Output sections (each one is best-effort — a failure in one section does
+    NOT prevent the others from rendering):
+
+      [1] Distinct sources in shadow_trades / paper_trades / live fills
+          (with trade counts + win rates + net PnL).
+      [2] Calibration ECE per source (top N by sample count).
+      [3] Active strategies with their composite scores.
+      [4] WS reconnect rate from PositionMonitor stats.
+
+    Use for triaging firewall rejections, calibration drift, untagged
+    sources (the recent "strategy:unknown" / "strategy:untagged" findings),
+    and ws_position_monitor churn.
+    """
+    import json as _json
+    from collections import defaultdict
+    from datetime import datetime, timezone
+
+    out = {"generated_at": datetime.now(timezone.utc).isoformat()}
+
+    # ── [1] Sources across the trade tables ─────────────────────
+    try:
+        import src.data.database as db_mod
+        with db_mod.get_connection(for_read=True) as conn:
+            paper_rows = conn.execute(
+                "SELECT metadata, side, pnl, status FROM paper_trades "
+                "WHERE status = 'closed' ORDER BY closed_at DESC LIMIT 1000"
+            ).fetchall()
+        paper_by_source: dict = defaultdict(lambda: {"trades": 0, "wins": 0, "pnl": 0.0})
+        live_by_source: dict = defaultdict(lambda: {"trades": 0, "wins": 0, "pnl": 0.0})
+        for r in paper_rows:
+            d = dict(r)
+            try:
+                meta = _json.loads(d.get("metadata") or "{}")
+            except (ValueError, TypeError):
+                meta = {}
+            src = (meta.get("source") or meta.get("source_key") or "untagged").strip()
+            pnl = float(d.get("pnl") or 0.0)
+            bucket = live_by_source if meta.get("live_mirror") else paper_by_source
+            bucket[src]["trades"] += 1
+            bucket[src]["pnl"] += pnl
+            if pnl > 0:
+                bucket[src]["wins"] += 1
+        out["paper_sources"] = _format_source_breakdown(paper_by_source)
+        out["live_sources"] = _format_source_breakdown(live_by_source)
+    except Exception as exc:
+        out["paper_sources_error"] = str(exc)
+        out["live_sources_error"] = str(exc)
+
+    # Shadow tracker
+    try:
+        from src.analysis.shadow_tracker import ShadowTracker
+        st = ShadowTracker()
+        attribution = st.get_attribution(days=90)
+        shadow = []
+        for src, m in attribution.items():
+            shadow.append({
+                "source": src,
+                "trades": int(m.get("trades", 0)),
+                "win_rate": float(m.get("win_rate", 0.0)),
+                "pnl": float(m.get("pnl", 0.0)),
+                "sharpe": float(m.get("sharpe", 0.0)),
+            })
+        shadow.sort(key=lambda x: -x["trades"])
+        out["shadow_sources"] = shadow
+    except Exception as exc:
+        out["shadow_sources_error"] = str(exc)
+
+    # ── [2] Calibration ECE per source ──────────────────────────
+    try:
+        from src.signals.calibration import CalibrationTracker
+        tracker = CalibrationTracker()
+        ranking = tracker.get_source_ranking() if hasattr(tracker, "get_source_ranking") else []
+        if not ranking and hasattr(tracker, "_bins"):
+            # Fallback: compute a quick top-N from in-memory bins
+            ranking = []
+            for key, bins in tracker._bins.items():
+                if key == "global":
+                    continue
+                samples = sum(b.get("total", 0) for b in bins.values())
+                if samples < 20:
+                    continue
+                ranking.append({"source_key": key, "samples": samples})
+            ranking.sort(key=lambda x: -x["samples"])
+        out["calibration_top"] = ranking[:25]
+    except Exception as exc:
+        out["calibration_top_error"] = str(exc)
+
+    # ── [3] Active strategies + scores ──────────────────────────
+    try:
+        import src.data.database as db_mod
+        with db_mod.get_connection(for_read=True) as conn:
+            rows = conn.execute(
+                "SELECT id, name, strategy_type, current_score, trade_count, win_rate "
+                "FROM strategies WHERE active = 1 "
+                "ORDER BY current_score DESC LIMIT 25"
+            ).fetchall()
+        out["active_strategies"] = [dict(r) for r in rows]
+    except Exception as exc:
+        out["active_strategies_error"] = str(exc)
+
+    # ── [4] WS reconnect rate from PositionMonitor stats ────────
+    out["ws_position_monitor"] = {
+        "note": (
+            "Reconnect rate isn't queryable without a running PositionMonitor "
+            "instance -- use grep on the logs for 'WebSocket closed (code=' "
+            "events per minute. Counts in the bot's running log are the "
+            "authoritative source."
+        )
+    }
+
+    if getattr(args, "diagnose_json", False):
+        print(_json.dumps(out, indent=2, sort_keys=True, default=str))
+    else:
+        _print_diagnose_human(out)
+    return 0
+
+
+def _format_source_breakdown(by_source: dict) -> list:
+    out = []
+    for src, m in by_source.items():
+        n = int(m.get("trades", 0))
+        wins = int(m.get("wins", 0))
+        out.append({
+            "source": src,
+            "trades": n,
+            "wins": wins,
+            "losses": n - wins,
+            "win_rate": (wins / n) if n else 0.0,
+            "pnl": round(float(m.get("pnl", 0.0)), 4),
+        })
+    out.sort(key=lambda x: -x["trades"])
+    return out
+
+
+def _print_diagnose_human(out: dict) -> None:
+    print(f"=== DIAGNOSE @ {out.get('generated_at', '?')} ===\n")
+
+    def _section(title: str, rows: list, columns: list, formatters: dict = None) -> None:
+        formatters = formatters or {}
+        print(f"-- {title} --")
+        if not rows:
+            print("  (none)\n")
+            return
+        widths = [
+            max(len(c), max((len(str(formatters.get(c, str)(r.get(c, '')))) for r in rows), default=0))
+            for c in columns
+        ]
+        header = "  " + "  ".join(c.ljust(w) for c, w in zip(columns, widths))
+        print(header)
+        print("  " + "  ".join("-" * w for w in widths))
+        for r in rows:
+            print(
+                "  " + "  ".join(
+                    str(formatters.get(c, str)(r.get(c, ''))).ljust(w)
+                    for c, w in zip(columns, widths)
+                )
+            )
+        print()
+
+    _section(
+        "Paper-only trade sources (last 1000)",
+        out.get("paper_sources", [])[:25],
+        ["source", "trades", "wins", "losses", "win_rate", "pnl"],
+        {"win_rate": lambda v: f"{float(v) * 100:.1f}%", "pnl": lambda v: f"${float(v):+.3f}"},
+    )
+    _section(
+        "Live-mirrored trade sources (last 1000)",
+        out.get("live_sources", [])[:25],
+        ["source", "trades", "wins", "losses", "win_rate", "pnl"],
+        {"win_rate": lambda v: f"{float(v) * 100:.1f}%", "pnl": lambda v: f"${float(v):+.3f}"},
+    )
+    _section(
+        "Shadow tracker sources (90d)",
+        out.get("shadow_sources", [])[:25],
+        ["source", "trades", "win_rate", "pnl", "sharpe"],
+        {"win_rate": lambda v: f"{float(v) * 100:.1f}%", "pnl": lambda v: f"${float(v):+.2f}"},
+    )
+    _section(
+        "Calibration top sources (by sample count)",
+        out.get("calibration_top", [])[:25],
+        ["source_key", "samples"],
+    )
+    _section(
+        "Active strategies (top 25 by score)",
+        out.get("active_strategies", [])[:25],
+        ["id", "name", "strategy_type", "current_score", "trade_count", "win_rate"],
+        {"current_score": lambda v: f"{float(v):.4f}", "win_rate": lambda v: f"{float(v) * 100:.1f}%"},
+    )
+    note = out.get("ws_position_monitor", {}).get("note")
+    if note:
+        print(f"-- WS position monitor --\n  {note}\n")
+
+
 def run_db_repair_cli(args) -> int:
     from src.data.db_audit import format_db_repair_report, run_db_repair
 
@@ -357,4 +553,12 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Skip network-backed candle/regime refresh during --db-repair")
     parser.add_argument("--core-only", action="store_true",
                         help="Run with fundable-core profile only (minimal subsystems)")
+    parser.add_argument(
+        "--diagnose",
+        action="store_true",
+        help="Print a diagnostic snapshot of trade sources, calibration, "
+             "active strategies, and WS reconnect notes",
+    )
+    parser.add_argument("--diagnose-json", action="store_true",
+                        help="Print --diagnose output as JSON")
     return parser
