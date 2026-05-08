@@ -440,6 +440,16 @@ class XGBoostRegimeForecaster:
             logger.warning("XGBoost not installed -- cannot train")
             return None
 
+        # Promote any matured predictions to observed labels first so the
+        # training set actually grows over time (otherwise the dataset is
+        # stuck at 0 observed rows and training falls back to synthetic).
+        try:
+            import config as _cfg
+            if getattr(_cfg, "XGBOOST_LABELER_ENABLED", True):
+                self.label_predictions_with_forward_returns()
+        except Exception as exc:
+            logger.debug("Pre-train labeling skipped: %s", exc)
+
         X, y = self._get_training_data()
 
         if len(y) < self.min_samples:
@@ -668,6 +678,214 @@ class XGBoostRegimeForecaster:
                 )
         except Exception as exc:
             logger.debug("Failed to store prediction: %s", exc)
+
+    # ─── Forward-return labeler ─────────────────────────────────────
+
+    def label_predictions_with_forward_returns(
+        self,
+        forward_minutes: Optional[int] = None,
+        crash_pct: Optional[float] = None,
+        bullish_pct: Optional[float] = None,
+        batch_size: Optional[int] = None,
+        min_age_minutes: Optional[int] = None,
+    ) -> Dict[str, int]:
+        """Promote past predictions to observed training labels.
+
+        For each row in regime_history older than min_age_minutes that still
+        has label_source='predicted' and regime_label IS NULL, fetch the
+        forward 1m candles for the row's coin from the prediction timestamp
+        out to forward_minutes, compute (last_close - entry_close)/entry_close,
+        and write back regime_label + label_source='observed'.
+
+        Returns:
+            {"scanned": int, "labeled": int, "no_data": int, "errors": int}
+        """
+        import config as _cfg
+        from datetime import datetime, timezone, timedelta
+
+        forward_minutes = int(
+            forward_minutes
+            if forward_minutes is not None
+            else getattr(_cfg, "XGBOOST_LABELER_FORWARD_MINUTES", 60)
+        )
+        crash_pct = float(
+            crash_pct
+            if crash_pct is not None
+            else getattr(_cfg, "XGBOOST_LABELER_CRASH_PCT", -0.015)
+        )
+        bullish_pct = float(
+            bullish_pct
+            if bullish_pct is not None
+            else getattr(_cfg, "XGBOOST_LABELER_BULLISH_PCT", 0.015)
+        )
+        batch_size = int(
+            batch_size
+            if batch_size is not None
+            else getattr(_cfg, "XGBOOST_LABELER_BATCH_SIZE", 200)
+        )
+        min_age_minutes = int(
+            min_age_minutes
+            if min_age_minutes is not None
+            else getattr(_cfg, "XGBOOST_LABELER_MIN_AGE_MINUTES", forward_minutes + 5)
+        )
+
+        stats = {"scanned": 0, "labeled": 0, "no_data": 0, "errors": 0}
+        try:
+            from src.data import database as db
+            from src.data.database import get_connection
+            from src.data import hyperliquid_client as hl
+        except Exception as exc:
+            logger.warning("Labeler aborted (imports): %s", exc)
+            stats["errors"] += 1
+            return stats
+
+        backend = db.get_backend_name()
+        cutoff_sql = (
+            f"now() - INTERVAL '{min_age_minutes} minutes'"
+            if backend == "postgres"
+            else f"datetime('now', '-{min_age_minutes} minutes')"
+        )
+        try:
+            with get_connection(for_read=True) as conn:
+                rows = conn.execute(
+                    f"""
+                    SELECT id, timestamp, coin
+                    FROM regime_history
+                    WHERE label_source = 'predicted'
+                      AND regime_label IS NULL
+                      AND timestamp <= {cutoff_sql}
+                    ORDER BY timestamp ASC
+                    LIMIT {int(batch_size)}
+                    """
+                ).fetchall()
+        except Exception as exc:
+            logger.warning("Labeler query failed: %s", exc)
+            stats["errors"] += 1
+            return stats
+
+        if not rows:
+            return stats
+
+        # Group by coin so we make at most one candle fetch per coin.
+        by_coin: Dict[str, list] = {}
+        for r in rows:
+            try:
+                row_id = int(r["id"]) if hasattr(r, "keys") else int(r[0])
+                ts_raw = r["timestamp"] if hasattr(r, "keys") else r[1]
+                coin = (r["coin"] if hasattr(r, "keys") else r[2]) or "BTC"
+            except Exception:
+                stats["errors"] += 1
+                continue
+            stats["scanned"] += 1
+            ts_dt: Optional[datetime] = None
+            try:
+                if isinstance(ts_raw, datetime):
+                    ts_dt = ts_raw if ts_raw.tzinfo else ts_raw.replace(tzinfo=timezone.utc)
+                else:
+                    ts_dt = datetime.fromisoformat(str(ts_raw).replace("Z", "+00:00"))
+                    if ts_dt.tzinfo is None:
+                        ts_dt = ts_dt.replace(tzinfo=timezone.utc)
+            except Exception:
+                stats["errors"] += 1
+                continue
+            by_coin.setdefault(coin.upper(), []).append((row_id, ts_dt))
+
+        # Fetch one window of candles per coin covering the earliest pred
+        # through (latest pred + forward window).
+        updates: list[tuple[int, int]] = []  # (row_id, regime_label)
+        for coin, items in by_coin.items():
+            try:
+                earliest_ts = min(t for _, t in items)
+                latest_ts = max(t for _, t in items)
+                start_ms = int(earliest_ts.timestamp() * 1000) - 60_000
+                end_ms = int(
+                    (latest_ts + timedelta(minutes=forward_minutes)).timestamp() * 1000
+                ) + 60_000
+                candles = hl.get_candles(
+                    coin, interval="1m", start_time=start_ms, end_time=end_ms
+                ) or []
+            except Exception as exc:
+                logger.debug("Labeler candle fetch failed for %s: %s", coin, exc)
+                stats["errors"] += len(items)
+                continue
+            if not candles:
+                stats["no_data"] += len(items)
+                continue
+
+            # Hyperliquid candles use keys: t (open ms), c (close), o, h, l ...
+            try:
+                candle_list = sorted(
+                    [(int(c.get("t", 0)), float(c.get("c", 0))) for c in candles],
+                    key=lambda x: x[0],
+                )
+            except Exception:
+                stats["errors"] += len(items)
+                continue
+
+            for row_id, ts_dt in items:
+                pred_ms = int(ts_dt.timestamp() * 1000)
+                target_ms = pred_ms + forward_minutes * 60_000
+                entry = self._closest_close(candle_list, pred_ms)
+                exit_ = self._closest_close(candle_list, target_ms)
+                if entry is None or exit_ is None or entry <= 0:
+                    stats["no_data"] += 1
+                    continue
+                ret = (exit_ - entry) / entry
+                if ret <= crash_pct:
+                    label = REGIME_LABELS["crash"]
+                elif ret >= bullish_pct:
+                    label = REGIME_LABELS["bullish"]
+                else:
+                    label = REGIME_LABELS["neutral"]
+                updates.append((row_id, label))
+
+        if updates:
+            try:
+                with get_connection() as conn:
+                    if backend == "postgres":
+                        conn.executemany(
+                            "UPDATE regime_history SET regime_label = %s, "
+                            "label_source = 'observed' WHERE id = %s",
+                            [(label, rid) for rid, label in updates],
+                        )
+                    else:
+                        conn.executemany(
+                            "UPDATE regime_history SET regime_label = ?, "
+                            "label_source = 'observed' WHERE id = ?",
+                            [(label, rid) for rid, label in updates],
+                        )
+                stats["labeled"] = len(updates)
+            except Exception as exc:
+                logger.warning("Labeler write-back failed: %s", exc)
+                stats["errors"] += len(updates)
+        if stats["scanned"]:
+            logger.info(
+                "XGBoost labeler: scanned=%d labeled=%d no_data=%d errors=%d "
+                "(forward=%dm, crash<=%.2f%%, bullish>=%.2f%%)",
+                stats["scanned"],
+                stats["labeled"],
+                stats["no_data"],
+                stats["errors"],
+                forward_minutes,
+                crash_pct * 100,
+                bullish_pct * 100,
+            )
+        return stats
+
+    @staticmethod
+    def _closest_close(
+        sorted_candles: list, target_ms: int
+    ) -> Optional[float]:
+        """Return the close price of the candle whose open is closest to and
+        not after target_ms. Returns None if there's no candle at or before."""
+        if not sorted_candles:
+            return None
+        best = None
+        for ts, close in sorted_candles:
+            if ts > target_ms:
+                break
+            best = close
+        return best
 
     # ─── DB Schema ──────────────────────────────────────────────────
 

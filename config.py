@@ -955,6 +955,31 @@ READINESS_ALERT_COOLDOWN_S = int(
     os.environ.get("READINESS_ALERT_COOLDOWN_S", 900)
 )
 
+# ─── Cross-Venue Hedger ────────────────────────────────────────
+# Default hedge venue is Kraken Futures (futures.kraken.com). Binance/Bybit
+# code paths exist but live execution is NOT implemented for those — leave
+# disabled. dry_run defaults to True; flip to False only after credentials
+# are set and you've reviewed at least one [DRY-RUN] log cycle.
+HEDGER_DRY_RUN = os.environ.get(
+    "HEDGER_DRY_RUN", "true"
+).strip().lower() in ("1", "true", "yes", "on")
+HEDGER_HEDGE_RATIO = float(os.environ.get("HEDGER_HEDGE_RATIO", 0.5))
+HEDGER_CRASH_CONFIDENCE = float(os.environ.get("HEDGER_CRASH_CONFIDENCE", 0.5))
+HEDGER_KRAKEN_ENABLED = os.environ.get(
+    "HEDGER_KRAKEN_ENABLED", "true"
+).strip().lower() in ("1", "true", "yes", "on")
+HEDGER_BINANCE_ENABLED = os.environ.get(
+    "HEDGER_BINANCE_ENABLED", "false"
+).strip().lower() in ("1", "true", "yes", "on")
+HEDGER_BYBIT_ENABLED = os.environ.get(
+    "HEDGER_BYBIT_ENABLED", "false"
+).strip().lower() in ("1", "true", "yes", "on")
+HEDGER_KRAKEN_SYMBOL_TEMPLATE = os.environ.get(
+    "HEDGER_KRAKEN_SYMBOL_TEMPLATE", "PF_{COIN}USD"
+)
+HEDGER_KRAKEN_ORDER_TYPE = os.environ.get("HEDGER_KRAKEN_ORDER_TYPE", "mkt")
+HEDGER_RATE_LIMIT_MS = int(os.environ.get("HEDGER_RATE_LIMIT_MS", 100))
+
 # ─── PositionMonitor (WebSocket subscriptions) ─────────────────
 # When True, only bootstrap and subscribe to tracked wallets that have shown
 # positions or fills within the last POSITION_MONITOR_ACTIVITY_LOOKBACK_S
@@ -1057,6 +1082,31 @@ XGBOOST_MODEL_PATH = "models/regime_xgboost.json"
 XGBOOST_CRASH_THRESHOLD = float(os.environ.get("XGBOOST_CRASH_THRESHOLD", -0.18))
 XGBOOST_MIN_CONFIDENCE = float(os.environ.get("XGBOOST_MIN_CONFIDENCE", 0.52))
 XGBOOST_RETRAIN_INTERVAL = int(os.environ.get("XGBOOST_RETRAIN_INTERVAL", 86400))  # 24h walk-forward
+# Forward-return labeler: turns past predictions into observed training labels
+# by inspecting price moves over a forward window. Without this, the model
+# only ever sees synthetic warm-start data (source=synthetic in logs).
+XGBOOST_LABELER_ENABLED = os.environ.get(
+    "XGBOOST_LABELER_ENABLED", "true"
+).strip().lower() in ("1", "true", "yes", "on")
+XGBOOST_LABELER_FORWARD_MINUTES = int(
+    os.environ.get("XGBOOST_LABELER_FORWARD_MINUTES", 60)
+)
+# Forward % move thresholds. Tighter than typical signal thresholds because
+# regime labels are about market state, not trade direction.
+XGBOOST_LABELER_CRASH_PCT = float(
+    os.environ.get("XGBOOST_LABELER_CRASH_PCT", -0.015)  # -1.5%
+)
+XGBOOST_LABELER_BULLISH_PCT = float(
+    os.environ.get("XGBOOST_LABELER_BULLISH_PCT", 0.015)  # +1.5%
+)
+XGBOOST_LABELER_BATCH_SIZE = int(
+    os.environ.get("XGBOOST_LABELER_BATCH_SIZE", 200)
+)
+# Minimum age of a prediction before we'll label it (lets the forward window
+# fully mature; should be >= forward_minutes).
+XGBOOST_LABELER_MIN_AGE_MINUTES = int(
+    os.environ.get("XGBOOST_LABELER_MIN_AGE_MINUTES", 65)
+)
 
 # --- Feature Store Alpha Pipeline (Phase B) ---
 ENABLE_ALPHA_PIPELINE = os.environ.get("ENABLE_ALPHA_PIPELINE", "true").lower() in ("true", "1", "yes")

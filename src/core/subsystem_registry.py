@@ -831,7 +831,21 @@ def build_subsystems(
     if "cross_venue_hedger" in profile:
         from src.trading.cross_venue_hedger import CrossVenueHedger
         c.cross_venue_hedger = _safe_init(
-            "cross_venue_hedger", CrossVenueHedger, health,
+            "cross_venue_hedger",
+            lambda: CrossVenueHedger({
+                "dry_run": getattr(config, "HEDGER_DRY_RUN", True),
+                "hedge_ratio": getattr(config, "HEDGER_HEDGE_RATIO", 0.5),
+                "crash_confidence": getattr(config, "HEDGER_CRASH_CONFIDENCE", 0.5),
+                "kraken_enabled": getattr(config, "HEDGER_KRAKEN_ENABLED", True),
+                "binance_enabled": getattr(config, "HEDGER_BINANCE_ENABLED", False),
+                "bybit_enabled": getattr(config, "HEDGER_BYBIT_ENABLED", False),
+                "kraken_symbol_template": getattr(
+                    config, "HEDGER_KRAKEN_SYMBOL_TEMPLATE", "PF_{COIN}USD"
+                ),
+                "kraken_order_type": getattr(config, "HEDGER_KRAKEN_ORDER_TYPE", "mkt"),
+                "rate_limit_ms": getattr(config, "HEDGER_RATE_LIMIT_MS", 100),
+            }),
+            health,
         )
 
     # ─── Shadow tracker ───────────────────────────────────────

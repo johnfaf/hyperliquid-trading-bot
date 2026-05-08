@@ -11,6 +11,72 @@ from src.signals.xgboost_regime_forecaster import (
 )
 
 
+def test_labeler_classifies_forward_returns(monkeypatch):
+    """label_predictions_with_forward_returns maps fwd-returns to crash/neutral/bullish."""
+    from src.data import database as db_mod
+    from src.data import hyperliquid_client as hl_mod
+
+    with patch.object(XGBoostRegimeForecaster, "_ensure_regime_history_table"), \
+         patch.object(XGBoostRegimeForecaster, "_load_model"), \
+         patch.object(XGBoostRegimeForecaster, "train"):
+        fc = XGBoostRegimeForecaster({"min_training_samples": 10})
+
+    base_ms = 1700000000000
+    fake_rows = [
+        {"id": 11, "timestamp": "2023-11-14T22:13:20+00:00", "coin": "BTC"},
+        {"id": 22, "timestamp": "2023-11-14T22:13:20+00:00", "coin": "ETH"},
+        {"id": 33, "timestamp": "2023-11-14T22:13:20+00:00", "coin": "SOL"},
+    ]
+
+    class _FakeConn:
+        def __init__(self):
+            self.executed = []
+
+        def execute(self, sql, params=()):
+            class _Cur:
+                def fetchall(_self):
+                    return fake_rows
+            return _Cur()
+
+        def executemany(self, sql, seq):
+            self.executed.append((sql, list(seq)))
+
+    fake_conn = _FakeConn()
+
+    @contextmanager
+    def fake_get_connection(*args, **kwargs):
+        yield fake_conn
+
+    candle_map = {
+        "BTC": [{"t": base_ms - 60_000, "c": 100.0}, {"t": base_ms + 60 * 60_000, "c": 105.0}],
+        "ETH": [{"t": base_ms - 60_000, "c": 100.0}, {"t": base_ms + 60 * 60_000, "c": 97.0}],
+        "SOL": [{"t": base_ms - 60_000, "c": 100.0}, {"t": base_ms + 60 * 60_000, "c": 100.5}],
+    }
+
+    monkeypatch.setattr(db_mod, "get_backend_name", lambda: "sqlite")
+    monkeypatch.setattr(db_mod, "get_connection", fake_get_connection)
+    monkeypatch.setattr(
+        hl_mod,
+        "get_candles",
+        lambda coin, **kw: candle_map.get(coin.upper(), []),
+    )
+
+    stats = fc.label_predictions_with_forward_returns(
+        forward_minutes=60, crash_pct=-0.015, bullish_pct=0.015,
+        batch_size=10, min_age_minutes=0,
+    )
+
+    assert stats["scanned"] == 3
+    assert stats["labeled"] == 3
+    flat = []
+    for _sql, seq in fake_conn.executed:
+        flat.extend(seq)
+    by_id = {rid: label for label, rid in flat}
+    assert by_id[11] == REGIME_LABELS["bullish"]  # BTC +5%
+    assert by_id[22] == REGIME_LABELS["crash"]    # ETH -3%
+    assert by_id[33] == REGIME_LABELS["neutral"]  # SOL +0.5%
+
+
 class TestXGBoostRegimeForecaster:
     """Test suite for XGBoost regime forecaster (LOW-12)."""
 

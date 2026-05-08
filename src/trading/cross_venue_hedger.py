@@ -1,8 +1,8 @@
 """
 Cross-Venue Hedging Module
 ===========================
-Automatically places reduce-only hedging orders on Binance/Bybit when
-crash regime is detected by the XGBoost regime forecaster.
+Automatically places reduce-only hedging orders on Kraken Futures (default),
+Binance, or Bybit when crash regime is detected by the regime forecaster.
 
 This module monitors market regime predictions and dynamically hedges
 open positions on alternative venues to reduce portfolio exposure during
@@ -12,30 +12,37 @@ Features:
   - Crash-triggered hedging: Places reduce-only orders on hedging venues
   - Regime-aware closure: Closes hedges when regime returns to neutral/bullish
   - Dry-run by default: Logs actions without executing (controlled via dry_run flag)
-  - Venue abstraction: Supports Binance Futures and Bybit Perpetuals (v5 API)
+  - Venue abstraction: Kraken Futures (default), Binance Futures, Bybit Perp v5
   - Rate limiting: Built-in delays to avoid exchange rate limits
-  - Environment-based auth: API keys loaded from env vars (BINANCE_API_KEY, etc.)
+  - Environment-based auth: API keys loaded from env vars
 
 Environment Variables (all optional when dry_run=True):
-  - BINANCE_API_KEY: Binance Futures API key
-  - BINANCE_API_SECRET: Binance Futures API secret
-  - BYBIT_API_KEY: Bybit v5 API key
-  - BYBIT_API_SECRET: Bybit v5 API secret
+  - KRAKEN_FUTURES_API_KEY:    Kraken Futures (futures.kraken.com) API key
+  - KRAKEN_FUTURES_API_SECRET: Kraken Futures API secret (base64-encoded)
+  - BINANCE_API_KEY / BINANCE_API_SECRET: Binance Futures
+  - BYBIT_API_KEY / BYBIT_API_SECRET: Bybit v5
 
 Configuration:
   config = {
-      "dry_run": True,              # Default: no live execution
-      "hedge_ratio": 0.5,           # Default: hedge 50% of open position
-      "crash_confidence": 0.5,      # Confidence threshold for crash detection
-      "binance_enabled": True,      # Use Binance for hedging
-      "bybit_enabled": False,       # Use Bybit for hedging
-      "rate_limit_ms": 100,         # Delay between API calls (ms)
+      "dry_run": True,             # Default: no live execution
+      "hedge_ratio": 0.5,          # Default: hedge 50% of open position
+      "crash_confidence": 0.5,     # Confidence threshold for crash detection
+      "kraken_enabled": True,      # Use Kraken Futures (default)
+      "binance_enabled": False,    # Use Binance for hedging
+      "bybit_enabled": False,      # Use Bybit for hedging
+      "rate_limit_ms": 100,        # Delay between API calls (ms)
   }
 """
 
+import base64
+import hashlib
+import hmac
+import json
 import logging
 import os
 import time
+import urllib.parse
+import urllib.request
 from typing import Dict, Optional, List
 from enum import Enum
 
@@ -44,6 +51,7 @@ logger = logging.getLogger(__name__)
 
 class HedgeVenue(Enum):
     """Supported hedging venues."""
+    KRAKEN = "kraken"
     BINANCE = "binance"
     BYBIT = "bybit"
 
@@ -63,8 +71,10 @@ class CrossVenueHedger:
                 - dry_run (bool): If True, log actions without executing (default: True)
                 - hedge_ratio (float): Fraction of position to hedge (default: 0.5)
                 - crash_confidence (float): Confidence threshold for crash (default: 0.5)
-                - binance_enabled (bool): Enable Binance hedging (default: True)
+                - kraken_enabled (bool): Enable Kraken Futures hedging (default: True)
+                - binance_enabled (bool): Enable Binance hedging (default: False)
                 - bybit_enabled (bool): Enable Bybit hedging (default: False)
+                - kraken_symbol_template (str): Symbol format, default "PF_{COIN}USD"
                 - rate_limit_ms (int): Delay between API calls in ms (default: 100)
         """
         cfg = config or {}
@@ -72,12 +82,25 @@ class CrossVenueHedger:
         self.dry_run = cfg.get("dry_run", True)
         self.hedge_ratio = cfg.get("hedge_ratio", 0.5)
         self.crash_confidence = cfg.get("crash_confidence", 0.5)
-        self.binance_enabled = cfg.get("binance_enabled", True)
+        self.kraken_enabled = cfg.get("kraken_enabled", True)
+        self.binance_enabled = cfg.get("binance_enabled", False)
         self.bybit_enabled = cfg.get("bybit_enabled", False)
         self.rate_limit_ms = cfg.get("rate_limit_ms", 100)
         self.allow_unimplemented_live = bool(cfg.get("allow_unimplemented_live", False))
+        # PF_<COIN>USD = USD-collateralized perp on Kraken Futures (post-2022).
+        # Override to "PI_{COIN}USD" if you specifically want inverse contracts.
+        self.kraken_symbol_template = str(
+            cfg.get("kraken_symbol_template", "PF_{COIN}USD")
+        )
+        self.kraken_order_type = str(cfg.get("kraken_order_type", "mkt")).lower()
+        self.kraken_api_url = str(
+            cfg.get("kraken_api_url", "https://futures.kraken.com")
+        ).rstrip("/")
+        self.kraken_request_timeout_s = float(cfg.get("kraken_request_timeout_s", 5.0))
 
         # API credentials (loaded from environment)
+        self.kraken_api_key = os.environ.get("KRAKEN_FUTURES_API_KEY", "")
+        self.kraken_api_secret = os.environ.get("KRAKEN_FUTURES_API_SECRET", "")
         self.binance_api_key = os.environ.get("BINANCE_API_KEY", "")
         self.binance_api_secret = os.environ.get("BINANCE_API_SECRET", "")
         self.bybit_api_key = os.environ.get("BYBIT_API_KEY", "")
@@ -85,6 +108,7 @@ class CrossVenueHedger:
 
         # Active hedges tracking: {venue: {coin: {"side": str, "size": float, "ts": float}}}
         self._active_hedges: Dict[str, Dict] = {
+            HedgeVenue.KRAKEN.value: {},
             HedgeVenue.BINANCE.value: {},
             HedgeVenue.BYBIT.value: {},
         }
@@ -102,15 +126,28 @@ class CrossVenueHedger:
 
         mode_str = "DRY_RUN" if self.dry_run else "LIVE"
 
+        # Binance and Bybit live execution are still NOT implemented; refuse to
+        # silently no-op. Kraken Futures live execution IS implemented (signed
+        # v3 sendorder), but require credentials before going live.
         if not self.dry_run and not self.allow_unimplemented_live and (self.binance_enabled or self.bybit_enabled):
             logger.error(
-                "Cross-venue hedger live execution is disabled: API signing/execution "
-                "is not fully implemented. Forcing hedger to no-op live mode."
+                "Binance/Bybit live hedge execution is not implemented; disabling those "
+                "venues. Use kraken_enabled=True for real hedges."
             )
             self.binance_enabled = False
             self.bybit_enabled = False
+        if not self.dry_run and self.kraken_enabled and not (
+            self.kraken_api_key and self.kraken_api_secret
+        ):
+            logger.error(
+                "Kraken Futures hedger requested LIVE but KRAKEN_FUTURES_API_KEY / "
+                "KRAKEN_FUTURES_API_SECRET are not set. Disabling kraken hedger."
+            )
+            self.kraken_enabled = False
 
         venues = []
+        if self.kraken_enabled:
+            venues.append("Kraken-Futures")
         if self.binance_enabled:
             venues.append("Binance")
         if self.bybit_enabled:
@@ -192,7 +229,11 @@ class CrossVenueHedger:
                 f"Closing {len(self._count_active_hedges())} active hedge(s)."
             )
             hedges_closed = 0
-            for venue in [HedgeVenue.BINANCE.value, HedgeVenue.BYBIT.value]:
+            for venue in [
+                HedgeVenue.KRAKEN.value,
+                HedgeVenue.BINANCE.value,
+                HedgeVenue.BYBIT.value,
+            ]:
                 for coin in list(self._active_hedges[venue].keys()):
                     if self._close_hedge(coin, venue):
                         hedges_closed += 1
@@ -229,6 +270,18 @@ class CrossVenueHedger:
 
         success = False
 
+        if self.kraken_enabled:
+            if self._place_kraken_hedge(coin, hedge_side, hedge_size):
+                success = True
+                self._active_hedges[HedgeVenue.KRAKEN.value][coin] = {
+                    "side": hedge_side,
+                    "size": hedge_size,
+                    "ts": time.time(),
+                }
+                logger.debug(f"Kraken hedge placed for {coin}: {hedge_side} {hedge_size}")
+
+        self._rate_limit()
+
         if self.binance_enabled:
             if self._place_binance_hedge(coin, hedge_side, hedge_size):
                 success = True
@@ -252,6 +305,117 @@ class CrossVenueHedger:
                 logger.debug(f"Bybit hedge placed for {coin}: {hedge_side} {hedge_size}")
 
         return success
+
+    def _kraken_symbol(self, coin: str) -> str:
+        """Map an internal coin symbol to Kraken Futures symbol.
+
+        Kraken uses XBT for Bitcoin; everything else maps directly.
+        Template comes from cfg.kraken_symbol_template (default PF_{COIN}USD).
+        """
+        c = coin.upper().strip()
+        if c == "BTC":
+            c = "XBT"
+        return self.kraken_symbol_template.format(COIN=c)
+
+    def _kraken_sign(self, post_data: str, nonce: str, endpoint_path: str) -> str:
+        """Compute Kraken Futures Authent header.
+
+        spec: Authent = base64(HMAC_SHA512(
+            base64_decode(api_secret),
+            SHA256(postData + nonce + endpointPath)
+        ))
+        """
+        message = (post_data + nonce + endpoint_path).encode("utf-8")
+        sha = hashlib.sha256(message).digest()
+        try:
+            secret_decoded = base64.b64decode(self.kraken_api_secret)
+        except Exception as exc:
+            raise ValueError(f"KRAKEN_FUTURES_API_SECRET is not valid base64: {exc}") from exc
+        mac = hmac.new(secret_decoded, sha, hashlib.sha512).digest()
+        return base64.b64encode(mac).decode("ascii")
+
+    def _place_kraken_hedge(self, coin: str, side: str, size: float) -> bool:
+        """Place a reduce-only order on Kraken Futures.
+
+        Endpoint: POST https://futures.kraken.com/derivatives/api/v3/sendorder
+        Auth: APIKey + Authent (HMAC-SHA512 over SHA256(post + nonce + path)).
+
+        Args:
+            coin: Internal coin symbol (e.g. "BTC", "ETH").
+            side: "BUY" or "SELL" (we pass through as lowercase).
+            size: Order quantity in contracts.
+
+        Returns:
+            True on accepted order or on dry-run; False on any error path.
+            Raises NotImplementedError ONLY if explicitly disabled later.
+        """
+        try:
+            symbol = self._kraken_symbol(coin)
+            kraken_side = "buy" if side.upper() == "BUY" else "sell"
+
+            if self.dry_run:
+                logger.info(
+                    f"[DRY-RUN] Kraken hedge order: {kraken_side} {size} {symbol} "
+                    f"(reduce-only, type={self.kraken_order_type})"
+                )
+                return True
+
+            if not (self.kraken_api_key and self.kraken_api_secret):
+                logger.error("Kraken hedge requested without API credentials")
+                return False
+
+            endpoint_path = "/derivatives/api/v3/sendorder"
+            params = {
+                "orderType": self.kraken_order_type,
+                "symbol": symbol,
+                "side": kraken_side,
+                "size": str(size),
+                "reduceOnly": "true",
+            }
+            post_data = urllib.parse.urlencode(params)
+            # Nonce: monotonically-increasing string. Microsecond ts is fine.
+            nonce = str(int(time.time() * 1000_000))
+            authent = self._kraken_sign(post_data, nonce, endpoint_path)
+
+            url = f"{self.kraken_api_url}{endpoint_path}"
+            req = urllib.request.Request(
+                url,
+                data=post_data.encode("utf-8"),
+                method="POST",
+                headers={
+                    "APIKey": self.kraken_api_key,
+                    "Authent": authent,
+                    "Nonce": nonce,
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Accept": "application/json",
+                },
+            )
+            with urllib.request.urlopen(req, timeout=self.kraken_request_timeout_s) as resp:
+                body = resp.read().decode("utf-8", errors="replace")
+            try:
+                payload = json.loads(body)
+            except json.JSONDecodeError:
+                logger.error("Kraken hedge: non-JSON response: %s", body[:200])
+                return False
+            result = str(payload.get("result", "")).lower()
+            if result != "success":
+                logger.error(
+                    "Kraken hedge rejected for %s: result=%s, error=%s",
+                    coin, result, payload.get("error") or payload.get("errors"),
+                )
+                return False
+            order_status = (payload.get("sendStatus") or {}).get("status", "")
+            order_id = (payload.get("sendStatus") or {}).get("order_id", "")
+            logger.info(
+                "Kraken hedge placed %s %s %s (status=%s, oid=%s)",
+                kraken_side, size, symbol, order_status, order_id,
+            )
+            # Per Kraken docs, status="placed" or "fullyExecuted" both indicate
+            # the order was accepted; anything else is a soft failure.
+            return order_status in ("placed", "fullyExecuted", "partiallyFilled")
+        except Exception as e:
+            logger.error(f"Failed to place Kraken hedge for {coin}: {e}")
+            return False
 
     def _place_binance_hedge(self, coin: str, side: str, size: float) -> bool:
         """
@@ -354,7 +518,9 @@ class CrossVenueHedger:
 
         success = False
         try:
-            if venue == HedgeVenue.BINANCE.value:
+            if venue == HedgeVenue.KRAKEN.value:
+                success = self._place_kraken_hedge(coin, close_side, original_size)
+            elif venue == HedgeVenue.BINANCE.value:
                 success = self._place_binance_hedge(coin, close_side, original_size)
             elif venue == HedgeVenue.BYBIT.value:
                 success = self._place_bybit_hedge(coin, close_side, original_size)
@@ -447,6 +613,8 @@ class CrossVenueHedger:
         """
         active_count = sum(len(h) for h in self._active_hedges.values())
         venues = []
+        if self.kraken_enabled:
+            venues.append("kraken")
         if self.binance_enabled:
             venues.append("binance")
         if self.bybit_enabled:
