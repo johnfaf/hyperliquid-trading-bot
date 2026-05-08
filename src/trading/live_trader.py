@@ -55,7 +55,44 @@ from src.trading.live_trader_signing import (
 # Re-exports for tests/callers that previously patched these on this module.
 from src.trading.live_trader_signing import _encode_typed_data, _USE_TYPED_DATA  # noqa: F401
 
-# _keccak is still used by _make_cloid for deterministic order-id hashing.
+# Pure helpers / static methods extracted for clarity. Re-exported below so
+# tests and downstream callers can keep importing them from this module.
+from src.trading.live_trader_helpers import (
+    _derive_missing_live_drawdown_cap,
+    coerce_float as _helpers_coerce_float,
+    extract_free_margin_from_state as _helpers_extract_free_margin,
+    make_cloid as _helpers_make_cloid,
+    normalize_coin_key as _helpers_normalize_coin_key,
+    normalize_order_side as _helpers_normalize_order_side,
+    parse_iso_timestamp as _helpers_parse_iso_timestamp,
+    resolve_signal_stop_roe_pct as _helpers_resolve_signal_stop_roe_pct,
+    shadow_trade_metadata as _helpers_shadow_trade_metadata,
+    signal_side_value as _helpers_signal_side_value,
+    signal_source_key as _helpers_signal_source_key,
+    signed_position_size_for_coin as _helpers_signed_position_size,
+)
+from src.trading.live_trader_order_results import (
+    coerce_exchange_leverage as _ord_coerce_exchange_leverage,
+    extract_inner_order_statuses as _ord_extract_inner_statuses,
+    extract_reported_fill_price as _ord_extract_fill_price,
+    extract_reported_fill_size as _ord_extract_fill_size,
+    extract_resting_order_ids as _ord_extract_resting_ids,
+    is_insufficient_margin_rejection as _ord_is_insufficient_margin,
+    is_order_result_success as _ord_is_success,
+)
+from src.trading.live_trader_protective_legs import (
+    classify_protective_leg as _legs_classify,
+    is_protective_order as _legs_is_protective,
+    split_valid_legs as _legs_split_valid,
+)
+from src.trading.live_trader_state_io import (
+    atomic_write_json as _state_atomic_write_json,
+    kill_switch_payload as _state_kill_switch_payload,
+    read_json as _state_read_json,
+)
+
+# _keccak is still used by some legacy code paths for deterministic order-id
+# hashing; the helpers module also imports it independently.
 try:
     from eth_utils import keccak as _keccak  # type: ignore
 except ImportError:  # pragma: no cover
@@ -80,33 +117,6 @@ from src.trading.scaling_tiers import (
 from src.trading.regime_reversal_manager import RegimeReversalDecision, RegimeReversalManager
 
 logger = logging.getLogger(__name__)
-
-
-def _derive_missing_live_drawdown_cap(
-    *,
-    max_daily_loss: float,
-    max_position_size: float,
-    max_order_usd: float,
-    min_order_usd: float,
-) -> float:
-    """Derive a conservative rolling drawdown cap when the env var is absent.
-
-    This does not replace an explicit operator cap. It only prevents a live
-    deployment from running uncapped when the per-tier/per-order limits already
-    define a tighter safety envelope.
-    """
-    candidates = []
-    if max_daily_loss > 0:
-        candidates.append(float(max_daily_loss) * 0.25)
-    if max_position_size > 0:
-        candidates.append(float(max_position_size) * 0.10)
-    if max_order_usd > 0:
-        candidates.append(float(max_order_usd) * 0.25)
-    if not candidates:
-        return 0.0
-    default_min_cap = max(1.0, float(min_order_usd) * 0.10) if min_order_usd > 0 else 1.0
-    min_cap = _safe_env_float("LIVE_MIN_DRAWDOWN_CAP_USD", default_min_cap, lo=0.0, hi=1e6)
-    return max(float(min_cap), min(candidates))
 
 
 class LiveTrader:
@@ -868,31 +878,12 @@ class LiveTrader:
 
     def _persist_kill_switch_state(self, active: bool, reason: str) -> None:
         """Persist sticky kill-switch state so restarts cannot clear it."""
-        path = self.kill_switch_state_file
-        if not path:
-            return
-        try:
-            directory = os.path.dirname(path)
-            if directory:
-                if not os.path.exists(directory) and "LIVE_KILL_SWITCH_STATE_FILE" not in os.environ:
-                    logger.warning(
-                        "Kill-switch state directory %s does not exist; skipping "
-                        "persistence until LIVE_KILL_SWITCH_STATE_FILE is explicitly set",
-                        directory,
-                    )
-                    return
-                os.makedirs(directory, exist_ok=True)
-            payload = {
-                "active": bool(active),
-                "reason": str(reason or ""),
-                "updated_at": datetime.now(timezone.utc).isoformat(),
-            }
-            tmp_path = f"{path}.tmp"
-            with open(tmp_path, "w", encoding="utf-8") as handle:
-                json.dump(payload, handle, sort_keys=True)
-            os.replace(tmp_path, path)
-        except Exception as exc:
-            logger.warning("Failed to persist kill-switch state to %s: %s", path, exc)
+        _state_atomic_write_json(
+            self.kill_switch_state_file,
+            _state_kill_switch_payload(active, reason),
+            require_dir_or_env="LIVE_KILL_SWITCH_STATE_FILE",
+            component="kill-switch",
+        )
 
     def _load_persisted_kill_switch_state(self) -> None:
         """Restore sticky kill-switch state from the previous process."""
@@ -914,11 +905,10 @@ class LiveTrader:
                 pass
             return
         path = self.kill_switch_state_file
-        if not path or not os.path.exists(path):
+        payload = _state_read_json(path, component="kill-switch")
+        if payload is None:
             return
         try:
-            with open(path, "r", encoding="utf-8") as handle:
-                payload = json.load(handle)
             if isinstance(payload, dict) and payload.get("active"):
                 reason = str(payload.get("reason") or f"persisted:{path}")
                 if reason.startswith("protective_order_churn:"):
@@ -1603,27 +1593,7 @@ class LiveTrader:
 
     @staticmethod
     def _extract_free_margin_from_state(state: Dict[str, Any]) -> Optional[float]:
-        """Extract free/available margin from a clearinghouse state payload."""
-        if not isinstance(state, dict) or not state:
-            return None
-
-        for key in ("marginSummary", "crossMarginSummary"):
-            margin_summary = state.get(key, {}) or {}
-            try:
-                acct = float(margin_summary.get("accountValue", 0) or 0)
-                used = float(margin_summary.get("totalMarginUsed", 0) or 0)
-                if acct > 0 or used > 0:
-                    return max(0.0, acct - used)
-            except (TypeError, ValueError):
-                continue
-
-        withdrawable = state.get("withdrawable")
-        try:
-            if withdrawable is not None:
-                return max(0.0, float(withdrawable))
-        except (TypeError, ValueError):
-            pass
-        return None
+        return _helpers_extract_free_margin(state)
 
     def get_free_margin(self) -> Optional[float]:
         """
@@ -1850,34 +1820,7 @@ class LiveTrader:
 
     @staticmethod
     def _coerce_float(value: Any, default: float = 0.0) -> float:
-        """Safely coerce a Hyperliquid API field to float.
-
-        Hyperliquid returns many numeric fields as strings ("0.123"),
-        sometimes as nested dicts ({"value": 5}), and occasionally as
-        ``null``.  Plain ``float(x)`` crashes on dicts and None — which
-        caused ``Error getting positions: float() argument must be a
-        string or a real number, not 'dict'`` to fire 72 times in one
-        log, bringing down ``verify_fill`` and leaving real positions
-        unprotected on the exchange.
-        """
-        if value is None:
-            return default
-        if isinstance(value, (int, float)):
-            return float(value)
-        if isinstance(value, str):
-            try:
-                return float(value) if value else default
-            except ValueError:
-                return default
-        if isinstance(value, dict):
-            # Hyperliquid encodes leverage as {"type": "cross", "value": 5}
-            # and cum funding as {"allTime": "0.123", ...}.  Prefer "value"
-            # then "allTime" then any numeric-looking entry.
-            for key in ("value", "allTime", "sinceOpen", "sinceChange"):
-                if key in value:
-                    return LiveTrader._coerce_float(value[key], default)
-            return default
-        return default
+        return _helpers_coerce_float(value, default)
 
     def _normalize_position(self, pos: Dict[str, Any]) -> Dict[str, Any]:
         """Flatten Hyperliquid position payload into a consistent dict shape.
@@ -1954,32 +1897,11 @@ class LiveTrader:
 
     @staticmethod
     def _signal_source_key(signal: TradeSignal) -> str:
-        source = getattr(signal, "source", None)
-        if hasattr(source, "value"):
-            source = source.value
-        key = str(source or "unknown").strip().lower() or "unknown"
-
-        # Copy-trade throughput caps should apply per copied trader, not as one
-        # global "copy_trade" bucket. Otherwise one early fill can starve all
-        # remaining copy signals for the day and create side skew.
-        if key == "copy_trade":
-            trader_address = str(getattr(signal, "trader_address", "") or "").strip().lower()
-            if trader_address:
-                return f"{key}:{trader_address}"
-            return key
-
-        strategy_type = str(getattr(signal, "strategy_type", "") or "").strip().lower()
-        if strategy_type:
-            return f"{key}:{strategy_type}"
-
-        return key
+        return _helpers_signal_source_key(signal)
 
     @staticmethod
     def _signal_side_value(signal: TradeSignal) -> str:
-        side = getattr(signal, "side", None)
-        if hasattr(side, "value"):
-            side = side.value
-        return str(side or "").strip().lower()
+        return _helpers_signal_side_value(signal)
 
     def _get_source_policy(self, signal: TradeSignal) -> Dict[str, Any]:
         source_key = self._signal_source_key(signal)
@@ -2021,29 +1943,7 @@ class LiveTrader:
 
     @staticmethod
     def _resolve_signal_stop_roe_pct(signal: TradeSignal) -> float:
-        """Resolve the signal stop distance in margin/ROE space."""
-        risk = getattr(signal, "risk", None)
-        leverage = max(float(getattr(signal, "leverage", 1.0) or 1.0), 1.0)
-        if risk is not None and hasattr(risk, "resolve_roe_stop_loss_pct"):
-            try:
-                stop_roe = float(risk.resolve_roe_stop_loss_pct(leverage))
-                if stop_roe > 0:
-                    return stop_roe
-            except Exception:
-                pass
-
-        context = getattr(signal, "context", {}) or {}
-        if isinstance(context, dict):
-            risk_policy = context.get("risk_policy", {}) or {}
-            if isinstance(risk_policy, dict):
-                try:
-                    stop_roe = float(risk_policy.get("stop_roe_pct", 0.0) or 0.0)
-                    if stop_roe > 0:
-                        return stop_roe
-                except (TypeError, ValueError):
-                    pass
-
-        return max(float(getattr(config, "PAPER_TRADING_STOP_LOSS_PCT", 0.05) or 0.05), 0.001)
+        return _helpers_resolve_signal_stop_roe_pct(signal)
 
     def _store_sizing_explanation(self, explanation: Dict[str, Any]) -> None:
         explanation = dict(explanation)
@@ -2250,15 +2150,7 @@ class LiveTrader:
         coin: str,
         positions: Optional[List[Dict[str, Any]]],
     ) -> Optional[float]:
-        """Return signed szi for a coin from an exchange position snapshot."""
-        if positions is None:
-            return None
-        wanted = str(coin or "").upper()
-        for pos in positions:
-            if str(pos.get("coin", "") or "").upper() != wanted:
-                continue
-            return self._coerce_float(pos.get("szi", pos.get("size", 0)), 0.0)
-        return 0.0
+        return _helpers_signed_position_size(coin, positions)
 
     def _refresh_external_kill_switch(self) -> bool:
         """
@@ -2306,35 +2198,7 @@ class LiveTrader:
 
     @staticmethod
     def _make_cloid(*salt_parts: Any) -> str:
-        """Produce an exchange-level client order ID.
-
-        H1 (audit): Hyperliquid supports a ``c`` field on each order,
-        a 128-bit hex string.  When present, the exchange rejects a
-        *resubmission* of the same cloid as a duplicate — this is the
-        authoritative idempotency guarantee.  Our local ``_post_order``
-        dedup cache is client-side only; it cannot help when our process
-        crashes and restarts between signing and fill.  The cloid fills
-        that gap.
-
-        We derive the cloid from a keccak hash of the caller-supplied
-        salt parts (coin, side, size, price, intent, time-bucket) so
-        retries of the *same logical order* produce the same cloid and
-        benefit from exchange dedup, while genuinely-different orders
-        get unique cloids.
-
-        Returns a lowercase hex string of the form ``0x`` + 32 hex chars
-        as required by the exchange.
-        """
-        # Hash the salt parts deterministically.  ``str()`` is enough
-        # because every caller converts numeric fields to the same
-        # canonical form (wire size/price) before hashing.
-        payload = "|".join(str(p) for p in salt_parts)
-        # 32 hex chars = 128 bits.  Take the first 16 bytes of keccak256.
-        if HAS_KECCAK:
-            digest = _keccak(payload.encode("utf-8"))[:16]
-        else:
-            digest = hashlib.sha256(payload.encode("utf-8")).digest()[:16]
-        return "0x" + digest.hex()
+        return _helpers_make_cloid(*salt_parts)
 
     def _check_daily_reset(self):
         """Reset daily counters at midnight UTC."""
@@ -2576,7 +2440,7 @@ class LiveTrader:
 
     @staticmethod
     def _normalize_coin_key(coin: Any) -> str:
-        return str(coin or "").strip().upper()
+        return _helpers_normalize_coin_key(coin)
 
     def _persist_protective_churn_quarantine(self) -> None:
         """Persist coin-level protective churn quarantine across restarts."""
@@ -3149,25 +3013,11 @@ class LiveTrader:
 
     @staticmethod
     def _shadow_trade_metadata(trade: Dict[str, Any]) -> Dict[str, Any]:
-        metadata = trade.get("metadata", {})
-        if isinstance(metadata, str):
-            try:
-                metadata = json.loads(metadata or "{}")
-            except Exception:
-                metadata = {}
-        return dict(metadata or {})
+        return _helpers_shadow_trade_metadata(trade)
 
     @staticmethod
     def _parse_timestamp(value: Any) -> Optional[datetime]:
-        if not value:
-            return None
-        try:
-            dt = datetime.fromisoformat(str(value))
-        except (TypeError, ValueError):
-            return None
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(timezone.utc)
+        return _helpers_parse_iso_timestamp(value)
 
     def _fallback_shadow_risk_policy(
         self,
@@ -3397,149 +3247,11 @@ class LiveTrader:
 
     @staticmethod
     def _is_protective_order(order: Dict[str, Any], coin: Optional[str] = None) -> bool:
-        if not isinstance(order, dict):
-            return False
-        if coin and str(order.get("coin", "") or "").upper() != str(coin).upper():
-            return False
-        reduce_only = bool(order.get("reduceOnly") or order.get("reduce_only"))
-        is_trigger = bool(order.get("isTrigger") or order.get("is_trigger"))
-        is_position_tpsl = bool(order.get("isPositionTpsl") or order.get("is_position_tpsl"))
-        order_type = str(order.get("orderType") or order.get("type") or "").lower()
-        trigger_condition = str(order.get("triggerCondition") or "").lower()
-        trigger_px = order.get("triggerPx") or order.get("trigger_px")
-        has_trigger_px = trigger_px not in (None, "", "0", "0.0", 0, 0.0)
-        return bool(
-            reduce_only
-            or is_trigger
-            or is_position_tpsl
-            or "stop" in order_type
-            or "take" in order_type
-            or "profit" in order_type
-            or "trigger" in order_type
-            or "price above" in trigger_condition
-            or "price below" in trigger_condition
-            or has_trigger_px
-        )
+        return _legs_is_protective(order, coin=coin)
 
     @classmethod
     def _classify_protective_leg(cls, order: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """Classify a single frontend/open-order entry as an SL or TP leg.
-
-        P0-4 (audit): per-leg validation for ``protect_orphaned_positions``.
-        Returns a dict with ``coin``, ``leg`` ("sl"/"tp"), ``side`` ("buy"/
-        "sell"), ``trigger_px`` (float or None), ``size`` (float),
-        ``reduce_only`` (bool), and ``oid``.  Returns None for orders that
-        are NOT protective (entries, non-trigger limit orders, etc.).
-
-        Hyperliquid represents trigger orders with:
-        * ``t.trigger.tpsl`` = ``"sl"`` or ``"tp"`` (authoritative), or
-        * ``orderType`` containing "stop" / "take" when the nested form
-          is absent (older Info responses).
-        """
-        if not isinstance(order, dict):
-            return None
-        coin = str(order.get("coin", "") or "")
-        if not coin:
-            return None
-        is_position_tpsl = bool(order.get("isPositionTpsl") or order.get("is_position_tpsl"))
-        reduce_only = bool(order.get("reduceOnly") or order.get("reduce_only") or is_position_tpsl)
-        order_type = str(order.get("orderType") or order.get("type") or "").lower()
-        trigger_condition = str(
-            order.get("triggerCondition") or order.get("trigger_condition") or ""
-        ).lower()
-
-        leg: Optional[str] = None
-        trigger_px_raw: Any = None
-        trigger_nested = order.get("t")
-        if isinstance(trigger_nested, dict):
-            trig = trigger_nested.get("trigger")
-            if isinstance(trig, dict):
-                tpsl = str(trig.get("tpsl", "") or "").lower()
-                if tpsl in ("sl", "tp"):
-                    leg = tpsl
-                trigger_px_raw = trig.get("triggerPx")
-        # Top-level triggerPx (some response shapes)
-        if trigger_px_raw is None:
-            trigger_px_raw = order.get("triggerPx") or order.get("trigger_px")
-
-        if leg is None:
-            # Fall back to orderType keyword parsing
-            if "stop" in order_type:
-                leg = "sl"
-            elif "take" in order_type or "profit" in order_type:
-                leg = "tp"
-
-        # Side: prefer boolean "b" (our wire format), fall back to "side" string.
-        side = None
-        if "b" in order and isinstance(order.get("b"), bool):
-            side = "buy" if order["b"] else "sell"
-        else:
-            for side_key in ("side", "direction", "action"):
-                if not isinstance(order.get(side_key), str):
-                    continue
-                raw_side = order[side_key].strip().lower()
-                if raw_side in ("buy", "b", "bid") or "close short" in raw_side:
-                    side = "buy"
-                    break
-                if raw_side in ("sell", "s", "a", "ask") or "close long" in raw_side:
-                    side = "sell"
-                    break
-
-        if leg is None and trigger_condition:
-            # Some Hyperliquid order views omit ``t.trigger.tpsl`` and expose
-            # only "Close Long/Short" plus "Price above/below".  Infer leg
-            # from close side + trigger direction:
-            #   close long  (sell): below=SL, above=TP
-            #   close short (buy):  above=SL, below=TP
-            if side == "sell":
-                if "price below" in trigger_condition:
-                    leg = "sl"
-                elif "price above" in trigger_condition:
-                    leg = "tp"
-            elif side == "buy":
-                if "price above" in trigger_condition:
-                    leg = "sl"
-                elif "price below" in trigger_condition:
-                    leg = "tp"
-
-        if leg is None:
-            # Not a recognised protective leg.  reduce-only alone isn't
-            # enough to treat as an SL or TP: a plain reduce-only limit
-            # won't fire automatically on adverse moves.
-            return None
-
-        size_raw = order.get("sz")
-        try:
-            parsed_size_raw = float(size_raw) if size_raw not in (None, "") else 0.0
-        except (TypeError, ValueError):
-            parsed_size_raw = 0.0
-        if parsed_size_raw <= 0:
-            size_raw = order.get("origSz") or order.get("orig_sz") or order.get("s") or order.get("size")
-        try:
-            size_val = abs(float(size_raw)) if size_raw not in (None, "") else 0.0
-        except (TypeError, ValueError):
-            size_val = 0.0
-        try:
-            trigger_px_val = float(trigger_px_raw) if trigger_px_raw not in (None, "") else None
-        except (TypeError, ValueError):
-            trigger_px_val = None
-
-        oid = order.get("oid") or order.get("order_id") or order.get("id")
-        try:
-            oid_val = int(oid) if oid is not None else None
-        except (TypeError, ValueError):
-            oid_val = None
-
-        return {
-            "coin": coin,
-            "leg": leg,
-            "side": side,
-            "trigger_px": trigger_px_val,
-            "size": size_val,
-            "reduce_only": reduce_only,
-            "oid": oid_val,
-            "order_type": order_type,
-        }
+        return _legs_classify(order)
 
     @staticmethod
     def _split_valid_legs(
@@ -3551,64 +3263,14 @@ class LiveTrader:
         entry_price: float,
         position_size: float,
     ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-        """Partition classified legs into (valid, invalid) for one position.
-
-        P0-4 (audit): a leg is only accepted as protecting the position if
-        ALL of these hold:
-
-        * ``leg`` matches ``leg_kind`` (sl vs tp)
-        * ``reduce_only`` is True — otherwise it could add exposure
-        * ``side`` equals ``protect_side`` (long positions need sell-side
-          protectors; short positions need buy-side)
-        * ``trigger_px`` is on the correct side of entry:
-            SL long  → trigger_px < entry
-            SL short → trigger_px > entry
-            TP long  → trigger_px > entry
-            TP short → trigger_px < entry
-          (If trigger_px cannot be parsed we mark the leg invalid rather
-          than silently accept.)
-        * ``size`` covers ≥ 90% of the position (partial protection is
-          accepted down to 90% to tolerate rounding; below that the leg
-          is treated as a stale under-sized remnant to clear).
-
-        Returns ``(valid_list, invalid_list)`` where each invalid entry
-        has an ``invalid_reason`` string attached for logging.
-        """
-        valid: List[Dict[str, Any]] = []
-        invalid: List[Dict[str, Any]] = []
-        min_coverage = max(position_size * 0.9, 0.0)
-        for leg in legs:
-            reasons: List[str] = []
-            if leg.get("leg") != leg_kind:
-                reasons.append(f"leg_mismatch:{leg.get('leg')}")
-            if not leg.get("reduce_only"):
-                reasons.append("not_reduce_only")
-            if leg.get("side") != protect_side:
-                reasons.append(f"wrong_side:{leg.get('side')}")
-            trigger_px = leg.get("trigger_px")
-            if trigger_px is None:
-                reasons.append("no_trigger_px")
-            else:
-                if leg_kind == "sl":
-                    if position_side == "long" and trigger_px >= entry_price:
-                        reasons.append("sl_above_entry_on_long")
-                    elif position_side == "short" and trigger_px <= entry_price:
-                        reasons.append("sl_below_entry_on_short")
-                elif leg_kind == "tp":
-                    if position_side == "long" and trigger_px <= entry_price:
-                        reasons.append("tp_below_entry_on_long")
-                    elif position_side == "short" and trigger_px >= entry_price:
-                        reasons.append("tp_above_entry_on_short")
-            if leg.get("size", 0.0) < min_coverage:
-                reasons.append(
-                    f"undersized:{leg.get('size'):.6f}<{min_coverage:.6f}"
-                )
-            if reasons:
-                leg["invalid_reason"] = ",".join(reasons)
-                invalid.append(leg)
-            else:
-                valid.append(leg)
-        return valid, invalid
+        return _legs_split_valid(
+            legs,
+            leg_kind=leg_kind,
+            position_side=position_side,
+            protect_side=protect_side,
+            entry_price=entry_price,
+            position_size=position_size,
+        )
 
     def _cancel_protective_orders(self, coin: str) -> int:
         # P0-3: the caller (protective-retry flow) needs to see all live
@@ -4579,149 +4241,31 @@ class LiveTrader:
 
     @staticmethod
     def _normalize_order_side(side: str) -> str:
-        """Normalize long/short or buy/sell inputs to buy/sell."""
-        value = str(side or "").strip().lower()
-        if value in {"buy", "long"}:
-            return "buy"
-        if value in {"sell", "short"}:
-            return "sell"
-        raise ValueError(f"Unsupported order side: {side}")
+        return _helpers_normalize_order_side(side)
 
     @staticmethod
     def _extract_inner_order_statuses(result: Optional[Dict]) -> List[Dict[str, Any]]:
-        """Pull the per-order ``statuses`` list out of a Hyperliquid response.
-
-        Hyperliquid wraps successful requests in
-        ``{"status": "ok", "response": {"type": "order", "data": {"statuses": [...]}}}``
-        where each entry is one of:
-          - ``{"resting": {"oid": int}}``     — posted, waiting to match
-          - ``{"filled": {"oid": int, "totalSz": str, "avgPx": str}}``
-          - ``{"error": "..."}``              — per-order rejection, outer
-                                                status is STILL ``"ok"``
-
-        Returns ``[]`` if the shape doesn't match.
-        """
-        if not isinstance(result, dict):
-            return []
-        response = result.get("response")
-        if not isinstance(response, dict):
-            return []
-        data = response.get("data")
-        if not isinstance(data, dict):
-            return []
-        statuses = data.get("statuses")
-        if isinstance(statuses, list):
-            return [s for s in statuses if isinstance(s, dict)]
-        return []
+        return _ord_extract_inner_statuses(result)
 
     @classmethod
     def _extract_reported_fill_size(cls, result: Optional[Dict]) -> Optional[float]:
-        """Return the exchange-reported filled size from an order response, if any."""
-        total = 0.0
-        found = False
-        for entry in cls._extract_inner_order_statuses(result):
-            filled = entry.get("filled")
-            if not isinstance(filled, dict):
-                continue
-            total_sz = cls._coerce_float(filled.get("totalSz"), 0.0)
-            if total_sz > 0:
-                total += total_sz
-                found = True
-        return total if found else None
+        return _ord_extract_fill_size(result)
 
     @classmethod
     def _extract_reported_fill_price(cls, result: Optional[Dict]) -> Optional[float]:
-        """Return size-weighted average fill price from an order response, if any."""
-        weighted_notional = 0.0
-        total_size = 0.0
-        for entry in cls._extract_inner_order_statuses(result):
-            filled = entry.get("filled")
-            if not isinstance(filled, dict):
-                continue
-            total_sz = cls._coerce_float(filled.get("totalSz"), 0.0)
-            avg_px = cls._coerce_float(filled.get("avgPx"), 0.0)
-            if total_sz <= 0 or avg_px <= 0:
-                continue
-            weighted_notional += total_sz * avg_px
-            total_size += total_sz
-        if total_size > 0:
-            return weighted_notional / total_size
-        return None
+        return _ord_extract_fill_price(result)
 
     @classmethod
     def _extract_resting_order_ids(cls, result: Optional[Dict]) -> List[int]:
-        """Return order ids that were accepted but are still resting."""
-        out: List[int] = []
-        for entry in cls._extract_inner_order_statuses(result):
-            resting = entry.get("resting")
-            if not isinstance(resting, dict):
-                continue
-            oid = resting.get("oid") or resting.get("order_id") or resting.get("id")
-            try:
-                out.append(int(oid))
-            except (TypeError, ValueError):
-                continue
-        return out
+        return _ord_extract_resting_ids(result)
 
     @classmethod
     def _is_order_result_success(cls, result: Optional[Dict]) -> bool:
-        """Best-effort classification of exchange responses into success/failure.
-
-        Hyperliquid uses a two-level success model: the outer request can
-        be ``status: ok`` while the inner per-order ``statuses`` list
-        contains ``{"error": "..."}`` rejections.  We must inspect the
-        inner list — otherwise a wire-format rejection (e.g. "Order has
-        invalid price.") looks successful and fill verification polls
-        pointlessly for 10 seconds before reporting a phantom failure.
-        """
-        if not result:
-            return False
-        if not isinstance(result, dict):
-            return bool(result)
-        status = str(result.get("status", "")).strip().lower()
-        if not status:
-            # Hyperliquid returns {"status": "ok", "response": {...}} on success.
-            # Missing/empty status means malformed response — treat as failure.
-            logger.warning("Order result has no status field: %s", result)
-            return False
-        if status not in {"success", "simulated", "verified", "filled", "accepted", "ok"}:
-            return False
-
-        # Outer ok — but drill into inner statuses and fail if any entry
-        # carries an error string.
-        inner = cls._extract_inner_order_statuses(result)
-        if inner and any("error" in entry for entry in inner):
-            errors = [entry.get("error") for entry in inner if "error" in entry]
-            logger.warning(
-                "Order outer status was 'ok' but per-order statuses contain "
-                "errors: %s",
-                errors,
-            )
-            return False
-        return True
+        return _ord_is_success(result)
 
     @classmethod
     def _is_insufficient_margin_rejection(cls, result: Optional[Dict]) -> bool:
-        """Return True when an order rejection is caused by insufficient margin."""
-        if not isinstance(result, dict):
-            return False
-
-        reason = str(result.get("reason", "")).strip().lower()
-        if "insufficient_margin" in reason:
-            return True
-
-        messages: List[str] = []
-        errors = result.get("errors")
-        if isinstance(errors, list):
-            messages.extend(str(err) for err in errors if err is not None)
-        elif errors is not None:
-            messages.append(str(errors))
-
-        message = result.get("message")
-        if message:
-            messages.append(str(message))
-
-        return any("insufficient margin" in msg.lower() for msg in messages)
+        return _ord_is_insufficient_margin(result)
 
     def _post_order(self, action: Dict, dry_run_override: Optional[bool] = None) -> Dict:
         """
@@ -4946,14 +4490,7 @@ class LiveTrader:
 
     @staticmethod
     def _coerce_exchange_leverage(leverage: float) -> int:
-        """Hyperliquid updateLeverage requires an integer leverage value."""
-        try:
-            leverage_value = float(leverage)
-        except (TypeError, ValueError):
-            leverage_value = 1.0
-        if not math.isfinite(leverage_value) or leverage_value <= 0:
-            leverage_value = 1.0
-        return max(1, int(math.floor(leverage_value + 0.5)))
+        return _ord_coerce_exchange_leverage(leverage)
 
     def ensure_exchange_leverage(
         self,
