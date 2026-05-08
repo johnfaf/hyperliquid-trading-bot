@@ -139,6 +139,19 @@ class DecisionFirewall:
         self.market_side_guard_min_confidence = float(
             cfg.get("market_side_guard_min_confidence", 0.60)
         )
+        # Only enforce strategy-level regime pauses when the regime call itself
+        # is confident enough. A 49%-confidence "ranging" call shouldn't pause
+        # momentum strategies — that's how the bot ends up rejecting 5/5
+        # candidates and just paying infra to do nothing.
+        self.regime_pause_min_confidence = float(
+            cfg.get("regime_pause_min_confidence", 0.55)
+        )
+        # Tolerance band on confidence-vs-threshold comparisons. A signal at
+        # 0.4499 vs threshold 0.45 should not be rejected by an off-by-one-bp
+        # rounding artefact.
+        self.confidence_threshold_tolerance = max(
+            0.0, float(cfg.get("confidence_threshold_tolerance", 0.005))
+        )
         self.canary_mode = bool(cfg.get("canary_mode", False))
         self.canary_max_positions = max(1, int(cfg.get("canary_max_positions", 2)))
         self.cooldown_seconds = int(cfg.get("cooldown_seconds", 180))
@@ -1462,7 +1475,7 @@ class DecisionFirewall:
             return False, f"Source allocator paused {source_key} ({status})", policy
 
         min_conf = float(policy.get("min_confidence", 0.0) or 0.0)
-        if signal.confidence < min_conf:
+        if signal.confidence + self.confidence_threshold_tolerance < min_conf:
             return (
                 False,
                 f"Source allocator requires {min_conf:.0%} confidence for {source_key} "
@@ -1869,13 +1882,38 @@ class DecisionFirewall:
         if regime_data:
             guidance = regime_data.get("strategy_guidance", {})
             paused = set(guidance.get("pause", []))
-            if "all" in paused:
-                return _reject("rejected_regime",
-                              f"Regime {regime_data.get('overall_regime', '?')} pauses all trading")
-            if signal.strategy_type and signal.strategy_type.lower() in paused:
-                return _reject("rejected_regime",
-                              f"Regime pauses {signal.strategy_type} "
-                              f"(regime={regime_data.get('overall_regime', '?')})")
+            # Only enforce regime-driven pauses when the regime call is
+            # confident. A low-confidence "ranging" read shouldn't kill all
+            # momentum strategies — that produces the 5/5-rejected gridlock.
+            try:
+                regime_conf = float(
+                    regime_data.get("overall_confidence",
+                        regime_data.get("regime_confidence", 0.0)) or 0.0
+                )
+            except (TypeError, ValueError):
+                regime_conf = 0.0
+            if regime_conf >= self.regime_pause_min_confidence:
+                if "all" in paused:
+                    return _reject("rejected_regime",
+                                  f"Regime {regime_data.get('overall_regime', '?')} pauses all trading "
+                                  f"(conf {regime_conf:.0%})")
+                if signal.strategy_type and signal.strategy_type.lower() in paused:
+                    return _reject("rejected_regime",
+                                  f"Regime pauses {signal.strategy_type} "
+                                  f"(regime={regime_data.get('overall_regime', '?')}, conf {regime_conf:.0%})")
+            elif paused and (
+                "all" in paused
+                or (signal.strategy_type and signal.strategy_type.lower() in paused)
+            ):
+                # Low-confidence regime: don't block, just leave a breadcrumb
+                # so we can see in logs that a pause was suppressed.
+                logger.info(
+                    "Regime pause suppressed for %s (regime=%s, conf %.0f%% < %.0f%%)",
+                    signal.strategy_type or "?",
+                    regime_data.get("overall_regime", "?"),
+                    regime_conf * 100,
+                    self.regime_pause_min_confidence * 100,
+                )
 
             # Apply size modifier from regime
             size_mod = float(guidance.get("size_modifier", 1.0) or 1.0)

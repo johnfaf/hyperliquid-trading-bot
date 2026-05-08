@@ -128,6 +128,23 @@ class CopyTrader:
         )
         self._source_side_policy_cache: Dict[str, object] = {"ts": 0.0, "closed": [], "policies": {}}
         self._source_side_policy_cache_ttl_s = 300.0
+        # Static blocklist (e.g., "0x350e33a7") and aggregate per-source hard cutoff.
+        self.blocked_sources: frozenset[str] = frozenset(
+            (addr or "").strip().lower()
+            for addr in getattr(config, "COPY_TRADER_BLOCKED_SOURCES", ()) or ()
+            if (addr or "").strip()
+        )
+        self.hard_cutoff_enabled = bool(
+            getattr(config, "COPY_TRADER_HARD_CUTOFF_ENABLED", True)
+        )
+        self.hard_cutoff_min_trades = max(
+            1, int(getattr(config, "COPY_TRADER_HARD_CUTOFF_MIN_TRADES", 30))
+        )
+        self.hard_cutoff_win_rate = float(
+            getattr(config, "COPY_TRADER_HARD_CUTOFF_WIN_RATE", 0.50)
+        )
+        self._hard_cutoff_cache: Dict[str, tuple[float, bool, str]] = {}
+        self._hard_cutoff_cache_ttl_s = 300.0
         self._copy_guardrail_status: Dict[str, object] = {
             "status": "healthy" if self.enabled else "paused",
             "reason": (
@@ -145,6 +162,69 @@ class CopyTrader:
     def _source_key(payload: Dict) -> str:
         trader = str(payload.get("source_trader", "") or "").strip().lower()
         return f"copy_trade:{trader}" if trader else "copy_trade"
+
+    def _source_address(self, signal: Dict) -> str:
+        return str(signal.get("source_trader", "") or "").strip().lower()
+
+    def _is_source_blocklisted(self, signal: Dict) -> tuple[bool, str]:
+        """Static blocklist check — runs before all guards/policies."""
+        if not self.blocked_sources:
+            return False, ""
+        addr = self._source_address(signal)
+        if not addr:
+            return False, ""
+        for blocked in self.blocked_sources:
+            # Allow short prefix matches (e.g. "0x350e33a7") or full addresses.
+            if addr == blocked or addr.startswith(blocked):
+                return True, f"source {addr[:10]} on COPY_TRADER_BLOCKED_SOURCES"
+        return False, ""
+
+    def _is_source_hard_cutoff(self, signal: Dict) -> tuple[bool, str]:
+        """Aggregate per-source win-rate cutoff over min_trades closed trades."""
+        if not self.hard_cutoff_enabled:
+            return False, ""
+        source_key = self._source_key(signal)
+        cached = self._hard_cutoff_cache.get(source_key)
+        now = time.time()
+        if cached and (now - cached[0]) < self._hard_cutoff_cache_ttl_s:
+            return cached[1], cached[2]
+
+        closed = self._get_source_side_closed_trades()
+        # Filter trades by source_key match
+        n_total = 0
+        n_wins = 0
+        for trade in closed or []:
+            meta = trade.get("metadata", {})
+            if isinstance(meta, str):
+                try:
+                    meta = json.loads(meta or "{}")
+                except (json.JSONDecodeError, TypeError):
+                    meta = {}
+            t_source = str(
+                (meta or {}).get("source") or trade.get("source") or ""
+            ).strip().lower()
+            if t_source != source_key:
+                continue
+            n_total += 1
+            try:
+                if float(trade.get("net_pnl_after_fees", trade.get("pnl", 0)) or 0) > 0:
+                    n_wins += 1
+            except (TypeError, ValueError):
+                pass
+
+        blocked = False
+        reason = ""
+        if n_total >= self.hard_cutoff_min_trades:
+            wr = n_wins / n_total
+            if wr < self.hard_cutoff_win_rate:
+                blocked = True
+                reason = (
+                    f"hard cutoff: {source_key} has {wr*100:.0f}% WR over "
+                    f"{n_total} trades (cutoff {self.hard_cutoff_win_rate*100:.0f}% "
+                    f"@ {self.hard_cutoff_min_trades}+ trades)"
+                )
+        self._hard_cutoff_cache[source_key] = (now, blocked, reason)
+        return blocked, reason
 
     def _get_source_side_closed_trades(self) -> List[Dict]:
         now = time.time()
@@ -617,6 +697,24 @@ class CopyTrader:
 
                 if signal["type"] in ("copy_open", "copy_scale_in", "copy_flip", "golden_copy"):
                     if not allow_new_entries:
+                        continue
+                    blocklisted, blocklist_reason = self._is_source_blocklisted(signal)
+                    if blocklisted:
+                        logger.warning(
+                            "  Copy source blocklisted: %s %s rejected (%s)",
+                            signal["side"],
+                            signal["coin"],
+                            blocklist_reason,
+                        )
+                        continue
+                    cutoff, cutoff_reason = self._is_source_hard_cutoff(signal)
+                    if cutoff:
+                        logger.warning(
+                            "  Copy source hard cutoff: %s %s rejected (%s)",
+                            signal["side"],
+                            signal["coin"],
+                            cutoff_reason,
+                        )
                         continue
                     if (
                         self.max_new_trades_per_cycle > 0

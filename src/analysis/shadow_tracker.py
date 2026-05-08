@@ -514,6 +514,35 @@ class ShadowTracker:
             raise
 
 
+    def get_return_fractions(self, days: int = 90) -> list[float]:
+        """Return per-trade return fractions (pnl/notional) for the last N days.
+
+        Used by the RL sizer to widen its training dataset with shadow trades
+        (signals the firewall blocked from real execution).
+        """
+        cutoff_ts = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+        try:
+            with self._get_connection() as conn:
+                rows = conn.execute(
+                    """
+                    SELECT pnl_pct FROM shadow_trades
+                    WHERE exit_ts IS NOT NULL AND exit_ts > ? AND pnl_pct IS NOT NULL
+                    """,
+                    (cutoff_ts,),
+                ).fetchall()
+        except Exception as exc:
+            logger.warning("shadow get_return_fractions query failed: %s", exc)
+            return []
+        out: list[float] = []
+        for r in rows:
+            try:
+                # pnl_pct is stored in % units; convert to fraction.
+                out.append(float(r["pnl_pct"]) / 100.0)
+            except (TypeError, ValueError, KeyError):
+                continue
+        return out
+
+
 if __name__ == "__main__":
     # Quick test
     tracker = ShadowTracker()

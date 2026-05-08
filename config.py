@@ -302,13 +302,18 @@ TIME_WINDOWS = {
 # ─── Strategy Scoring ─────────────────────────────────────────
 # Weight decay factor for older strategy scores (per day)
 SCORE_DECAY_RATE = 0.95
-# Minimum score to keep a strategy active
-MIN_STRATEGY_SCORE = 0.05
+# Minimum composite score for a strategy to remain active. 0.05 was effectively
+# a no-op (every strategy passed); 0.20 forces real selectivity while still
+# leaving a comfortable margin above noise.
+MIN_STRATEGY_SCORE = float(os.environ.get("MIN_STRATEGY_SCORE", 0.20))
 # Keep at least top-N strategies active even when all scores are weak, to avoid
 # complete strategy starvation during cold-start or rough regimes.
 MIN_ACTIVE_STRATEGIES = int(os.environ.get("MIN_ACTIVE_STRATEGIES", 5))
-# Max active strategies in DB — prune lowest-scoring beyond this
-MAX_ACTIVE_STRATEGIES = int(os.environ.get("MAX_ACTIVE_STRATEGIES", 200))
+# Hard cap on active strategies in DB — lowest-scoring are deactivated beyond
+# this. Default 25 gives MAX_STRATEGIES_PER_CYCLE (15) headroom for rotation
+# without an unbounded `strategies` table. Previous default of 200 happened to
+# match the discovered-strategy population so the cap never fired.
+MAX_ACTIVE_STRATEGIES = int(os.environ.get("MAX_ACTIVE_STRATEGIES", 25))
 # Max strategies per trading cycle fed to decision engine
 MAX_STRATEGIES_PER_CYCLE = int(os.environ.get("MAX_STRATEGIES_PER_CYCLE", 15))
 # Scoring weights
@@ -561,6 +566,32 @@ COPY_TRADER_SOURCE_SIDE_CONFIDENCE_MULTIPLIER = float(
 )
 COPY_TRADER_SOURCE_SIDE_SIZE_MULTIPLIER = float(
     os.environ.get("COPY_TRADER_SOURCE_SIDE_SIZE_MULTIPLIER", 0.50)
+)
+# Hard blocklist for copy-trade sources. Comma-separated 0x-addresses (case-
+# insensitive). Any signal whose source_trader matches is dropped immediately,
+# bypassing all guards. Use for confirmed bad actors or sources you want
+# permanently disabled.
+COPY_TRADER_BLOCKED_SOURCES = tuple(
+    addr.strip().lower()
+    for addr in os.environ.get(
+        "COPY_TRADER_BLOCKED_SOURCES",
+        "0x350e33a7",
+    ).split(",")
+    if addr.strip()
+)
+# Aggregate per-source hard cutoff. After at least
+# COPY_TRADER_HARD_CUTOFF_MIN_TRADES closed trades, if a source's overall
+# win rate falls below COPY_TRADER_HARD_CUTOFF_WIN_RATE the source is auto-
+# disabled (different from auto_pause: this is per-source, not per-side, and
+# evaluates regardless of net PnL).
+COPY_TRADER_HARD_CUTOFF_ENABLED = os.environ.get(
+    "COPY_TRADER_HARD_CUTOFF_ENABLED", "true"
+).strip().lower() in ("1", "true", "yes", "on")
+COPY_TRADER_HARD_CUTOFF_MIN_TRADES = int(
+    os.environ.get("COPY_TRADER_HARD_CUTOFF_MIN_TRADES", 30)
+)
+COPY_TRADER_HARD_CUTOFF_WIN_RATE = float(
+    os.environ.get("COPY_TRADER_HARD_CUTOFF_WIN_RATE", 0.50)
 )
 LIVE_EXTERNAL_KILL_SWITCH_FILE = os.environ.get("LIVE_EXTERNAL_KILL_SWITCH_FILE", "").strip()
 LIVE_KILL_SWITCH_STATE_FILE = os.environ.get("LIVE_KILL_SWITCH_STATE_FILE", "/data/live_kill_switch_state.json").strip()
@@ -924,6 +955,22 @@ READINESS_ALERT_COOLDOWN_S = int(
     os.environ.get("READINESS_ALERT_COOLDOWN_S", 900)
 )
 
+# ─── PositionMonitor (WebSocket subscriptions) ─────────────────
+# When True, only bootstrap and subscribe to tracked wallets that have shown
+# positions or fills within the last POSITION_MONITOR_ACTIVITY_LOOKBACK_S
+# seconds. Inactive wallets are skipped until the next periodic full refresh
+# (POSITION_MONITOR_FULL_REFRESH_S). This cuts wasted REST calls and
+# Hyperliquid "Inactive" reconnect churn when tracking large lists.
+POSITION_MONITOR_ACTIVITY_FILTER_ENABLED = os.environ.get(
+    "POSITION_MONITOR_ACTIVITY_FILTER_ENABLED", "true"
+).strip().lower() in ("1", "true", "yes", "on")
+POSITION_MONITOR_ACTIVITY_LOOKBACK_S = int(
+    os.environ.get("POSITION_MONITOR_ACTIVITY_LOOKBACK_S", 21600)  # 6 hours
+)
+POSITION_MONITOR_FULL_REFRESH_S = int(
+    os.environ.get("POSITION_MONITOR_FULL_REFRESH_S", 86400)  # 24 hours
+)
+
 # ─── Scheduling ────────────────────────────────────────────────
 # 3-tier scheduling:
 #   Tier 1 — Fast cycle:   position checks, SL/TP, copy-trade scan
@@ -1039,6 +1086,19 @@ RL_SIZER_APPLY_TO_ORDERS = _safe_env_bool("RL_SIZER_APPLY_TO_ORDERS", False)
 RL_SIZER_RETRAIN_INTERVAL = int(os.environ.get("RL_SIZER_RETRAIN_INTERVAL", 43200))  # 12 hours
 RL_SIZER_TRAINING_EPISODES = int(os.environ.get("RL_SIZER_TRAINING_EPISODES", 500))
 RL_SIZER_MODEL_DIR = os.environ.get("RL_SIZER_MODEL_DIR", "models/rl_sizer")
+# Minimum closed-trade count required before the RL sizer trains. Lowered
+# from 100 to 50 so the model bootstraps faster; shadow trades are added to
+# the dataset (see RL_SIZER_USE_SHADOW_DATA) to widen the sample.
+RL_SIZER_MIN_TRAINING_TRADES = int(os.environ.get("RL_SIZER_MIN_TRAINING_TRADES", 50))
+# When true, shadow_tracker pnl_pct values are concatenated with Kelly's
+# realized returns at training time. This lets the sizer learn from signals
+# the firewall blocked, expanding the dataset without taking risk.
+RL_SIZER_USE_SHADOW_DATA = os.environ.get(
+    "RL_SIZER_USE_SHADOW_DATA", "true"
+).strip().lower() in ("1", "true", "yes", "on")
+RL_SIZER_SHADOW_LOOKBACK_DAYS = int(
+    os.environ.get("RL_SIZER_SHADOW_LOOKBACK_DAYS", 90)
+)
 
 # ─── Kelly Sizing ─────────────────────────────────────────────
 # Multiplier: 1.0=full, 0.5=half, 0.25=quarter (recommended for crypto)
@@ -1154,8 +1214,8 @@ def _validate_config_bounds() -> None:
         globals()["DB_BACKEND"] = "sqlite"
 
     rules = [
-        ("MIN_STRATEGY_SCORE", 0.0, 1.0, 0.05),
-        ("MAX_ACTIVE_STRATEGIES", 1, 5000, 200),
+        ("MIN_STRATEGY_SCORE", 0.0, 1.0, 0.20),
+        ("MAX_ACTIVE_STRATEGIES", 1, 5000, 25),
         ("MIN_ACTIVE_STRATEGIES", 1, 500, 5),
         ("MAX_STRATEGIES_PER_CYCLE", 1, 200, 15),
         ("PAPER_TRADING_MAX_LEVERAGE", 1.0, 25.0, 5.0),

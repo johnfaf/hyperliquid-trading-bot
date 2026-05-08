@@ -367,7 +367,12 @@ class RLPositionSizer:
         self.retrain_interval = cfg.get("retrain_interval", 43200)  # 12 hours
         self.training_episodes = cfg.get("training_episodes", 500)
         self.episode_length = cfg.get("episode_length", 50)
-        self.min_training_trades = cfg.get("min_training_trades", 100)
+        self.min_training_trades = cfg.get("min_training_trades", 50)
+        # Optional shadow-data provider: anything with .get_attribution(days)
+        # returning a dict of source -> trades. Used to widen the dataset.
+        self.shadow_tracker = cfg.get("shadow_tracker")
+        self.use_shadow_data = bool(cfg.get("use_shadow_data", True))
+        self.shadow_lookback_days = int(cfg.get("shadow_lookback_days", 90))
 
         self._dqn: Optional[DQNetwork] = None
         self._last_train_time: float = 0
@@ -496,6 +501,25 @@ class RLPositionSizer:
                 all_returns = []
                 for outcomes in self.kelly._strategy_outcomes.values():
                     all_returns.extend([o["return_pct"] for o in outcomes])
+                kelly_n = len(all_returns)
+                if (
+                    self.use_shadow_data
+                    and self.shadow_tracker is not None
+                    and hasattr(self.shadow_tracker, "get_return_fractions")
+                ):
+                    try:
+                        shadow_returns = self.shadow_tracker.get_return_fractions(
+                            days=self.shadow_lookback_days
+                        )
+                    except Exception as exc:
+                        logger.debug("RLSizer: shadow data fetch failed: %s", exc)
+                        shadow_returns = []
+                    if shadow_returns:
+                        all_returns.extend(shadow_returns)
+                        logger.info(
+                            "RLSizer: augmenting Kelly data (%d) with %d shadow returns",
+                            kelly_n, len(shadow_returns),
+                        )
                 if len(all_returns) < self.min_training_trades:
                     logger.info(
                         "RLSizer: not enough trade data (%d < %d), training skipped",

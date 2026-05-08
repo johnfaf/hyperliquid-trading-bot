@@ -528,6 +528,15 @@ def build_subsystems(
                 "model_dir": getattr(config, "RL_SIZER_MODEL_DIR", "models/rl_sizer"),
                 "retrain_interval": getattr(config, "RL_SIZER_RETRAIN_INTERVAL", 43200),
                 "training_episodes": getattr(config, "RL_SIZER_TRAINING_EPISODES", 500),
+                "min_training_trades": getattr(
+                    config, "RL_SIZER_MIN_TRAINING_TRADES", 50
+                ),
+                "use_shadow_data": getattr(config, "RL_SIZER_USE_SHADOW_DATA", True),
+                "shadow_lookback_days": getattr(
+                    config, "RL_SIZER_SHADOW_LOOKBACK_DAYS", 90
+                ),
+                # shadow_tracker is wired after the shadow_tracker subsystem
+                # is built later in this profile.
             }),
             health,
         )
@@ -835,6 +844,8 @@ def build_subsystems(
             c.paper_trader.shadow_tracker = c.shadow_tracker
         if c.copy_trader:
             c.copy_trader.shadow_tracker = c.shadow_tracker
+        if getattr(c, "rl_sizer", None) is not None:
+            c.rl_sizer.shadow_tracker = c.shadow_tracker
 
     # ─── Bot detector + regime filter ─────────────────────────
     if "adaptive_bot_detector" in profile:

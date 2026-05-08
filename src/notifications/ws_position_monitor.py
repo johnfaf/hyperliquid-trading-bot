@@ -103,6 +103,23 @@ class PositionMonitor:
         self._active_position_addresses: Set[str] = set()
         self._quarantined_addresses: Dict[str, str] = {}
         self._reconnect_wake_event = threading.Event()
+        # Per-address timestamp of last bootstrap that returned positions.
+        # Used by the activity filter to skip wallets that have been empty
+        # for longer than POSITION_MONITOR_ACTIVITY_LOOKBACK_S between
+        # full-refresh windows.
+        self._last_active_ts: Dict[str, float] = {}
+        self._last_full_refresh_ts: float = 0.0
+        self._activity_filter_enabled = bool(
+            getattr(config, "POSITION_MONITOR_ACTIVITY_FILTER_ENABLED", True)
+        )
+        self._activity_lookback_s = max(
+            60.0,
+            float(getattr(config, "POSITION_MONITOR_ACTIVITY_LOOKBACK_S", 21600)),
+        )
+        self._full_refresh_s = max(
+            self._activity_lookback_s,
+            float(getattr(config, "POSITION_MONITOR_FULL_REFRESH_S", 86400)),
+        )
 
         # Stats
         self._messages_received = 0
@@ -611,12 +628,23 @@ class PositionMonitor:
             with self._lock:
                 self._position_cache.clear()
                 self._subscribed_addresses.clear()
-            # Bootstrap fresh position state before consuming new deltas.
-            for address in tracked:
+            to_bootstrap, skipped = self._filter_active_addresses(tracked)
+            if skipped:
+                logger.info(
+                    "PositionMonitor activity filter: bootstrapping %d/%d wallets, skipping %d inactive",
+                    len(to_bootstrap), len(tracked), skipped,
+                )
+            for address in to_bootstrap:
                 self._bootstrap_positions(address)
         else:
             logger.info("PositionMonitor connected")
-            for address in tracked:
+            to_bootstrap, skipped = self._filter_active_addresses(tracked)
+            if skipped:
+                logger.info(
+                    "PositionMonitor activity filter: bootstrapping %d/%d wallets, skipping %d inactive",
+                    len(to_bootstrap), len(tracked), skipped,
+                )
+            for address in to_bootstrap:
                 self._bootstrap_positions(address)
 
         # Track whether any trader has positions — if none do,
@@ -1058,6 +1086,11 @@ class PositionMonitor:
             else:
                 tracked = list(self._tracked_addresses)
 
+        # Skip wallets that have been empty for longer than the activity
+        # lookback (except during periodic full-refresh windows). _bootstrap-
+        # _positions still updates _last_active_ts when new positions appear.
+        tracked, _skipped = self._filter_active_addresses(tracked)
+
         emitted = 0
         for address in tracked:
             with self._lock:
@@ -1147,10 +1180,12 @@ class PositionMonitor:
         try:
             positions = self._fetch_positions_snapshot(address)
 
+            now = time.time()
             with self._lock:
                 self._position_cache[address] = positions
                 if positions:
                     self._active_position_addresses.add(address)
+                    self._last_active_ts[address] = now
                 else:
                     self._active_position_addresses.discard(address)
 
@@ -1159,3 +1194,36 @@ class PositionMonitor:
         except Exception as e:
             logger.warning(f"Bootstrap failed for {address[:10]}: {e}")
             return {}
+
+    def _filter_active_addresses(self, addresses: List[str]) -> tuple[List[str], int]:
+        """Return the subset of addresses to bootstrap this pass and the count
+        skipped by the activity filter.
+
+        Rules:
+          - If the filter is disabled, return all addresses unchanged.
+          - During a periodic full refresh window (every full_refresh_s) we
+            include every address so newly-active wallets aren't missed.
+          - Otherwise, include only addresses whose last_active_ts is fresher
+            than activity_lookback_s. Addresses we have never seen positions
+            for are included on the first pass and then skipped until the
+            next full refresh.
+        """
+        if not self._activity_filter_enabled or not addresses:
+            return list(addresses), 0
+        now = time.time()
+        if (now - self._last_full_refresh_ts) >= self._full_refresh_s:
+            self._last_full_refresh_ts = now
+            return list(addresses), 0
+        kept: List[str] = []
+        skipped = 0
+        for addr in addresses:
+            last = self._last_active_ts.get(addr)
+            if last is None:
+                # Never observed — include once so we get a baseline.
+                kept.append(addr)
+                continue
+            if (now - last) <= self._activity_lookback_s:
+                kept.append(addr)
+            else:
+                skipped += 1
+        return kept, skipped

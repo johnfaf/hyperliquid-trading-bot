@@ -406,19 +406,22 @@ class StrategyScorer:
         # Keep all above-threshold strategies, but ensure at least top-N stay
         # active during weak-score phases (prevents strategy "death spiral").
         keep_top_n = max(1, int(getattr(config, "MIN_ACTIVE_STRATEGIES", 5)))
+        max_active = max(keep_top_n, int(getattr(config, "MAX_ACTIVE_STRATEGIES", 25)))
         threshold = float(config.MIN_STRATEGY_SCORE)
-        desired_active_ids = {
+        passed_threshold_ids = {
             r["strategy_id"] for r in results if r["score"] >= threshold
         }
+        desired_active_ids = set(passed_threshold_ids)
         for r in results[:keep_top_n]:
             desired_active_ids.add(r["strategy_id"])
 
-        # Hard cap for operational safety.
-        if len(desired_active_ids) > config.MAX_ACTIVE_STRATEGIES:
-            capped_ids = {
-                r["strategy_id"] for r in results[:config.MAX_ACTIVE_STRATEGIES]
+        # Hard cap for operational safety — keep only the highest-scoring rows.
+        capped = False
+        if len(desired_active_ids) > max_active:
+            desired_active_ids = {
+                r["strategy_id"] for r in results[:max_active]
             }
-            desired_active_ids = capped_ids
+            capped = True
 
         for r in results:
             r["active"] = r["strategy_id"] in desired_active_ids
@@ -429,9 +432,13 @@ class StrategyScorer:
             logger.error("Failed to persist scoring cycle: %s", exc)
 
         logger.info(
-            "Strategy activation policy: threshold=%.3f, keep_top_n=%d, active=%d/%d",
+            "Strategy activation policy: threshold=%.3f, passed=%d, floor_top_n=%d, "
+            "max_active=%d, capped=%s, active=%d/%d",
             threshold,
+            len(passed_threshold_ids),
             keep_top_n,
+            max_active,
+            "yes" if capped else "no",
             sum(1 for r in results if r["active"]),
             len(results),
         )
