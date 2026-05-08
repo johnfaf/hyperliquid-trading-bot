@@ -955,6 +955,35 @@ READINESS_ALERT_COOLDOWN_S = int(
     os.environ.get("READINESS_ALERT_COOLDOWN_S", 900)
 )
 
+# ─── Decision-engine signal sources (arena/polymarket/options_flow) ───
+# These three subsystems all log activity but were producing zero signals in
+# the May logs because their thresholds were tuned for steady-state, not
+# bootstrap. Defaults below are looser than before but still real filters.
+OPTIONS_FLOW_MIN_NOTIONAL = int(
+    os.environ.get("OPTIONS_FLOW_MIN_NOTIONAL", 10_000)
+)
+OPTIONS_FLOW_MIN_VOL_OI_RATIO = float(
+    os.environ.get("OPTIONS_FLOW_MIN_VOL_OI_RATIO", 0.08)
+)
+OPTIONS_FLOW_MIN_CONVICTION_PCT = float(
+    os.environ.get("OPTIONS_FLOW_MIN_CONVICTION_PCT", 30.0)
+)
+ARENA_CHAMPION_MIN_FITNESS = float(
+    os.environ.get("ARENA_CHAMPION_MIN_FITNESS", 0.10)
+)
+ARENA_CHAMPION_MIN_TRADES = int(
+    os.environ.get("ARENA_CHAMPION_MIN_TRADES", 3)
+)
+ARENA_CHAMPION_MIN_WIN_RATE = float(
+    os.environ.get("ARENA_CHAMPION_MIN_WIN_RATE", 0.45)
+)
+POLYMARKET_MIN_VOLUME_THRESHOLD = int(
+    os.environ.get("POLYMARKET_MIN_VOLUME_THRESHOLD", 5_000)
+)
+POLYMARKET_MIN_LIQUIDITY_THRESHOLD = int(
+    os.environ.get("POLYMARKET_MIN_LIQUIDITY_THRESHOLD", 500)
+)
+
 # ─── Cross-Venue Hedger ────────────────────────────────────────
 # Default hedge venue is Kraken Futures (futures.kraken.com). Binance/Bybit
 # code paths exist but live execution is NOT implemented for those — leave

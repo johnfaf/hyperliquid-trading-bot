@@ -31,9 +31,11 @@ TIER_BLOCK = 2_000_000
 TIER_SWEEP = 500_000
 TIER_LARGE = 100_000
 
-# Minimum filters
-MIN_VOL_OI_RATIO = 0.10  # 10% of OI is already noteworthy for options
-MIN_NOTIONAL = 25_000    # Lowered from 50K; options have smaller trade sizes
+# Minimum filters. Both env-overridable so we don't have to redeploy when
+# Deribit volumes are quiet and the scanner returns 0 unusual prints.
+import os as _os
+MIN_VOL_OI_RATIO = float(_os.environ.get("OPTIONS_FLOW_MIN_VOL_OI_RATIO", 0.08))
+MIN_NOTIONAL = int(_os.environ.get("OPTIONS_FLOW_MIN_NOTIONAL", 10_000))
 
 # Supported underlyings
 # SOL removed: Deribit has no SOL options — every scan returned 0 trades.

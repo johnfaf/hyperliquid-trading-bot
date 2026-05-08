@@ -2379,13 +2379,13 @@ def test_hyperliquid_signer_uses_agent_primary_type_and_exchange_domain():
     signer = HyperliquidSigner.__new__(HyperliquidSigner)
     signer.account = FakeAccount()
 
-    import src.trading.live_trader as lt
-    original = lt._encode_typed_data
+    import src.trading.live_trader_signing as lts
+    original = lts._encode_typed_data
     try:
-        lt._encode_typed_data = fake_encode
+        lts._encode_typed_data = fake_encode
         signer.sign_action({"type": "noop"}, nonce=1, vault_address=None)
     finally:
-        lt._encode_typed_data = original
+        lts._encode_typed_data = original
 
     payload = captured["payload"]
     assert payload is not None, "encode_typed_data was not called"

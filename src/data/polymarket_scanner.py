@@ -183,8 +183,22 @@ class PolymarketScanner:
 
         # Cache configuration
         self.cache_ttl_minutes = self.config.get("cache_ttl_minutes", 5)
-        self.min_volume_threshold = self.config.get("min_volume_threshold", 10000)  # $10k
-        self.min_liquidity_threshold = self.config.get("min_liquidity_threshold", 1000)  # $1k
+        # Defaults pulled from top-level config so operators can tune via env
+        # without touching code; explicit cfg dict still overrides.
+        try:
+            import config as _app_cfg
+        except ImportError:  # pragma: no cover
+            _app_cfg = None
+        _vol_default = (
+            getattr(_app_cfg, "POLYMARKET_MIN_VOLUME_THRESHOLD", 5_000)
+            if _app_cfg is not None else 5_000
+        )
+        _liq_default = (
+            getattr(_app_cfg, "POLYMARKET_MIN_LIQUIDITY_THRESHOLD", 500)
+            if _app_cfg is not None else 500
+        )
+        self.min_volume_threshold = self.config.get("min_volume_threshold", _vol_default)
+        self.min_liquidity_threshold = self.config.get("min_liquidity_threshold", _liq_default)
 
         # Detection thresholds
         self.odds_movement_threshold_1h = self.config.get("odds_movement_1h", 0.005)  # 0.5% (for 3-min scans)
