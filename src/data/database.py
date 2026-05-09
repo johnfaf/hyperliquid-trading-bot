@@ -49,6 +49,10 @@ _LEARNING_SEED_TABLES = frozenset({
     "continuous_learning_policies",
     "source_inventory",
 })
+_SYNTHETIC_STRATEGY_MIN_TRADES = 1000
+_SYNTHETIC_STRATEGY_MIN_WIN_RATE = 0.995
+_SYNTHETIC_STRATEGY_SCORE = 0.7955
+_SYNTHETIC_STRATEGY_SCORE_TOLERANCE = 0.0005
 
 # Resolved once at import — config.py already tested writability
 _DB_PATH = config.DB_PATH
@@ -125,6 +129,35 @@ def _strategy_parameters(strategy: dict) -> dict:
     return _loads_json_dict((strategy or {}).get("parameters"))
 
 
+def _strategy_metric_float(strategy: dict, key: str, default: float = 0.0) -> float:
+    try:
+        return float((strategy or {}).get(key, default) or default)
+    except (TypeError, ValueError):
+        return default
+
+
+def is_synthetic_strategy_placeholder(strategy: dict) -> bool:
+    """Return True for impossible legacy seed rows that look live-eligible.
+
+    A previous repair/import path could leave active strategy rows with a valid
+    source wallet but synthetic-looking performance: thousands of trades, near
+    perfect win rate, and the same rounded score across every strategy.  Those
+    rows are not real trading edge and must never seed live-mode side policy.
+    """
+    strategy = dict(strategy or {})
+    trade_count = int(_strategy_metric_float(strategy, "trade_count", 0.0))
+    win_rate = _strategy_metric_float(strategy, "win_rate", 0.0)
+    if win_rate > 1.5:
+        win_rate /= 100.0
+    score = _strategy_metric_float(strategy, "current_score", -1.0)
+
+    return (
+        trade_count >= _SYNTHETIC_STRATEGY_MIN_TRADES
+        and win_rate >= _SYNTHETIC_STRATEGY_MIN_WIN_RATE
+        and abs(score - _SYNTHETIC_STRATEGY_SCORE) <= _SYNTHETIC_STRATEGY_SCORE_TOLERANCE
+    )
+
+
 def strategy_quarantine_reason(strategy: dict) -> Optional[str]:
     """Return why a strategy must not be used for live selection, or None."""
     strategy = dict(strategy or {})
@@ -136,6 +169,8 @@ def strategy_quarantine_reason(strategy: dict) -> Optional[str]:
 
     if strategy_type == "retired_placeholder" or params.get("auto_repaired"):
         return "auto_repaired_placeholder"
+    if is_synthetic_strategy_placeholder(strategy):
+        return "synthetic_placeholder_metrics"
     if any(marker in combined for marker in _FIXTURE_STRATEGY_MARKERS):
         return "fixture_or_demo_strategy"
 

@@ -227,6 +227,75 @@ def test_get_active_strategies_filters_missing_or_bot_like_source(tmp_path, monk
     assert len(db.get_active_strategies(validated_only=False)) == 3
 
 
+def test_get_active_strategies_filters_synthetic_placeholder_metrics(tmp_path, monkeypatch):
+    db_path = tmp_path / "runtime.db"
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    conn.execute(
+        """
+        CREATE TABLE strategies (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            description TEXT,
+            strategy_type TEXT NOT NULL,
+            parameters TEXT DEFAULT '{}',
+            discovered_at TEXT NOT NULL,
+            last_scored TEXT,
+            current_score REAL DEFAULT 0,
+            total_pnl REAL DEFAULT 0,
+            trade_count INTEGER DEFAULT 0,
+            win_rate REAL DEFAULT 0,
+            active INTEGER DEFAULT 1
+        )
+        """
+    )
+    valid_wallet = "0x" + "4" * 40
+    rows = [
+        ("synthetic_edge", 0.7955, 2000, 0.998),
+        ("real_edge", 0.62, 42, 0.57),
+    ]
+    for name, score, trade_count, win_rate in rows:
+        conn.execute(
+            """
+            INSERT INTO strategies
+            (name, description, strategy_type, parameters, discovered_at,
+             last_scored, current_score, total_pnl, trade_count, win_rate, active)
+            VALUES (?, '', 'momentum_long', ?, '2026-01-01', '2026-01-02',
+                    ?, 250, ?, ?, 1)
+            """,
+            (
+                name,
+                json.dumps({"source_wallet": valid_wallet, "source_wallet_bot_score": 0}),
+                score,
+                trade_count,
+                win_rate,
+            ),
+        )
+    conn.commit()
+    conn.close()
+
+    @contextmanager
+    def _fake_connection(*, for_read=False):
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        try:
+            yield conn
+            conn.commit()
+        finally:
+            conn.close()
+
+    monkeypatch.setattr(db, "get_connection", _fake_connection)
+
+    assert [row["name"] for row in db.get_active_strategies()] == ["real_edge"]
+
+    summary = db.quarantine_contaminated_runtime_data()
+
+    assert summary["invalid_strategies"] == [
+        {"id": 1, "name": "synthetic_edge", "reason": "synthetic_placeholder_metrics"}
+    ]
+    assert [row["name"] for row in db.get_active_strategies(validated_only=False)] == ["real_edge"]
+
+
 def test_recover_valid_inactive_strategies_keeps_quarantine_guard(tmp_path, monkeypatch):
     db_path = tmp_path / "runtime.db"
     conn = sqlite3.connect(db_path)

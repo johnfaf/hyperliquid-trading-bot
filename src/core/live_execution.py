@@ -64,6 +64,65 @@ def _is_insufficient_margin_rejection(result) -> bool:
     return any("insufficient margin" in msg.lower() for msg in messages)
 
 
+def _paper_trade_id_from_live_mirror(execution, live_signal=None) -> Optional[int]:
+    """Extract the paper trade id that produced a live mirror attempt."""
+    candidates = []
+    if isinstance(execution, dict):
+        candidates.extend(
+            execution.get(key)
+            for key in ("id", "paper_trade_id", "trade_id")
+        )
+    context = getattr(live_signal, "context", None)
+    if isinstance(context, dict):
+        candidates.extend(
+            context.get(key)
+            for key in ("paper_trade_id", "trade_id", "id")
+        )
+
+    for value in candidates:
+        try:
+            trade_id = int(value)
+        except (TypeError, ValueError):
+            continue
+        if trade_id > 0:
+            return trade_id
+    return None
+
+
+def _mark_paper_trade_live_mirrored(
+    trade_id: Optional[int],
+    live_signal,
+    live_result: Dict,
+) -> None:
+    """Persist live-mirror metadata so live-mode history filters see the trade."""
+    if not trade_id:
+        return
+    if not isinstance(live_result, dict):
+        return
+
+    metadata = {
+        "live_mirror": True,
+        "live_mirror_marked_at": datetime.now(timezone.utc).isoformat(),
+        "live_mirror_status": live_result.get("status"),
+        "live_mirror_coin": getattr(live_signal, "coin", None),
+        "live_mirror_side": getattr(getattr(live_signal, "side", None), "value", None)
+        or str(getattr(live_signal, "side", "") or ""),
+    }
+    for key in ("order_id", "oid", "cloid", "client_order_id", "live_order_id"):
+        value = live_result.get(key)
+        if value not in (None, ""):
+            metadata[f"live_mirror_{key}"] = value
+
+    try:
+        db.update_paper_trade_metadata(int(trade_id), metadata)
+    except Exception as exc:
+        logger.warning(
+            "Could not mark paper trade %s as live_mirror for live history: %s",
+            trade_id,
+            exc,
+        )
+
+
 def _paper_trade_id_for_client_order_id(client_order_id: str) -> Optional[int]:
     """Return an existing paper trade id for an idempotency key, if present."""
     if not client_order_id:
@@ -710,6 +769,7 @@ def mirror_executed_trades_to_live(
                 margin = notional / leverage if leverage > 0 else notional
                 candidates.append({
                     "signal": live_signal,
+                    "paper_trade_id": _paper_trade_id_from_live_mirror(trade, live_signal),
                     "notional": notional,
                     "margin": margin,
                 })
@@ -783,6 +843,11 @@ def mirror_executed_trades_to_live(
                 # triggered the mirror.  Kill-switch and daily loss still apply.
                 live_result = trader.execute_signal(live_signal, bypass_firewall=True)
                 if live_result and live_result.get("status") not in ("error", "rejected"):
+                    _mark_paper_trade_live_mirrored(
+                        item.get("paper_trade_id"),
+                        live_signal,
+                        live_result,
+                    )
                     logger.info(
                         "%s: %s %s %s",
                         success_label,

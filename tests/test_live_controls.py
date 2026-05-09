@@ -1430,6 +1430,60 @@ def test_mirror_executed_trades_uses_account_value_without_wallet_alias():
     assert trader.executed == [("ETH", "long", True)]
 
 
+def test_mirror_executed_trades_marks_successful_paper_trade_as_live(monkeypatch):
+    class FakeLiveTrader:
+        def __init__(self):
+            self.executed = []
+
+        def is_live_enabled(self):
+            return True
+
+        def is_deployable(self):
+            return True
+
+        def get_account_value(self):
+            return 250.0
+
+        def execute_signal(self, signal, bypass_firewall=False):
+            self.executed.append((signal.coin, signal.side.value, bypass_firewall))
+            return {"status": "success", "order_id": "live-123"}
+
+    metadata_updates = []
+    monkeypatch.setattr("src.core.live_execution._rescale_size_for_live", lambda trade, _trader: trade)
+    monkeypatch.setattr(
+        "src.core.live_execution.db.update_paper_trade_metadata",
+        lambda trade_id, extra: metadata_updates.append((trade_id, extra)),
+    )
+
+    trader = FakeLiveTrader()
+    container = type("Container", (), {"live_trader": trader})()
+    executed = [
+        {
+            "id": 77,
+            "coin": "ETH",
+            "side": "long",
+            "confidence": 0.7,
+            "entry_price": 2000.0,
+            "size": 0.01,
+            "leverage": 2,
+            "strategy_type": "mirror_test",
+        }
+    ]
+
+    mirror_executed_trades_to_live(
+        container,
+        executed,
+        success_label="LIVE",
+        skip_label="SKIP",
+    )
+
+    assert trader.executed == [("ETH", "long", True)]
+    assert metadata_updates[0][0] == 77
+    assert metadata_updates[0][1]["live_mirror"] is True
+    assert metadata_updates[0][1]["live_mirror_status"] == "success"
+    assert metadata_updates[0][1]["live_mirror_order_id"] == "live-123"
+
+
 def test_mirror_executed_trades_logs_warning_for_insufficient_margin(monkeypatch, caplog):
     class FakeLiveTrader:
         def __init__(self):
