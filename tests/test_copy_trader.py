@@ -92,22 +92,52 @@ class TestApplyRegimeWeight:
         expected = 0.80 * _NEUTRAL_COPY_CONFIDENCE_MULTIPLIER
         assert abs(result["confidence"] - expected) < 0.001
 
-    def test_bullish_boosts_size_not_confidence(self):
-        # Bullish weighting now goes through regime_size_modifier so the
-        # calibrator continues to see the source's true confidence and
-        # cannot be poisoned by saturating it at 1.0.
+    def test_bullish_boosts_size_for_long_signals(self):
+        # Bullish + long signal: size up, confidence held at calibrated value.
         ct = self._make_trader()
         ct.regime_forecaster.predict_regime.return_value = {"regime": "bullish"}
-        signal = {"confidence": 0.80}
+        signal = {"side": "long", "confidence": 0.80}
         result = ct._apply_regime_weight(signal, "BTC")
         assert abs(result["confidence"] - 0.80) < 0.001
         expected_mod = _BULLISH_COPY_CONFIDENCE_MULTIPLIER  # starting from 1.0
         assert abs(result["regime_size_modifier"] - expected_mod) < 0.001
 
+    def test_bullish_does_not_boost_size_for_short_signals(self):
+        # Counter-trend short in a bullish regime: confidence is reduced and
+        # NO size boost is applied. This was a latent asymmetry bug — the
+        # old code boosted ANY copy signal's size in bullish regimes, even
+        # shorts.
+        ct = self._make_trader()
+        ct.regime_forecaster.predict_regime.return_value = {"regime": "bullish"}
+        signal = {"side": "short", "confidence": 0.80}
+        result = ct._apply_regime_weight(signal, "BTC")
+        assert "regime_size_modifier" not in result
+        assert result["confidence"] < 0.80  # de-risked, not boosted
+
+    def test_bearish_boosts_size_for_short_signals(self):
+        # The new bearish branch — symmetric mirror of bullish.
+        ct = self._make_trader()
+        ct.regime_forecaster.predict_regime.return_value = {"regime": "bearish"}
+        signal = {"side": "short", "confidence": 0.80}
+        result = ct._apply_regime_weight(signal, "BTC")
+        assert abs(result["confidence"] - 0.80) < 0.001
+        # Bearish multiplier mirrors bullish at 1.20x.
+        assert result["regime_size_modifier"] > 1.0
+        assert result["regime_size_modifier"] <= 2.0
+
+    def test_bearish_de_risks_long_signals(self):
+        # Counter-trend long in bearish regime — confidence cut.
+        ct = self._make_trader()
+        ct.regime_forecaster.predict_regime.return_value = {"regime": "bearish"}
+        signal = {"side": "long", "confidence": 0.80}
+        result = ct._apply_regime_weight(signal, "BTC")
+        assert "regime_size_modifier" not in result
+        assert result["confidence"] < 0.80
+
     def test_bullish_size_modifier_clamped(self):
         ct = self._make_trader()
         ct.regime_forecaster.predict_regime.return_value = {"regime": "bullish"}
-        signal = {"confidence": 0.95, "regime_size_modifier": 1.9}
+        signal = {"side": "long", "confidence": 0.95, "regime_size_modifier": 1.9}
         result = ct._apply_regime_weight(signal, "BTC")
         assert result["regime_size_modifier"] <= 2.0
         assert abs(result["confidence"] - 0.95) < 0.001

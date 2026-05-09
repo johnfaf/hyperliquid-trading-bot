@@ -289,7 +289,20 @@ def signal_from_execution_dict(execution: Dict[str, Any]) -> TradeSignal:
     else:
         source = SignalSource.STRATEGY
 
-    side_value = str(execution.get("side", "long")).strip().lower()
+    # Default-to-long fallback removed. The canonical execution-dict ->
+    # TradeSignal converter used to silently coerce a missing `side` to
+    # "long", which baked long bias into every malformed signal. Now we
+    # reject it loudly so upstream pipelines have to set side explicitly.
+    raw_side = str(execution.get("side", "")).strip().lower()
+    if raw_side in {"buy", "long"}:
+        side_value = "long"
+    elif raw_side in {"sell", "short"}:
+        side_value = "short"
+    else:
+        raise ValueError(
+            "signal_from_execution_dict: 'side' is required and must be one "
+            f"of long/short/buy/sell (got {execution.get('side')!r})"
+        )
     entry_price = float(execution.get("entry_price", 0.0) or 0.0)
 
     # Reconstruct RiskParams from absolute SL/TP prices when available.

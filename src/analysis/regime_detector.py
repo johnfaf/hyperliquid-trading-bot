@@ -44,19 +44,27 @@ class Regime(str, Enum):
 
 # Maps regime → which strategy types should be active
 REGIME_STRATEGY_MAP = {
+    # Equalised TRENDING_UP and TRENDING_DOWN.
+    # Previously TRENDING_UP activated 4 strategy types (incl. swing_trading)
+    # at 1.0x size, while TRENDING_DOWN activated only 3 at 0.8x size — i.e.
+    # shorts entered with a 20% size handicap and one fewer strategy
+    # contributing. That 20% handicap and the swing_trading mismatch were
+    # baked-in long bias every time the regime was directional, on top of the
+    # naturally long-leaning signal sources. Both directions now treat their
+    # mirror strategies identically. If shorts genuinely turn out riskier on
+    # the data, lower BOTH size_modifiers to 0.9 — don't reintroduce
+    # asymmetry.
     Regime.TRENDING_UP: {
         "activate": ["momentum_long", "trend_following", "breakout", "swing_trading"],
-        "pause": ["mean_reversion", "funding_arb", "delta_neutral"],
-        "size_modifier": 1.0,  # Full size
+        "pause": ["momentum_short", "mean_reversion", "funding_arb",
+                  "delta_neutral", "concentrated_bet"],
+        "size_modifier": 0.9,
     },
     Regime.TRENDING_DOWN: {
-        "activate": ["momentum_short", "trend_following", "breakout"],
-        # concentrated_bet has no fixed direction — pausing it forces regime_default
-        # (short) rather than the hard-coded "long" fallback.
-        # swing_trading longs get badly hurt in downtrends.
-        "pause": ["momentum_long", "funding_arb", "delta_neutral",
-                  "concentrated_bet", "swing_trading"],
-        "size_modifier": 0.8,  # Slightly reduced (shorts are riskier)
+        "activate": ["momentum_short", "trend_following", "breakout", "swing_trading"],
+        "pause": ["momentum_long", "mean_reversion", "funding_arb",
+                  "delta_neutral", "concentrated_bet"],
+        "size_modifier": 0.9,
     },
     Regime.RANGING: {
         "activate": ["mean_reversion", "funding_arb", "delta_neutral", "scalping",

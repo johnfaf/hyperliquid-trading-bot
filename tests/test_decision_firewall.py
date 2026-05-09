@@ -716,6 +716,114 @@ def test_firewall_blocks_shorts_when_recent_shorts_are_bad(mock_db):
 
 
 @patch("src.signals.decision_firewall.db")
+def test_firewall_blocks_longs_when_recent_longs_are_bad(mock_db):
+    """Mirror of the short-hardening blocking test. Without long_hardening,
+    the bot was running 88-90% long because losing longs faced no equivalent
+    gate. With this gate, a streak of losing longs blocks new long entries
+    the same way losing shorts have always blocked new shorts.
+    """
+    mock_db.get_open_paper_trades.return_value = []
+    mock_db.get_paper_account.return_value = {"balance": 10000}
+    mock_db.get_paper_trade_history.return_value = [
+        {"side": "long", "pnl": -0.7, "metadata": "{}"},
+        {"side": "long", "pnl": -0.4, "metadata": "{}"},
+        {"side": "long", "pnl": -0.2, "metadata": "{}"},
+        {"side": "long", "pnl": 0.1, "metadata": "{}"},
+    ]
+    mock_db.audit_log = MagicMock()
+
+    from src.signals.decision_firewall import DecisionFirewall
+
+    fw = DecisionFirewall(
+        {
+            "long_hardening_enabled": True,
+            "long_hardening_min_closed_trades": 4,
+            "long_hardening_block_win_rate": 0.35,
+            "long_hardening_block_net_pnl": -1.0,
+            "enable_predictive_derisk": False,
+            "funding_risk_enabled": False,
+        }
+    )
+    signal = MockSignal(side_val="long", confidence=0.8)
+
+    passed, reason = fw.validate(signal)
+
+    assert passed is False
+    assert "underperforming" in reason.lower()
+    assert fw.get_stats()["rejected_side_policy"] == 1
+
+
+@patch("src.signals.decision_firewall.db")
+def test_firewall_long_hardening_can_be_disabled(mock_db):
+    """Disabling long_hardening must not also disable short_hardening — and
+    a healthy long signal must pass through cleanly when the gate is off."""
+    mock_db.get_open_paper_trades.return_value = []
+    mock_db.get_paper_account.return_value = {"balance": 10000}
+    mock_db.get_paper_trade_history.return_value = [
+        {"side": "long", "pnl": -0.7, "metadata": "{}"},
+        {"side": "long", "pnl": -0.4, "metadata": "{}"},
+        {"side": "long", "pnl": -0.2, "metadata": "{}"},
+        {"side": "long", "pnl": 0.1, "metadata": "{}"},
+    ]
+    mock_db.audit_log = MagicMock()
+
+    from src.signals.decision_firewall import DecisionFirewall
+
+    fw = DecisionFirewall(
+        {
+            "long_hardening_enabled": False,
+            "enable_predictive_derisk": False,
+            "funding_risk_enabled": False,
+        }
+    )
+    signal = MockSignal(side_val="long", confidence=0.8)
+    passed, _ = fw.validate(signal)
+    assert passed is True
+
+
+@patch("src.signals.decision_firewall.db")
+def test_firewall_long_hardening_degrades_size_when_recent_longs_are_marginal(mock_db):
+    """Marginal-but-not-blocked recent longs should reduce size+confidence,
+    mirroring what short_hardening does in the degraded state."""
+    mock_db.get_open_paper_trades.return_value = []
+    mock_db.get_paper_account.return_value = {"balance": 10000}
+    # 5 trades, 2 wins -> WR 40%. Net PnL slightly negative but above
+    # block_net_pnl=-1.0. degrade_win_rate=0.48 catches this; block_win_rate=
+    # 0.35 does not.
+    mock_db.get_paper_trade_history.return_value = [
+        {"side": "long", "pnl": +0.2, "metadata": "{}"},
+        {"side": "long", "pnl": -0.3, "metadata": "{}"},
+        {"side": "long", "pnl": +0.1, "metadata": "{}"},
+        {"side": "long", "pnl": -0.2, "metadata": "{}"},
+        {"side": "long", "pnl": -0.1, "metadata": "{}"},
+    ]
+    mock_db.audit_log = MagicMock()
+
+    from src.signals.decision_firewall import DecisionFirewall
+
+    fw = DecisionFirewall(
+        {
+            "long_hardening_enabled": True,
+            "long_hardening_min_closed_trades": 4,
+            "long_hardening_degrade_win_rate": 0.48,
+            "long_hardening_block_win_rate": 0.30,
+            "long_hardening_block_net_pnl": -5.0,
+            "long_hardening_confidence_multiplier": 0.80,
+            "long_hardening_size_multiplier": 0.50,
+            "enable_predictive_derisk": False,
+            "funding_risk_enabled": False,
+        }
+    )
+    signal = MockSignal(side_val="long", confidence=0.80, size=0.2, position_pct=0.1)
+    passed, _ = fw.validate(signal)
+    assert passed is True
+    # Confidence and size halved/0.8x'd by the degrade path.
+    assert signal.confidence == pytest.approx(0.80 * 0.80)
+    assert signal.size == pytest.approx(0.2 * 0.50)
+    assert signal.position_pct == pytest.approx(0.1 * 0.50)
+
+
+@patch("src.signals.decision_firewall.db")
 def test_firewall_allows_high_confidence_shorts_in_bearish_regime(mock_db):
     mock_db.get_open_paper_trades.return_value = []
     mock_db.get_paper_account.return_value = {"balance": 10000}

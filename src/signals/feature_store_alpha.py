@@ -911,7 +911,18 @@ class FeatureStoreAlphaPipeline:
         raw_probability_up = float(np.mean([model.predict_proba(X)[0][1] for model in members]))
         calibrated_probability_up = self._calibrate_probability(horizon, raw_probability_up)
         confidence = float(max(calibrated_probability_up, 1.0 - calibrated_probability_up))
-        predicted_side = "long" if calibrated_probability_up >= 0.5 else "short"
+        # Tightened from `>= 0.5` to `> 0.55`. Calibrated probabilities of
+        # exactly 0.5 (genuine uncertainty) used to default LONG, baking in
+        # one of several long biases. The eligible-prediction gate
+        # (_prediction_eligible) already filters on confidence, but we now
+        # also leave predicted_side blank in the dead-zone so the downstream
+        # firewall doesn't see a coin-flip dressed up as a long signal.
+        if calibrated_probability_up > 0.55:
+            predicted_side = "long"
+        elif calibrated_probability_up < 0.45:
+            predicted_side = "short"
+        else:
+            predicted_side = ""
 
         metadata = self.model_metadata.get(horizon, {})
         prediction = AlphaPrediction(
@@ -925,7 +936,10 @@ class FeatureStoreAlphaPipeline:
             predicted_side=predicted_side,
             expected_return_bps=self._expected_return_bps(horizon, confidence),
             significance_pvalue=float(metadata.get("significance_pvalue", 1.0)),
-            eligible=self._prediction_eligible(horizon, confidence),
+            # A prediction in the 0.45-0.55 calibrated-probability dead-zone
+            # has no usable side; force it ineligible so downstream gates
+            # don't have to handle the empty-string side case.
+            eligible=bool(predicted_side) and self._prediction_eligible(horizon, confidence),
             model_version=str(metadata.get("model_version", "untrained")),
         )
         self._record_prediction(prediction)

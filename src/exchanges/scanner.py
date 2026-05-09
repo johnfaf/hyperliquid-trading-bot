@@ -402,17 +402,31 @@ class MultiExchangeScanner:
         Run cross-venue confirmation on a batch of signals.
         Logs detailed observability: checked, boosted, downgraded counts.
         """
+        # Default-to-long fallbacks removed. Signals without a usable
+        # direction are dropped from the pass-through result rather than
+        # being silently confirmed as a long.
+        def _norm_direction(s) -> str:
+            d = str(s.get("direction", "") or "").strip().lower()
+            if d in {"buy", "long"}:
+                return "long"
+            if d in {"sell", "short"}:
+                return "short"
+            return ""
+
         if not self.cross_venue:
             logger.info("CrossVenue: single venue mode -- no confirmation possible")
-            return [
-                CrossVenueSignal(
+            out = []
+            for s in signals:
+                d = _norm_direction(s)
+                if not d:
+                    continue
+                out.append(CrossVenueSignal(
                     coin=s.get("coin", ""),
-                    direction=s.get("direction", "long"),
+                    direction=d,
                     primary_exchange=primary_exchange,
                     primary_score=s.get("score", 0.5),
-                )
-                for s in signals
-            ]
+                ))
+            return out
 
         # Check if any secondary venue is actually healthy
         healthy = self._get_healthy_adapters()
@@ -420,15 +434,18 @@ class MultiExchangeScanner:
         if not secondary_healthy:
             logger.info(f"CrossVenue: no healthy secondary venues "
                        f"(states: {self.check_health()}) -- skipping confirmation")
-            return [
-                CrossVenueSignal(
+            out = []
+            for s in signals:
+                d = _norm_direction(s)
+                if not d:
+                    continue
+                out.append(CrossVenueSignal(
                     coin=s.get("coin", ""),
-                    direction=s.get("direction", "long"),
+                    direction=d,
                     primary_exchange=primary_exchange,
                     primary_score=s.get("score", 0.5),
-                )
-                for s in signals
-            ]
+                ))
+            return out
 
         confirmed = self.cross_venue.confirm_batch(signals, primary_exchange)
 

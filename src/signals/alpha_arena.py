@@ -995,7 +995,7 @@ class Backtester:
         side = None
         confidence = 0.0
 
-        if stype in ("momentum_long", "trend_following"):
+        if stype == "momentum_long":
             if sma_fast > sma_slow and rsi > 50 and rsi < 80:
                 side = "long"
                 momentum = (sma_fast - sma_slow) / sma_slow
@@ -1003,6 +1003,22 @@ class Backtester:
 
         elif stype == "momentum_short":
             if sma_fast < sma_slow and rsi < 50 and rsi > 20:
+                side = "short"
+                momentum = (sma_slow - sma_fast) / sma_slow
+                confidence = min(0.5 + momentum * 10, 0.95)
+
+        elif stype == "trend_following":
+            # BUG FIX: trend_following used to be bundled with momentum_long
+            # in the same branch, so it could only ever fire long. A strategy
+            # named "trend_following" must follow the trend WHICHEVER way it
+            # goes — long in uptrends, short in downtrends. Otherwise it's a
+            # disguised long-only momentum agent and contributes to the
+            # 88-90% long bias the bot was running at.
+            if sma_fast > sma_slow and rsi > 50 and rsi < 80:
+                side = "long"
+                momentum = (sma_fast - sma_slow) / sma_slow
+                confidence = min(0.5 + momentum * 10, 0.95)
+            elif sma_fast < sma_slow and rsi < 50 and rsi > 20:
                 side = "short"
                 momentum = (sma_slow - sma_fast) / sma_slow
                 confidence = min(0.5 + momentum * 10, 0.95)
@@ -1036,9 +1052,15 @@ class Backtester:
                 confidence = 0.55
 
         elif stype == "swing_trading":
+            # BUG FIX: previously only had a long branch. Symmetric mirror so
+            # swing_trading can pick the winning side of a range/trend instead
+            # of being a hidden long-only agent.
             if sma_fast > sma_slow and rsi < 60:
                 side = "long"
                 confidence = 0.55 + (60 - rsi) / 100
+            elif sma_fast < sma_slow and rsi > 40:
+                side = "short"
+                confidence = 0.55 + (rsi - 40) / 100
 
         elif stype == "lstm_direction":
             if self.lstm_agent:

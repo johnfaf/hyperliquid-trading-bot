@@ -941,15 +941,29 @@ def run_trading_cycle(container, cycle_count: int) -> None:
         # Inject Polymarket signals as synthetic strategies
         if polymarket_signals:
             for pm in polymarket_signals:
+                # Default-to-long fallbacks removed. A polymarket signal
+                # without a side is malformed and gets skipped rather than
+                # silently coerced into a long.
+                pm_raw_side = str(pm.get("side", "") or "").strip().lower()
+                if pm_raw_side in {"buy", "long"}:
+                    pm_side = "long"
+                elif pm_raw_side in {"sell", "short"}:
+                    pm_side = "short"
+                else:
+                    logger.debug(
+                        "  Polymarket: skipping signal with no side (coin=%s)",
+                        pm.get("coin", "?"),
+                    )
+                    continue
                 synthetic = {
                     "id": None,
-                    "name": f"polymarket_{pm.get('coin', 'UNK')}_{pm.get('side', '?')}",
+                    "name": f"polymarket_{pm.get('coin', 'UNK')}_{pm_side}",
                     "strategy_type": "event_driven",
                     "trader_address": "polymarket",
                     "current_score": pm.get("confidence", 0.5),
                     "confidence": pm.get("confidence", 0.5),
-                    "direction": pm.get("side", "long"),
-                    "side": pm.get("side", "long"),
+                    "direction": pm_side,
+                    "side": pm_side,
                     "source": "polymarket",
                     "parameters": {
                         "coins": [pm.get("coin", "BTC")],
@@ -1267,7 +1281,15 @@ def _run_cross_venue_confirmation(container, top_strategies):
             if isinstance(coins, str):
                 coins = [coins]
             coin = coins[0] if coins else ""
-            direction = s.get("direction", "long")
+            # Default-to-long removed. Drop strategies without a direction
+            # rather than silently confirming them as long.
+            raw_dir = str(s.get("direction", "") or s.get("side", "") or "").strip().lower()
+            if raw_dir in {"buy", "long"}:
+                direction = "long"
+            elif raw_dir in {"sell", "short"}:
+                direction = "short"
+            else:
+                continue
             score = s.get("score", 0.5)
             if coin and coin != "unknown":
                 signals_to_confirm.append({"coin": coin, "direction": direction, "score": score})
@@ -1286,9 +1308,18 @@ def _run_cross_venue_confirmation(container, top_strategies):
                 if isinstance(coins, str):
                     coins = [coins]
                 coin = coins[0] if coins else ""
-                direction = s.get("direction", "long")
-                key = f"{coin}:{direction}"
-                cv_score = confirm_map.get(key, 0.0)
+                # Same direction normalisation as the loop above. A strategy
+                # without a usable side gets cv_score=0 instead of being
+                # silently keyed as long:0:0.
+                raw_dir = str(s.get("direction", "") or s.get("side", "") or "").strip().lower()
+                if raw_dir in {"buy", "long"}:
+                    direction = "long"
+                elif raw_dir in {"sell", "short"}:
+                    direction = "short"
+                else:
+                    direction = ""
+                key = f"{coin}:{direction}" if direction else None
+                cv_score = confirm_map.get(key, 0.0) if key else 0.0
                 if "metadata" not in s:
                     s["metadata"] = {}
                 s["metadata"]["cross_venue_score"] = cv_score

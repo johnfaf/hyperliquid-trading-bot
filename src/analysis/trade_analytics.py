@@ -620,37 +620,51 @@ def compute_live_paper_drift(
     }
 
 
-def evaluate_short_side_policy(
+def _evaluate_side_policy(
     trades: Iterable[Dict],
     *,
+    side_label: str,
     min_trades: int,
     degrade_win_rate: float,
     block_win_rate: float,
     block_net_pnl: float,
 ) -> Dict:
+    """Side-agnostic implementation. ``evaluate_short_side_policy`` and
+    ``evaluate_long_side_policy`` are thin wrappers that pin ``side_label``.
+
+    The short/long-hardening machinery is now symmetric: previously only the
+    short side had a "recent N trades are losing -> block/degrade new entries"
+    gate, which combined with naturally long-leaning signal sources to push
+    the bot toward 88-90% long. Long hardening uses the same logic against
+    long history to break that asymmetry.
+    """
+    side_label = (side_label or "").strip().lower()
+    if side_label not in {"long", "short"}:
+        raise ValueError(f"side_label must be 'long' or 'short', got {side_label!r}")
+
     analytics = compute_trade_analytics(trades, source_limit=8)
-    short_row = next((row for row in analytics["by_side"] if row["label"] == "short"), None)
-    if not short_row:
+    side_row = next((row for row in analytics["by_side"] if row["label"] == side_label), None)
+    if not side_row:
         return {
             "status": "insufficient",
-            "reason": "No closed short trades yet",
+            "reason": f"No closed {side_label} trades yet",
             "metrics": {"count": 0, "win_rate": 0.0, "net_pnl": 0.0},
         }
 
-    count = int(short_row["count"])
-    win_rate = float(short_row["win_rate"])
-    net_pnl = float(short_row["net_pnl"])
+    count = int(side_row["count"])
+    win_rate = float(side_row["win_rate"])
+    net_pnl = float(side_row["net_pnl"])
     if count < int(min_trades):
         return {
             "status": "insufficient",
-            "reason": f"Need {min_trades} closed shorts before policy activates",
+            "reason": f"Need {min_trades} closed {side_label}s before policy activates",
             "metrics": {"count": count, "win_rate": win_rate, "net_pnl": net_pnl},
         }
     if win_rate < float(block_win_rate) and net_pnl <= float(block_net_pnl):
         return {
             "status": "blocked",
             "reason": (
-                f"Recent shorts are underperforming ({count} trades, "
+                f"Recent {side_label}s are underperforming ({count} trades, "
                 f"win rate {win_rate:.0%}, net {net_pnl:.2f})"
             ),
             "metrics": {"count": count, "win_rate": win_rate, "net_pnl": net_pnl},
@@ -659,7 +673,7 @@ def evaluate_short_side_policy(
         return {
             "status": "degraded",
             "reason": (
-                f"Recent shorts need caution ({count} trades, "
+                f"Recent {side_label}s need caution ({count} trades, "
                 f"win rate {win_rate:.0%}, net {net_pnl:.2f})"
             ),
             "metrics": {"count": count, "win_rate": win_rate, "net_pnl": net_pnl},
@@ -667,8 +681,44 @@ def evaluate_short_side_policy(
     return {
         "status": "healthy",
         "reason": (
-            f"Short side healthy enough ({count} trades, "
+            f"{side_label.capitalize()} side healthy enough ({count} trades, "
             f"win rate {win_rate:.0%}, net {net_pnl:.2f})"
         ),
         "metrics": {"count": count, "win_rate": win_rate, "net_pnl": net_pnl},
     }
+
+
+def evaluate_short_side_policy(
+    trades: Iterable[Dict],
+    *,
+    min_trades: int,
+    degrade_win_rate: float,
+    block_win_rate: float,
+    block_net_pnl: float,
+) -> Dict:
+    return _evaluate_side_policy(
+        trades,
+        side_label="short",
+        min_trades=min_trades,
+        degrade_win_rate=degrade_win_rate,
+        block_win_rate=block_win_rate,
+        block_net_pnl=block_net_pnl,
+    )
+
+
+def evaluate_long_side_policy(
+    trades: Iterable[Dict],
+    *,
+    min_trades: int,
+    degrade_win_rate: float,
+    block_win_rate: float,
+    block_net_pnl: float,
+) -> Dict:
+    return _evaluate_side_policy(
+        trades,
+        side_label="long",
+        min_trades=min_trades,
+        degrade_win_rate=degrade_win_rate,
+        block_win_rate=block_win_rate,
+        block_net_pnl=block_net_pnl,
+    )

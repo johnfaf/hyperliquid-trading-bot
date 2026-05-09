@@ -21,7 +21,11 @@ from datetime import datetime, timezone
 from typing import List, Dict, Optional, Tuple
 from collections import defaultdict
 
-from src.analysis.trade_analytics import evaluate_short_side_policy, evaluate_side_source_policy
+from src.analysis.trade_analytics import (
+    evaluate_long_side_policy,
+    evaluate_short_side_policy,
+    evaluate_side_source_policy,
+)
 from src.signals.signal_schema import TradeSignal
 from src.data import database as db
 
@@ -132,6 +136,35 @@ class DecisionFirewall:
         )
         self.short_hardening_coin_block_net_pnl = float(
             cfg.get("short_hardening_coin_block_net_pnl", -0.25)
+        )
+        # ── long_hardening: structural mirror of short_hardening ──
+        # Previously only the short side was gated against recent losses, which
+        # combined with naturally long-leaning signal sources (copy traders,
+        # bullish-regime size boost, alpha_arena trend_following bug, etc.)
+        # to push 88-90% of executed trades to the long side. Adding the same
+        # gate against long history breaks that asymmetry — losing longs now
+        # block/degrade new long entries the same way losing shorts do.
+        self.long_hardening_enabled = bool(cfg.get("long_hardening_enabled", True))
+        self.long_hardening_lookback_trades = max(
+            10, int(cfg.get("long_hardening_lookback_trades", 120))
+        )
+        self.long_hardening_min_closed_trades = max(
+            1, int(cfg.get("long_hardening_min_closed_trades", 12))
+        )
+        self.long_hardening_degrade_win_rate = float(
+            cfg.get("long_hardening_degrade_win_rate", 0.48)
+        )
+        self.long_hardening_block_win_rate = float(
+            cfg.get("long_hardening_block_win_rate", 0.40)
+        )
+        self.long_hardening_block_net_pnl = float(
+            cfg.get("long_hardening_block_net_pnl", -0.5)
+        )
+        self.long_hardening_confidence_multiplier = float(
+            cfg.get("long_hardening_confidence_multiplier", 0.80)
+        )
+        self.long_hardening_size_multiplier = float(
+            cfg.get("long_hardening_size_multiplier", 0.50)
         )
         self.market_side_guard_enabled = bool(
             cfg.get("market_side_guard_enabled", True)
@@ -676,6 +709,63 @@ class DecisionFirewall:
             }
         return dict((self._get_short_policy_cache().get("short") or {}))
 
+    def _get_long_policy_cache(self) -> Dict[str, object]:
+        """Mirror of _get_short_policy_cache that evaluates the long side.
+
+        Cached on the same _side_policy_cache structure under the "long" key
+        so the dual evaluation only re-fetches the trade history once per TTL.
+        """
+        now = time.time()
+        cached_ts = float(self._side_policy_cache.get("ts", 0.0) or 0.0)
+        if (
+            self._side_policy_cache.get("long")
+            and (now - cached_ts) < self._side_policy_cache_ttl_s
+        ):
+            return dict(self._side_policy_cache)
+
+        try:
+            closed = db.get_paper_trade_history(
+                limit=self.long_hardening_lookback_trades,
+                mode=db._resolve_history_mode_for_runtime(),
+            )
+            policy = evaluate_long_side_policy(
+                closed,
+                min_trades=self.long_hardening_min_closed_trades,
+                degrade_win_rate=self.long_hardening_degrade_win_rate,
+                block_win_rate=self.long_hardening_block_win_rate,
+                block_net_pnl=self.long_hardening_block_net_pnl,
+            )
+        except Exception as exc:
+            logger.debug("Long-side policy lookup failed: %s", exc)
+            closed = []
+            policy = {
+                "status": "policy_error",
+                "reason": str(exc),
+                "metrics": {"count": 0, "win_rate": 0.0, "net_pnl": 0.0},
+            }
+
+        # Update only the long slot (and ``closed`` if we actually re-fetched)
+        # so a same-cycle short-side fetch and long-side fetch share a single
+        # round-trip when both keys land in the same TTL window.
+        prev = dict(self._side_policy_cache)
+        prev["ts"] = now
+        if not prev.get("closed"):
+            prev["closed"] = list(closed or [])
+        prev["long"] = dict(policy)
+        prev.setdefault("short", prev.get("short") or {})
+        prev.setdefault("scoped", prev.get("scoped") or {})
+        self._side_policy_cache = prev
+        return dict(self._side_policy_cache)
+
+    def _get_long_side_policy(self) -> Dict:
+        if not self.long_hardening_enabled:
+            return {
+                "status": "disabled",
+                "reason": "Long hardening disabled",
+                "metrics": {"count": 0, "win_rate": 0.0, "net_pnl": 0.0},
+            }
+        return dict((self._get_long_policy_cache().get("long") or {}))
+
     def _get_scoped_short_policies(self, signal: TradeSignal) -> List[Dict]:
         if not self.short_hardening_enabled:
             return []
@@ -1016,6 +1106,55 @@ class DecisionFirewall:
             )
         return True, ""
 
+    def _apply_long_hardening(self, signal: TradeSignal) -> Tuple[bool, str]:
+        """Mirror of the short_hardening core gate against the long side.
+
+        Same block / degrade thresholds as the short side. We don't (yet)
+        replicate the short_hardening_block_override / market_adaptive /
+        scoped source+coin variants here — the core gate alone closes the
+        single biggest asymmetry that produces 88-90% long executions.
+        Operators can re-enable longs entirely via LONG_HARDENING_ENABLED=
+        false if they have an outside reason to allow losing longs.
+        """
+        if not self.long_hardening_enabled:
+            return True, ""
+
+        policy = self._get_long_side_policy()
+        status = str(policy.get("status", "") or "").strip().lower()
+
+        if status == "blocked":
+            if isinstance(getattr(signal, "context", None), dict):
+                signal.context["long_side_policy"] = {
+                    "status": status,
+                    "reason": policy.get("reason"),
+                    "metrics": policy.get("metrics", {}),
+                }
+            return False, policy.get("reason", "Long-side guardrail blocked the signal")
+
+        if status == "degraded":
+            original_confidence = float(signal.confidence)
+            signal.confidence *= self.long_hardening_confidence_multiplier
+            signal.position_pct *= self.long_hardening_size_multiplier
+            if signal.size > 0:
+                signal.size *= self.long_hardening_size_multiplier
+            if isinstance(getattr(signal, "context", None), dict):
+                signal.context["long_side_policy"] = {
+                    "status": status,
+                    "reason": policy.get("reason"),
+                    "metrics": policy.get("metrics", {}),
+                }
+            logger.warning(
+                "Long hardening de-risked %s: confidence %.0f%% -> %.0f%%, "
+                "size *= %.2f (%s)",
+                signal.coin,
+                original_confidence * 100,
+                signal.confidence * 100,
+                self.long_hardening_size_multiplier,
+                policy.get("reason", "recent long underperformance"),
+            )
+
+        return True, ""
+
     def _apply_side_policy(
         self,
         signal: TradeSignal,
@@ -1031,6 +1170,9 @@ class DecisionFirewall:
         )
         if not market_ok:
             return False, market_reason
+
+        if side_val == "long":
+            return self._apply_long_hardening(signal)
 
         if side_val != "short":
             return True, ""

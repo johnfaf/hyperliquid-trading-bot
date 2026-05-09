@@ -36,6 +36,13 @@ logger = logging.getLogger(__name__)
 _CRASH_COPY_CONFIDENCE_MULTIPLIER = 0.60
 _NEUTRAL_COPY_CONFIDENCE_MULTIPLIER = 0.70
 _BULLISH_COPY_CONFIDENCE_MULTIPLIER = 1.20
+# Mirror of the bullish boost. Previously the if/elif chain in
+# _apply_regime_weight had no `bearish` branch at all, so a confirmed
+# downtrend gave SHORT copy signals zero size advantage while LONG copy
+# signals in a bullish regime got a 1.20x size boost. Adding the symmetric
+# bearish branch removes one of the structural reasons the bot ran 88-90%
+# long.
+_BEARISH_COPY_CONFIDENCE_MULTIPLIER = 1.20
 
 # Signal confidence model — explicit baselines and caps per signal type.
 # Rationale:
@@ -314,7 +321,19 @@ class CopyTrader:
         regime_data: Optional[Dict] = None,
     ) -> tuple[float, float, Dict[str, object]]:
         price = float(signal.get("price", 0.0) or 0.0)
-        side = str(signal.get("side", "long") or "long")
+        # Default-to-long fallback removed. A copy signal without a side is
+        # malformed and should be normalised by the caller, not silently
+        # coerced to long.
+        raw_side = str(signal.get("side", "") or "").strip().lower()
+        if raw_side in {"buy", "long"}:
+            side = "long"
+        elif raw_side in {"sell", "short"}:
+            side = "short"
+        else:
+            raise ValueError(
+                "_resolve_copy_trade_risk: copy signal has no usable side "
+                f"(got {signal.get('side')!r})"
+            )
         source_trader = str(signal.get("source_trader", "") or "").strip().lower()
         trade_signal = TradeSignal(
             coin=str(signal.get("coin", "")),
@@ -635,6 +654,14 @@ class CopyTrader:
         # inflates ECE on every trade in a bullish regime. Sizing
         # captures operator intent (more aggressive when conditions
         # favour us) without corrupting the prediction signal.
+        # Side of the copy signal — used by the directional bullish/bearish
+        # branches so boosting the size only happens when the signal aligns
+        # with the regime read.
+        side_raw = str(signal.get("side", "") or "").strip().lower()
+        signal_side = "long" if side_raw in {"long", "buy"} else (
+            "short" if side_raw in {"short", "sell"} else ""
+        )
+
         if regime == "crash":
             adjusted_confidence = original_confidence * _CRASH_COPY_CONFIDENCE_MULTIPLIER
             logger.info(
@@ -650,15 +677,54 @@ class CopyTrader:
             )
             signal["confidence"] = adjusted_confidence
         elif regime == "bullish":
-            existing_mod = float(signal.get("regime_size_modifier", 1.0) or 1.0)
-            new_mod = max(0.0, min(existing_mod * _BULLISH_COPY_CONFIDENCE_MULTIPLIER, 2.0))
-            signal["regime_size_modifier"] = new_mod
-            logger.info(
-                "REGIME WEIGHT: bullish detected for %s, "
-                "boosting regime size modifier %.2fx -> %.2fx "
-                "(confidence held at %.2f to keep calibration honest)",
-                coin, existing_mod, new_mod, original_confidence,
-            )
+            # Only boost size when the signal is actually long. A short copy
+            # signal in a bullish regime should NOT get a size boost — that
+            # was the latent asymmetry that combined with mostly-long copy
+            # sources to over-allocate to longs.
+            if signal_side == "long":
+                existing_mod = float(signal.get("regime_size_modifier", 1.0) or 1.0)
+                new_mod = max(0.0, min(existing_mod * _BULLISH_COPY_CONFIDENCE_MULTIPLIER, 2.0))
+                signal["regime_size_modifier"] = new_mod
+                logger.info(
+                    "REGIME WEIGHT: bullish detected for %s, "
+                    "boosting LONG regime size modifier %.2fx -> %.2fx "
+                    "(confidence held at %.2f to keep calibration honest)",
+                    coin, existing_mod, new_mod, original_confidence,
+                )
+            elif signal_side == "short":
+                # Counter-trend short in a bullish regime — de-risk via
+                # confidence so it has to be a high-conviction signal to
+                # pass the firewall thresholds.
+                adjusted_confidence = original_confidence * _NEUTRAL_COPY_CONFIDENCE_MULTIPLIER
+                logger.info(
+                    "REGIME WEIGHT: bullish regime for %s but signal is short, "
+                    "reducing copy confidence %.2f -> %.2f (counter-trend)",
+                    coin, original_confidence, adjusted_confidence,
+                )
+                signal["confidence"] = adjusted_confidence
+        elif regime == "bearish":
+            # Symmetric mirror of the bullish branch. Without this, a confirmed
+            # downtrend gave short copy signals zero size advantage while long
+            # copy signals in bullish regimes got a 1.20x boost — one of the
+            # structural reasons the executed trade mix ran 88-90% long.
+            if signal_side == "short":
+                existing_mod = float(signal.get("regime_size_modifier", 1.0) or 1.0)
+                new_mod = max(0.0, min(existing_mod * _BEARISH_COPY_CONFIDENCE_MULTIPLIER, 2.0))
+                signal["regime_size_modifier"] = new_mod
+                logger.info(
+                    "REGIME WEIGHT: bearish detected for %s, "
+                    "boosting SHORT regime size modifier %.2fx -> %.2fx "
+                    "(confidence held at %.2f to keep calibration honest)",
+                    coin, existing_mod, new_mod, original_confidence,
+                )
+            elif signal_side == "long":
+                adjusted_confidence = original_confidence * _NEUTRAL_COPY_CONFIDENCE_MULTIPLIER
+                logger.info(
+                    "REGIME WEIGHT: bearish regime for %s but signal is long, "
+                    "reducing copy confidence %.2f -> %.2f (counter-trend)",
+                    coin, original_confidence, adjusted_confidence,
+                )
+                signal["confidence"] = adjusted_confidence
 
         return signal
 

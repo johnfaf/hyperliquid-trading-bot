@@ -314,9 +314,23 @@ class CrossVenueConfirmation:
 
         results = []
         for sig in signals:
+            # Default-to-long removed. A signal without a direction can't be
+            # cross-venue confirmed — skip rather than silently confirm a
+            # synthetic long.
+            direction = str(sig.get("direction", "") or "").strip().lower()
+            if direction in {"buy", "long"}:
+                direction = "long"
+            elif direction in {"sell", "short"}:
+                direction = "short"
+            else:
+                logger.debug(
+                    "cross_venue.confirm_signals: skipping signal with no "
+                    "direction (coin=%s)", sig.get("coin", "?"),
+                )
+                continue
             confirmed = self.confirm_signal(
                 coin=sig.get("coin", ""),
-                direction=sig.get("direction", "long"),
+                direction=direction,
                 primary_score=sig.get("score", 0.5),
                 primary_exchange=primary_exchange,
             )

@@ -7,7 +7,7 @@ import logging
 import threading
 import time
 from datetime import datetime, timedelta, timezone
-from typing import List, Dict, Optional, Tuple
+from typing import Iterable, List, Dict, Optional, Tuple
 
 import sys
 import os
@@ -107,6 +107,167 @@ def _load_seed_addresses() -> list:
 SEED_TRADER_ADDRESSES = _load_seed_addresses()
 
 
+# ─── 90-day profitability filter ────────────────────────────────
+# The hardcoded seed list above is bull-market vintage — most of those
+# addresses got onto a "successful HL trader" list during the post-2022 BTC
+# run. Survivorship bias in the seed pool produced ~80%-long copy sources,
+# which combined with regime/firewall asymmetries to push the bot to 88-90%
+# long executions. The 90-day filter promotes traders who stayed profitable
+# across multiple regimes — the kind we'd actually want to copy — and
+# demotes the rest.
+
+# Window length & profitability gate (env-overridable).
+DISCOVERY_PROFITABLE_WINDOW_DAYS = int(
+    os.environ.get("DISCOVERY_PROFITABLE_WINDOW_DAYS", 90)
+)
+# Minimum closed-trade count required before we grade a trader. Below this
+# we don't have enough data to reject them for non-profitability — they
+# pass through the filter on a "needs more data" verdict.
+DISCOVERY_PROFITABLE_MIN_TRADES = int(
+    os.environ.get("DISCOVERY_PROFITABLE_MIN_TRADES", 10)
+)
+# Minimum cumulative net PnL over the window (USD) to count as profitable.
+# Default 0 means break-even or better. Raise to require an actual edge.
+DISCOVERY_PROFITABLE_MIN_NET_PNL_USD = float(
+    os.environ.get("DISCOVERY_PROFITABLE_MIN_NET_PNL_USD", 0.0)
+)
+
+
+def evaluate_trader_profitability_window(
+    address: str,
+    *,
+    window_days: int = None,
+    min_trades: int = None,
+    min_net_pnl_usd: float = None,
+) -> Dict:
+    """Return a verdict dict on whether ``address`` was profitable over the
+    last ``window_days`` of fills.
+
+    Verdicts:
+      - "profitable":    enough trades + net PnL >= threshold
+      - "unprofitable":  enough trades + net PnL below threshold
+      - "insufficient":  fewer than ``min_trades`` closed trades in window
+      - "error":         couldn't fetch fills
+
+    Net PnL is the sum of every closing fill's ``closedPnl`` minus the sum
+    of every fill's ``fee``. This matches what the user sees on the HL
+    "trade history" export and is consistent with how the rest of the bot
+    measures realised PnL.
+    """
+    window_days = int(window_days if window_days is not None
+                       else DISCOVERY_PROFITABLE_WINDOW_DAYS)
+    min_trades = int(min_trades if min_trades is not None
+                      else DISCOVERY_PROFITABLE_MIN_TRADES)
+    min_net_pnl_usd = float(min_net_pnl_usd if min_net_pnl_usd is not None
+                              else DISCOVERY_PROFITABLE_MIN_NET_PNL_USD)
+
+    cutoff_ms = int((datetime.now(timezone.utc) - timedelta(days=window_days))
+                      .timestamp() * 1000)
+    try:
+        fills = hl.get_user_fills(address, start_time=cutoff_ms) or []
+    except Exception as exc:
+        logger.debug("profitability window fetch failed for %s: %s", address[:10], exc)
+        return {
+            "address": address, "verdict": "error", "reason": str(exc),
+            "trades": 0, "net_pnl": 0.0, "fees": 0.0,
+            "window_days": window_days,
+        }
+
+    closing = []
+    total_fees = 0.0
+    for f in fills:
+        try:
+            fee = float(f.get("fee", 0) or 0)
+        except (TypeError, ValueError):
+            fee = 0.0
+        total_fees += fee
+        # Closing trades carry a non-zero closedPnl; opens have closedPnl
+        # equal to -fee (the fee deduction). We score on closing fills only.
+        try:
+            closed_pnl = float(f.get("closedPnl", 0) or 0)
+        except (TypeError, ValueError):
+            closed_pnl = 0.0
+        # Heuristic for "this is a close, not just a fee deduction":
+        # the dir field starts with Close/>, OR closedPnl differs from -fee.
+        direction = str(f.get("dir", "") or "")
+        is_close = direction.startswith("Close") or ">" in direction or (
+            abs(closed_pnl + fee) > 1e-9
+        )
+        if is_close:
+            closing.append(closed_pnl)
+
+    n = len(closing)
+    if n < min_trades:
+        return {
+            "address": address, "verdict": "insufficient",
+            "reason": f"only {n} closed trades in last {window_days}d "
+                      f"(need {min_trades})",
+            "trades": n, "net_pnl": float(sum(closing) - total_fees),
+            "fees": total_fees, "window_days": window_days,
+        }
+
+    net_pnl = float(sum(closing) - total_fees)
+    if net_pnl >= min_net_pnl_usd:
+        return {
+            "address": address, "verdict": "profitable",
+            "reason": f"net ${net_pnl:.2f} over {n} trades "
+                      f"(>= ${min_net_pnl_usd:.2f})",
+            "trades": n, "net_pnl": net_pnl, "fees": total_fees,
+            "window_days": window_days,
+        }
+    return {
+        "address": address, "verdict": "unprofitable",
+        "reason": f"net ${net_pnl:.2f} over {n} trades "
+                  f"(< ${min_net_pnl_usd:.2f})",
+        "trades": n, "net_pnl": net_pnl, "fees": total_fees,
+        "window_days": window_days,
+    }
+
+
+def filter_profitable_addresses(
+    addresses: Iterable[str],
+    *,
+    keep_insufficient: bool = True,
+    keep_errored: bool = True,
+) -> List[str]:
+    """Apply ``evaluate_trader_profitability_window`` to each address and
+    return only the profitable ones.
+
+    By default we KEEP addresses with insufficient data or fetch errors so
+    a leaderboard scrape doesn't drop a candidate solely because their
+    fills aren't reachable yet — the bot can re-evaluate them later. Set
+    ``keep_insufficient=False`` to require concrete profitability.
+    """
+    out: List[str] = []
+    for addr in addresses:
+        verdict = evaluate_trader_profitability_window(addr)
+        v = verdict.get("verdict")
+        if v == "profitable":
+            out.append(addr)
+            logger.info(
+                "trader filter [%s]: PROFITABLE -- %s",
+                addr[:10], verdict.get("reason"),
+            )
+        elif v == "insufficient" and keep_insufficient:
+            out.append(addr)
+            logger.info(
+                "trader filter [%s]: insufficient (keeping) -- %s",
+                addr[:10], verdict.get("reason"),
+            )
+        elif v == "error" and keep_errored:
+            out.append(addr)
+            logger.debug(
+                "trader filter [%s]: error (keeping) -- %s",
+                addr[:10], verdict.get("reason"),
+            )
+        else:
+            logger.warning(
+                "trader filter [%s]: REJECTED (%s) -- %s",
+                addr[:10], v, verdict.get("reason"),
+            )
+    return out
+
+
 class TraderDiscovery:
     """Discovers and monitors top Hyperliquid traders."""
 
@@ -139,8 +300,17 @@ class TraderDiscovery:
 
         discovered = []
 
-        # Method 0: Seed addresses — always check these (never skip seeds)
-        for addr in SEED_TRADER_ADDRESSES:
+        # Method 0: Seed addresses — gated by 90-day profitability so the
+        # hardcoded bull-market vintage list doesn't perpetually inject
+        # long-biased survivors back into the candidate pool.
+        seed_filter_enabled = os.environ.get(
+            "DISCOVERY_SEED_PROFITABILITY_FILTER", "true"
+        ).strip().lower() in ("1", "true", "yes", "on")
+        if seed_filter_enabled:
+            kept_seeds = filter_profitable_addresses(SEED_TRADER_ADDRESSES)
+        else:
+            kept_seeds = list(SEED_TRADER_ADDRESSES)
+        for addr in kept_seeds:
             discovered.append({
                 "address": addr,
                 "total_pnl": 0,
@@ -148,7 +318,15 @@ class TraderDiscovery:
                 "source": "seed",
                 "metadata": {},
             })
-        logger.info(f"Added {len(SEED_TRADER_ADDRESSES)} seed trader addresses")
+        if seed_filter_enabled:
+            logger.info(
+                "Added %d/%d seed traders (90d profitability filter rejected %d)",
+                len(kept_seeds), len(SEED_TRADER_ADDRESSES),
+                len(SEED_TRADER_ADDRESSES) - len(kept_seeds),
+            )
+        else:
+            logger.info("Added %d seed trader addresses (filter disabled)",
+                        len(SEED_TRADER_ADDRESSES))
 
         # Method 1: Try the leaderboard endpoint
         leaderboard = hl.get_leaderboard()

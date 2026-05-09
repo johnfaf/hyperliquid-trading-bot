@@ -115,7 +115,14 @@ def test_macro_overlay_does_not_compound_global_trending_up_size_modifier():
 
     result = _apply_macro_regime_overlay(container, regime_data)
 
-    assert result["strategy_guidance"]["size_modifier"] == 0.70
+    # The macro overlay multiplies the regime's size_modifier by its own
+    # (see trading_cycle._apply_macro_regime_overlay line ~307). The thing
+    # this test guards against is the GLOBAL REGIME_STRATEGY_MAP being
+    # mutated as a side-effect of the per-cycle overlay — which would
+    # poison subsequent cycles.
+    assert result["strategy_guidance"]["size_modifier"] == round(
+        original_size * 0.70, 3
+    )
     assert REGIME_STRATEGY_MAP[Regime.TRENDING_UP]["size_modifier"] == original_size
 
 
@@ -149,4 +156,6 @@ def test_detector_returns_independent_strategy_guidance(monkeypatch):
     result["strategy_guidance"]["size_modifier"] = 0.0
 
     assert REGIME_STRATEGY_MAP[Regime.TRENDING_UP]["activate"]
-    assert REGIME_STRATEGY_MAP[Regime.TRENDING_UP]["size_modifier"] == 1.0
+    # Equalised with TRENDING_DOWN at 0.9x (was 1.0x); the test only cares
+    # that the source list wasn't mutated by a downstream consumer.
+    assert REGIME_STRATEGY_MAP[Regime.TRENDING_UP]["size_modifier"] == 0.9
