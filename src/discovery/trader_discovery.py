@@ -27,6 +27,14 @@ ARB_PATTERN_MAX_ABS_CLOSED_PNL = 10.0
 ARB_PATTERN_MIN_NOTIONAL_PER_LEG = 250.0
 ARB_PATTERN_MIN_MATCH_RATIO = 0.20
 ARB_PATTERN_MIN_MATCH_COUNT = 3
+HL_USER_FILLS_PAGE_CAP = 2000
+
+
+def _safe_float(value, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def _detect_leaderboard_schema(data) -> Tuple[List, Optional[str]]:
@@ -686,7 +694,19 @@ class TraderDiscovery:
             account_value=state["account_value"],
             win_rate=trade_analysis.get("win_rate", 0),
             trade_count=trade_analysis.get("total_trades", 0),
-            metadata={"last_profile": profile.get("position_analysis", {})},
+            metadata={
+                "last_profile": profile.get("position_analysis", {}),
+                "bot_score": bot_score,
+                "status": (
+                    "bot_detected"
+                    if bot_score >= float(getattr(config, "BOT_THRESHOLD", 3))
+                    else "active_candidate"
+                ),
+                "raw_fill_count": trade_analysis.get("raw_fill_count", 0),
+                "closed_trade_count": trade_analysis.get("closed_trade_count", 0),
+                "sample_is_capped": trade_analysis.get("sample_is_capped", False),
+            },
+            is_active=bot_score < float(getattr(config, "BOT_THRESHOLD", 3)),
         )
 
         return profile
@@ -757,12 +777,19 @@ class TraderDiscovery:
         """Analyze a trader's recent trade fills for performance metrics."""
         if not fills:
             return {
-                "total_trades": 0, "win_rate": 0, "total_closed_pnl": 0,
-                "avg_roi": 0, "avg_trade_size": 0, "trading_frequency": "inactive"
+                "total_trades": 0, "raw_fill_count": 0, "closed_trade_count": 0,
+                "win_rate": 0, "total_closed_pnl": 0, "profit_factor": None,
+                "avg_roi": 0, "avg_trade_size": 0, "trading_frequency": "inactive",
+                "trades_per_day": 0.0, "sample_is_capped": False,
             }
 
-        total_trades = len(fills)
-        closed_pnls = [f["closed_pnl"] for f in fills if f["closed_pnl"] != 0]
+        raw_fill_count = len(fills)
+        closed_pnls = [
+            _safe_float(f.get("closed_pnl"))
+            for f in fills
+            if _safe_float(f.get("closed_pnl")) != 0
+        ]
+        closed_trade_count = len(closed_pnls)
         winning_trades = len([p for p in closed_pnls if p > 0])
         losing_trades = len([p for p in closed_pnls if p < 0])
 
@@ -777,7 +804,7 @@ class TraderDiscovery:
             times = sorted([f["time"] for f in fills if f["time"]])
             if len(times) >= 2:
                 span_hours = (times[-1] - times[0]) / (1000 * 3600)
-                trades_per_day = total_trades / max(span_hours / 24, 1)
+                trades_per_day = raw_fill_count / max(span_hours / 24, 1)
                 if trades_per_day > 50:
                     frequency = "scalper"
                 elif trades_per_day > 10:
@@ -794,19 +821,31 @@ class TraderDiscovery:
         # Profit factor
         gross_profit = sum(p for p in closed_pnls if p > 0)
         gross_loss = abs(sum(p for p in closed_pnls if p < 0))
-        profit_factor = min(gross_profit / gross_loss, 999.0) if gross_loss > 0 else 999.0
+        # No observed losses is not proof of infinite edge. The fills endpoint
+        # is capped and can return a biased recent window, so keep PF unknown
+        # instead of manufacturing a 999.0 strategy-score booster.
+        profit_factor = gross_profit / gross_loss if gross_loss > 0 else None
 
         # Coins traded
         coins = list(set(f["coin"] for f in fills))
 
         # Average trade size
-        avg_size = sum(f["size"] * f["price"] for f in fills) / total_trades if total_trades else 0
+        avg_size = (
+            sum(_safe_float(f.get("size")) * _safe_float(f.get("price")) for f in fills)
+            / raw_fill_count
+            if raw_fill_count
+            else 0
+        )
 
         # Liquidation count
         liquidations = len([f for f in fills if f.get("is_liquidation")])
 
         return {
-            "total_trades": total_trades,
+            # Outcome count used by strategy scoring. Raw fills include opens
+            # and are hard-capped by Hyperliquid at 2000 rows.
+            "total_trades": closed_trade_count,
+            "raw_fill_count": raw_fill_count,
+            "closed_trade_count": closed_trade_count,
             "winning_trades": winning_trades,
             "losing_trades": losing_trades,
             "win_rate": win_rate,
@@ -816,9 +855,15 @@ class TraderDiscovery:
             "profit_factor": profit_factor,
             "avg_trade_size": avg_size,
             "trading_frequency": frequency,
+            "trades_per_day": trades_per_day if "trades_per_day" in locals() else 0.0,
             "coins_traded": coins,
             "liquidations": liquidations,
-            "avg_roi": total_closed_pnl / (avg_size * total_trades) if avg_size * total_trades > 0 else 0,
+            "sample_is_capped": raw_fill_count >= HL_USER_FILLS_PAGE_CAP,
+            "avg_roi": (
+                total_closed_pnl / (avg_size * closed_trade_count)
+                if avg_size * closed_trade_count > 0
+                else 0
+            ),
         }
 
     def _fast_prescreen(self, address: str) -> bool:
@@ -1250,24 +1295,22 @@ class TraderDiscovery:
         humans = [p for p in all_profiles if p.get("bot_score", 0) < BOT_THRESHOLD]
         bots = [p for p in all_profiles if p.get("bot_score", 0) >= BOT_THRESHOLD]
 
-        # If we don't have enough human traders, promote the least-bot-like bots
         profiles = humans
         promoted_bots = 0
         if len(profiles) < MIN_TRADERS and bots:
-            bots_sorted = sorted(bots, key=lambda p: p.get("bot_score", 99))
-            needed = MIN_TRADERS - len(profiles)
-            promoted = bots_sorted[:needed]
-            profiles.extend(promoted)
-            promoted_bots = len(promoted)
-            logger.info(f"Only {len(humans)} human traders found -- promoted {promoted_bots} "
-                       f"least-bot-like accounts (scores: {[p.get('bot_score',0) for p in promoted]})")
+            logger.warning(
+                "Only %d human traders found; refusing to promote %d bot-like "
+                "account(s) into the strategy pool. Fewer clean sources are "
+                "safer than learning from market-maker/scalper bots.",
+                len(humans),
+                len(bots),
+            )
 
-        # Mark high-confidence bots as inactive (score 3+, and not promoted)
-        # Lowered from 4 to 3 so ALL detected bots get persisted and skipped next cycle
-        promoted_addrs = {p["address"] for p in profiles}
+        # Mark detected bots inactive. They may stay in the DB for diagnostics,
+        # but they must not seed strategy rows.
         bots_marked = 0
         for p in bots:
-            if p["address"] not in promoted_addrs and p.get("bot_score", 0) >= BOT_THRESHOLD:
+            if p.get("bot_score", 0) >= BOT_THRESHOLD:
                 db.upsert_trader(
                     address=p["address"],
                     total_pnl=0, roi_pct=0,

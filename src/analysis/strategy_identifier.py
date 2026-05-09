@@ -77,6 +77,17 @@ def _estimate_sharpe(metrics: Dict) -> float:
     return round(max(-3.0, min(5.0, raw_sharpe)), 3)  # clamp to [-3, 5]
 
 
+def _profit_factor_confidence_value(value) -> float:
+    """Return a bounded PF contribution for confidence formulas."""
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if parsed <= 0:
+        return 0.0
+    return min(parsed, 5.0)
+
+
 # ─── Strategy Types ────────────────────────────────────────────
 
 STRATEGY_TYPES = {
@@ -308,8 +319,9 @@ class StrategyIdentifier:
         avg_lev = pos_analysis.get("avg_leverage", 1)
 
         if frequency in ("swing_trader", "position_trader") and 1 < avg_lev < 10:
+            pf = _profit_factor_confidence_value(trade_analysis.get("profit_factor"))
             confidence = min(0.85, 0.4 + trade_analysis.get("win_rate", 0) * 0.3 +
-                           (trade_analysis.get("profit_factor", 1) / 5) * 0.2)
+                           (pf / 5) * 0.2)
             return {
                 "type": "swing_trading",
                 "description": STRATEGY_TYPES["swing_trading"],
@@ -437,7 +449,7 @@ class StrategyIdentifier:
                         trend_aligned += 1
 
         if len(positions) > 0 and trend_aligned / len(positions) > 0.6:
-            pf = trade_analysis.get("profit_factor", 1)
+            pf = _profit_factor_confidence_value(trade_analysis.get("profit_factor"))
             confidence = min(0.8, 0.3 + (trend_aligned / len(positions)) * 0.3 +
                            min(pf / 5, 0.2))
             return {

@@ -7,6 +7,7 @@ API-intensive (~3000+ calls) — not needed every trading cycle.
 
 Extracted from ``HyperliquidResearchBot._run_discovery``.
 """
+import json
 import logging
 import time
 
@@ -60,6 +61,16 @@ def run_discovery(container) -> None:
                     continue
                 state = hl.get_user_state(address)
                 if state:
+                    try:
+                        trader_meta = json.loads(trader.get("metadata") or "{}")
+                        if not isinstance(trader_meta, dict):
+                            trader_meta = {}
+                    except Exception:
+                        trader_meta = {}
+                    try:
+                        bot_score = float(trader_meta.get("bot_score", 0) or 0)
+                    except (TypeError, ValueError):
+                        bot_score = 0.0
                     # ★ H27 FIX: previously injected ``profit_factor: 1.5`` as
                     # a hard-coded constant for every newly-identified
                     # strategy.  That credited every trader with a synthetic
@@ -73,12 +84,16 @@ def run_discovery(container) -> None:
                         "address": address,
                         "positions": state["positions"],
                         "position_analysis": container.discovery._analyze_positions(state["positions"]),
+                        "bot_score": bot_score,
                         "trade_analysis": {
                             "total_trades": trader["trade_count"],
                             "win_rate": trader["win_rate"],
                             "total_closed_pnl": trader["total_pnl"],
                             "trading_frequency": "unknown",
                             "profit_factor": None,
+                            "raw_fill_count": trader_meta.get("raw_fill_count", 0),
+                            "closed_trade_count": trader_meta.get("closed_trade_count", trader["trade_count"]),
+                            "sample_is_capped": trader_meta.get("sample_is_capped", False),
                             "coins_traded": [
                                 p["coin"] for p in state["positions"] if p["size"] > 0
                             ],
