@@ -70,13 +70,16 @@ def _count_paper_trades_to_delete(cutoff_iso: str) -> int:
 
 
 def _count_strategies_to_delete(cutoff_iso: str) -> int:
+    # Schema fix: the canonical strategies table (migrations/0001) has
+    # ``discovered_at`` and ``last_scored`` — not ``updated_at``. Use
+    # last_scored as the freshness indicator, fall back to discovered_at.
     with db.get_connection(for_read=True) as conn:
         row = conn.execute(
             """
             SELECT COUNT(*) AS c FROM strategies
             WHERE COALESCE(active, 0) = 0
-              AND COALESCE(NULLIF(updated_at, ''), discovered_at) IS NOT NULL
-              AND COALESCE(NULLIF(updated_at, ''), discovered_at) < ?
+              AND COALESCE(last_scored, discovered_at) IS NOT NULL
+              AND COALESCE(last_scored, discovered_at) < ?
             """,
             (cutoff_iso,),
         ).fetchone()
@@ -106,8 +109,8 @@ def _delete_inactive_strategies(cutoff_iso: str) -> int:
             """
             DELETE FROM strategies
             WHERE COALESCE(active, 0) = 0
-              AND COALESCE(NULLIF(updated_at, ''), discovered_at) IS NOT NULL
-              AND COALESCE(NULLIF(updated_at, ''), discovered_at) < ?
+              AND COALESCE(last_scored, discovered_at) IS NOT NULL
+              AND COALESCE(last_scored, discovered_at) < ?
             """,
             (cutoff_iso,),
         )

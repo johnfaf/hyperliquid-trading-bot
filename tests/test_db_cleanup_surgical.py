@@ -46,7 +46,7 @@ def _seed_test_db(conn: sqlite3.Connection) -> None:
             current_score REAL DEFAULT 0,
             active INTEGER DEFAULT 1,
             discovered_at TEXT,
-            updated_at TEXT
+            last_scored TEXT
         )
         """
     )
@@ -71,7 +71,7 @@ def _seed_test_db(conn: sqlite3.Connection) -> None:
     )
     conn.executemany(
         """
-        INSERT INTO strategies (name, strategy_type, active, discovered_at, updated_at)
+        INSERT INTO strategies (name, strategy_type, active, discovered_at, last_scored)
         VALUES (?, ?, ?, ?, ?)
         """,
         [
