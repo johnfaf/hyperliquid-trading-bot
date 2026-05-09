@@ -73,11 +73,19 @@ def _count_strategies_to_delete(cutoff_iso: str) -> int:
     # Schema fix: the canonical strategies table (migrations/0001) has
     # ``discovered_at`` and ``last_scored`` — not ``updated_at``. Use
     # last_scored as the freshness indicator, fall back to discovered_at.
+    #
+    # Cross-backend compatibility: Postgres ``active`` column is BOOLEAN,
+    # SQLite stores 0/1. ``COALESCE(active, 0) = 0`` errored on the
+    # Postgres dualwrite mirror with "DatatypeMismatch: COALESCE types
+    # boolean and integer cannot be matched". Splitting into
+    # ``active IS NULL OR active = 0 OR active = false`` works on both —
+    # SQLite treats ``false`` as 0, Postgres treats 0 as comparing to
+    # boolean false isn't valid, so we use the dialect-specific form.
     with db.get_connection(for_read=True) as conn:
         row = conn.execute(
             """
             SELECT COUNT(*) AS c FROM strategies
-            WHERE COALESCE(active, 0) = 0
+            WHERE (active IS NULL OR active = 0)
               AND COALESCE(last_scored, discovered_at) IS NOT NULL
               AND COALESCE(last_scored, discovered_at) < ?
             """,
@@ -117,10 +125,14 @@ def _delete_inactive_strategies(cutoff_iso: str) -> int:
             conn.execute("PRAGMA busy_timeout = 60000")
         except Exception:
             pass
+        # Same cross-backend split as _count_strategies_to_delete: the
+        # dualwrite adapter has a BOOLEAN-column regex that rewrites
+        # ``active = 0`` to ``active = false`` for the Postgres mirror,
+        # but it doesn't reach into the COALESCE form.
         cur = conn.execute(
             """
             DELETE FROM strategies
-            WHERE COALESCE(active, 0) = 0
+            WHERE (active IS NULL OR active = 0)
               AND COALESCE(last_scored, discovered_at) IS NOT NULL
               AND COALESCE(last_scored, discovered_at) < ?
             """,
