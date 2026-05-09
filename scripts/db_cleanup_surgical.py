@@ -92,7 +92,15 @@ def _count_strategies_to_delete(cutoff_iso: str) -> int:
 
 
 def _delete_paper_trades(cutoff_iso: str) -> int:
+    # PRAGMA busy_timeout = 60s: the running bot has the SQLite file open
+    # and writes constantly (every cycle). Default 5s timeout fails under
+    # contention. 60s is enough to catch one of the bot's idle gaps. The
+    # delete itself is atomic so a partial rollback is impossible.
     with db.get_connection() as conn:
+        try:
+            conn.execute("PRAGMA busy_timeout = 60000")
+        except Exception:
+            pass
         cur = conn.execute(
             """
             DELETE FROM paper_trades
@@ -105,6 +113,10 @@ def _delete_paper_trades(cutoff_iso: str) -> int:
 
 def _delete_inactive_strategies(cutoff_iso: str) -> int:
     with db.get_connection() as conn:
+        try:
+            conn.execute("PRAGMA busy_timeout = 60000")
+        except Exception:
+            pass
         cur = conn.execute(
             """
             DELETE FROM strategies
