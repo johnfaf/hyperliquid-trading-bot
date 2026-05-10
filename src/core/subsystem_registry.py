@@ -323,6 +323,7 @@ def build_subsystems(
                 lambda: XGBoostRegimeForecaster({
                     "model_path": getattr(_cfg, "XGBOOST_MODEL_PATH", "models/regime_xgboost.json"),
                     "retrain_interval": getattr(_cfg, "XGBOOST_RETRAIN_INTERVAL", 86400),
+                    "synthetic_max_confidence": getattr(_cfg, "XGBOOST_SYNTHETIC_MAX_CONFIDENCE", 0.45),
                     "source_registry": c.data_source_registry,
                 }),
                 health,
@@ -681,7 +682,14 @@ def build_subsystems(
         from src.exchanges.scanner import MultiExchangeScanner
         c.multi_scanner = _safe_init(
             "multi_scanner",
-            lambda: MultiExchangeScanner(config={"lighter_enabled": config.LIGHTER_ENABLED}),
+            lambda: MultiExchangeScanner(
+                config={
+                    "lighter_enabled": config.LIGHTER_ENABLED,
+                    "lighter_strategy_injection_enabled": getattr(
+                        config, "LIGHTER_STRATEGY_INJECTION_ENABLED", False
+                    ),
+                }
+            ),
             health,
         )
 

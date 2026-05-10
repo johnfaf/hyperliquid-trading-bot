@@ -70,6 +70,17 @@ def run_reporting(container, cycle_count: int, health_registry=None) -> None:
                 f"{shadow_summary['avg_win_rate']:.0%}",
                 shadow_summary.get("best_source", "N/A"),
             )
+            if (
+                int(shadow_summary.get("total_trades", 0) or 0) >= 30
+                and float(shadow_summary.get("total_pnl", 0.0) or 0.0) < 0
+                and float(shadow_summary.get("avg_win_rate", 0.0) or 0.0) < 0.45
+            ):
+                logger.warning(
+                    "  ShadowTracker degraded: negative 30d shadow edge "
+                    "(PnL=$%.2f, WR=%.0f%%). Review/pause weak copy sources.",
+                    float(shadow_summary.get("total_pnl", 0.0) or 0.0),
+                    float(shadow_summary.get("avg_win_rate", 0.0) or 0.0) * 100,
+                )
     except Exception:
         pass
     try:
@@ -183,7 +194,8 @@ def _log_module_stats(container):
     """Log V2.5+ module statistics."""
     _safe_stat("LCRS", lambda: (
         container.liquidation_strategy and
-        _fmt("setups_detected={setups_detected}, signals={signals_generated}",
+        _fmt("setups_detected={setups_detected}, signals={signals_generated}, "
+             "oi_spike={oi_spike_threshold:.3f}, funding_long={funding_extreme_long:.4f}",
              container.liquidation_strategy.get_stats())
     ))
     _safe_stat("Kelly", lambda: (
@@ -216,7 +228,7 @@ def _log_module_stats(container):
     ))
     _safe_stat("DecisionEngine", lambda: (
         container.decision_engine and
-        _fmt("decisions={total_decisions}, executions={total_executions}",
+        _fmt("decisions={total_decisions}, prescreened_candidates={total_prescreened_candidates}",
              container.decision_engine.get_stats())
     ))
     _safe_stat("MultiExchange", lambda: (
@@ -281,9 +293,12 @@ def _fmt_calibration(cal):
 
 
 def _fmt_multi(stats):
+    injection_state = "on" if stats.get("lighter_strategy_injection_enabled") else "off"
     return (
         f"{stats['venue_count']} venues ({', '.join(stats['venues'])}), "
         f"{stats.get('health_check_count', 0)} health checks, "
         f"{stats.get('funding_scan_count', 0)} funding scans, "
-        f"{stats['scan_count']} discovery scans, {stats['cached_traders']} cached"
+        f"{stats['scan_count']} discovery scans, {stats['cached_traders']} cached, "
+        f"lighter_injected={stats.get('lighter_injected_strategy_count', 0)} "
+        f"(injection={injection_state})"
     )

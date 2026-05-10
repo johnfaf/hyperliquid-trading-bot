@@ -373,8 +373,11 @@ class AgentScorer:
             if trader_address:
                 return f"{source}:{trader_address}"
             return source
-        if stype:
+        stype = str(stype or "").strip().lower()
+        if stype and stype != "unknown":
             return f"{source}:{stype}"
+        if source == "strategy":
+            return "strategy:untagged"
         return source
 
     def get_all_scores(self) -> List[Dict]:

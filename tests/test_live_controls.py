@@ -1075,6 +1075,75 @@ def test_verify_fill_uses_position_delta_not_total_position(monkeypatch):
     assert trader.verify_fill("ETH", "buy", 0.1, blocking=False, baseline_position_size=0.5) is None
 
 
+def test_same_side_add_protects_new_delta_not_total_position(monkeypatch):
+    class FakeFirewall:
+        def validate(self, signal, **kwargs):
+            return True, "ok"
+
+    protected_sizes = []
+
+    monkeypatch.setattr(LiveTrader, "_load_credentials", _fake_live_credentials)
+    monkeypatch.setattr(LiveTrader, "_load_asset_index_map", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "reconcile_positions", lambda self: None)
+    monkeypatch.setattr(
+        LiveTrader,
+        "get_positions",
+        lambda self, **kw: [{"coin": "ETH", "szi": 0.25, "entryPx": 1900.0}],
+    )
+    monkeypatch.setattr(
+        LiveTrader,
+        "get_firewall_positions",
+        lambda self: [{"coin": "ETH", "szi": 0.25, "entryPx": 1900.0}],
+    )
+    monkeypatch.setattr(LiveTrader, "get_account_value", lambda self: 5000.0)
+    monkeypatch.setattr(LiveTrader, "_get_mid_price", lambda self, coin: 2000.0)
+    monkeypatch.setattr(LiveTrader, "update_daily_pnl_from_fills", lambda self: None)
+    monkeypatch.setattr(
+        LiveTrader,
+        "_place_entry_order",
+        lambda self, coin, side, size, leverage, baseline_position_size=0.0: {
+            "status": "success",
+            "submitted_size": 0.005,
+            "exchange_reported_fill_size": 0.005,
+            "exchange_reported_fill_price": 2000.0,
+        },
+    )
+    monkeypatch.setattr(
+        LiveTrader,
+        "verify_fill",
+        lambda self, *args, **kwargs: {
+            "status": "verified",
+            "size": 0.005,
+            "position_size": 0.255,
+            "position_delta": 0.005,
+            "entry_price": 2000.0,
+        },
+    )
+
+    def fake_protect(self, coin, close_side, size, sl_price, tp_price):
+        protected_sizes.append(size)
+        return {"status": "success"}, {"status": "success"}, 1
+
+    monkeypatch.setattr(LiveTrader, "_place_protective_orders_with_retries", fake_protect)
+
+    trader = LiveTrader(firewall=FakeFirewall(), dry_run=False, max_order_usd=100.0)
+    result = trader.execute_signal(
+        {
+            "coin": "ETH",
+            "side": "long",
+            "confidence": 0.90,
+            "entry_price": 2000.0,
+            "position_pct": 0.01,
+            "leverage": 2,
+            "size": 0.005,
+            "strategy_type": "momentum_long",
+        }
+    )
+
+    assert result["status"] == "success"
+    assert protected_sizes == [0.005]
+
+
 def test_cancel_all_orders_uses_hyperliquid_oid_fallback(monkeypatch):
     class FakeFirewall:
         def validate(self, signal, **kwargs):
@@ -2140,6 +2209,59 @@ def test_process_closed_trades_skips_synthetic_reconciliation():
     assert container.arena.calls == []
     assert container.kelly_sizer.calls == []
     assert container.agent_scorer.calls == []
+
+
+def test_process_closed_trades_uses_copy_source_key_for_agent_scorer():
+    class FakeAgentScorer:
+        def __init__(self):
+            self.calls = []
+
+        def record_outcome(self, *args):
+            self.calls.append(args)
+
+    class FakeKelly:
+        def __init__(self):
+            self.calls = []
+
+        def record_outcome(self, **kwargs):
+            self.calls.append(kwargs)
+
+    container = type(
+        "Container",
+        (),
+        {
+            "arena": None,
+            "kelly_sizer": FakeKelly(),
+            "agent_scorer": FakeAgentScorer(),
+            "shadow_tracker": None,
+        },
+    )()
+
+    _process_closed_trades(
+        container,
+        [
+            {
+                "trade_id": 8,
+                "coin": "BTC",
+                "side": "long",
+                "entry_price": 80000.0,
+                "exit_price": 80100.0,
+                "size": 0.001,
+                "leverage": 5,
+                "pnl": 0.5,
+                "strategy_type": "unknown",
+                "trader_address": "0xabc123",
+                "metadata": {
+                    "source": "copy_trade",
+                    "source_trader": "0xabc123",
+                    "signal_id": "sig-1",
+                },
+            }
+        ],
+    )
+
+    assert container.agent_scorer.calls[0][0] == "copy_trade:0xabc123"
+    assert container.kelly_sizer.calls[0]["strategy_key"] == "copy_trade:0xabc123"
 
 
 def test_firewall_uses_explicit_live_positions_without_falling_back(monkeypatch):

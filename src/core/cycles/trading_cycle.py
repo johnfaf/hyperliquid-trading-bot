@@ -1157,6 +1157,11 @@ def _run_multi_exchange_scan(container):
                     min_volume_usd=float(getattr(config, "LIGHTER_STRATEGY_MIN_VOLUME_USD", 10_000.0)),
                 )
                 logger.info("  Lighter strategy injection: %s", injected)
+            elif "lighter" in getattr(container.multi_scanner, "adapters", {}):
+                logger.info(
+                    "  Lighter strategy injection disabled "
+                    "(LIGHTER_STRATEGY_INJECTION_ENABLED=false)"
+                )
             cross_venue_data = {
                 "health": venue_health,
                 "common_markets": common_markets,
@@ -1694,9 +1699,39 @@ def _process_closed_trades(container, closed):
     for c_trade in closed:
         try:
             meta = c_trade.get("metadata") or {}
+            if isinstance(meta, str):
+                try:
+                    import json as _json
+                    meta = _json.loads(meta or "{}")
+                except (ValueError, TypeError):
+                    meta = {}
             if meta.get("synthetic_reconciliation") or c_trade.get("reason") == "live_reconciled_closed":
                 continue
-            stype = c_trade.get("strategy_type", "unknown")
+            stype = str(
+                c_trade.get("strategy_type")
+                or meta.get("strategy_type")
+                or ""
+            ).strip().lower()
+            if not stype:
+                stype = "unknown"
+            source = str(meta.get("source") or c_trade.get("source") or "").strip().lower()
+            trader = str(
+                meta.get("source_trader")
+                or meta.get("trader_address")
+                or c_trade.get("source_trader")
+                or c_trade.get("trader_address")
+                or ""
+            ).strip().lower()
+            source_key = str(meta.get("source_key") or "").strip().lower()
+            if not source_key:
+                if source == "copy_trade":
+                    source_key = f"copy_trade:{trader}" if trader else "copy_trade:untagged"
+                elif source:
+                    source_key = source if stype == "unknown" else f"{source}:{stype}"
+                elif stype != "unknown":
+                    source_key = f"strategy:{stype}"
+                else:
+                    source_key = "strategy:untagged"
             pnl = c_trade.get("pnl", 0)
             entry = c_trade.get("entry_price", 1)
             size = c_trade.get("size", 0)
@@ -1722,9 +1757,8 @@ def _process_closed_trades(container, closed):
             if container.kelly_sizer:
                 try:
                     # Use strategy_type as key; copy trades get source-specific key
-                    source = meta.get("source", "")
                     if source == "copy_trade":
-                        kelly_key = f"copy_trade:{c_trade.get('trader_address', 'unknown')}"
+                        kelly_key = source_key
                     elif source == "options_flow":
                         kelly_key = f"options_flow:{c_trade.get('coin', 'UNK')}"
                     else:
@@ -1742,9 +1776,7 @@ def _process_closed_trades(container, closed):
             # AgentScorer outcome
             if container.agent_scorer:
                 try:
-                    meta = c_trade.get("metadata") or {}
                     signal_id = meta.get("signal_id", "")
-                    source_key = f"strategy:{stype}"
                     if signal_id:
                         container.agent_scorer.record_outcome(source_key, signal_id, pnl, return_pct)
                 except Exception:
@@ -1763,8 +1795,11 @@ def _run_alpha_arena(container, regime_data):
         container.arena.run_cycle(historical_candles=arena_candle_map)
         stats = container.arena.get_stats()
         logger.info(
-            "  Arena: %d active, %d champions, PnL=$%.2f",
-            stats["active_agents"], stats["champions"], stats["total_arena_pnl"],
+            "  Arena: %d active, %d champions, %d signal-qualified, PnL=$%.2f",
+            stats["active_agents"],
+            stats["champions"],
+            stats.get("qualified_signal_agents", 0),
+            stats["total_arena_pnl"],
         )
 
         # Champion signals → paper trading

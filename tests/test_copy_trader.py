@@ -134,6 +134,34 @@ class TestApplyRegimeWeight:
         assert "regime_size_modifier" not in result
         assert result["confidence"] < 0.80
 
+    def test_detector_countertrend_block_beats_copy_signal(self):
+        ct = self._make_trader()
+        ct.regime_forecaster.predict_regime.return_value = {"regime": "bullish", "confidence": 0.99}
+        signal = {"side": "long", "confidence": 0.80}
+        result = ct._apply_regime_weight(
+            signal,
+            "BTC",
+            regime_data={
+                "overall_regime": "trending_down",
+                "overall_confidence": 0.72,
+            },
+        )
+        assert result["regime_block_reason"] == "detector_trending_down_blocks_long"
+
+    def test_synthetic_regime_caps_but_does_not_block(self):
+        ct = self._make_trader()
+        ct.regime_forecaster.predict_regime.return_value = {
+            "regime": "crash",
+            "confidence": 0.90,
+            "training_source": "synthetic",
+            "synthetic_warm_start": True,
+        }
+        signal = {"side": "long", "confidence": 0.80}
+        result = ct._apply_regime_weight(signal, "BTC")
+        assert "regime_block_reason" not in result
+        assert result["confidence"] == 0.50
+        assert result["regime_data_quality"] == "synthetic_warm_start"
+
     def test_bullish_size_modifier_clamped(self):
         ct = self._make_trader()
         ct.regime_forecaster.predict_regime.return_value = {"regime": "bullish"}

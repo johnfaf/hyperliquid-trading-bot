@@ -213,6 +213,27 @@ def test_on_close_inactive_with_active_positions_reconnects_quickly(caplog):
     assert "refreshing subscription" in caplog.text.lower()
 
 
+def test_repeated_inactive_active_stream_uses_rest_fallback_window(caplog):
+    monitor = PositionMonitor()
+    monitor._running = True
+    monitor._inactive_active_reconnect_s = 6.0
+    monitor._inactive_active_rest_only_after = 2
+    monitor._inactive_active_rest_only_s = 120.0
+    monitor._active_position_addresses = {"0x" + "4" * 40}
+
+    monitor._on_close(None, None, "Inactive")
+    _wait, _reason = monitor._consume_reconnect_wait()
+
+    with caplog.at_level(logging.INFO):
+        monitor._on_close(None, None, "Inactive")
+
+    wait, reason = monitor._consume_reconnect_wait()
+    assert wait == 120.0
+    assert reason == "inactive userEvents stream"
+    assert monitor.get_stats()["transport_mode"] == "rest_only"
+    assert "parking websocket" in caplog.text.lower()
+
+
 def test_note_disconnect_preserves_backoff_for_short_lived_flaps(monkeypatch):
     monitor = PositionMonitor()
     monitor._connected = True

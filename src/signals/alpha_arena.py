@@ -1914,6 +1914,16 @@ class AlphaArena:
         """Get arena summary stats."""
         agents = list(self.agents.values())
         active = [a for a in agents if a.status != AgentStatus.ELIMINATED]
+        min_fitness = float(getattr(config, "ARENA_CHAMPION_MIN_FITNESS", 0.15))
+        min_trades = int(getattr(config, "ARENA_CHAMPION_MIN_TRADES", 5))
+        min_win_rate = float(getattr(config, "ARENA_CHAMPION_MIN_WIN_RATE", 0.45))
+        qualified_signal_agents = [
+            a for a in active
+            if a.status in (AgentStatus.CHAMPION, AgentStatus.ACTIVE)
+            and a.fitness_score >= min_fitness
+            and a.total_trades >= min_trades
+            and a.win_rate >= min_win_rate
+        ]
 
         return {
             "total_agents": len(agents),
@@ -1926,6 +1936,10 @@ class AlphaArena:
             "total_rounds": self.tournament.round_count,
             "max_elo": max((a.elo_rating for a in active), default=0),
             "avg_fitness": np.mean([a.fitness_score for a in active]) if active else 0,
+            "qualified_signal_agents": len(qualified_signal_agents),
+            "min_signal_fitness": min_fitness,
+            "min_signal_trades": min_trades,
+            "min_signal_win_rate": min_win_rate,
             "total_arena_pnl": sum(a.total_pnl for a in active),
             "total_backtest_pnl": sum(a.backtest_pnl for a in active),
             "total_backtest_trades": sum(a.backtest_trades for a in active),

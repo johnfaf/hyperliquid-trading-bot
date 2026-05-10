@@ -593,6 +593,9 @@ class MultiExchangeScanner:
             "funding_scan_count": self._funding_scan_count,
             "cached_traders": len(self._trader_cache),
             "lighter_injected_strategy_count": self._injected_strategy_count,
+            "lighter_strategy_injection_enabled": bool(
+                self.config.get("lighter_strategy_injection_enabled", False)
+            ),
         }
 
         # Per-venue stats with health state

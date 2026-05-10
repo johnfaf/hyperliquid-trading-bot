@@ -217,6 +217,14 @@ class PositionMonitor:
             1.0,
             float(getattr(config, "POSITION_MONITOR_INACTIVE_ACTIVE_RECONNECT_S", 10.0)),
         )
+        self._inactive_active_rest_only_after = max(
+            1,
+            int(getattr(config, "POSITION_MONITOR_INACTIVE_ACTIVE_REST_ONLY_AFTER", 2)),
+        )
+        self._inactive_active_rest_only_s = max(
+            self._inactive_active_reconnect_s,
+            float(getattr(config, "POSITION_MONITOR_INACTIVE_ACTIVE_REST_ONLY_S", 120.0)),
+        )
         self._rest_fallback_thread = None
         self._reconnect_delay_override_s: Optional[float] = None
         self._reconnect_reason: Optional[str] = None
@@ -224,6 +232,7 @@ class PositionMonitor:
         # disconnects with "Inactive" after ~60s.  Track consecutive
         # empty-bootstrap reconnects so we can extend the delay.
         self._consecutive_empty_reconnects: int = 0
+        self._consecutive_inactive_active_closes: int = 0
         self._IDLE_RECONNECT_CAP_S: float = 300.0  # 5 min when no positions
 
     def start(self, addresses: List[str]) -> None:
@@ -529,11 +538,33 @@ class PositionMonitor:
         with self._lock:
             has_active_positions = self._has_active_cached_positions_locked()
             if has_active_positions:
-                self._transport_mode = "reconnecting"
-                self._transport_reason = reason
-                self._rest_only_until_ts = 0.0
+                self._consecutive_inactive_active_closes += 1
+                active_inactive_count = self._consecutive_inactive_active_closes
+                if active_inactive_count >= self._inactive_active_rest_only_after:
+                    self._transport_mode = "rest_only"
+                    self._transport_reason = reason
+                    self._rest_only_until_ts = time.time() + self._inactive_active_rest_only_s
+                else:
+                    self._transport_mode = "reconnecting"
+                    self._transport_reason = reason
+                    self._rest_only_until_ts = 0.0
+            else:
+                active_inactive_count = 0
 
         if has_active_positions:
+            if active_inactive_count >= self._inactive_active_rest_only_after:
+                self._request_fast_reconnect(
+                    reason,
+                    delay_s=self._inactive_active_rest_only_s,
+                    wake=False,
+                )
+                logger.info(
+                    "PositionMonitor inactive active stream repeated %d time(s); "
+                    "parking WebSocket for %.1fs while REST fallback monitors positions",
+                    active_inactive_count,
+                    self._inactive_active_rest_only_s,
+                )
+                return
             self._request_fast_reconnect(
                 reason,
                 delay_s=self._inactive_active_reconnect_s,
@@ -621,6 +652,7 @@ class PositionMonitor:
             self._connected_since = now
             self._last_msg_time = now
             self._last_ws_activity_time = now
+            self._consecutive_inactive_active_closes = 0
             self._watchdog_grace_until = now + self._watchdog_startup_grace_s
             self._transport_mode = "websocket"
             self._transport_reason = "connected"

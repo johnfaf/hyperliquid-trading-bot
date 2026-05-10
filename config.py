@@ -1111,6 +1111,9 @@ XGBOOST_MODEL_PATH = "models/regime_xgboost.json"
 XGBOOST_CRASH_THRESHOLD = float(os.environ.get("XGBOOST_CRASH_THRESHOLD", -0.18))
 XGBOOST_MIN_CONFIDENCE = float(os.environ.get("XGBOOST_MIN_CONFIDENCE", 0.52))
 XGBOOST_RETRAIN_INTERVAL = int(os.environ.get("XGBOOST_RETRAIN_INTERVAL", 86400))  # 24h walk-forward
+XGBOOST_SYNTHETIC_MAX_CONFIDENCE = _safe_env_float(
+    "XGB_SYNTHETIC_MAX_CONFIDENCE", 0.45, lo=0.0, hi=0.60,
+)
 # Forward-return labeler: turns past predictions into observed training labels
 # by inspecting price moves over a forward window. Without this, the model
 # only ever sees synthetic warm-start data (source=synthetic in logs).
@@ -1192,10 +1195,10 @@ FUNDING_POSITIVE_THRESHOLD = float(os.environ.get("FUNDING_POSITIVE_THRESHOLD", 
 # ─── Polymarket Integration ──────────────────────────────────
 POLYMARKET_ENABLED = os.environ.get("POLYMARKET_ENABLED", "true").lower() in ("true", "1", "yes")
 POLYMARKET_SCAN_INTERVAL = int(os.environ.get("POLYMARKET_SCAN_INTERVAL", 180))  # 3 minutes
-POLYMARKET_MIN_VOLUME = float(os.environ.get("POLYMARKET_MIN_VOLUME", 10000))    # $10k min volume
+POLYMARKET_MIN_VOLUME = float(os.environ.get("POLYMARKET_MIN_VOLUME", 5000))    # $5k min volume
 POLYMARKET_MIN_LIQUIDITY = float(
-    os.environ.get("POLYMARKET_MIN_LIQUIDITY", 1000)
-)  # $1k min liquidity
+    os.environ.get("POLYMARKET_MIN_LIQUIDITY", 500)
+)  # $500 min liquidity
 POLYMARKET_MAX_MARKETS_PER_SCAN = int(
     os.environ.get("POLYMARKET_MAX_MARKETS_PER_SCAN", 100)
 )
@@ -1407,11 +1410,12 @@ def _validate_config_bounds() -> None:
         ("ROTATION_SHADOW_MODE_DAYS", 0, 365, 7),
         ("FORECASTER_CRASH_THRESHOLD", -1.0, 0.0, -0.15),
         ("XGBOOST_CRASH_THRESHOLD", -1.0, 0.0, -0.18),
+        ("XGB_SYNTHETIC_MAX_CONFIDENCE", 0.0, 0.60, 0.45),
         ("FUNDING_NEGATIVE_THRESHOLD", -1.0, 0.0, -0.001),
         ("FUNDING_POSITIVE_THRESHOLD", 0.0, 1.0, 0.003),
         ("DB_AUDIT_NON_ACTIVE_REGIME_RETENTION_DAYS", 0.0, 3650.0, 7.0),
-        ("POLYMARKET_MIN_VOLUME", 0.0, 1e9, 10_000.0),
-        ("POLYMARKET_MIN_LIQUIDITY", 0.0, 1e9, 1_000.0),
+        ("POLYMARKET_MIN_VOLUME", 0.0, 1e9, 5_000.0),
+        ("POLYMARKET_MIN_LIQUIDITY", 0.0, 1e9, 500.0),
         ("LIVE_CANARY_MAX_ORDER_USD", 10.0, 1_000_000.0, 25.0),
         ("LIVE_CANARY_MAX_SIGNALS_PER_DAY", 1, 100_000, 25),
         ("LIVE_MAX_ORDERS_PER_SOURCE_PER_DAY", 0, 100_000, 0),
@@ -1446,6 +1450,8 @@ def _validate_config_bounds() -> None:
         ("COPY_TRADER_SOURCE_SIDE_BLOCK_NET_PNL", -1_000_000.0, 1_000_000.0, -0.25),
         ("COPY_TRADER_SOURCE_SIDE_CONFIDENCE_MULTIPLIER", 0.0, 1.0, 0.75),
         ("COPY_TRADER_SOURCE_SIDE_SIZE_MULTIPLIER", 0.0, 1.0, 0.50),
+        ("COPY_TRADER_COUNTERTREND_BLOCK_MIN_CONFIDENCE", 0.0, 1.0, 0.58),
+        ("COPY_TRADER_SYNTHETIC_REGIME_CONFIDENCE_CAP", 0.0, 1.0, 0.50),
         ("SHORT_HARDENING_LOOKBACK_TRADES", 10, 5_000, 120),
         ("SHORT_HARDENING_MIN_CLOSED_TRADES", 1, 1_000, 12),
         ("SHORT_HARDENING_DEGRADE_WIN_RATE", 0.0, 1.0, 0.48),

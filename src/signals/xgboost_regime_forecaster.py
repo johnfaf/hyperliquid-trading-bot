@@ -149,12 +149,12 @@ class XGBoostRegimeForecaster:
             self._synthetic_max_confidence = float(
                 cfg.get(
                     "synthetic_max_confidence",
-                    os.environ.get("XGB_SYNTHETIC_MAX_CONFIDENCE", 0.60),
+                    os.environ.get("XGB_SYNTHETIC_MAX_CONFIDENCE", 0.45),
                 )
             )
         except (TypeError, ValueError):
-            self._synthetic_max_confidence = 0.60
-        self._synthetic_max_confidence = max(0.0, min(0.74, self._synthetic_max_confidence))
+            self._synthetic_max_confidence = 0.45
+        self._synthetic_max_confidence = max(0.0, min(0.60, self._synthetic_max_confidence))
 
         # Ensure models dir exists
         Path(self.model_path).parent.mkdir(parents=True, exist_ok=True)
@@ -242,6 +242,13 @@ class XGBoostRegimeForecaster:
                     "training_source": self._model_training_source,
                     "observed_training_rows": int(self._model_observed_rows),
                     "synthetic_warm_start": bool(self._model_uses_synthetic_warm_start),
+                    "authoritative": not bool(self._model_uses_synthetic_warm_start),
+                    "degraded": bool(self._model_uses_synthetic_warm_start),
+                    "degraded_reason": (
+                        "synthetic_warm_start"
+                        if self._model_uses_synthetic_warm_start
+                        else ""
+                    ),
                     "probabilities": {
                         "crash": round(float(proba[0]), 4),
                         "neutral": round(float(proba[1]), 4),

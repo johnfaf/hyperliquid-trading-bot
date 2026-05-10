@@ -433,6 +433,7 @@ class DecisionEngine:
         return {
             **self.stats,
             "cycles": self._cycle_count,
+            "total_prescreened_candidates": self.stats["total_executions"],
             "execution_rate": (self.stats["total_executions"] /
                               max(self.stats["total_candidates"], 1)),
             "no_trade_rate": (self.stats["total_no_trade"] /

@@ -333,4 +333,8 @@ class LiquidationStrategy:
             "setups_detected": self.setups_detected,
             "signals_generated": self.signals_generated,
             "hit_rate": self.signals_generated / max(self.setups_detected, 1),
+            "funding_extreme_long": self.funding_extreme_long,
+            "funding_extreme_short": self.funding_extreme_short,
+            "oi_spike_threshold": self.oi_spike_threshold,
+            "exhaustion_trend_max": self.exhaustion_trend_max,
         }

@@ -513,12 +513,12 @@ class StrategyScorer:
         This is the key self-improvement metric.
         """
         strategies = db.get_active_strategies()
+        try:
+            runtime_status = db.get_strategy_runtime_status()
+        except Exception:
+            runtime_status = {}
 
         if not strategies:
-            try:
-                runtime_status = db.get_strategy_runtime_status()
-            except Exception:
-                runtime_status = {}
             total = int(runtime_status.get("total", 0) or 0)
             inactive_valid = int(runtime_status.get("inactive_valid", 0) or 0)
             health = "cold_start" if total == 0 else "degraded_no_valid_active_strategies"
@@ -548,6 +548,12 @@ class StrategyScorer:
         # Overall portfolio score trend
         all_scores = [s["current_score"] for s in strategies]
         avg_score = np.mean(all_scores) if all_scores else 0
+        invalid_reasons = runtime_status.get("invalid_reasons", {}) or {}
+        synthetic_placeholders = int(invalid_reasons.get("synthetic_placeholder_metrics", 0) or 0)
+        active_invalid = int(runtime_status.get("active_invalid", 0) or 0)
+        health = "good" if improving > declining else "needs_attention" if declining > improving else "neutral"
+        if synthetic_placeholders or active_invalid:
+            health = "degraded_strategy_data"
 
         return {
             "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -557,7 +563,8 @@ class StrategyScorer:
             "stable": stable,
             "avg_score": round(avg_score, 4),
             "top_strategy": strategies[0] if strategies else None,
-            "health": "good" if improving > declining else "needs_attention" if declining > improving else "neutral",
+            "health": health,
+            "strategy_runtime_status": runtime_status,
             "trends": {s["id"]: trends.get(s["id"], {}) for s in strategies[:10]},
         }
 

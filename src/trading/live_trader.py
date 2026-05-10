@@ -4753,7 +4753,16 @@ class LiveTrader:
             "grouping": "na"
         }
 
-        logger.info(f"Placing market order: {coin} {side} {size} @ ${price:.2f} (notional: ${notional:.2f}) cloid={cloid[:10]}…")
+        logger.info(
+            "Placing market order: %s %s %.8f with worst_px=$%.2f "
+            "(cap_ref_notional=$%.2f) cloid=%s...",
+            coin,
+            side,
+            size,
+            price,
+            notional,
+            cloid[:10],
+        )
         result = self._post_order(action)
         if isinstance(result, dict):
             result = dict(result)
@@ -4847,8 +4856,15 @@ class LiveTrader:
                 )
 
                 logger.info(
-                    f"Fill VERIFIED: {coin} size={pos_size} "
-                    f"(expected={expected_size:.6f}, attempt {attempt})"
+                    "Fill VERIFIED: %s delta=%.6f protected_size=%.6f "
+                    "(total_position=%.6f, baseline=%.6f, expected=%.6f, attempt %d)",
+                    coin,
+                    fill_size,
+                    matched_size,
+                    pos_size,
+                    baseline_position_size,
+                    expected_size,
+                    attempt,
                 )
                 return {
                     "status": "verified",
@@ -6492,14 +6508,29 @@ class LiveTrader:
                         )
 
             # Protective sizing:
-            # - If we verified a concrete position, protect that observed size.
+            # - If we verified a concrete position, protect the new fill delta.
             # - If verification is pending/non-blocking, protect intended size.
+            # Same-side add-ons are deliberately not protected as total size
+            # here; existing SL/TP remains live and manage_open_positions
+            # consolidates once the new delta has protection.
             observed_position_size = 0.0
             if fill_check:
                 observed_position_size = abs(
                     self._coerce_float(fill_check.get("position_size"), 0.0)
                 )
-                protective_size = max(actual_fill_size, observed_position_size)
+                if observed_position_size > actual_fill_size * 1.01 and not self.dry_run:
+                    logger.warning(
+                        "Existing same-side %s position detected. Fresh fill "
+                        "delta=%.6f, total_position=%.6f. Placing protection "
+                        "for the new delta only; total-position consolidation "
+                        "is deferred to manage_open_positions.",
+                        coin,
+                        actual_fill_size,
+                        observed_position_size,
+                    )
+                    protective_size = actual_fill_size
+                else:
+                    protective_size = max(actual_fill_size, observed_position_size)
             else:
                 protective_size = max(expected_fill_size, submitted_entry_size)
             if protective_size <= 0:
@@ -6527,16 +6558,6 @@ class LiveTrader:
                     actual_fill_size,
                     protective_size,
                 )
-                if observed_position_size > actual_fill_size * 1.01 and not self.dry_run:
-                    logger.warning(
-                        "Existing same-side %s position detected. Keeping current "
-                        "protective orders live and placing protection only for "
-                        "the new fill size %.6f; total-position replacement is "
-                        "handled by manage_open_positions after new protection is verified.",
-                        coin,
-                        actual_fill_size,
-                    )
-                    protective_size = actual_fill_size
 
             # 2. Calculate stop loss and take profit prices from actual fill price when available.
             entry_anchor_price = exchange_reported_fill_price or verified_fill_price

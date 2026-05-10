@@ -43,6 +43,12 @@ _BULLISH_COPY_CONFIDENCE_MULTIPLIER = 1.20
 # bearish branch removes one of the structural reasons the bot ran 88-90%
 # long.
 _BEARISH_COPY_CONFIDENCE_MULTIPLIER = 1.20
+_COUNTERTREND_COPY_BLOCK_MIN_CONFIDENCE = float(
+    getattr(config, "COPY_TRADER_COUNTERTREND_BLOCK_MIN_CONFIDENCE", 0.58)
+)
+_SYNTHETIC_REGIME_CONFIDENCE_CAP = float(
+    getattr(config, "COPY_TRADER_SYNTHETIC_REGIME_CONFIDENCE_CAP", 0.50)
+)
 
 # Signal confidence model — explicit baselines and caps per signal type.
 # Rationale:
@@ -619,110 +625,156 @@ class CopyTrader:
 
         return signals
 
-    def _apply_regime_weight(self, signal: Dict, coin: str) -> Dict:
+    def _apply_regime_weight(
+        self,
+        signal: Dict,
+        coin: str,
+        regime_data: Optional[Dict] = None,
+    ) -> Dict:
         """
-        Apply regime-based weighting to copy signal confidence.
+        Apply regime-aware copy-trade policy.
 
-        Reduces copy aggressiveness during crash regimes and increases during bullish regimes.
-        Gracefully degrades if regime_forecaster is unavailable.
-
-        Args:
-            signal: Copy signal dict
-            coin: Coin symbol
-
-        Returns:
-            Modified signal dict with adjusted confidence
+        The trading-cycle regime/global-momentum view is authoritative for
+        hard countertrend blocks. The XGBoost warm-start forecaster is only a
+        weak hint; synthetic output may cap confidence but cannot hard-veto or
+        boost size as if it were an observed-label model.
         """
+        original_confidence = float(signal.get("confidence", 0.5) or 0.5)
+        side_raw = str(signal.get("side", "") or "").strip().lower()
+        signal_side = "long" if side_raw in {"long", "buy"} else (
+            "short" if side_raw in {"short", "sell"} else ""
+        )
+        regime_data = regime_data or {}
+
+        block_side = str(regime_data.get("countertrend_block_side", "") or "").strip().lower()
+        overall_regime = str(regime_data.get("overall_regime", "") or "").strip().lower()
+        try:
+            overall_conf = float(regime_data.get("overall_confidence", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            overall_conf = 0.0
+
+        if signal_side and block_side == signal_side:
+            signal["regime_block_reason"] = f"cycle_countertrend_block:{block_side}"
+            return signal
+        if overall_conf >= _COUNTERTREND_COPY_BLOCK_MIN_CONFIDENCE:
+            if signal_side == "long" and overall_regime in {"trending_down", "bearish", "crash"}:
+                signal["regime_block_reason"] = f"detector_{overall_regime}_blocks_long"
+                return signal
+            if signal_side == "short" and overall_regime in {"trending_up", "bullish"}:
+                signal["regime_block_reason"] = f"detector_{overall_regime}_blocks_short"
+                return signal
+
         if not self.regime_forecaster:
             return signal
 
         try:
             regime_info = self.regime_forecaster.predict_regime(coin)
         except Exception as e:
-            logger.debug(f"Failed to fetch regime data for {coin}: {e}")
+            logger.debug("Failed to fetch regime data for %s: %s", coin, e)
             return signal
 
-        regime = regime_info.get("regime", "neutral")
-        original_confidence = signal.get("confidence", 0.5)
-
-        # Regime weighting policy: derisks (crash/neutral) move *confidence*
-        # because the calibrator sees them and folds them into the model.
-        # Bullish weighting now goes through *size* (regime_size_modifier),
-        # which the executor already applies. Multiplying confidence
-        # above its calibrated value pollutes the calibrator — we'd
-        # report 1.0 confidence whose true win rate is unchanged, which
-        # inflates ECE on every trade in a bullish regime. Sizing
-        # captures operator intent (more aggressive when conditions
-        # favour us) without corrupting the prediction signal.
-        # Side of the copy signal — used by the directional bullish/bearish
-        # branches so boosting the size only happens when the signal aligns
-        # with the regime read.
-        side_raw = str(signal.get("side", "") or "").strip().lower()
-        signal_side = "long" if side_raw in {"long", "buy"} else (
-            "short" if side_raw in {"short", "sell"} else ""
+        regime = str(regime_info.get("regime", "neutral") or "neutral").strip().lower()
+        try:
+            regime_conf = float(regime_info.get("confidence", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            regime_conf = 0.0
+        training_source = str(regime_info.get("training_source", "") or "").strip().lower()
+        synthetic_regime = bool(regime_info.get("synthetic_warm_start", False)) or (
+            "synthetic" in training_source
         )
 
+        if synthetic_regime:
+            capped = min(original_confidence, _SYNTHETIC_REGIME_CONFIDENCE_CAP)
+            if capped < original_confidence:
+                logger.info(
+                    "REGIME WEIGHT: %s synthetic regime for %s is non-authoritative; "
+                    "capping copy confidence %.2f -> %.2f",
+                    regime,
+                    coin,
+                    original_confidence,
+                    capped,
+                )
+                signal["confidence"] = capped
+            signal["regime_data_quality"] = "synthetic_warm_start"
+            return signal
+
         if regime == "crash":
+            if signal_side == "long" and regime_conf >= _COUNTERTREND_COPY_BLOCK_MIN_CONFIDENCE:
+                signal["regime_block_reason"] = f"forecaster_crash_blocks_long:{regime_conf:.2f}"
+                return signal
+            if signal_side == "short":
+                existing_mod = float(signal.get("regime_size_modifier", 1.0) or 1.0)
+                signal["regime_size_modifier"] = max(
+                    0.0, min(existing_mod * _BEARISH_COPY_CONFIDENCE_MULTIPLIER, 2.0)
+                )
+                return signal
             adjusted_confidence = original_confidence * _CRASH_COPY_CONFIDENCE_MULTIPLIER
             logger.info(
-                f"REGIME WEIGHT: crash detected for {coin}, "
-                f"reducing copy confidence {original_confidence:.2f} -> {adjusted_confidence:.2f}"
+                "REGIME WEIGHT: crash detected for %s, reducing copy confidence %.2f -> %.2f",
+                coin,
+                original_confidence,
+                adjusted_confidence,
             )
             signal["confidence"] = adjusted_confidence
         elif regime == "neutral":
             adjusted_confidence = original_confidence * _NEUTRAL_COPY_CONFIDENCE_MULTIPLIER
             logger.debug(
-                f"REGIME WEIGHT: neutral regime for {coin}, "
-                f"reducing copy confidence {original_confidence:.2f} -> {adjusted_confidence:.2f}"
+                "REGIME WEIGHT: neutral regime for %s, reducing copy confidence %.2f -> %.2f",
+                coin,
+                original_confidence,
+                adjusted_confidence,
             )
             signal["confidence"] = adjusted_confidence
         elif regime == "bullish":
-            # Only boost size when the signal is actually long. A short copy
-            # signal in a bullish regime should NOT get a size boost — that
-            # was the latent asymmetry that combined with mostly-long copy
-            # sources to over-allocate to longs.
+            if signal_side == "short" and regime_conf >= _COUNTERTREND_COPY_BLOCK_MIN_CONFIDENCE:
+                signal["regime_block_reason"] = f"forecaster_bullish_blocks_short:{regime_conf:.2f}"
+                return signal
             if signal_side == "long":
                 existing_mod = float(signal.get("regime_size_modifier", 1.0) or 1.0)
                 new_mod = max(0.0, min(existing_mod * _BULLISH_COPY_CONFIDENCE_MULTIPLIER, 2.0))
                 signal["regime_size_modifier"] = new_mod
                 logger.info(
-                    "REGIME WEIGHT: bullish detected for %s, "
-                    "boosting LONG regime size modifier %.2fx -> %.2fx "
+                    "REGIME WEIGHT: bullish detected for %s, boosting LONG regime size modifier %.2fx -> %.2fx "
                     "(confidence held at %.2f to keep calibration honest)",
-                    coin, existing_mod, new_mod, original_confidence,
+                    coin,
+                    existing_mod,
+                    new_mod,
+                    original_confidence,
                 )
             elif signal_side == "short":
-                # Counter-trend short in a bullish regime — de-risk via
-                # confidence so it has to be a high-conviction signal to
-                # pass the firewall thresholds.
                 adjusted_confidence = original_confidence * _NEUTRAL_COPY_CONFIDENCE_MULTIPLIER
                 logger.info(
                     "REGIME WEIGHT: bullish regime for %s but signal is short, "
                     "reducing copy confidence %.2f -> %.2f (counter-trend)",
-                    coin, original_confidence, adjusted_confidence,
+                    coin,
+                    original_confidence,
+                    adjusted_confidence,
                 )
                 signal["confidence"] = adjusted_confidence
         elif regime == "bearish":
-            # Symmetric mirror of the bullish branch. Without this, a confirmed
-            # downtrend gave short copy signals zero size advantage while long
-            # copy signals in bullish regimes got a 1.20x boost — one of the
-            # structural reasons the executed trade mix ran 88-90% long.
+            if signal_side == "long" and regime_conf >= _COUNTERTREND_COPY_BLOCK_MIN_CONFIDENCE:
+                signal["regime_block_reason"] = f"forecaster_bearish_blocks_long:{regime_conf:.2f}"
+                return signal
             if signal_side == "short":
                 existing_mod = float(signal.get("regime_size_modifier", 1.0) or 1.0)
                 new_mod = max(0.0, min(existing_mod * _BEARISH_COPY_CONFIDENCE_MULTIPLIER, 2.0))
                 signal["regime_size_modifier"] = new_mod
                 logger.info(
-                    "REGIME WEIGHT: bearish detected for %s, "
-                    "boosting SHORT regime size modifier %.2fx -> %.2fx "
+                    "REGIME WEIGHT: bearish detected for %s, boosting SHORT regime size modifier %.2fx -> %.2fx "
                     "(confidence held at %.2f to keep calibration honest)",
-                    coin, existing_mod, new_mod, original_confidence,
+                    coin,
+                    existing_mod,
+                    new_mod,
+                    original_confidence,
                 )
             elif signal_side == "long":
                 adjusted_confidence = original_confidence * _NEUTRAL_COPY_CONFIDENCE_MULTIPLIER
                 logger.info(
                     "REGIME WEIGHT: bearish regime for %s but signal is long, "
                     "reducing copy confidence %.2f -> %.2f (counter-trend)",
-                    coin, original_confidence, adjusted_confidence,
+                    coin,
+                    original_confidence,
+                    adjusted_confidence,
                 )
                 signal["confidence"] = adjusted_confidence
 
@@ -755,6 +807,7 @@ class CopyTrader:
                 guardrail.get("reason", "copy guardrail blocked"),
             )
         new_entries_seen = 0
+        blocklisted_summary: Dict[str, Dict[str, object]] = {}
 
         for signal in signals:
             try:
@@ -770,12 +823,13 @@ class CopyTrader:
                         continue
                     blocklisted, blocklist_reason = self._is_source_blocklisted(signal)
                     if blocklisted:
-                        logger.warning(
-                            "  Copy source blocklisted: %s %s rejected (%s)",
-                            signal["side"],
-                            signal["coin"],
+                        summary = blocklisted_summary.setdefault(
                             blocklist_reason,
+                            {"count": 0, "coins": set(), "sides": set()},
                         )
+                        summary["count"] = int(summary["count"]) + 1
+                        summary["coins"].add(str(signal.get("coin", "?")).upper())
+                        summary["sides"].add(str(signal.get("side", "?")).lower())
                         continue
                     cutoff, cutoff_reason = self._is_source_hard_cutoff(signal)
                     if cutoff:
@@ -798,7 +852,15 @@ class CopyTrader:
                             signal["coin"],
                         )
                         continue
-                    signal = self._apply_regime_weight(signal, signal["coin"])
+                    signal = self._apply_regime_weight(signal, signal["coin"], regime_data=regime_data)
+                    if signal.get("regime_block_reason"):
+                        logger.info(
+                            "  Copy regime blocked %s %s: %s",
+                            signal["side"],
+                            signal["coin"],
+                            signal["regime_block_reason"],
+                        )
+                        continue
                     source_side_ok, source_side_reason = self._apply_source_side_guard(signal)
                     if not source_side_ok:
                         logger.info(
@@ -863,6 +925,17 @@ class CopyTrader:
 
             except Exception as e:
                 logger.error(f"Error executing copy signal: {e}")
+
+        for reason, summary in blocklisted_summary.items():
+            coins = ",".join(sorted(summary["coins"]))
+            sides = ",".join(sorted(summary["sides"]))
+            logger.warning(
+                "  Copy source blocklisted: rejected %d signal(s) for %s [%s] (%s)",
+                summary["count"],
+                coins or "?",
+                sides or "?",
+                reason,
+            )
 
         replacements_used = 0
         rotation_enabled = bool(config.ROTATION_ENGINE_ENABLED)
