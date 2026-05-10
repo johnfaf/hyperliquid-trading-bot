@@ -868,7 +868,6 @@ def main():
 
     # Commands that don't need the full bot
     if args.bootstrap:
-        from src.core.boot import setup_logging
         logger = setup_logging()
         bootstrap_seed_data(logger, days=args.bootstrap_days)
         return
