@@ -37,6 +37,34 @@ def test_ema_convergence():
     assert ema[-1] == pytest.approx(100.0, abs=0.5)
 
 
+def test_ema_skips_leading_nans():
+    """EMA must not propagate leading NaNs (regression: MACD signal line was all-NaN).
+
+    The MACD signal line is EMA(macd_line, 9), and macd_line has leading NaNs from
+    the slow EMA. Pre-fix, seeding with np.mean(close[:period]) returned NaN and
+    every downstream value inherited it.
+    """
+    close = np.concatenate([np.full(25, np.nan), np.linspace(100.0, 120.0, 200)])
+    ema = _ema(close, 9)
+    valid = ema[~np.isnan(ema)]
+    assert len(valid) > 0, "EMA produced no values after leading NaN block"
+    assert valid[-1] == pytest.approx(120.0, abs=1.0)
+
+
+def test_sma_skips_leading_nans():
+    """SMA must not propagate leading NaNs (regression: stochastic %D was all-NaN).
+
+    stoch_d = SMA(stoch_k, 3), and stoch_k has leading NaNs before the k-period
+    lookback fills. Pre-fix, np.cumsum absorbed the NaN forward and zeroed the
+    whole series out.
+    """
+    close = np.concatenate([np.full(13, np.nan), np.full(100, 50.0)])
+    sma = _sma(close, 3)
+    valid = sma[~np.isnan(sma)]
+    assert len(valid) > 0, "SMA produced no values after leading NaN block"
+    assert all(v == pytest.approx(50.0) for v in valid)
+
+
 def test_rsi_boundaries():
     """RSI should be between 0 and 100."""
     close = np.random.normal(100, 5, 100).cumsum()

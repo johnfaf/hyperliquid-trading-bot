@@ -123,25 +123,66 @@ class CandleBacktestConfig:
 # ─── Indicator Library (vectorized numpy) ────────────────────────
 
 def _sma(close: np.ndarray, period: int) -> np.ndarray:
-    """Simple Moving Average — cumsum trick, O(n)."""
+    """Simple Moving Average — cumsum trick, O(n).
+
+    NaN-tolerant: emits a value only when the trailing `period` window has no NaN.
+    Required so SMA composes with other indicators (e.g. _sma of stochastic %K
+    which has leading NaNs before its lookback fills).
+    """
     out = np.full_like(close, np.nan)
-    if len(close) < period:
+    n = len(close)
+    if n < period:
         return out
-    cumsum = np.cumsum(close)
-    cumsum[period:] = cumsum[period:] - cumsum[:-period]
-    out[period - 1:] = cumsum[period - 1:] / period
+    isnan = np.isnan(close)
+    if not isnan.any():
+        cumsum = np.cumsum(close)
+        cumsum[period:] = cumsum[period:] - cumsum[:-period]
+        out[period - 1:] = cumsum[period - 1:] / period
+        return out
+    safe = np.where(isnan, 0.0, close)
+    cumsum_val = np.cumsum(safe)
+    cumsum_cnt = np.cumsum((~isnan).astype(np.int64))
+    win_sum = cumsum_val.copy()
+    win_sum[period:] = cumsum_val[period:] - cumsum_val[:-period]
+    win_cnt = cumsum_cnt.copy()
+    win_cnt[period:] = cumsum_cnt[period:] - cumsum_cnt[:-period]
+    mask = win_cnt == period
+    mask[:period - 1] = False
+    out[mask] = win_sum[mask] / period
     return out
 
 
 def _ema(close: np.ndarray, period: int) -> np.ndarray:
-    """Exponential Moving Average."""
+    """Exponential Moving Average.
+
+    NaN-tolerant: seeds from the first `period`-wide window of non-NaN values
+    rather than `close[:period]`. Required so EMA composes with other indicators
+    (e.g. signal line = EMA of MACD line, which has leading NaNs).
+    """
     out = np.full_like(close, np.nan)
-    if len(close) < period:
+    n = len(close)
+    if n < period:
         return out
     alpha = 2.0 / (period + 1)
-    out[period - 1] = np.mean(close[:period])
-    for i in range(period, len(close)):
-        out[i] = alpha * close[i] + (1 - alpha) * out[i - 1]
+    isnan = np.isnan(close)
+    if not isnan.any():
+        out[period - 1] = float(np.mean(close[:period]))
+        for i in range(period, n):
+            out[i] = alpha * close[i] + (1 - alpha) * out[i - 1]
+        return out
+    cum_valid = np.cumsum((~isnan).astype(np.int64))
+    win_cnt = cum_valid.copy()
+    win_cnt[period:] = cum_valid[period:] - cum_valid[:-period]
+    candidates = np.where(win_cnt[period - 1:] == period)[0]
+    if len(candidates) == 0:
+        return out
+    seed_idx = int(candidates[0]) + (period - 1)
+    out[seed_idx] = float(np.mean(close[seed_idx - period + 1:seed_idx + 1]))
+    for i in range(seed_idx + 1, n):
+        if isnan[i]:
+            out[i] = out[i - 1]
+        else:
+            out[i] = alpha * close[i] + (1 - alpha) * out[i - 1]
     return out
 
 
