@@ -48,6 +48,33 @@ FULL_PROFILE = FUNDABLE_CORE | {
     "lstm_agent", "rl_sizer", "macro_regime",
 }
 
+# Profile for historical replay (src/backtest/replay/harness.py).
+# Includes only subsystems that can run causally against frozen data:
+#   - REAL subsystems for the post-signal decision pipeline (scorer,
+#     firewall, paper_trader, regime detection, sizing, calibration, etc.)
+#   - DROPS heavy / ML / live-execution / discovery: alpha_pipeline,
+#     lstm_agent, xgboost_forecaster, rl_sizer, live_trader, copy_trader,
+#     llm_filter, position_monitor, dashboard, telegram, discovery,
+#     liquidation_strategy, arena_incubator, alpha_arena.
+#   - The harness then OVERWRITES these container slots with neutral stub
+#     subsystems (see src/backtest/replay/stub_subsystems.py):
+#     polymarket, options_flow, macro_regime, event_scanner,
+#     multi_scanner, exchange_aggregator, predictive_forecaster,
+#     cross_venue_hedger.
+# Result: the cycle runs end-to-end without any code path that needs an
+# external data source the harness cannot replay.
+REPLAY_PROFILE = {
+    "strategy_scorer", "decision_firewall", "paper_trader",
+    "regime_detector", "feature_engine", "agent_scorer",
+    "decision_engine", "signal_processor", "risk_policy_engine",
+    "kelly_sizer", "trade_memory", "calibration", "regime_strategy_filter",
+    "shadow_tracker",
+    # Stub-target slots (built minimally; harness will overwrite):
+    "polymarket", "options_flow", "macro_regime", "event_scanner",
+    "multi_scanner", "exchange_aggregator", "predictive_forecaster",
+    "cross_venue_hedger",
+}
+
 
 # ---------------------------------------------------------------------------
 # Container

@@ -38,6 +38,7 @@ from src.backtest.replay.api_manager_shim import (
 from src.backtest.replay.network_sandbox import engage as engage_sandbox
 from src.backtest.replay.network_sandbox import disengage as disengage_sandbox
 from src.backtest.replay.stub_subsystems import all_stubs
+from src.backtest.replay.replay_db import ReplayDB
 from src.core import clock_provider
 
 logger = logging.getLogger(__name__)
@@ -104,6 +105,9 @@ class ReplayHarness:
         strict_api: bool = True,
         engage_network_sandbox: bool = True,
         sandbox_allow_loopback: bool = True,
+        build_container: bool = False,
+        run_id: Optional[str] = None,
+        keep_replay_db: bool = True,
     ):
         if end_ts_ms <= start_ts_ms:
             raise ValueError(f"end_ts_ms ({end_ts_ms}) must be > start_ts_ms ({start_ts_ms})")
@@ -115,12 +119,18 @@ class ReplayHarness:
         self.strict_api = bool(strict_api)
         self._engage_network = bool(engage_network_sandbox)
         self._sandbox_loopback = bool(sandbox_allow_loopback)
+        self._build_container = bool(build_container)
+        self._run_id = run_id
+        self._keep_replay_db = bool(keep_replay_db)
 
         # Lazy-built in __enter__
         self.clock: Optional[ReplayClock] = None
         self.oracle: Optional[CandleOracle] = None
         self.api: Optional[ReplayAPIManager] = None
         self.stubs: Dict[str, Any] = {}
+        self.replay_db: Optional[ReplayDB] = None
+        self.container: Any = None  # SubsystemContainer if build_container=True
+        self.health: Any = None
 
         self._prev_clock_backend = None
         self._engaged = False
@@ -156,15 +166,36 @@ class ReplayHarness:
         # 5. stubs (caller can read them via self.stubs)
         self.stubs = all_stubs()
 
-        # 6. network sandbox
+        # 6. network sandbox -- engage BEFORE building subsystems so any
+        # subsystem __init__ that tries to phone home raises loudly.
         if self._engage_network:
             engage_sandbox(allow_loopback=self._sandbox_loopback)
 
+        # 7. Replay DB + subsystem container (opt-in).
+        if self._build_container:
+            self.replay_db = ReplayDB(run_id=self._run_id, keep_on_exit=self._keep_replay_db)
+            self.replay_db.install()
+            self.replay_db.init_schema()
+            self.replay_db.reset_runtime_state()
+
+            from src.backtest.replay.subsystem_assembly import build_replay_container
+            self.container, container_stubs = build_replay_container()
+            # The stubs created during assembly are the ones actually on the
+            # container; use them for telemetry instead of the bag we created
+            # at step 5.
+            self.stubs = container_stubs
+            # Make the clock available on the container for code that
+            # otherwise can't find it (subsystems that don't import
+            # clock_provider directly can reach .clock here).
+            if hasattr(self.container, "__dict__"):
+                self.container.clock = self.clock
+
         self._engaged = True
         logger.info(
-            "ReplayHarness engaged: window=[%d, %d], cache=%s, coins=%s, sandbox=%s",
+            "ReplayHarness engaged: window=[%d, %d], cache=%s, coins=%s, "
+            "sandbox=%s, container=%s",
             self.start_ts_ms, self.end_ts_ms, self.cache_db,
-            self.api._known_coins, self._engage_network,
+            self.api._known_coins, self._engage_network, self._build_container,
         )
 
     def teardown(self) -> None:
@@ -177,9 +208,14 @@ class ReplayHarness:
             try:
                 uninstall_replay_manager()
             finally:
-                clock_provider.restore(self._prev_clock_backend)
-                self._engaged = False
-                logger.info("ReplayHarness torn down")
+                try:
+                    if self.replay_db is not None:
+                        self.replay_db.uninstall()
+                finally:
+                    clock_provider.restore(self._prev_clock_backend)
+                    self._engaged = False
+                    self.container = None
+                    logger.info("ReplayHarness torn down")
 
     # ---- ticking ------------------------------------------------------
 
