@@ -19,6 +19,7 @@ import sys
 import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import config
+from src.core import clock_provider
 from src.data import database as db
 from src.data import decision_journal
 from src.data import hyperliquid_client as hl
@@ -641,8 +642,8 @@ class PaperTrader:
                             "req": {
                                 "coin": coin,
                                 "interval": "1h",
-                                "startTime": int((datetime.now(timezone.utc).timestamp() - 100 * 3600) * 1000),
-                                "endTime": int(datetime.now(timezone.utc).timestamp() * 1000),
+                                "startTime": int((clock_provider.utc_now().timestamp() - 100 * 3600) * 1000),
+                                "endTime": int(clock_provider.utc_now().timestamp() * 1000),
                             }
                         }
                         raw = get_manager().post(payload=payload, priority=Priority.NORMAL, timeout=10)
@@ -1793,7 +1794,7 @@ class PaperTrader:
                 "strategy_type": signal.get("strategy_type", ""),
                 "source": signal.get("source", "strategy"),
                 "confidence": signal.get("confidence", 0),
-                "opened_at": datetime.now(timezone.utc).isoformat(),
+                "opened_at": clock_provider.utc_now().isoformat(),
                 "metadata": {
                     "strategy_type": signal.get("strategy_type", ""),
                     "source": signal.get("source", "strategy"),
@@ -2010,7 +2011,7 @@ class PaperTrader:
                     pnl=pnl,
                     return_pct=return_pct,
                     opened_at=trade.get("opened_at", ""),
-                    closed_at=datetime.now(timezone.utc).isoformat(),
+                    closed_at=clock_provider.utc_now().isoformat(),
                     confidence=trade_meta.get("confidence", 0),
                     source=source_key,
                     regime=trade_meta.get("regime", ""),
@@ -2031,7 +2032,7 @@ class PaperTrader:
                         "exit_price": slipped_exit,
                         "size": trade["size"],
                         "entry_ts": trade.get("opened_at") or None,
-                        "exit_ts": datetime.now(timezone.utc).isoformat(),
+                        "exit_ts": clock_provider.utc_now().isoformat(),
                         "pnl": pnl,
                         "pnl_pct": return_pct * 100,
                         "regime_at_entry": trade_meta.get("regime") or None,
@@ -2063,7 +2064,7 @@ class PaperTrader:
             "exit_price": slipped_exit,
             "metadata": trade_meta,
             "opened_at": trade.get("opened_at", ""),
-            "closed_at": datetime.now(timezone.utc).isoformat(),
+            "closed_at": clock_provider.utc_now().isoformat(),
         }
         try:
             if self.rotation_manager:
@@ -2161,7 +2162,7 @@ class PaperTrader:
             except Exception as exc:
                 logger.debug("Funding rate fetch for paper accrual failed: %s", exc)
 
-        now_utc = datetime.now(timezone.utc)
+        now_utc = clock_provider.utc_now()
         closed = []
 
         for trade in open_trades:
@@ -2337,7 +2338,7 @@ class PaperTrader:
                     # Ensure timezone-aware for safe subtraction
                     if opened.tzinfo is None:
                         opened = opened.replace(tzinfo=timezone.utc)
-                    age_hours = (datetime.now(timezone.utc) - opened).total_seconds() / 3600
+                    age_hours = (clock_provider.utc_now() - opened).total_seconds() / 3600
                     time_limit_hours = float(risk_policy.get("time_limit_hours", 24.0) or 24.0)
                     if age_hours > time_limit_hours:
                         should_close = True

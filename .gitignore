@@ -11,6 +11,15 @@ build/
 data/*.db
 data/*.db-journal
 data/*.db-wal
+data/*.db-shm
+
+# Bulk imported / regeneratable data
+data/*.csv
+
+# Replay artifacts (per-run; regenerate from cache + code)
+data/replay_*/
+data/replay_*.db
+data/kill_switch_log/
 
 # Logs & reports (generated at runtime)
 logs/

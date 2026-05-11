@@ -29,6 +29,7 @@ import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from src.data import hyperliquid_client as hl
 from src.data.exchange_aggregator import ExchangeAggregator
+from src.core import clock_provider
 
 logger = logging.getLogger(__name__)
 
@@ -447,8 +448,8 @@ class RegimeDetector:
                 "req": {
                     "coin": coin,
                     "interval": interval,
-                    "startTime": int((datetime.now(timezone.utc).timestamp() - count * 3600) * 1000),
-                    "endTime": int(datetime.now(timezone.utc).timestamp() * 1000),
+                    "startTime": int((clock_provider.utc_now().timestamp() - count * 3600) * 1000),
+                    "endTime": int(clock_provider.utc_now().timestamp() * 1000),
                 }
             }
             data = get_manager().post(payload=payload, priority=Priority.NORMAL, timeout=10)
