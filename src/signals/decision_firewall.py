@@ -18,6 +18,8 @@ import logging
 import threading
 import time
 from datetime import datetime, timezone
+
+from src.core import clock_provider
 from typing import List, Dict, Optional, Tuple
 from collections import defaultdict
 
@@ -663,7 +665,7 @@ class DecisionFirewall:
         )
 
     def _get_short_policy_cache(self) -> Dict[str, object]:
-        now = time.time()
+        now = clock_provider.unix_now()
         cached_ts = float(self._side_policy_cache.get("ts", 0.0) or 0.0)
         if (
             self._side_policy_cache.get("short")
@@ -715,7 +717,7 @@ class DecisionFirewall:
         Cached on the same _side_policy_cache structure under the "long" key
         so the dual evaluation only re-fetches the trade history once per TTL.
         """
-        now = time.time()
+        now = clock_provider.unix_now()
         cached_ts = float(self._side_policy_cache.get("ts", 0.0) or 0.0)
         if (
             self._side_policy_cache.get("long")
@@ -2012,7 +2014,7 @@ class DecisionFirewall:
                               f"signal wants {side_value}")
 
         # 7. Cooldown — prevent revenge trading
-        now = time.time()
+        now = clock_provider.unix_now()
         last_trade_ts = self._recent_trades.get(signal.coin, 0)
         if now - last_trade_ts < self.cooldown_seconds:
             remaining = int(self.cooldown_seconds - (now - last_trade_ts))
@@ -2267,7 +2269,7 @@ class DecisionFirewall:
         Fetch current funding rate from Hyperliquid (cached).
         Returns per-8h rate (NOT annualized).
         """
-        now = time.time()
+        now = clock_provider.unix_now()
         if now - self._funding_cache_ts < self._funding_cache_ttl and coin in self._funding_cache:
             return self._funding_cache[coin]
 
@@ -2297,7 +2299,7 @@ class DecisionFirewall:
 
     def _check_daily_reset(self):
         """Reset daily loss counter at midnight UTC. Must hold _lock."""
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        today = clock_provider.utc_now().strftime("%Y-%m-%d")
         if today != self._daily_reset_date:
             self._daily_reset_date = today
             self._daily_losses = 0.0

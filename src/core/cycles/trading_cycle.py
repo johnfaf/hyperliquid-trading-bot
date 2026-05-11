@@ -12,6 +12,7 @@ import copy
 from datetime import datetime, timezone
 
 import config
+from src.core import clock_provider
 from src.data import database as db
 from src.core.live_execution import (
     get_execution_open_positions,
@@ -71,8 +72,8 @@ def _fetch_arena_candle_universe():
     from src.core.api_manager import get_manager, Priority
 
     manager = get_manager()
-    end_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-    start_ms = int((datetime.now(timezone.utc).timestamp() - (_ARENA_LOOKBACK_HOURS * 3600)) * 1000)
+    end_ms = int(clock_provider.utc_now().timestamp() * 1000)
+    start_ms = int((clock_provider.utc_now().timestamp() - (_ARENA_LOOKBACK_HOURS * 3600)) * 1000)
     candle_map = {}
 
     for coin in _get_arena_coin_universe():
@@ -1220,8 +1221,8 @@ def _run_liquidation_scan(container, regime_data):
                             "type": "candleSnapshot",
                             "req": {
                                 "coin": coin, "interval": "1h",
-                                "startTime": int((datetime.now(timezone.utc).timestamp() - 100 * 3600) * 1000),
-                                "endTime": int(datetime.now(timezone.utc).timestamp() * 1000),
+                                "startTime": int((clock_provider.utc_now().timestamp() - 100 * 3600) * 1000),
+                                "endTime": int(clock_provider.utc_now().timestamp() * 1000),
                             },
                         }
                         raw = get_manager().post(payload=payload, priority=Priority.NORMAL, timeout=10)

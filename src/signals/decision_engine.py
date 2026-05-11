@@ -26,6 +26,8 @@ from typing import Dict, List, Optional, Tuple
 from datetime import datetime, timezone
 from collections import deque
 
+from src.core import clock_provider
+
 logger = logging.getLogger(__name__)
 
 
@@ -225,7 +227,7 @@ class DecisionEngine:
         # ─── Store decision for audit trail ──────────────
         self._decision_history.append({
             "cycle": self._cycle_count,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "timestamp": clock_provider.utc_now().isoformat(),
             "candidates": len(strategies),
             "qualified": len(qualified),
             "prescreened": len(executions),
@@ -334,7 +336,7 @@ class DecisionEngine:
         if discovered:
             try:
                 disc_dt = datetime.fromisoformat(discovered.replace("Z", "+00:00"))
-                age_hours = (datetime.now(timezone.utc) - disc_dt.replace(tzinfo=timezone.utc)).total_seconds() / 3600
+                age_hours = (clock_provider.utc_now() - disc_dt.replace(tzinfo=timezone.utc)).total_seconds() / 3600
                 if age_hours < 24:
                     freshness = 1.0
                 elif age_hours < 72:
