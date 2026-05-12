@@ -16,9 +16,6 @@ Flow: Signal Source → TradeSignal → DecisionFirewall → Execution
 """
 import logging
 import threading
-import time
-from datetime import datetime, timezone
-
 from src.core import clock_provider
 from typing import List, Dict, Optional, Tuple
 from collections import defaultdict
@@ -1626,10 +1623,22 @@ class DecisionFirewall:
 
         min_conf = float(policy.get("min_confidence", 0.0) or 0.0)
         if signal.confidence + self.confidence_threshold_tolerance < min_conf:
+            # Surface confidence_inputs (if any) so operators can diagnose a
+            # stuck-rejection pattern without having to grep the source code.
+            # Copy-trader signals carry these via signal.context.confidence_inputs.
+            ctx = getattr(signal, "context", None) or {}
+            ci = ctx.get("confidence_inputs") if isinstance(ctx, dict) else None
+            extra = ""
+            if isinstance(ci, dict) and ci:
+                stype = ci.get("signal_type", "?")
+                wr = ci.get("win_rate")
+                tc = ci.get("trade_count")
+                if wr is not None:
+                    extra = f" [signal_type={stype}, trader_win_rate={float(wr):.2%}, trades={tc}]"
             return (
                 False,
                 f"Source allocator requires {min_conf:.0%} confidence for {source_key} "
-                f"(got {signal.confidence:.0%})",
+                f"(got {signal.confidence:.0%}){extra}",
                 policy,
             )
 

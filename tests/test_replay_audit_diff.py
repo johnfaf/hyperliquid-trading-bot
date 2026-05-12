@@ -6,10 +6,8 @@ windows, double-counting consumed replay rows, etc.).
 """
 import json
 import sqlite3
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
-
-import pytest
 
 # Import the diff module directly (it lives in scripts/).
 import importlib.util

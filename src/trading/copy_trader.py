@@ -313,11 +313,24 @@ class CopyTrader:
         The win-rate contribution is capped at 0.5 (a perfect trader at 100% WR
         adds 0.5 to the base). This avoids inflating confidence to near-1.0 based
         solely on historical data that may not generalise.
+
+        Defensive unit normalisation: the codebase has two conventions for
+        win_rate -- some modules store it as a fraction [0, 1] and some as a
+        percent [0, 100]. trader_discovery.py:800 writes it as a fraction, so
+        that's the contract here -- but if a future code path ever writes a
+        percent, we want this function to do the right thing instead of
+        silently clamping at the cap. The defensive pattern matches the
+        idiom already used in src/data/database.py:150 and
+        src/analysis/strategy_scorer.py:176.
         """
         model = _SIGNAL_CONFIDENCE_MODEL.get(signal_type, {"base": 0.50, "max": 0.90})
         base = model["base"]
         cap = model["max"]
-        win_contribution = min(float(trader_win_rate), 1.0) * 0.5
+        rate = float(trader_win_rate or 0.0)
+        if rate > 1.5:                  # looks like a percent (e.g. 60.0)
+            rate = rate / 100.0
+        rate = max(0.0, min(rate, 1.0)) # belt-and-braces clamp
+        win_contribution = rate * 0.5
         return min(cap, base + win_contribution)
 
     def _resolve_copy_trade_risk(
@@ -355,6 +368,7 @@ class CopyTrader:
                 "features": {},
                 "atr_pct": signal.get("atr_pct"),
                 "volatility": signal.get("volatility"),
+                "confidence_inputs": signal.get("confidence_inputs") or {},
             },
             regime=str(signal.get("regime", "")),
             source_accuracy=float(signal.get("source_accuracy", 0.0) or 0.0),
@@ -549,6 +563,14 @@ class CopyTrader:
         win_rate = trader.get("win_rate", 0)
         normalized_address = str(address or "").strip().lower()
 
+        # Observability: stamp the inputs that produced this confidence so the
+        # firewall's rejection logs can surface "why 43%" without needing to
+        # reverse-engineer the math. Persisted on every emitted signal below.
+        confidence_inputs = {
+            "win_rate": float(win_rate or 0.0),
+            "trade_count": int(trader.get("trade_count", 0) or 0),
+        }
+
         # New positions opened by the trader
         for coin in new_coins - old_coins:
             pos = new_positions[coin]
@@ -565,6 +587,7 @@ class CopyTrader:
                 "source_trader": normalized_address,
                 "source_pnl": trader.get("total_pnl", 0),
                 "confidence": self._calculate_signal_confidence("copy_open", win_rate),
+                "confidence_inputs": {**confidence_inputs, "signal_type": "copy_open"},
             })
 
         # Positions closed by the trader (they exited)
@@ -596,6 +619,7 @@ class CopyTrader:
                     "source_trader": normalized_address,
                     "source_pnl": trader.get("total_pnl", 0),
                     "confidence": self._calculate_signal_confidence("copy_flip", win_rate),
+                    "confidence_inputs": {**confidence_inputs, "signal_type": "copy_flip"},
                 })
             elif old_size > 0 and new_size > old_size * 1.5:  # 50%+ increase
                 pos = new_positions[coin]
@@ -611,6 +635,7 @@ class CopyTrader:
                     "source_trader": normalized_address,
                     "source_pnl": trader.get("total_pnl", 0),
                     "confidence": self._calculate_signal_confidence("copy_scale_in", win_rate),
+                    "confidence_inputs": {**confidence_inputs, "signal_type": "copy_scale_in"},
                 })
             elif old_size > 0 and new_size <= old_size * 0.5:  # 50%+ decrease
                 signals.append({
@@ -621,6 +646,7 @@ class CopyTrader:
                     "new_size": new_size,
                     "reduction_pct": 1.0 - (new_size / old_size),
                     "confidence": self._calculate_signal_confidence("copy_scale_out", win_rate),
+                    "confidence_inputs": {**confidence_inputs, "signal_type": "copy_scale_out"},
                 })
 
         return signals
