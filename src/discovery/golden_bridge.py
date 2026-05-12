@@ -193,7 +193,7 @@ def get_golden_copy_signals(mids: Optional[Dict] = None) -> List[Dict]:
                     "side": pos["side"],
                     "price": price,
                     "leverage": min(pos["leverage"], config.PAPER_TRADING_MAX_LEVERAGE),
-                    "source_trader": address[:10],
+                    "source_trader": address,
                     "source_pnl": wallet.get("penalised_pnl", 0),
                     "confidence": boosted_conf,
                     "sharpe": wallet.get("sharpe_ratio", 0),

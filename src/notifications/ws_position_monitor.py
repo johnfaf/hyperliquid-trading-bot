@@ -1007,7 +1007,7 @@ class PositionMonitor:
                 "side": pos["side"],
                 "price": price,
                 "leverage": min(pos["leverage"], config.PAPER_TRADING_MAX_LEVERAGE),
-                "source_trader": address[:10],
+                "source_trader": address,
                 "source_pnl": 0,  # userEvents doesn't include account PnL, would need separate call
                 "confidence": 0.85,  # High confidence for real-time detection
             })
@@ -1017,7 +1017,7 @@ class PositionMonitor:
             signals.append({
                 "type": "copy_close",
                 "coin": coin,
-                "source_trader": address[:10],
+                "source_trader": address,
             })
 
         # 3+4+5. Existing-position deltas — exactly ONE signal per coin.
@@ -1039,7 +1039,7 @@ class PositionMonitor:
                     "side": pos["side"],
                     "price": price,
                     "leverage": min(pos["leverage"], config.PAPER_TRADING_MAX_LEVERAGE),
-                    "source_trader": address[:10],
+                    "source_trader": address,
                     "source_pnl": 0,
                     "confidence": 0.90,
                 })
@@ -1054,7 +1054,7 @@ class PositionMonitor:
                     "side": pos["side"],
                     "price": price,
                     "leverage": min(pos["leverage"], config.PAPER_TRADING_MAX_LEVERAGE),
-                    "source_trader": address[:10],
+                    "source_trader": address,
                     "source_pnl": 0,
                     "confidence": 0.80,
                 })
@@ -1062,7 +1062,7 @@ class PositionMonitor:
                 signals.append({
                     "type": "copy_scale_out",
                     "coin": coin,
-                    "source_trader": address[:10],
+                    "source_trader": address,
                     "old_size": old_size,
                     "new_size": new_size,
                     "reduction_pct": 1.0 - (new_size / old_size),
