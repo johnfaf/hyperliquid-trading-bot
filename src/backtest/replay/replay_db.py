@@ -112,7 +112,15 @@ class ReplayDB:
         self._retarget_database_module()
 
     def uninstall(self) -> None:
-        """Restore the previous HL_BOT_DB. Optionally delete the file."""
+        """Restore the previous HL_BOT_DB. Optionally delete the file.
+
+        On Windows, sqlite connections opened by production code (the
+        router caches none but garbage-collected ones may still hold the
+        file briefly) can leave the .db locked. We make a best-effort
+        attempt to nudge GC + close any tracked connections before unlink,
+        then fall back to silently leaving the file if deletion still
+        fails.
+        """
         if not self._installed:
             return
         try:
@@ -123,11 +131,38 @@ class ReplayDB:
         finally:
             self._installed = False
             if not self.keep_on_exit and self.db_path.exists():
-                try:
-                    self.db_path.unlink()
-                except OSError as e:
-                    logger.warning("Could not delete %s: %s", self.db_path, e)
+                self._delete_db_file()
             logger.info("ReplayDB uninstalled (run_id=%s)", self.run_id)
+
+    def _delete_db_file(self) -> None:
+        """Tear down sqlite handles + unlink. Best-effort; tolerates Windows
+        WAL-mode lockholding by retrying briefly."""
+        import gc
+        import time as _time
+        # Nudge any lingering sqlite handles to close. Production code
+        # uses `with sqlite3.connect(...)` blocks so they should already
+        # be released, but Windows + WAL can hold the .db-wal sidecar
+        # until the connection is GC'd.
+        gc.collect()
+        for attempt in range(5):
+            try:
+                self.db_path.unlink()
+                # Also remove WAL sidecars if present.
+                for suffix in ("-wal", "-shm", "-journal"):
+                    side = self.db_path.with_suffix(self.db_path.suffix + suffix)
+                    if side.exists():
+                        try:
+                            side.unlink()
+                        except OSError:
+                            pass
+                return
+            except OSError as e:
+                if attempt == 4:
+                    logger.warning("Could not delete %s after 5 attempts: %s "
+                                   "(left on disk; safe to remove manually)",
+                                   self.db_path, e)
+                    return
+                _time.sleep(0.1)
 
     def _retarget_database_module(self) -> None:
         """Patch the active DB path everywhere it's already cached.
@@ -165,14 +200,26 @@ class ReplayDB:
 
         Imports `src.data.database` and calls its `init_db()`. Because we've
         already set HL_BOT_DB, the production init writes here, not to bot.db.
+        Also runs `init_golden_tables()` -- the golden_wallets DDL lives in
+        src/discovery/golden_wallet.py rather than database.init_db, and the
+        copy_trader code path reads from it during the trading cycle.
+        Without this the cycle emits a 'no such table: golden_wallets'
+        SQLite warning on every run.
         """
         if not self._installed:
             raise ReplayDBError("ReplayDB.install() must be called before init_schema()")
 
-        # Local import: deferred so any prior imports in the calling code
+        # Local imports: deferred so any prior imports in the calling code
         # don't capture the wrong _DB_PATH.
         from src.data import database as db
         db.init_db()
+
+        try:
+            from src.discovery.golden_wallet import init_golden_tables
+            init_golden_tables()
+        except Exception as e:
+            logger.warning("Could not init golden_wallets tables: %s", e)
+
         logger.info("Schema initialised at %s", self.db_path)
 
     def reset_runtime_state(self) -> None:
