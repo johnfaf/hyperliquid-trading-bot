@@ -27,13 +27,22 @@ from __future__ import annotations
 
 import logging
 import threading
-from collections import Counter, defaultdict
+from collections import Counter
 from typing import Any, Dict, List, Optional
 
-from src.backtest.replay.candle_oracle import CandleOracle, TIMEFRAME_MS
+from src.backtest.replay.candle_oracle import CandleOracle
 from src.backtest.replay.clock import Clock
 
 logger = logging.getLogger(__name__)
+
+
+# Some coins traded under one ticker historically and another after a rebrand.
+# Hyperliquid still serves the old ticker; Binance Vision only has the new one.
+# Map "callers ask for X" -> "look up Y in the cache" so the regime detector's
+# 10-coin universe resolves cleanly against post-rebrand backfills.
+COIN_ALIAS = {
+    "MATIC": "POL",   # MATIC -> POL rebrand (Sept 2024); Binance Vision only has POL.
+}
 
 
 HL_INTERVAL_TO_TF = {
@@ -84,6 +93,13 @@ class ReplayAPIManager:
         if known_coins is None:
             known_coins = oracle.available_coins("1m") or oracle.available_coins("1h")
         self._known_coins = sorted({c.upper() for c in known_coins})
+        # Expose aliased forms too: callers that ask for "MATIC" should be
+        # answered from the "POL" cache entry. Otherwise the regime detector
+        # logs N cache misses per tick on every replay.
+        self._known_coins_with_aliases = set(self._known_coins) | {
+            alias for alias, target in COIN_ALIAS.items()
+            if target in self._known_coins
+        }
         if not self._known_coins:
             raise RuntimeError("ReplayAPIManager: no coins available in oracle cache")
 
@@ -128,7 +144,11 @@ class ReplayAPIManager:
     # ---- handlers ------------------------------------------------------
 
     def _handle_all_mids(self, payload: Dict[str, Any]) -> Dict[str, str]:
-        """Return latest mid for every known coin. HL returns string-typed prices."""
+        """Return latest mid for every known coin. HL returns string-typed prices.
+
+        Aliased tickers (e.g. MATIC) are emitted alongside their target (POL)
+        so callers reading either name get the same price.
+        """
         out: Dict[str, str] = {}
         for coin in self._known_coins:
             px = self._oracle.get_latest_price(coin, "1m") or self._oracle.get_latest_price(coin, "1h")
@@ -137,6 +157,11 @@ class ReplayAPIManager:
                     self._coin_cache_misses[coin] += 1
                 continue
             out[coin] = f"{px}"
+        for alias, target in COIN_ALIAS.items():
+            if target in self._known_coins and alias not in out:
+                px_str = out.get(target)
+                if px_str is not None:
+                    out[alias] = px_str
         return out
 
     def _handle_meta_and_asset_ctxs(self, payload: Dict[str, Any]) -> List[Any]:
@@ -176,10 +201,15 @@ class ReplayAPIManager:
 
         if not coin:
             return []
-        if coin not in self._known_coins:
+        # Resolve known aliases (e.g. MATIC -> POL after the 2024 rebrand)
+        # before reporting a miss, otherwise the regime detector floods the
+        # report with phantom misses on every tick.
+        lookup_coin = COIN_ALIAS.get(coin, coin)
+        if lookup_coin not in self._known_coins:
             with self._lock:
                 self._coin_cache_misses[coin] += 1
             return []
+        coin = lookup_coin
 
         # If caller didn't bound the request, give them the most recent ~5000 bars
         # below the clock horizon -- mirrors HL's default cap.

@@ -40,3 +40,5 @@ env/
 # OS
 .DS_Store
 Thumbs.db
+fixtures/replay_pool_prod.json
+models/regime_xgboost_replay_*.json*

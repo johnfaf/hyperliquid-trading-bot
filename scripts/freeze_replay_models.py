@@ -65,9 +65,9 @@ import logging
 import os
 import sqlite3
 import sys
-from datetime import datetime, timezone, date
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict
 
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
@@ -132,7 +132,7 @@ def cmd_audit(args: argparse.Namespace) -> int:
             n = conn.execute("SELECT COUNT(*) FROM regime_history").fetchone()[0]
         print(f"  replay regime_history: {n:,} rows ({rh})")
     else:
-        print(f"  replay regime_history: NOT GENERATED. Run --generate-history.")
+        print("  replay regime_history: NOT GENERATED. Run --generate-history.")
 
     prod_rh = "data/bot.db"
     if os.path.exists(prod_rh):
@@ -141,14 +141,14 @@ def cmd_audit(args: argparse.Namespace) -> int:
                 n = conn.execute("SELECT COUNT(*) FROM regime_history").fetchone()[0]
             print(f"  prod  regime_history: {n:,} rows ({prod_rh})")
         except sqlite3.OperationalError:
-            print(f"  prod  regime_history: table missing")
+            print("  prod  regime_history: table missing")
 
     artifact = "models/regime_xgboost.json"
     if os.path.exists(artifact):
         mtime = datetime.fromtimestamp(os.path.getmtime(artifact), tz=timezone.utc)
         print(f"  models/regime_xgboost.json: exists, mtime={mtime.isoformat()}")
     else:
-        print(f"  models/regime_xgboost.json: missing")
+        print("  models/regime_xgboost.json: missing")
 
     print()
     print("Verdict:")
@@ -307,11 +307,31 @@ def cmd_train_xgboost(args: argparse.Namespace) -> int:
     X = np.array([[float(r[2] or 0.0)] for r in rows], dtype=np.float64)
     y = np.array([int(r[1]) for r in rows], dtype=np.int64)
 
-    model = xgb.XGBClassifier(
+    # XGBoost requires contiguous label classes starting at 0. The synthesized
+    # rule-based labels may only cover a subset of {0, 1, 2}, so remap to
+    # whatever's actually present and persist the mapping in the meta sidecar
+    # so the harness can un-map at inference.
+    unique_labels = sorted({int(v) for v in y.tolist()})
+    label_to_class = {orig: i for i, orig in enumerate(unique_labels)}
+    class_to_label = {i: orig for orig, i in label_to_class.items()}
+    y_remapped = np.array([label_to_class[int(v)] for v in y], dtype=np.int64)
+
+    if len(unique_labels) < 2:
+        logger.error("Only one class %s in training data; XGBoost needs >= 2. "
+                     "Regenerate history over a window with more regime variety.",
+                     unique_labels)
+        return 1
+
+    n_classes = len(unique_labels)
+    objective = "binary:logistic" if n_classes == 2 else "multi:softprob"
+    classifier_kwargs = dict(
         n_estimators=60, max_depth=4, learning_rate=0.1,
-        objective="multi:softprob", num_class=3, verbosity=0,
+        objective=objective, verbosity=0,
     )
-    model.fit(X, y)
+    if n_classes > 2:
+        classifier_kwargs["num_class"] = n_classes
+    model = xgb.XGBClassifier(**classifier_kwargs)
+    model.fit(X, y_remapped)
 
     out = args.out or f"models/regime_xgboost_replay_{args.cutoff}.json"
     Path(out).parent.mkdir(parents=True, exist_ok=True)
@@ -322,6 +342,9 @@ def cmd_train_xgboost(args: argparse.Namespace) -> int:
         "cutoff_date": args.cutoff,
         "n_samples": len(rows),
         "feature_set": "confidence_only (stand-in -- real production model uses 6 features)",
+        "label_classes": unique_labels,           # Original [crash=0, neutral=1, bullish=2] subset
+        "class_to_label": class_to_label,         # XGBoost class index -> original label
+        "n_classes": n_classes,
         "warning": "This model is trained on synthesized rule-based regime labels, "
                    "not on the bot's live regime_history. Use only for replay "
                    "smoke tests; cannot reproduce live ML behaviour.",

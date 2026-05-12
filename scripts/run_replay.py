@@ -29,9 +29,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import os
 import sys
-from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -104,6 +102,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
         run_id=args.run_id,
         keep_replay_db=not args.discard_replay_db,
         strict_api=not args.lax_api,
+        frozen_xgb_model=args.frozen_xgb_model,
     ) as h:
         seed_into(str(h.replay_db.db_path), snapshot)
 
@@ -276,6 +275,13 @@ def main(argv: list[str] | None = None) -> int:
                         help="Return None for unknown HL req_types instead of raising")
     parser.add_argument("--halt-on-error", action="store_true",
                         help="Stop replay on the first tick that raises")
+
+    # ML opt-in
+    parser.add_argument("--frozen-xgb-model",
+                        help="Path to a frozen XGBoost regime model "
+                             "(produced by scripts/freeze_replay_models.py --train-xgboost). "
+                             "When set, the predictive_forecaster stub is bypassed and the "
+                             "frozen model serves regime forecasts at decision time.")
 
     # Output
     parser.add_argument("--report-out",

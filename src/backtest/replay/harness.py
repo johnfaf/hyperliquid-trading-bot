@@ -24,11 +24,10 @@ Usage:
 from __future__ import annotations
 
 import logging
-from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterator, List, Optional
 
-from src.backtest.replay.clock import LiveClock, ReplayClock
+from src.backtest.replay.clock import ReplayClock
 from src.backtest.replay.candle_oracle import CandleOracle
 from src.backtest.replay.api_manager_shim import (
     ReplayAPIManager,
@@ -108,6 +107,7 @@ class ReplayHarness:
         build_container: bool = False,
         run_id: Optional[str] = None,
         keep_replay_db: bool = True,
+        frozen_xgb_model: Optional[str] = None,
     ):
         if end_ts_ms <= start_ts_ms:
             raise ValueError(f"end_ts_ms ({end_ts_ms}) must be > start_ts_ms ({start_ts_ms})")
@@ -122,6 +122,7 @@ class ReplayHarness:
         self._build_container = bool(build_container)
         self._run_id = run_id
         self._keep_replay_db = bool(keep_replay_db)
+        self._frozen_xgb_model = frozen_xgb_model
 
         # Lazy-built in __enter__
         self.clock: Optional[ReplayClock] = None
@@ -179,7 +180,10 @@ class ReplayHarness:
             self.replay_db.reset_runtime_state()
 
             from src.backtest.replay.subsystem_assembly import build_replay_container
-            self.container, container_stubs = build_replay_container()
+            self.container, container_stubs = build_replay_container(
+                enable_xgboost=bool(self._frozen_xgb_model),
+                xgboost_model_path=self._frozen_xgb_model,
+            )
             # The stubs created during assembly are the ones actually on the
             # container; use them for telemetry instead of the bag we created
             # at step 5.
