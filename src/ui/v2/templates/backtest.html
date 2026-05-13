@@ -31,6 +31,67 @@
   </div>
 </section>
 
+<section class="grid grid-cols-1 md:grid-cols-3 gap-3 mb-6">
+  <div class="bg-slate-900 border border-slate-800 rounded p-4">
+    <h2 class="text-sm font-semibold text-slate-300">Run replay validation</h2>
+    <p class="mt-1 text-xs text-slate-500">
+      Replays the densest production audit window and diffs live decisions
+      against replay decisions. Use this to decide whether replay research is
+      trustworthy before tuning strategy parameters.
+    </p>
+    <form id="replay-run-form"
+          hx-post="/api/replay/run"
+          hx-trigger="submit"
+          hx-swap="none"
+          class="mt-3 grid grid-cols-2 gap-2 items-end">
+      <div class="col-span-2">
+        <label class="block text-[10px] uppercase text-slate-500">coins</label>
+        <input name="coins" type="text" value="BTC,ETH,SOL,HYPE,XRP,DOGE,BNB,ADA,AVAX,LINK"
+               class="w-full bg-slate-950 border border-slate-700 rounded px-2 py-1 text-xs font-mono" />
+      </div>
+      <div>
+        <label class="block text-[10px] uppercase text-slate-500">window days</label>
+        <input name="window_days" type="number" value="3" min="1" max="30"
+               class="w-full bg-slate-950 border border-slate-700 rounded px-2 py-1 text-xs" />
+      </div>
+      <div>
+        <label class="block text-[10px] uppercase text-slate-500">step</label>
+        <select name="step" class="w-full bg-slate-950 border border-slate-700 rounded px-2 py-1 text-xs">
+          <option value="1h" selected>1h</option>
+          <option value="30m">30m</option>
+          <option value="15m">15m</option>
+          <option value="5m">5m</option>
+        </select>
+      </div>
+      <div>
+        <label class="block text-[10px] uppercase text-slate-500">live match</label>
+        <input name="min_live_match_rate" type="number" value="0.70" min="0" max="1" step="0.05"
+               class="w-full bg-slate-950 border border-slate-700 rounded px-2 py-1 text-xs" />
+      </div>
+      <div>
+        <label class="block text-[10px] uppercase text-slate-500">replay match</label>
+        <input name="min_replay_match_rate" type="number" value="0.70" min="0" max="1" step="0.05"
+               class="w-full bg-slate-950 border border-slate-700 rounded px-2 py-1 text-xs" />
+      </div>
+      <button class="col-span-2 bg-sky-600 hover:bg-sky-500 text-white text-xs font-semibold py-1.5 px-3 rounded">
+        Start Replay Validation
+      </button>
+    </form>
+    <div id="replay-run-result" class="mt-2 text-xs"></div>
+  </div>
+
+  <div class="bg-slate-900 border border-slate-800 rounded p-4 md:col-span-2"
+       hx-get="/api/replay/status"
+       hx-trigger="load, every 5s"
+       hx-swap="none">
+    <div class="flex items-center justify-between gap-3">
+      <h2 class="text-sm font-semibold text-slate-300">Replay validation status</h2>
+      <span class="text-[10px] uppercase text-slate-500">live vs replay audit diff</span>
+    </div>
+    <div id="replay-status-pane" class="mt-3 text-xs text-slate-300">Loading...</div>
+  </div>
+</section>
+
 <section>
   <h2 class="text-sm font-semibold text-slate-300 mb-2">Recent backtest results</h2>
   <div class="overflow-x-auto bg-slate-900 border border-slate-800 rounded">
@@ -73,6 +134,18 @@
   const escapeBacktestHtml = (value) => String(value ?? '').replace(/[&<>"']/g, (ch) => ({
     '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
   }[ch]));
+  const replayPct = (value) => {
+    const n = Number(value ?? 0);
+    return `${(n * 100).toFixed(1)}%`;
+  };
+  const replayFileName = (value) => String(value || '').split(/[\\/]/).pop();
+  const renderReplayReasons = (title, rows) => {
+    if (!Array.isArray(rows) || rows.length === 0) return '';
+    const items = rows.slice(0, 5).map(([reason, count]) =>
+      `<li>${escapeBacktestHtml(reason)} <span class="text-slate-500">x${count}</span></li>`
+    ).join('');
+    return `<div class="mt-2"><div class="text-slate-500">${title}</div><ul class="list-disc list-inside text-slate-400">${items}</ul></div>`;
+  };
 
   document.body.addEventListener('htmx:afterRequest', (ev) => {
     const path = ev.detail.requestConfig?.path || '';
@@ -115,6 +188,73 @@
       }
       pane.innerHTML = lines.join('');
       return;
+    }
+
+    if (path === '/api/replay/status') {
+      const pane = document.getElementById('replay-status-pane');
+      if (!pane) return;
+      let body;
+      try { body = JSON.parse(ev.detail.xhr.responseText); } catch { return; }
+      const lines = [];
+      const progress = body.progress || {};
+      const latest = body.last_result || (body.recent_results || [])[0];
+      if (body.running) {
+        const elapsed = body.elapsed_s ? `${Math.round(body.elapsed_s)}s` : '?';
+        lines.push(`<div class="text-amber-300">Running (${elapsed} elapsed) - ${escapeBacktestHtml(progress.phase || 'running')}</div>`);
+        if (progress.coins) {
+          lines.push(`<div class="text-slate-500 mt-1">coins: ${escapeBacktestHtml(progress.coins)} | window: ${progress.window_days || 3}d | step: ${escapeBacktestHtml(progress.step || '1h')}</div>`);
+        }
+      } else if (body.last_error && !latest) {
+        lines.push(`<div class="text-rose-300">last error: ${escapeBacktestHtml(body.last_error)}</div>`);
+      } else if (latest) {
+        const diag = latest.diagnostics || {};
+        const totals = latest.totals || {};
+        const tone = latest.trustworthy ? 'text-emerald-300' : 'text-amber-300';
+        lines.push(`<div class="${tone}">Latest replay: ${escapeBacktestHtml(latest.status || 'complete')} | live ${replayPct(diag.live_match_rate)} | replay ${replayPct(diag.replay_match_rate)}</div>`);
+        lines.push(`<div class="grid grid-cols-2 md:grid-cols-5 gap-2 mt-3">
+          <div class="bg-slate-950/70 rounded p-2"><div class="text-slate-500">live</div><div class="font-mono">${totals.live ?? 0}</div></div>
+          <div class="bg-slate-950/70 rounded p-2"><div class="text-slate-500">replay</div><div class="font-mono">${totals.replay ?? 0}</div></div>
+          <div class="bg-slate-950/70 rounded p-2"><div class="text-slate-500">matched</div><div class="font-mono">${totals.matched ?? 0}</div></div>
+          <div class="bg-slate-950/70 rounded p-2"><div class="text-slate-500">live-only</div><div class="font-mono">${totals.live_only ?? 0}</div></div>
+          <div class="bg-slate-950/70 rounded p-2"><div class="text-slate-500">replay-only</div><div class="font-mono">${totals.replay_only ?? 0}</div></div>
+        </div>`);
+        if (latest.window) {
+          lines.push(`<div class="text-slate-500 mt-2">window: ${escapeBacktestHtml(latest.window.start_iso || latest.window.start || '?')} -> ${escapeBacktestHtml(latest.window.end_iso || latest.window.end || '?')}</div>`);
+        }
+        if (latest.report_path) {
+          lines.push(`<div class="text-slate-500 mt-1">reports: ${escapeBacktestHtml(replayFileName(latest.report_path))} / ${escapeBacktestHtml(replayFileName(latest.diff_report_path))}</div>`);
+        }
+        if (diag.guidance) {
+          lines.push(`<div class="text-slate-400 mt-2">${escapeBacktestHtml(diag.guidance)}</div>`);
+        }
+        lines.push(renderReplayReasons('top live-only reasons', latest.top_live_only_reasons));
+        lines.push(renderReplayReasons('top replay-only reasons', latest.top_replay_only_reasons));
+        if (body.last_error) {
+          lines.push(`<details class="mt-2"><summary class="text-rose-300 cursor-pointer">last stderr</summary><pre class="mt-1 whitespace-pre-wrap text-[11px] text-slate-500">${escapeBacktestHtml(body.last_error)}</pre></details>`);
+        }
+      } else {
+        lines.push('<div class="text-slate-400">Idle. No replay validation has been run from the dashboard yet.</div>');
+      }
+      pane.innerHTML = lines.join('');
+      return;
+    }
+
+    if (path === '/api/replay/run') {
+      const resultEl = document.getElementById('replay-run-result');
+      if (!resultEl) return;
+      let body;
+      try { body = JSON.parse(ev.detail.xhr.responseText); } catch { body = {}; }
+      const xhr = ev.detail.xhr;
+      if (xhr.status >= 200 && xhr.status < 300) {
+        resultEl.className = 'mt-2 text-xs text-emerald-300';
+        resultEl.textContent = `Replay validation started (${body.params?.window_days || 3}d window). Status will poll every 5s.`;
+      } else if (xhr.status === 409) {
+        resultEl.className = 'mt-2 text-xs text-amber-300';
+        resultEl.textContent = 'Another replay validation is already running.';
+      } else {
+        resultEl.className = 'mt-2 text-xs text-rose-300';
+        resultEl.textContent = body.error || body.message || 'Failed to start replay validation.';
+      }
     }
 
     if (path === '/api/backtest/run') {

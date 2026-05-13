@@ -2742,6 +2742,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
         elif parsed.path == "/api/backtest":
             self._serve_backtest_data()
 
+        elif parsed.path == "/api/replay/status":
+            self._serve_replay_status()
+
         elif parsed.path == "/api/candle-backtest/cache":
             self._serve_cache_list()
 
@@ -2767,6 +2770,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._handle_order()
         elif parsed.path == "/api/backtest/run":
             self._handle_backtest_run()
+        elif parsed.path == "/api/replay/run":
+            self._handle_replay_run()
         elif parsed.path == "/api/paper/reset":
             self._handle_paper_reset()
         elif parsed.path == "/api/trade/close":
@@ -3130,6 +3135,46 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self._json_response(data)
             else:
                 self._json_response({"error": "Wallet not found"}, code=404)
+        except Exception as e:
+            self._json_response({"error": str(e)}, code=500)
+
+    def _serve_replay_status(self):
+        """Serve replay validation job status and latest reports."""
+        try:
+            from src.ui.replay_dashboard import get_replay_status
+            self._json_response(get_replay_status())
+        except Exception as e:
+            self._json_response({"error": str(e)}, code=500)
+
+    def _handle_replay_run(self):
+        """Trigger production-audit replay validation in the background."""
+        try:
+            from src.ui.replay_dashboard import params_from_mapping, start_replay_validation
+
+            values: dict = {}
+            raw_body = self._read_request_body()
+            if raw_body is None:
+                return
+            if raw_body:
+                content_type = (self.headers.get("Content-Type") or "").lower()
+                if "application/json" in content_type:
+                    try:
+                        body = json.loads(raw_body.decode("utf-8", errors="ignore") or "{}")
+                        if isinstance(body, dict):
+                            values.update(body)
+                    except json.JSONDecodeError as exc:
+                        self._json_response({"error": f"invalid_json: {exc.msg}"}, code=400)
+                        return
+                else:
+                    form = parse_qs(raw_body.decode("utf-8", errors="ignore"))
+                    values.update({key: vals[-1] for key, vals in form.items() if vals})
+            query_params = parse_qs(urlparse(self.path).query)
+            values.update({key: vals[-1] for key, vals in query_params.items() if vals})
+            result = start_replay_validation(params_from_mapping(values))
+            self._json_response(
+                result,
+                code=409 if result.get("error") == "replay_job_already_running" else 200,
+            )
         except Exception as e:
             self._json_response({"error": str(e)}, code=500)
 

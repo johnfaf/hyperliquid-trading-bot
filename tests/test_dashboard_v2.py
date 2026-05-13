@@ -393,6 +393,42 @@ def test_backtest_status_endpoint(client):
     assert "recent_results" in payload
 
 
+def test_replay_status_endpoint(client):
+    r = client.get("/api/replay/status")
+    assert r.status_code == 200
+    payload = r.json()
+    assert "running" in payload
+    assert "recent_results" in payload
+
+
+def test_replay_run_starts_dashboard_job(client, monkeypatch):
+    from src.ui.v2.routers import backtest as backtest_router
+
+    calls = []
+
+    def _fake_start(params):
+        calls.append(params)
+        return {"status": "started", "started_at": 123.0, "params": params.__dict__}
+
+    monkeypatch.setattr(backtest_router, "start_replay_validation", _fake_start)
+    r = client.post(
+        "/api/replay/run",
+        data={"coins": "BTC,ETH", "window_days": 3, "step": "1h"},
+    )
+
+    assert r.status_code == 200
+    payload = r.json()
+    assert payload["status"] == "started"
+    assert calls and calls[0].coins == "BTC,ETH"
+
+
+def test_replay_run_requires_auth_when_token_set(monkeypatch, app):
+    monkeypatch.setenv("DASHBOARD_AUTH_TOKEN", "secret")
+    client = TestClient(app)
+    r = client.post("/api/replay/run", data={"coins": "BTC"})
+    assert r.status_code == 401
+
+
 def test_backtest_run_requires_auth_when_token_set(monkeypatch, app):
     monkeypatch.setenv("DASHBOARD_AUTH_TOKEN", "secret")
     client = TestClient(app)

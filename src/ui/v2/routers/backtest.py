@@ -17,6 +17,12 @@ from typing import Any, Dict, Optional
 from fastapi import APIRouter, Form, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
+from src.ui.replay_dashboard import (
+    DEFAULT_REPLAY_COINS,
+    get_replay_status,
+    params_from_mapping,
+    start_replay_validation,
+)
 from src.ui.v2.auth import require_auth, verify_cookie
 
 logger = logging.getLogger(__name__)
@@ -252,6 +258,41 @@ async def backtest_run(request: Request, max_wallets: int = Form(30)):
         "requested_max_wallets": requested,
         "max_wallets": capped,
     })
+
+
+@router.get("/api/replay/status", response_class=JSONResponse)
+async def replay_status(request: Request):
+    redirect = require_auth(request)
+    if redirect is not None:
+        return JSONResponse({"error": "auth_required"}, status_code=401)
+    return JSONResponse(get_replay_status())
+
+
+@router.post("/api/replay/run")
+async def replay_run(
+    request: Request,
+    coins: str = Form(DEFAULT_REPLAY_COINS),
+    window_days: int = Form(3),
+    min_rows: int = Form(1),
+    step: str = Form("1h"),
+    min_live_match_rate: float = Form(0.70),
+    min_replay_match_rate: float = Form(0.70),
+):
+    if not verify_cookie(request):
+        return JSONResponse({"error": "auth_required"}, status_code=401)
+
+    params = params_from_mapping({
+        "coins": coins,
+        "window_days": window_days,
+        "min_rows": min_rows,
+        "step": step,
+        "min_live_match_rate": min_live_match_rate,
+        "min_replay_match_rate": min_replay_match_rate,
+    })
+    result = start_replay_validation(params)
+    if result.get("error") == "replay_job_already_running":
+        return JSONResponse(result, status_code=409)
+    return JSONResponse(result)
 
 
 @router.get("/backtest", response_class=HTMLResponse)

@@ -382,6 +382,42 @@ BACKTEST_HTML = """<!DOCTYPE html>
     </div>
   </div>
 
+  <!-- Replay Validation Section -->
+  <div class="paper-section" id="replay-section">
+    <div class="section-row">
+      <div>
+        <h2 style="margin:0">Replay Validation</h2>
+        <div class="subtitle">Replay a production audit window and compare live decisions against replay decisions.</div>
+      </div>
+      <button class="btn btn-outline" id="replayBtn" onclick="runReplayValidation()">Run Replay Validation</button>
+    </div>
+    <div class="flex-row" style="margin-top:14px">
+      <div>
+        <label style="display:block;color:var(--dim);font-size:10px;text-transform:uppercase;letter-spacing:.8px">Coins</label>
+        <input id="replay-coins" value="BTC,ETH,SOL,HYPE,XRP,DOGE,BNB,ADA,AVAX,LINK"
+               style="width:100%;background:#0e1319;border:1px solid var(--border);color:var(--text);border-radius:8px;padding:8px;font-family:monospace">
+      </div>
+      <div>
+        <label style="display:block;color:var(--dim);font-size:10px;text-transform:uppercase;letter-spacing:.8px">Window days</label>
+        <input id="replay-days" type="number" min="1" max="30" value="3"
+               style="width:100%;background:#0e1319;border:1px solid var(--border);color:var(--text);border-radius:8px;padding:8px">
+      </div>
+      <div>
+        <label style="display:block;color:var(--dim);font-size:10px;text-transform:uppercase;letter-spacing:.8px">Step</label>
+        <select id="replay-step"
+                style="width:100%;background:#0e1319;border:1px solid var(--border);color:var(--text);border-radius:8px;padding:8px">
+          <option value="1h">1h</option>
+          <option value="30m">30m</option>
+          <option value="15m">15m</option>
+          <option value="5m">5m</option>
+        </select>
+      </div>
+    </div>
+    <div id="replay-status" style="margin-top:12px;color:var(--dim);font-size:12px;min-height:18px;">Loading replay status...</div>
+    <div class="stats-grid" id="replay-stats" style="margin-top:14px"></div>
+    <div id="replay-diagnostics" style="margin-top:10px;font-size:12px;color:var(--dim);"></div>
+  </div>
+
   <!-- Overview page -->
   <div id="overview-page">
     <div class="stats-grid" id="summary-stats"></div>
@@ -475,6 +511,7 @@ async function load() {
     }
     renderOverview();
     renderPaperStats();
+    pollReplayStatus();
   } catch(e) {
     document.getElementById('status-msg').textContent = 'No backtest data yet. Click "Run Golden Scan" to start.';
   }
@@ -548,6 +585,104 @@ function isEthAddress(a) { return /^0x[a-fA-F0-9]{40}$/.test(String(a || '')); }
 function shortAddr(a) {
   const text = String(a || '');
   return isEthAddress(text) ? text.slice(0,6) + '...' + text.slice(-4) : 'invalid';
+}
+
+function pct(v) {
+  const n = Number(v || 0);
+  return (n * 100).toFixed(1) + '%';
+}
+
+function replayFileName(v) {
+  return String(v || '').split(/[\\\\/]/).pop();
+}
+
+async function pollReplayStatus() {
+  try {
+    const r = await fetch('/api/replay/status');
+    const data = await r.json();
+    renderReplayStatus(data);
+  } catch(e) {
+    const status = document.getElementById('replay-status');
+    if (status) status.textContent = 'Replay status unavailable: ' + e.message;
+  }
+}
+
+function renderReplayReasonList(title, rows) {
+  if (!Array.isArray(rows) || !rows.length) return '';
+  return `<div style="margin-top:8px"><strong>${escHtml(title)}</strong><ul style="margin:4px 0 0 18px">` +
+    rows.slice(0,5).map(([reason, count]) => `<li>${escHtml(reason)} <span style="color:var(--dim)">x${count}</span></li>`).join('') +
+    '</ul></div>';
+}
+
+function renderReplayStatus(data) {
+  const status = document.getElementById('replay-status');
+  const stats = document.getElementById('replay-stats');
+  const diagEl = document.getElementById('replay-diagnostics');
+  if (!status || !stats || !diagEl) return;
+  const latest = data.last_result || (data.recent_results || [])[0];
+  if (data.running) {
+    const elapsed = data.elapsed_s ? Math.round(data.elapsed_s) + 's' : '?';
+    const progress = data.progress || {};
+    status.innerHTML = `<span class="gold">Running (${elapsed} elapsed)</span> - ${escHtml(progress.phase || 'running')}`;
+    stats.innerHTML = '';
+    diagEl.textContent = `coins=${progress.coins || 'default'} window=${progress.window_days || 3}d step=${progress.step || '1h'}`;
+    return;
+  }
+  if (!latest) {
+    status.textContent = data.last_error ? 'Last replay error: ' + data.last_error : 'No replay validation run yet.';
+    stats.innerHTML = '';
+    diagEl.innerHTML = '';
+    return;
+  }
+  const diag = latest.diagnostics || {};
+  const totals = latest.totals || {};
+  const ok = latest.trustworthy;
+  status.innerHTML = `<span class="${ok ? 'positive' : 'gold'}">${escHtml(latest.status || 'complete')}</span> - live ${pct(diag.live_match_rate)} / replay ${pct(diag.replay_match_rate)}`;
+  stats.innerHTML = `
+    <div class="stat-card"><div class="stat-label">Live decisions</div><div class="stat-value">${totals.live || 0}</div></div>
+    <div class="stat-card"><div class="stat-label">Replay decisions</div><div class="stat-value">${totals.replay || 0}</div></div>
+    <div class="stat-card"><div class="stat-label">Matched</div><div class="stat-value positive">${totals.matched || 0}</div></div>
+    <div class="stat-card"><div class="stat-label">Live-only</div><div class="stat-value gold">${totals.live_only || 0}</div></div>
+    <div class="stat-card"><div class="stat-label">Replay-only</div><div class="stat-value gold">${totals.replay_only || 0}</div></div>
+  `;
+  const windowInfo = latest.window
+    ? `<div>window: <code>${escHtml(latest.window.start_iso || latest.window.start || '?')}</code> -> <code>${escHtml(latest.window.end_iso || latest.window.end || '?')}</code></div>`
+    : '';
+  const reportInfo = latest.report_path
+    ? `<div>reports: <code>${escHtml(replayFileName(latest.report_path))}</code> / <code>${escHtml(replayFileName(latest.diff_report_path))}</code></div>`
+    : '';
+  diagEl.innerHTML = windowInfo + reportInfo +
+    (diag.guidance ? `<div style="margin-top:6px">${escHtml(diag.guidance)}</div>` : '') +
+    renderReplayReasonList('Top live-only reasons', latest.top_live_only_reasons) +
+    renderReplayReasonList('Top replay-only reasons', latest.top_replay_only_reasons);
+}
+
+async function runReplayValidation() {
+  const btn = document.getElementById('replayBtn');
+  const status = document.getElementById('replay-status');
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span>Replaying...';
+  status.textContent = 'Starting replay validation...';
+  try {
+    const body = {
+      coins: document.getElementById('replay-coins').value,
+      window_days: parseInt(document.getElementById('replay-days').value || '3'),
+      step: document.getElementById('replay-step').value,
+    };
+    const r = await fetch('/api/replay/run', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(body),
+    });
+    const result = await r.json();
+    if (!r.ok) throw new Error(result.error || 'Replay validation failed to start');
+    status.textContent = 'Replay validation started. Status refreshes every 10s.';
+    await pollReplayStatus();
+  } catch(e) {
+    status.textContent = 'Replay validation failed: ' + e.message;
+  }
+  btn.disabled = false;
+  btn.textContent = 'Run Replay Validation';
 }
 
 function renderOverview() {
@@ -1079,6 +1214,7 @@ function renderCbtTradeTable(trades) {
 
 // Auto-refresh every 30s
 setInterval(load, 30000);
+setInterval(pollReplayStatus, 10000);
 load();
 </script>
 </body>
