@@ -8,6 +8,10 @@ from src.trading.paper_trader import PaperTrader
 from src.trading.portfolio_rotation import RotationDecision
 
 
+COPY_ADDR_A = "0xabc0000000000000000000000000000000000000"
+COPY_ADDR_B = "0xdef0000000000000000000000000000000000000"
+
+
 def _open_trade(
     trade_id: int,
     coin: str,
@@ -95,7 +99,7 @@ def test_copy_trader_rotation_prescreen_bypasses_capacity(monkeypatch):
                 "price": 100.0,
                 "leverage": 2,
                 "confidence": 0.9,
-                "source_trader": "0xabc",
+                "source_trader": COPY_ADDR_A,
             }
         ],
         regime_data={"overall_regime": "neutral"},
@@ -127,7 +131,7 @@ def test_copy_trader_scale_out_signal_closes_source_reduce(monkeypatch):
     open_copy["metadata"] = {
         "is_copy_trade": True,
         "source": "copy_trade",
-        "source_trader": "0xabc",
+        "source_trader": COPY_ADDR_A,
     }
     closed = []
 
@@ -151,7 +155,7 @@ def test_copy_trader_scale_out_signal_closes_source_reduce(monkeypatch):
                 "type": "copy_scale_out",
                 "coin": "BTC",
                 "confidence": 1.0,
-                "source_trader": "0xabc",
+                "source_trader": COPY_ADDR_A,
             }
         ],
         regime_data={"overall_regime": "neutral"},
@@ -179,11 +183,11 @@ def test_copy_trader_auto_pauses_new_entries_when_copy_book_is_bad(monkeypatch):
     monkeypatch.setattr(
         "src.trading.copy_trader.db.get_paper_trade_history",
         lambda limit=250, mode="any": [
-            {"side": "short", "pnl": -12.0, "metadata": {"source_key": "copy_trade:0xabc"}},
-            {"side": "short", "pnl": -9.0, "metadata": {"source_key": "copy_trade:0xdef"}},
-            {"side": "long", "pnl": -8.0, "metadata": {"source_key": "copy_trade:0xabc"}},
-            {"side": "short", "pnl": -7.0, "metadata": {"source_key": "copy_trade:0xabc"}},
-            {"side": "long", "pnl": -6.0, "metadata": {"source_key": "copy_trade:0xdef"}},
+            {"side": "short", "pnl": -12.0, "metadata": {"source_key": f"copy_trade:{COPY_ADDR_A}"}},
+            {"side": "short", "pnl": -9.0, "metadata": {"source_key": f"copy_trade:{COPY_ADDR_B}"}},
+            {"side": "long", "pnl": -8.0, "metadata": {"source_key": f"copy_trade:{COPY_ADDR_A}"}},
+            {"side": "short", "pnl": -7.0, "metadata": {"source_key": f"copy_trade:{COPY_ADDR_A}"}},
+            {"side": "long", "pnl": -6.0, "metadata": {"source_key": f"copy_trade:{COPY_ADDR_B}"}},
         ],
     )
     monkeypatch.setattr("src.trading.copy_trader.hl.get_all_mids", lambda: {"BTC": 100.0})
@@ -200,7 +204,7 @@ def test_copy_trader_auto_pauses_new_entries_when_copy_book_is_bad(monkeypatch):
                 "price": 100.0,
                 "leverage": 2,
                 "confidence": 0.8,
-                "source_trader": "0xabc",
+                "source_trader": COPY_ADDR_A,
             }
         ],
         regime_data={"overall_regime": "neutral"},
@@ -244,7 +248,7 @@ def test_copy_trader_hard_caps_concurrent_copy_positions(monkeypatch):
                 "price": 100.0,
                 "leverage": 2,
                 "confidence": 0.8,
-                "source_trader": "0xabc",
+                "source_trader": COPY_ADDR_A,
             }
         ],
         regime_data={"overall_regime": "neutral"},

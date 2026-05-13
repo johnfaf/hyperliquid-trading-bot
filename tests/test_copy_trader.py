@@ -479,6 +479,49 @@ class TestDetectPositionChanges:
         assert abs(signals[0]["confidence"] - expected) < 0.001
 
 
+def test_execute_rejects_truncated_hex_source_before_firewall(monkeypatch, caplog):
+    """The 0.43 cascade came from short-form source keys like 0x1ee7a73c.
+
+    If a future signal builder regresses and emits that shape again, the copy
+    trader must reject it before source-side guard / agent scorer / firewall
+    can create more fragmented state.
+    """
+    ct = CopyTrader()
+    monkeypatch.setattr("src.trading.copy_trader.db.get_paper_account", lambda: {"balance": 10_000.0})
+    monkeypatch.setattr("src.trading.copy_trader.db.get_open_paper_trades", lambda: [])
+    monkeypatch.setattr("src.trading.copy_trader.hl.get_all_mids", lambda: {"BTC": 50_000.0})
+    monkeypatch.setattr(ct, "_annotate_open_trades", lambda trades, mids: None)
+    monkeypatch.setattr(
+        ct,
+        "_refresh_copy_guardrail_status",
+        lambda: {"status": "healthy", "reason": "test"},
+    )
+    monkeypatch.setattr(
+        ct,
+        "_open_copy_trade",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("truncated source should never open")
+        ),
+    )
+
+    with caplog.at_level(logging.WARNING):
+        executed = ct.execute_copy_signals(
+            [{
+                "type": "copy_open",
+                "coin": "BTC",
+                "side": "long",
+                "price": 50_000.0,
+                "leverage": 2,
+                "confidence": 0.85,
+                "source_trader": "0x1ee7a73c",
+            }],
+            regime_data={"overall_regime": "neutral"},
+        )
+
+    assert executed == []
+    assert "truncated_source_trader_address" in caplog.text
+
+
 def test_open_copy_trade_logs_sizer_fallback(monkeypatch, caplog):
     class BrokenSizer:
         pass

@@ -127,6 +127,15 @@ def _cmd_run(args: argparse.Namespace) -> int:
         report = h.build_report(tick_count=completed_ticks, step_ms=step_ms)
         report_dict = _build_report_dict(h, args, snapshot, report,
                                          completed_ticks, failed_ticks, last_err)
+        if args.diff_live_db:
+            report_dict["decision_diff"] = _build_decision_diff_report(
+                live_db=args.diff_live_db,
+                replay_db=str(h.replay_db.db_path),
+                start_ms=start_ms,
+                end_ms=end_ms,
+                match_window_s=args.diff_match_window,
+                report_out=args.diff_report_out,
+            )
 
         if args.report_out:
             out_path = Path(args.report_out)
@@ -184,6 +193,47 @@ def _build_report_dict(h, args, snapshot, report, completed_ticks, failed_ticks,
             "audit_trail_rows": audit_count,
         },
     }
+
+
+def _iso_from_ms(ts_ms: int) -> str:
+    return datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).isoformat()
+
+
+def _build_decision_diff_report(
+    *,
+    live_db: str,
+    replay_db: str,
+    start_ms: int,
+    end_ms: int,
+    match_window_s: float,
+    report_out: str | None = None,
+) -> dict:
+    """Attach replay-vs-live audit diff to a replay run report."""
+    from scripts import replay_audit_diff
+
+    start_iso = _iso_from_ms(start_ms)
+    end_iso = _iso_from_ms(end_ms)
+    live_rows = replay_audit_diff._load_audit(live_db, start_iso, end_iso)
+    replay_rows = replay_audit_diff._load_audit(replay_db, start_iso, end_iso)
+    diff = replay_audit_diff.diff_audit_trails(
+        live_rows,
+        replay_rows,
+        match_window_s=match_window_s,
+    )
+    out = diff.to_dict()
+    out["config"] = {
+        "live": live_db,
+        "replay": replay_db,
+        "start": start_iso,
+        "end": end_iso,
+        "match_window_s": match_window_s,
+    }
+    if report_out:
+        out_path = Path(report_out)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        with out_path.open("w", encoding="utf-8") as f:
+            json.dump(out, f, indent=2, default=str, sort_keys=True)
+    return out
 
 
 def _print_summary(report: dict, h) -> None:
@@ -286,6 +336,12 @@ def main(argv: list[str] | None = None) -> int:
     # Output
     parser.add_argument("--report-out",
                         help="Where to write the JSON run report")
+    parser.add_argument("--diff-live-db",
+                        help="Optional live bot DB to diff against the replay audit_trail")
+    parser.add_argument("--diff-match-window", type=float, default=600.0,
+                        help="Decision diff matching tolerance in seconds. Default 600.")
+    parser.add_argument("--diff-report-out",
+                        help="Optional standalone JSON output for the decision diff")
 
     args = parser.parse_args(argv)
 

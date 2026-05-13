@@ -112,6 +112,22 @@ def test_diff_different_coin_no_match(tmp_path):
     assert diff.replay_only == 1
 
 
+def test_diff_different_side_no_match(tmp_path):
+    """A replay BTC short must not match a live BTC long."""
+    live = _make_audit_db(tmp_path, "live.db", [
+        (_ts(2025, 8, 1, 12, 0), "signal_approved", "BTC", "long", "momentum", {}),
+    ])
+    replay = _make_audit_db(tmp_path, "replay.db", [
+        (_ts(2025, 8, 1, 12, 0), "signal_approved", "BTC", "short", "momentum", {}),
+    ])
+    lr = audit_diff._load_audit(live, _ts(2025, 8, 1), _ts(2025, 8, 2))
+    rr = audit_diff._load_audit(replay, _ts(2025, 8, 1), _ts(2025, 8, 2))
+    diff = audit_diff.diff_audit_trails(lr, rr, match_window_s=600.0)
+    assert diff.matched == 0
+    assert diff.live_only == 1
+    assert diff.replay_only == 1
+
+
 def test_diff_action_breakdown(tmp_path):
     """by_action counters should reflect each action category."""
     live = _make_audit_db(tmp_path, "live.db", [
@@ -192,3 +208,37 @@ def test_diff_one_replay_row_matches_one_live_row(tmp_path):
     assert diff.matched == 1
     assert diff.live_only == 1
     assert diff.replay_only == 0
+
+
+def test_diff_does_not_consume_stale_replay_rows_when_later_row_matches(tmp_path):
+    """A too-early replay row stays replay_only even if a later replay row matches."""
+    live = _make_audit_db(tmp_path, "live.db", [
+        (_ts(2025, 8, 1, 12, 0), "signal_approved", "BTC", "long", "momentum", {}),
+    ])
+    replay = _make_audit_db(tmp_path, "replay.db", [
+        (_ts(2025, 8, 1, 11, 0), "signal_approved", "BTC", "long", "momentum", {}),
+        (_ts(2025, 8, 1, 12, 0), "signal_approved", "BTC", "long", "momentum", {}),
+    ])
+    lr = audit_diff._load_audit(live, _ts(2025, 8, 1), _ts(2025, 8, 2))
+    rr = audit_diff._load_audit(replay, _ts(2025, 8, 1), _ts(2025, 8, 2))
+    diff = audit_diff.diff_audit_trails(lr, rr, match_window_s=300.0)
+    assert diff.matched == 1
+    assert diff.live_only == 0
+    assert diff.replay_only == 1
+    assert diff.by_action_replay["signal_approved"] == 2
+
+
+def test_diff_chooses_closest_replay_row_in_window(tmp_path):
+    """Within-window matching should prefer the closest row, not the first row."""
+    live = _make_audit_db(tmp_path, "live.db", [
+        (_ts(2025, 8, 1, 12, 0), "signal_approved", "BTC", "long", "momentum", {}),
+    ])
+    replay = _make_audit_db(tmp_path, "replay.db", [
+        (_ts(2025, 8, 1, 11, 55), "signal_approved", "BTC", "long", "momentum", {}),
+        (_ts(2025, 8, 1, 12, 1), "signal_approved", "BTC", "long", "momentum", {}),
+    ])
+    lr = audit_diff._load_audit(live, _ts(2025, 8, 1), _ts(2025, 8, 2))
+    rr = audit_diff._load_audit(replay, _ts(2025, 8, 1), _ts(2025, 8, 2))
+    diff = audit_diff.diff_audit_trails(lr, rr, match_window_s=600.0)
+    assert diff.matched == 1
+    assert diff.replay_only == 1

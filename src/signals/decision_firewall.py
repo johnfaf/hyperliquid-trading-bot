@@ -1634,7 +1634,11 @@ class DecisionFirewall:
                 wr = ci.get("win_rate")
                 tc = ci.get("trade_count")
                 if wr is not None:
-                    extra = f" [signal_type={stype}, trader_win_rate={float(wr):.2%}, trades={tc}]"
+                    try:
+                        wr_text = f"{float(wr):.2%}"
+                    except (TypeError, ValueError):
+                        wr_text = str(wr)
+                    extra = f" [signal_type={stype}, trader_win_rate={wr_text}, trades={tc}]"
             return (
                 False,
                 f"Source allocator requires {min_conf:.0%} confidence for {source_key} "

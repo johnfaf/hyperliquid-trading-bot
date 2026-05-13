@@ -79,6 +79,12 @@ def test_string_winrate_coerced_or_safe():
     assert 0.5 < conf <= _SIGNAL_CONFIDENCE_MODEL["copy_open"]["max"]
 
 
+def test_bad_string_winrate_falls_back_to_base():
+    """Bad imported metadata should not crash signal generation."""
+    conf = CopyTrader._calculate_signal_confidence("copy_open", "not-a-number")
+    assert conf == _SIGNAL_CONFIDENCE_MODEL["copy_open"]["base"]
+
+
 # --- Observability ----------------------------------------------------
 
 def test_signal_carries_confidence_inputs_for_diagnostics():
@@ -98,5 +104,22 @@ def test_signal_carries_confidence_inputs_for_diagnostics():
     assert "confidence_inputs" in s, f"Signal missing confidence_inputs: {s}"
     inputs = s["confidence_inputs"]
     assert inputs["win_rate"] == pytest.approx(0.06)
+    assert inputs["raw_win_rate"] == pytest.approx(0.06)
     assert inputs["trade_count"] == 17
     assert inputs["signal_type"] == "copy_open"
+
+
+def test_confidence_inputs_store_normalized_percent_winrate():
+    ct = CopyTrader(firewall=None, agent_scorer=None)
+    trader = {"address": "0xabc", "win_rate": 60.0, "trade_count": "3", "total_pnl": 100}
+    signals = ct._detect_position_changes(
+        "0xabc",
+        {},
+        {"BTC": {"side": "long", "size": 1.0, "leverage": 5, "entry_price": 50_000}},
+        trader,
+        {"BTC": 50_000},
+    )
+    inputs = signals[0]["confidence_inputs"]
+    assert inputs["win_rate"] == pytest.approx(0.60)
+    assert inputs["raw_win_rate"] == 60.0
+    assert inputs["trade_count"] == 3

@@ -8,6 +8,7 @@ V2: Signals routed through DecisionFirewall and tracked by AgentScorer.
 """
 import logging
 import json
+import re
 import time
 from datetime import datetime, timezone
 from typing import List, Dict, Optional
@@ -32,6 +33,8 @@ from src.signals.calibration import (
 from src.signals.risk_policy import RiskPolicyEngine
 
 logger = logging.getLogger(__name__)
+
+_TRUNCATED_ETH_ADDRESS_RE = re.compile(r"^0x[0-9a-f]{1,39}$", re.IGNORECASE)
 
 _CRASH_COPY_CONFIDENCE_MULTIPLIER = 0.60
 _NEUTRAL_COPY_CONFIDENCE_MULTIPLIER = 0.70
@@ -178,6 +181,42 @@ class CopyTrader:
 
     def _source_address(self, signal: Dict) -> str:
         return str(signal.get("source_trader", "") or "").strip().lower()
+
+    @staticmethod
+    def _is_truncated_eth_address(value: object) -> bool:
+        """True for the historical bug shape: `0x` + a hex prefix < 40 chars."""
+        text = str(value or "").strip().lower()
+        return bool(_TRUNCATED_ETH_ADDRESS_RE.fullmatch(text))
+
+    @staticmethod
+    def _normalise_win_rate(value: object) -> float:
+        try:
+            rate = float(value or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+        if rate > 1.5:
+            rate /= 100.0
+        return max(0.0, min(rate, 1.0))
+
+    @staticmethod
+    def _entry_source_issue(signal: Dict) -> str:
+        """Reject only the known-dangerous truncated-address source shape.
+
+        Fixture-like values such as ``0xtest`` are left alone for tests and
+        local dry-runs, but a hex prefix like ``0x1ee7a73c`` is exactly the
+        production bug that fragmented scorer state and caused the 0.43 loop.
+        """
+        if str(signal.get("type", "") or "") not in {
+            "copy_open",
+            "copy_scale_in",
+            "copy_flip",
+            "golden_copy",
+        }:
+            return ""
+        source_trader = str(signal.get("source_trader", "") or "").strip().lower()
+        if CopyTrader._is_truncated_eth_address(source_trader):
+            return "truncated_source_trader_address"
+        return ""
 
     def _is_source_blocklisted(self, signal: Dict) -> tuple[bool, str]:
         """Static blocklist check — runs before all guards/policies."""
@@ -326,10 +365,7 @@ class CopyTrader:
         model = _SIGNAL_CONFIDENCE_MODEL.get(signal_type, {"base": 0.50, "max": 0.90})
         base = model["base"]
         cap = model["max"]
-        rate = float(trader_win_rate or 0.0)
-        if rate > 1.5:                  # looks like a percent (e.g. 60.0)
-            rate = rate / 100.0
-        rate = max(0.0, min(rate, 1.0)) # belt-and-braces clamp
+        rate = CopyTrader._normalise_win_rate(trader_win_rate)
         win_contribution = rate * 0.5
         return min(cap, base + win_contribution)
 
@@ -561,14 +597,20 @@ class CopyTrader:
         new_coins = set(new_positions.keys())
 
         win_rate = trader.get("win_rate", 0)
+        normalised_win_rate = self._normalise_win_rate(win_rate)
         normalized_address = str(address or "").strip().lower()
 
         # Observability: stamp the inputs that produced this confidence so the
         # firewall's rejection logs can surface "why 43%" without needing to
         # reverse-engineer the math. Persisted on every emitted signal below.
+        try:
+            trade_count = int(trader.get("trade_count", 0) or 0)
+        except (TypeError, ValueError):
+            trade_count = 0
         confidence_inputs = {
-            "win_rate": float(win_rate or 0.0),
-            "trade_count": int(trader.get("trade_count", 0) or 0),
+            "win_rate": normalised_win_rate,
+            "raw_win_rate": win_rate,
+            "trade_count": trade_count,
         }
 
         # New positions opened by the trader
@@ -846,6 +888,16 @@ class CopyTrader:
 
                 if signal["type"] in ("copy_open", "copy_scale_in", "copy_flip", "golden_copy"):
                     if not allow_new_entries:
+                        continue
+                    source_issue = self._entry_source_issue(signal)
+                    if source_issue:
+                        logger.warning(
+                            "  Copy signal rejected before firewall: %s %s from %r (%s)",
+                            signal.get("side", "?"),
+                            signal.get("coin", "?"),
+                            signal.get("source_trader", ""),
+                            source_issue,
+                        )
                         continue
                     blocklisted, blocklist_reason = self._is_source_blocklisted(signal)
                     if blocklisted:

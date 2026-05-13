@@ -35,7 +35,7 @@ import sqlite3
 import sys
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -64,6 +64,42 @@ class AuditRow:
             ).timestamp()
         except ValueError:
             return 0.0
+
+
+def _norm(value: Optional[str]) -> str:
+    return str(value or "").strip().lower()
+
+
+def _match_key(row: AuditRow) -> Tuple[str, str, str]:
+    """Decision identity for replay-vs-live matching.
+
+    Side matters. A replay that approves a BTC long should not be credited for
+    matching a live BTC short just because the action and timestamp line up.
+    """
+    return (_norm(row.coin), _norm(row.action), _norm(row.side))
+
+
+def _reason_for(row: AuditRow) -> str:
+    """Best-effort mismatch reason extraction from old and new audit schemas."""
+    details = row.details if isinstance(row.details, dict) else {}
+    for key in (
+        "reason",
+        "rejection_reason",
+        "firewall_reason",
+        "status_reason",
+        "decision_reason",
+    ):
+        value = details.get(key)
+        if value:
+            return str(value)[:120]
+    for nested_key in ("firewall", "decision", "result"):
+        nested = details.get(nested_key)
+        if isinstance(nested, dict):
+            for key in ("reason", "rejection_reason", "status_reason"):
+                value = nested.get(key)
+                if value:
+                    return str(value)[:120]
+    return (row.action or "?")[:120]
 
 
 def _load_audit(db_path: str, start_iso: str, end_iso: str) -> List[AuditRow]:
@@ -166,20 +202,31 @@ class DiffResult:
 def diff_audit_trails(
     live: List[AuditRow], replay: List[AuditRow], match_window_s: float = 600.0,
 ) -> DiffResult:
-    """Greedy time-sorted matcher. O(n + m) using two pointers per coin.
+    """Greedy time-sorted matcher using side-aware decision keys.
 
-    Two rows match if action == action, coin == coin, and |dt| <= match_window_s.
+    Two rows match if action, coin, and side all match and |dt| is within the
+    configured window. For each live row we pick the closest unmatched replay
+    row in that key bucket. Older replay rows skipped while seeking a match are
+    still counted as replay_only later; they are never silently consumed.
     """
     result = DiffResult(total_live=len(live), total_replay=len(replay))
 
-    # Index by (coin, action) and sort each bucket by timestamp.
-    buckets_replay: Dict[Tuple[str, str], List[AuditRow]] = defaultdict(list)
-    for r in replay:
-        buckets_replay[(r.coin or "", r.action)].append(r)
-    for k in buckets_replay:
-        buckets_replay[k].sort(key=lambda r: r.ts_epoch)
+    for rrow in replay:
+        result.by_action_replay[rrow.action] += 1
+        if rrow.coin:
+            result.by_coin_replay[rrow.coin] += 1
+        if rrow.source:
+            result.by_source_replay[rrow.source] += 1
 
-    consumed = {k: 0 for k in buckets_replay}
+    # Index by (coin, action, side) and sort each bucket by timestamp.
+    buckets_replay: Dict[Tuple[str, str, str], List[Tuple[int, AuditRow]]] = defaultdict(list)
+    for idx, r in enumerate(replay):
+        buckets_replay[_match_key(r)].append((idx, r))
+    for k in buckets_replay:
+        buckets_replay[k].sort(key=lambda item: item[1].ts_epoch)
+
+    first_candidate = {k: 0 for k in buckets_replay}
+    matched_replay: set[int] = set()
 
     for lrow in live:
         result.by_action_live[lrow.action] += 1
@@ -188,11 +235,11 @@ def diff_audit_trails(
         if lrow.source:
             result.by_source_live[lrow.source] += 1
 
-        key = (lrow.coin or "", lrow.action)
+        key = _match_key(lrow)
         bucket = buckets_replay.get(key)
         if not bucket:
             result.live_only += 1
-            reason = (lrow.details.get("reason") or lrow.action or "?")[:80]
+            reason = _reason_for(lrow)
             result.live_only_reasons[reason] += 1
             if len(result.sample_mismatches) < 40:
                 result.sample_mismatches.append({
@@ -200,59 +247,61 @@ def diff_audit_trails(
                 })
             continue
 
-        # Advance the bucket cursor to the first replay row within window.
-        idx = consumed[key]
-        matched = False
+        # Advance to the first replay row that could still match this live row.
+        # Rows before that pointer remain unmatched and will be counted as
+        # replay_only at the end.
+        lts = lrow.ts_epoch
+        idx = first_candidate.get(key, 0)
         while idx < len(bucket):
-            rrow = bucket[idx]
-            dt = rrow.ts_epoch - lrow.ts_epoch
-            if dt < -match_window_s:
-                # Replay row is before live row's window; already consumed.
+            _, rrow = bucket[idx]
+            if rrow.ts_epoch < lts - match_window_s:
                 idx += 1
                 continue
+            break
+        first_candidate[key] = idx
+
+        best_replay_idx: Optional[int] = None
+        best_abs_dt: Optional[float] = None
+        scan = idx
+        while scan < len(bucket):
+            replay_idx, rrow = bucket[scan]
+            dt = rrow.ts_epoch - lts
             if dt > match_window_s:
                 break
-            # Within window. Mark matched + advance.
-            matched = True
-            consumed[key] = idx + 1
+            if replay_idx not in matched_replay:
+                abs_dt = abs(dt)
+                if best_abs_dt is None or abs_dt < best_abs_dt:
+                    best_abs_dt = abs_dt
+                    best_replay_idx = replay_idx
+            scan += 1
+
+        if best_replay_idx is not None:
+            matched_replay.add(best_replay_idx)
             result.matched += 1
             result.by_action_matched[lrow.action] += 1
             if lrow.coin:
                 result.by_coin_matched[lrow.coin] += 1
-            break
-
-        if not matched:
+        else:
             result.live_only += 1
-            reason = (lrow.details.get("reason") or lrow.action or "?")[:80]
+            reason = _reason_for(lrow)
             result.live_only_reasons[reason] += 1
             if len(result.sample_mismatches) < 40:
                 result.sample_mismatches.append({
                     "kind": "live_only", "row": _row_to_dict(lrow),
                 })
 
-    # Any replay rows not consumed are replay_only.
-    for key, bucket in buckets_replay.items():
-        for rrow in bucket[consumed.get(key, 0):]:
+    # Any replay rows not matched are replay_only.
+    for bucket in buckets_replay.values():
+        for replay_idx, rrow in bucket:
+            if replay_idx in matched_replay:
+                continue
             result.replay_only += 1
-            result.by_action_replay[rrow.action] += 1
-            if rrow.coin:
-                result.by_coin_replay[rrow.coin] += 1
-            if rrow.source:
-                result.by_source_replay[rrow.source] += 1
-            reason = (rrow.details.get("reason") or rrow.action or "?")[:80]
+            reason = _reason_for(rrow)
             result.replay_only_reasons[reason] += 1
             if len(result.sample_mismatches) < 40:
                 result.sample_mismatches.append({
                     "kind": "replay_only", "row": _row_to_dict(rrow),
                 })
-
-    # Count replay rows that were consumed so totals stay honest.
-    for rrow in replay:
-        result.by_action_replay[rrow.action] += 1
-        if rrow.coin:
-            result.by_coin_replay[rrow.coin] += 1
-        if rrow.source:
-            result.by_source_replay[rrow.source] += 1
 
     return result
 
@@ -318,6 +367,10 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--end", required=True, help="ISO date or datetime, exclusive")
     p.add_argument("--match-window", type=float, default=600.0,
                    help="Tolerance window (seconds) for matching rows. Default 600 (10m).")
+    p.add_argument("--min-live-match-rate", type=float, default=0.0,
+                   help="Fail if matched/live is below this decimal threshold, e.g. 0.70.")
+    p.add_argument("--min-replay-match-rate", type=float, default=0.0,
+                   help="Fail if matched/replay is below this decimal threshold, e.g. 0.70.")
     p.add_argument("--report-out", help="JSON output path")
     p.add_argument("--verbose", "-v", action="store_true")
     args = p.parse_args(argv)
@@ -363,6 +416,22 @@ def main(argv: list[str] | None = None) -> int:
     if diff.total_live == 0 and diff.total_replay == 0:
         logger.error("No rows on either side -- check --live / --replay / --start / --end")
         return 2
+    live_rate = diff.matched / max(diff.total_live, 1)
+    replay_rate = diff.matched / max(diff.total_replay, 1)
+    if args.min_live_match_rate and live_rate < args.min_live_match_rate:
+        logger.error(
+            "Live match rate %.1f%% below required %.1f%%",
+            live_rate * 100,
+            args.min_live_match_rate * 100,
+        )
+        return 1
+    if args.min_replay_match_rate and replay_rate < args.min_replay_match_rate:
+        logger.error(
+            "Replay match rate %.1f%% below required %.1f%%",
+            replay_rate * 100,
+            args.min_replay_match_rate * 100,
+        )
+        return 1
     return 0
 
 

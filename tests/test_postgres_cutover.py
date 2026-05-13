@@ -4,6 +4,7 @@ import logging
 import sqlite3
 import threading
 from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -659,6 +660,8 @@ def test_shadow_tracker_uses_shared_runtime_database(monkeypatch, tmp_path):
     monkeypatch.setattr(shadow_tracker_module.db, "get_db_path", lambda: str(shared_db))
 
     tracker = shadow_tracker_module.ShadowTracker(db_path=str(tmp_path / "legacy-shadow.db"))
+    entry_ts = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+    exit_ts = datetime.now(timezone.utc).isoformat()
     tracker.record_trade(
         {
             "signal_source": "strategy:momentum",
@@ -667,8 +670,8 @@ def test_shadow_tracker_uses_shared_runtime_database(monkeypatch, tmp_path):
             "entry_price": 100.0,
             "exit_price": 102.5,
             "size": 1.0,
-            "entry_ts": "2026-04-12T00:00:00+00:00",
-            "exit_ts": "2026-04-12T01:00:00+00:00",
+            "entry_ts": entry_ts,
+            "exit_ts": exit_ts,
             "confidence": 0.7,
         }
     )
