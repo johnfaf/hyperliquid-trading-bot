@@ -92,6 +92,23 @@
   </div>
 </section>
 
+<section class="bg-slate-900 border border-slate-800 rounded p-4 mb-6"
+         hx-get="/api/auto-backtest/status"
+         hx-trigger="load, every 10s"
+         hx-swap="none">
+  <div class="flex items-center justify-between gap-3">
+    <div>
+      <h2 class="text-sm font-semibold text-slate-300">Auto backtest loop</h2>
+      <p class="mt-1 text-xs text-slate-500">
+        Background offline loop for learning cycles, replay validation, and candle research.
+        It writes promotion packages for review and does not mutate live config.
+      </p>
+    </div>
+    <span id="auto-backtest-badge" class="text-[10px] uppercase text-slate-500">Loading</span>
+  </div>
+  <div id="auto-backtest-pane" class="mt-3 text-xs text-slate-300">Loading...</div>
+</section>
+
 <section>
   <h2 class="text-sm font-semibold text-slate-300 mb-2">Recent backtest results</h2>
   <div class="overflow-x-auto bg-slate-900 border border-slate-800 rounded">
@@ -139,6 +156,7 @@
     return `${(n * 100).toFixed(1)}%`;
   };
   const replayFileName = (value) => String(value || '').split(/[\\/]/).pop();
+  const shortAutoReport = (value) => String(value || '').split(/[\\/]/).pop();
   const renderReplayReasons = (title, rows) => {
     if (!Array.isArray(rows) || rows.length === 0) return '';
     const items = rows.slice(0, 5).map(([reason, count]) =>
@@ -236,6 +254,39 @@
         lines.push('<div class="text-slate-400">Idle. No replay validation has been run from the dashboard yet.</div>');
       }
       pane.innerHTML = lines.join('');
+      return;
+    }
+
+    if (path === '/api/auto-backtest/status') {
+      const pane = document.getElementById('auto-backtest-pane');
+      const badge = document.getElementById('auto-backtest-badge');
+      if (!pane || !badge) return;
+      let body;
+      try { body = JSON.parse(ev.detail.xhr.responseText); } catch { return; }
+      badge.textContent = body.enabled ? 'Enabled' : 'Disabled';
+      badge.className = body.enabled
+        ? 'text-[10px] uppercase text-emerald-300'
+        : 'text-[10px] uppercase text-slate-500';
+      const latest = (body.recent_results || [])[0];
+      if (body.running) {
+        const active = body.active || {};
+        pane.innerHTML = `<div class="text-amber-300">Running ${escapeBacktestHtml(active.cycle_id || '')} - ${escapeBacktestHtml(active.phase || 'running')}</div>`;
+      } else if (latest) {
+        const steps = latest.steps || {};
+        const actions = latest.next_actions || [];
+        pane.innerHTML = `<div class="${latest.status === 'completed' ? 'text-emerald-300' : 'text-amber-300'}">Latest cycle: ${escapeBacktestHtml(latest.status)} | ${escapeBacktestHtml(latest.cycle_id)}</div>
+          <div class="grid grid-cols-1 md:grid-cols-3 gap-2 mt-3">
+            <div class="bg-slate-950/70 rounded p-2"><div class="text-slate-500">offline learning</div><div>${escapeBacktestHtml(steps.offline_learning?.status || 'off')}</div></div>
+            <div class="bg-slate-950/70 rounded p-2"><div class="text-slate-500">replay</div><div>${escapeBacktestHtml(steps.replay_validation?.status || 'off')}</div></div>
+            <div class="bg-slate-950/70 rounded p-2"><div class="text-slate-500">candle research</div><div>${escapeBacktestHtml(steps.candle_research?.status || 'off')}</div></div>
+          </div>
+          <div class="text-slate-500 mt-2">report: ${escapeBacktestHtml(shortAutoReport(latest.report_path || latest.artifacts?.cycle_report))}</div>
+          ${actions.length ? `<div class="text-slate-400 mt-2">next: ${actions.map(escapeBacktestHtml).join(' | ')}</div>` : ''}`;
+      } else {
+        pane.innerHTML = body.enabled
+          ? '<div class="text-slate-400">Enabled, waiting for the first scheduled cycle.</div>'
+          : '<div class="text-slate-400">Disabled. Set <code>AUTO_BACKTEST_LOOP_ENABLED=true</code> to run it inside the bot, or run <code>python scripts/run_auto_backtest_loop.py --once</code>.</div>';
+      }
       return;
     }
 

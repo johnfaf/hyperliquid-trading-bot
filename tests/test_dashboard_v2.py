@@ -401,6 +401,15 @@ def test_replay_status_endpoint(client):
     assert "recent_results" in payload
 
 
+def test_auto_backtest_status_endpoint(client):
+    r = client.get("/api/auto-backtest/status")
+    assert r.status_code == 200
+    payload = r.json()
+    assert "enabled" in payload
+    assert "recent_results" in payload
+    assert payload["safety"] == "offline_only_no_live_config_mutation"
+
+
 def test_replay_run_starts_dashboard_job(client, monkeypatch):
     from src.ui.v2.routers import backtest as backtest_router
 

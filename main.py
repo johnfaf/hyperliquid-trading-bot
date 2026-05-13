@@ -230,6 +230,7 @@ class HyperliquidResearchBot:
         self.runtime_config = RuntimeConfigManager()
         self.runtime_config.poll(self.container, force=True)
         self.runtime_monitor = RuntimeIncidentMonitor()
+        self.auto_backtest_loop = None
 
         # Wire Telegram critical alert for any subsystem that transitions
         # to FAILED — operator is notified within seconds, not on next log read.
@@ -326,6 +327,33 @@ class HyperliquidResearchBot:
             else:
                 self._startup_background_task_names.append("bg-options-flow")
 
+        if _bool_config(os.environ.get("AUTO_BACKTEST_LOOP_ENABLED", "false")):
+            try:
+                from src.learning.auto_backtest_loop import (
+                    AutoBacktestConfig,
+                    AutoBacktestLoop,
+                )
+
+                auto_bt_config = AutoBacktestConfig.from_env()
+                self.auto_backtest_loop = AutoBacktestLoop(auto_bt_config)
+                self.task_runner.register(
+                    "bg-auto-backtest",
+                    self._auto_backtest_cycle,
+                    interval_seconds=auto_bt_config.interval_seconds,
+                    initial_delay_seconds=auto_bt_config.startup_delay_seconds,
+                    max_retries=2,
+                    auto_recover_cooldown_s=max(300.0, auto_bt_config.interval_seconds / 2.0),
+                )
+                health_registry.register("bg-auto-backtest", affects_trading=False)
+                self._startup_background_task_names.append("bg-auto-backtest")
+                self.logger.info(
+                    "Auto-backtest loop enabled: interval=%ss startup_delay=%ss",
+                    auto_bt_config.interval_seconds,
+                    auto_bt_config.startup_delay_seconds,
+                )
+            except Exception as exc:
+                self.logger.warning("Auto-backtest loop not registered: %s", exc)
+
         if not self._deferred_background_task_names:
             self._deferred_background_tasks_started = True
 
@@ -386,6 +414,13 @@ class HyperliquidResearchBot:
 
     def _options_scan(self):
         self.container.options_scanner.scan_flow()
+
+    def _auto_backtest_cycle(self):
+        if self.auto_backtest_loop is None:
+            return
+        result = self.auto_backtest_loop.run_cycle()
+        if result.status == "failed":
+            raise RuntimeError("; ".join(result.errors) or "auto-backtest cycle failed")
 
     def _background_heartbeat(self):
         heartbeat_active(self.container, health_registry)

@@ -268,6 +268,16 @@ async def replay_status(request: Request):
     return JSONResponse(get_replay_status())
 
 
+@router.get("/api/auto-backtest/status", response_class=JSONResponse)
+async def auto_backtest_status(request: Request):
+    redirect = require_auth(request)
+    if redirect is not None:
+        return JSONResponse({"error": "auth_required"}, status_code=401)
+    from src.learning.auto_backtest_loop import get_auto_backtest_status
+
+    return JSONResponse(get_auto_backtest_status())
+
+
 @router.post("/api/replay/run")
 async def replay_run(
     request: Request,

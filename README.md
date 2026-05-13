@@ -160,7 +160,52 @@ python scripts/diagnose_rejections.py          # Debug signal rejections
 python scripts/replay_decision_cycle.py        # Replay recent approve/reject outcomes
 python scripts/run_crash_monte_carlo.py        # Crash stress test
 python scripts/run_rotation_shadow_mode.py     # 7-day rotation shadow mode
+python scripts/run_auto_backtest_loop.py --once # One offline auto-learning/backtest cycle
 ```
+
+## Automated Backtest Improvement Loop
+
+The bot can run an opt-in offline loop that repeatedly:
+
+- builds a labelled decision dataset from `decision_snapshots` / `decision_outcomes`
+- runs the continuous-learning improvement pipeline
+- creates promotion/shadow packages for operator review
+- runs replay validation against production audit rows when a readable SQLite live DB is available
+- runs cross-coin candle research over cached historical candles
+- writes JSON reports under `reports/auto_backtest`
+
+It does **not** mutate live trading config, SL/TP, leverage, sizing, or kill-switch state.
+
+Run once:
+
+```bash
+python scripts/run_auto_backtest_loop.py --once
+```
+
+Run continuously as a standalone process:
+
+```bash
+python scripts/run_auto_backtest_loop.py --interval-seconds 21600
+```
+
+Run inside `main.py` as a supervised background task:
+
+```bash
+AUTO_BACKTEST_LOOP_ENABLED=true
+AUTO_BACKTEST_INTERVAL_SECONDS=21600
+AUTO_BACKTEST_STARTUP_DELAY_SECONDS=300
+```
+
+Useful optional env vars:
+
+- `AUTO_BACKTEST_DATASET_LIMIT=5000`
+- `AUTO_BACKTEST_COINS=BTC,ETH,SOL,HYPE,XRP,DOGE,BNB,ADA,AVAX,LINK`
+- `AUTO_BACKTEST_CANDLE_FETCH_MISSING=false`
+- `AUTO_BACKTEST_RUN_REPLAY_VALIDATION=true`
+- `AUTO_BACKTEST_LIVE_DB=data/bot.db`
+- `AUTO_BACKTEST_REPORTS_DIR=reports/auto_backtest`
+
+The v2 Backtest dashboard shows whether the loop is enabled, the active phase, and the latest cycle report.
 
 
 ## Live Safety And Scaling

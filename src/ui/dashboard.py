@@ -2745,6 +2745,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
         elif parsed.path == "/api/replay/status":
             self._serve_replay_status()
 
+        elif parsed.path == "/api/auto-backtest/status":
+            self._serve_auto_backtest_status()
+
         elif parsed.path == "/api/candle-backtest/cache":
             self._serve_cache_list()
 
@@ -3143,6 +3146,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
         try:
             from src.ui.replay_dashboard import get_replay_status
             self._json_response(get_replay_status())
+        except Exception as e:
+            self._json_response({"error": str(e)}, code=500)
+
+    def _serve_auto_backtest_status(self):
+        """Serve automated offline backtest loop status."""
+        try:
+            from src.learning.auto_backtest_loop import get_auto_backtest_status
+            self._json_response(get_auto_backtest_status())
         except Exception as e:
             self._json_response({"error": str(e)}, code=500)
 
