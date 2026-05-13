@@ -664,12 +664,57 @@ def quarantine_invalid_strategies() -> list[dict]:
     return quarantined
 
 
+def cleanup_short_copy_trade_agent_scores(apply: bool = True) -> dict:
+    """Remove legacy truncated copy-trader source keys from agent_scores.
+
+    A bad historical key shape such as ``copy_trade:0x12345678`` creates a
+    separate warmup bucket from the real ``copy_trade:<full_address>`` source.
+    That keeps the allocator stuck in cold-start and makes live side-policy
+    history look empty. The valid key includes a full 42-char address.
+    """
+    summary = {"candidates": [], "deleted": 0, "applied": bool(apply)}
+    try:
+        if not table_exists("agent_scores"):
+            return summary
+        with get_connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT source_key
+                FROM agent_scores
+                WHERE source_key LIKE 'copy_trade:0x________'
+                  AND length(source_key) < 30
+                ORDER BY source_key
+                """
+            ).fetchall()
+            keys = [str(row["source_key"] if hasattr(row, "keys") else row[0]) for row in rows]
+            summary["candidates"] = keys
+            if apply and keys:
+                conn.execute(
+                    """
+                    DELETE FROM agent_scores
+                    WHERE source_key LIKE 'copy_trade:0x________'
+                      AND length(source_key) < 30
+                    """
+                )
+                summary["deleted"] = len(keys)
+    except Exception as exc:
+        logger.debug("Short copy-trade agent score cleanup skipped: %s", exc)
+        summary["error"] = str(exc)
+    if summary.get("deleted"):
+        logger.warning(
+            "Deleted %d legacy truncated copy-trade agent_score row(s)",
+            summary["deleted"],
+        )
+    return summary
+
+
 def quarantine_contaminated_runtime_data() -> dict:
     """Run all runtime data quarantines used before strategy/live selection."""
     summary = {
         "invalid_traders": [],
         "invalid_golden_wallets": [],
         "invalid_strategies": [],
+        "short_copy_trade_agent_scores": {},
     }
     try:
         summary["invalid_traders"] = quarantine_invalid_traders()
@@ -683,6 +728,12 @@ def quarantine_contaminated_runtime_data() -> dict:
         summary["invalid_strategies"] = quarantine_invalid_strategies()
     except Exception as exc:
         logger.debug("Invalid strategy quarantine skipped: %s", exc)
+    try:
+        summary["short_copy_trade_agent_scores"] = cleanup_short_copy_trade_agent_scores(
+            apply=True
+        )
+    except Exception as exc:
+        logger.debug("Short copy-trade score cleanup skipped: %s", exc)
     return summary
 
 

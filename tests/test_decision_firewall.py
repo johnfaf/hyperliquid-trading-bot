@@ -725,6 +725,48 @@ def test_firewall_derisks_shorts_when_recent_shorts_need_caution(mock_db):
 
 
 @patch("src.signals.decision_firewall.db")
+def test_scoped_short_policy_does_not_crush_confidence_on_thin_sample(mock_db):
+    mock_db.get_open_paper_trades.return_value = []
+    mock_db.get_paper_account.return_value = {"balance": 10000}
+    mock_db.get_paper_trade_history.return_value = [
+        {"side": "short", "pnl": -0.3, "metadata": {"source_key": "test:momentum"}},
+        {"side": "short", "pnl": -0.2, "metadata": {"source_key": "test:momentum"}},
+        {"side": "short", "pnl": 0.4, "metadata": {"source_key": "test:momentum"}},
+        {"side": "short", "pnl": -0.1, "metadata": {"source_key": "test:momentum"}},
+    ]
+    mock_db.audit_log = MagicMock()
+
+    from src.signals.decision_firewall import DecisionFirewall
+
+    fw = DecisionFirewall(
+        {
+            "short_hardening_enabled": True,
+            "short_hardening_min_closed_trades": 20,
+            "short_hardening_source_min_closed_trades": 3,
+            "short_hardening_degrade_win_rate": 0.45,
+            "short_hardening_block_win_rate": 0.0,
+            "short_hardening_source_block_net_pnl": -5.0,
+            "short_hardening_confidence_multiplier": 0.75,
+            "short_hardening_scoped_confidence_min_closed_trades": 10,
+            "short_hardening_size_multiplier": 0.5,
+            "min_confidence": 0.3,
+            "enable_predictive_derisk": False,
+            "funding_risk_enabled": False,
+        }
+    )
+    signal = MockSignal(side_val="short", confidence=0.85, size=0.2, position_pct=0.1)
+
+    passed, reason = fw.validate(signal)
+
+    assert passed is True
+    assert reason == "approved"
+    assert signal.confidence == pytest.approx(0.85)
+    assert signal.size == 0.1
+    assert signal.position_pct == 0.05
+    assert signal.context["short_side_policy_confidence_multiplier"] == 1.0
+
+
+@patch("src.signals.decision_firewall.db")
 def test_validate_batch_counts_projected_notional_for_signals_without_size(mock_db):
     mock_db.get_open_paper_trades.return_value = []
     mock_db.get_paper_account.return_value = {"balance": 1000}

@@ -141,6 +141,22 @@ def run_reporting(container, cycle_count: int, health_registry=None) -> None:
         if tg and tg.is_configured() and tg_alerts and cycle_count % cycles_per_day == 0:
             tg_alerts.send_daily_pnl_summary()
             logger.info("  Sent daily P&L Telegram summary")
+            try:
+                from src.learning.audit_source_analysis import analyze_audit_sources
+
+                analyze_audit_sources(
+                    days=int(getattr(config, "SOURCE_WARMUP_ALERT_LOOKBACK_DAYS", 14)),
+                    limit=5_000,
+                    warmup_days=int(getattr(config, "SOURCE_WARMUP_STUCK_DAYS", 2)),
+                    warmup_min_rejections=int(
+                        getattr(config, "SOURCE_WARMUP_STUCK_MIN_REJECTIONS", 25)
+                    ),
+                    cleanup_short_copy_keys=False,
+                    send_warmup_alerts=True,
+                    cache_ttl_seconds=3600.0,
+                )
+            except Exception as exc:
+                logger.debug("  Source warmup alert check failed: %s", exc)
         if tg and tg.is_configured() and tg_alerts and cycle_count % (cycles_per_day * 7) == 0:
             tg_alerts.send_weekly_digest()
             logger.info("  Sent weekly Telegram digest")

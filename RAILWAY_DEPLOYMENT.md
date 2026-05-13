@@ -193,7 +193,35 @@ Search for:
 - `bot_detected` — traders flagged as bots
 - `CRASH REGIME` — predictive de-risking activated
 
-## 8. Troubleshooting
+## 8. Daily Candle Backfill Cron
+
+Use a separate Railway cron service for historical candles so the live bot does
+not spend trading-cycle time downloading backtest data. Point the cron at the
+same `/data` volume:
+
+```
+python scripts/backfill_multi_coin_klines.py \
+  --coins BTC,ETH,SOL,BNB,XRP,DOGE,AVAX,LINK,ARB,OP \
+  --timeframe 1m \
+  --days 3 \
+  --cache-db /data/candle_cache.db
+```
+
+For BTCUSDC 1-second research data:
+
+```
+python scripts/backfill_multi_coin_klines.py \
+  --coins BTC \
+  --timeframe 1s \
+  --days 1 \
+  --quote USDC \
+  --cache-db /data/candle_cache.db
+```
+
+Run the cron daily after the UTC Binance Vision files are published. If a day is
+not available yet, the script records the missing day and exits cleanly.
+
+## 9. Troubleshooting
 
 ### "Backup failed: Permission denied"
 

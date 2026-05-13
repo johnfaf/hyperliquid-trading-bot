@@ -578,6 +578,42 @@ def send_subsystem_failure_alert(subsystem_name: str, reason: str) -> bool:
 # ─── Testing Utilities ────────────────────────────────────────────
 
 
+def send_source_warmup_stuck_alert(alerts: List[Dict]) -> bool:
+    """Alert when a source stays in allocator warmup despite many rejections."""
+    if not is_configured() or not alerts:
+        return False
+
+    try:
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        top = sorted(
+            alerts,
+            key=lambda row: int(row.get("warmup_rejections", 0) or 0),
+            reverse=True,
+        )[:8]
+        lines = [
+            "<b>SOURCE WARMUP STUCK</b>",
+            f"<b>Sources:</b> {len(alerts)}",
+            f"<b>Time:</b> {ts}",
+            "",
+        ]
+        for row in top:
+            lines.append(
+                f"- {row.get('source_key', 'unknown')}: "
+                f"{int(row.get('warmup_rejections', 0) or 0)} warmup rejects, "
+                f"age {int(row.get('age_days', 0) or 0)}d"
+            )
+        lines.extend(
+            [
+                "",
+                "Check source key shape, closed-trade attribution, and allocator warmup thresholds.",
+            ]
+        )
+        return _send_message("\n".join(lines))
+    except Exception as e:
+        logger.error("Failed to send source warmup alert: %s", e)
+        return False
+
+
 def test_alerts():
     """Test all alert functions with mock data."""
     if not is_configured():

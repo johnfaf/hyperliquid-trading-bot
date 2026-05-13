@@ -87,6 +87,15 @@ class DecisionFirewall:
         self.short_hardening_confidence_multiplier = float(
             cfg.get("short_hardening_confidence_multiplier", 0.80)
         )
+        self.short_hardening_scoped_confidence_min_closed_trades = max(
+            1,
+            int(
+                cfg.get(
+                    "short_hardening_scoped_confidence_min_closed_trades",
+                    10,
+                )
+            ),
+        )
         self.short_hardening_size_multiplier = float(
             cfg.get("short_hardening_size_multiplier", 0.50)
         )
@@ -353,6 +362,15 @@ class DecisionFirewall:
                     "SHORT_HARDENING_CONFIDENCE_MULTIPLIER",
                     self.short_hardening_confidence_multiplier,
                 )
+            )
+            self.short_hardening_scoped_confidence_min_closed_trades = max(
+                1,
+                int(
+                    overrides.get(
+                        "SHORT_HARDENING_SCOPED_CONFIDENCE_MIN_CLOSED_TRADES",
+                        self.short_hardening_scoped_confidence_min_closed_trades,
+                    )
+                ),
             )
             self.short_hardening_size_multiplier = float(
                 overrides.get(
@@ -640,7 +658,8 @@ class DecisionFirewall:
         if degraded_policies:
             policy = degraded_policies[0]
             original_confidence = float(signal.confidence)
-            signal.confidence *= self.short_hardening_confidence_multiplier
+            confidence_multiplier = self._short_policy_confidence_multiplier(policy)
+            signal.confidence *= confidence_multiplier
             signal.position_pct *= self.short_hardening_size_multiplier
             if signal.size > 0:
                 signal.size *= self.short_hardening_size_multiplier
@@ -654,6 +673,7 @@ class DecisionFirewall:
                     }
                     for p in policies
                 ]
+                signal.context["short_side_policy_confidence_multiplier"] = confidence_multiplier
             logger.warning(
                 "Short hardening de-risked %s: confidence %.0f%% -> %.0f%%, size *= %.2f (%s)",
                 signal.coin,
@@ -663,6 +683,26 @@ class DecisionFirewall:
                 policy.get("reason", "recent short underperformance"),
             )
         return True, ""
+
+    def _short_policy_confidence_multiplier(self, policy: Dict) -> float:
+        """Only crush confidence for scoped guards after enough closed trades."""
+        scope = str(policy.get("scope", "") or "").strip().lower()
+        source = str(policy.get("source", "") or "").strip().lower()
+        coin = str(policy.get("coin", "") or "").strip().upper()
+        scoped = bool(source and source != "all") or bool(coin) or (
+            bool(scope) and scope != "global_short" and scope != "short"
+        )
+        if not scoped:
+            return self.short_hardening_confidence_multiplier
+
+        metrics = policy.get("metrics", {}) if isinstance(policy, dict) else {}
+        try:
+            closed = int(metrics.get("count", 0) or 0)
+        except Exception:
+            closed = 0
+        if closed < self.short_hardening_scoped_confidence_min_closed_trades:
+            return 1.0
+        return self.short_hardening_confidence_multiplier
 
     @staticmethod
     def _float_or_none(value: object) -> Optional[float]:

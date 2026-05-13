@@ -623,6 +623,21 @@ def _get_v2_metrics(conn) -> Dict:
     except Exception:
         pass
 
+    try:
+        from src.learning.audit_source_analysis import analyze_audit_sources
+
+        v2["audit_source_analysis"] = analyze_audit_sources(
+            days=14,
+            limit=2_000,
+            warmup_days=2,
+            warmup_min_rejections=25,
+            cleanup_short_copy_keys=False,
+            send_warmup_alerts=False,
+            cache_ttl_seconds=60.0,
+        )
+    except Exception:
+        pass
+
     return v2
 
 

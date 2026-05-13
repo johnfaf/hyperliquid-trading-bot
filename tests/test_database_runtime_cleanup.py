@@ -175,6 +175,46 @@ def test_quarantine_contaminated_runtime_data_disconnects_fixture_sources(tmp_pa
     assert dict(bad_strategy) == {"active": 0, "current_score": 0.0}
 
 
+def test_cleanup_short_copy_trade_agent_scores_removes_truncated_keys(tmp_path, monkeypatch):
+    db_path = tmp_path / "runtime.db"
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    conn.execute(
+        """
+        CREATE TABLE agent_scores (
+            source_key TEXT PRIMARY KEY,
+            dynamic_weight REAL DEFAULT 0
+        )
+        """
+    )
+    full_key = "copy_trade:0x" + "1" * 40
+    short_key = "copy_trade:0x12345678"
+    conn.execute("INSERT INTO agent_scores (source_key, dynamic_weight) VALUES (?, ?)", (full_key, 0.7))
+    conn.execute("INSERT INTO agent_scores (source_key, dynamic_weight) VALUES (?, ?)", (short_key, 0.1))
+    conn.commit()
+    conn.close()
+
+    @contextmanager
+    def _fake_connection(*, for_read=False):
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        try:
+            yield conn
+            conn.commit()
+        finally:
+            conn.close()
+
+    monkeypatch.setattr(db, "get_connection", _fake_connection)
+
+    summary = db.cleanup_short_copy_trade_agent_scores(apply=True)
+
+    assert summary["deleted"] == 1
+    conn = sqlite3.connect(db_path)
+    remaining = [row[0] for row in conn.execute("SELECT source_key FROM agent_scores ORDER BY source_key")]
+    conn.close()
+    assert remaining == [full_key]
+
+
 def test_get_active_strategies_filters_missing_or_bot_like_source(tmp_path, monkeypatch):
     db_path = tmp_path / "runtime.db"
     conn = sqlite3.connect(db_path)

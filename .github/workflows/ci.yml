@@ -64,6 +64,10 @@ jobs:
         run: >
           python -m pytest
           tests/test_decision_firewall.py
+          tests/test_copy_trade_source_key_shape.py
+          tests/test_audit_source_analysis.py
+          tests/test_research_suite.py
+          tests/test_backfill_multi_coin_klines.py
           tests/test_live_controls.py
           tests/test_options_flow.py
           tests/test_portfolio_rotation.py
