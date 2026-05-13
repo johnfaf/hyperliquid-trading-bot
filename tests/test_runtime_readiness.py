@@ -1,9 +1,17 @@
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
+import sqlite3
 from types import SimpleNamespace
 
 from src.core import readiness
 from src.core.health_registry import SubsystemHealthRegistry, SubsystemState
 from src.core.subsystem_registry import heartbeat_active
+
+
+@contextmanager
+def _sqlite_ctx(conn):
+    yield conn
+    conn.commit()
 
 
 class _FakeLiveTrader:
@@ -151,6 +159,53 @@ def test_evaluate_readiness_blocks_on_db_audit_findings(monkeypatch):
     assert snapshot["ready"] is False
     assert snapshot["checks"]["db_audit_ok"] is False
     assert "db_audit_high:open_trades_missing_protection" in snapshot["reasons"]
+
+
+def test_probe_db_audit_auto_repairs_paper_account_summary(monkeypatch):
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.executescript(
+        """
+        CREATE TABLE paper_account (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            balance REAL NOT NULL,
+            total_pnl REAL DEFAULT 0,
+            total_trades INTEGER DEFAULT 0,
+            winning_trades INTEGER DEFAULT 0,
+            last_updated TEXT NOT NULL
+        );
+        CREATE TABLE paper_trades (
+            id INTEGER PRIMARY KEY,
+            status TEXT,
+            pnl REAL
+        );
+        INSERT INTO paper_account
+        (id, balance, total_pnl, total_trades, winning_trades, last_updated)
+        VALUES (1, 1000, 0, 0, 0, '2026-05-13T00:00:00+00:00');
+        INSERT INTO paper_trades (id, status, pnl) VALUES
+            (1, 'closed', 5.0),
+            (2, 'closed', -2.0);
+        """
+    )
+    monkeypatch.setattr(readiness.db, "get_connection", lambda for_read=False: _sqlite_ctx(conn))
+    monkeypatch.setattr(readiness.db, "get_backend_name", lambda: "sqlite")
+    monkeypatch.setattr(readiness.db, "get_db_path", lambda: "test.db")
+    readiness._DB_AUDIT_CACHE.update({"ts": 0.0, "ok": True, "report": {}, "blockers": []})
+
+    ok, payload, blockers = readiness._probe_db_audit(ttl_s=5)
+
+    assert ok is False  # the intentionally tiny schema still has unrelated audit blockers
+    assert not {
+        "paper_account_trade_count",
+        "paper_account_total_pnl",
+        "paper_account_winning_trades",
+    }.intersection({item["check"] for item in blockers})
+    assert any(
+        action["action"] == "paper_account" and action["status"] == "applied"
+        for action in payload["auto_repair_actions"]
+    )
+    row = conn.execute("SELECT total_pnl, total_trades, winning_trades FROM paper_account WHERE id = 1").fetchone()
+    assert dict(row) == {"total_pnl": 3.0, "total_trades": 2, "winning_trades": 1}
 
 
 def test_health_registry_heartbeat_recovers_from_stale_degradation():

@@ -98,6 +98,29 @@ def test_build_runtime_health_snapshot_includes_subsystems_and_safety(monkeypatc
     assert snapshot["copy_trader"]["guardrail"]["status"] == "blocked"
 
 
+def test_dashboard_health_registry_falls_back_to_process_singleton(monkeypatch):
+    from src.core.health_registry import registry
+
+    registry.reset()
+    try:
+        registry.register("decision_firewall", affects_trading=True)
+        registry.set_status(
+            "decision_firewall",
+            SubsystemState.HEALTHY,
+            dependency_ready=True,
+            startup_status="READY",
+        )
+        registry.heartbeat("decision_firewall")
+        monkeypatch.setattr(dashboard, "_health_registry", None)
+
+        resolved = dashboard._resolve_health_registry()
+
+        assert resolved is registry
+        assert resolved.is_all_trading_safe() is True
+    finally:
+        registry.reset()
+
+
 def test_dashboard_host_defaults_to_localhost_when_not_hosted(monkeypatch):
     for name in (
         "DASHBOARD_HOST",

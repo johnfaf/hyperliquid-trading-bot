@@ -15,6 +15,26 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
+def _evaluate_dashboard_readiness() -> dict:
+    from src.core.readiness import evaluate_readiness
+    from src.ui.v2.state import get_components
+
+    components = get_components()
+    health_registry = components.health_registry
+    if health_registry is None:
+        try:
+            from src.core.health_registry import registry
+
+            health_registry = registry
+        except Exception:
+            health_registry = None
+
+    class _Container:
+        live_trader = components.live_trader
+
+    return evaluate_readiness(container=_Container(), health_registry=health_registry)
+
+
 @router.get("/api/health")
 async def health() -> JSONResponse:
     return JSONResponse({"status": "ok"})
@@ -29,8 +49,7 @@ async def ready() -> JSONResponse:
     state at a glance.
     """
     try:
-        from src.core.readiness import evaluate_readiness
-        result = evaluate_readiness()
+        result = _evaluate_dashboard_readiness()
     except Exception as exc:
         logger.warning("readiness check failed: %s", exc)
         return JSONResponse(
@@ -57,8 +76,7 @@ async def health_strip() -> JSONResponse:
     """
     payload: dict = {"tone": "amber", "label": "unknown", "summary": "no data", "reasons": []}
     try:
-        from src.core.readiness import evaluate_readiness
-        result = evaluate_readiness() or {}
+        result = _evaluate_dashboard_readiness() or {}
     except Exception as exc:
         logger.warning("health strip readiness failed: %s", exc)
         return JSONResponse({

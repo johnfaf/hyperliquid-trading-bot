@@ -670,6 +670,18 @@ def set_live_trader(trader):
     _live_trader = trader
 
 
+def _resolve_health_registry():
+    """Return the wired registry, falling back to the process singleton."""
+    if _health_registry is not None:
+        return _health_registry
+    try:
+        from src.core.health_registry import registry
+
+        return registry
+    except Exception:
+        return None
+
+
 def _close_paper_trade_at_market(trade_id: int, *, close_live: bool = True) -> dict:
     """
     Close a single paper trade at the current market price.
@@ -871,6 +883,7 @@ def set_v2_components(firewall=None, regime_detector=None, arena=None,
 def _build_runtime_health_snapshot() -> Dict:
     """Build a compact runtime health payload for dashboard/API consumers."""
     now = datetime.now(timezone.utc)
+    health_registry = _resolve_health_registry()
     snapshot: Dict[str, object] = {
         "timestamp": now.isoformat(),
         "overall": "unknown",
@@ -886,8 +899,8 @@ def _build_runtime_health_snapshot() -> Dict:
     )
 
     try:
-        if _health_registry:
-            statuses = _health_registry.get_all()
+        if health_registry:
+            statuses = health_registry.get_all()
             state_counts: Dict[str, int] = {}
             stale_names = []
             at_risk = []
@@ -915,7 +928,7 @@ def _build_runtime_health_snapshot() -> Dict:
                     else None,
                 }
 
-            all_safe = bool(_health_registry.is_all_trading_safe())
+            all_safe = bool(health_registry.is_all_trading_safe())
             overall = "ok" if all_safe and not at_risk else "at_risk"
             snapshot.update(
                 {
@@ -936,7 +949,7 @@ def _build_runtime_health_snapshot() -> Dict:
 
         snapshot["readiness"] = evaluate_readiness(
             container=_Container(),
-            health_registry=_health_registry,
+            health_registry=health_registry,
             stale_seconds=stale_timeout_s,
         )
     except Exception as exc:
@@ -2475,7 +2488,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
             readiness = evaluate_readiness(
                 container=_Container(),
-                health_registry=_health_registry,
+                health_registry=_resolve_health_registry(),
             )
             if parsed.path == "/api/live_ready":
                 live_ready = bool(readiness.get("live_ready", False))

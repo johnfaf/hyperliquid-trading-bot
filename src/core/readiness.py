@@ -25,6 +25,12 @@ _DB_WRITE_PROBE_CACHE: Dict[str, Any] = {"ts": 0.0, "ok": False, "error": ""}
 _DB_AUDIT_CACHE: Dict[str, Any] = {"ts": 0.0, "ok": True, "report": {}, "blockers": []}
 _DB_WRITE_PROBE_CACHE_LOCK = threading.Lock()
 _DB_AUDIT_CACHE_LOCK = threading.Lock()
+_AUTO_REPAIRABLE_DB_AUDIT_CHECKS = {
+    "paper_account_singleton",
+    "paper_account_trade_count",
+    "paper_account_winning_trades",
+    "paper_account_total_pnl",
+}
 
 
 def _probe_db_readable() -> tuple[bool, str]:
@@ -94,6 +100,30 @@ def _probe_db_audit(ttl_s: Optional[int] = None) -> tuple[bool, Dict[str, Any], 
         report = run_db_audit(include_candle_cache=True, include_code_scan=False)
         payload = report.to_dict(block_severity=block_severity)
         blockers = [finding.to_dict() for finding in report.findings_at_or_above(block_severity)]
+        if _has_auto_repairable_db_blocker(blockers) and bool(
+            getattr(config, "READINESS_DB_AUDIT_AUTO_REPAIR", True)
+        ):
+            try:
+                from src.data.db_audit import run_startup_safe_repair
+
+                actions = run_startup_safe_repair()
+                report = run_db_audit(include_candle_cache=True, include_code_scan=False)
+                payload = report.to_dict(block_severity=block_severity)
+                payload["auto_repair_actions"] = [
+                    {
+                        "action": getattr(action, "action", ""),
+                        "status": getattr(action, "status", ""),
+                        "message": getattr(action, "message", ""),
+                        "details": getattr(action, "details", {}),
+                    }
+                    for action in actions
+                ]
+                blockers = [
+                    finding.to_dict()
+                    for finding in report.findings_at_or_above(block_severity)
+                ]
+            except Exception as repair_exc:
+                payload["auto_repair_error"] = str(repair_exc)
         ok = not blockers
     except Exception as exc:
         payload = {
@@ -115,6 +145,14 @@ def _probe_db_audit(ttl_s: Optional[int] = None) -> tuple[bool, Dict[str, Any], 
     with _DB_AUDIT_CACHE_LOCK:
         _DB_AUDIT_CACHE.update({"ts": now, "ok": ok, "report": payload, "blockers": blockers})
     return ok, payload, blockers
+
+
+def _has_auto_repairable_db_blocker(blockers: list) -> bool:
+    for finding in blockers or []:
+        check = str((finding or {}).get("check", "") or "")
+        if check in _AUTO_REPAIRABLE_DB_AUDIT_CHECKS:
+            return True
+    return False
 
 
 def evaluate_readiness(
