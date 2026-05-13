@@ -45,6 +45,28 @@ if str(ROOT) not in sys.path:
 
 logger = logging.getLogger("audit-diff")
 
+DEFAULT_TRUST_MATCH_RATE = 0.70
+
+_SUBSYSTEM_REASON_HINTS = (
+    ("polymarket", "polymarket"),
+    ("poly", "polymarket"),
+    ("options", "options_flow"),
+    ("deribit", "options_flow"),
+    ("macro", "macro_regime"),
+    ("event", "event_scanner"),
+    ("calendar", "event_scanner"),
+    ("regime", "regime_forecaster"),
+    ("xgboost", "regime_forecaster"),
+    ("copy", "copy_trader"),
+    ("source allocator", "agent_scorer"),
+    ("source", "agent_scorer"),
+    ("calibration", "calibration"),
+    ("position", "portfolio_state"),
+    ("cooldown", "stateful_firewall"),
+    ("daily", "stateful_firewall"),
+    ("kill", "safety_stop"),
+)
+
 
 @dataclass
 class AuditRow:
@@ -100,6 +122,20 @@ def _reason_for(row: AuditRow) -> str:
                 if value:
                     return str(value)[:120]
     return (row.action or "?")[:120]
+
+
+def _hints_for_reasons(reasons: Counter) -> Dict[str, int]:
+    hints: Counter = Counter()
+    for reason, count in reasons.items():
+        text = str(reason or "").lower()
+        matched = False
+        for needle, subsystem in _SUBSYSTEM_REASON_HINTS:
+            if needle in text:
+                hints[subsystem] += count
+                matched = True
+        if not matched:
+            hints["unknown"] += count
+    return dict(hints)
 
 
 def _load_audit(db_path: str, start_iso: str, end_iso: str) -> List[AuditRow]:
@@ -162,6 +198,42 @@ class DiffResult:
 
     sample_mismatches: List[Dict] = field(default_factory=list)
 
+    def diagnostics(
+        self,
+        *,
+        min_live_match_rate: float = DEFAULT_TRUST_MATCH_RATE,
+        min_replay_match_rate: float = DEFAULT_TRUST_MATCH_RATE,
+    ) -> Dict:
+        live_rate = self.matched / max(self.total_live, 1)
+        replay_rate = self.matched / max(self.total_replay, 1)
+        live_ok = self.total_live > 0 and live_rate >= min_live_match_rate
+        replay_ok = self.total_replay > 0 and replay_rate >= min_replay_match_rate
+        status = "trusted" if live_ok and replay_ok else "needs_more_shims"
+        if self.total_live == 0 and self.total_replay == 0:
+            status = "no_audit_rows"
+        elif self.total_live == 0:
+            status = "live_audit_empty"
+        elif self.total_replay == 0:
+            status = "replay_audit_empty"
+
+        return {
+            "status": status,
+            "trustworthy": status == "trusted",
+            "thresholds": {
+                "min_live_match_rate": min_live_match_rate,
+                "min_replay_match_rate": min_replay_match_rate,
+            },
+            "live_match_rate": round(live_rate, 4),
+            "replay_match_rate": round(replay_rate, 4),
+            "live_only_subsystem_hints": _hints_for_reasons(self.live_only_reasons),
+            "replay_only_subsystem_hints": _hints_for_reasons(self.replay_only_reasons),
+            "guidance": (
+                "Harness overlap is high enough for research conclusions."
+                if status == "trusted"
+                else "Investigate top live_only/replay_only reasons before trusting replay conclusions."
+            ),
+        }
+
     def to_dict(self) -> Dict:
         return {
             "totals": {
@@ -195,6 +267,7 @@ class DiffResult:
                 "live_only":   dict(self.live_only_reasons),
                 "replay_only": dict(self.replay_only_reasons),
             },
+            "diagnostics": self.diagnostics(),
             "sample_mismatches": self.sample_mismatches[:40],
         }
 
@@ -396,6 +469,10 @@ def main(argv: list[str] | None = None) -> int:
     diff = diff_audit_trails(live, replay, match_window_s=args.match_window)
 
     out = diff.to_dict()
+    out["diagnostics"] = diff.diagnostics(
+        min_live_match_rate=args.min_live_match_rate or DEFAULT_TRUST_MATCH_RATE,
+        min_replay_match_rate=args.min_replay_match_rate or DEFAULT_TRUST_MATCH_RATE,
+    )
     out["config"] = {
         "live": args.live,
         "replay": args.replay,

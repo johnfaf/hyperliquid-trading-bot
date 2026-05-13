@@ -161,6 +161,10 @@ def test_diff_reject_reason_tracked(tmp_path):
     diff = audit_diff.diff_audit_trails(lr, rr, match_window_s=60.0)
     assert diff.live_only_reasons["cooldown_active"] == 1
     assert diff.live_only_reasons["regime_mismatch"] == 1
+    diagnostics = diff.diagnostics(min_live_match_rate=0.70, min_replay_match_rate=0.70)
+    assert diagnostics["status"] == "replay_audit_empty"
+    assert diagnostics["live_only_subsystem_hints"]["stateful_firewall"] == 1
+    assert diagnostics["live_only_subsystem_hints"]["regime_forecaster"] == 1
 
 
 def test_diff_missing_audit_table_is_empty_not_crash(tmp_path):
@@ -242,3 +246,20 @@ def test_diff_chooses_closest_replay_row_in_window(tmp_path):
     diff = audit_diff.diff_audit_trails(lr, rr, match_window_s=600.0)
     assert diff.matched == 1
     assert diff.replay_only == 1
+
+
+def test_diff_diagnostics_mark_trusted_when_match_rates_clear_threshold(tmp_path):
+    rows = [
+        (_ts(2025, 8, 1, 12, 0), "signal_approved", "BTC", "long", "momentum", {}),
+        (_ts(2025, 8, 1, 13, 0), "signal_rejected", "ETH", "short", "rsi", {"reason": "cooldown"}),
+    ]
+    live = _make_audit_db(tmp_path, "live.db", rows)
+    replay = _make_audit_db(tmp_path, "replay.db", rows)
+    lr = audit_diff._load_audit(live, _ts(2025, 8, 1), _ts(2025, 8, 2))
+    rr = audit_diff._load_audit(replay, _ts(2025, 8, 1), _ts(2025, 8, 2))
+    diff = audit_diff.diff_audit_trails(lr, rr, match_window_s=60.0)
+
+    diagnostics = diff.diagnostics(min_live_match_rate=0.70, min_replay_match_rate=0.70)
+
+    assert diagnostics["status"] == "trusted"
+    assert diagnostics["trustworthy"] is True

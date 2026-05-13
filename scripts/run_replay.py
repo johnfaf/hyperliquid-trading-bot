@@ -134,6 +134,8 @@ def _cmd_run(args: argparse.Namespace) -> int:
                 start_ms=start_ms,
                 end_ms=end_ms,
                 match_window_s=args.diff_match_window,
+                min_live_match_rate=args.diff_min_live_match_rate,
+                min_replay_match_rate=args.diff_min_replay_match_rate,
                 report_out=args.diff_report_out,
             )
 
@@ -145,7 +147,14 @@ def _cmd_run(args: argparse.Namespace) -> int:
             logger.info("Report written to %s", out_path)
 
         _print_summary(report_dict, h)
-        return 0 if failed_ticks == 0 else 1
+        if failed_ticks:
+            return 1
+        decision_diff = report_dict.get("decision_diff") or {}
+        diagnostics = decision_diff.get("diagnostics") or {}
+        if args.diff_live_db and diagnostics.get("trustworthy") is False:
+            logger.error("Decision diff did not meet trust threshold: %s", diagnostics)
+            return 1
+        return 0
 
 
 def _build_report_dict(h, args, snapshot, report, completed_ticks, failed_ticks, last_err):
@@ -206,6 +215,8 @@ def _build_decision_diff_report(
     start_ms: int,
     end_ms: int,
     match_window_s: float,
+    min_live_match_rate: float,
+    min_replay_match_rate: float,
     report_out: str | None = None,
 ) -> dict:
     """Attach replay-vs-live audit diff to a replay run report."""
@@ -221,6 +232,10 @@ def _build_decision_diff_report(
         match_window_s=match_window_s,
     )
     out = diff.to_dict()
+    out["diagnostics"] = diff.diagnostics(
+        min_live_match_rate=min_live_match_rate,
+        min_replay_match_rate=min_replay_match_rate,
+    )
     out["config"] = {
         "live": live_db,
         "replay": replay_db,
@@ -340,6 +355,10 @@ def main(argv: list[str] | None = None) -> int:
                         help="Optional live bot DB to diff against the replay audit_trail")
     parser.add_argument("--diff-match-window", type=float, default=600.0,
                         help="Decision diff matching tolerance in seconds. Default 600.")
+    parser.add_argument("--diff-min-live-match-rate", type=float, default=0.70,
+                        help="Fail replay when matched/live is below this decimal threshold. Default 0.70.")
+    parser.add_argument("--diff-min-replay-match-rate", type=float, default=0.70,
+                        help="Fail replay when matched/replay is below this decimal threshold. Default 0.70.")
     parser.add_argument("--diff-report-out",
                         help="Optional standalone JSON output for the decision diff")
 
