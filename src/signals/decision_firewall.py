@@ -339,6 +339,8 @@ class DecisionFirewall:
             "rejected_side_imbalance": 0,
             "rejected_unknown_source": 0,
             "rejected_bucketed_confidence": 0,
+            "rejected_data_readiness": 0,
+            "rejected_ev_gate": 0,
             # LOW-FIX LOW-1: count audit-log write failures so ops can detect
             # when the audit trail is silently broken (DB full, locked, etc.)
             "audit_log_failures": 0,
@@ -1908,6 +1910,17 @@ class DecisionFirewall:
         if not signal.validate():
             return _reject("rejected_schema", f"Invalid signal schema: {signal.coin} {signal.side.value}")
 
+        # 1b. Data-readiness gate -- prop-firm rule: no trade if inputs
+        # are incomplete. Reject upfront so we don't evaluate downstream
+        # gates on half-data.
+        try:
+            from src.signals.data_readiness import is_signal_data_ready
+            ready, ready_reason = is_signal_data_ready(signal)
+            if not ready:
+                return _reject("rejected_data_readiness", ready_reason)
+        except Exception as exc:
+            logger.debug("Data-readiness check failed (fail-open): %s", exc)
+
         predictive_regime = None
         if self._forecaster and self.enable_predictive_derisk:
             try:
@@ -1996,6 +2009,51 @@ class DecisionFirewall:
                     )
             except Exception as exc:
                 logger.debug("Bucketed-threshold check failed (fail-open): %s", exc)
+
+        # 2c. Expected-value gate: positive-EV after fees + slippage +
+        # funding. The single most disciplined check on the signal --
+        # bucketed-threshold above gates on confidence; this gates on
+        # the dollars-after-costs question.
+        try:
+            from src.signals.ev_gate import evaluate_signal_ev
+            from src.signals.calibration import bucket_regime as _ev_bucket_regime
+            ev_raw_regime = ""
+            if regime_data and isinstance(regime_data, dict):
+                ev_raw_regime = str(regime_data.get("overall_regime", "") or "")
+            if not ev_raw_regime:
+                ev_raw_regime = str(getattr(signal, "regime", "") or "")
+            ev_regime = _ev_bucket_regime(ev_raw_regime)
+            bucket_n = 1.0
+            if self.calibration is not None:
+                try:
+                    side_v = signal.side.value if hasattr(signal.side, "value") else str(signal.side)
+                    composed = None
+                    try:
+                        from src.signals.calibration import compose_calibration_key
+                        composed = compose_calibration_key(source_key, side_v, ev_regime)
+                    except Exception:
+                        composed = source_key
+                    bucket_n = float(self.calibration.get_sample_size(composed))
+                except Exception:
+                    bucket_n = 1.0
+            accept_ev, ev_reason, ev_breakdown = evaluate_signal_ev(
+                signal,
+                calibration=self.calibration,
+                source_key=source_key,
+                regime=ev_regime,
+                bucket_n=bucket_n,
+            )
+            if not accept_ev:
+                return _reject("rejected_ev_gate", ev_reason)
+            # Attach EV breakdown to signal context so downstream
+            # logging / dashboards can show the "why entered" math.
+            try:
+                if isinstance(getattr(signal, "context", None), dict):
+                    signal.context["ev_breakdown"] = ev_breakdown
+            except Exception:
+                pass
+        except Exception as exc:
+            logger.debug("EV gate check failed (fail-open): %s", exc)
 
         # 2b. Per-source/day throughput cap (approved signals).
         policy_ok, policy_reason, source_policy = self._apply_source_policy(

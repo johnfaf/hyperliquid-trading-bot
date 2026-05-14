@@ -809,6 +809,54 @@ ORPHAN_REAPER_MAX_AGE_HOURS = _safe_env_float(
 ORPHAN_REAPER_REQUIRE_BREAKEVEN = os.environ.get(
     "ORPHAN_REAPER_REQUIRE_BREAKEVEN", "true"
 ).lower() in ("true", "1", "yes")
+
+# ─── Expected-value gate ──────────────────────────────────────
+# Replace confidence-only thresholds with a post-cost EV check. A signal
+# at modest confidence with 3R/1R asymmetry can clear; a signal at high
+# confidence with 1R/1R after fees+slippage+funding can be rejected.
+# Live trades additionally need the lower-confidence-bound positive.
+EV_GATE_ENABLED = os.environ.get("EV_GATE_ENABLED", "true").lower() in ("true", "1", "yes")
+EV_GATE_MIN_BPS = _safe_env_float("EV_GATE_MIN_BPS", 10.0, lo=0.0, hi=10_000.0)
+EV_GATE_MIN_COST_RATIO = _safe_env_float("EV_GATE_MIN_COST_RATIO", 1.5, lo=1.0, hi=10.0)
+EV_GATE_LIVE_SIGMA_MULT = _safe_env_float("EV_GATE_LIVE_SIGMA_MULT", 2.0, lo=0.0, hi=10.0)
+
+# ─── Trade-cost estimator ─────────────────────────────────────
+TRADE_COSTS_DEFAULT_HOLDING_HOURS = _safe_env_float(
+    "TRADE_COSTS_DEFAULT_HOLDING_HOURS", 24.0, lo=0.1, hi=720.0
+)
+TRADE_QUALITY_EXPECTED_SLIPPAGE_BPS = _safe_env_float(
+    "TRADE_QUALITY_EXPECTED_SLIPPAGE_BPS", 5.0, lo=0.0, hi=500.0
+)
+
+# ─── Data-readiness gate ──────────────────────────────────────
+# Reject signals whose data inputs are incomplete. Off-by-default
+# components (oi, source_health) are logged but don't block; the
+# required set blocks. Set DATA_READINESS_REQUIRED_COMPONENTS to a
+# comma-separated list to customise.
+DATA_READINESS_GATE_ENABLED = os.environ.get(
+    "DATA_READINESS_GATE_ENABLED", "true"
+).lower() in ("true", "1", "yes")
+DATA_READINESS_REQUIRED_COMPONENTS = os.environ.get(
+    "DATA_READINESS_REQUIRED_COMPONENTS",
+    "candles,funding,spread,feature_vector",
+)
+
+# ─── Calibration trend monitor ────────────────────────────────
+CALIBRATION_TREND_ENABLED = os.environ.get(
+    "CALIBRATION_TREND_ENABLED", "true"
+).lower() in ("true", "1", "yes")
+CALIBRATION_TREND_WINDOW_DAYS = int(
+    os.environ.get("CALIBRATION_TREND_WINDOW_DAYS", 3) or 3
+)
+CALIBRATION_TREND_DETERIORATION_BRIER_PER_DAY = _safe_env_float(
+    "CALIBRATION_TREND_DETERIORATION_BRIER_PER_DAY", 0.02, lo=0.0, hi=1.0
+)
+CALIBRATION_TREND_MIN_SAMPLES_PER_DAY = int(
+    os.environ.get("CALIBRATION_TREND_MIN_SAMPLES_PER_DAY", 5) or 5
+)
+CALIBRATION_TREND_DERISK_MULTIPLIER = _safe_env_float(
+    "CALIBRATION_TREND_DERISK_MULTIPLIER", 0.75, lo=0.1, hi=1.0
+)
 FIREWALL_MAX_SIGNALS_PER_SOURCE_PER_DAY = int(
     os.environ.get("FIREWALL_MAX_SIGNALS_PER_SOURCE_PER_DAY", 0)
 )

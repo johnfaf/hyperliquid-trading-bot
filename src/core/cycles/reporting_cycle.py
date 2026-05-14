@@ -166,6 +166,22 @@ def run_reporting(container, cycle_count: int, health_registry=None) -> None:
     except Exception as exc:
         logger.debug("  Report export error: %s", exc)
 
+    # ── Calibration trend monitor (auto-derisk on deteriorating Brier) ──
+    try:
+        from src.signals.calibration_trend import apply_trend_derisk
+        adjusted = apply_trend_derisk(getattr(container, "agent_scorer", None))
+        if adjusted:
+            logger.warning(
+                "  Calibration trend derisked %d source(s): %s",
+                len(adjusted),
+                ", ".join(
+                    f"{a['source_key']} ({a['old_weight']:.2f}->{a['new_weight']:.2f})"
+                    for a in adjusted
+                ),
+            )
+    except Exception as exc:
+        logger.debug("  Calibration trend monitor error: %s", exc)
+
     # ── Orphan position reaper (opt-in via ORPHAN_REAPER_ENABLED) ──
     try:
         from src.trading.orphan_reaper import reap_orphan_positions

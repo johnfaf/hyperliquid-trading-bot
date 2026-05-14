@@ -61,6 +61,11 @@ def _bypass_promotion_gate(monkeypatch):
         "src.learning.promotion_gate.is_live_promotable",
         lambda trade: (True, "test_bypass"),
     )
+    # Same rationale for the data-readiness + EV gates -- the legacy
+    # test fixtures don't carry populated feature vectors or stubbed
+    # market data. Each gate has its own dedicated test module.
+    monkeypatch.setattr(config, "DATA_READINESS_GATE_ENABLED", False, raising=False)
+    monkeypatch.setattr(config, "EV_GATE_ENABLED", False, raising=False)
 from src.trading.portfolio_rotation import PortfolioRotationManager, RotationDecision
 
 

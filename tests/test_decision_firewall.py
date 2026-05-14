@@ -5,6 +5,19 @@ Unit tests for DecisionFirewall.
 import pytest
 from unittest.mock import patch, MagicMock
 
+import config
+
+
+@pytest.fixture(autouse=True)
+def _bypass_new_gates(monkeypatch):
+    """The legacy firewall tests predate the data-readiness and EV gates
+    and use minimal MockSignal fixtures without populated context. Bypass
+    both gates here so the pre-existing tests keep exercising the
+    schema/source/confidence/risk math they were written for. Dedicated
+    coverage for the new gates lives in their own test files."""
+    monkeypatch.setattr(config, "DATA_READINESS_GATE_ENABLED", False, raising=False)
+    monkeypatch.setattr(config, "EV_GATE_ENABLED", False, raising=False)
+
 
 class MockSignal:
     """Minimal mock of TradeSignal for testing."""
