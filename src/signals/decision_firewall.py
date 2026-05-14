@@ -426,6 +426,16 @@ class DecisionFirewall:
             self.event_risk_enabled = bool(
                 overrides.get("EVENT_RISK_ENABLED", self.event_risk_enabled)
             )
+            self.block_unknown_sources = bool(
+                overrides.get(
+                    "FIREWALL_BLOCK_UNKNOWN_SOURCES", self.block_unknown_sources
+                )
+            )
+            self.use_bucketed_thresholds = bool(
+                overrides.get(
+                    "FIREWALL_USE_BUCKETED_THRESHOLDS", self.use_bucketed_thresholds
+                )
+            )
             self.short_hardening_enabled = bool(
                 overrides.get("SHORT_HARDENING_ENABLED", self.short_hardening_enabled)
             )

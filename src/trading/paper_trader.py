@@ -872,6 +872,28 @@ class PaperTrader:
                         status="approved",
                         metadata={"ignore_position_limit": True},
                     )
+                    # Update the candidate snapshot so it doesn't sit at
+                    # ``firewall_decision=pending`` forever. Without this,
+                    # every signal that passes the dry-run prescreen and
+                    # then drops out further downstream (rotation cap,
+                    # arena reject, ev gate, etc.) leaves a stale
+                    # "pending" row that pollutes every per-source/per-
+                    # bucket query.
+                    decision_id = self._decision_id_for_signal(trade_signal, sig)
+                    if decision_id:
+                        try:
+                            decision_journal.update_decision_status(
+                                decision_id,
+                                final_status="firewall_prescreen_approved",
+                                firewall_decision="approved",
+                                metadata={"stage": "paper_trader_prescreen"},
+                            )
+                        except Exception as exc:
+                            logger.debug(
+                                "Prescreen-approved snapshot update failed for %s: %s",
+                                decision_id,
+                                exc,
+                            )
                     logger.debug(f"Firewall approved {sig['side']} {sig['coin']} "
                                 f"(confidence={trade_signal.confidence:.0%})")
                 else:

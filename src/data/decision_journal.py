@@ -273,6 +273,35 @@ def resolve_decision_id(signal: Any) -> str:
     return str(getattr(signal, "signal_id", "") or "").strip()
 
 
+def _derive_source_key_from_signal(signal: Any, raw: Dict[str, Any]) -> Optional[str]:
+    """Best-effort fallback for the ``source_key`` column.
+
+    Mirrors ``DecisionFirewall._source_key`` so journal rows agree with
+    firewall calibration buckets even when the upstream signal dict
+    didn't carry an explicit ``source_key`` field. Previously this
+    column was silently left NULL, breaking every per-bucket query.
+    """
+    source = _enum_value(getattr(signal, "source", None))
+    if not source:
+        source = raw.get("source", "")
+    key = str(source or "").strip().lower()
+    if not key:
+        return None
+    if key == "copy_trade":
+        trader = str(
+            getattr(signal, "trader_address", raw.get("trader_address", "")) or ""
+        ).strip().lower()
+        if trader:
+            return f"{key}:{trader}"
+        return key
+    strategy_type = str(
+        getattr(signal, "strategy_type", raw.get("strategy_type", "")) or ""
+    ).strip().lower()
+    if strategy_type:
+        return f"{key}:{strategy_type}"
+    return key
+
+
 def _raw_signal(signal: Any, raw_signal: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     if isinstance(raw_signal, dict):
         return dict(raw_signal)
@@ -360,7 +389,11 @@ def _decision_reason_metadata(
             "coin": coin,
             "side": _enum_value(getattr(signal, "side", raw.get("side", ""))),
             "source": _enum_value(getattr(signal, "source", raw.get("source", ""))),
-            "source_key": raw.get("source_key") or context.get("source_key"),
+            "source_key": (
+                raw.get("source_key")
+                or context.get("source_key")
+                or _derive_source_key_from_signal(signal, raw)
+            ),
             "strategy_type": getattr(signal, "strategy_type", raw.get("strategy_type", "")),
             "strategy_id": str(getattr(signal, "strategy_id", raw.get("strategy_id", "")) or ""),
             "signal_reason": getattr(signal, "reason", raw.get("reason", "")),
@@ -477,7 +510,11 @@ def record_decision_snapshot(
             "coin": getattr(signal, "coin", None),
             "side": _enum_value(getattr(signal, "side", "")),
             "source": _enum_value(getattr(signal, "source", raw.get("source", ""))),
-            "source_key": raw.get("source_key") or context.get("source_key"),
+            "source_key": (
+                raw.get("source_key")
+                or context.get("source_key")
+                or _derive_source_key_from_signal(signal, raw)
+            ),
             "strategy_type": getattr(signal, "strategy_type", raw.get("strategy_type", "")),
             "strategy_id": str(getattr(signal, "strategy_id", raw.get("strategy_id", "")) or ""),
             "signal_id": str(raw.get("signal_id") or getattr(signal, "signal_id", "") or ""),
