@@ -604,12 +604,29 @@ class CalibrationTracker:
         if ece is None:
             return coldstart, f"coldstart_no_ece:{resolved}"
 
-        if ece >= self.quarantine_ece:
+        # Critical: only apply *quarantine* (effective-block) to specific
+        # (source, side, regime) buckets, never to the ``global``
+        # fallback. The global bucket aggregates every source; a high
+        # ECE there means "some sources are miscalibrated", not "every
+        # source must be blocked". If we hit the global bucket here it
+        # means we couldn't find a specific bucket with data -- the
+        # right response is cold-start caution (raise to coldstart
+        # prior), not quarantine. Without this carve-out the gate
+        # locks the bot into its existing positions whenever overall
+        # calibration is shaky -- exactly the asymmetric short-only
+        # behaviour we saw in production on 2026-05-14.
+        is_global_fallback = resolved == "global"
+
+        if ece >= self.quarantine_ece and not is_global_fallback:
             high = max(global_floor, 0.95)
             return high, f"quarantine_high_ece:{resolved}|ece={ece:.3f}"
-        if ece >= self.quarantine_ece * 0.6:
+        if ece >= self.quarantine_ece * 0.6 and not is_global_fallback:
             mid = max(global_floor, 0.55)
             return mid, f"caution_mid_ece:{resolved}|ece={ece:.3f}"
+        if is_global_fallback and ece >= self.quarantine_ece * 0.6:
+            # Global is shaky but we have no source-specific evidence;
+            # require coldstart-level confidence rather than a hard block.
+            return coldstart, f"global_fallback_caution:{resolved}|ece={ece:.3f}"
 
         return global_floor, f"healthy:{resolved}|ece={ece:.3f}|n={total:.0f}"
 

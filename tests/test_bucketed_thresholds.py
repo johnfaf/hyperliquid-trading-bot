@@ -153,6 +153,51 @@ def test_hierarchical_fallback_walks_chain(monkeypatch):
     assert "any" in reason
 
 
+def test_global_fallback_does_not_quarantine(monkeypatch):
+    """High ECE on the *global* bucket must NOT trigger the 0.95 quarantine.
+
+    This is the production bug observed on 2026-05-14: with no source-
+    specific data, every signal's bucket resolution fell back to
+    ``global``; the global bucket had ECE=0.368 (above the 0.25
+    quarantine threshold); my gate then raised every threshold to
+    0.95, blocking every long copy-trade while leaving an existing
+    SHORT ETH position in place. The carve-out: quarantine only fires
+    on *specific* buckets, never on the global fallback. Global with
+    bad ECE should yield cold-start caution at most.
+    """
+    tracker = _fresh_tracker(monkeypatch)
+    # Push 100 outcomes into the global bucket directly, miscalibrated.
+    # ``record`` propagates to both the composed key and the global
+    # aggregate, so we use a synthesised non-fallback source then drop
+    # its composed bucket to leave only the global aggregate populated.
+    _seed_outcomes(
+        tracker,
+        source_key="strategy:transient",
+        side="long",
+        regime="trend",
+        n_trades=100,
+        confidence=0.80,
+        win_rate=0.30,  # miscalibrated => global ECE high
+    )
+    # Drop the specific bucket so only ``global`` carries the bad ECE.
+    composed = compose_calibration_key("strategy:transient", "long", "trend")
+    tracker._bins.pop(composed, None)
+    tracker._brier.pop(composed, None)
+
+    # Now query a brand-new source -- resolution should walk up to "global".
+    threshold, reason = tracker.get_bucketed_min_confidence(
+        "strategy:new_source",
+        side="long",
+        regime="trend",
+        global_min=0.40,
+    )
+    # Cold-start prior is 0.50; threshold must be that, NOT 0.95.
+    assert threshold < 0.95, (
+        f"Global fallback must not trigger quarantine; got {threshold} ({reason})"
+    )
+    assert threshold == pytest.approx(0.50, abs=1e-6)
+
+
 def test_compose_key_roundtrip():
     """Sanity check the key composition used by the threshold method."""
     key = compose_calibration_key("strategy:momentum", "long", "trend")
