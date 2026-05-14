@@ -258,9 +258,14 @@ class TournamentEngine:
 
 class CapitalAllocator:
     """
-    Equal capital allocation for the 9 fixed arena agents.
-    Each agent receives an equal share of the total pool ($10,000 each).
+    Equal capital allocation for the fixed arena agents.
+    Each agent receives an equal share of the total pool.
     No fitness-based weighting — agents compete on pure performance.
+
+    The total pool defaults to ``config.ARENA_TOTAL_POOL_USD`` (set to the
+    paper-trader starting balance so the Arena scoreboard stays consistent
+    with actual paper equity). Callers may pass an explicit ``total_pool``
+    to override, e.g. to mirror current paper balance dynamically.
 
     ★ H11 FIX: removed dead `MAX_SINGLE_AGENT` and `MIN_ALLOCATION`
     constants that suggested fitness-based caps but were never read.
@@ -269,12 +274,15 @@ class CapitalAllocator:
     allocator is implemented.
     """
 
-    BASE_CAPITAL = 10_000.0   # Each of 9 agents gets equal share
-    TOTAL_POOL = 90_000.0     # Total virtual capital: 9 agents × $10,000 each
+    DEFAULT_TOTAL_POOL = 10_000.0   # Matches paper trader starting balance
 
     def __init__(self, total_pool: float = None):
-        if total_pool:
-            self.TOTAL_POOL = total_pool
+        if total_pool is not None and total_pool > 0:
+            self.TOTAL_POOL = float(total_pool)
+        else:
+            self.TOTAL_POOL = float(
+                getattr(config, "ARENA_TOTAL_POOL_USD", self.DEFAULT_TOTAL_POOL)
+            )
 
     def reallocate(self, agents: List[ArenaAgent]) -> Dict[str, float]:
         """

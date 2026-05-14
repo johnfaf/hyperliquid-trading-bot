@@ -156,7 +156,14 @@ class DecisionEngine:
             # Fallback 1: extract from trader's current positions in metrics
             if not coins or (coins and coins[0].lower() == "unknown"):
                 metrics = s.get("metrics", {})
-                traded_coins = metrics.get("coins", metrics.get("coins_traded", []))
+                traded_coins = (
+                    metrics.get("coins")
+                    or metrics.get("coins_traded")
+                    or metrics.get("coin")
+                    or []
+                )
+                if isinstance(traded_coins, str):
+                    traded_coins = [traded_coins]
                 if traded_coins and isinstance(traded_coins, list):
                     coins = [str(coin).upper() for coin in traded_coins if str(coin or "").strip()]
                     params["coins"] = coins  # Persist so _compute_composite_score sees it

@@ -1283,7 +1283,7 @@ def _run_cross_venue_confirmation(container, top_strategies):
                     params = json.loads(params)
                 except (json.JSONDecodeError, TypeError):
                     params = {}
-            coins = params.get("coins", params.get("coins_traded", []))
+            coins = params.get("coins") or params.get("coins_traded") or params.get("coin") or []
             if isinstance(coins, str):
                 coins = [coins]
             coin = coins[0] if coins else ""
@@ -1310,7 +1310,7 @@ def _run_cross_venue_confirmation(container, top_strategies):
                         params = json.loads(params)
                     except (json.JSONDecodeError, TypeError):
                         params = {}
-                coins = params.get("coins", params.get("coins_traded", []))
+                coins = params.get("coins") or params.get("coins_traded") or params.get("coin") or []
                 if isinstance(coins, str):
                     coins = [coins]
                 coin = coins[0] if coins else ""

@@ -143,6 +143,14 @@ def is_synthetic_strategy_placeholder(strategy: dict) -> bool:
     source wallet but synthetic-looking performance: thousands of trades, near
     perfect win rate, and the same rounded score across every strategy.  Those
     rows are not real trading edge and must never seed live-mode side policy.
+
+    Detection: either the full impossible-performance pattern (high trades +
+    near-perfect WR + sentinel score), OR the sentinel score alone. The
+    sentinel ``_SYNTHETIC_STRATEGY_SCORE = 0.7955`` (±0.0005) is a deliberate
+    seed marker; real strategy scoring is extremely unlikely to land in that
+    1/1000-wide band, so a score-only hit is sufficient evidence to quarantine
+    even when other fields look "live-like" (e.g. low trade count slipping
+    through the older 1000-trade gate).
     """
     strategy = dict(strategy or {})
     trade_count = int(_strategy_metric_float(strategy, "trade_count", 0.0))
@@ -151,11 +159,14 @@ def is_synthetic_strategy_placeholder(strategy: dict) -> bool:
         win_rate /= 100.0
     score = _strategy_metric_float(strategy, "current_score", -1.0)
 
-    return (
+    score_sentinel_hit = (
+        abs(score - _SYNTHETIC_STRATEGY_SCORE) <= _SYNTHETIC_STRATEGY_SCORE_TOLERANCE
+    )
+    impossible_performance = (
         trade_count >= _SYNTHETIC_STRATEGY_MIN_TRADES
         and win_rate >= _SYNTHETIC_STRATEGY_MIN_WIN_RATE
-        and abs(score - _SYNTHETIC_STRATEGY_SCORE) <= _SYNTHETIC_STRATEGY_SCORE_TOLERANCE
     )
+    return score_sentinel_hit or impossible_performance
 
 
 def strategy_quarantine_reason(strategy: dict) -> Optional[str]:

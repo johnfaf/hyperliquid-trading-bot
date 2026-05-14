@@ -402,7 +402,7 @@ LIVE_MIN_ORDER_USD = _safe_env_float("LIVE_MIN_ORDER_USD", 11.0, lo=1.0, hi=10_0
 # can actually execute; set a higher value via env var as confidence grows.
 # NOTE: a value below LIVE_MIN_ORDER_USD is impossible to honor — the
 # LiveTrader will raise it to LIVE_MIN_ORDER_USD at startup with a warning.
-LIVE_MAX_ORDER_USD = _safe_env_float("LIVE_MAX_ORDER_USD", 100.0, lo=1.0, hi=1_000_000.0)
+LIVE_MAX_ORDER_USD = _safe_env_float("LIVE_MAX_ORDER_USD", 150.0, lo=1.0, hi=1_000_000.0)
 _live_max_position_default = os.environ.get(
     "HL_MAX_POSITION_SIZE", str(LIVE_MAX_ORDER_USD)
 )
@@ -1099,6 +1099,13 @@ ARENA_HIGH_CONFIDENCE_THRESHOLD = float(
 ARENA_UNVALIDATED_CONFIDENCE_CAP = float(
     os.environ.get("ARENA_UNVALIDATED_CONFIDENCE_CAP", 0.74)
 )
+# Total virtual capital allocated across all Alpha Arena agents. Per-agent share
+# is TOTAL / N_active. Default matches the paper trader starting balance so the
+# Arena scoreboard stays consistent with paper equity instead of inflating to
+# $90K against a $10K paper account.
+ARENA_TOTAL_POOL_USD = _safe_env_float(
+    "ARENA_TOTAL_POOL_USD", 10_000.0, lo=10.0, hi=10_000_000.0
+)
 
 # Options-flow conviction gate (0-100).
 OPTIONS_FLOW_MIN_CONVICTION_PCT = float(
@@ -1304,8 +1311,8 @@ def _validate_config_bounds() -> None:
         ("PAPER_TRADING_STOP_LOSS_PCT", 0.001, 1.0, 0.15),
         ("PAPER_TRADING_TAKE_PROFIT_PCT", 0.001, 5.0, 0.75),
         ("LIVE_MIN_ORDER_USD", 10.0, 1_000_000.0, 11.0),
-        ("LIVE_MAX_ORDER_USD", 10.0, 1_000_000.0, 100.0),
-        ("LIVE_MAX_POSITION_SIZE_USD", 10.0, 10_000_000.0, 100.0),
+        ("LIVE_MAX_ORDER_USD", 10.0, 1_000_000.0, 150.0),
+        ("LIVE_MAX_POSITION_SIZE_USD", 10.0, 10_000_000.0, 150.0),
         ("LIVE_MAX_DAILY_LOSS_USD", 1.0, 10_000_000.0, 100.0),
         ("PORTFOLIO_TARGET_POSITIONS", 1, 100, 8),
         ("PORTFOLIO_HARD_MAX_POSITIONS", 1, 200, 10),
@@ -1494,6 +1501,7 @@ def _validate_config_bounds() -> None:
         ("RISK_POLICY_SHORT_CAUTION_BREAKEVEN_AT_R", 0.1, 5.0, 0.65),
         ("ARENA_HIGH_CONFIDENCE_THRESHOLD", 0.0, 1.0, 0.80),
         ("ARENA_UNVALIDATED_CONFIDENCE_CAP", 0.0, 1.0, 0.74),
+        ("ARENA_TOTAL_POOL_USD", 10.0, 10_000_000.0, 10_000.0),
         ("READINESS_STALE_SECONDS", 30, 86_400, 600),
         ("READINESS_DB_WRITE_TTL_S", 1, 3_600, 60),
         ("READINESS_ALERT_COOLDOWN_S", 30, 86_400, 900),

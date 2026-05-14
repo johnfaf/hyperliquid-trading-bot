@@ -52,6 +52,19 @@ _COUNTERTREND_COPY_BLOCK_MIN_CONFIDENCE = float(
 _SYNTHETIC_REGIME_CONFIDENCE_CAP = float(
     getattr(config, "COPY_TRADER_SYNTHETIC_REGIME_CONFIDENCE_CAP", 0.50)
 )
+# Threshold above which a synthetic regime forecast is still used as a one-way
+# *safety brake*: when synthetic confidently flags a countertrend direction we
+# block the entry rather than just capping confidence. Asymmetric on purpose —
+# synthetic data never confirms or boosts a trade, but a high-confidence
+# bearish/crash synthetic read is better than ignoring it entirely (this is the
+# pattern that allowed the 2026-05 HYPE long during a trending_down regime).
+_SYNTHETIC_REGIME_DIRECTIONAL_BLOCK_MIN_CONFIDENCE = float(
+    getattr(
+        config,
+        "COPY_TRADER_SYNTHETIC_REGIME_DIRECTIONAL_BLOCK_MIN_CONFIDENCE",
+        0.70,
+    )
+)
 
 # Signal confidence model — explicit baselines and caps per signal type.
 # Rationale:
@@ -752,6 +765,25 @@ class CopyTrader:
         )
 
         if synthetic_regime:
+            # Asymmetric safety brake: synthetic data never confirms or boosts a
+            # trade, but at high forecaster confidence a countertrend synthetic
+            # read is treated as a one-way block. Symmetric to the cycle-regime
+            # block at lines above, but with a stricter confidence floor since
+            # the underlying data is warm-start synthetic.
+            if regime_conf >= _SYNTHETIC_REGIME_DIRECTIONAL_BLOCK_MIN_CONFIDENCE:
+                if signal_side == "long" and regime in {"trending_down", "bearish", "crash"}:
+                    signal["regime_block_reason"] = (
+                        f"synthetic_forecaster_{regime}_blocks_long:{regime_conf:.2f}"
+                    )
+                    signal["regime_data_quality"] = "synthetic_warm_start"
+                    return signal
+                if signal_side == "short" and regime in {"trending_up", "bullish"}:
+                    signal["regime_block_reason"] = (
+                        f"synthetic_forecaster_{regime}_blocks_short:{regime_conf:.2f}"
+                    )
+                    signal["regime_data_quality"] = "synthetic_warm_start"
+                    return signal
+
             capped = min(original_confidence, _SYNTHETIC_REGIME_CONFIDENCE_CAP)
             if capped < original_confidence:
                 logger.info(

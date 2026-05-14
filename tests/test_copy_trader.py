@@ -148,10 +148,48 @@ class TestApplyRegimeWeight:
         )
         assert result["regime_block_reason"] == "detector_trending_down_blocks_long"
 
-    def test_synthetic_regime_caps_but_does_not_block(self):
+    def test_synthetic_regime_blocks_high_conf_countertrend_long(self):
+        # Asymmetric safety brake: synthetic regime data normally just caps
+        # confidence, but at high forecaster confidence (>= 0.70) a
+        # countertrend direction now blocks the entry. This is the gate that
+        # would have caught the 2026-05 HYPE long during a trending_down
+        # regime where the cycle-regime data was stale at decision time.
         ct = self._make_trader()
         ct.regime_forecaster.predict_regime.return_value = {
             "regime": "crash",
+            "confidence": 0.90,
+            "training_source": "synthetic",
+            "synthetic_warm_start": True,
+        }
+        signal = {"side": "long", "confidence": 0.80}
+        result = ct._apply_regime_weight(signal, "BTC")
+        assert result["regime_block_reason"].startswith("synthetic_forecaster_crash_blocks_long")
+        assert result["regime_data_quality"] == "synthetic_warm_start"
+
+    def test_synthetic_regime_caps_below_directional_block_threshold(self):
+        # Below the directional-block threshold (< 0.70) synthetic regime
+        # still falls back to confidence-cap-only behaviour so calibration
+        # data keeps flowing for low-confidence forecasts.
+        ct = self._make_trader()
+        ct.regime_forecaster.predict_regime.return_value = {
+            "regime": "crash",
+            "confidence": 0.55,
+            "training_source": "synthetic",
+            "synthetic_warm_start": True,
+        }
+        signal = {"side": "long", "confidence": 0.80}
+        result = ct._apply_regime_weight(signal, "BTC")
+        assert "regime_block_reason" not in result
+        assert result["confidence"] == 0.50
+        assert result["regime_data_quality"] == "synthetic_warm_start"
+
+    def test_synthetic_regime_non_countertrend_still_caps_only(self):
+        # Synthetic bullish forecast for a long signal is not countertrend, so
+        # no block fires regardless of forecaster confidence — but synthetic
+        # data still never *confirms* the trade, so confidence is capped.
+        ct = self._make_trader()
+        ct.regime_forecaster.predict_regime.return_value = {
+            "regime": "bullish",
             "confidence": 0.90,
             "training_source": "synthetic",
             "synthetic_warm_start": True,
