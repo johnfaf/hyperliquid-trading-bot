@@ -68,6 +68,11 @@ class DecisionFirewall:
         # gap surfaces as a clear rejection rather than silently shipping
         # uncalibratable trades to live.
         self.block_unknown_sources = bool(cfg.get("block_unknown_sources", True))
+        # When enabled and a calibration tracker is wired in, derive a
+        # per-(source, side, regime) min-confidence floor from observed
+        # ECE/sample-size instead of using only the global ``min_confidence``.
+        # Asymmetric: only raises the floor, never lowers it.
+        self.use_bucketed_thresholds = bool(cfg.get("use_bucketed_thresholds", True))
         self.max_signals_per_source_per_day = int(
             cfg.get("max_signals_per_source_per_day", 0)
         )
@@ -327,11 +332,13 @@ class DecisionFirewall:
             "rejected_drawdown": 0,
             "rejected_exposure": 0,
             "rejected_funding": 0,
+            "rejected_funding_divergence": 0,
             "rejected_event_risk": 0,
             "rejected_side_policy": 0,
             "rejected_entry_location": 0,
             "rejected_side_imbalance": 0,
             "rejected_unknown_source": 0,
+            "rejected_bucketed_confidence": 0,
             # LOW-FIX LOW-1: count audit-log write failures so ops can detect
             # when the audit trail is silently broken (DB full, locked, etc.)
             "audit_log_failures": 0,
@@ -1947,6 +1954,39 @@ class DecisionFirewall:
                 "tag strategy_type/source, blocking from execution",
             )
 
+        # 2a-bis. Per-bucket min-confidence floor.
+        # The global ``min_confidence`` already filtered obvious garbage
+        # above. Now consult the calibration tracker for the most-specific
+        # (source, side, regime) bucket -- if that bucket is thin or
+        # miscalibrated, raise the floor for *this* trade. Never lowers
+        # below the global floor; can only tighten.
+        if self.use_bucketed_thresholds and self.calibration is not None:
+            try:
+                side_val = (
+                    signal.side.value if hasattr(signal.side, "value") else str(signal.side)
+                )
+                from src.signals.calibration import bucket_regime as _bucket_regime
+                raw_regime = ""
+                if regime_data and isinstance(regime_data, dict):
+                    raw_regime = str(regime_data.get("overall_regime", "") or "")
+                if not raw_regime:
+                    raw_regime = str(getattr(signal, "regime", "") or "")
+                bucket = _bucket_regime(raw_regime)
+                threshold, threshold_reason = self.calibration.get_bucketed_min_confidence(
+                    source_key,
+                    side=side_val,
+                    regime=bucket,
+                    global_min=self.min_confidence,
+                )
+                if signal.confidence + self.confidence_threshold_tolerance < threshold:
+                    return _reject(
+                        "rejected_bucketed_confidence",
+                        f"Confidence {signal.confidence:.0%} below bucket floor "
+                        f"{threshold:.0%} ({threshold_reason})",
+                    )
+            except Exception as exc:
+                logger.debug("Bucketed-threshold check failed (fail-open): %s", exc)
+
         # 2b. Per-source/day throughput cap (approved signals).
         policy_ok, policy_reason, source_policy = self._apply_source_policy(
             signal,
@@ -2196,6 +2236,20 @@ class DecisionFirewall:
                                   f"shorts pay {funding*3*365:.0f}% annualized, blocking short")
             except Exception as e:
                 logger.debug(f"Funding rate check failed: {e}")
+
+        # 11b. Funding-vs-price divergence (cross-market BTC/ETH read).
+        #      Different from the per-coin funding check above: this one
+        #      blocks longs when the broader market shows crowded longs
+        #      paying premium into a selloff (and symmetric for shorts).
+        try:
+            from src.signals.funding_divergence import should_block_side
+
+            side_val = signal.side.value if hasattr(signal.side, "value") else str(signal.side)
+            divergence_block, divergence_reason = should_block_side(side_val)
+            if divergence_block:
+                return _reject("rejected_funding_divergence", divergence_reason)
+        except Exception as exc:
+            logger.debug("Funding divergence check failed (fail-open): %s", exc)
 
         # 12. Predictive regime de-risking
         #     If forecaster detects crash with high confidence, dynamically reduce

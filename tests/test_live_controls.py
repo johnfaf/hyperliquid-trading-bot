@@ -48,6 +48,19 @@ from src.trading.live_trader import (
     _hl_format_price,
     _hl_format_size,
 )
+
+
+@pytest.fixture(autouse=True)
+def _bypass_promotion_gate(monkeypatch):
+    """Pre-existing live-control tests use minimal trade dicts that the
+    walk-forward promotion gate would (correctly) reject as untagged.
+    Bypass the gate so these tests keep exercising the rescale/firewall
+    math they were written for. The promotion gate itself is covered by
+    ``tests/test_promotion_gate.py``."""
+    monkeypatch.setattr(
+        "src.learning.promotion_gate.is_live_promotable",
+        lambda trade: (True, "test_bypass"),
+    )
 from src.trading.portfolio_rotation import PortfolioRotationManager, RotationDecision
 
 
@@ -2582,6 +2595,10 @@ def test_rescale_size_for_live_blocks_when_paper_balance_missing(monkeypatch):
         def get_account_value(self):
             return 2500.0
 
+    monkeypatch.setattr(
+        "src.learning.promotion_gate.is_live_promotable",
+        lambda trade: (True, "test_bypass"),
+    )
     monkeypatch.setattr("src.core.live_execution.db.get_paper_account", lambda: {"balance": 0})
     monkeypatch.setattr("src.core.live_execution.db.get_open_paper_trades", lambda: [])
 
@@ -2601,6 +2618,10 @@ def test_rescale_size_for_live_enforces_max_order_usd_cap(monkeypatch):
         def get_account_value(self):
             return 10_000.0  # equal to paper — scale = 1.0
 
+    monkeypatch.setattr(
+        "src.learning.promotion_gate.is_live_promotable",
+        lambda trade: (True, "test_bypass"),
+    )
     monkeypatch.setattr("src.core.live_execution.db.get_paper_account", lambda: {"balance": 10_000.0})
     monkeypatch.setattr("src.core.live_execution.db.get_open_paper_trades", lambda: [])
     monkeypatch.setattr("src.core.live_execution.get_all_mids", lambda: {"ETH": 2000.0})
@@ -2632,6 +2653,10 @@ def test_rescale_size_for_live_uses_free_margin_for_scale(monkeypatch):
         def get_free_margin(self):
             return 50.0
 
+    monkeypatch.setattr(
+        "src.learning.promotion_gate.is_live_promotable",
+        lambda trade: (True, "test_bypass"),
+    )
     monkeypatch.setattr("src.core.live_execution.db.get_paper_account", lambda: {"balance": 1_000.0})
     monkeypatch.setattr("src.core.live_execution.db.get_open_paper_trades", lambda: [])
     monkeypatch.setattr("src.core.live_execution.get_all_mids", lambda: {"ETH": 100.0})
@@ -2672,6 +2697,10 @@ def test_rescale_size_for_live_deducts_paper_open_margin(monkeypatch):
         def get_free_margin(self):
             return 9_000.0
 
+    monkeypatch.setattr(
+        "src.learning.promotion_gate.is_live_promotable",
+        lambda trade: (True, "test_bypass"),
+    )
     monkeypatch.setattr("src.core.live_execution.db.get_paper_account",
                         lambda: {"balance": 10_000.0})
     monkeypatch.setattr(
@@ -2719,6 +2748,10 @@ def test_rescale_size_for_live_skips_when_paper_fully_levered(monkeypatch):
         def get_free_margin(self):
             return 1_000.0
 
+    monkeypatch.setattr(
+        "src.learning.promotion_gate.is_live_promotable",
+        lambda trade: (True, "test_bypass"),
+    )
     monkeypatch.setattr("src.core.live_execution.db.get_paper_account",
                         lambda: {"balance": 1_000.0})
     # Single paper trade locks up the entire balance as margin:

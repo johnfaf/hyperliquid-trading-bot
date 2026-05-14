@@ -546,6 +546,73 @@ class CalibrationTracker:
         self._curve_size_at_fit[source_key] = total
         return curve
 
+    def get_bucketed_min_confidence(
+        self,
+        source_key: str,
+        *,
+        side: Optional[str] = None,
+        regime: Optional[str] = None,
+        global_min: float = 0.40,
+    ) -> Tuple[float, str]:
+        """Return ``(threshold, reason)`` for a (source, side, regime) bucket.
+
+        Asymmetric on purpose: this method can *raise* the global
+        ``min_confidence`` floor for a noisy or thin bucket, but never
+        lowers it. A well-calibrated bucket gets the global default;
+        a miscalibrated bucket gets a tighter (higher) gate; an
+        unknown bucket falls back to whichever parent has data.
+
+        Resolution chain (most-specific first):
+          1. ``(source | side | regime)``
+          2. ``(source | side | any)``
+          3. ``(source | * | any)``
+          4. Legacy raw ``source_key``
+          5. ``"global"``
+
+        Rules applied to the resolved bucket:
+          * No data anywhere → ``max(global_min, coldstart_prior)``.
+          * Sample size below ``min_outcomes`` → same cold-start cap.
+          * ECE >= ``quarantine_ece`` → high threshold (effectively
+            block: ``max(global_min, 0.95)``).
+          * ECE >= ``quarantine_ece * 0.6`` → mid threshold
+            (``max(global_min, 0.55)``).
+          * Otherwise → ``global_min``.
+        """
+        global_floor = float(global_min)
+        coldstart = float(max(global_floor, self.coldstart_prior))
+
+        resolved = self._resolve_key(source_key, side=side, regime=regime)
+        total = self._source_total(resolved)
+        if total <= 0:
+            # No data at the most-specific bucket; try walking up the
+            # chain explicitly so we don't silently fall back to global.
+            for fallback in (
+                compose_calibration_key(source_key, side, _REGIME_ANY),
+                compose_calibration_key(source_key, None, _REGIME_ANY),
+                "global",
+            ):
+                if self._source_total(fallback) > 0:
+                    resolved = fallback
+                    total = self._source_total(fallback)
+                    break
+        if total <= 0:
+            return coldstart, f"coldstart_no_data:{resolved}"
+        if total < self.min_outcomes:
+            return coldstart, f"coldstart_thin:{resolved}|n={total:.0f}"
+
+        ece = self.get_ece(resolved)
+        if ece is None:
+            return coldstart, f"coldstart_no_ece:{resolved}"
+
+        if ece >= self.quarantine_ece:
+            high = max(global_floor, 0.95)
+            return high, f"quarantine_high_ece:{resolved}|ece={ece:.3f}"
+        if ece >= self.quarantine_ece * 0.6:
+            mid = max(global_floor, 0.55)
+            return mid, f"caution_mid_ece:{resolved}|ece={ece:.3f}"
+
+        return global_floor, f"healthy:{resolved}|ece={ece:.3f}|n={total:.0f}"
+
     def get_reliability_multiplier(self, source_key: str = "global") -> float:
         """Return a confidence-derisk multiplier based on calibration error.
 

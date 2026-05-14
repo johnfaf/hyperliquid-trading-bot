@@ -404,6 +404,9 @@ def build_subsystems(
             "block_unknown_sources": bool(
                 getattr(_fw_cfg, "FIREWALL_BLOCK_UNKNOWN_SOURCES", True)
             ),
+            "use_bucketed_thresholds": bool(
+                getattr(_fw_cfg, "FIREWALL_USE_BUCKETED_THRESHOLDS", True)
+            ),
             "max_signals_per_source_per_day": getattr(
                 _fw_cfg, "FIREWALL_MAX_SIGNALS_PER_SOURCE_PER_DAY", 0
             ),

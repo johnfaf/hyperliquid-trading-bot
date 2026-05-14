@@ -742,6 +742,53 @@ FIREWALL_MIN_CONFIDENCE = float(os.environ.get("FIREWALL_MIN_CONFIDENCE", 0.40))
 FIREWALL_BLOCK_UNKNOWN_SOURCES = os.environ.get(
     "FIREWALL_BLOCK_UNKNOWN_SOURCES", "true"
 ).lower() in ("true", "1", "yes")
+
+# ─── Live promotion gate ──────────────────────────────────────
+# Walk-forward gate that blocks paper -> live mirror until a strategy /
+# source has accumulated enough out-of-sample evidence. Layered on top
+# of synthetic-strategy quarantine -- quarantine catches broken rows,
+# this catches well-formed but unproven sources.
+LIVE_PROMOTION_GATE_ENABLED = os.environ.get(
+    "LIVE_PROMOTION_GATE_ENABLED", "true"
+).lower() in ("true", "1", "yes")
+LIVE_PROMOTION_MIN_TRADES = int(
+    os.environ.get("LIVE_PROMOTION_MIN_TRADES", 30)
+)
+LIVE_PROMOTION_MIN_WIN_RATE = _safe_env_float(
+    "LIVE_PROMOTION_MIN_WIN_RATE", 0.45, lo=0.0, hi=1.0
+)
+LIVE_PROMOTION_MIN_SCORE = _safe_env_float(
+    "LIVE_PROMOTION_MIN_SCORE", 0.20, lo=0.0, hi=1.0
+)
+
+# ─── Funding-rate divergence brake ─────────────────────────────
+# Cross-market safety brake: when BTC/ETH funding is meaningfully
+# positive AND price is below the 4h moving average (crowded longs
+# paying premium into a selloff), block new longs. Symmetric for
+# crowded shorts into rallies. Asymmetric -- never confirms or
+# boosts a trade, only blocks.
+FUNDING_DIVERGENCE_ENABLED = os.environ.get(
+    "FUNDING_DIVERGENCE_ENABLED", "true"
+).lower() in ("true", "1", "yes")
+FUNDING_DIVERGENCE_FUNDING_THRESHOLD = _safe_env_float(
+    "FUNDING_DIVERGENCE_FUNDING_THRESHOLD", 0.00015, lo=0.0, hi=0.01
+)
+FUNDING_DIVERGENCE_PRICE_DEV_THRESHOLD = _safe_env_float(
+    "FUNDING_DIVERGENCE_PRICE_DEV_THRESHOLD", 0.005, lo=0.0, hi=0.5
+)
+FUNDING_DIVERGENCE_CACHE_TTL_S = _safe_env_float(
+    "FUNDING_DIVERGENCE_CACHE_TTL_S", 300.0, lo=10.0, hi=3600.0
+)
+
+# ─── Per-bucket firewall confidence thresholds ─────────────────
+# When enabled, the firewall consults the calibration tracker to
+# derive a per-(source, side, regime) min-confidence floor instead of
+# using a single global value. Asymmetric: never lowers below
+# FIREWALL_MIN_CONFIDENCE, only raises for thin/miscalibrated buckets.
+# Disable while the calibration table is being repopulated.
+FIREWALL_USE_BUCKETED_THRESHOLDS = os.environ.get(
+    "FIREWALL_USE_BUCKETED_THRESHOLDS", "true"
+).lower() in ("true", "1", "yes")
 FIREWALL_MAX_SIGNALS_PER_SOURCE_PER_DAY = int(
     os.environ.get("FIREWALL_MAX_SIGNALS_PER_SOURCE_PER_DAY", 0)
 )
