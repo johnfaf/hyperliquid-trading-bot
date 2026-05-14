@@ -975,6 +975,22 @@ class PaperTrader:
                             logger.debug(f"Calibration adjust {sig['coin']}: "
                                        f"{trade_signal.confidence:.2f} -> {adjusted:.2f}")
                         trade_signal.confidence = adjusted
+                        # Push the post-calibration value back to the
+                        # snapshot so the calibrated_confidence column
+                        # reflects what the gate actually saw, not the
+                        # pre-adjustment raw score.
+                        decision_id = self._decision_id_for_signal(trade_signal, sig)
+                        if decision_id:
+                            try:
+                                decision_journal.update_calibrated_confidence(
+                                    decision_id, trade_signal.confidence
+                                )
+                            except Exception as exc:
+                                logger.debug(
+                                    "calibrated_confidence snapshot update "
+                                    "failed for %s: %s",
+                                    decision_id, exc,
+                                )
                         composed_key = compose_calibration_key(
                             source_key, cal_side, cal_regime
                         )

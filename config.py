@@ -789,6 +789,26 @@ FUNDING_DIVERGENCE_CACHE_TTL_S = _safe_env_float(
 FIREWALL_USE_BUCKETED_THRESHOLDS = os.environ.get(
     "FIREWALL_USE_BUCKETED_THRESHOLDS", "true"
 ).lower() in ("true", "1", "yes")
+
+# ─── Orphan position reaper ───────────────────────────────────
+# An orphan is a live position the bot found on the exchange but
+# didn't open itself. The reconciliation path creates a synthetic
+# paper trade so PnL accounting stays consistent, but the bot has
+# no thesis for these positions and never closes them. The reaper
+# is opt-in: set ``ORPHAN_REAPER_ENABLED=true`` to have it close
+# orphans past ``ORPHAN_REAPER_MAX_AGE_HOURS`` old. The break-even
+# gate (default on) holds positions whose mid-price is worse than
+# entry so the reaper doesn't realise losses on positions the
+# operator might want to manage manually.
+ORPHAN_REAPER_ENABLED = os.environ.get(
+    "ORPHAN_REAPER_ENABLED", "false"
+).lower() in ("true", "1", "yes")
+ORPHAN_REAPER_MAX_AGE_HOURS = _safe_env_float(
+    "ORPHAN_REAPER_MAX_AGE_HOURS", 24.0, lo=0.1, hi=720.0
+)
+ORPHAN_REAPER_REQUIRE_BREAKEVEN = os.environ.get(
+    "ORPHAN_REAPER_REQUIRE_BREAKEVEN", "true"
+).lower() in ("true", "1", "yes")
 FIREWALL_MAX_SIGNALS_PER_SOURCE_PER_DAY = int(
     os.environ.get("FIREWALL_MAX_SIGNALS_PER_SOURCE_PER_DAY", 0)
 )

@@ -565,6 +565,38 @@ def record_decision_snapshot(
         return None
 
 
+def update_calibrated_confidence(decision_id: str, value: float) -> bool:
+    """Refresh the ``calibrated_confidence`` column on an existing snapshot.
+
+    The snapshot is recorded at signal-generation time, before the
+    calibration tracker has had a chance to adjust confidence. Without
+    this update, every snapshot row carries the *raw* score in both
+    the ``raw_confidence`` and ``calibrated_confidence`` columns --
+    masking what the calibrator actually did. Called after the
+    calibration adjustment runs in paper_trader.
+    """
+    if not _enabled() or not decision_id:
+        return False
+    if not _schema_or_skip():
+        return False
+    try:
+        from src.data import database as db
+
+        with db.get_connection() as conn:
+            conn.execute(
+                """
+                UPDATE decision_snapshots
+                SET updated_at = ?, calibrated_confidence = ?
+                WHERE decision_id = ?
+                """,
+                (_now(), float(value), decision_id),
+            )
+        return True
+    except Exception as exc:
+        _record_write_failure("calibrated_confidence_update", exc)
+        return False
+
+
 def update_decision_status(
     decision_id: str,
     *,
