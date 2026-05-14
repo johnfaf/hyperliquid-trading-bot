@@ -732,6 +732,16 @@ ROTATION_REQUIRE_EXPLICIT_THRESHOLDS = os.environ.get(
 # adjusted signals through.  Raise back to 0.45+ once we have
 # meaningful live-trade history to score sources against.
 FIREWALL_MIN_CONFIDENCE = float(os.environ.get("FIREWALL_MIN_CONFIDENCE", 0.40))
+# Block signals whose source resolves to ``unknown`` / ``strategy:unknown`` /
+# ``strategy:untagged`` at the firewall layer. Default-on because those
+# buckets dominate the calibration table when upstream signal generators
+# fail to tag strategy_type/source -- if calibration data is mostly one
+# fat untagged bucket, per-source thresholds have nothing to gate on.
+# Disable via ``FIREWALL_BLOCK_UNKNOWN_SOURCES=false`` to allow them
+# through (e.g. during a deliberate paper-collection backfill).
+FIREWALL_BLOCK_UNKNOWN_SOURCES = os.environ.get(
+    "FIREWALL_BLOCK_UNKNOWN_SOURCES", "true"
+).lower() in ("true", "1", "yes")
 FIREWALL_MAX_SIGNALS_PER_SOURCE_PER_DAY = int(
     os.environ.get("FIREWALL_MAX_SIGNALS_PER_SOURCE_PER_DAY", 0)
 )

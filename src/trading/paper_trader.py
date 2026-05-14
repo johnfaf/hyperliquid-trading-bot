@@ -135,8 +135,16 @@ class PaperTrader:
                 metadata=metadata or {},
             )
             decision_journal.record_decision_outcome(decision_id)
-        except Exception:
-            pass
+        except Exception as exc:
+            # Surfacing the failure (was silent ``pass``). decision_outcomes
+            # rows are the calibration ground truth -- if these writes are
+            # failing in production we need to see it in logs, not have it
+            # show up later as an empty calibration table.
+            logger.debug(
+                "decision_outcomes write skipped for decision_id=%s: %s",
+                decision_id,
+                exc,
+            )
 
     def _ensure_account(self):
         """Initialize paper trading account if it doesn't exist."""
@@ -2073,6 +2081,20 @@ class PaperTrader:
             pass
         self._closed_events.append(closed_event)
         decision_id = str(trade_meta.get("decision_id") or trade.get("decision_id") or "").strip()
+        if not decision_id:
+            # Silent skip here is the most likely root cause of an empty
+            # decision_outcomes table -- if signal->trade plumbing didn't
+            # carry a decision_id through, every close is uncalibratable.
+            # Logging the gap (debug-level so it doesn't spam in normal
+            # operation) lets ops see exactly which trades are slipping
+            # through without outcome rows.
+            logger.debug(
+                "decision_outcomes skipped at close: trade %s (coin=%s, "
+                "close_reason=%s) had no decision_id in trade or metadata",
+                trade.get("id", "?"),
+                trade.get("coin", "?"),
+                close_reason,
+            )
         if decision_id:
             hold_minutes = None
             try:
@@ -2124,8 +2146,18 @@ class PaperTrader:
                         },
                     },
                 )
-            except Exception:
-                pass
+            except Exception as exc:
+                # Was silent ``pass``. decision_outcomes is the ground truth
+                # for calibration; if the close-time write keeps failing
+                # we need to see why in logs.
+                logger.debug(
+                    "decision_outcomes close-write skipped for decision_id=%s "
+                    "(coin=%s, close_reason=%s): %s",
+                    decision_id,
+                    trade.get("coin", "?"),
+                    close_reason,
+                    exc,
+                )
         return closed_event
 
     def drain_closed_events(self) -> List[Dict]:

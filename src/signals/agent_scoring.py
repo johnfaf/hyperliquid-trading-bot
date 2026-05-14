@@ -25,6 +25,17 @@ logger = logging.getLogger(__name__)
 # Time decay: how quickly old performance fades
 DECAY_HALF_LIFE_TRADES = 50   # After 50 trades, weight of old data is halved
 
+# Calendar decay on top of trade-count decay. A source that hasn't produced
+# a tracked outcome in N days is treated as stale even if its trade-count
+# history looks healthy — markets change, and a source that performed in
+# the past quarter but hasn't traded recently shouldn't keep its full
+# weight. Idle thresholds and multipliers are picked so a source dropping
+# off for 2 weeks halves its weight, and a month idle quarters it.
+SOURCE_IDLE_DOWNWEIGHT_DAYS = 14
+SOURCE_STALE_DOWNWEIGHT_DAYS = 30
+SOURCE_IDLE_WEIGHT_MULTIPLIER = 0.50
+SOURCE_STALE_WEIGHT_MULTIPLIER = 0.25
+
 
 @dataclass
 class SourceScore:
@@ -335,11 +346,45 @@ class AgentScorer:
     # ─── Query ────────────────────────────────────────────────
 
     def get_weight(self, source_key: str) -> float:
-        """Get the current dynamic weight for a signal source."""
+        """Get the current dynamic weight for a signal source.
+
+        Applies calendar decay on top of the stored dynamic_weight: idle
+        sources (no tracked outcome for N days) get halved, stale sources
+        (no outcome for ~1 month) get quartered. Trade-count decay still
+        runs at score-update time inside ``_update_score``.
+        """
         score = self.scores.get(source_key)
         if not score or score.total_signals < 5:
             return 0.5  # Default weight for new/unknown sources
-        return score.dynamic_weight
+        weight = float(score.dynamic_weight)
+        idle_days = self._source_idle_days(score)
+        if idle_days is None:
+            return weight
+        if idle_days >= SOURCE_STALE_DOWNWEIGHT_DAYS:
+            return max(0.05, weight * SOURCE_STALE_WEIGHT_MULTIPLIER)
+        if idle_days >= SOURCE_IDLE_DOWNWEIGHT_DAYS:
+            return max(0.05, weight * SOURCE_IDLE_WEIGHT_MULTIPLIER)
+        return weight
+
+    @staticmethod
+    def _source_idle_days(score: SourceScore) -> Optional[float]:
+        """Return how many days ago this source last produced an outcome.
+
+        Returns ``None`` when ``last_updated`` is missing or unparseable
+        (treat as fresh rather than stale, since a parsing bug shouldn't
+        silently quarter every source's weight).
+        """
+        raw = (score.last_updated or "").strip()
+        if not raw:
+            return None
+        try:
+            dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            delta = datetime.now(timezone.utc) - dt
+            return max(0.0, delta.total_seconds() / 86400.0)
+        except (TypeError, ValueError):
+            return None
 
     def get_accuracy(self, source_key: str) -> float:
         """Get the time-decay weighted accuracy for a source."""

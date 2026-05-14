@@ -466,10 +466,16 @@ def test_firewall_enforces_per_source_day_cap(mock_db):
             "funding_risk_enabled": False,
         }
     )
+    # Source must resolve to a fully-tagged source_key
+    # (``copy_trade:0x...``); the firewall now blocks bare ``copy_trade``
+    # without a trader_address as an upstream tagging gap.
+    trader = "0x" + "a" * 40
     first = MockSignal(coin="BTC", confidence=0.6)
     first.source = "copy_trade"
+    first.trader_address = trader
     second = MockSignal(coin="ETH", confidence=0.6)
     second.source = "copy_trade"
+    second.trader_address = trader
 
     passed1, _ = fw.validate(first)
     passed2, reason2 = fw.validate(second)
@@ -479,7 +485,7 @@ def test_firewall_enforces_per_source_day_cap(mock_db):
     assert "source/day cap" in reason2.lower()
     stats = fw.get_stats()
     assert stats["rejected_source_cap"] == 1
-    assert stats["source_signal_counts"]["copy_trade"] == 1
+    assert stats["source_signal_counts"][f"copy_trade:{trader}"] == 1
 
 
 @patch("src.signals.decision_firewall.db")

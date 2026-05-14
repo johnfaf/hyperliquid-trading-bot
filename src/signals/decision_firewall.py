@@ -60,6 +60,14 @@ class DecisionFirewall:
         # strategy DB has 50+ scored strategies with >10 trades each.
         self.min_confidence = cfg.get("min_confidence", 0.15)
         self.min_source_accuracy = cfg.get("min_source_accuracy", 0.0)  # 0 = no filter
+        # Block signals whose source_key resolves to a known-untagged bucket
+        # (``unknown``, ``strategy:unknown``, ``strategy:untagged``). These rows
+        # dominate the calibration table when upstream signal generators fail
+        # to set strategy_type/source, masking real per-source calibration
+        # signal behind one fat untagged bucket. Default-on so the upstream
+        # gap surfaces as a clear rejection rather than silently shipping
+        # uncalibratable trades to live.
+        self.block_unknown_sources = bool(cfg.get("block_unknown_sources", True))
         self.max_signals_per_source_per_day = int(
             cfg.get("max_signals_per_source_per_day", 0)
         )
@@ -323,6 +331,7 @@ class DecisionFirewall:
             "rejected_side_policy": 0,
             "rejected_entry_location": 0,
             "rejected_side_imbalance": 0,
+            "rejected_unknown_source": 0,
             # LOW-FIX LOW-1: count audit-log write failures so ops can detect
             # when the audit trail is silently broken (DB full, locked, etc.)
             "audit_log_failures": 0,
@@ -355,6 +364,31 @@ class DecisionFirewall:
         if strategy_type:
             return f"{key}:{strategy_type}"
         return key
+
+    _UNKNOWN_SOURCE_KEYS = frozenset({
+        "unknown",
+        "strategy:unknown",
+        "strategy:untagged",
+        "strategy:",
+    })
+
+    @classmethod
+    def _is_unknown_source_key(cls, source_key: str) -> bool:
+        """Return True if the source_key signals an upstream tagging gap.
+
+        A bare ``copy_trade`` (no trader address) is also untagged for
+        calibration purposes — every copy trade should resolve to
+        ``copy_trade:0x...`` once the source is known. Catch that here so
+        an unconfigured copy hook doesn't pollute the calibration table.
+        """
+        key = str(source_key or "").strip().lower()
+        if not key:
+            return True
+        if key in cls._UNKNOWN_SOURCE_KEYS:
+            return True
+        if key == "copy_trade":  # no trader_address resolved
+            return True
+        return False
 
     def _effective_source_cap(self, policy: Dict) -> int:
         """Combine static per-source/day caps with allocator-driven caps."""
@@ -1895,9 +1929,25 @@ class DecisionFirewall:
             return _reject("rejected_confidence",
                           f"Low confidence {signal.confidence:.0%} < {self.min_confidence:.0%}")
 
-        # 2b. Per-source/day throughput cap (approved signals).
+        # 2a. Unknown-source gate.
+        # Calibration data is dominated by `strategy:unknown` and
+        # `strategy:untagged` buckets when upstream signal sources fail to
+        # tag their strategy_type/source. Letting those signals through
+        # pollutes the calibration table with one fat untagged bucket and
+        # gives any future bucket-aware threshold nothing to gate on.
+        # Block them at the firewall by default so the upstream pipeline
+        # gap becomes visible immediately rather than masked behind
+        # bad confidence.
         self._check_daily_reset()
         source_key = self._source_key(signal)
+        if self.block_unknown_sources and self._is_unknown_source_key(source_key):
+            return _reject(
+                "rejected_unknown_source",
+                f"Unknown source key {source_key!r} -- upstream pipeline did not "
+                "tag strategy_type/source, blocking from execution",
+            )
+
+        # 2b. Per-source/day throughput cap (approved signals).
         policy_ok, policy_reason, source_policy = self._apply_source_policy(
             signal,
             source_key,

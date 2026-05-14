@@ -401,6 +401,9 @@ def build_subsystems(
             "event_scanner": c.event_scanner,
             "event_risk_enabled": bool(getattr(_fw_cfg, "EVENT_RISK_ENABLED", True)),
             "min_confidence": getattr(_fw_cfg, "FIREWALL_MIN_CONFIDENCE", 0.40),
+            "block_unknown_sources": bool(
+                getattr(_fw_cfg, "FIREWALL_BLOCK_UNKNOWN_SOURCES", True)
+            ),
             "max_signals_per_source_per_day": getattr(
                 _fw_cfg, "FIREWALL_MAX_SIGNALS_PER_SOURCE_PER_DAY", 0
             ),
