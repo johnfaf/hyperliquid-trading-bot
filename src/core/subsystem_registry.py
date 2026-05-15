@@ -407,6 +407,15 @@ def build_subsystems(
             "use_bucketed_thresholds": bool(
                 getattr(_fw_cfg, "FIREWALL_USE_BUCKETED_THRESHOLDS", True)
             ),
+            "coldstart_leverage_clamp_enabled": bool(
+                getattr(_fw_cfg, "COLDSTART_LEVERAGE_CLAMP_ENABLED", True)
+            ),
+            "coldstart_max_leverage": float(
+                getattr(_fw_cfg, "COLDSTART_MAX_LEVERAGE", 3.0)
+            ),
+            "coldstart_calibration_min_samples": int(
+                getattr(_fw_cfg, "COLDSTART_CALIBRATION_MIN_SAMPLES", 30)
+            ),
             "max_signals_per_source_per_day": getattr(
                 _fw_cfg, "FIREWALL_MAX_SIGNALS_PER_SOURCE_PER_DAY", 0
             ),

@@ -765,6 +765,24 @@ FIREWALL_BLOCK_UNKNOWN_SOURCES = os.environ.get(
     "FIREWALL_BLOCK_UNKNOWN_SOURCES", "true"
 ).lower() in ("true", "1", "yes")
 
+# ─── Cold-start leverage clamp ────────────────────────────────
+# While a (source|side|regime) calibration bucket has fewer than
+# COLDSTART_CALIBRATION_MIN_SAMPLES real outcomes, the EV gate runs on
+# the assumed p_win=0.50 prior -- the trade is unproven. Clamp leverage
+# to COLDSTART_MAX_LEVERAGE so an unproven bucket can't (a) over-
+# concentrate capital-at-risk, or (b) saturate the leveraged-notional
+# aggregate-exposure cap and lock out diversified signals (observed in
+# prod: one 8x cold-start short → 23 exposure rejections / 6h).
+COLDSTART_LEVERAGE_CLAMP_ENABLED = os.environ.get(
+    "COLDSTART_LEVERAGE_CLAMP_ENABLED", "true"
+).lower() in ("true", "1", "yes")
+COLDSTART_MAX_LEVERAGE = _safe_env_float(
+    "COLDSTART_MAX_LEVERAGE", 3.0, lo=1.0, hi=25.0
+)
+COLDSTART_CALIBRATION_MIN_SAMPLES = int(
+    os.environ.get("COLDSTART_CALIBRATION_MIN_SAMPLES", 30) or 30
+)
+
 # ─── Live promotion gate ──────────────────────────────────────
 # Walk-forward gate that blocks paper -> live mirror until a strategy /
 # source has accumulated enough out-of-sample evidence. Layered on top

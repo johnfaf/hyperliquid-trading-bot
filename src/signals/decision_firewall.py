@@ -73,6 +73,26 @@ class DecisionFirewall:
         # ECE/sample-size instead of using only the global ``min_confidence``.
         # Asymmetric: only raises the floor, never lowers it.
         self.use_bucketed_thresholds = bool(cfg.get("use_bucketed_thresholds", True))
+        # Cold-start leverage clamp. When a (source|side|regime) bucket
+        # has fewer than ``coldstart_calibration_min_samples`` real
+        # calibration outcomes, the EV gate is running on the assumed
+        # p_win=0.50 prior -- the trade is not proven. Don't let an
+        # unproven bucket run high leverage: it over-concentrates
+        # capital-at-risk AND (because the aggregate-exposure cap is
+        # measured in *leveraged* notional) a single high-leverage
+        # cold-start trade saturates the cap and locks out hours of
+        # diversified signals (observed in the 6h prod scan: one 8x SOL
+        # short → 23 exposure rejections / 6h). Clamp leverage to a
+        # conservative ceiling until the bucket earns it.
+        self.coldstart_leverage_clamp_enabled = bool(
+            cfg.get("coldstart_leverage_clamp_enabled", True)
+        )
+        self.coldstart_max_leverage = float(
+            cfg.get("coldstart_max_leverage", 3.0)
+        )
+        self.coldstart_calibration_min_samples = int(
+            cfg.get("coldstart_calibration_min_samples", 30)
+        )
         self.max_signals_per_source_per_day = int(
             cfg.get("max_signals_per_source_per_day", 0)
         )
@@ -436,6 +456,23 @@ class DecisionFirewall:
             self.use_bucketed_thresholds = bool(
                 overrides.get(
                     "FIREWALL_USE_BUCKETED_THRESHOLDS", self.use_bucketed_thresholds
+                )
+            )
+            self.coldstart_leverage_clamp_enabled = bool(
+                overrides.get(
+                    "COLDSTART_LEVERAGE_CLAMP_ENABLED",
+                    self.coldstart_leverage_clamp_enabled,
+                )
+            )
+            self.coldstart_max_leverage = float(
+                overrides.get(
+                    "COLDSTART_MAX_LEVERAGE", self.coldstart_max_leverage
+                )
+            )
+            self.coldstart_calibration_min_samples = int(
+                overrides.get(
+                    "COLDSTART_CALIBRATION_MIN_SAMPLES",
+                    self.coldstart_calibration_min_samples,
                 )
             )
             self.short_hardening_enabled = bool(
@@ -2079,6 +2116,38 @@ class DecisionFirewall:
                     signal.context["ev_breakdown"] = ev_breakdown
             except Exception:
                 pass
+            # Cold-start leverage clamp (see __init__ rationale). bucket_n
+            # is the real calibration sample count for this exact
+            # (source|side|regime) bucket, computed just above.
+            if self.coldstart_leverage_clamp_enabled:
+                try:
+                    cur_lev = float(getattr(signal, "leverage", 1.0) or 1.0)
+                    if (
+                        bucket_n < self.coldstart_calibration_min_samples
+                        and cur_lev > self.coldstart_max_leverage
+                    ):
+                        _cs_side = (
+                            signal.side.value if hasattr(signal.side, "value")
+                            else str(signal.side)
+                        )
+                        signal.leverage = self.coldstart_max_leverage
+                        if isinstance(getattr(signal, "context", None), dict):
+                            signal.context["coldstart_leverage_clamped"] = {
+                                "from": cur_lev,
+                                "to": self.coldstart_max_leverage,
+                                "bucket_n": bucket_n,
+                                "min_samples": self.coldstart_calibration_min_samples,
+                            }
+                        logger.info(
+                            "COLDSTART-CLAMP %s %s [%s|%s]: bucket n=%.0f < %d "
+                            "-> leverage %.1fx -> %.1fx (EV is assumption-"
+                            "driven; de-risking until calibration matures)",
+                            signal.coin, _cs_side, source_key, ev_regime,
+                            bucket_n, self.coldstart_calibration_min_samples,
+                            cur_lev, self.coldstart_max_leverage,
+                        )
+                except Exception as exc:
+                    logger.debug("Cold-start leverage clamp skipped: %s", exc)
         except Exception as exc:
             logger.debug("EV gate check failed (fail-open): %s", exc)
 

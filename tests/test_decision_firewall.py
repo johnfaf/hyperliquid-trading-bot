@@ -270,8 +270,13 @@ def test_firewall_clamps_leverage(mock_db):
     mock_db.audit_log = MagicMock()
 
     from src.signals.decision_firewall import DecisionFirewall
+    # Isolate the generic max-leverage clamp: disable the cold-start
+    # leverage clamp (its own coverage is in
+    # tests/test_coldstart_leverage_clamp.py) so it doesn't further
+    # reduce 5x -> 3x on this no-calibration-history signal.
     fw = DecisionFirewall({"max_leverage": 5, "enable_predictive_derisk": False,
-                           "funding_risk_enabled": False})
+                           "funding_risk_enabled": False,
+                           "coldstart_leverage_clamp_enabled": False})
     signal = MockSignal(leverage=10)
     passed, reason = fw.validate(signal)
     assert passed is True
