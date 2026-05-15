@@ -126,41 +126,94 @@ def _check_source_health(signal: Any) -> Tuple[bool, str]:
     return True, "ok"
 
 
-def _check_feature_vector(signal: Any) -> Tuple[bool, str]:
-    """Is at least the minimum useful feature set populated?
-
-    Mirrors ``TradeMemory._available_feature_keys`` -- expects the
-    similarity-feature set so the entry actually has enough context
-    to record/compare against past trades.
-    """
-    context = getattr(signal, "context", None)
-    if not isinstance(context, dict):
-        return False, "no_context"
-    features = context.get("features")
-    if not isinstance(features, dict):
-        return False, "no_features"
+def _min_feature_overlap() -> int:
     try:
-        from src.trading.trade_memory import SIMILARITY_FEATURES, MIN_FEATURE_OVERLAP
+        from src.trading.trade_memory import MIN_FEATURE_OVERLAP
+        return int(MIN_FEATURE_OVERLAP)
     except Exception:
-        # Trade memory module unavailable; fall back to a soft check
-        # so the gate doesn't crash the firewall.
-        usable = sum(
-            1 for v in features.values()
-            if isinstance(v, (int, float)) and float(v) != 0.0
+        return 3
+
+
+def _similarity_features() -> Tuple[str, ...]:
+    try:
+        from src.trading.trade_memory import SIMILARITY_FEATURES
+        return tuple(SIMILARITY_FEATURES)
+    except Exception:
+        return (
+            "funding_rate", "oi_change", "price_change", "trend_strength",
+            "volatility", "volume_ratio", "rsi", "momentum_score",
+            "bollinger_position", "overall_score",
         )
-        if usable < 3:
-            return False, f"feature_vector_sparse:{usable}<3"
-        return True, "ok"
-    usable = sum(
-        1 for k in SIMILARITY_FEATURES
+
+
+def _usable_feature_count(features: Any) -> int:
+    if not isinstance(features, dict) or not features:
+        return 0
+    sim = _similarity_features()
+    aligned = sum(
+        1 for k in sim
         if k in features and isinstance(features.get(k), (int, float))
     )
-    if usable < MIN_FEATURE_OVERLAP:
-        return (
-            False,
-            f"feature_vector_sparse:{usable}<{MIN_FEATURE_OVERLAP}",
-        )
-    return True, "ok"
+    if aligned:
+        return aligned
+    # Generic fallback: any numeric, non-zero values (handles feature
+    # stores that use different naming, e.g. ``rsi_14``).
+    return sum(
+        1 for v in features.values()
+        if isinstance(v, (int, float)) and float(v) != 0.0
+    )
+
+
+def _check_feature_vector(signal: Any) -> Tuple[bool, str]:
+    """Is feature data *available* for this decision?
+
+    A readiness gate asks "does the data exist?", not "did this specific
+    code path attach it?". So: first check the signal's own context;
+    if that's sparse, fall back to the persisted feature store for the
+    coin. Only reject when no feature data exists anywhere -- which is
+    the genuine "not ready" case (brand-new coin, feature cycle never
+    ran). This is what lets options-flow and non-BTC/ETH/SOL signals
+    through without weakening the gate: the candle features for those
+    coins really do exist in the store, the signal object just didn't
+    carry them.
+    """
+    min_overlap = _min_feature_overlap()
+    context = getattr(signal, "context", None)
+    if isinstance(context, dict):
+        ctx_features = context.get("features")
+        if _usable_feature_count(ctx_features) >= min_overlap:
+            return True, "ok"
+
+    # Fallback: persisted feature store for this coin.
+    coin = str(getattr(signal, "coin", "") or "").upper()
+    if isinstance(signal, dict):
+        coin = coin or str(signal.get("coin", "") or "").upper()
+    if coin:
+        try:
+            from src.data import feature_store
+            stored = feature_store.get_feature_vector(coin, "1h")
+        except Exception as exc:
+            logger.debug("data_readiness: feature_store lookup failed: %s", exc)
+            stored = None
+        if isinstance(stored, dict):
+            # ``timestamp_ms`` is bookkeeping, not a feature.
+            usable = sum(
+                1 for k, v in stored.items()
+                if k != "timestamp_ms"
+                and isinstance(v, (int, float))
+                and float(v) != 0.0
+            )
+            if usable >= min_overlap:
+                return True, "ok_from_feature_store"
+
+    ctx_usable = (
+        _usable_feature_count(context.get("features"))
+        if isinstance(context, dict) else 0
+    )
+    return (
+        False,
+        f"feature_vector_sparse:ctx={ctx_usable},store=0<{min_overlap}",
+    )
 
 
 _CHECKERS = {

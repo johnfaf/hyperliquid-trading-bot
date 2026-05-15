@@ -724,10 +724,29 @@ class PaperTrader:
                         signal["confidence"] = min(signal["confidence"] * 1.15, 1.0)
                         logger.debug(f"Features confirm {signal['side']} {coin}")
 
-                    # Add feature context to signal
+                    # Add feature context to signal.
+                    # NOTE: keys MUST align with
+                    # ``trade_memory.SIMILARITY_FEATURES`` (also used by
+                    # the data-readiness gate). The previous version only
+                    # copied rsi_signal/volume_trend/funding_signal --
+                    # none of which are in SIMILARITY_FEATURES -- so the
+                    # similarity vector and the readiness check saw at
+                    # most 2 usable keys and rejected every signal as
+                    # ``feature_vector_sparse``. The FeatureVector already
+                    # computes all of these; we just have to copy the
+                    # right ones.
                     signal["features"] = {
                         "overall_score": feat.overall_score,
                         "rsi": feat.rsi,
+                        "trend_strength": feat.trend_strength,
+                        "volatility": feat.volatility,
+                        "volume_ratio": feat.volume_ratio,
+                        "momentum_score": feat.momentum_score,
+                        "bollinger_position": feat.bollinger_position,
+                        "funding_rate": feat.funding_rate,
+                        # Signal-derived extras kept for other consumers
+                        # (dashboards, risk policy) -- harmless to the
+                        # similarity/readiness checks.
                         "rsi_signal": feat.rsi_signal,
                         "volume_trend": feat.volume_trend,
                         "funding_signal": feat.funding_signal,

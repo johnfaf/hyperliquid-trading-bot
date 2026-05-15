@@ -90,6 +90,34 @@ def test_sparse_feature_vector_blocks():
     assert "feature_vector" in reason
 
 
+def test_feature_store_fallback_passes_when_signal_lacks_features(monkeypatch):
+    """Signal has no features in context, but the feature store has a
+    fresh vector for the coin -> data IS ready (options-flow case)."""
+    monkeypatch.setattr(
+        "src.data.feature_store.get_feature_vector",
+        lambda coin, tf="1h": {
+            "timestamp_ms": 1, "rsi_14": 55.0, "realized_vol_20": 0.03,
+            "funding_rate": 0.0001, "trend_strength": 0.4,
+        },
+    )
+    sig = _signal(features=None)  # nothing on the signal itself
+    ok, reason = is_signal_data_ready(sig)
+    assert ok, reason
+    assert reason == "ok"  # is_signal_data_ready collapses to "ok"
+
+
+def test_feature_store_empty_still_blocks(monkeypatch):
+    """No features on signal AND empty feature store -> genuine reject."""
+    monkeypatch.setattr(
+        "src.data.feature_store.get_feature_vector",
+        lambda coin, tf="1h": None,
+    )
+    sig = _signal(features=None)
+    ok, reason = is_signal_data_ready(sig)
+    assert not ok
+    assert "feature_vector" in reason
+
+
 def test_payload_shape():
     features = {"rsi": 55.0, "volatility": 0.02, "volume_ratio": 1.1}
     sig = _signal(features=features)
