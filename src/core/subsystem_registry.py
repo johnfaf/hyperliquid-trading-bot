@@ -331,6 +331,15 @@ def build_subsystems(
                 "policy_strong_recent_pnl_floor": getattr(
                     config, "SOURCE_POLICY_STRONG_RECENT_PNL_FLOOR", 0.0
                 ),
+                "options_flow_cap_graduation_enabled": getattr(
+                    config, "OPTIONS_FLOW_CAP_GRADUATION_ENABLED", True
+                ),
+                "options_flow_cap_min_trades": getattr(
+                    config, "OPTIONS_FLOW_CAP_MIN_TRADES", 3
+                ),
+                "options_flow_graduated_cap": getattr(
+                    config, "OPTIONS_FLOW_GRADUATED_CAP", 4
+                ),
             }
         ),
         health,

@@ -1079,6 +1079,22 @@ SOURCE_POLICY_WARMUP_MAX_SIGNALS_PER_DAY = int(
 SOURCE_POLICY_DEGRADED_MAX_SIGNALS_PER_DAY = int(
     os.environ.get("SOURCE_POLICY_DEGRADED_MAX_SIGNALS_PER_DAY", 1)
 )
+# Options-flow per-day cap graduation. Warmup/degraded fixed caps
+# throttle an options_flow directional source to ~1 signal/day until
+# it has a track record (prod 6h scan: 23 of 93 decisions rejected on
+# this cap). Once a source whose key starts with ``options_flow`` has
+# produced MORE THAN OPTIONS_FLOW_CAP_MIN_TRADES closed trades, its
+# per-day cap is lifted to OPTIONS_FLOW_GRADUATED_CAP. Never overrides
+# a paused/blocked source (hard safety stop stays hard).
+OPTIONS_FLOW_CAP_GRADUATION_ENABLED = os.environ.get(
+    "OPTIONS_FLOW_CAP_GRADUATION_ENABLED", "true"
+).lower() in ("true", "1", "yes")
+OPTIONS_FLOW_CAP_MIN_TRADES = int(
+    os.environ.get("OPTIONS_FLOW_CAP_MIN_TRADES", 3)
+)
+OPTIONS_FLOW_GRADUATED_CAP = int(
+    os.environ.get("OPTIONS_FLOW_GRADUATED_CAP", 4)
+)
 SOURCE_POLICY_WARMUP_SIZE_MULTIPLIER = float(
     os.environ.get("SOURCE_POLICY_WARMUP_SIZE_MULTIPLIER", 0.75)
 )

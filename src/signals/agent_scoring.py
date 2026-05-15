@@ -125,6 +125,25 @@ class AgentScorer:
         self.policy_strong_recent_pnl_floor = float(
             cfg.get("policy_strong_recent_pnl_floor", 0.0)
         )
+        # Options-flow per-day cap graduation. The warmup/degraded fixed
+        # caps default to 1/day in prod, which throttled options-flow
+        # directional signals to ~1 trade/day (observed: 23 of 93
+        # decisions / 6h rejected on this source cap). Once an
+        # options_flow source has produced more than
+        # ``options_flow_cap_min_trades`` closed trades it has a real
+        # track record -- graduate its per-day cap to
+        # ``options_flow_graduated_cap`` instead of leaving it stuck in
+        # the warmup/degraded throttle. Never overrides a hard
+        # ``paused``/blocked source (that's a safety stop).
+        self.options_flow_cap_graduation_enabled = bool(
+            cfg.get("options_flow_cap_graduation_enabled", True)
+        )
+        self.options_flow_cap_min_trades = int(
+            cfg.get("options_flow_cap_min_trades", 3)
+        )
+        self.options_flow_graduated_cap = int(
+            cfg.get("options_flow_graduated_cap", 4)
+        )
 
         # Load existing scores from DB
         self._load_scores()
@@ -597,6 +616,28 @@ class AgentScorer:
             cap, reason = self._active_dynamic_cap(row)
             policy["max_signals_per_day"] = cap
             policy["dynamic_cap_reason"] = reason
+
+        # Options-flow per-day cap graduation. Applied last so it can
+        # lift the warmup/degraded fixed cap once the source has earned
+        # a track record, but it deliberately does NOT override a
+        # paused/blocked source -- a hard safety stop must stay hard.
+        if (
+            self.options_flow_cap_graduation_enabled
+            and not policy.get("blocked")
+            and str(policy.get("status", "")).lower() != "paused"
+            and str(source_key or "").strip().lower().startswith("options_flow")
+        ):
+            completed = int(policy.get("completed_trades", 0) or 0)
+            if completed > self.options_flow_cap_min_trades:
+                current = int(policy.get("max_signals_per_day", 0) or 0)
+                graduated = max(current, self.options_flow_graduated_cap)
+                if graduated != current:
+                    policy["max_signals_per_day"] = graduated
+                    policy["dynamic_cap_reason"] = (
+                        f"options_flow_graduated:{completed}>"
+                        f"{self.options_flow_cap_min_trades}"
+                        f"_cap_{current}->{graduated}"
+                    )
         return policy
 
     def _active_dynamic_cap(self, row: Dict) -> tuple[int, str]:
