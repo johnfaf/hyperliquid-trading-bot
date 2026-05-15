@@ -371,6 +371,21 @@ TRADE_QUALITY_SHORT_MIN_CONFIDENCE = float(
 TRADE_QUALITY_STRONG_SHORT_CONFIRMATION = os.environ.get(
     "TRADE_QUALITY_STRONG_SHORT_CONFIRMATION", "true"
 ).lower() in ("true", "1", "yes")
+# When true, paper_trader's trade-quality gate sources its edge from
+# the firewall EV gate's already-computed breakdown (signal context
+# ev_breakdown) instead of the legacy confidence proxy, and treats a
+# solidly-positive firewall EV as short-confirmation. Reconciles the
+# two EV gates into one source of truth and breaks the cold-start
+# deadlock where confidence pinned at 0.50 forced the proxy edge to
+# ~0 and silently vetoed every signal the firewall EV gate accepted.
+# NOTE: during calibration cold-start the firewall EV uses an assumed
+# p_win=0.50 with the strategy's R-multiples, so this lets regime-
+# aligned trades through on assumption-driven EV until per-bucket
+# calibration matures -- a deliberate tradeoff to get outcome data
+# flowing. Set false to revert to the confidence-proxy behaviour.
+TRADE_QUALITY_USE_FIREWALL_EV = os.environ.get(
+    "TRADE_QUALITY_USE_FIREWALL_EV", "true"
+).lower() in ("true", "1", "yes")
 
 # Live trading wallet / secret-management controls.
 # Agent-wallet-only mode: signer key must be for a delegated agent wallet, and

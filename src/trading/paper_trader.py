@@ -482,8 +482,47 @@ class PaperTrader:
             return expected * 10_000.0
         return expected
 
+    @staticmethod
+    def _firewall_ev(trade_signal: TradeSignal):
+        """Return (ev_bps, cost_bps) from the firewall EV gate, or None.
+
+        The firewall's expected-value gate runs in the prescreen BEFORE
+        this quality gate and attaches its breakdown to
+        ``signal.context["ev_breakdown"]``. That EV uses real TP/SL
+        R-multiples + the calibrated p_win -- a principled number. The
+        legacy confidence proxy below structurally collapses to ~0bps
+        whenever calibration is in cold-start (confidence pinned at the
+        0.50 prior), which silently vetoed every regime-aligned signal
+        the firewall EV gate had already accepted. Single source of EV
+        truth.
+        """
+        ctx = getattr(trade_signal, "context", None)
+        if not isinstance(ctx, dict):
+            return None
+        ev = ctx.get("ev_breakdown")
+        if not isinstance(ev, dict):
+            return None
+        try:
+            return float(ev.get("ev_bps")), float(ev.get("cost_bps", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            return None
+
     def _estimate_signal_edge_bps(self, trade_signal: TradeSignal, sig: Dict) -> float:
         context = dict(getattr(trade_signal, "context", {}) or {})
+        # Prefer the firewall EV gate's already-computed expected value.
+        if bool(getattr(config, "TRADE_QUALITY_USE_FIREWALL_EV", True)):
+            fw = self._firewall_ev(trade_signal)
+            if fw is not None:
+                ev_bps, ev_cost = fw
+                # ev_bps is net of cost; the quality gate compares edge
+                # against minimum = cost * mult, so add cost back to a
+                # gross edge to keep that comparison meaningful.
+                edge_bps = ev_bps + ev_cost
+                if sig.get("volume_confirmed"):
+                    edge_bps += 5.0
+                if sig.get("options_flow_aligned"):
+                    edge_bps += 5.0
+                return round(edge_bps, 4)
         expected_return = (
             sig.get("expected_return")
             or context.get("expected_return")
@@ -519,11 +558,23 @@ class PaperTrader:
         )
         side = str(sig.get("side", "") or "").lower()
         confidence = float(trade_signal.confidence or 0.0)
+        # A solidly-positive firewall EV is stronger evidence than a
+        # volume tick -- treat it as confirmation so cold-start (conf
+        # pinned at 0.50) doesn't deadlock every regime-aligned short.
+        firewall_ev_ok = False
+        if bool(getattr(config, "TRADE_QUALITY_USE_FIREWALL_EV", True)):
+            fw = self._firewall_ev(trade_signal)
+            if fw is not None and fw[0] > 0.0:
+                firewall_ev_ok = True
         if (
             bool(getattr(config, "TRADE_QUALITY_STRONG_SHORT_CONFIRMATION", True))
             and side == "short"
             and confidence < float(getattr(config, "TRADE_QUALITY_SHORT_MIN_CONFIDENCE", 0.55) or 0.55)
-            and not (sig.get("volume_confirmed") or sig.get("options_flow_aligned"))
+            and not (
+                sig.get("volume_confirmed")
+                or sig.get("options_flow_aligned")
+                or firewall_ev_ok
+            )
         ):
             return False, {
                 "reason": "short_lacks_confirmation",
