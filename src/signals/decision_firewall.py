@@ -2043,6 +2043,33 @@ class DecisionFirewall:
                 regime=ev_regime,
                 bucket_n=bucket_n,
             )
+            # Per-signal "why entered / why rejected" EV line. Fires for
+            # both outcomes so production logs show the math directly:
+            # grep ``EV-DECISION`` to audit every signal's edge calc.
+            if ev_breakdown:
+                _side_v = (
+                    signal.side.value if hasattr(signal.side, "value")
+                    else str(signal.side)
+                )
+                logger.info(
+                    "EV-DECISION %s %s [%s|%s]: p_win=%.3f (%s) win=%.0fbps "
+                    "loss=%.0fbps cost=%.0fbps -> ev=%.1fbps sigma=%.1fbps "
+                    "n=%.0f -> %s%s",
+                    signal.coin,
+                    _side_v.upper(),
+                    source_key,
+                    ev_regime,
+                    ev_breakdown.get("p_win", 0.0),
+                    ev_breakdown.get("p_win_source", "?"),
+                    ev_breakdown.get("avg_win_bps", 0.0),
+                    ev_breakdown.get("avg_loss_bps", 0.0),
+                    ev_breakdown.get("cost_bps", 0.0),
+                    ev_breakdown.get("ev_bps", 0.0),
+                    ev_breakdown.get("sigma_bps", 0.0),
+                    ev_breakdown.get("bucket_n", 0.0),
+                    "ACCEPT" if accept_ev else "REJECT",
+                    "" if accept_ev else f" ({ev_reason})",
+                )
             if not accept_ev:
                 return _reject("rejected_ev_gate", ev_reason)
             # Attach EV breakdown to signal context so downstream

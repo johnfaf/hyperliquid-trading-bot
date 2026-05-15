@@ -894,6 +894,28 @@ class PaperTrader:
                                 decision_id,
                                 exc,
                             )
+                        # Persist the firewall's EV math so the why-enter
+                        # dashboard can show the post-cost edge calc that
+                        # drove this decision (the firewall ran in
+                        # dry_run, so its own journal write was skipped).
+                        ev_ctx = None
+                        try:
+                            ctx = getattr(trade_signal, "context", None)
+                            if isinstance(ctx, dict):
+                                ev_ctx = ctx.get("ev_breakdown")
+                        except Exception:
+                            ev_ctx = None
+                        if ev_ctx:
+                            try:
+                                decision_journal.update_decision_ev_breakdown(
+                                    decision_id, ev_ctx
+                                )
+                            except Exception as exc:
+                                logger.debug(
+                                    "EV-breakdown snapshot update failed for %s: %s",
+                                    decision_id,
+                                    exc,
+                                )
                     logger.debug(f"Firewall approved {sig['side']} {sig['coin']} "
                                 f"(confidence={trade_signal.confidence:.0%})")
                 else:

@@ -418,6 +418,10 @@ def _decision_reason_metadata(
             "entry_price": _float(getattr(signal, "entry_price", raw.get("price")), None),
             "risk_policy": context.get("risk_policy") or raw.get("risk_policy") or {},
         },
+        # EV math from the firewall's expected-value gate, when present.
+        # Lets the why-enter dashboard show the post-cost edge calc that
+        # actually drove the accept/reject without re-deriving it.
+        "ev_breakdown": context.get("ev_breakdown") or raw.get("ev_breakdown") or {},
     }
 
 
@@ -594,6 +598,42 @@ def update_calibrated_confidence(decision_id: str, value: float) -> bool:
         return True
     except Exception as exc:
         _record_write_failure("calibrated_confidence_update", exc)
+        return False
+
+
+def update_decision_ev_breakdown(decision_id: str, ev_breakdown: Dict[str, Any]) -> bool:
+    """Merge the firewall's EV math into the snapshot metadata.
+
+    The snapshot is recorded at signal-generation time, before the
+    firewall's EV gate runs. Without this, the why-enter dashboard
+    can't show the post-cost edge calculation that actually drove the
+    accept/reject. Called from paper_trader after the firewall prescreen.
+    """
+    if not _enabled() or not decision_id or not isinstance(ev_breakdown, dict):
+        return False
+    if not _schema_or_skip():
+        return False
+    try:
+        from src.data import database as db
+
+        with db.get_connection() as conn:
+            row = conn.execute(
+                "SELECT metadata FROM decision_snapshots WHERE decision_id = ?",
+                (decision_id,),
+            ).fetchone()
+            merged = _loads(row["metadata"] if row else None)
+            merged["ev_breakdown"] = dict(ev_breakdown)
+            conn.execute(
+                """
+                UPDATE decision_snapshots
+                SET updated_at = ?, metadata = ?
+                WHERE decision_id = ?
+                """,
+                (_now(), _json(merged), decision_id),
+            )
+        return True
+    except Exception as exc:
+        _record_write_failure("ev_breakdown_update", exc)
         return False
 
 
