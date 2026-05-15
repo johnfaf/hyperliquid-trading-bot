@@ -329,6 +329,13 @@ SCORING_WEIGHTS = {
 PAPER_TRADING_INITIAL_BALANCE = 10_000  # USD
 PAPER_TRADING_MAX_POSITION_PCT = 0.08   # 8% of balance per trade (smaller = more concurrent trades)
 PAPER_TRADING_MAX_LEVERAGE = float(os.environ.get("PAPER_TRADING_MAX_LEVERAGE", 5))
+# Max number of coins to pre-compute candle features for per strategy
+# cycle. Core BTC/ETH/SOL are always included; the rest come from the
+# coins this cycle's strategies target. Cap protects the candle API
+# from a large strategy fan-out.
+PAPER_FEATURE_PRECOMPUTE_MAX_COINS = int(
+    os.environ.get("PAPER_FEATURE_PRECOMPUTE_MAX_COINS", 12) or 12
+)
 # Paper-trading risk is defined in ROE space, then converted back into raw
 # trigger prices by dividing by leverage. Take-profit is always kept at 5x the
 # configured stop-loss so every paper signal uses the same reward-to-risk shape.

@@ -637,11 +637,48 @@ class PaperTrader:
         mids = hl.get_all_mids() or {}
         self._annotate_open_trades(open_trades, mids)
 
-        # Pre-compute features for relevant coins if feature engine available
+        # Pre-compute features for the coins this cycle's strategies
+        # actually target -- not a hardcoded BTC/ETH/SOL set. Core coins
+        # are always included (regime / correlation context). Capped so
+        # a large strategy fan-out doesn't hammer the candle API.
+        feature_coins: List[str] = ["BTC", "ETH", "SOL"]
+        try:
+            import json as _json
+            _core = {"BTC", "ETH", "SOL"}
+            _extra: set = set()
+            for _strat in strategies or []:
+                _params = _strat.get("parameters", {})
+                if isinstance(_params, str):
+                    try:
+                        _params = _json.loads(_params)
+                    except (ValueError, TypeError):
+                        _params = {}
+                _pre = str(_strat.get("_decision_coin", "") or "").strip().upper()
+                if _pre and _pre != "UNKNOWN":
+                    _extra.add(_pre)
+                _coins = (
+                    _params.get("coins")
+                    or _params.get("coins_traded")
+                    or _params.get("coin")
+                    or []
+                )
+                if isinstance(_coins, str):
+                    _coins = [_coins]
+                for _c in _coins:
+                    _cu = str(_c or "").strip().upper()
+                    if _cu and _cu != "UNKNOWN":
+                        _extra.add(_cu)
+            _cap = max(3, int(getattr(config, "PAPER_FEATURE_PRECOMPUTE_MAX_COINS", 12)))
+            feature_coins = ["BTC", "ETH", "SOL"] + sorted(_extra - _core)
+            feature_coins = feature_coins[:_cap]
+        except Exception as exc:
+            logger.debug("Feature coin-set resolution failed, using core: %s", exc)
+            feature_coins = ["BTC", "ETH", "SOL"]
+
         coin_features = {}
         if self.feature_engine:
             try:
-                for coin in set(["BTC", "ETH", "SOL"]):
+                for coin in feature_coins:
                     try:
                         # Fetch candles for feature computation
                         from src.core.api_manager import get_manager, Priority
