@@ -802,8 +802,16 @@ class PaperTrader:
                             continue
                         signal["confidence"] = signal.get("confidence", 0.5) * (0.5 + vol_confidence * 0.5)
                         signal["volume_confirmed"] = True
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        # Don't let an errored confirmation masquerade as
+                        # "confirmed". Mark explicitly unconfirmed + log so
+                        # a broken volume feed is visible, not silent.
+                        signal["volume_confirmed"] = False
+                        logger.debug(
+                            "CONFIRM volume_confirmation errored for %s %s "
+                            "(treating as unconfirmed): %s",
+                            signal.get("side"), signal.get("coin"), e,
+                        )
 
                 # Options flow confirmation
                 if options_scanner:
@@ -818,8 +826,13 @@ class PaperTrader:
                             else:
                                 signal["confidence"] = signal.get("confidence", 0.5) * 0.7
                                 signal["options_flow_aligned"] = False
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        signal["options_flow_aligned"] = False
+                        logger.debug(
+                            "CONFIRM options_flow errored for %s %s "
+                            "(treating as not-aligned): %s",
+                            signal.get("side"), signal.get("coin"), e,
+                        )
 
                 # Attach strategy reference
                 signal["strategy"] = strategy
@@ -2093,8 +2106,12 @@ class PaperTrader:
         if self.firewall:
             try:
                 self.firewall.record_trade_outcome(trade["coin"], pnl)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(
+                    "LEARN-WRITE firewall.record_trade_outcome failed "
+                    "(coin=%s trade=%s): %s",
+                    trade.get("coin"), trade.get("id"), e,
+                )
 
         if self.kelly_sizer:
             try:
@@ -2105,8 +2122,12 @@ class PaperTrader:
                     size=trade["size"],
                     leverage=trade.get("leverage", 1),
                 )
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(
+                    "LEARN-WRITE kelly_sizer.record_outcome failed "
+                    "(source=%s trade=%s): %s",
+                    source_key, trade.get("id"), e,
+                )
 
         if self.calibration:
             try:
@@ -2120,8 +2141,17 @@ class PaperTrader:
                     side=trade["side"],
                     regime=_bucket_regime(trade_meta.get("regime") or trade.get("regime")),
                 )
-            except Exception:
-                pass
+            except Exception as e:
+                # Calibration is the ground truth the EV / bucketed-
+                # threshold gates learn from. A silent failure here is
+                # exactly the class of bug that starved the calibration
+                # tables -- surface it.
+                logger.warning(
+                    "LEARN-WRITE calibration.record FAILED "
+                    "(source=%s coin=%s side=%s trade=%s): %s",
+                    source_key, trade.get("coin"), trade.get("side"),
+                    trade.get("id"), e,
+                )
 
         if self.trade_memory:
             try:
@@ -2142,8 +2172,12 @@ class PaperTrader:
                     setup_type=trade_meta.get("setup_type", strategy_type),
                     features=trade_meta.get("features", {}),
                 )
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(
+                    "LEARN-WRITE trade_memory.record_trade failed "
+                    "(coin=%s trade=%s): %s",
+                    trade.get("coin"), trade.get("id"), e,
+                )
 
         if self.shadow_tracker:
             try:

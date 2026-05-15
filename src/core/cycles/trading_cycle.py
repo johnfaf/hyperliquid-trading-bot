@@ -1272,8 +1272,15 @@ def _run_liquidation_scan(container, regime_data):
                                 lcrs_features["funding_rate"] = float(asset_ctx.get("funding", 0))
                                 lcrs_features["oi_change"] = float(asset_ctx.get("openInterest", 0)) * 0.01
                                 break
-                except Exception:
-                    pass
+                except Exception as e:
+                    # Incomplete LCRS features here -> the data-readiness
+                    # gate later rejects this signal for missing
+                    # feature_vector. Log so the rejection is traceable
+                    # to this root cause, not just its symptom.
+                    logger.debug(
+                        "LCRS funding/oi fetch failed for %s "
+                        "(features will be partial): %s", coin, e,
+                    )
 
                 # Feature engine enrichment
                 if container.feature_engine:
@@ -1305,8 +1312,12 @@ def _run_liquidation_scan(container, regime_data):
                                 lcrs_features["price_change"] = (
                                     (candles[-1]["close"] - candles[-8]["close"]) / candles[-8]["close"]
                                 )
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.debug(
+                            "LCRS feature-engine enrichment failed for %s "
+                            "(features will be partial -> may be rejected "
+                            "by data-readiness gate): %s", coin, e,
+                        )
 
                 sig = container.liquidation_strategy.generate_signal(coin, lcrs_features, price)
                 if sig:
@@ -1832,8 +1843,12 @@ def _process_closed_trades(container, closed):
                         size=max(size, 1e-8),
                         leverage=max(leverage, 1),
                     )
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug(
+                        "LEARN-WRITE kelly_sizer.record_outcome failed "
+                        "(key=%s coin=%s): %s",
+                        kelly_key, c_trade.get("coin"), e,
+                    )
 
             # AgentScorer outcome
             if container.agent_scorer:
@@ -1841,10 +1856,24 @@ def _process_closed_trades(container, closed):
                     signal_id = meta.get("signal_id", "")
                     if signal_id:
                         container.agent_scorer.record_outcome(source_key, signal_id, pnl, return_pct)
-                except Exception:
-                    pass
-        except Exception:
-            pass
+                except Exception as e:
+                    logger.debug(
+                        "LEARN-WRITE agent_scorer.record_outcome failed "
+                        "(source=%s coin=%s): %s",
+                        source_key, c_trade.get("coin"), e,
+                    )
+        except Exception as e:
+            # Umbrella over the whole closed-trade learning update
+            # (arena / shadow / kelly / agent_scorer). A throw here
+            # silently drops every learning signal for this trade --
+            # the broadest version of the data-loss class.
+            logger.warning(
+                "LEARN-WRITE closed-trade outcome processing FAILED "
+                "(coin=%s id=%s): %s",
+                c_trade.get("coin") if isinstance(c_trade, dict) else "?",
+                c_trade.get("id") if isinstance(c_trade, dict) else "?",
+                e,
+            )
 
 
 def _run_alpha_arena(container, regime_data):
