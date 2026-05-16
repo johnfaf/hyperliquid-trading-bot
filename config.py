@@ -1095,6 +1095,22 @@ OPTIONS_FLOW_CAP_MIN_TRADES = int(
 OPTIONS_FLOW_GRADUATED_CAP = int(
     os.environ.get("OPTIONS_FLOW_GRADUATED_CAP", 4)
 )
+# Regime-aware LLM exhaustion guard. The exhaustion-trap block (no
+# shorting RSI<22 / no longing RSI>78) protects against reversal in
+# ranging/volatile/contra-regime contexts, but in a CONFIRMED strong
+# trend it inverts -- shorting RSI<22 while regime==TRENDING_DOWN is
+# trend continuation, the highest-conviction setup. A blanket hard
+# block there deadlocks the core strategy (observed: LLM pass_rate 4%,
+# 0 orders while the bot wanted to short a trending_down market). When
+# enabled, trend-aligned signals are de-risked (confidence *=
+# LLM_EXHAUSTION_TREND_ALIGNED_CONF_MULT) instead of hard-blocked;
+# non-aligned contexts keep the hard block.
+LLM_EXHAUSTION_REGIME_AWARE = os.environ.get(
+    "LLM_EXHAUSTION_REGIME_AWARE", "true"
+).lower() in ("true", "1", "yes")
+LLM_EXHAUSTION_TREND_ALIGNED_CONF_MULT = _safe_env_float(
+    "LLM_EXHAUSTION_TREND_ALIGNED_CONF_MULT", 0.85, lo=0.1, hi=1.0
+)
 SOURCE_POLICY_WARMUP_SIZE_MULTIPLIER = float(
     os.environ.get("SOURCE_POLICY_WARMUP_SIZE_MULTIPLIER", 0.75)
 )

@@ -32,7 +32,19 @@ import json
 import time
 from typing import Dict, Optional, Tuple
 
+try:
+    import config as _config
+except Exception:  # pragma: no cover - config always importable in app
+    _config = None
+
 logger = logging.getLogger(__name__)
+
+
+def _cfg_default(name: str, fallback):
+    """Read an env-backed default from the config module if present."""
+    if _config is None:
+        return fallback
+    return getattr(_config, name, fallback)
 
 
 class LLMFilter:
@@ -58,6 +70,25 @@ class LLMFilter:
         self.memory_avoid_threshold = cfg.get("memory_avoid_threshold", 0.30)  # WR below 30% = block
         self.exhaustion_rsi_long = cfg.get("exhaustion_rsi_long", 78)  # Don't long above this RSI
         self.exhaustion_rsi_short = cfg.get("exhaustion_rsi_short", 22)  # Don't short below this RSI
+        # Regime-aware exhaustion. The exhaustion-trap guard protects
+        # against shorting an oversold *bounce* / longing an overbought
+        # *fade* -- a real risk in ranging / volatile / contra-regime
+        # contexts. But in a CONFIRMED strong trend it inverts: a short
+        # into RSI<22 while regime==TRENDING_DOWN is trend *continuation*
+        # (oversold stays oversold in strong downtrends), not exhaustion.
+        # A blanket hard block there makes the highest-conviction setup
+        # impossible (observed: pass_rate 4%, 0 orders for hours while
+        # the bot wanted to short a trending_down market). When the
+        # trade is trend-aligned we de-risk (confidence haircut) instead
+        # of hard-blocking; non-aligned contexts keep the hard block.
+        self.exhaustion_regime_aware = bool(cfg.get(
+            "exhaustion_regime_aware",
+            _cfg_default("LLM_EXHAUSTION_REGIME_AWARE", True),
+        ))
+        self.exhaustion_trend_aligned_conf_mult = float(cfg.get(
+            "exhaustion_trend_aligned_conf_mult",
+            _cfg_default("LLM_EXHAUSTION_TREND_ALIGNED_CONF_MULT", 0.85),
+        ))
         self.max_correlated_positions = cfg.get("max_correlated_positions", 3)
 
         # Correlated asset groups
@@ -174,11 +205,14 @@ class LLMFilter:
 
         reasons = []
 
+        # Resolve regime once -- both the regime-contradiction check and
+        # the regime-aware exhaustion check below need it, and Check 4
+        # must work even if check_regime is disabled.
+        regime_data = context.get("regime_data", {}) or {}
+        regime = str(regime_data.get("overall_regime", "") or "").upper()
+
         # ─── Check 1: Regime Contradiction ───────────────────────
         if self.check_regime:
-            regime_data = context.get("regime_data", {})
-            regime = regime_data.get("overall_regime", "").upper()
-
             if regime == "TRENDING_UP" and side == "short":
                 confidence *= 0.6
                 reasons.append("contra-regime: shorting in TRENDING_UP")
@@ -218,14 +252,35 @@ class LLMFilter:
         if self.check_exhaustion:
             rsi = features.get("rsi", 50)
             bb_pos = features.get("bollinger_position", 0)
+            # Trade is trend-aligned when its direction matches a
+            # confirmed trend regime -> the "exhaustion" RSI extreme is
+            # trend continuation, not a reversal trap.
+            trend_aligned_short = side == "short" and regime == "TRENDING_DOWN"
+            trend_aligned_long = side == "long" and regime == "TRENDING_UP"
 
             if side == "long" and rsi > self.exhaustion_rsi_long:
-                self.stats["blocked_exhaustion"] += 1
-                return False, 0, f"Exhaustion block: longing with RSI={rsi:.0f} (>{self.exhaustion_rsi_long})"
+                if self.exhaustion_regime_aware and trend_aligned_long:
+                    confidence *= self.exhaustion_trend_aligned_conf_mult
+                    reasons.append(
+                        f"extended-but-trend-aligned long "
+                        f"(RSI={rsi:.0f}>{self.exhaustion_rsi_long}, "
+                        f"TRENDING_UP): de-risk not block"
+                    )
+                else:
+                    self.stats["blocked_exhaustion"] += 1
+                    return False, 0, f"Exhaustion block: longing with RSI={rsi:.0f} (>{self.exhaustion_rsi_long})"
 
             if side == "short" and rsi < self.exhaustion_rsi_short:
-                self.stats["blocked_exhaustion"] += 1
-                return False, 0, f"Exhaustion block: shorting with RSI={rsi:.0f} (<{self.exhaustion_rsi_short})"
+                if self.exhaustion_regime_aware and trend_aligned_short:
+                    confidence *= self.exhaustion_trend_aligned_conf_mult
+                    reasons.append(
+                        f"extended-but-trend-aligned short "
+                        f"(RSI={rsi:.0f}<{self.exhaustion_rsi_short}, "
+                        f"TRENDING_DOWN): de-risk not block"
+                    )
+                else:
+                    self.stats["blocked_exhaustion"] += 1
+                    return False, 0, f"Exhaustion block: shorting with RSI={rsi:.0f} (<{self.exhaustion_rsi_short})"
 
             # Bollinger extreme warning
             if side == "long" and bb_pos > 0.9:
