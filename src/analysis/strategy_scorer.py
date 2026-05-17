@@ -613,8 +613,32 @@ class StrategyScorer:
         invalid_reasons = runtime_status.get("invalid_reasons", {}) or {}
         synthetic_placeholders = int(invalid_reasons.get("synthetic_placeholder_metrics", 0) or 0)
         active_invalid = int(runtime_status.get("active_invalid", 0) or 0)
+        active_valid = int(runtime_status.get("active_valid", len(strategies)) or 0)
+        inactive_valid = int(runtime_status.get("inactive_valid", 0) or 0)
+        recovery_target = max(
+            1,
+            int(
+                getattr(
+                    config,
+                    "STRATEGY_RECOVERY_TARGET_ACTIVE_VALID",
+                    max(config.MIN_ACTIVE_STRATEGIES, config.MAX_STRATEGIES_PER_CYCLE),
+                )
+                or 1
+            ),
+        )
         health = "good" if improving > declining else "needs_attention" if declining > improving else "neutral"
-        if synthetic_placeholders or active_invalid:
+        data_hygiene_warnings = {}
+        if synthetic_placeholders:
+            data_hygiene_warnings["synthetic_placeholder_metrics"] = synthetic_placeholders
+        if active_invalid:
+            data_hygiene_warnings["active_invalid"] = active_invalid
+        if inactive_valid and active_valid < recovery_target:
+            data_hygiene_warnings["underfilled_active_valid"] = active_valid
+        if (
+            active_invalid
+            or active_valid < max(1, int(getattr(config, "MIN_ACTIVE_STRATEGIES", 5) or 5))
+            or (inactive_valid and active_valid < recovery_target)
+        ):
             health = "degraded_strategy_data"
 
         return {
@@ -627,6 +651,7 @@ class StrategyScorer:
             "top_strategy": strategies[0] if strategies else None,
             "health": health,
             "strategy_runtime_status": runtime_status,
+            "data_hygiene_warnings": data_hygiene_warnings,
             "trends": {s["id"]: trends.get(s["id"], {}) for s in strategies[:10]},
         }
 

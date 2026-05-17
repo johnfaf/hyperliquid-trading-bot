@@ -77,6 +77,7 @@ async def health_strip() -> JSONResponse:
                 "DASHBOARD_V2_HEALTH_STRIP_CACHE_SECONDS",
                 _cache_ttl("DASHBOARD_V2_HEALTH_CACHE_SECONDS", 5.0),
             ),
+            _health_strip_include_db_audit(),
         ) or {}
     except Exception as exc:
         logger.warning("health strip readiness failed: %s", exc)
@@ -114,11 +115,22 @@ async def health_strip() -> JSONResponse:
     return JSONResponse(payload)
 
 
-def _cached_readiness(key: str, ttl_s: float) -> dict:
-    return get_ttl(key, ttl_s, _evaluate_readiness)
+def _cached_readiness(key: str, ttl_s: float, include_db_audit: bool = True) -> dict:
+    return get_ttl(
+        key,
+        ttl_s,
+        lambda: _evaluate_readiness(include_db_audit=include_db_audit),
+    )
 
 
-def _evaluate_readiness() -> dict:
+def _health_strip_include_db_audit() -> bool:
+    return os.environ.get(
+        "DASHBOARD_V2_HEALTH_STRIP_INCLUDE_DB_AUDIT",
+        "false",
+    ).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _evaluate_readiness(*, include_db_audit: bool = True) -> dict:
     from src.core.readiness import evaluate_readiness
 
-    return evaluate_readiness()
+    return evaluate_readiness(include_db_audit=include_db_audit)

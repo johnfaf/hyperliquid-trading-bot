@@ -459,6 +459,27 @@ def test_health_strip_returns_a_tone(client):
     assert "label" in payload
 
 
+def test_health_strip_uses_lightweight_readiness_by_default(monkeypatch, client):
+    from src.ui.v2 import cache as v2_cache
+    from src.ui.v2.routers import health as health_router
+
+    calls = []
+
+    def fake_readiness(*, include_db_audit=True):
+        calls.append(include_db_audit)
+        return {"ready": True, "live_ready": False, "reasons": []}
+
+    v2_cache.invalidate("dashboard_health_strip")
+    monkeypatch.delenv("DASHBOARD_V2_HEALTH_STRIP_INCLUDE_DB_AUDIT", raising=False)
+    monkeypatch.setenv("DASHBOARD_V2_HEALTH_STRIP_CACHE_SECONDS", "0")
+    monkeypatch.setattr(health_router, "_evaluate_readiness", fake_readiness)
+
+    r = client.get("/api/health/strip")
+
+    assert r.status_code == 200
+    assert calls == [False]
+
+
 def test_clear_quarantine_requires_audit_reason(client):
     r = client.post(
         "/api/sources/clear_quarantine",

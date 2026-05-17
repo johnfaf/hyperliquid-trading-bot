@@ -234,6 +234,45 @@ def test_repeated_inactive_active_stream_uses_rest_fallback_window(caplog):
     assert "parking websocket" in caplog.text.lower()
 
 
+def test_inactive_active_counter_survives_reconnect_until_real_event(monkeypatch):
+    monitor = PositionMonitor()
+    address = "0x" + "4" * 40
+    monitor._running = True
+    monitor._inactive_active_reconnect_s = 6.0
+    monitor._inactive_active_rest_only_after = 2
+    monitor._inactive_active_rest_only_s = 120.0
+    monitor._tracked_addresses = {address}
+    monitor._active_position_addresses = {address}
+    monitor._position_cache = {
+        address: {
+            "BTC": {
+                "size": 1.0,
+                "side": "long",
+                "entry_price": 100.0,
+                "leverage": 2.0,
+                "unrealized_pnl": 0.0,
+            }
+        }
+    }
+
+    monkeypatch.setattr(monitor, "_filter_active_addresses", lambda addresses: (list(addresses), 0))
+    monkeypatch.setattr(monitor, "_bootstrap_positions", lambda _address: None)
+    monkeypatch.setattr(monitor, "_subscribe_to_address", lambda _address: None)
+
+    monitor._on_close(None, None, "Inactive")
+    _wait, _reason = monitor._consume_reconnect_wait()
+    monitor._on_open(object())
+
+    assert monitor._consecutive_inactive_active_closes == 1
+
+    monitor._on_close(None, None, "Inactive")
+    wait, reason = monitor._consume_reconnect_wait()
+
+    assert wait == 120.0
+    assert reason == "inactive userEvents stream"
+    assert monitor.get_stats()["transport_mode"] == "rest_only"
+
+
 def test_note_disconnect_preserves_backoff_for_short_lived_flaps(monkeypatch):
     monitor = PositionMonitor()
     monitor._connected = True

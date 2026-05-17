@@ -176,6 +176,7 @@ def evaluate_readiness(
     container: Optional[Any] = None,
     health_registry: Optional[Any] = None,
     stale_seconds: Optional[int] = None,
+    include_db_audit: bool = True,
 ) -> Dict[str, Any]:
     """
     Evaluate runtime and live-trading readiness using concrete local checks.
@@ -210,7 +211,14 @@ def evaluate_readiness(
     if not db_writable:
         reasons.append(f"db_write_failed:{db_write_error[:160]}")
 
-    db_audit_ok, db_audit_report, db_audit_blockers = _probe_db_audit()
+    if include_db_audit:
+        db_audit_ok, db_audit_report, db_audit_blockers = _probe_db_audit()
+    else:
+        db_audit_ok, db_audit_report, db_audit_blockers = (
+            True,
+            {"enabled": False, "ok": True, "skipped": "lightweight_readiness"},
+            [],
+        )
     checks["db_audit_ok"] = db_audit_ok
     checks["db_audit"] = db_audit_report
     if not db_audit_ok:

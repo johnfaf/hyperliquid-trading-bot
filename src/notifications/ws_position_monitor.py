@@ -652,7 +652,6 @@ class PositionMonitor:
             self._connected_since = now
             self._last_msg_time = now
             self._last_ws_activity_time = now
-            self._consecutive_inactive_active_closes = 0
             self._watchdog_grace_until = now + self._watchdog_startup_grace_s
             self._transport_mode = "websocket"
             self._transport_reason = "connected"
@@ -948,6 +947,7 @@ class PositionMonitor:
             if current_positions:
                 self._active_position_addresses.add(user)
                 self._subscribed_addresses.add(user)
+                self._consecutive_inactive_active_closes = 0
             else:
                 self._active_position_addresses.discard(user)
                 self._subscribed_addresses.discard(user)

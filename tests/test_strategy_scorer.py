@@ -227,3 +227,42 @@ def test_improvement_report_no_strategies_has_concrete_health(monkeypatch):
 
     assert report["health"] == "degraded_no_valid_active_strategies"
     assert report["recoverable_inactive_strategies"] == 2
+
+
+def test_improvement_report_does_not_degrade_on_inactive_invalid_bloat(monkeypatch):
+    scorer = StrategyScorer()
+    monkeypatch.setattr(config, "MIN_ACTIVE_STRATEGIES", 5)
+    monkeypatch.setattr(config, "MAX_STRATEGIES_PER_CYCLE", 15)
+    monkeypatch.setattr(config, "STRATEGY_RECOVERY_TARGET_ACTIVE_VALID", 15)
+    strategies = [
+        {"id": idx, "current_score": 0.5, "name": f"s{idx}", "strategy_type": "momentum"}
+        for idx in range(15)
+    ]
+
+    monkeypatch.setattr(db, "get_active_strategies", lambda: strategies)
+    monkeypatch.setattr(
+        db,
+        "get_strategy_runtime_status",
+        lambda: {
+            "total": 1621,
+            "active_valid": 15,
+            "active_invalid": 0,
+            "inactive_valid": 1100,
+            "inactive_invalid": 506,
+            "invalid_reasons": {
+                "fixture_or_demo_strategy": 5,
+                "missing_source_wallet": 500,
+                "synthetic_placeholder_metrics": 1,
+            },
+        },
+    )
+    monkeypatch.setattr(
+        scorer,
+        "get_strategy_trend",
+        lambda _strategy_id: {"trend": "stable", "momentum": 0, "current_score": 0.5},
+    )
+
+    report = scorer.generate_improvement_report()
+
+    assert report["health"] == "neutral"
+    assert report["data_hygiene_warnings"]["synthetic_placeholder_metrics"] == 1

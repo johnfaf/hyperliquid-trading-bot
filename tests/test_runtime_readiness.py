@@ -153,6 +153,28 @@ def test_evaluate_readiness_blocks_on_db_audit_findings(monkeypatch):
     assert "db_audit_high:open_trades_missing_protection" in snapshot["reasons"]
 
 
+def test_evaluate_readiness_can_skip_expensive_db_audit(monkeypatch):
+    monkeypatch.setattr(readiness, "_probe_db_readable", lambda: (True, ""))
+    monkeypatch.setattr(readiness, "_probe_db_writable", lambda ttl_s=None: (True, ""))
+    monkeypatch.setattr(readiness.db, "get_db_path", lambda: "test.db")
+
+    def fail_audit(ttl_s=None):
+        raise AssertionError("lightweight readiness should not run db audit")
+
+    monkeypatch.setattr(readiness, "_probe_db_audit", fail_audit)
+
+    snapshot = readiness.evaluate_readiness(
+        container=_FakeContainer({"live_enabled": False}),
+        health_registry=_healthy_registry(),
+        stale_seconds=600,
+        include_db_audit=False,
+    )
+
+    assert snapshot["ready"] is True
+    assert snapshot["checks"]["db_audit_ok"] is True
+    assert snapshot["checks"]["db_audit"]["skipped"] == "lightweight_readiness"
+
+
 def test_evaluate_readiness_tolerates_missing_registry_by_default(monkeypatch):
     monkeypatch.setattr(readiness, "_probe_db_readable", lambda: (True, ""))
     monkeypatch.setattr(readiness, "_probe_db_writable", lambda ttl_s=None: (True, ""))
