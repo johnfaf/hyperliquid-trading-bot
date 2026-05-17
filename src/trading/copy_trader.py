@@ -604,7 +604,15 @@ class CopyTrader:
                 "Copy trader open signals paused: %s",
                 guardrail.get("reason", "copy guardrail blocked"),
             )
-        new_entries_seen = 0
+        candidate_cap = 0
+        if self.max_new_trades_per_cycle > 0:
+            # The execution cap must apply to successful opens, not merely to
+            # candidates that pass the early pre-screen. Live logs showed the
+            # first pending candidate failing execution-time firewall checks,
+            # while the old counter had already blocked every later candidate.
+            # Keep a generous prefilter cap so one bad candidate cannot starve
+            # the cycle, but candidate collection is still bounded.
+            candidate_cap = max(10, self.max_new_trades_per_cycle * 10)
 
         for signal in signals:
             try:
@@ -619,13 +627,13 @@ class CopyTrader:
                     if not allow_new_entries:
                         continue
                     if (
-                        self.max_new_trades_per_cycle > 0
-                        and new_entries_seen >= self.max_new_trades_per_cycle
+                        candidate_cap > 0
+                        and len(pending_entries) >= candidate_cap
                     ):
                         logger.info(
-                            "  Copy-trader cycle cap reached (%d/%d); skipping %s %s",
-                            new_entries_seen,
-                            self.max_new_trades_per_cycle,
+                            "  Copy-trader candidate cap reached (%d/%d); skipping %s %s",
+                            len(pending_entries),
+                            candidate_cap,
                             signal["side"],
                             signal["coin"],
                         )
@@ -691,7 +699,6 @@ class CopyTrader:
                         "signal": signal,
                         "trade_signal": trade_signal,
                     })
-                    new_entries_seen += 1
 
             except Exception as e:
                 logger.error(f"Error executing copy signal: {e}")
@@ -707,6 +714,17 @@ class CopyTrader:
             ),
             reverse=True,
         ):
+            if (
+                self.max_new_trades_per_cycle > 0
+                and len(executed) >= self.max_new_trades_per_cycle
+            ):
+                logger.info(
+                    "  Copy-trader execution cap reached (%d/%d); skipping remaining candidates",
+                    len(executed),
+                    self.max_new_trades_per_cycle,
+                )
+                break
+
             signal = candidate["signal"]
             trade_signal = candidate["trade_signal"]
             decision = self.rotation_manager.decide(

@@ -289,6 +289,16 @@ MIN_ACTIVE_STRATEGIES = int(os.environ.get("MIN_ACTIVE_STRATEGIES", 5))
 MAX_ACTIVE_STRATEGIES = int(os.environ.get("MAX_ACTIVE_STRATEGIES", 200))
 # Max strategies per trading cycle fed to decision engine
 MAX_STRATEGIES_PER_CYCLE = int(os.environ.get("MAX_STRATEGIES_PER_CYCLE", 15))
+# If the live active-valid strategy pool is smaller than the per-cycle feed,
+# recover valid inactive rows before scoring. This prevents the bot from
+# getting trapped with only a few momentum rows while valid range/copy-derived
+# strategies sit inactive after a prior quarantine/scoring pass.
+STRATEGY_RECOVERY_TARGET_ACTIVE_VALID = int(
+    os.environ.get(
+        "STRATEGY_RECOVERY_TARGET_ACTIVE_VALID",
+        max(MIN_ACTIVE_STRATEGIES, MAX_STRATEGIES_PER_CYCLE),
+    )
+)
 # Scoring weights
 SCORING_WEIGHTS = {
     "pnl": 0.30,
@@ -1028,6 +1038,7 @@ def _validate_config_bounds() -> None:
         ("MAX_ACTIVE_STRATEGIES", 1, 5000, 200),
         ("MIN_ACTIVE_STRATEGIES", 1, 500, 5),
         ("MAX_STRATEGIES_PER_CYCLE", 1, 200, 15),
+        ("STRATEGY_RECOVERY_TARGET_ACTIVE_VALID", 1, 500, 15),
         ("PAPER_TRADING_MAX_LEVERAGE", 1.0, 25.0, 5.0),
         ("PAPER_TRADING_STOP_LOSS_PCT", 0.001, 1.0, 0.15),
         ("PAPER_TRADING_TAKE_PROFIT_PCT", 0.001, 5.0, 0.75),

@@ -1084,7 +1084,7 @@ def recover_valid_inactive_strategies(limit: int = None) -> list[dict]:
             )
 
     logger.warning(
-        "Recovered %d valid inactive strategy row(s) for rescoring after active set went empty",
+        "Recovered %d valid inactive strategy row(s) for rescoring",
         len(recovered),
     )
     return recovered

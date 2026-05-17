@@ -2411,6 +2411,7 @@ def run_startup_safe_repair() -> list[DbRepairAction]:
     )
     _repair_invalid_strategy_bloat(actions, max_rows=startup_strategy_prune_limit)
     _repair_orphan_strategy_score_parents(actions, max_rows=startup_strategy_prune_limit)
+    _repair_missing_source_wallet_strategy_bloat(actions)
     _repair_paper_account(actions)
     _repair_stale_pending_decisions(actions)
     _repair_source_health_history(actions)

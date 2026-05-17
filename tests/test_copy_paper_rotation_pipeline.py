@@ -120,6 +120,87 @@ def test_copy_trader_crash_weight_preserves_strong_signal_above_firewall_floor()
     assert weighted["confidence"] >= getattr(config, "FIREWALL_MIN_CONFIDENCE", 0.45)
 
 
+def test_copy_trader_execution_cap_does_not_starve_after_rejected_candidate(monkeypatch):
+    monkeypatch.setattr(config, "COPY_TRADER_ENABLED", True, raising=False)
+    monkeypatch.setattr(config, "COPY_TRADER_MAX_CONCURRENT_TRADES", 5, raising=False)
+    monkeypatch.setattr(config, "COPY_TRADER_MAX_NEW_TRADES_PER_CYCLE", 1, raising=False)
+    monkeypatch.setattr(config, "COPY_TRADER_AUTO_PAUSE_MIN_CLOSED_TRADES", 10, raising=False)
+
+    final_calls = []
+
+    class FakeFirewall:
+        def validate(self, signal, **kwargs):
+            if kwargs.get("dry_run"):
+                return True, "pre-screen-ok"
+            final_calls.append(signal.coin)
+            if signal.coin == "ETH":
+                return False, "execution-time calibration reject"
+            return True, "ok"
+
+    monkeypatch.setattr("src.trading.copy_trader.db.get_paper_account", lambda: {"balance": 10_000.0})
+    monkeypatch.setattr("src.trading.copy_trader.db.get_open_paper_trades", lambda: [])
+    monkeypatch.setattr("src.trading.copy_trader.db.get_paper_trade_history", lambda limit=250: [])
+    monkeypatch.setattr("src.trading.copy_trader.hl.get_all_mids", lambda: {"ETH": 100.0, "BTC": 100.0})
+
+    trader = CopyTrader(firewall=FakeFirewall())
+    monkeypatch.setattr(trader, "_annotate_open_trades", lambda trades, mids: None)
+    monkeypatch.setattr(
+        trader.rotation_manager,
+        "candidate_score",
+        lambda signal, regime_data=None: 2.0 if signal.coin == "ETH" else 1.0,
+    )
+    monkeypatch.setattr(
+        trader.rotation_manager,
+        "decide",
+        lambda *args, **kwargs: RotationDecision(
+            action="open",
+            reason="capacity available",
+            candidate_score=1.0,
+        ),
+    )
+    monkeypatch.setattr(
+        trader,
+        "_open_copy_trade",
+        lambda account, signal, positions: {
+            "id": 123,
+            "coin": signal["coin"],
+            "side": signal["side"],
+            "entry_price": signal["price"],
+            "size": 1.0,
+            "leverage": signal["leverage"],
+            "opened_at": datetime.now(timezone.utc).isoformat(),
+            "metadata": {"is_copy_trade": True, "source": "copy_trade"},
+        },
+    )
+
+    executed = trader.execute_copy_signals(
+        [
+            {
+                "type": "copy_open",
+                "coin": "ETH",
+                "side": "long",
+                "price": 100.0,
+                "leverage": 2,
+                "confidence": 0.9,
+                "source_trader": "0xabc",
+            },
+            {
+                "type": "copy_open",
+                "coin": "BTC",
+                "side": "long",
+                "price": 100.0,
+                "leverage": 2,
+                "confidence": 0.9,
+                "source_trader": "0xdef",
+            },
+        ],
+        regime_data={"overall_regime": "neutral"},
+    )
+
+    assert final_calls == ["ETH", "BTC"]
+    assert [trade["coin"] for trade in executed] == ["BTC"]
+
+
 def test_copy_trader_scale_out_signal_closes_source_reduce(monkeypatch):
     monkeypatch.setattr(config, "COPY_TRADER_ENABLED", True, raising=False)
     monkeypatch.setattr(config, "COPY_TRADER_AUTO_PAUSE_MIN_CLOSED_TRADES", 10, raising=False)

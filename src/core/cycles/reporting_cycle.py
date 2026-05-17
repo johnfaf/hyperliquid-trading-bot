@@ -177,7 +177,21 @@ def run_reporting(container, cycle_count: int, health_registry=None) -> None:
             stale = health_registry.check_stale(timeout_seconds=600)
             stale_names = {name: state for name, state in stale.items() if state}
             if stale_names:
-                logger.warning("  Stale subsystems: %s", stale_names)
+                statuses = health_registry.get_all()
+                trading_stale = {
+                    name: state
+                    for name, state in stale_names.items()
+                    if getattr(statuses.get(name), "affects_trading", True)
+                }
+                non_trading_stale = {
+                    name: state
+                    for name, state in stale_names.items()
+                    if not getattr(statuses.get(name), "affects_trading", True)
+                }
+                if trading_stale:
+                    logger.warning("  Stale trading subsystems: %s", trading_stale)
+                if non_trading_stale:
+                    logger.info("  Stale non-trading subsystems: %s", non_trading_stale)
         except Exception:
             pass
 

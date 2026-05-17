@@ -62,6 +62,66 @@ class StrategyScorer:
         self.weights = config.SCORING_WEIGHTS
         self.decay_rate = config.SCORE_DECAY_RATE
 
+    def _recover_underfilled_active_pool(self) -> Dict:
+        """Recover valid inactive rows when the active pool is too narrow.
+
+        Live logs showed the engine stuck at 5 active-valid strategies while
+        more than 1k valid strategies were inactive. Scoring only the already
+        active rows means the bot can get trapped with one side/regime family
+        (for example momentum_long) and then every cycle is firewall-rejected
+        when the market regime changes. This recovery keeps quarantine rules
+        intact: only rows passing ``strategy_quarantine_reason`` are reactivated.
+        """
+        try:
+            status = db.get_strategy_runtime_status()
+        except Exception as exc:
+            logger.warning("Strategy runtime status lookup failed before scoring: %s", exc)
+            return {}
+
+        target = max(
+            1,
+            int(
+                getattr(
+                    config,
+                    "STRATEGY_RECOVERY_TARGET_ACTIVE_VALID",
+                    max(config.MIN_ACTIVE_STRATEGIES, config.MAX_STRATEGIES_PER_CYCLE),
+                )
+                or 1
+            ),
+        )
+        active_valid = int(status.get("active_valid", 0) or 0)
+        inactive_valid = int(status.get("inactive_valid", 0) or 0)
+        if active_valid >= target or inactive_valid <= 0:
+            return status
+
+        needed = min(target - active_valid, inactive_valid)
+        try:
+            recovered = db.recover_valid_inactive_strategies(limit=needed)
+        except Exception as exc:
+            logger.warning(
+                "Strategy recovery failed with active_valid=%d target=%d inactive_valid=%d: %s",
+                active_valid,
+                target,
+                inactive_valid,
+                exc,
+            )
+            return status
+
+        if recovered:
+            logger.warning(
+                "Strategy active-valid pool underfilled (%d/%d); recovered %d valid "
+                "inactive strategy row(s) before scoring",
+                active_valid,
+                target,
+                len(recovered),
+            )
+            try:
+                status = db.get_strategy_runtime_status()
+            except Exception:
+                status = dict(status)
+            status["recovered_this_cycle"] = len(recovered)
+        return status
+
     def _persist_scoring_results(
         self,
         results: List[Dict],
@@ -354,6 +414,7 @@ class StrategyScorer:
                 )
         except Exception as exc:
             logger.warning("Strategy data quarantine failed before scoring: %s", exc)
+        runtime_status = self._recover_underfilled_active_pool()
         strategies = db.get_active_strategies()
         if not strategies:
             try:
@@ -371,6 +432,15 @@ class StrategyScorer:
                 strategies = db.get_active_strategies()
         results = []
 
+        if runtime_status:
+            logger.info(
+                "Strategy runtime before scoring: total=%s active_valid=%s "
+                "inactive_valid=%s invalid_reasons=%s",
+                runtime_status.get("total", "?"),
+                runtime_status.get("active_valid", "?"),
+                runtime_status.get("inactive_valid", "?"),
+                runtime_status.get("invalid_reasons", {}),
+            )
         logger.info(f"Scoring {len(strategies)} active strategies...")
 
         for strategy in strategies:
