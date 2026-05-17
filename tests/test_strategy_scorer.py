@@ -13,6 +13,7 @@ def test_score_all_strategies_batches_persistence(monkeypatch):
     monkeypatch.setattr(config, "MIN_ACTIVE_STRATEGIES", 1)
     monkeypatch.setattr(config, "MAX_ACTIVE_STRATEGIES", 10)
     monkeypatch.setattr(config, "MIN_STRATEGY_SCORE", 0.5)
+    monkeypatch.setattr(config, "STRATEGY_RECOVERY_TARGET_ACTIVE_VALID", 2)
     strategies = [
         {
             "id": 1,
@@ -35,6 +36,11 @@ def test_score_all_strategies_batches_persistence(monkeypatch):
     ]
 
     monkeypatch.setattr(db, "get_active_strategies", lambda: strategies)
+    monkeypatch.setattr(
+        db,
+        "get_strategy_runtime_status",
+        lambda: {"total": 2, "active_valid": 2, "inactive_valid": 0, "invalid_reasons": {}},
+    )
     monkeypatch.setattr(
         db,
         "quarantine_contaminated_runtime_data",
@@ -125,6 +131,7 @@ def test_score_all_strategies_recovers_valid_inactive_when_active_set_empty(monk
     monkeypatch.setattr(config, "MIN_ACTIVE_STRATEGIES", 1)
     monkeypatch.setattr(config, "MAX_ACTIVE_STRATEGIES", 10)
     monkeypatch.setattr(config, "MIN_STRATEGY_SCORE", 0.1)
+    monkeypatch.setattr(config, "STRATEGY_RECOVERY_TARGET_ACTIVE_VALID", 1)
 
     recovered_strategy = {
         "id": 9,
@@ -137,16 +144,24 @@ def test_score_all_strategies_recovers_valid_inactive_when_active_set_empty(monk
     }
     calls = {"get_active": 0, "recover": 0}
 
+    recovered_flag = {"done": False}
+
     def fake_get_active():
         calls["get_active"] += 1
-        return [] if calls["get_active"] == 1 else [recovered_strategy]
+        return [recovered_strategy] if recovered_flag["done"] else []
 
     def fake_recover(limit):
         calls["recover"] += 1
         assert limit == 1
+        recovered_flag["done"] = True
         return [recovered_strategy]
 
     monkeypatch.setattr(db, "get_active_strategies", fake_get_active)
+    monkeypatch.setattr(
+        db,
+        "get_strategy_runtime_status",
+        lambda: {"total": 1, "active_valid": 0, "inactive_valid": 1, "invalid_reasons": {}},
+    )
     monkeypatch.setattr(db, "recover_valid_inactive_strategies", fake_recover)
     monkeypatch.setattr(
         db,
@@ -188,7 +203,7 @@ def test_score_all_strategies_recovers_valid_inactive_when_active_set_empty(monk
 
     results = scorer.score_all_strategies()
 
-    assert calls == {"get_active": 2, "recover": 1}
+    assert calls == {"get_active": 1, "recover": 1}
     assert results[0]["strategy_id"] == 9
     assert results[0]["breakdown"]["win_rate_pvalue"] is None
     assert any(sql.startswith("INSERT INTO strategy_scores") for sql, _ in persisted)
