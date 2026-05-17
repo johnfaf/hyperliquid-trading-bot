@@ -44,17 +44,30 @@ def _seed_outcomes(
         )
 
 
-def test_no_data_returns_coldstart_prior(monkeypatch):
+def test_no_data_returns_operator_min_by_default(monkeypatch):
+    """Default (coldstart_uses_global_min): no per-bucket evidence must
+    NOT raise above the operator min_confidence -- absence of evidence
+    is not evidence of badness. This is the bootstrap-deadlock fix."""
     tracker = _fresh_tracker(monkeypatch)
     threshold, reason = tracker.get_bucketed_min_confidence(
         "strategy:fresh", side="long", regime="trend", global_min=0.40
     )
-    # Coldstart prior defaults to 0.50 — should land at max(global_min, prior).
-    assert threshold == pytest.approx(0.50, abs=1e-6)
+    assert threshold == pytest.approx(0.40, abs=1e-6)
     assert reason.startswith("coldstart_no_data")
 
 
-def test_thin_sample_returns_coldstart_cap(monkeypatch):
+def test_no_data_restores_prior_when_knob_false(monkeypatch):
+    """Knob off -> old behaviour: cold-start raises to coldstart_prior."""
+    tracker = _fresh_tracker(monkeypatch)
+    tracker.coldstart_uses_global_min = False
+    threshold, reason = tracker.get_bucketed_min_confidence(
+        "strategy:fresh", side="long", regime="trend", global_min=0.40
+    )
+    assert threshold == pytest.approx(0.50, abs=1e-6)  # max(0.40, prior 0.50)
+    assert reason.startswith("coldstart_no_data")
+
+
+def test_thin_sample_uses_operator_min_by_default(monkeypatch):
     tracker = _fresh_tracker(monkeypatch)
     _seed_outcomes(
         tracker,
@@ -68,7 +81,7 @@ def test_thin_sample_returns_coldstart_cap(monkeypatch):
     threshold, reason = tracker.get_bucketed_min_confidence(
         "strategy:thin", side="long", regime="trend", global_min=0.40
     )
-    assert threshold == pytest.approx(0.50, abs=1e-6)
+    assert threshold == pytest.approx(0.40, abs=1e-6)
     assert reason.startswith("coldstart")
 
 
@@ -191,11 +204,13 @@ def test_global_fallback_does_not_quarantine(monkeypatch):
         regime="trend",
         global_min=0.40,
     )
-    # Cold-start prior is 0.50; threshold must be that, NOT 0.95.
+    # Global fallback must NOT quarantine (the key invariant). With the
+    # default knob it also must not invent a cold-start tax -> lands at
+    # the operator min (0.40), never 0.95.
     assert threshold < 0.95, (
         f"Global fallback must not trigger quarantine; got {threshold} ({reason})"
     )
-    assert threshold == pytest.approx(0.50, abs=1e-6)
+    assert threshold == pytest.approx(0.40, abs=1e-6)
 
 
 def test_compose_key_roundtrip():

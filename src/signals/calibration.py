@@ -143,6 +143,17 @@ class CalibrationTracker:
             if isotonic_min_outcomes is not None
             else getattr(config, "CALIBRATION_ISOTONIC_MIN_OUTCOMES", _DEFAULT_ISOTONIC_MIN)
         )
+        # When True (default), the bucketed-threshold floor does NOT
+        # invent a cold-start confidence tax above the operator's
+        # min_confidence when there is simply no per-bucket evidence
+        # (no-data / thin / global-fallback). Absence of evidence is
+        # not evidence of badness -- a *measured* bad-ECE bucket still
+        # hard-quarantines. The cold-start risk control is the
+        # leverage clamp + reduced size + positive-EV requirement, not
+        # a redundant confidence tax that deadlocks bootstrap.
+        self.coldstart_uses_global_min = bool(
+            getattr(config, "CALIBRATION_COLDSTART_USES_GLOBAL_MIN", True)
+        )
         self.quarantine_ece = float(
             quarantine_ece
             if quarantine_ece is not None
@@ -570,16 +581,30 @@ class CalibrationTracker:
           5. ``"global"``
 
         Rules applied to the resolved bucket:
-          * No data anywhere → ``max(global_min, coldstart_prior)``.
-          * Sample size below ``min_outcomes`` → same cold-start cap.
+          * No data / thin / global-fallback → ``global_min`` (the
+            operator floor) when ``coldstart_uses_global_min`` (default);
+            absence of evidence is not evidence of badness. Set the knob
+            false to restore the old ``max(global_min, coldstart_prior)``
+            cold-start tax.
           * ECE >= ``quarantine_ece`` → high threshold (effectively
-            block: ``max(global_min, 0.95)``).
+            block: ``max(global_min, 0.95)``) — measured bad bucket.
           * ECE >= ``quarantine_ece * 0.6`` → mid threshold
-            (``max(global_min, 0.55)``).
+            (``max(global_min, 0.55)``) — measured shaky bucket.
           * Otherwise → ``global_min``.
         """
         global_floor = float(global_min)
-        coldstart = float(max(global_floor, self.coldstart_prior))
+        # Cold-start / no-evidence floor. When coldstart_uses_global_min
+        # is set we do NOT raise above the operator's configured
+        # min_confidence just because a bucket lacks data -- that
+        # invented tax deadlocks bootstrap (signals at ~0.4x cold-start
+        # confidence with strongly +EV regime-aligned setups were all
+        # rejected as "below bucket floor 50%"). Measured bad-ECE
+        # buckets still hard-quarantine below.
+        coldstart = (
+            global_floor
+            if self.coldstart_uses_global_min
+            else float(max(global_floor, self.coldstart_prior))
+        )
 
         resolved = self._resolve_key(source_key, side=side, regime=regime)
         total = self._source_total(resolved)

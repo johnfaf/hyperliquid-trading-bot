@@ -652,6 +652,20 @@ CALIBRATION_MIN_OUTCOMES = int(
 CALIBRATION_COLDSTART_PRIOR = float(
     os.environ.get("CALIBRATION_COLDSTART_PRIOR", "0.50")
 )
+# When true (default), the bucketed-threshold firewall floor does NOT
+# raise above the operator's FIREWALL_MIN_CONFIDENCE just because a
+# (source|side|regime) bucket lacks evidence (no-data / thin /
+# global-fallback). Absence of evidence is not evidence of badness;
+# inventing a cold-start confidence tax there deadlocked bootstrap
+# (regime-aligned, strongly +EV signals at ~0.4x cold-start
+# confidence were all rejected as "below bucket floor 50%"). A
+# *measured* bad-ECE bucket still hard-quarantines. Cold-start risk is
+# controlled by the leverage clamp + reduced size + positive-EV
+# requirement, not a redundant confidence tax. Set false to restore
+# the old max(min_confidence, coldstart_prior) cold-start floor.
+CALIBRATION_COLDSTART_USES_GLOBAL_MIN = os.environ.get(
+    "CALIBRATION_COLDSTART_USES_GLOBAL_MIN", "true"
+).lower() in ("true", "1", "yes")
 # Above this minimum we still apply Bayesian shrinkage; we only trust
 # the empirical isotonic fit once a source crosses this many outcomes.
 CALIBRATION_ISOTONIC_MIN_OUTCOMES = int(
