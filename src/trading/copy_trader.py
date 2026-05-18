@@ -542,7 +542,15 @@ class CopyTrader:
         top-N are evicted after _POSITION_CACHE_TTL_SECONDS so memory doesn't
         grow unboundedly over long run times.
         """
-        traders = db.get_active_traders(valid_only=True, quarantine_invalid=True)[:top_n]
+        # Copy sources must clear the minimum-evidence bar (>= N realized
+        # closed trades AND non-zero realized PnL/ROI).  This excludes the
+        # thin/degenerate "100% winrate / 0% ROI" rows from ever becoming
+        # live copy sources -- they are not branded bots, just not yet
+        # actionable, and re-enter automatically once they have a real
+        # track record.
+        traders = db.get_copyable_traders(
+            valid_only=True, quarantine_invalid=True
+        )[:top_n]
         if not traders:
             return []
 

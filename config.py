@@ -298,6 +298,15 @@ BOT_PERFECT_WINRATE = float(os.environ.get("BOT_PERFECT_WINRATE", 0.98))       #
 BOT_PERFECT_WINRATE_MIN_TRADES = int(
     os.environ.get("BOT_PERFECT_WINRATE_MIN_TRADES", 15)
 )  # min closed trades before a perfect/near-perfect record counts as a bot signal
+# Minimum statistical evidence for a trader to be "copyable" (shown on the
+# dashboard, eligible as a copy source).  A trader below this bar is NOT a
+# bot -- it just has too little realized history to act on, so it is hidden
+# as insufficient-evidence (and stays re-discoverable: discovery re-evaluates
+# it and it returns automatically once it has a real track record).  Bar:
+# >= TRADER_MIN_CLOSED_TRADES realized closed trades AND non-zero realized
+# PnL/ROI (a $0-pnl/0%-ROI row is degenerate junk, e.g. the trivial
+# "100% winrate / 0% ROI" accounts).
+TRADER_MIN_CLOSED_TRADES = int(os.environ.get("TRADER_MIN_CLOSED_TRADES", 10))
 
 # ─── Strategy Analysis ────────────────────────────────────────
 # Minimum number of trades to classify a strategy
@@ -1652,6 +1661,7 @@ def _validate_config_bounds() -> None:
         ("BOT_ELEVATED_FREQ", 1, 100_000, 50),
         ("BOT_PERFECT_WINRATE", 0.50, 1.0, 0.98),
         ("BOT_PERFECT_WINRATE_MIN_TRADES", 1, 100_000, 15),
+        ("TRADER_MIN_CLOSED_TRADES", 0, 100_000, 10),
         ("PORTFOLIO_CHURN_PENALTY", 0.0, 1.0, 0.02),
         ("PORTFOLIO_MIN_HOLD_MINUTES", 0, 525_600, 60),
         ("ROTATION_SHADOW_MODE_DAYS", 0, 365, 7),

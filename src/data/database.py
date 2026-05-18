@@ -892,18 +892,97 @@ def get_trader(address):
     return dict(row) if row else None
 
 
+def trader_meets_evidence_bar(row, min_closed_trades=None) -> bool:
+    """True if a trader row has enough realized history to be actionable.
+
+    Bar: ``trade_count >= min_closed_trades`` AND non-zero realized
+    PnL/ROI.  A row that fails this is NOT a bot -- it just has too
+    little (or degenerate, e.g. ``$0 pnl / 0% roi``) realized history to
+    copy or to show as a meaningful source.  Used by the dashboard and
+    the copy pool so the "100% winrate / 0% ROI" junk is hidden without
+    branding those wallets as bots (discovery still re-evaluates them).
+    """
+    if min_closed_trades is None:
+        try:
+            min_closed_trades = int(getattr(config, "TRADER_MIN_CLOSED_TRADES", 10))
+        except (TypeError, ValueError):
+            min_closed_trades = 10
+    try:
+        trade_count = int(row.get("trade_count", 0) or 0)
+    except (TypeError, ValueError):
+        trade_count = 0
+    if trade_count < min_closed_trades:
+        return False
+    try:
+        total_pnl = float(row.get("total_pnl", 0) or 0)
+    except (TypeError, ValueError):
+        total_pnl = 0.0
+    try:
+        roi_pct = float(row.get("roi_pct", 0) or 0)
+    except (TypeError, ValueError):
+        roi_pct = 0.0
+    # Degenerate $0-pnl / 0%-roi rows are junk even with a trade_count.
+    if total_pnl == 0.0 and roi_pct == 0.0:
+        return False
+    return True
+
+
+def get_copyable_traders(*, valid_only: bool = False,
+                          quarantine_invalid: bool = False,
+                          min_closed_trades=None):
+    """Active traders that clear :func:`trader_meets_evidence_bar`.
+
+    This is the set the dashboard displays and the copy pool draws
+    sources from.  Thin/degenerate rows are excluded (not deactivated --
+    they remain in the active set for discovery to re-evaluate, so a
+    trader who later builds a real track record returns automatically).
+    """
+    traders = get_active_traders(
+        valid_only=valid_only, quarantine_invalid=quarantine_invalid
+    )
+    return [t for t in traders if trader_meets_evidence_bar(t, min_closed_trades)]
+
+
+def _trader_metadata_status(meta) -> str:
+    """Best-effort extract of the ``status`` field from a trader row's
+    metadata column (stored as JSON text)."""
+    if not meta:
+        return ""
+    try:
+        parsed = json.loads(meta) if isinstance(meta, str) else meta
+    except (TypeError, ValueError):
+        return ""
+    if isinstance(parsed, dict):
+        return str(parsed.get("status", "") or "").strip().lower()
+    return ""
+
+
 def get_known_bot_addresses() -> set:
     """
     Get all addresses previously detected as bots (active=0).
     Used by trader_discovery to skip known bots entirely on subsequent scans,
     persisting across redeploys since the data lives in SQLite.
+
+    Rows deactivated purely for *insufficient evidence*
+    (``metadata.status == "low_evidence"``) are NOT bots and are
+    deliberately excluded here so discovery keeps re-evaluating them --
+    a thin trader who later builds a real track record must be able to
+    return to the active/copyable set automatically.
     """
     with get_connection() as conn:
         rows = conn.execute(
-            "SELECT address FROM traders WHERE active = ?",
+            "SELECT address, metadata FROM traders WHERE active = ?",
             (False,),
         ).fetchall()
-    return {r["address"] for r in rows}
+    bots = set()
+    for r in rows:
+        try:
+            if _trader_metadata_status(r["metadata"]) == "low_evidence":
+                continue
+        except Exception:
+            pass
+        bots.add(r["address"])
+    return bots
 
 
 def get_all_traders_including_bots():
