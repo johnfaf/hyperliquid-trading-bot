@@ -978,6 +978,117 @@ def _fetch_stage_summary(conn: Any, decision_id: str) -> Dict[str, Any]:
     }
 
 
+_EXECUTED_STATUSES = {
+    "paper_opened",
+    "live_opened",
+    "live_filled",
+    "executed",
+    "filled",
+    "opened",
+}
+
+
+def _is_executed_row(row: Dict[str, Any]) -> bool:
+    if row.get("paper_trade_id") not in (None, "", 0):
+        return True
+    return str(row.get("final_status") or "").strip().lower() in _EXECUTED_STATUSES
+
+
+def _summarize_decision_rows(rows: list, *, window_hours: float) -> Dict[str, Any]:
+    """Pure aggregation over decision_snapshots rows.
+
+    Answers, at a glance, *"why isn't the bot trading?"* — the question
+    that previously required hand-reading hours of Railway logs. Kept pure
+    (no DB) so it is unit-testable in isolation.
+    """
+    total = len(rows)
+    executed = 0
+    rejected = 0
+    other = 0
+    reasons: Counter[str] = Counter()
+    by_source: Counter[str] = Counter()
+    by_coin: Counter[str] = Counter()
+    for row in rows:
+        if _is_executed_row(row):
+            executed += 1
+            continue
+        reason = str(
+            row.get("rejection_reason")
+            or row.get("firewall_decision")
+            or ""
+        ).strip()
+        if reason and reason.lower() not in {"approved", "pending", "pass", "passed"}:
+            rejected += 1
+            # Collapse value-bearing detail so reasons aggregate, e.g.
+            # "Aggregate exposure 2570% would exceed..." -> stable prefix.
+            key = reason.split(":")[0].split("(")[0].strip()[:60] or reason[:60]
+            reasons[key] += 1
+            src = str(row.get("source") or "unknown").strip().lower()
+            by_source[src] += 1
+            coin = str(row.get("coin") or "?").strip().upper()
+            by_coin[coin] += 1
+        else:
+            other += 1
+    return {
+        "available": True,
+        "window_hours": window_hours,
+        "total": total,
+        "executed": executed,
+        "rejected": rejected,
+        "other": other,
+        "top_reasons": reasons.most_common(10),
+        "by_source": by_source.most_common(8),
+        "by_coin": by_coin.most_common(8),
+    }
+
+
+def _summary_line(summary: Dict[str, Any]) -> str:
+    """Compact one-liner for the trading-cycle log."""
+    if not summary.get("available"):
+        return "Decision summary: unavailable"
+    top = summary.get("top_reasons") or []
+    top_txt = ", ".join(f"{r} x{c}" for r, c in top[:5]) or "none"
+    return (
+        f"Decision summary ({summary.get('window_hours')}h): "
+        f"{summary.get('total', 0)} candidates -> {summary.get('executed', 0)} executed, "
+        f"{summary.get('rejected', 0)} rejected | top blocks: {top_txt}"
+    )
+
+
+def summarize_recent_decisions(hours: float = 6.0, limit: int = 20000) -> Dict[str, Any]:
+    """Roll up the last ``hours`` of decision_snapshots into a
+    why-not-trading summary. Best-effort: returns ``{"available": False}``
+    if the journal/table is absent — must never raise into a caller."""
+    if not _enabled():
+        return {"available": False, "reason": "journal_disabled"}
+    try:
+        from datetime import timedelta
+
+        from src.data import database as db
+
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(hours=float(hours))
+        ).isoformat()
+        lim = max(1, min(int(limit or 20000), 100000))
+        with db.get_connection(for_read=True) as conn:
+            rows = conn.execute(
+                """
+                SELECT created_at, final_status, rejection_reason,
+                       firewall_decision, source, coin, paper_trade_id
+                FROM decision_snapshots
+                WHERE created_at >= ?
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (cutoff, lim),
+            ).fetchall()
+        norm = [dict(r) if not isinstance(r, dict) else r for r in rows]
+        return _summarize_decision_rows(norm, window_hours=float(hours))
+    except Exception as exc:
+        _record_write_failure("summary_read", exc)
+        return {"available": False, "reason": str(exc)[:160]}
+
+
 def record_decision_outcome(
     decision_id: str,
     *,

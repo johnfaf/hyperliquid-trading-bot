@@ -256,6 +256,12 @@ class HyperliquidResearchBot:
         self._register_background_tasks()
 
         self.logger.info("Bot initialized.")
+        try:
+            from src.core.build_info import build_banner
+
+            self.logger.info(build_banner())
+        except Exception as exc:
+            self.logger.debug("build banner unavailable: %s", exc)
         sys.stdout.flush()
         try:
             self.logger.info(health_registry.get_health_report())

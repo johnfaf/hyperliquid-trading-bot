@@ -231,6 +231,24 @@ async def audit_data(
     return JSONResponse(_summary_payload(decision_id, status, days, limit))
 
 
+@router.get("/api/audit/summary", response_class=JSONResponse)
+async def audit_summary(request: Request, hours: float = 6.0):
+    """Rolling "why isn't the bot trading?" rollup over the last
+    ``hours`` of decision snapshots: candidates -> executed/rejected and
+    the top blocking reasons. Cheap, read-only, best-effort."""
+    redirect = require_auth(request)
+    if redirect is not None:
+        return JSONResponse({"error": "auth_required"}, status_code=401)
+    try:
+        from src.data import decision_journal
+
+        payload = decision_journal.summarize_recent_decisions(hours=hours)
+    except Exception as exc:
+        logger.debug("audit summary failed: %s", exc)
+        payload = {"available": False, "reason": str(exc)[:160]}
+    return JSONResponse(payload)
+
+
 @router.get("/audit", response_class=HTMLResponse)
 async def audit_page(
     request: Request,

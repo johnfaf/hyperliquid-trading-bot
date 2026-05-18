@@ -1176,6 +1176,18 @@ def run_trading_cycle(container, cycle_count: int) -> None:
 
         logger.info("Trading cycle #%d complete.", cycle_count)
 
+        # Why-not-trading rollup: one line per cycle in the Railway log so
+        # "bullish shown but no orders / only shorts" is answerable in
+        # seconds instead of hours of log archaeology. Strictly best-effort
+        # and read-only — a journal hiccup must never affect trading.
+        try:
+            from src.data import decision_journal
+
+            _dsum = decision_journal.summarize_recent_decisions(hours=6.0)
+            logger.info("  %s", decision_journal._summary_line(_dsum))
+        except Exception as exc:
+            logger.debug("decision summary line skipped: %s", exc)
+
         # Notify the v2 dashboard's WS subscribers (no-op when v2 isn't
         # running). Wrapped so a dashboard glitch never breaks trading.
         try:
