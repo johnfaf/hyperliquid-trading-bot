@@ -1640,6 +1640,11 @@ def _execute_options_flow_trades(container, regime_data):
                     flow_signal, regime_data=regime_data,
                     open_positions=get_execution_open_positions(container),
                     account_balance=live_account_value if live_active else None,
+                    # Live options-flow is a direct live entry: force the
+                    # exposure/margin caps onto the real live wallet and
+                    # refuse (rather than fall back to the ~$10k paper
+                    # balance) if the live balance is unavailable.
+                    require_live_balance=live_active,
                 )
                 if not passed:
                     logger.info("  Firewall rejected options flow %s: %s", conv["ticker"], reason)

@@ -117,7 +117,7 @@ class CopyTrader:
         self._sizer_fallback_count = 0
         self.enabled = bool(getattr(config, "COPY_TRADER_ENABLED", True))
         self.max_concurrent_trades = max(
-            0, int(getattr(config, "COPY_TRADER_MAX_CONCURRENT_TRADES", 2))
+            0, int(getattr(config, "COPY_TRADER_MAX_CONCURRENT_TRADES", 5))
         )
         self.max_new_trades_per_cycle = max(
             0, int(getattr(config, "COPY_TRADER_MAX_NEW_TRADES_PER_CYCLE", 1))

@@ -95,6 +95,66 @@ def test_analyze_fills_scores_closed_outcomes_not_raw_hl_fill_cap():
     assert metrics["profit_factor"] is None
 
 
+def _ta(*, closed, raw=None, win_rate=0.0, losing=0):
+    """Minimal trade_analysis dict for the anomaly scorer."""
+    return {
+        "closed_trade_count": closed,
+        "raw_fill_count": raw if raw is not None else closed,
+        "win_rate": win_rate,
+        "losing_trades": losing,
+    }
+
+
+def test_anomaly_scorer_flags_perfect_winrate_over_real_sample():
+    d = TraderDiscovery.__new__(TraderDiscovery)
+    score, reason = d._statistical_anomaly_score(
+        _ta(closed=40, raw=120, win_rate=1.0, losing=0)
+    )
+    assert score >= 3  # >= config.BOT_THRESHOLD -> excluded from humans
+    assert "perfect_winrate" in reason
+
+
+def test_anomaly_scorer_flags_never_realizes_loss():
+    d = TraderDiscovery.__new__(TraderDiscovery)
+    # 0.90 win rate is below the perfect threshold, but 0 losing trades
+    # over a real sample means losses are held open forever (uncopyable).
+    score, reason = d._statistical_anomaly_score(
+        _ta(closed=25, raw=80, win_rate=0.90, losing=0)
+    )
+    assert score >= 3
+    assert "never_realizes_loss" in reason
+
+
+def test_anomaly_scorer_flags_zero_evidence_junk():
+    d = TraderDiscovery.__new__(TraderDiscovery)
+    score, reason = d._statistical_anomaly_score(
+        _ta(closed=0, raw=50, win_rate=0.0, losing=0)
+    )
+    assert score >= 3
+    assert "no_evidence" in reason
+
+
+def test_anomaly_scorer_ignores_thin_perfect_record():
+    """A 3-trade 100% record is thin data, not a proven bot -- it must NOT
+    be flagged (upstream 'insufficient' handling owns this case; this also
+    guards test_analyze_fills_* which legitimately yields win_rate=1.0)."""
+    d = TraderDiscovery.__new__(TraderDiscovery)
+    score, reason = d._statistical_anomaly_score(
+        _ta(closed=3, raw=2000, win_rate=1.0, losing=0)
+    )
+    assert score == 0
+    assert reason == ""
+
+
+def test_anomaly_scorer_passes_normal_human():
+    d = TraderDiscovery.__new__(TraderDiscovery)
+    score, reason = d._statistical_anomaly_score(
+        _ta(closed=60, raw=140, win_rate=0.55, losing=27)
+    )
+    assert score == 0
+    assert reason == ""
+
+
 def test_discovery_cycle_refuses_to_promote_bot_like_sources(monkeypatch):
     discovery = TraderDiscovery.__new__(TraderDiscovery)
     discovery.known_traders = {}

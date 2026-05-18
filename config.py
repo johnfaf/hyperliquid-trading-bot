@@ -288,6 +288,16 @@ BOT_HARD_CUTOFF_TRADES = int(os.environ.get("BOT_HARD_CUTOFF_TRADES", 100))   # 
 BOT_THRESHOLD = int(os.environ.get("BOT_THRESHOLD", 3))                        # signal score >= N = bot
 BOT_MM_PNL_THRESHOLD = float(os.environ.get("BOT_MM_PNL_THRESHOLD", 0.0))     # median PnL < N = spread/MM
 BOT_ELEVATED_FREQ = int(os.environ.get("BOT_ELEVATED_FREQ", 50))              # trades/day for elevated freq signal
+# Statistical-anomaly separation (catches accounts the frequency-based
+# detectors miss): a ~100% win rate sustained over a meaningful closed
+# sample is statistically implausible for a real directional trader -- it
+# is wash trading, a vault/MM, or "selective close" (never realizes a
+# loss). Such accounts (and zero-evidence junk wallets) are uncopyable and
+# must be separated from humans rather than displayed at "100% winrate".
+BOT_PERFECT_WINRATE = float(os.environ.get("BOT_PERFECT_WINRATE", 0.98))       # win rate >= N (with min trades) = anomaly
+BOT_PERFECT_WINRATE_MIN_TRADES = int(
+    os.environ.get("BOT_PERFECT_WINRATE_MIN_TRADES", 15)
+)  # min closed trades before a perfect/near-perfect record counts as a bot signal
 
 # ─── Strategy Analysis ────────────────────────────────────────
 # Minimum number of trades to classify a strategy
@@ -551,7 +561,7 @@ COPY_TRADER_ENABLED = os.environ.get(
     "COPY_TRADER_ENABLED", "true"
 ).lower() in ("true", "1", "yes")
 COPY_TRADER_MAX_CONCURRENT_TRADES = int(
-    os.environ.get("COPY_TRADER_MAX_CONCURRENT_TRADES", 2)
+    os.environ.get("COPY_TRADER_MAX_CONCURRENT_TRADES", 5)
 )
 COPY_TRADER_MAX_NEW_TRADES_PER_CYCLE = int(
     os.environ.get("COPY_TRADER_MAX_NEW_TRADES_PER_CYCLE", 1)
@@ -990,6 +1000,22 @@ FIREWALL_MAX_AGGREGATE_EXPOSURE = float(
 # positions at once".  Set to 0 to disable.
 FIREWALL_MAX_AGGREGATE_MARGIN_PCT = float(
     os.environ.get("FIREWALL_MAX_AGGREGATE_MARGIN_PCT", 0.60)
+)
+# FIREWALL_AGGREGATE_EXPOSURE_FLOOR_USD — absolute dollar floor for the
+# *leveraged-notional* aggregate cap.  FIREWALL_MAX_AGGREGATE_EXPOSURE scales
+# with balance, which structurally deadlocks a very small live wallet: 150%
+# of a $102 account is only $153 of leveraged notional, so a single mirrored
+# position blows it and every subsequent live entry is hard-rejected.  When
+# ``balance * FIREWALL_MAX_AGGREGATE_EXPOSURE`` falls below this floor the
+# floor is used instead, so a tiny account can still run its intended
+# positions.  This does NOT loosen real risk: the leverage-agnostic
+# FIREWALL_MAX_AGGREGATE_MARGIN_PCT cap (margin actually locked vs balance)
+# remains the true capital-at-risk control and binds first on a small wallet.
+# At normal balances the percentage cap already exceeds this floor so behavior
+# is unchanged (e.g. $10k paper -> 150% = $15k > $5k floor).  Set 0 to
+# disable the floor entirely (pure percentage cap, legacy behavior).
+FIREWALL_AGGREGATE_EXPOSURE_FLOOR_USD = float(
+    os.environ.get("FIREWALL_AGGREGATE_EXPOSURE_FLOOR_USD", 5000.0)
 )
 FIREWALL_BLOCK_LOSING_AVERAGING = _safe_env_bool(
     "FIREWALL_BLOCK_LOSING_AVERAGING", True
@@ -1545,6 +1571,7 @@ def _validate_config_bounds() -> None:
         # AUDIT M1 — leveraged notional and margin caps
         ("FIREWALL_MAX_AGGREGATE_EXPOSURE", 0.0, 20.0, 1.50),
         ("FIREWALL_MAX_AGGREGATE_MARGIN_PCT", 0.0, 5.0, 0.60),
+        ("FIREWALL_AGGREGATE_EXPOSURE_FLOOR_USD", 0.0, 10_000_000.0, 5000.0),
         ("SOURCE_POLICY_MIN_CLOSED_TRADES", 1, 1000, 3),
         ("SOURCE_POLICY_KEEP_TOP_N", 1, 1000, 5),
         ("SOURCE_POLICY_PAUSE_WEIGHT", 0.0, 1.0, 0.12),
@@ -1623,6 +1650,8 @@ def _validate_config_bounds() -> None:
         ("BOT_HARD_CUTOFF_TRADES", 1, 100_000, 100),
         ("BOT_THRESHOLD", 1, 100, 3),
         ("BOT_ELEVATED_FREQ", 1, 100_000, 50),
+        ("BOT_PERFECT_WINRATE", 0.50, 1.0, 0.98),
+        ("BOT_PERFECT_WINRATE_MIN_TRADES", 1, 100_000, 15),
         ("PORTFOLIO_CHURN_PENALTY", 0.0, 1.0, 0.02),
         ("PORTFOLIO_MIN_HOLD_MINUTES", 0, 525_600, 60),
         ("ROTATION_SHADOW_MODE_DAYS", 0, 365, 7),
@@ -1656,7 +1685,7 @@ def _validate_config_bounds() -> None:
         ("REGIME_REVERSAL_MAX_ACTIONS_PER_COIN_PER_DAY", 0, 100, 2),
         ("REGIME_REVERSAL_TIGHTEN_STOP_R_MULTIPLE", 0.01, 2.0, 0.35),
         ("REGIME_REVERSAL_REVERSE_POSITION_PCT", 0.001, 0.50, 0.03),
-        ("COPY_TRADER_MAX_CONCURRENT_TRADES", 0, 100, 2),
+        ("COPY_TRADER_MAX_CONCURRENT_TRADES", 0, 100, 5),
         ("COPY_TRADER_MAX_NEW_TRADES_PER_CYCLE", 0, 100, 1),
         ("COPY_TRADER_AUTO_PAUSE_MIN_CLOSED_TRADES", 1, 5_000, 6),
         ("COPY_TRADER_AUTO_PAUSE_DEGRADE_WIN_RATE", 0.0, 1.0, 0.40),

@@ -6162,6 +6162,12 @@ class LiveTrader:
                 signal,
                 open_positions=live_positions,
                 account_balance=live_account_value,
+                # Genuine live entry (mirror path bypasses this block
+                # entirely). When deployable, the exposure/margin caps must
+                # use the real live wallet and reject if it is unavailable,
+                # consistent with the live_positions-None guard above —
+                # never silently fall back to the ~$10k paper balance.
+                require_live_balance=self.is_deployable(),
             )
             if not passed:
                 self._incr_entry_metric("rejected_firewall")

@@ -294,6 +294,22 @@ class DecisionFirewall:
             cfg.get("max_aggregate_margin_pct", 0.60)
         )
 
+        # AUDIT M1 — absolute dollar floor for the leveraged-notional cap.
+        # The percentage cap above scales with balance, which deadlocks a
+        # very small live wallet (150% of a $102 account == $153 of
+        # leveraged notional; one mirrored position blows it and every
+        # subsequent live entry is hard-rejected).  When
+        # ``balance * max_aggregate_exposure_pct`` is below this floor the
+        # floor is used instead.  This does NOT loosen real risk: the
+        # leverage-agnostic ``max_aggregate_margin_pct`` cap remains the
+        # true capital-at-risk control and binds first on a small account.
+        # Defaults to 0.0 here (disabled) so unit tests that build the
+        # firewall directly keep their exact legacy behavior; production
+        # wires the real floor via subsystem_registry / config.
+        self.aggregate_exposure_floor_usd = max(
+            0.0, float(cfg.get("aggregate_exposure_floor_usd", 0.0) or 0.0)
+        )
+
         # Predictive regime forecaster for dynamic de-risking
         self.enable_predictive_derisk = cfg.get("enable_predictive_derisk", True)
         self.crash_confidence_threshold = cfg.get("crash_confidence_threshold", 0.4)
@@ -1861,7 +1877,8 @@ class DecisionFirewall:
                  open_positions: Optional[List[Dict]] = None,
                  ignore_position_limit: bool = False,
                  dry_run: bool = False,
-                 account_balance: Optional[float] = None) -> Tuple[bool, str]:
+                 account_balance: Optional[float] = None,
+                 require_live_balance: bool = False) -> Tuple[bool, str]:
         """
         Validate a single trade signal through all checks.
         Thread-safe: acquires _lock to prevent concurrent state corruption.
@@ -1878,13 +1895,15 @@ class DecisionFirewall:
                 ignore_position_limit=ignore_position_limit,
                 dry_run=dry_run,
                 account_balance=account_balance,
+                require_live_balance=require_live_balance,
             )
 
     def _validate_locked(self, signal: TradeSignal, regime_data: Optional[Dict] = None,
                          open_positions: Optional[List[Dict]] = None,
                          ignore_position_limit: bool = False,
                          dry_run: bool = False,
-                         account_balance: Optional[float] = None) -> Tuple[bool, str]:
+                         account_balance: Optional[float] = None,
+                         require_live_balance: bool = False) -> Tuple[bool, str]:
         """Inner validate — must be called with _lock held."""
         # Activate the signal's trace ID so every downstream log line
         # (execution, fill verification, SL/TP placement) includes it.
@@ -2225,7 +2244,19 @@ class DecisionFirewall:
             return _reject("rejected_side_imbalance", side_imbalance_reason)
 
         balance = account_balance
-        if balance is None:
+        if require_live_balance:
+            # Live entry path: the exposure/margin caps MUST be measured
+            # against the real live wallet, never the ~$10k paper account.
+            # Silently falling back to the paper balance would loosen the
+            # cap ~100x on real money.  If the live balance is missing or
+            # non-positive, fail safe (reject) rather than trade blind.
+            if balance is None or balance <= 0:
+                return _reject(
+                    "rejected_exposure",
+                    "Live balance unavailable; refusing to validate a live "
+                    "entry against the paper-account fallback",
+                )
+        elif balance is None:
             account = db.get_paper_account()
             balance = account.get("balance", 10000) if account else None
         if balance:
@@ -2254,11 +2285,24 @@ class DecisionFirewall:
             projected_exposure = total_exposure + new_notional
             exposure_pct = projected_exposure / balance if balance > 0 else 1.0
 
-            if exposure_pct > self.max_aggregate_exposure_pct:
+            # Percentage cap, lifted to an absolute dollar floor when set so
+            # a very small live wallet is not structurally deadlocked (the
+            # leverage-agnostic margin cap below is the real capital-at-risk
+            # control).  Floor defaults to 0 (disabled) for direct unit
+            # tests, so this is mathematically identical to the legacy
+            # ``exposure_pct > max_aggregate_exposure_pct`` check there.
+            exposure_cap_usd = balance * self.max_aggregate_exposure_pct
+            if self.aggregate_exposure_floor_usd > 0:
+                exposure_cap_usd = max(
+                    exposure_cap_usd, self.aggregate_exposure_floor_usd
+                )
+
+            if projected_exposure > exposure_cap_usd:
                 return _reject("rejected_exposure",
                               f"Aggregate exposure {exposure_pct:.0%} would exceed "
                               f"{self.max_aggregate_exposure_pct:.0%} limit "
-                              f"(${projected_exposure:,.0f}/${balance:,.0f})")
+                              f"(${projected_exposure:,.0f}/${balance:,.0f}"
+                              f"; cap ${exposure_cap_usd:,.0f})")
 
             # Separate margin-based cap (AUDIT M1).  Disabled when
             # max_aggregate_margin_pct <= 0 so operators can opt out.

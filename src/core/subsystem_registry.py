@@ -544,6 +544,9 @@ def build_subsystems(
             "max_aggregate_margin_pct": float(
                 getattr(_fw_cfg, "FIREWALL_MAX_AGGREGATE_MARGIN_PCT", 0.60)
             ),
+            "aggregate_exposure_floor_usd": float(
+                getattr(_fw_cfg, "FIREWALL_AGGREGATE_EXPOSURE_FLOOR_USD", 5000.0)
+            ),
         }),
         health,
     )
