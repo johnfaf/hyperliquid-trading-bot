@@ -1,0 +1,60 @@
+# Normalize all text to LF in the repo (checked-in form) regardless of
+# contributor OS / core.autocrlf. Editors on Windows kept rewriting whole
+# files CRLF, producing 300+ line "diffs" that were 95% line-ending noise
+# and masked the real change (and risked merge conflicts on this
+# multi-branch repo). With this, newly written/edited files are stored
+# LF; existing CRLF blobs converge to LF the next time they are touched.
+#
+# NOTE: intentionally NOT mass-renormalizing the repo here
+# (`git add --renormalize .`) — that would be a huge diff across an
+# active multi-branch tree and belongs in its own reviewed cleanup.
+* text=auto eol=lf
+
+# Explicit text types (reinforces the catch-all)
+*.py    text eol=lf
+*.pyi   text eol=lf
+*.md    text eol=lf
+*.txt   text eol=lf
+*.cfg   text eol=lf
+*.ini   text eol=lf
+*.toml  text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+*.json  text eol=lf
+*.sh    text eol=lf
+*.html  text eol=lf
+*.css   text eol=lf
+*.js    text eol=lf
+*.sql   text eol=lf
+*.env   text eol=lf
+Dockerfile      text eol=lf
+Procfile        text eol=lf
+.gitignore      text eol=lf
+.gitattributes  text eol=lf
+requirements.txt text eol=lf
+
+# Binaries — never normalize / diff
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.ico   binary
+*.webp  binary
+*.pdf   binary
+*.zip   binary
+*.gz    binary
+*.tar   binary
+*.db    binary
+*.sqlite binary
+*.sqlite3 binary
+*.ipynb binary
+*.parquet binary
+*.pkl   binary
+*.joblib binary
+*.npy   binary
+*.npz   binary
+*.onnx  binary
+*.bin   binary
+*.woff  binary
+*.woff2 binary
+*.ttf   binary
