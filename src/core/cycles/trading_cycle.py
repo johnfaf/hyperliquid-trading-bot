@@ -1623,13 +1623,26 @@ def _execute_options_flow_trades(container, regime_data):
                     if estimated_notional > 0:
                         flow_signal.size = estimated_notional / price
 
-            sizing_balance = live_account_value if live_active and live_account_value else None
-            if sizing_balance is None:
-                try:
-                    paper_account = db.get_paper_account()
-                    sizing_balance = float(paper_account["balance"]) if paper_account else None
-                except Exception:
-                    sizing_balance = None
+            try:
+                paper_account = db.get_paper_account()
+                _paper_balance = (
+                    float(paper_account["balance"]) if paper_account else None
+                )
+            except Exception:
+                _paper_balance = None
+            # Canonical account-basis: single source of truth, identical
+            # precedence to the prior live-else-paper ternary, centralized
+            # so the $102-live-vs-$10k-paper mismatch cannot silently
+            # reappear here. resolve+source is unit-tested for exact
+            # behavioral equivalence.
+            from src.core.account_basis import resolve_account_basis
+
+            _basis = resolve_account_basis(
+                live_active=bool(live_active),
+                live_value=live_account_value,
+                paper_value=_paper_balance,
+            )
+            sizing_balance = _basis.usd if _basis.source != "unknown" else None
             if sizing_balance and (getattr(container, "kelly_sizer", None) or getattr(container, "rl_sizer", None)):
                 try:
                     sizing = _get_dynamic_sizing(
