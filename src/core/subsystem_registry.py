@@ -495,6 +495,18 @@ def build_subsystems(
             "market_side_guard_min_confidence": float(
                 getattr(_fw_cfg, "FIREWALL_MARKET_SIDE_GUARD_MIN_CONFIDENCE", 0.60)
             ),
+            "market_read_uses_options_flow": bool(
+                getattr(_fw_cfg, "FIREWALL_MARKET_READ_USES_OPTIONS_FLOW", True)
+            ),
+            "options_flow_read_min_conviction": float(
+                getattr(_fw_cfg, "FIREWALL_OPTIONS_FLOW_READ_MIN_CONVICTION", 0.70)
+            ),
+            "options_flow_override_max_regime_conf": float(
+                getattr(_fw_cfg, "FIREWALL_OPTIONS_FLOW_OVERRIDE_MAX_REGIME_CONF", 0.85)
+            ),
+            "forecaster_synthetic_weight": float(
+                getattr(_fw_cfg, "FIREWALL_FORECASTER_SYNTHETIC_WEIGHT", 0.5)
+            ),
             "cooldown_seconds": int(getattr(_fw_cfg, "FIREWALL_COIN_COOLDOWN_SECONDS", 180)),
             "same_side_cooldown_seconds": int(
                 getattr(_fw_cfg, "FIREWALL_SAME_SIDE_COOLDOWN_SECONDS", 900)

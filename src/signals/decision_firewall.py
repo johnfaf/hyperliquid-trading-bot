@@ -204,6 +204,20 @@ class DecisionFirewall:
         self.market_side_guard_min_confidence = float(
             cfg.get("market_side_guard_min_confidence", 0.60)
         )
+        # Market-read inputs (fix: lone regime label vetoing high-conviction
+        # counter-regime entries -- bullish options flow shown, LONG blocked).
+        self.market_read_uses_options_flow = bool(
+            cfg.get("market_read_uses_options_flow", True)
+        )
+        self.options_flow_read_min_conviction = float(
+            cfg.get("options_flow_read_min_conviction", 0.70)
+        )
+        self.options_flow_override_max_regime_conf = float(
+            cfg.get("options_flow_override_max_regime_conf", 0.85)
+        )
+        self.forecaster_synthetic_weight = float(
+            cfg.get("forecaster_synthetic_weight", 0.5)
+        )
         # Only enforce strategy-level regime pauses when the regime call itself
         # is confident enough. A 49%-confidence "ranging" call shouldn't pause
         # momentum strategies — that's how the bot ends up rejecting 5/5
@@ -644,6 +658,30 @@ class DecisionFirewall:
                     self.market_side_guard_min_confidence,
                 )
             )
+            self.market_read_uses_options_flow = bool(
+                overrides.get(
+                    "FIREWALL_MARKET_READ_USES_OPTIONS_FLOW",
+                    self.market_read_uses_options_flow,
+                )
+            )
+            self.options_flow_read_min_conviction = float(
+                overrides.get(
+                    "FIREWALL_OPTIONS_FLOW_READ_MIN_CONVICTION",
+                    self.options_flow_read_min_conviction,
+                )
+            )
+            self.options_flow_override_max_regime_conf = float(
+                overrides.get(
+                    "FIREWALL_OPTIONS_FLOW_OVERRIDE_MAX_REGIME_CONF",
+                    self.options_flow_override_max_regime_conf,
+                )
+            )
+            self.forecaster_synthetic_weight = float(
+                overrides.get(
+                    "FIREWALL_FORECASTER_SYNTHETIC_WEIGHT",
+                    self.forecaster_synthetic_weight,
+                )
+            )
             self.cooldown_seconds = int(
                 overrides.get("FIREWALL_COIN_COOLDOWN_SECONDS", self.cooldown_seconds)
             )
@@ -1028,12 +1066,24 @@ class DecisionFirewall:
         forecaster_regime = str(regime_payload.get("forecaster_regime", "") or "").strip().lower()
         forecaster_conf = _float(regime_payload.get("forecaster_confidence"), 0.0)
         forecaster_synthetic = bool(regime_payload.get("forecaster_synthetic_warm_start", False))
-        if forecaster_regime and not forecaster_synthetic:
+        if forecaster_regime:
+            # A synthetic warm-start forecaster is no longer discarded
+            # outright (that silently removed fresh bullish/bearish
+            # evidence and let a lone regime label veto it).  It now
+            # contributes at a reduced weight so it can help *align* a
+            # counter-regime entry but is not strong enough, alone, to
+            # *block* the opposite side past the guard threshold.
+            if forecaster_synthetic:
+                fc_source = "forecaster_synthetic"
+                fc_conf = forecaster_conf * self.forecaster_synthetic_weight
+            else:
+                fc_source = "forecaster"
+                fc_conf = forecaster_conf
             candidates.append(
                 {
-                    "source": "forecaster",
+                    "source": fc_source,
                     "regime": forecaster_regime,
-                    "confidence": forecaster_conf,
+                    "confidence": fc_conf,
                     "momentum": 0.0,
                     "trend_direction": 0.0,
                 }
@@ -1053,6 +1103,50 @@ class DecisionFirewall:
                     "trend_direction": _float(context.get("trend_direction"), 0.0),
                 }
             )
+
+        # Options-flow conviction is independent market evidence the guard
+        # otherwise ignored entirely.  A strong fresh net-flow print should
+        # be allowed to satisfy the "current market read" instead of being
+        # silently vetoed by a lone regime label (the bullish-LONG-blocked
+        # bug).  The injected candidate carries the signal's own conviction
+        # side; it is gated by a conviction floor and a hard crash/panic
+        # carve-out so one print can never buy into a confirmed crash.
+        if self.market_read_uses_options_flow:
+            sig_source = getattr(signal, "source", None)
+            sig_source = (
+                sig_source.value if hasattr(sig_source, "value")
+                else str(sig_source or "")
+            ).strip().lower()
+            if sig_source == "options_flow":
+                of_conf = _float(getattr(signal, "confidence", 0.0), 0.0)
+                if of_conf >= self.options_flow_read_min_conviction:
+                    opposite = "short" if side == "long" else "long"
+                    crash_block = False
+                    if opposite == "short":
+                        # Never let one bullish print override a confirmed
+                        # crash/panic.  (A crash regime can't endanger a
+                        # short, so the carve-out is long-only by design.)
+                        for c in candidates:
+                            c_reg = str(c.get("regime", "") or "").strip().lower()
+                            c_cf = _float(c.get("confidence"), 0.0)
+                            if c_reg in {"crash", "panic"} and (
+                                c_cf >= self.options_flow_override_max_regime_conf
+                            ):
+                                crash_block = True
+                                break
+                    if not crash_block:
+                        candidates.append(
+                            {
+                                "source": "options_flow",
+                                "regime": (
+                                    "trending_up" if side == "long"
+                                    else "trending_down"
+                                ),
+                                "confidence": of_conf,
+                                "momentum": 0.0,
+                                "trend_direction": 0.0,
+                            }
+                        )
 
         min_conf = self.short_hardening_block_override_min_regime_confidence
         min_momentum = abs(self.short_hardening_market_adaptive_min_momentum)
