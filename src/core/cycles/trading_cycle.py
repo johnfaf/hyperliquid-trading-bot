@@ -9,7 +9,6 @@ Extracted from ``HyperliquidResearchBot._run_trading_cycle``.
 """
 import logging
 import copy
-from datetime import datetime, timezone
 
 import config
 from src.core import clock_provider

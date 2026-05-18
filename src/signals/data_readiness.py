@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Any, Dict, Iterable, Optional, Tuple
+from typing import Any, Dict, Tuple
 
 import config
 

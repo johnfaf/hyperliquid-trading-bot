@@ -9,7 +9,6 @@ import tempfile
 
 import pytest
 
-import config
 from src.signals.calibration import CalibrationTracker, compose_calibration_key
 
 

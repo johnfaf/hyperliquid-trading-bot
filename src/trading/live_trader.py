@@ -25,16 +25,13 @@ import logging
 import os
 import time
 import json
-import hashlib
 import copy
 import math
 import random
 import threading
 from collections import defaultdict, deque
 from datetime import datetime, timezone
-from decimal import Decimal
 from typing import Any, Deque, Dict, List, Optional, Tuple, Union
-from enum import Enum
 
 import requests
 
@@ -43,14 +40,14 @@ import requests
 # public symbols below for backward compatibility (tests and external
 # callers import them from this module).
 from src.trading.live_trader_signing import (
-    HAS_ETH_ACCOUNT,
-    HAS_KECCAK,
-    HAS_MSGPACK,
+    HAS_ETH_ACCOUNT,  # noqa: F401
+    HAS_KECCAK,  # noqa: F401
+    HAS_MSGPACK,  # noqa: F401
     HyperliquidSigner,
     OrderType,
     _hl_format_price,
     _hl_format_size,
-    _hl_normalize_decimal,
+    _hl_normalize_decimal,  # noqa: F401
 )
 # Re-exports for tests/callers that previously patched these on this module.
 from src.trading.live_trader_signing import _encode_typed_data, _USE_TYPED_DATA  # noqa: F401

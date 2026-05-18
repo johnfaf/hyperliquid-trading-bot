@@ -7,7 +7,6 @@ rejected 23 of 93 decisions / 6h in prod. Never overrides paused.
 """
 from __future__ import annotations
 
-import pytest
 
 from src.signals.agent_scoring import AgentScorer
 

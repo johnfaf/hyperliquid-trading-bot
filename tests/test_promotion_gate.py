@@ -9,7 +9,6 @@ from __future__ import annotations
 import pytest
 
 import config
-from src.learning import promotion_gate
 from src.learning.promotion_gate import is_live_promotable
 
 

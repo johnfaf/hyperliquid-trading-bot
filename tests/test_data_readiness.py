@@ -4,7 +4,6 @@ from __future__ import annotations
 import pytest
 
 import config
-from src.signals import data_readiness
 from src.signals.data_readiness import assess_signal_readiness, is_signal_data_ready
 
 

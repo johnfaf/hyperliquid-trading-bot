@@ -17,7 +17,6 @@ deteriorating by more than 2% per day = bad signal, drop weight).
 from __future__ import annotations
 
 import logging
-import math
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 

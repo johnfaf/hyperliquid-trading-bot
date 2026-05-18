@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Tuple
 
 import config
 from src.data import database as db
