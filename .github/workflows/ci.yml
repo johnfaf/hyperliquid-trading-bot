@@ -60,16 +60,12 @@ jobs:
         run: |
           pip install -r requirements.txt
           pip install pytest
-      - name: Run stable regression suite
-        run: >
-          python -m pytest
-          tests/test_decision_firewall.py
-          tests/test_live_controls.py
-          tests/test_options_flow.py
-          tests/test_portfolio_rotation.py
-          tests/test_regime_reversal_manager.py
-          tests/test_risk_policy.py
-          -v --tb=short
+      - name: Run full test suite
+        # Gate merges on the ENTIRE suite, not a ~6-file subset. Every
+        # incident this cycle was a cross-file gate interaction that the
+        # subset never exercised; the full suite (1000+ tests, ~4 min)
+        # is the regression net that actually catches them.
+        run: python -m pytest tests/ -q --tb=short --durations=15
 
   safety:
     runs-on: ubuntu-latest
