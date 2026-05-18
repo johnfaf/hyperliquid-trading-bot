@@ -189,15 +189,28 @@ def evaluate_trader_profitability_window(
         except (TypeError, ValueError):
             fee = 0.0
         total_fees += fee
-        # Closing trades carry a non-zero closedPnl; opens have closedPnl
-        # equal to -fee (the fee deduction). We score on closing fills only.
+        # ★ SCHEMA FIX: ``hl.get_user_fills`` NORMALIZES the raw Hyperliquid
+        # fill before returning it -- the camelCase ``closedPnl``/``dir``
+        # keys become snake_case ``closed_pnl``/``direction``.  This
+        # function was written/unit-tested against the RAW shape (the test
+        # mocks return ``closedPnl``/``dir``), so in PRODUCTION every
+        # ``f.get("closedPnl")`` returned 0 and every ``f.get("dir")``
+        # returned "" -> net_pnl collapsed to ``-fees`` for EVERY trader
+        # with >= min_trades fills, so the seed/leaderboard profitability
+        # gate rejected all real active traders and kept only thin/dormant
+        # accounts.  Read the normalized key first, fall back to the raw
+        # key so both the live client output and the existing unit tests
+        # resolve correctly.
         try:
-            closed_pnl = float(f.get("closedPnl", 0) or 0)
+            closed_pnl = float(
+                f.get("closed_pnl", f.get("closedPnl", 0)) or 0
+            )
         except (TypeError, ValueError):
             closed_pnl = 0.0
         # Heuristic for "this is a close, not just a fee deduction":
-        # the dir field starts with Close/>, OR closedPnl differs from -fee.
-        direction = str(f.get("dir", "") or "")
+        # the direction field starts with Close/>, OR closedPnl differs
+        # from -fee.
+        direction = str(f.get("direction", f.get("dir", "")) or "")
         is_close = direction.startswith("Close") or ">" in direction or (
             abs(closed_pnl + fee) > 1e-9
         )
@@ -673,6 +686,22 @@ class TraderDiscovery:
                 pass
             bot_score = self._get_bot_score(fills, positions, trade_analysis)
 
+        # Statistical-anomaly separation.  The detectors above are
+        # frequency-based and do NOT catch a ~100% win rate, a wallet that
+        # never realizes a loss, or a zero-closed-trade junk wallet -- the
+        # "100% winratio / 0% ROI" sources the operator flagged.  Fold the
+        # anomaly score in via max() so such an account crosses
+        # BOT_THRESHOLD regardless of its trade frequency and is excluded
+        # from the human pool / marked inactive.
+        anomaly_score, anomaly_reason = self._statistical_anomaly_score(trade_analysis)
+        if anomaly_score > 0:
+            if anomaly_score > bot_score:
+                bot_score = anomaly_score
+            logger.info(
+                "Statistical anomaly for %s...: %s (bot_score now %d)",
+                address[:10], anomaly_reason, bot_score,
+            )
+
         # Build trader profile (always, even for suspected bots — let caller decide)
         profile = {
             "address": address,
@@ -1146,6 +1175,65 @@ class TraderDiscovery:
             logger.info("Human-like (clean, %.0f trades/day)", trades_per_day)
 
         return bot_signals
+
+    def _statistical_anomaly_score(self, trade_analysis: Dict) -> Tuple[int, str]:
+        """Catch abnormal accounts the frequency-based detectors miss.
+
+        The trade-frequency / timing / size / session detectors above only
+        flag *high-frequency* bots.  They never flag a wallet that shows a
+        ~100% win rate, never realizes a loss, or has no closed outcomes at
+        all -- exactly the "100% winratio / 0% ROI" accounts that pollute
+        the discovery list.  Such accounts are uncopyable and must be
+        separated from humans.
+
+        Returns ``(score, reason)``.  A score >= ``config.BOT_THRESHOLD``
+        means the account is treated as a bot (excluded from the human
+        pool, marked inactive in the DB).
+
+        Every rule requires a *meaningful* sample so a trader with thin
+        history is left to the upstream "insufficient data" path and is
+        NOT permanently mislabelled a bot.
+        """
+        try:
+            closed = int(trade_analysis.get("closed_trade_count", 0) or 0)
+            raw = int(trade_analysis.get("raw_fill_count", 0) or 0)
+            win_rate = float(trade_analysis.get("win_rate", 0.0) or 0.0)
+            losing = int(trade_analysis.get("losing_trades", 0) or 0)
+        except (TypeError, ValueError):
+            return 0, ""
+
+        min_trades = int(getattr(config, "BOT_PERFECT_WINRATE_MIN_TRADES", 15))
+        perfect_wr = float(getattr(config, "BOT_PERFECT_WINRATE", 0.98))
+        bot_threshold = int(getattr(config, "BOT_THRESHOLD", 3))
+
+        # Rule 1: perfect / near-perfect win rate over a real sample.
+        # No human directional trader sustains >= ~98% wins over 15+
+        # closed trades -- this is wash trading, a vault, an MM, or a
+        # selective-close account.
+        if closed >= min_trades and win_rate >= perfect_wr:
+            return bot_threshold, (
+                f"perfect_winrate: {win_rate:.0%} over {closed} closed "
+                f"trades (>= {perfect_wr:.0%} @ {min_trades}+ trades is "
+                f"statistically implausible for a human)"
+            )
+
+        # Rule 2: never realizes a loss over a real sample. The displayed
+        # PnL/ROI is fiction (losers held open forever); uncopyable.
+        if closed >= min_trades and losing == 0:
+            return bot_threshold, (
+                f"never_realizes_loss: 0 losing trades over {closed} "
+                f"closed trades (selective-close / uncopyable)"
+            )
+
+        # Rule 3: zero-evidence junk -- an active wallet that never closes
+        # a position in-window. Nothing to learn from; shows as 0% ROI.
+        if closed == 0 and raw >= min_trades:
+            return bot_threshold, (
+                f"no_evidence: {raw} fills but 0 closed trades in-window "
+                f"(no realized edge; surfaces as 0% ROI)"
+            )
+
+        return 0, ""
 
     def run_discovery_cycle(self) -> Dict:
         """

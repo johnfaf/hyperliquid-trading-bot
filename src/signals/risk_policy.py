@@ -103,6 +103,31 @@ class RiskPolicyEngine:
         self.default_reward_multiple = float(cfg.get("default_reward_multiple", 3.25))
         self.min_reward_multiple = float(cfg.get("min_reward_multiple", 1.75))
         self.max_reward_multiple = float(cfg.get("max_reward_multiple", 4.5))
+        # Regime-specific R-multiple bounds. The base ``min/max`` apply when
+        # the regime isn't in this table or its bounds are looser. Specific
+        # regimes can *tighten* in either direction (e.g. ranging should
+        # never target 4R, low_liquidity caps the target hard). Bootstrap
+        # defaults match the operator recommendation: trending 2.5-4R,
+        # ranging 1.2-2R, crash 1.5-2.5R with already-widened stops.
+        default_regime_bounds: Dict[str, Dict[str, float]] = {
+            "trending_up": {"min": 2.5, "max": 4.0},
+            "trending_down": {"min": 2.5, "max": 4.0},
+            "bullish": {"min": 2.5, "max": 4.0},
+            "bearish": {"min": 2.5, "max": 4.0},
+            "ranging": {"min": 1.2, "max": 2.0},
+            "crash": {"min": 1.5, "max": 2.5},
+            "volatile": {"min": 1.5, "max": 2.5},
+            "low_liquidity": {"min": 1.2, "max": 1.8},
+        }
+        configured_bounds = cfg.get("regime_reward_bounds", {})
+        self.regime_reward_bounds = dict(default_regime_bounds)
+        if isinstance(configured_bounds, dict):
+            for regime_name, bounds in configured_bounds.items():
+                if not isinstance(bounds, dict):
+                    continue
+                merged = dict(self.regime_reward_bounds.get(str(regime_name).lower(), {}))
+                merged.update({k: float(v) for k, v in bounds.items() if k in {"min", "max"}})
+                self.regime_reward_bounds[str(regime_name).lower()] = merged
         self.atr_stop_multiplier = float(cfg.get("atr_stop_multiplier", 1.0))
         self.min_stop_roe_pct = float(cfg.get("min_stop_roe_pct", 0.01))
         self.max_stop_roe_pct = float(cfg.get("max_stop_roe_pct", 0.15))
@@ -331,6 +356,26 @@ class RiskPolicyEngine:
                 rationale.append(f"expected_move_cap={expected_rr:.2f}R")
 
             reward_multiple = min(max(reward_multiple, self.min_reward_multiple), self.max_reward_multiple)
+
+            # Regime-specific bounds override the base bounds. This lets
+            # ranging cap at 2R (no chasing 4R targets in chop) and lets
+            # crash/low_liquidity floor below the base 1.75R when the
+            # operator wants tighter exits in volatile / illiquid books.
+            regime_key = str(regime or "").strip().lower()
+            regime_bounds = self.regime_reward_bounds.get(regime_key)
+            if regime_bounds:
+                regime_min = float(regime_bounds.get("min", self.min_reward_multiple))
+                regime_max = float(regime_bounds.get("max", self.max_reward_multiple))
+                if regime_min > regime_max:
+                    regime_min, regime_max = regime_max, regime_min
+                clamped = min(max(reward_multiple, regime_min), regime_max)
+                if abs(clamped - reward_multiple) > 1e-6:
+                    rationale.append(
+                        f"regime_bounds[{regime_key}]:"
+                        f"R={reward_multiple:.2f}->{clamped:.2f}"
+                        f"(min={regime_min:.2f},max={regime_max:.2f})"
+                    )
+                reward_multiple = clamped
 
             if self.rr_mode == "hybrid_min_5r":
                 # Floor the dynamic result at hybrid_min_r_floor so the

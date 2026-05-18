@@ -261,17 +261,32 @@ class TradeMemory:
         query_feature_keys = self._available_feature_keys(features)
 
         if not query_feature_keys or not any(v != 0 for v in query_vector):
-            logger.warning("Trade memory received empty/zero feature vector; defaulting to caution")
+            missing = sorted(set(SIMILARITY_FEATURES) - set(features.keys()))
+            present_nonnumeric = sorted(
+                k for k in features.keys()
+                if k in SIMILARITY_FEATURES and not isinstance(features.get(k), (int, float))
+            )
+            logger.warning(
+                "Trade memory received empty/zero feature vector; defaulting to caution. "
+                "missing=%s present_nonnumeric=%s (caller should populate %s)",
+                missing[:6],
+                present_nonnumeric[:6],
+                SIMILARITY_FEATURES,
+            )
             return SimilarityResult(
                 similar_trades=[], total_found=0, win_rate=0, avg_pnl=0,
                 avg_return=0, recommendation="caution",
                 reason="No feature data available", similarity_scores=[],
             )
         if len(query_feature_keys) < MIN_FEATURE_OVERLAP:
+            missing = sorted(set(SIMILARITY_FEATURES) - query_feature_keys)
             logger.warning(
-                "Trade memory received sparse feature vector (%d/%d usable); defaulting to caution",
+                "Trade memory received sparse feature vector (%d/%d usable); defaulting to caution. "
+                "have=%s missing=%s",
                 len(query_feature_keys),
                 len(SIMILARITY_FEATURES),
+                sorted(query_feature_keys),
+                missing[:6],
             )
             return SimilarityResult(
                 similar_trades=[], total_found=0, win_rate=0, avg_pnl=0,

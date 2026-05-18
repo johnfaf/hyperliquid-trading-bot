@@ -273,6 +273,35 @@ def resolve_decision_id(signal: Any) -> str:
     return str(getattr(signal, "signal_id", "") or "").strip()
 
 
+def _derive_source_key_from_signal(signal: Any, raw: Dict[str, Any]) -> Optional[str]:
+    """Best-effort fallback for the ``source_key`` column.
+
+    Mirrors ``DecisionFirewall._source_key`` so journal rows agree with
+    firewall calibration buckets even when the upstream signal dict
+    didn't carry an explicit ``source_key`` field. Previously this
+    column was silently left NULL, breaking every per-bucket query.
+    """
+    source = _enum_value(getattr(signal, "source", None))
+    if not source:
+        source = raw.get("source", "")
+    key = str(source or "").strip().lower()
+    if not key:
+        return None
+    if key == "copy_trade":
+        trader = str(
+            getattr(signal, "trader_address", raw.get("trader_address", "")) or ""
+        ).strip().lower()
+        if trader:
+            return f"{key}:{trader}"
+        return key
+    strategy_type = str(
+        getattr(signal, "strategy_type", raw.get("strategy_type", "")) or ""
+    ).strip().lower()
+    if strategy_type:
+        return f"{key}:{strategy_type}"
+    return key
+
+
 def _raw_signal(signal: Any, raw_signal: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     if isinstance(raw_signal, dict):
         return dict(raw_signal)
@@ -360,7 +389,11 @@ def _decision_reason_metadata(
             "coin": coin,
             "side": _enum_value(getattr(signal, "side", raw.get("side", ""))),
             "source": _enum_value(getattr(signal, "source", raw.get("source", ""))),
-            "source_key": raw.get("source_key") or context.get("source_key"),
+            "source_key": (
+                raw.get("source_key")
+                or context.get("source_key")
+                or _derive_source_key_from_signal(signal, raw)
+            ),
             "strategy_type": getattr(signal, "strategy_type", raw.get("strategy_type", "")),
             "strategy_id": str(getattr(signal, "strategy_id", raw.get("strategy_id", "")) or ""),
             "signal_reason": getattr(signal, "reason", raw.get("reason", "")),
@@ -385,6 +418,10 @@ def _decision_reason_metadata(
             "entry_price": _float(getattr(signal, "entry_price", raw.get("price")), None),
             "risk_policy": context.get("risk_policy") or raw.get("risk_policy") or {},
         },
+        # EV math from the firewall's expected-value gate, when present.
+        # Lets the why-enter dashboard show the post-cost edge calc that
+        # actually drove the accept/reject without re-deriving it.
+        "ev_breakdown": context.get("ev_breakdown") or raw.get("ev_breakdown") or {},
     }
 
 
@@ -477,7 +514,11 @@ def record_decision_snapshot(
             "coin": getattr(signal, "coin", None),
             "side": _enum_value(getattr(signal, "side", "")),
             "source": _enum_value(getattr(signal, "source", raw.get("source", ""))),
-            "source_key": raw.get("source_key") or context.get("source_key"),
+            "source_key": (
+                raw.get("source_key")
+                or context.get("source_key")
+                or _derive_source_key_from_signal(signal, raw)
+            ),
             "strategy_type": getattr(signal, "strategy_type", raw.get("strategy_type", "")),
             "strategy_id": str(getattr(signal, "strategy_id", raw.get("strategy_id", "")) or ""),
             "signal_id": str(raw.get("signal_id") or getattr(signal, "signal_id", "") or ""),
@@ -526,6 +567,74 @@ def record_decision_snapshot(
     except Exception as exc:
         _record_write_failure("snapshot_write", exc)
         return None
+
+
+def update_calibrated_confidence(decision_id: str, value: float) -> bool:
+    """Refresh the ``calibrated_confidence`` column on an existing snapshot.
+
+    The snapshot is recorded at signal-generation time, before the
+    calibration tracker has had a chance to adjust confidence. Without
+    this update, every snapshot row carries the *raw* score in both
+    the ``raw_confidence`` and ``calibrated_confidence`` columns --
+    masking what the calibrator actually did. Called after the
+    calibration adjustment runs in paper_trader.
+    """
+    if not _enabled() or not decision_id:
+        return False
+    if not _schema_or_skip():
+        return False
+    try:
+        from src.data import database as db
+
+        with db.get_connection() as conn:
+            conn.execute(
+                """
+                UPDATE decision_snapshots
+                SET updated_at = ?, calibrated_confidence = ?
+                WHERE decision_id = ?
+                """,
+                (_now(), float(value), decision_id),
+            )
+        return True
+    except Exception as exc:
+        _record_write_failure("calibrated_confidence_update", exc)
+        return False
+
+
+def update_decision_ev_breakdown(decision_id: str, ev_breakdown: Dict[str, Any]) -> bool:
+    """Merge the firewall's EV math into the snapshot metadata.
+
+    The snapshot is recorded at signal-generation time, before the
+    firewall's EV gate runs. Without this, the why-enter dashboard
+    can't show the post-cost edge calculation that actually drove the
+    accept/reject. Called from paper_trader after the firewall prescreen.
+    """
+    if not _enabled() or not decision_id or not isinstance(ev_breakdown, dict):
+        return False
+    if not _schema_or_skip():
+        return False
+    try:
+        from src.data import database as db
+
+        with db.get_connection() as conn:
+            row = conn.execute(
+                "SELECT metadata FROM decision_snapshots WHERE decision_id = ?",
+                (decision_id,),
+            ).fetchone()
+            merged = _loads(row["metadata"] if row else None)
+            merged["ev_breakdown"] = dict(ev_breakdown)
+            conn.execute(
+                """
+                UPDATE decision_snapshots
+                SET updated_at = ?, metadata = ?
+                WHERE decision_id = ?
+                """,
+                (_now(), _json(merged), decision_id),
+            )
+        return True
+    except Exception as exc:
+        _record_write_failure("ev_breakdown_update", exc)
+        return False
 
 
 def update_decision_status(

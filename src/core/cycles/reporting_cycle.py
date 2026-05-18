@@ -166,6 +166,43 @@ def run_reporting(container, cycle_count: int, health_registry=None) -> None:
     except Exception as exc:
         logger.debug("  Report export error: %s", exc)
 
+    # ── Calibration trend monitor (auto-derisk on deteriorating Brier) ──
+    try:
+        from src.signals.calibration_trend import apply_trend_derisk
+        adjusted = apply_trend_derisk(getattr(container, "agent_scorer", None))
+        if adjusted:
+            logger.warning(
+                "  Calibration trend derisked %d source(s): %s",
+                len(adjusted),
+                ", ".join(
+                    f"{a['source_key']} ({a['old_weight']:.2f}->{a['new_weight']:.2f})"
+                    for a in adjusted
+                ),
+            )
+    except Exception as exc:
+        logger.debug("  Calibration trend monitor error: %s", exc)
+
+    # ── Orphan position reaper (opt-in via ORPHAN_REAPER_ENABLED) ──
+    try:
+        from src.trading.orphan_reaper import reap_orphan_positions
+        reaped = reap_orphan_positions(container)
+        if reaped:
+            logger.warning(
+                "  Orphan reaper closed %d position(s): %s",
+                len(reaped),
+                ", ".join(f"{r['coin']} {r['side']}" for r in reaped),
+            )
+    except Exception as exc:
+        logger.debug("  Orphan reaper error: %s", exc)
+
+    # ── Pipeline-health observability ──
+    # The calibration loop is broken if these tables don't accumulate
+    # rows. Surface stagnation here so it's obvious in ops logs.
+    try:
+        _check_pipeline_health(container, cycle_count)
+    except Exception as exc:
+        logger.debug("  Pipeline health check error: %s", exc)
+
     # ── Health registry staleness check ──
     if health_registry:
         try:
@@ -202,6 +239,79 @@ def run_reporting(container, cycle_count: int, health_registry=None) -> None:
         )
     except Exception as exc:
         logger.debug("  Health report error: %s", exc)
+
+
+# Module-level cache so the health check can detect stagnation across
+# cycles without each cycle re-querying counts twice.
+_PIPELINE_HEALTH_PREV: dict = {}
+_PIPELINE_HEALTH_STREAK: dict = {}
+
+
+def _check_pipeline_health(container, cycle_count: int) -> None:
+    """Warn when calibration/learning tables don't accumulate rows.
+
+    Three tables drive the bot's ability to learn: ``decision_outcomes``
+    (what happened to each decision), ``agent_scores`` (per-source
+    track records), and ``calibration_records`` (predicted vs realised
+    accuracy). If any of these stays at 0 rows or stops growing while
+    the bot is taking trades, the gates that depend on them silently
+    fall back to cold-start values -- which is what happened on
+    2026-05-14 when the bucketed-threshold gate locked the bot into
+    its existing positions because global ECE never had real data to
+    refine against.
+    """
+    global _PIPELINE_HEALTH_PREV, _PIPELINE_HEALTH_STREAK
+    tables = ("decision_outcomes", "agent_scores", "calibration_records")
+    try:
+        with db.get_connection(for_read=True) as conn:
+            counts = {}
+            for t in tables:
+                try:
+                    counts[t] = int(
+                        conn.execute(f'SELECT COUNT(*) FROM "{t}"').fetchone()[0]
+                    )
+                except Exception:
+                    counts[t] = None
+    except Exception as exc:
+        logger.debug("  Pipeline health: db query failed: %s", exc)
+        return
+
+    for t in tables:
+        cur = counts.get(t)
+        prev = _PIPELINE_HEALTH_PREV.get(t)
+        if cur is None:
+            continue
+        if prev is None:
+            _PIPELINE_HEALTH_PREV[t] = cur
+            _PIPELINE_HEALTH_STREAK[t] = 0
+            continue
+        if cur == prev:
+            _PIPELINE_HEALTH_STREAK[t] = _PIPELINE_HEALTH_STREAK.get(t, 0) + 1
+        else:
+            _PIPELINE_HEALTH_STREAK[t] = 0
+        _PIPELINE_HEALTH_PREV[t] = cur
+
+    logger.info(
+        "  Pipeline health: decision_outcomes=%s, agent_scores=%s, "
+        "calibration_records=%s",
+        counts.get("decision_outcomes", "?"),
+        counts.get("agent_scores", "?"),
+        counts.get("calibration_records", "?"),
+    )
+
+    # Warn loudly when a table has been at zero rows for several cycles
+    # -- this is the smoking gun that the learning loop isn't writing.
+    stagnant_cycles_warn = 5
+    for t in tables:
+        cur = counts.get(t)
+        streak = _PIPELINE_HEALTH_STREAK.get(t, 0)
+        if cur == 0 and streak >= stagnant_cycles_warn:
+            logger.warning(
+                "  Pipeline health: %s has been at 0 rows for %d cycles. "
+                "Calibration/promotion gates will fall back to cold-start "
+                "values until this table accumulates data.",
+                t, streak,
+            )
 
 
 def _log_module_stats(container):

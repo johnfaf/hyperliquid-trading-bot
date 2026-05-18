@@ -60,6 +60,39 @@ class DecisionFirewall:
         # strategy DB has 50+ scored strategies with >10 trades each.
         self.min_confidence = cfg.get("min_confidence", 0.15)
         self.min_source_accuracy = cfg.get("min_source_accuracy", 0.0)  # 0 = no filter
+        # Block signals whose source_key resolves to a known-untagged bucket
+        # (``unknown``, ``strategy:unknown``, ``strategy:untagged``). These rows
+        # dominate the calibration table when upstream signal generators fail
+        # to set strategy_type/source, masking real per-source calibration
+        # signal behind one fat untagged bucket. Default-on so the upstream
+        # gap surfaces as a clear rejection rather than silently shipping
+        # uncalibratable trades to live.
+        self.block_unknown_sources = bool(cfg.get("block_unknown_sources", True))
+        # When enabled and a calibration tracker is wired in, derive a
+        # per-(source, side, regime) min-confidence floor from observed
+        # ECE/sample-size instead of using only the global ``min_confidence``.
+        # Asymmetric: only raises the floor, never lowers it.
+        self.use_bucketed_thresholds = bool(cfg.get("use_bucketed_thresholds", True))
+        # Cold-start leverage clamp. When a (source|side|regime) bucket
+        # has fewer than ``coldstart_calibration_min_samples`` real
+        # calibration outcomes, the EV gate is running on the assumed
+        # p_win=0.50 prior -- the trade is not proven. Don't let an
+        # unproven bucket run high leverage: it over-concentrates
+        # capital-at-risk AND (because the aggregate-exposure cap is
+        # measured in *leveraged* notional) a single high-leverage
+        # cold-start trade saturates the cap and locks out hours of
+        # diversified signals (observed in the 6h prod scan: one 8x SOL
+        # short → 23 exposure rejections / 6h). Clamp leverage to a
+        # conservative ceiling until the bucket earns it.
+        self.coldstart_leverage_clamp_enabled = bool(
+            cfg.get("coldstart_leverage_clamp_enabled", True)
+        )
+        self.coldstart_max_leverage = float(
+            cfg.get("coldstart_max_leverage", 3.0)
+        )
+        self.coldstart_calibration_min_samples = int(
+            cfg.get("coldstart_calibration_min_samples", 30)
+        )
         self.max_signals_per_source_per_day = int(
             cfg.get("max_signals_per_source_per_day", 0)
         )
@@ -261,6 +294,22 @@ class DecisionFirewall:
             cfg.get("max_aggregate_margin_pct", 0.60)
         )
 
+        # AUDIT M1 — absolute dollar floor for the leveraged-notional cap.
+        # The percentage cap above scales with balance, which deadlocks a
+        # very small live wallet (150% of a $102 account == $153 of
+        # leveraged notional; one mirrored position blows it and every
+        # subsequent live entry is hard-rejected).  When
+        # ``balance * max_aggregate_exposure_pct`` is below this floor the
+        # floor is used instead.  This does NOT loosen real risk: the
+        # leverage-agnostic ``max_aggregate_margin_pct`` cap remains the
+        # true capital-at-risk control and binds first on a small account.
+        # Defaults to 0.0 here (disabled) so unit tests that build the
+        # firewall directly keep their exact legacy behavior; production
+        # wires the real floor via subsystem_registry / config.
+        self.aggregate_exposure_floor_usd = max(
+            0.0, float(cfg.get("aggregate_exposure_floor_usd", 0.0) or 0.0)
+        )
+
         # Predictive regime forecaster for dynamic de-risking
         self.enable_predictive_derisk = cfg.get("enable_predictive_derisk", True)
         self.crash_confidence_threshold = cfg.get("crash_confidence_threshold", 0.4)
@@ -319,10 +368,15 @@ class DecisionFirewall:
             "rejected_drawdown": 0,
             "rejected_exposure": 0,
             "rejected_funding": 0,
+            "rejected_funding_divergence": 0,
             "rejected_event_risk": 0,
             "rejected_side_policy": 0,
             "rejected_entry_location": 0,
             "rejected_side_imbalance": 0,
+            "rejected_unknown_source": 0,
+            "rejected_bucketed_confidence": 0,
+            "rejected_data_readiness": 0,
+            "rejected_ev_gate": 0,
             # LOW-FIX LOW-1: count audit-log write failures so ops can detect
             # when the audit trail is silently broken (DB full, locked, etc.)
             "audit_log_failures": 0,
@@ -356,6 +410,31 @@ class DecisionFirewall:
             return f"{key}:{strategy_type}"
         return key
 
+    _UNKNOWN_SOURCE_KEYS = frozenset({
+        "unknown",
+        "strategy:unknown",
+        "strategy:untagged",
+        "strategy:",
+    })
+
+    @classmethod
+    def _is_unknown_source_key(cls, source_key: str) -> bool:
+        """Return True if the source_key signals an upstream tagging gap.
+
+        A bare ``copy_trade`` (no trader address) is also untagged for
+        calibration purposes — every copy trade should resolve to
+        ``copy_trade:0x...`` once the source is known. Catch that here so
+        an unconfigured copy hook doesn't pollute the calibration table.
+        """
+        key = str(source_key or "").strip().lower()
+        if not key:
+            return True
+        if key in cls._UNKNOWN_SOURCE_KEYS:
+            return True
+        if key == "copy_trade":  # no trader_address resolved
+            return True
+        return False
+
     def _effective_source_cap(self, policy: Dict) -> int:
         """Combine static per-source/day caps with allocator-driven caps."""
         configured_cap = int(self.max_signals_per_source_per_day or 0)
@@ -384,6 +463,33 @@ class DecisionFirewall:
             )
             self.event_risk_enabled = bool(
                 overrides.get("EVENT_RISK_ENABLED", self.event_risk_enabled)
+            )
+            self.block_unknown_sources = bool(
+                overrides.get(
+                    "FIREWALL_BLOCK_UNKNOWN_SOURCES", self.block_unknown_sources
+                )
+            )
+            self.use_bucketed_thresholds = bool(
+                overrides.get(
+                    "FIREWALL_USE_BUCKETED_THRESHOLDS", self.use_bucketed_thresholds
+                )
+            )
+            self.coldstart_leverage_clamp_enabled = bool(
+                overrides.get(
+                    "COLDSTART_LEVERAGE_CLAMP_ENABLED",
+                    self.coldstart_leverage_clamp_enabled,
+                )
+            )
+            self.coldstart_max_leverage = float(
+                overrides.get(
+                    "COLDSTART_MAX_LEVERAGE", self.coldstart_max_leverage
+                )
+            )
+            self.coldstart_calibration_min_samples = int(
+                overrides.get(
+                    "COLDSTART_CALIBRATION_MIN_SAMPLES",
+                    self.coldstart_calibration_min_samples,
+                )
             )
             self.short_hardening_enabled = bool(
                 overrides.get("SHORT_HARDENING_ENABLED", self.short_hardening_enabled)
@@ -1771,7 +1877,8 @@ class DecisionFirewall:
                  open_positions: Optional[List[Dict]] = None,
                  ignore_position_limit: bool = False,
                  dry_run: bool = False,
-                 account_balance: Optional[float] = None) -> Tuple[bool, str]:
+                 account_balance: Optional[float] = None,
+                 require_live_balance: bool = False) -> Tuple[bool, str]:
         """
         Validate a single trade signal through all checks.
         Thread-safe: acquires _lock to prevent concurrent state corruption.
@@ -1788,13 +1895,15 @@ class DecisionFirewall:
                 ignore_position_limit=ignore_position_limit,
                 dry_run=dry_run,
                 account_balance=account_balance,
+                require_live_balance=require_live_balance,
             )
 
     def _validate_locked(self, signal: TradeSignal, regime_data: Optional[Dict] = None,
                          open_positions: Optional[List[Dict]] = None,
                          ignore_position_limit: bool = False,
                          dry_run: bool = False,
-                         account_balance: Optional[float] = None) -> Tuple[bool, str]:
+                         account_balance: Optional[float] = None,
+                         require_live_balance: bool = False) -> Tuple[bool, str]:
         """Inner validate — must be called with _lock held."""
         # Activate the signal's trace ID so every downstream log line
         # (execution, fill verification, SL/TP placement) includes it.
@@ -1857,6 +1966,17 @@ class DecisionFirewall:
         if not signal.validate():
             return _reject("rejected_schema", f"Invalid signal schema: {signal.coin} {signal.side.value}")
 
+        # 1b. Data-readiness gate -- prop-firm rule: no trade if inputs
+        # are incomplete. Reject upfront so we don't evaluate downstream
+        # gates on half-data.
+        try:
+            from src.signals.data_readiness import is_signal_data_ready
+            ready, ready_reason = is_signal_data_ready(signal)
+            if not ready:
+                return _reject("rejected_data_readiness", ready_reason)
+        except Exception as exc:
+            logger.debug("Data-readiness check failed (fail-open): %s", exc)
+
         predictive_regime = None
         if self._forecaster and self.enable_predictive_derisk:
             try:
@@ -1895,9 +2015,162 @@ class DecisionFirewall:
             return _reject("rejected_confidence",
                           f"Low confidence {signal.confidence:.0%} < {self.min_confidence:.0%}")
 
-        # 2b. Per-source/day throughput cap (approved signals).
+        # 2a. Unknown-source gate.
+        # Calibration data is dominated by `strategy:unknown` and
+        # `strategy:untagged` buckets when upstream signal sources fail to
+        # tag their strategy_type/source. Letting those signals through
+        # pollutes the calibration table with one fat untagged bucket and
+        # gives any future bucket-aware threshold nothing to gate on.
+        # Block them at the firewall by default so the upstream pipeline
+        # gap becomes visible immediately rather than masked behind
+        # bad confidence.
         self._check_daily_reset()
         source_key = self._source_key(signal)
+        if self.block_unknown_sources and self._is_unknown_source_key(source_key):
+            return _reject(
+                "rejected_unknown_source",
+                f"Unknown source key {source_key!r} -- upstream pipeline did not "
+                "tag strategy_type/source, blocking from execution",
+            )
+
+        # 2a-bis. Per-bucket min-confidence floor.
+        # The global ``min_confidence`` already filtered obvious garbage
+        # above. Now consult the calibration tracker for the most-specific
+        # (source, side, regime) bucket -- if that bucket is thin or
+        # miscalibrated, raise the floor for *this* trade. Never lowers
+        # below the global floor; can only tighten.
+        if self.use_bucketed_thresholds and self.calibration is not None:
+            try:
+                side_val = (
+                    signal.side.value if hasattr(signal.side, "value") else str(signal.side)
+                )
+                from src.signals.calibration import bucket_regime as _bucket_regime
+                raw_regime = ""
+                if regime_data and isinstance(regime_data, dict):
+                    raw_regime = str(regime_data.get("overall_regime", "") or "")
+                if not raw_regime:
+                    raw_regime = str(getattr(signal, "regime", "") or "")
+                bucket = _bucket_regime(raw_regime)
+                threshold, threshold_reason = self.calibration.get_bucketed_min_confidence(
+                    source_key,
+                    side=side_val,
+                    regime=bucket,
+                    global_min=self.min_confidence,
+                )
+                if signal.confidence + self.confidence_threshold_tolerance < threshold:
+                    return _reject(
+                        "rejected_bucketed_confidence",
+                        f"Confidence {signal.confidence:.0%} below bucket floor "
+                        f"{threshold:.0%} ({threshold_reason})",
+                    )
+            except Exception as exc:
+                logger.debug("Bucketed-threshold check failed (fail-open): %s", exc)
+
+        # 2c. Expected-value gate: positive-EV after fees + slippage +
+        # funding. The single most disciplined check on the signal --
+        # bucketed-threshold above gates on confidence; this gates on
+        # the dollars-after-costs question.
+        try:
+            from src.signals.ev_gate import evaluate_signal_ev
+            from src.signals.calibration import bucket_regime as _ev_bucket_regime
+            ev_raw_regime = ""
+            if regime_data and isinstance(regime_data, dict):
+                ev_raw_regime = str(regime_data.get("overall_regime", "") or "")
+            if not ev_raw_regime:
+                ev_raw_regime = str(getattr(signal, "regime", "") or "")
+            ev_regime = _ev_bucket_regime(ev_raw_regime)
+            bucket_n = 1.0
+            if self.calibration is not None:
+                try:
+                    side_v = signal.side.value if hasattr(signal.side, "value") else str(signal.side)
+                    composed = None
+                    try:
+                        from src.signals.calibration import compose_calibration_key
+                        composed = compose_calibration_key(source_key, side_v, ev_regime)
+                    except Exception:
+                        composed = source_key
+                    bucket_n = float(self.calibration.get_sample_size(composed))
+                except Exception:
+                    bucket_n = 1.0
+            accept_ev, ev_reason, ev_breakdown = evaluate_signal_ev(
+                signal,
+                calibration=self.calibration,
+                source_key=source_key,
+                regime=ev_regime,
+                bucket_n=bucket_n,
+            )
+            # Per-signal "why entered / why rejected" EV line. Fires for
+            # both outcomes so production logs show the math directly:
+            # grep ``EV-DECISION`` to audit every signal's edge calc.
+            if ev_breakdown:
+                _side_v = (
+                    signal.side.value if hasattr(signal.side, "value")
+                    else str(signal.side)
+                )
+                logger.info(
+                    "EV-DECISION %s %s [%s|%s]: p_win=%.3f (%s) win=%.0fbps "
+                    "loss=%.0fbps cost=%.0fbps -> ev=%.1fbps sigma=%.1fbps "
+                    "n=%.0f -> %s%s",
+                    signal.coin,
+                    _side_v.upper(),
+                    source_key,
+                    ev_regime,
+                    ev_breakdown.get("p_win", 0.0),
+                    ev_breakdown.get("p_win_source", "?"),
+                    ev_breakdown.get("avg_win_bps", 0.0),
+                    ev_breakdown.get("avg_loss_bps", 0.0),
+                    ev_breakdown.get("cost_bps", 0.0),
+                    ev_breakdown.get("ev_bps", 0.0),
+                    ev_breakdown.get("sigma_bps", 0.0),
+                    ev_breakdown.get("bucket_n", 0.0),
+                    "ACCEPT" if accept_ev else "REJECT",
+                    "" if accept_ev else f" ({ev_reason})",
+                )
+            if not accept_ev:
+                return _reject("rejected_ev_gate", ev_reason)
+            # Attach EV breakdown to signal context so downstream
+            # logging / dashboards can show the "why entered" math.
+            try:
+                if isinstance(getattr(signal, "context", None), dict):
+                    signal.context["ev_breakdown"] = ev_breakdown
+            except Exception:
+                pass
+            # Cold-start leverage clamp (see __init__ rationale). bucket_n
+            # is the real calibration sample count for this exact
+            # (source|side|regime) bucket, computed just above.
+            if self.coldstart_leverage_clamp_enabled:
+                try:
+                    cur_lev = float(getattr(signal, "leverage", 1.0) or 1.0)
+                    if (
+                        bucket_n < self.coldstart_calibration_min_samples
+                        and cur_lev > self.coldstart_max_leverage
+                    ):
+                        _cs_side = (
+                            signal.side.value if hasattr(signal.side, "value")
+                            else str(signal.side)
+                        )
+                        signal.leverage = self.coldstart_max_leverage
+                        if isinstance(getattr(signal, "context", None), dict):
+                            signal.context["coldstart_leverage_clamped"] = {
+                                "from": cur_lev,
+                                "to": self.coldstart_max_leverage,
+                                "bucket_n": bucket_n,
+                                "min_samples": self.coldstart_calibration_min_samples,
+                            }
+                        logger.info(
+                            "COLDSTART-CLAMP %s %s [%s|%s]: bucket n=%.0f < %d "
+                            "-> leverage %.1fx -> %.1fx (EV is assumption-"
+                            "driven; de-risking until calibration matures)",
+                            signal.coin, _cs_side, source_key, ev_regime,
+                            bucket_n, self.coldstart_calibration_min_samples,
+                            cur_lev, self.coldstart_max_leverage,
+                        )
+                except Exception as exc:
+                    logger.debug("Cold-start leverage clamp skipped: %s", exc)
+        except Exception as exc:
+            logger.debug("EV gate check failed (fail-open): %s", exc)
+
+        # 2b. Per-source/day throughput cap (approved signals).
         policy_ok, policy_reason, source_policy = self._apply_source_policy(
             signal,
             source_key,
@@ -1971,7 +2244,19 @@ class DecisionFirewall:
             return _reject("rejected_side_imbalance", side_imbalance_reason)
 
         balance = account_balance
-        if balance is None:
+        if require_live_balance:
+            # Live entry path: the exposure/margin caps MUST be measured
+            # against the real live wallet, never the ~$10k paper account.
+            # Silently falling back to the paper balance would loosen the
+            # cap ~100x on real money.  If the live balance is missing or
+            # non-positive, fail safe (reject) rather than trade blind.
+            if balance is None or balance <= 0:
+                return _reject(
+                    "rejected_exposure",
+                    "Live balance unavailable; refusing to validate a live "
+                    "entry against the paper-account fallback",
+                )
+        elif balance is None:
             account = db.get_paper_account()
             balance = account.get("balance", 10000) if account else None
         if balance:
@@ -2000,11 +2285,24 @@ class DecisionFirewall:
             projected_exposure = total_exposure + new_notional
             exposure_pct = projected_exposure / balance if balance > 0 else 1.0
 
-            if exposure_pct > self.max_aggregate_exposure_pct:
+            # Percentage cap, lifted to an absolute dollar floor when set so
+            # a very small live wallet is not structurally deadlocked (the
+            # leverage-agnostic margin cap below is the real capital-at-risk
+            # control).  Floor defaults to 0 (disabled) for direct unit
+            # tests, so this is mathematically identical to the legacy
+            # ``exposure_pct > max_aggregate_exposure_pct`` check there.
+            exposure_cap_usd = balance * self.max_aggregate_exposure_pct
+            if self.aggregate_exposure_floor_usd > 0:
+                exposure_cap_usd = max(
+                    exposure_cap_usd, self.aggregate_exposure_floor_usd
+                )
+
+            if projected_exposure > exposure_cap_usd:
                 return _reject("rejected_exposure",
                               f"Aggregate exposure {exposure_pct:.0%} would exceed "
                               f"{self.max_aggregate_exposure_pct:.0%} limit "
-                              f"(${projected_exposure:,.0f}/${balance:,.0f})")
+                              f"(${projected_exposure:,.0f}/${balance:,.0f}"
+                              f"; cap ${exposure_cap_usd:,.0f})")
 
             # Separate margin-based cap (AUDIT M1).  Disabled when
             # max_aggregate_margin_pct <= 0 so operators can opt out.
@@ -2146,6 +2444,20 @@ class DecisionFirewall:
                                   f"shorts pay {funding*3*365:.0f}% annualized, blocking short")
             except Exception as e:
                 logger.debug(f"Funding rate check failed: {e}")
+
+        # 11b. Funding-vs-price divergence (cross-market BTC/ETH read).
+        #      Different from the per-coin funding check above: this one
+        #      blocks longs when the broader market shows crowded longs
+        #      paying premium into a selloff (and symmetric for shorts).
+        try:
+            from src.signals.funding_divergence import should_block_side
+
+            side_val = signal.side.value if hasattr(signal.side, "value") else str(signal.side)
+            divergence_block, divergence_reason = should_block_side(side_val)
+            if divergence_block:
+                return _reject("rejected_funding_divergence", divergence_reason)
+        except Exception as exc:
+            logger.debug("Funding divergence check failed (fail-open): %s", exc)
 
         # 12. Predictive regime de-risking
         #     If forecaster detects crash with high confidence, dynamically reduce

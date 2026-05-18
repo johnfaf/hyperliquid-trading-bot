@@ -25,6 +25,17 @@ logger = logging.getLogger(__name__)
 # Time decay: how quickly old performance fades
 DECAY_HALF_LIFE_TRADES = 50   # After 50 trades, weight of old data is halved
 
+# Calendar decay on top of trade-count decay. A source that hasn't produced
+# a tracked outcome in N days is treated as stale even if its trade-count
+# history looks healthy — markets change, and a source that performed in
+# the past quarter but hasn't traded recently shouldn't keep its full
+# weight. Idle thresholds and multipliers are picked so a source dropping
+# off for 2 weeks halves its weight, and a month idle quarters it.
+SOURCE_IDLE_DOWNWEIGHT_DAYS = 14
+SOURCE_STALE_DOWNWEIGHT_DAYS = 30
+SOURCE_IDLE_WEIGHT_MULTIPLIER = 0.50
+SOURCE_STALE_WEIGHT_MULTIPLIER = 0.25
+
 
 @dataclass
 class SourceScore:
@@ -113,6 +124,25 @@ class AgentScorer:
         self.policy_strong_win_rate = float(cfg.get("policy_strong_win_rate", 0.55))
         self.policy_strong_recent_pnl_floor = float(
             cfg.get("policy_strong_recent_pnl_floor", 0.0)
+        )
+        # Options-flow per-day cap graduation. The warmup/degraded fixed
+        # caps default to 1/day in prod, which throttled options-flow
+        # directional signals to ~1 trade/day (observed: 23 of 93
+        # decisions / 6h rejected on this source cap). Once an
+        # options_flow source has produced more than
+        # ``options_flow_cap_min_trades`` closed trades it has a real
+        # track record -- graduate its per-day cap to
+        # ``options_flow_graduated_cap`` instead of leaving it stuck in
+        # the warmup/degraded throttle. Never overrides a hard
+        # ``paused``/blocked source (that's a safety stop).
+        self.options_flow_cap_graduation_enabled = bool(
+            cfg.get("options_flow_cap_graduation_enabled", True)
+        )
+        self.options_flow_cap_min_trades = int(
+            cfg.get("options_flow_cap_min_trades", 3)
+        )
+        self.options_flow_graduated_cap = int(
+            cfg.get("options_flow_graduated_cap", 4)
         )
 
         # Load existing scores from DB
@@ -335,11 +365,45 @@ class AgentScorer:
     # ─── Query ────────────────────────────────────────────────
 
     def get_weight(self, source_key: str) -> float:
-        """Get the current dynamic weight for a signal source."""
+        """Get the current dynamic weight for a signal source.
+
+        Applies calendar decay on top of the stored dynamic_weight: idle
+        sources (no tracked outcome for N days) get halved, stale sources
+        (no outcome for ~1 month) get quartered. Trade-count decay still
+        runs at score-update time inside ``_update_score``.
+        """
         score = self.scores.get(source_key)
         if not score or score.total_signals < 5:
             return 0.5  # Default weight for new/unknown sources
-        return score.dynamic_weight
+        weight = float(score.dynamic_weight)
+        idle_days = self._source_idle_days(score)
+        if idle_days is None:
+            return weight
+        if idle_days >= SOURCE_STALE_DOWNWEIGHT_DAYS:
+            return max(0.05, weight * SOURCE_STALE_WEIGHT_MULTIPLIER)
+        if idle_days >= SOURCE_IDLE_DOWNWEIGHT_DAYS:
+            return max(0.05, weight * SOURCE_IDLE_WEIGHT_MULTIPLIER)
+        return weight
+
+    @staticmethod
+    def _source_idle_days(score: SourceScore) -> Optional[float]:
+        """Return how many days ago this source last produced an outcome.
+
+        Returns ``None`` when ``last_updated`` is missing or unparseable
+        (treat as fresh rather than stale, since a parsing bug shouldn't
+        silently quarter every source's weight).
+        """
+        raw = (score.last_updated or "").strip()
+        if not raw:
+            return None
+        try:
+            dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            delta = datetime.now(timezone.utc) - dt
+            return max(0.0, delta.total_seconds() / 86400.0)
+        except (TypeError, ValueError):
+            return None
 
     def get_accuracy(self, source_key: str) -> float:
         """Get the time-decay weighted accuracy for a source."""
@@ -552,6 +616,28 @@ class AgentScorer:
             cap, reason = self._active_dynamic_cap(row)
             policy["max_signals_per_day"] = cap
             policy["dynamic_cap_reason"] = reason
+
+        # Options-flow per-day cap graduation. Applied last so it can
+        # lift the warmup/degraded fixed cap once the source has earned
+        # a track record, but it deliberately does NOT override a
+        # paused/blocked source -- a hard safety stop must stay hard.
+        if (
+            self.options_flow_cap_graduation_enabled
+            and not policy.get("blocked")
+            and str(policy.get("status", "")).lower() != "paused"
+            and str(source_key or "").strip().lower().startswith("options_flow")
+        ):
+            completed = int(policy.get("completed_trades", 0) or 0)
+            if completed > self.options_flow_cap_min_trades:
+                current = int(policy.get("max_signals_per_day", 0) or 0)
+                graduated = max(current, self.options_flow_graduated_cap)
+                if graduated != current:
+                    policy["max_signals_per_day"] = graduated
+                    policy["dynamic_cap_reason"] = (
+                        f"options_flow_graduated:{completed}>"
+                        f"{self.options_flow_cap_min_trades}"
+                        f"_cap_{current}->{graduated}"
+                    )
         return policy
 
     def _active_dynamic_cap(self, row: Dict) -> tuple[int, str]:

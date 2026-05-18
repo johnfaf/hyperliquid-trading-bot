@@ -5,6 +5,19 @@ Unit tests for DecisionFirewall.
 import pytest
 from unittest.mock import patch, MagicMock
 
+import config
+
+
+@pytest.fixture(autouse=True)
+def _bypass_new_gates(monkeypatch):
+    """The legacy firewall tests predate the data-readiness and EV gates
+    and use minimal MockSignal fixtures without populated context. Bypass
+    both gates here so the pre-existing tests keep exercising the
+    schema/source/confidence/risk math they were written for. Dedicated
+    coverage for the new gates lives in their own test files."""
+    monkeypatch.setattr(config, "DATA_READINESS_GATE_ENABLED", False, raising=False)
+    monkeypatch.setattr(config, "EV_GATE_ENABLED", False, raising=False)
+
 
 class MockSignal:
     """Minimal mock of TradeSignal for testing."""
@@ -257,8 +270,13 @@ def test_firewall_clamps_leverage(mock_db):
     mock_db.audit_log = MagicMock()
 
     from src.signals.decision_firewall import DecisionFirewall
+    # Isolate the generic max-leverage clamp: disable the cold-start
+    # leverage clamp (its own coverage is in
+    # tests/test_coldstart_leverage_clamp.py) so it doesn't further
+    # reduce 5x -> 3x on this no-calibration-history signal.
     fw = DecisionFirewall({"max_leverage": 5, "enable_predictive_derisk": False,
-                           "funding_risk_enabled": False})
+                           "funding_risk_enabled": False,
+                           "coldstart_leverage_clamp_enabled": False})
     signal = MockSignal(leverage=10)
     passed, reason = fw.validate(signal)
     assert passed is True
@@ -466,10 +484,16 @@ def test_firewall_enforces_per_source_day_cap(mock_db):
             "funding_risk_enabled": False,
         }
     )
+    # Source must resolve to a fully-tagged source_key
+    # (``copy_trade:0x...``); the firewall now blocks bare ``copy_trade``
+    # without a trader_address as an upstream tagging gap.
+    trader = "0x" + "a" * 40
     first = MockSignal(coin="BTC", confidence=0.6)
     first.source = "copy_trade"
+    first.trader_address = trader
     second = MockSignal(coin="ETH", confidence=0.6)
     second.source = "copy_trade"
+    second.trader_address = trader
 
     passed1, _ = fw.validate(first)
     passed2, reason2 = fw.validate(second)
@@ -479,7 +503,7 @@ def test_firewall_enforces_per_source_day_cap(mock_db):
     assert "source/day cap" in reason2.lower()
     stats = fw.get_stats()
     assert stats["rejected_source_cap"] == 1
-    assert stats["source_signal_counts"]["copy_trade"] == 1
+    assert stats["source_signal_counts"][f"copy_trade:{trader}"] == 1
 
 
 @patch("src.signals.decision_firewall.db")

@@ -444,6 +444,28 @@ def _rescale_size_for_live(trade: Dict, trader) -> Optional[Dict]:
     After rescaling, the final notional is clamped to trader.max_order_usd
     (if set) so nothing above the bootstrap cap ever hits the exchange.
     """
+    # Walk-forward promotion gate: block live mirror if the strategy /
+    # source hasn't earned live status yet (insufficient trade history,
+    # poor win rate, or no resolvable track record). Paper continues
+    # so the source keeps accumulating outcomes; only the live mirror
+    # is gated. Bypass via ``LIVE_PROMOTION_GATE_ENABLED=false`` if you
+    # need to bootstrap a new source.
+    try:
+        from src.learning.promotion_gate import is_live_promotable
+        promotable, reason = is_live_promotable(trade)
+    except Exception as exc:
+        logger.debug("Promotion gate check failed (fail-open): %s", exc)
+        promotable, reason = True, "gate_error_fail_open"
+    if not promotable:
+        logger.info(
+            "Skipping live mirror for %s: promotion gate blocked (%s). "
+            "Paper trade continues; live stays gated until source meets "
+            "promotion thresholds.",
+            trade.get("coin", "?"),
+            reason,
+        )
+        return None
+
     paper_account = db.get_paper_account()
     paper_balance = float((paper_account or {}).get("balance", 0) or 0)
     # H6 (audit): compute a *free* paper balance that deducts margin

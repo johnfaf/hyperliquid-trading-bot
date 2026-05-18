@@ -331,6 +331,15 @@ def build_subsystems(
                 "policy_strong_recent_pnl_floor": getattr(
                     config, "SOURCE_POLICY_STRONG_RECENT_PNL_FLOOR", 0.0
                 ),
+                "options_flow_cap_graduation_enabled": getattr(
+                    config, "OPTIONS_FLOW_CAP_GRADUATION_ENABLED", True
+                ),
+                "options_flow_cap_min_trades": getattr(
+                    config, "OPTIONS_FLOW_CAP_MIN_TRADES", 3
+                ),
+                "options_flow_graduated_cap": getattr(
+                    config, "OPTIONS_FLOW_GRADUATED_CAP", 4
+                ),
             }
         ),
         health,
@@ -401,6 +410,21 @@ def build_subsystems(
             "event_scanner": c.event_scanner,
             "event_risk_enabled": bool(getattr(_fw_cfg, "EVENT_RISK_ENABLED", True)),
             "min_confidence": getattr(_fw_cfg, "FIREWALL_MIN_CONFIDENCE", 0.40),
+            "block_unknown_sources": bool(
+                getattr(_fw_cfg, "FIREWALL_BLOCK_UNKNOWN_SOURCES", True)
+            ),
+            "use_bucketed_thresholds": bool(
+                getattr(_fw_cfg, "FIREWALL_USE_BUCKETED_THRESHOLDS", True)
+            ),
+            "coldstart_leverage_clamp_enabled": bool(
+                getattr(_fw_cfg, "COLDSTART_LEVERAGE_CLAMP_ENABLED", True)
+            ),
+            "coldstart_max_leverage": float(
+                getattr(_fw_cfg, "COLDSTART_MAX_LEVERAGE", 3.0)
+            ),
+            "coldstart_calibration_min_samples": int(
+                getattr(_fw_cfg, "COLDSTART_CALIBRATION_MIN_SAMPLES", 30)
+            ),
             "max_signals_per_source_per_day": getattr(
                 _fw_cfg, "FIREWALL_MAX_SIGNALS_PER_SOURCE_PER_DAY", 0
             ),
@@ -519,6 +543,9 @@ def build_subsystems(
             ),
             "max_aggregate_margin_pct": float(
                 getattr(_fw_cfg, "FIREWALL_MAX_AGGREGATE_MARGIN_PCT", 0.60)
+            ),
+            "aggregate_exposure_floor_usd": float(
+                getattr(_fw_cfg, "FIREWALL_AGGREGATE_EXPOSURE_FLOOR_USD", 5000.0)
             ),
         }),
         health,

@@ -288,6 +288,16 @@ BOT_HARD_CUTOFF_TRADES = int(os.environ.get("BOT_HARD_CUTOFF_TRADES", 100))   # 
 BOT_THRESHOLD = int(os.environ.get("BOT_THRESHOLD", 3))                        # signal score >= N = bot
 BOT_MM_PNL_THRESHOLD = float(os.environ.get("BOT_MM_PNL_THRESHOLD", 0.0))     # median PnL < N = spread/MM
 BOT_ELEVATED_FREQ = int(os.environ.get("BOT_ELEVATED_FREQ", 50))              # trades/day for elevated freq signal
+# Statistical-anomaly separation (catches accounts the frequency-based
+# detectors miss): a ~100% win rate sustained over a meaningful closed
+# sample is statistically implausible for a real directional trader -- it
+# is wash trading, a vault/MM, or "selective close" (never realizes a
+# loss). Such accounts (and zero-evidence junk wallets) are uncopyable and
+# must be separated from humans rather than displayed at "100% winrate".
+BOT_PERFECT_WINRATE = float(os.environ.get("BOT_PERFECT_WINRATE", 0.98))       # win rate >= N (with min trades) = anomaly
+BOT_PERFECT_WINRATE_MIN_TRADES = int(
+    os.environ.get("BOT_PERFECT_WINRATE_MIN_TRADES", 15)
+)  # min closed trades before a perfect/near-perfect record counts as a bot signal
 
 # ─── Strategy Analysis ────────────────────────────────────────
 # Minimum number of trades to classify a strategy
@@ -339,6 +349,13 @@ SCORING_WEIGHTS = {
 PAPER_TRADING_INITIAL_BALANCE = 10_000  # USD
 PAPER_TRADING_MAX_POSITION_PCT = 0.08   # 8% of balance per trade (smaller = more concurrent trades)
 PAPER_TRADING_MAX_LEVERAGE = float(os.environ.get("PAPER_TRADING_MAX_LEVERAGE", 5))
+# Max number of coins to pre-compute candle features for per strategy
+# cycle. Core BTC/ETH/SOL are always included; the rest come from the
+# coins this cycle's strategies target. Cap protects the candle API
+# from a large strategy fan-out.
+PAPER_FEATURE_PRECOMPUTE_MAX_COINS = int(
+    os.environ.get("PAPER_FEATURE_PRECOMPUTE_MAX_COINS", 12) or 12
+)
 # Paper-trading risk is defined in ROE space, then converted back into raw
 # trigger prices by dividing by leverage. Take-profit is always kept at 5x the
 # configured stop-loss so every paper signal uses the same reward-to-risk shape.
@@ -373,6 +390,21 @@ TRADE_QUALITY_SHORT_MIN_CONFIDENCE = float(
 )
 TRADE_QUALITY_STRONG_SHORT_CONFIRMATION = os.environ.get(
     "TRADE_QUALITY_STRONG_SHORT_CONFIRMATION", "true"
+).lower() in ("true", "1", "yes")
+# When true, paper_trader's trade-quality gate sources its edge from
+# the firewall EV gate's already-computed breakdown (signal context
+# ev_breakdown) instead of the legacy confidence proxy, and treats a
+# solidly-positive firewall EV as short-confirmation. Reconciles the
+# two EV gates into one source of truth and breaks the cold-start
+# deadlock where confidence pinned at 0.50 forced the proxy edge to
+# ~0 and silently vetoed every signal the firewall EV gate accepted.
+# NOTE: during calibration cold-start the firewall EV uses an assumed
+# p_win=0.50 with the strategy's R-multiples, so this lets regime-
+# aligned trades through on assumption-driven EV until per-bucket
+# calibration matures -- a deliberate tradeoff to get outcome data
+# flowing. Set false to revert to the confidence-proxy behaviour.
+TRADE_QUALITY_USE_FIREWALL_EV = os.environ.get(
+    "TRADE_QUALITY_USE_FIREWALL_EV", "true"
 ).lower() in ("true", "1", "yes")
 
 # Live trading wallet / secret-management controls.
@@ -412,7 +444,7 @@ LIVE_MIN_ORDER_USD = _safe_env_float("LIVE_MIN_ORDER_USD", 11.0, lo=1.0, hi=10_0
 # can actually execute; set a higher value via env var as confidence grows.
 # NOTE: a value below LIVE_MIN_ORDER_USD is impossible to honor — the
 # LiveTrader will raise it to LIVE_MIN_ORDER_USD at startup with a warning.
-LIVE_MAX_ORDER_USD = _safe_env_float("LIVE_MAX_ORDER_USD", 100.0, lo=1.0, hi=1_000_000.0)
+LIVE_MAX_ORDER_USD = _safe_env_float("LIVE_MAX_ORDER_USD", 150.0, lo=1.0, hi=1_000_000.0)
 _live_max_position_default = os.environ.get(
     "HL_MAX_POSITION_SIZE", str(LIVE_MAX_ORDER_USD)
 )
@@ -539,7 +571,7 @@ COPY_TRADER_ENABLED = os.environ.get(
     "COPY_TRADER_ENABLED", "true"
 ).lower() in ("true", "1", "yes")
 COPY_TRADER_MAX_CONCURRENT_TRADES = int(
-    os.environ.get("COPY_TRADER_MAX_CONCURRENT_TRADES", 2)
+    os.environ.get("COPY_TRADER_MAX_CONCURRENT_TRADES", 5)
 )
 COPY_TRADER_MAX_NEW_TRADES_PER_CYCLE = int(
     os.environ.get("COPY_TRADER_MAX_NEW_TRADES_PER_CYCLE", 1)
@@ -640,6 +672,20 @@ CALIBRATION_MIN_OUTCOMES = int(
 CALIBRATION_COLDSTART_PRIOR = float(
     os.environ.get("CALIBRATION_COLDSTART_PRIOR", "0.50")
 )
+# When true (default), the bucketed-threshold firewall floor does NOT
+# raise above the operator's FIREWALL_MIN_CONFIDENCE just because a
+# (source|side|regime) bucket lacks evidence (no-data / thin /
+# global-fallback). Absence of evidence is not evidence of badness;
+# inventing a cold-start confidence tax there deadlocked bootstrap
+# (regime-aligned, strongly +EV signals at ~0.4x cold-start
+# confidence were all rejected as "below bucket floor 50%"). A
+# *measured* bad-ECE bucket still hard-quarantines. Cold-start risk is
+# controlled by the leverage clamp + reduced size + positive-EV
+# requirement, not a redundant confidence tax. Set false to restore
+# the old max(min_confidence, coldstart_prior) cold-start floor.
+CALIBRATION_COLDSTART_USES_GLOBAL_MIN = os.environ.get(
+    "CALIBRATION_COLDSTART_USES_GLOBAL_MIN", "true"
+).lower() in ("true", "1", "yes")
 # Above this minimum we still apply Bayesian shrinkage; we only trust
 # the empirical isotonic fit once a source crosses this many outcomes.
 CALIBRATION_ISOTONIC_MIN_OUTCOMES = int(
@@ -742,6 +788,149 @@ ROTATION_REQUIRE_EXPLICIT_THRESHOLDS = os.environ.get(
 # adjusted signals through.  Raise back to 0.45+ once we have
 # meaningful live-trade history to score sources against.
 FIREWALL_MIN_CONFIDENCE = float(os.environ.get("FIREWALL_MIN_CONFIDENCE", 0.40))
+# Block signals whose source resolves to ``unknown`` / ``strategy:unknown`` /
+# ``strategy:untagged`` at the firewall layer. Default-on because those
+# buckets dominate the calibration table when upstream signal generators
+# fail to tag strategy_type/source -- if calibration data is mostly one
+# fat untagged bucket, per-source thresholds have nothing to gate on.
+# Disable via ``FIREWALL_BLOCK_UNKNOWN_SOURCES=false`` to allow them
+# through (e.g. during a deliberate paper-collection backfill).
+FIREWALL_BLOCK_UNKNOWN_SOURCES = os.environ.get(
+    "FIREWALL_BLOCK_UNKNOWN_SOURCES", "true"
+).lower() in ("true", "1", "yes")
+
+# ─── Cold-start leverage clamp ────────────────────────────────
+# While a (source|side|regime) calibration bucket has fewer than
+# COLDSTART_CALIBRATION_MIN_SAMPLES real outcomes, the EV gate runs on
+# the assumed p_win=0.50 prior -- the trade is unproven. Clamp leverage
+# to COLDSTART_MAX_LEVERAGE so an unproven bucket can't (a) over-
+# concentrate capital-at-risk, or (b) saturate the leveraged-notional
+# aggregate-exposure cap and lock out diversified signals (observed in
+# prod: one 8x cold-start short → 23 exposure rejections / 6h).
+COLDSTART_LEVERAGE_CLAMP_ENABLED = os.environ.get(
+    "COLDSTART_LEVERAGE_CLAMP_ENABLED", "true"
+).lower() in ("true", "1", "yes")
+COLDSTART_MAX_LEVERAGE = _safe_env_float(
+    "COLDSTART_MAX_LEVERAGE", 3.0, lo=1.0, hi=25.0
+)
+COLDSTART_CALIBRATION_MIN_SAMPLES = int(
+    os.environ.get("COLDSTART_CALIBRATION_MIN_SAMPLES", 30) or 30
+)
+
+# ─── Live promotion gate ──────────────────────────────────────
+# Walk-forward gate that blocks paper -> live mirror until a strategy /
+# source has accumulated enough out-of-sample evidence. Layered on top
+# of synthetic-strategy quarantine -- quarantine catches broken rows,
+# this catches well-formed but unproven sources.
+LIVE_PROMOTION_GATE_ENABLED = os.environ.get(
+    "LIVE_PROMOTION_GATE_ENABLED", "true"
+).lower() in ("true", "1", "yes")
+LIVE_PROMOTION_MIN_TRADES = int(
+    os.environ.get("LIVE_PROMOTION_MIN_TRADES", 30)
+)
+LIVE_PROMOTION_MIN_WIN_RATE = _safe_env_float(
+    "LIVE_PROMOTION_MIN_WIN_RATE", 0.45, lo=0.0, hi=1.0
+)
+LIVE_PROMOTION_MIN_SCORE = _safe_env_float(
+    "LIVE_PROMOTION_MIN_SCORE", 0.20, lo=0.0, hi=1.0
+)
+
+# ─── Funding-rate divergence brake ─────────────────────────────
+# Cross-market safety brake: when BTC/ETH funding is meaningfully
+# positive AND price is below the 4h moving average (crowded longs
+# paying premium into a selloff), block new longs. Symmetric for
+# crowded shorts into rallies. Asymmetric -- never confirms or
+# boosts a trade, only blocks.
+FUNDING_DIVERGENCE_ENABLED = os.environ.get(
+    "FUNDING_DIVERGENCE_ENABLED", "true"
+).lower() in ("true", "1", "yes")
+FUNDING_DIVERGENCE_FUNDING_THRESHOLD = _safe_env_float(
+    "FUNDING_DIVERGENCE_FUNDING_THRESHOLD", 0.00015, lo=0.0, hi=0.01
+)
+FUNDING_DIVERGENCE_PRICE_DEV_THRESHOLD = _safe_env_float(
+    "FUNDING_DIVERGENCE_PRICE_DEV_THRESHOLD", 0.005, lo=0.0, hi=0.5
+)
+FUNDING_DIVERGENCE_CACHE_TTL_S = _safe_env_float(
+    "FUNDING_DIVERGENCE_CACHE_TTL_S", 300.0, lo=10.0, hi=3600.0
+)
+
+# ─── Per-bucket firewall confidence thresholds ─────────────────
+# When enabled, the firewall consults the calibration tracker to
+# derive a per-(source, side, regime) min-confidence floor instead of
+# using a single global value. Asymmetric: never lowers below
+# FIREWALL_MIN_CONFIDENCE, only raises for thin/miscalibrated buckets.
+# Disable while the calibration table is being repopulated.
+FIREWALL_USE_BUCKETED_THRESHOLDS = os.environ.get(
+    "FIREWALL_USE_BUCKETED_THRESHOLDS", "true"
+).lower() in ("true", "1", "yes")
+
+# ─── Orphan position reaper ───────────────────────────────────
+# An orphan is a live position the bot found on the exchange but
+# didn't open itself. The reconciliation path creates a synthetic
+# paper trade so PnL accounting stays consistent, but the bot has
+# no thesis for these positions and never closes them. The reaper
+# is opt-in: set ``ORPHAN_REAPER_ENABLED=true`` to have it close
+# orphans past ``ORPHAN_REAPER_MAX_AGE_HOURS`` old. The break-even
+# gate (default on) holds positions whose mid-price is worse than
+# entry so the reaper doesn't realise losses on positions the
+# operator might want to manage manually.
+ORPHAN_REAPER_ENABLED = os.environ.get(
+    "ORPHAN_REAPER_ENABLED", "false"
+).lower() in ("true", "1", "yes")
+ORPHAN_REAPER_MAX_AGE_HOURS = _safe_env_float(
+    "ORPHAN_REAPER_MAX_AGE_HOURS", 24.0, lo=0.1, hi=720.0
+)
+ORPHAN_REAPER_REQUIRE_BREAKEVEN = os.environ.get(
+    "ORPHAN_REAPER_REQUIRE_BREAKEVEN", "true"
+).lower() in ("true", "1", "yes")
+
+# ─── Expected-value gate ──────────────────────────────────────
+# Replace confidence-only thresholds with a post-cost EV check. A signal
+# at modest confidence with 3R/1R asymmetry can clear; a signal at high
+# confidence with 1R/1R after fees+slippage+funding can be rejected.
+# Live trades additionally need the lower-confidence-bound positive.
+EV_GATE_ENABLED = os.environ.get("EV_GATE_ENABLED", "true").lower() in ("true", "1", "yes")
+EV_GATE_MIN_BPS = _safe_env_float("EV_GATE_MIN_BPS", 10.0, lo=0.0, hi=10_000.0)
+EV_GATE_MIN_COST_RATIO = _safe_env_float("EV_GATE_MIN_COST_RATIO", 1.5, lo=1.0, hi=10.0)
+EV_GATE_LIVE_SIGMA_MULT = _safe_env_float("EV_GATE_LIVE_SIGMA_MULT", 2.0, lo=0.0, hi=10.0)
+
+# ─── Trade-cost estimator ─────────────────────────────────────
+TRADE_COSTS_DEFAULT_HOLDING_HOURS = _safe_env_float(
+    "TRADE_COSTS_DEFAULT_HOLDING_HOURS", 24.0, lo=0.1, hi=720.0
+)
+TRADE_QUALITY_EXPECTED_SLIPPAGE_BPS = _safe_env_float(
+    "TRADE_QUALITY_EXPECTED_SLIPPAGE_BPS", 5.0, lo=0.0, hi=500.0
+)
+
+# ─── Data-readiness gate ──────────────────────────────────────
+# Reject signals whose data inputs are incomplete. Off-by-default
+# components (oi, source_health) are logged but don't block; the
+# required set blocks. Set DATA_READINESS_REQUIRED_COMPONENTS to a
+# comma-separated list to customise.
+DATA_READINESS_GATE_ENABLED = os.environ.get(
+    "DATA_READINESS_GATE_ENABLED", "true"
+).lower() in ("true", "1", "yes")
+DATA_READINESS_REQUIRED_COMPONENTS = os.environ.get(
+    "DATA_READINESS_REQUIRED_COMPONENTS",
+    "candles,funding,spread,feature_vector",
+)
+
+# ─── Calibration trend monitor ────────────────────────────────
+CALIBRATION_TREND_ENABLED = os.environ.get(
+    "CALIBRATION_TREND_ENABLED", "true"
+).lower() in ("true", "1", "yes")
+CALIBRATION_TREND_WINDOW_DAYS = int(
+    os.environ.get("CALIBRATION_TREND_WINDOW_DAYS", 3) or 3
+)
+CALIBRATION_TREND_DETERIORATION_BRIER_PER_DAY = _safe_env_float(
+    "CALIBRATION_TREND_DETERIORATION_BRIER_PER_DAY", 0.02, lo=0.0, hi=1.0
+)
+CALIBRATION_TREND_MIN_SAMPLES_PER_DAY = int(
+    os.environ.get("CALIBRATION_TREND_MIN_SAMPLES_PER_DAY", 5) or 5
+)
+CALIBRATION_TREND_DERISK_MULTIPLIER = _safe_env_float(
+    "CALIBRATION_TREND_DERISK_MULTIPLIER", 0.75, lo=0.1, hi=1.0
+)
 FIREWALL_MAX_SIGNALS_PER_SOURCE_PER_DAY = int(
     os.environ.get("FIREWALL_MAX_SIGNALS_PER_SOURCE_PER_DAY", 0)
 )
@@ -821,6 +1010,22 @@ FIREWALL_MAX_AGGREGATE_EXPOSURE = float(
 # positions at once".  Set to 0 to disable.
 FIREWALL_MAX_AGGREGATE_MARGIN_PCT = float(
     os.environ.get("FIREWALL_MAX_AGGREGATE_MARGIN_PCT", 0.60)
+)
+# FIREWALL_AGGREGATE_EXPOSURE_FLOOR_USD — absolute dollar floor for the
+# *leveraged-notional* aggregate cap.  FIREWALL_MAX_AGGREGATE_EXPOSURE scales
+# with balance, which structurally deadlocks a very small live wallet: 150%
+# of a $102 account is only $153 of leveraged notional, so a single mirrored
+# position blows it and every subsequent live entry is hard-rejected.  When
+# ``balance * FIREWALL_MAX_AGGREGATE_EXPOSURE`` falls below this floor the
+# floor is used instead, so a tiny account can still run its intended
+# positions.  This does NOT loosen real risk: the leverage-agnostic
+# FIREWALL_MAX_AGGREGATE_MARGIN_PCT cap (margin actually locked vs balance)
+# remains the true capital-at-risk control and binds first on a small wallet.
+# At normal balances the percentage cap already exceeds this floor so behavior
+# is unchanged (e.g. $10k paper -> 150% = $15k > $5k floor).  Set 0 to
+# disable the floor entirely (pure percentage cap, legacy behavior).
+FIREWALL_AGGREGATE_EXPOSURE_FLOOR_USD = float(
+    os.environ.get("FIREWALL_AGGREGATE_EXPOSURE_FLOOR_USD", 5000.0)
 )
 FIREWALL_BLOCK_LOSING_AVERAGING = _safe_env_bool(
     "FIREWALL_BLOCK_LOSING_AVERAGING", True
@@ -923,6 +1128,38 @@ SOURCE_POLICY_WARMUP_MAX_SIGNALS_PER_DAY = int(
 )
 SOURCE_POLICY_DEGRADED_MAX_SIGNALS_PER_DAY = int(
     os.environ.get("SOURCE_POLICY_DEGRADED_MAX_SIGNALS_PER_DAY", 1)
+)
+# Options-flow per-day cap graduation. Warmup/degraded fixed caps
+# throttle an options_flow directional source to ~1 signal/day until
+# it has a track record (prod 6h scan: 23 of 93 decisions rejected on
+# this cap). Once a source whose key starts with ``options_flow`` has
+# produced MORE THAN OPTIONS_FLOW_CAP_MIN_TRADES closed trades, its
+# per-day cap is lifted to OPTIONS_FLOW_GRADUATED_CAP. Never overrides
+# a paused/blocked source (hard safety stop stays hard).
+OPTIONS_FLOW_CAP_GRADUATION_ENABLED = os.environ.get(
+    "OPTIONS_FLOW_CAP_GRADUATION_ENABLED", "true"
+).lower() in ("true", "1", "yes")
+OPTIONS_FLOW_CAP_MIN_TRADES = int(
+    os.environ.get("OPTIONS_FLOW_CAP_MIN_TRADES", 3)
+)
+OPTIONS_FLOW_GRADUATED_CAP = int(
+    os.environ.get("OPTIONS_FLOW_GRADUATED_CAP", 4)
+)
+# Regime-aware LLM exhaustion guard. The exhaustion-trap block (no
+# shorting RSI<22 / no longing RSI>78) protects against reversal in
+# ranging/volatile/contra-regime contexts, but in a CONFIRMED strong
+# trend it inverts -- shorting RSI<22 while regime==TRENDING_DOWN is
+# trend continuation, the highest-conviction setup. A blanket hard
+# block there deadlocks the core strategy (observed: LLM pass_rate 4%,
+# 0 orders while the bot wanted to short a trending_down market). When
+# enabled, trend-aligned signals are de-risked (confidence *=
+# LLM_EXHAUSTION_TREND_ALIGNED_CONF_MULT) instead of hard-blocked;
+# non-aligned contexts keep the hard block.
+LLM_EXHAUSTION_REGIME_AWARE = os.environ.get(
+    "LLM_EXHAUSTION_REGIME_AWARE", "true"
+).lower() in ("true", "1", "yes")
+LLM_EXHAUSTION_TREND_ALIGNED_CONF_MULT = _safe_env_float(
+    "LLM_EXHAUSTION_TREND_ALIGNED_CONF_MULT", 0.85, lo=0.1, hi=1.0
 )
 SOURCE_POLICY_WARMUP_SIZE_MULTIPLIER = float(
     os.environ.get("SOURCE_POLICY_WARMUP_SIZE_MULTIPLIER", 0.75)
@@ -1108,6 +1345,13 @@ ARENA_HIGH_CONFIDENCE_THRESHOLD = float(
 )
 ARENA_UNVALIDATED_CONFIDENCE_CAP = float(
     os.environ.get("ARENA_UNVALIDATED_CONFIDENCE_CAP", 0.74)
+)
+# Total virtual capital allocated across all Alpha Arena agents. Per-agent share
+# is TOTAL / N_active. Default matches the paper trader starting balance so the
+# Arena scoreboard stays consistent with paper equity instead of inflating to
+# $90K against a $10K paper account.
+ARENA_TOTAL_POOL_USD = _safe_env_float(
+    "ARENA_TOTAL_POOL_USD", 10_000.0, lo=10.0, hi=10_000_000.0
 )
 
 # Options-flow conviction gate (0-100).
@@ -1315,8 +1559,8 @@ def _validate_config_bounds() -> None:
         ("PAPER_TRADING_STOP_LOSS_PCT", 0.001, 1.0, 0.15),
         ("PAPER_TRADING_TAKE_PROFIT_PCT", 0.001, 5.0, 0.75),
         ("LIVE_MIN_ORDER_USD", 10.0, 1_000_000.0, 11.0),
-        ("LIVE_MAX_ORDER_USD", 10.0, 1_000_000.0, 100.0),
-        ("LIVE_MAX_POSITION_SIZE_USD", 10.0, 10_000_000.0, 100.0),
+        ("LIVE_MAX_ORDER_USD", 10.0, 1_000_000.0, 150.0),
+        ("LIVE_MAX_POSITION_SIZE_USD", 10.0, 10_000_000.0, 150.0),
         ("LIVE_MAX_DAILY_LOSS_USD", 1.0, 10_000_000.0, 100.0),
         ("PORTFOLIO_TARGET_POSITIONS", 1, 100, 8),
         ("PORTFOLIO_HARD_MAX_POSITIONS", 1, 200, 10),
@@ -1338,6 +1582,7 @@ def _validate_config_bounds() -> None:
         # AUDIT M1 — leveraged notional and margin caps
         ("FIREWALL_MAX_AGGREGATE_EXPOSURE", 0.0, 20.0, 1.50),
         ("FIREWALL_MAX_AGGREGATE_MARGIN_PCT", 0.0, 5.0, 0.60),
+        ("FIREWALL_AGGREGATE_EXPOSURE_FLOOR_USD", 0.0, 10_000_000.0, 5000.0),
         ("SOURCE_POLICY_MIN_CLOSED_TRADES", 1, 1000, 3),
         ("SOURCE_POLICY_KEEP_TOP_N", 1, 1000, 5),
         ("SOURCE_POLICY_PAUSE_WEIGHT", 0.0, 1.0, 0.12),
@@ -1416,6 +1661,8 @@ def _validate_config_bounds() -> None:
         ("BOT_HARD_CUTOFF_TRADES", 1, 100_000, 100),
         ("BOT_THRESHOLD", 1, 100, 3),
         ("BOT_ELEVATED_FREQ", 1, 100_000, 50),
+        ("BOT_PERFECT_WINRATE", 0.50, 1.0, 0.98),
+        ("BOT_PERFECT_WINRATE_MIN_TRADES", 1, 100_000, 15),
         ("PORTFOLIO_CHURN_PENALTY", 0.0, 1.0, 0.02),
         ("PORTFOLIO_MIN_HOLD_MINUTES", 0, 525_600, 60),
         ("ROTATION_SHADOW_MODE_DAYS", 0, 365, 7),
@@ -1449,7 +1696,7 @@ def _validate_config_bounds() -> None:
         ("REGIME_REVERSAL_MAX_ACTIONS_PER_COIN_PER_DAY", 0, 100, 2),
         ("REGIME_REVERSAL_TIGHTEN_STOP_R_MULTIPLE", 0.01, 2.0, 0.35),
         ("REGIME_REVERSAL_REVERSE_POSITION_PCT", 0.001, 0.50, 0.03),
-        ("COPY_TRADER_MAX_CONCURRENT_TRADES", 0, 100, 2),
+        ("COPY_TRADER_MAX_CONCURRENT_TRADES", 0, 100, 5),
         ("COPY_TRADER_MAX_NEW_TRADES_PER_CYCLE", 0, 100, 1),
         ("COPY_TRADER_AUTO_PAUSE_MIN_CLOSED_TRADES", 1, 5_000, 6),
         ("COPY_TRADER_AUTO_PAUSE_DEGRADE_WIN_RATE", 0.0, 1.0, 0.40),
@@ -1505,6 +1752,7 @@ def _validate_config_bounds() -> None:
         ("RISK_POLICY_SHORT_CAUTION_BREAKEVEN_AT_R", 0.1, 5.0, 0.65),
         ("ARENA_HIGH_CONFIDENCE_THRESHOLD", 0.0, 1.0, 0.80),
         ("ARENA_UNVALIDATED_CONFIDENCE_CAP", 0.0, 1.0, 0.74),
+        ("ARENA_TOTAL_POOL_USD", 10.0, 10_000_000.0, 10_000.0),
         ("READINESS_STALE_SECONDS", 30, 86_400, 600),
         ("READINESS_DB_WRITE_TTL_S", 1, 3_600, 60),
         ("READINESS_ALERT_COOLDOWN_S", 30, 86_400, 900),

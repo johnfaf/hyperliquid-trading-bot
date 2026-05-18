@@ -14,8 +14,17 @@ import src.discovery.trader_discovery as td
 
 
 def _fill(*, dir_: str, closed_pnl: float, fee: float = 0.0) -> dict:
-    """Hyperliquid-shaped fill record."""
+    """RAW Hyperliquid-shaped fill record (camelCase, as the public API
+    returns it before normalization)."""
     return {"dir": dir_, "closedPnl": closed_pnl, "fee": fee}
+
+
+def _norm_fill(*, dir_: str, closed_pnl: float, fee: float = 0.0) -> dict:
+    """NORMALIZED fill record -- the shape ``hl.get_user_fills`` actually
+    returns in production (snake_case ``direction``/``closed_pnl``).  The
+    profitability filter MUST handle this shape; a regression here silently
+    scores net_pnl = -fees for every real trader and inverts the gate."""
+    return {"direction": dir_, "closed_pnl": closed_pnl, "fee": fee}
 
 
 def test_evaluate_profitability_window_marks_winning_trader_profitable():
@@ -41,6 +50,26 @@ def test_evaluate_profitability_window_marks_winning_trader_profitable():
         )
     assert verdict["verdict"] == "profitable"
     assert verdict["trades"] >= 6
+    assert verdict["net_pnl"] > 0
+
+
+def test_evaluate_profitability_window_handles_normalized_production_shape():
+    """REGRESSION: production ``hl.get_user_fills`` returns NORMALIZED fills
+    (``direction``/``closed_pnl``), not the raw ``dir``/``closedPnl``. The
+    filter previously read only the raw keys, so every real trader scored
+    net_pnl = -fees and was wrongly rejected as 'unprofitable', leaving the
+    discovery pool full of thin/dormant 0%-ROI accounts. A clearly winning
+    trader in the NORMALIZED shape must be graded 'profitable'."""
+    fills = [
+        _norm_fill(dir_="Open Long", closed_pnl=-0.01, fee=0.01),
+        _norm_fill(dir_="Close Long", closed_pnl=3.00, fee=0.02),
+    ] * 12  # 12 closing fills of +$3 each, well above min_trades
+    with patch.object(td.hl, "get_user_fills", return_value=fills):
+        verdict = td.evaluate_trader_profitability_window(
+            "0x" + "c" * 40, window_days=90, min_trades=10, min_net_pnl_usd=0.0,
+        )
+    assert verdict["verdict"] == "profitable", verdict
+    assert verdict["trades"] >= 10
     assert verdict["net_pnl"] > 0
 
 

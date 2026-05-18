@@ -135,8 +135,16 @@ class PaperTrader:
                 metadata=metadata or {},
             )
             decision_journal.record_decision_outcome(decision_id)
-        except Exception:
-            pass
+        except Exception as exc:
+            # Surfacing the failure (was silent ``pass``). decision_outcomes
+            # rows are the calibration ground truth -- if these writes are
+            # failing in production we need to see it in logs, not have it
+            # show up later as an empty calibration table.
+            logger.debug(
+                "decision_outcomes write skipped for decision_id=%s: %s",
+                decision_id,
+                exc,
+            )
 
     def _ensure_account(self):
         """Initialize paper trading account if it doesn't exist."""
@@ -474,8 +482,47 @@ class PaperTrader:
             return expected * 10_000.0
         return expected
 
+    @staticmethod
+    def _firewall_ev(trade_signal: TradeSignal):
+        """Return (ev_bps, cost_bps) from the firewall EV gate, or None.
+
+        The firewall's expected-value gate runs in the prescreen BEFORE
+        this quality gate and attaches its breakdown to
+        ``signal.context["ev_breakdown"]``. That EV uses real TP/SL
+        R-multiples + the calibrated p_win -- a principled number. The
+        legacy confidence proxy below structurally collapses to ~0bps
+        whenever calibration is in cold-start (confidence pinned at the
+        0.50 prior), which silently vetoed every regime-aligned signal
+        the firewall EV gate had already accepted. Single source of EV
+        truth.
+        """
+        ctx = getattr(trade_signal, "context", None)
+        if not isinstance(ctx, dict):
+            return None
+        ev = ctx.get("ev_breakdown")
+        if not isinstance(ev, dict):
+            return None
+        try:
+            return float(ev.get("ev_bps")), float(ev.get("cost_bps", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            return None
+
     def _estimate_signal_edge_bps(self, trade_signal: TradeSignal, sig: Dict) -> float:
         context = dict(getattr(trade_signal, "context", {}) or {})
+        # Prefer the firewall EV gate's already-computed expected value.
+        if bool(getattr(config, "TRADE_QUALITY_USE_FIREWALL_EV", True)):
+            fw = self._firewall_ev(trade_signal)
+            if fw is not None:
+                ev_bps, ev_cost = fw
+                # ev_bps is net of cost; the quality gate compares edge
+                # against minimum = cost * mult, so add cost back to a
+                # gross edge to keep that comparison meaningful.
+                edge_bps = ev_bps + ev_cost
+                if sig.get("volume_confirmed"):
+                    edge_bps += 5.0
+                if sig.get("options_flow_aligned"):
+                    edge_bps += 5.0
+                return round(edge_bps, 4)
         expected_return = (
             sig.get("expected_return")
             or context.get("expected_return")
@@ -511,11 +558,23 @@ class PaperTrader:
         )
         side = str(sig.get("side", "") or "").lower()
         confidence = float(trade_signal.confidence or 0.0)
+        # A solidly-positive firewall EV is stronger evidence than a
+        # volume tick -- treat it as confirmation so cold-start (conf
+        # pinned at 0.50) doesn't deadlock every regime-aligned short.
+        firewall_ev_ok = False
+        if bool(getattr(config, "TRADE_QUALITY_USE_FIREWALL_EV", True)):
+            fw = self._firewall_ev(trade_signal)
+            if fw is not None and fw[0] > 0.0:
+                firewall_ev_ok = True
         if (
             bool(getattr(config, "TRADE_QUALITY_STRONG_SHORT_CONFIRMATION", True))
             and side == "short"
             and confidence < float(getattr(config, "TRADE_QUALITY_SHORT_MIN_CONFIDENCE", 0.55) or 0.55)
-            and not (sig.get("volume_confirmed") or sig.get("options_flow_aligned"))
+            and not (
+                sig.get("volume_confirmed")
+                or sig.get("options_flow_aligned")
+                or firewall_ev_ok
+            )
         ):
             return False, {
                 "reason": "short_lacks_confirmation",
@@ -629,11 +688,48 @@ class PaperTrader:
         mids = hl.get_all_mids() or {}
         self._annotate_open_trades(open_trades, mids)
 
-        # Pre-compute features for relevant coins if feature engine available
+        # Pre-compute features for the coins this cycle's strategies
+        # actually target -- not a hardcoded BTC/ETH/SOL set. Core coins
+        # are always included (regime / correlation context). Capped so
+        # a large strategy fan-out doesn't hammer the candle API.
+        feature_coins: List[str] = ["BTC", "ETH", "SOL"]
+        try:
+            import json as _json
+            _core = {"BTC", "ETH", "SOL"}
+            _extra: set = set()
+            for _strat in strategies or []:
+                _params = _strat.get("parameters", {})
+                if isinstance(_params, str):
+                    try:
+                        _params = _json.loads(_params)
+                    except (ValueError, TypeError):
+                        _params = {}
+                _pre = str(_strat.get("_decision_coin", "") or "").strip().upper()
+                if _pre and _pre != "UNKNOWN":
+                    _extra.add(_pre)
+                _coins = (
+                    _params.get("coins")
+                    or _params.get("coins_traded")
+                    or _params.get("coin")
+                    or []
+                )
+                if isinstance(_coins, str):
+                    _coins = [_coins]
+                for _c in _coins:
+                    _cu = str(_c or "").strip().upper()
+                    if _cu and _cu != "UNKNOWN":
+                        _extra.add(_cu)
+            _cap = max(3, int(getattr(config, "PAPER_FEATURE_PRECOMPUTE_MAX_COINS", 12)))
+            feature_coins = ["BTC", "ETH", "SOL"] + sorted(_extra - _core)
+            feature_coins = feature_coins[:_cap]
+        except Exception as exc:
+            logger.debug("Feature coin-set resolution failed, using core: %s", exc)
+            feature_coins = ["BTC", "ETH", "SOL"]
+
         coin_features = {}
         if self.feature_engine:
             try:
-                for coin in set(["BTC", "ETH", "SOL"]):
+                for coin in feature_coins:
                     try:
                         # Fetch candles for feature computation
                         from src.core.api_manager import get_manager, Priority
@@ -716,10 +812,29 @@ class PaperTrader:
                         signal["confidence"] = min(signal["confidence"] * 1.15, 1.0)
                         logger.debug(f"Features confirm {signal['side']} {coin}")
 
-                    # Add feature context to signal
+                    # Add feature context to signal.
+                    # NOTE: keys MUST align with
+                    # ``trade_memory.SIMILARITY_FEATURES`` (also used by
+                    # the data-readiness gate). The previous version only
+                    # copied rsi_signal/volume_trend/funding_signal --
+                    # none of which are in SIMILARITY_FEATURES -- so the
+                    # similarity vector and the readiness check saw at
+                    # most 2 usable keys and rejected every signal as
+                    # ``feature_vector_sparse``. The FeatureVector already
+                    # computes all of these; we just have to copy the
+                    # right ones.
                     signal["features"] = {
                         "overall_score": feat.overall_score,
                         "rsi": feat.rsi,
+                        "trend_strength": feat.trend_strength,
+                        "volatility": feat.volatility,
+                        "volume_ratio": feat.volume_ratio,
+                        "momentum_score": feat.momentum_score,
+                        "bollinger_position": feat.bollinger_position,
+                        "funding_rate": feat.funding_rate,
+                        # Signal-derived extras kept for other consumers
+                        # (dashboards, risk policy) -- harmless to the
+                        # similarity/readiness checks.
                         "rsi_signal": feat.rsi_signal,
                         "volume_trend": feat.volume_trend,
                         "funding_signal": feat.funding_signal,
@@ -738,8 +853,16 @@ class PaperTrader:
                             continue
                         signal["confidence"] = signal.get("confidence", 0.5) * (0.5 + vol_confidence * 0.5)
                         signal["volume_confirmed"] = True
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        # Don't let an errored confirmation masquerade as
+                        # "confirmed". Mark explicitly unconfirmed + log so
+                        # a broken volume feed is visible, not silent.
+                        signal["volume_confirmed"] = False
+                        logger.debug(
+                            "CONFIRM volume_confirmation errored for %s %s "
+                            "(treating as unconfirmed): %s",
+                            signal.get("side"), signal.get("coin"), e,
+                        )
 
                 # Options flow confirmation
                 if options_scanner:
@@ -754,8 +877,13 @@ class PaperTrader:
                             else:
                                 signal["confidence"] = signal.get("confidence", 0.5) * 0.7
                                 signal["options_flow_aligned"] = False
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        signal["options_flow_aligned"] = False
+                        logger.debug(
+                            "CONFIRM options_flow errored for %s %s "
+                            "(treating as not-aligned): %s",
+                            signal.get("side"), signal.get("coin"), e,
+                        )
 
                 # Attach strategy reference
                 signal["strategy"] = strategy
@@ -864,6 +992,50 @@ class PaperTrader:
                         status="approved",
                         metadata={"ignore_position_limit": True},
                     )
+                    # Update the candidate snapshot so it doesn't sit at
+                    # ``firewall_decision=pending`` forever. Without this,
+                    # every signal that passes the dry-run prescreen and
+                    # then drops out further downstream (rotation cap,
+                    # arena reject, ev gate, etc.) leaves a stale
+                    # "pending" row that pollutes every per-source/per-
+                    # bucket query.
+                    decision_id = self._decision_id_for_signal(trade_signal, sig)
+                    if decision_id:
+                        try:
+                            decision_journal.update_decision_status(
+                                decision_id,
+                                final_status="firewall_prescreen_approved",
+                                firewall_decision="approved",
+                                metadata={"stage": "paper_trader_prescreen"},
+                            )
+                        except Exception as exc:
+                            logger.debug(
+                                "Prescreen-approved snapshot update failed for %s: %s",
+                                decision_id,
+                                exc,
+                            )
+                        # Persist the firewall's EV math so the why-enter
+                        # dashboard can show the post-cost edge calc that
+                        # drove this decision (the firewall ran in
+                        # dry_run, so its own journal write was skipped).
+                        ev_ctx = None
+                        try:
+                            ctx = getattr(trade_signal, "context", None)
+                            if isinstance(ctx, dict):
+                                ev_ctx = ctx.get("ev_breakdown")
+                        except Exception:
+                            ev_ctx = None
+                        if ev_ctx:
+                            try:
+                                decision_journal.update_decision_ev_breakdown(
+                                    decision_id, ev_ctx
+                                )
+                            except Exception as exc:
+                                logger.debug(
+                                    "EV-breakdown snapshot update failed for %s: %s",
+                                    decision_id,
+                                    exc,
+                                )
                     logger.debug(f"Firewall approved {sig['side']} {sig['coin']} "
                                 f"(confidence={trade_signal.confidence:.0%})")
                 else:
@@ -945,6 +1117,22 @@ class PaperTrader:
                             logger.debug(f"Calibration adjust {sig['coin']}: "
                                        f"{trade_signal.confidence:.2f} -> {adjusted:.2f}")
                         trade_signal.confidence = adjusted
+                        # Push the post-calibration value back to the
+                        # snapshot so the calibrated_confidence column
+                        # reflects what the gate actually saw, not the
+                        # pre-adjustment raw score.
+                        decision_id = self._decision_id_for_signal(trade_signal, sig)
+                        if decision_id:
+                            try:
+                                decision_journal.update_calibrated_confidence(
+                                    decision_id, trade_signal.confidence
+                                )
+                            except Exception as exc:
+                                logger.debug(
+                                    "calibrated_confidence snapshot update "
+                                    "failed for %s: %s",
+                                    decision_id, exc,
+                                )
                         composed_key = compose_calibration_key(
                             source_key, cal_side, cal_regime
                         )
@@ -1969,8 +2157,12 @@ class PaperTrader:
         if self.firewall:
             try:
                 self.firewall.record_trade_outcome(trade["coin"], pnl)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(
+                    "LEARN-WRITE firewall.record_trade_outcome failed "
+                    "(coin=%s trade=%s): %s",
+                    trade.get("coin"), trade.get("id"), e,
+                )
 
         if self.kelly_sizer:
             try:
@@ -1981,8 +2173,12 @@ class PaperTrader:
                     size=trade["size"],
                     leverage=trade.get("leverage", 1),
                 )
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(
+                    "LEARN-WRITE kelly_sizer.record_outcome failed "
+                    "(source=%s trade=%s): %s",
+                    source_key, trade.get("id"), e,
+                )
 
         if self.calibration:
             try:
@@ -1996,8 +2192,17 @@ class PaperTrader:
                     side=trade["side"],
                     regime=_bucket_regime(trade_meta.get("regime") or trade.get("regime")),
                 )
-            except Exception:
-                pass
+            except Exception as e:
+                # Calibration is the ground truth the EV / bucketed-
+                # threshold gates learn from. A silent failure here is
+                # exactly the class of bug that starved the calibration
+                # tables -- surface it.
+                logger.warning(
+                    "LEARN-WRITE calibration.record FAILED "
+                    "(source=%s coin=%s side=%s trade=%s): %s",
+                    source_key, trade.get("coin"), trade.get("side"),
+                    trade.get("id"), e,
+                )
 
         if self.trade_memory:
             try:
@@ -2018,8 +2223,12 @@ class PaperTrader:
                     setup_type=trade_meta.get("setup_type", strategy_type),
                     features=trade_meta.get("features", {}),
                 )
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(
+                    "LEARN-WRITE trade_memory.record_trade failed "
+                    "(coin=%s trade=%s): %s",
+                    trade.get("coin"), trade.get("id"), e,
+                )
 
         if self.shadow_tracker:
             try:
@@ -2073,6 +2282,20 @@ class PaperTrader:
             pass
         self._closed_events.append(closed_event)
         decision_id = str(trade_meta.get("decision_id") or trade.get("decision_id") or "").strip()
+        if not decision_id:
+            # Silent skip here is the most likely root cause of an empty
+            # decision_outcomes table -- if signal->trade plumbing didn't
+            # carry a decision_id through, every close is uncalibratable.
+            # Logging the gap (debug-level so it doesn't spam in normal
+            # operation) lets ops see exactly which trades are slipping
+            # through without outcome rows.
+            logger.debug(
+                "decision_outcomes skipped at close: trade %s (coin=%s, "
+                "close_reason=%s) had no decision_id in trade or metadata",
+                trade.get("id", "?"),
+                trade.get("coin", "?"),
+                close_reason,
+            )
         if decision_id:
             hold_minutes = None
             try:
@@ -2124,8 +2347,18 @@ class PaperTrader:
                         },
                     },
                 )
-            except Exception:
-                pass
+            except Exception as exc:
+                # Was silent ``pass``. decision_outcomes is the ground truth
+                # for calibration; if the close-time write keeps failing
+                # we need to see why in logs.
+                logger.debug(
+                    "decision_outcomes close-write skipped for decision_id=%s "
+                    "(coin=%s, close_reason=%s): %s",
+                    decision_id,
+                    trade.get("coin", "?"),
+                    close_reason,
+                    exc,
+                )
         return closed_event
 
     def drain_closed_events(self) -> List[Dict]:

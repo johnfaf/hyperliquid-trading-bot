@@ -90,6 +90,64 @@ def _read_calibration_quarantines() -> List[Dict[str, Any]]:
     return rows
 
 
+def _loads(raw: Any) -> Dict[str, Any]:
+    if isinstance(raw, dict):
+        return dict(raw)
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+        return dict(parsed) if isinstance(parsed, dict) else {}
+    except Exception:
+        return {}
+
+
+def _build_why(metadata: Dict[str, Any], decision: Dict[str, Any]) -> Dict[str, Any]:
+    """Flatten the snapshot metadata into a compact why-enter/why-reject view.
+
+    The snapshot's metadata carries ``why_entered`` / ``market_read`` /
+    ``risk_and_sizing`` / ``ev_breakdown`` (written by
+    ``decision_journal._decision_reason_metadata``). This shapes them
+    into the few fields the dashboard actually renders so the template
+    stays dumb.
+    """
+    why = metadata.get("why_entered") or {}
+    market = metadata.get("market_read") or {}
+    risk = metadata.get("risk_and_sizing") or {}
+    ev = metadata.get("ev_breakdown") or {}
+
+    final_status = str(decision.get("final_status") or "").lower()
+    is_reject = "reject" in final_status or bool(decision.get("rejection_reason"))
+
+    return {
+        "verdict": "REJECT" if is_reject else (final_status.upper() or "—"),
+        "rejection_reason": decision.get("rejection_reason") or why.get("rejection_reason") or "",
+        "signal_reason": why.get("signal_reason") or "",
+        "strategy_type": why.get("strategy_type") or "",
+        "regime": market.get("overall_regime") or "",
+        "regime_confidence": market.get("overall_confidence"),
+        "countertrend_block_side": market.get("countertrend_block_side") or "",
+        "market_side_alignment": market.get("market_side_alignment"),
+        "ev": {
+            "ev_bps": ev.get("ev_bps"),
+            "sigma_bps": ev.get("sigma_bps"),
+            "p_win": ev.get("p_win"),
+            "p_win_source": ev.get("p_win_source"),
+            "avg_win_bps": ev.get("avg_win_bps"),
+            "avg_loss_bps": ev.get("avg_loss_bps"),
+            "cost_bps": ev.get("cost_bps"),
+        } if ev else {},
+        "risk": {
+            "leverage": risk.get("leverage"),
+            "position_pct": risk.get("position_pct"),
+            "entry_price": risk.get("entry_price"),
+            "risk_policy": risk.get("risk_policy") or {},
+        },
+        "source_health": market.get("source_health") or {},
+        "has_ev": bool(ev),
+    }
+
+
 def _read_decisions(decision_id: Optional[str], status: Optional[str], limit: int) -> List[Dict[str, Any]]:
     try:
         from src.data import database as db
@@ -99,7 +157,9 @@ def _read_decisions(decision_id: Optional[str], status: Optional[str], limit: in
     limit = max(1, min(int(limit or _MAX_DECISIONS), 500))
     sql_parts = [
         "SELECT decision_id, created_at, coin, side, source, source_key, "
-        "raw_confidence, calibrated_confidence, final_status, rejection_reason "
+        "raw_confidence, calibrated_confidence, final_status, rejection_reason, "
+        "regime, entry_price, proposed_sl_price, proposed_tp_price, "
+        "proposed_size_usd, proposed_leverage, metadata "
         "FROM decision_snapshots"
     ]
     where_clauses: List[str] = []
@@ -125,6 +185,8 @@ def _read_decisions(decision_id: Optional[str], status: Optional[str], limit: in
     for row in rows:
         d = dict(row) if not isinstance(row, dict) else row
         d["kind"] = "decision"
+        metadata = _loads(d.pop("metadata", None))
+        d["why"] = _build_why(metadata, d)
         out.append(d)
     return out
 

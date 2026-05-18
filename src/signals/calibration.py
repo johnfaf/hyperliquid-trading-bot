@@ -143,6 +143,17 @@ class CalibrationTracker:
             if isotonic_min_outcomes is not None
             else getattr(config, "CALIBRATION_ISOTONIC_MIN_OUTCOMES", _DEFAULT_ISOTONIC_MIN)
         )
+        # When True (default), the bucketed-threshold floor does NOT
+        # invent a cold-start confidence tax above the operator's
+        # min_confidence when there is simply no per-bucket evidence
+        # (no-data / thin / global-fallback). Absence of evidence is
+        # not evidence of badness -- a *measured* bad-ECE bucket still
+        # hard-quarantines. The cold-start risk control is the
+        # leverage clamp + reduced size + positive-EV requirement, not
+        # a redundant confidence tax that deadlocks bootstrap.
+        self.coldstart_uses_global_min = bool(
+            getattr(config, "CALIBRATION_COLDSTART_USES_GLOBAL_MIN", True)
+        )
         self.quarantine_ece = float(
             quarantine_ece
             if quarantine_ece is not None
@@ -545,6 +556,104 @@ class CalibrationTracker:
         self._curve_cache[source_key] = curve
         self._curve_size_at_fit[source_key] = total
         return curve
+
+    def get_bucketed_min_confidence(
+        self,
+        source_key: str,
+        *,
+        side: Optional[str] = None,
+        regime: Optional[str] = None,
+        global_min: float = 0.40,
+    ) -> Tuple[float, str]:
+        """Return ``(threshold, reason)`` for a (source, side, regime) bucket.
+
+        Asymmetric on purpose: this method can *raise* the global
+        ``min_confidence`` floor for a noisy or thin bucket, but never
+        lowers it. A well-calibrated bucket gets the global default;
+        a miscalibrated bucket gets a tighter (higher) gate; an
+        unknown bucket falls back to whichever parent has data.
+
+        Resolution chain (most-specific first):
+          1. ``(source | side | regime)``
+          2. ``(source | side | any)``
+          3. ``(source | * | any)``
+          4. Legacy raw ``source_key``
+          5. ``"global"``
+
+        Rules applied to the resolved bucket:
+          * No data / thin / global-fallback → ``global_min`` (the
+            operator floor) when ``coldstart_uses_global_min`` (default);
+            absence of evidence is not evidence of badness. Set the knob
+            false to restore the old ``max(global_min, coldstart_prior)``
+            cold-start tax.
+          * ECE >= ``quarantine_ece`` → high threshold (effectively
+            block: ``max(global_min, 0.95)``) — measured bad bucket.
+          * ECE >= ``quarantine_ece * 0.6`` → mid threshold
+            (``max(global_min, 0.55)``) — measured shaky bucket.
+          * Otherwise → ``global_min``.
+        """
+        global_floor = float(global_min)
+        # Cold-start / no-evidence floor. When coldstart_uses_global_min
+        # is set we do NOT raise above the operator's configured
+        # min_confidence just because a bucket lacks data -- that
+        # invented tax deadlocks bootstrap (signals at ~0.4x cold-start
+        # confidence with strongly +EV regime-aligned setups were all
+        # rejected as "below bucket floor 50%"). Measured bad-ECE
+        # buckets still hard-quarantine below.
+        coldstart = (
+            global_floor
+            if self.coldstart_uses_global_min
+            else float(max(global_floor, self.coldstart_prior))
+        )
+
+        resolved = self._resolve_key(source_key, side=side, regime=regime)
+        total = self._source_total(resolved)
+        if total <= 0:
+            # No data at the most-specific bucket; try walking up the
+            # chain explicitly so we don't silently fall back to global.
+            for fallback in (
+                compose_calibration_key(source_key, side, _REGIME_ANY),
+                compose_calibration_key(source_key, None, _REGIME_ANY),
+                "global",
+            ):
+                if self._source_total(fallback) > 0:
+                    resolved = fallback
+                    total = self._source_total(fallback)
+                    break
+        if total <= 0:
+            return coldstart, f"coldstart_no_data:{resolved}"
+        if total < self.min_outcomes:
+            return coldstart, f"coldstart_thin:{resolved}|n={total:.0f}"
+
+        ece = self.get_ece(resolved)
+        if ece is None:
+            return coldstart, f"coldstart_no_ece:{resolved}"
+
+        # Critical: only apply *quarantine* (effective-block) to specific
+        # (source, side, regime) buckets, never to the ``global``
+        # fallback. The global bucket aggregates every source; a high
+        # ECE there means "some sources are miscalibrated", not "every
+        # source must be blocked". If we hit the global bucket here it
+        # means we couldn't find a specific bucket with data -- the
+        # right response is cold-start caution (raise to coldstart
+        # prior), not quarantine. Without this carve-out the gate
+        # locks the bot into its existing positions whenever overall
+        # calibration is shaky -- exactly the asymmetric short-only
+        # behaviour we saw in production on 2026-05-14.
+        is_global_fallback = resolved == "global"
+
+        if ece >= self.quarantine_ece and not is_global_fallback:
+            high = max(global_floor, 0.95)
+            return high, f"quarantine_high_ece:{resolved}|ece={ece:.3f}"
+        if ece >= self.quarantine_ece * 0.6 and not is_global_fallback:
+            mid = max(global_floor, 0.55)
+            return mid, f"caution_mid_ece:{resolved}|ece={ece:.3f}"
+        if is_global_fallback and ece >= self.quarantine_ece * 0.6:
+            # Global is shaky but we have no source-specific evidence;
+            # require coldstart-level confidence rather than a hard block.
+            return coldstart, f"global_fallback_caution:{resolved}|ece={ece:.3f}"
+
+        return global_floor, f"healthy:{resolved}|ece={ece:.3f}|n={total:.0f}"
 
     def get_reliability_multiplier(self, source_key: str = "global") -> float:
         """Return a confidence-derisk multiplier based on calibration error.

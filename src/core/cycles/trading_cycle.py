@@ -699,10 +699,71 @@ def _train_rl_sizer_if_due(container):
 
 
 def _execute_signal_live(container, trade_signal, source_label: str, bypass_firewall: bool = True):
-    """Execute a TradeSignal directly on the live trader and log the outcome."""
+    """Execute a TradeSignal directly on the live trader and log the outcome.
+
+    Note: this is the direct-to-live path used by LCRS, Options Flow, and
+    Alpha Arena -- it bypasses both the paper executor and (by default)
+    the DecisionFirewall. Without the safety brakes below it would skip
+    every gate added for the paper->live mirror path. The funding-
+    divergence and unknown-source gates are applied here too because
+    they're cheap, asymmetric (only block), and the same risks apply
+    regardless of which path the signal came in on. Promotion gate is
+    *not* applied here because LCRS/options/arena don't have the same
+    strategy_id/agent_score tracking model as paper-mirror trades.
+    """
     trader = getattr(container, "live_trader", None)
     if not trader or not is_live_trading_active(container):
         return None
+
+    # Funding-divergence safety brake -- block longs into crowded
+    # selloffs / shorts into crowded rallies regardless of source.
+    try:
+        from src.signals.funding_divergence import should_block_side
+        side_val = (
+            trade_signal.side.value
+            if hasattr(trade_signal.side, "value")
+            else str(trade_signal.side)
+        )
+        block, reason = should_block_side(side_val)
+        if block:
+            logger.warning(
+                "  LIVE %s blocked by funding-divergence brake: %s %s (%s)",
+                source_label,
+                side_val.upper(),
+                trade_signal.coin,
+                reason,
+            )
+            return None
+    except Exception as exc:
+        logger.debug("Funding-divergence check failed for %s (fail-open): %s", source_label, exc)
+
+    # Unknown-source gate -- mirror the firewall check at the direct
+    # live path so an untagged signal can't slip past via this shortcut.
+    try:
+        from src.signals.decision_firewall import DecisionFirewall
+        source = getattr(trade_signal, "source", None)
+        if hasattr(source, "value"):
+            source = source.value
+        key = str(source or "unknown").strip().lower() or "unknown"
+        strategy_type = str(getattr(trade_signal, "strategy_type", "") or "").strip().lower()
+        if key == "copy_trade":
+            trader_addr = str(getattr(trade_signal, "trader_address", "") or "").strip().lower()
+            source_key = f"{key}:{trader_addr}" if trader_addr else key
+        elif strategy_type:
+            source_key = f"{key}:{strategy_type}"
+        else:
+            source_key = key
+        if DecisionFirewall._is_unknown_source_key(source_key):
+            logger.warning(
+                "  LIVE %s blocked by unknown-source gate: %s %s (source_key=%s)",
+                source_label,
+                trade_signal.side.value.upper() if hasattr(trade_signal.side, "value") else trade_signal.side,
+                trade_signal.coin,
+                source_key,
+            )
+            return None
+    except Exception as exc:
+        logger.debug("Unknown-source check failed for %s (fail-open): %s", source_label, exc)
 
     try:
         result = trader.execute_signal(trade_signal, bypass_firewall=bypass_firewall)
@@ -1211,8 +1272,15 @@ def _run_liquidation_scan(container, regime_data):
                                 lcrs_features["funding_rate"] = float(asset_ctx.get("funding", 0))
                                 lcrs_features["oi_change"] = float(asset_ctx.get("openInterest", 0)) * 0.01
                                 break
-                except Exception:
-                    pass
+                except Exception as e:
+                    # Incomplete LCRS features here -> the data-readiness
+                    # gate later rejects this signal for missing
+                    # feature_vector. Log so the rejection is traceable
+                    # to this root cause, not just its symptom.
+                    logger.debug(
+                        "LCRS funding/oi fetch failed for %s "
+                        "(features will be partial): %s", coin, e,
+                    )
 
                 # Feature engine enrichment
                 if container.feature_engine:
@@ -1244,8 +1312,12 @@ def _run_liquidation_scan(container, regime_data):
                                 lcrs_features["price_change"] = (
                                     (candles[-1]["close"] - candles[-8]["close"]) / candles[-8]["close"]
                                 )
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.debug(
+                            "LCRS feature-engine enrichment failed for %s "
+                            "(features will be partial -> may be rejected "
+                            "by data-readiness gate): %s", coin, e,
+                        )
 
                 sig = container.liquidation_strategy.generate_signal(coin, lcrs_features, price)
                 if sig:
@@ -1283,7 +1355,7 @@ def _run_cross_venue_confirmation(container, top_strategies):
                     params = json.loads(params)
                 except (json.JSONDecodeError, TypeError):
                     params = {}
-            coins = params.get("coins", params.get("coins_traded", []))
+            coins = params.get("coins") or params.get("coins_traded") or params.get("coin") or []
             if isinstance(coins, str):
                 coins = [coins]
             coin = coins[0] if coins else ""
@@ -1310,7 +1382,7 @@ def _run_cross_venue_confirmation(container, top_strategies):
                         params = json.loads(params)
                     except (json.JSONDecodeError, TypeError):
                         params = {}
-                coins = params.get("coins", params.get("coins_traded", []))
+                coins = params.get("coins") or params.get("coins_traded") or params.get("coin") or []
                 if isinstance(coins, str):
                     coins = [coins]
                 coin = coins[0] if coins else ""
@@ -1568,6 +1640,11 @@ def _execute_options_flow_trades(container, regime_data):
                     flow_signal, regime_data=regime_data,
                     open_positions=get_execution_open_positions(container),
                     account_balance=live_account_value if live_active else None,
+                    # Live options-flow is a direct live entry: force the
+                    # exposure/margin caps onto the real live wallet and
+                    # refuse (rather than fall back to the ~$10k paper
+                    # balance) if the live balance is unavailable.
+                    require_live_balance=live_active,
                 )
                 if not passed:
                     logger.info("  Firewall rejected options flow %s: %s", conv["ticker"], reason)
@@ -1771,8 +1848,12 @@ def _process_closed_trades(container, closed):
                         size=max(size, 1e-8),
                         leverage=max(leverage, 1),
                     )
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug(
+                        "LEARN-WRITE kelly_sizer.record_outcome failed "
+                        "(key=%s coin=%s): %s",
+                        kelly_key, c_trade.get("coin"), e,
+                    )
 
             # AgentScorer outcome
             if container.agent_scorer:
@@ -1780,10 +1861,24 @@ def _process_closed_trades(container, closed):
                     signal_id = meta.get("signal_id", "")
                     if signal_id:
                         container.agent_scorer.record_outcome(source_key, signal_id, pnl, return_pct)
-                except Exception:
-                    pass
-        except Exception:
-            pass
+                except Exception as e:
+                    logger.debug(
+                        "LEARN-WRITE agent_scorer.record_outcome failed "
+                        "(source=%s coin=%s): %s",
+                        source_key, c_trade.get("coin"), e,
+                    )
+        except Exception as e:
+            # Umbrella over the whole closed-trade learning update
+            # (arena / shadow / kelly / agent_scorer). A throw here
+            # silently drops every learning signal for this trade --
+            # the broadest version of the data-loss class.
+            logger.warning(
+                "LEARN-WRITE closed-trade outcome processing FAILED "
+                "(coin=%s id=%s): %s",
+                c_trade.get("coin") if isinstance(c_trade, dict) else "?",
+                c_trade.get("id") if isinstance(c_trade, dict) else "?",
+                e,
+            )
 
 
 def _run_alpha_arena(container, regime_data):
