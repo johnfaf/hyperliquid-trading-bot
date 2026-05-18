@@ -140,6 +140,10 @@ class RegimeDetector:
         self._cache_ts: Dict[str, float] = {}
         self._history: Dict[str, List[RegimeState]] = defaultdict(list)
         self.CACHE_TTL = 120  # 2 minutes
+        # #7 regime hysteresis: persisted across cycles; only consulted
+        # when REGIME_HYSTERESIS_ENABLED (default off -> stays empty/unused).
+        from src.analysis.regime_stability import empty_state
+        self._regime_stability = empty_state()
         logger.info("RegimeDetector initialized")
 
     # ─── Core Detection ───────────────────────────────────────
@@ -549,6 +553,60 @@ class RegimeDetector:
             overall_regime = Regime.UNKNOWN
             overall_confidence = 0.0
 
+        # #7 Regime hysteresis (default OFF -> this whole block is skipped
+        # and behavior is byte-identical). When enabled, debounce a
+        # *changed* overall label so the ~12 downstream gates don't act on
+        # a one-cycle flip; a high-confidence change still passes instantly.
+        raw_overall_regime = overall_regime
+        try:
+            import config as _cfg
+
+            if bool(getattr(_cfg, "REGIME_HYSTERESIS_ENABLED", False)):
+                from src.analysis.regime_stability import apply_regime_hysteresis
+
+                # override must key off regime STRENGTH (mean per-coin
+                # confidence of the winning regime), not overall_confidence
+                # -- the latter is a vote *share* that is ~1.0 whenever the
+                # coins agree, which would make the debounce a no-op.
+                _winner_states = [
+                    s for s in per_coin.values()
+                    if getattr(s, "regime", None) == raw_overall_regime
+                ]
+                if _winner_states:
+                    _winner_strength = sum(
+                        float(getattr(s, "confidence", 0.0) or 0.0)
+                        for s in _winner_states
+                    ) / len(_winner_states)
+                else:
+                    _winner_strength = float(overall_confidence)
+
+                effective_value, self._regime_stability = apply_regime_hysteresis(
+                    self._regime_stability,
+                    new_regime=overall_regime.value,
+                    new_confidence=_winner_strength,
+                    min_streak=int(getattr(_cfg, "REGIME_HYSTERESIS_MIN_STREAK", 2)),
+                    override_confidence=float(
+                        getattr(_cfg, "REGIME_HYSTERESIS_OVERRIDE_CONF", 0.85)
+                    ),
+                )
+                if effective_value != overall_regime.value:
+                    try:
+                        overall_regime = Regime(effective_value)
+                        logger.info(
+                            "Regime hysteresis: raw=%s (conf=%.0f%%) held; "
+                            "effective=%s (pending=%s x%d)",
+                            raw_overall_regime.value,
+                            overall_confidence * 100.0,
+                            effective_value,
+                            self._regime_stability.get("pending"),
+                            int(self._regime_stability.get("pending_count", 0) or 0),
+                        )
+                    except ValueError:
+                        overall_regime = raw_overall_regime  # unknown value -> no-op
+        except Exception as exc:
+            logger.debug("Regime hysteresis skipped (fail-open): %s", exc)
+            overall_regime = raw_overall_regime
+
         # Get strategy guidance for the overall regime
         # Return a per-cycle copy.  Downstream crash/macro overlays mutate
         # strategy_guidance; sharing REGIME_STRATEGY_MAP's nested lists/dicts
@@ -559,6 +617,7 @@ class RegimeDetector:
 
         result = {
             "overall_regime": overall_regime.value,
+            "raw_overall_regime": raw_overall_regime.value,
             "overall_confidence": round(overall_confidence, 3),
             "per_coin": {coin: state.to_dict() for coin, state in per_coin.items()},
             "regime_votes": {r.value: round(w, 2) for r, w in regime_votes.items()},

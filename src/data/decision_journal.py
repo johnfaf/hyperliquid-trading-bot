@@ -1089,6 +1089,88 @@ def summarize_recent_decisions(hours: float = 6.0, limit: int = 20000) -> Dict[s
         return {"available": False, "reason": str(exc)[:160]}
 
 
+def _summarize_source_pnl_rows(rows: list, *, window_days: float) -> Dict[str, Any]:
+    """Pure per-source realized-PnL attribution over decision_outcomes.
+
+    Makes "which source is actually making money?" provable instead of
+    inferred -- the missing half of source discipline (the evidence bar
+    gates *entry*; this measures *outcome*). Pure -> unit-testable.
+    """
+    groups: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        key = str(
+            row.get("source_key") or row.get("source") or "unknown"
+        ).strip().lower() or "unknown"
+        g = groups.setdefault(
+            key,
+            {"source_key": key, "trades": 0, "acted": 0, "wins": 0,
+             "losses": 0, "realized_pnl": 0.0},
+        )
+        g["trades"] += 1
+        if row.get("action_taken") not in (None, "", 0, False, "0"):
+            g["acted"] += 1
+        lw = row.get("label_win")
+        if lw in (1, "1", True):
+            g["wins"] += 1
+        elif lw in (0, "0", False):
+            g["losses"] += 1
+        try:
+            g["realized_pnl"] += float(row.get("outcome_pnl") or 0.0)
+        except (TypeError, ValueError):
+            pass
+    out = []
+    for g in groups.values():
+        decided = g["wins"] + g["losses"]
+        g["win_rate"] = round(g["wins"] / decided, 4) if decided else None
+        g["avg_pnl"] = round(g["realized_pnl"] / g["trades"], 4) if g["trades"] else 0.0
+        g["realized_pnl"] = round(g["realized_pnl"], 4)
+        out.append(g)
+    out.sort(key=lambda r: r["realized_pnl"], reverse=True)
+    total_pnl = round(sum(r["realized_pnl"] for r in out), 4)
+    return {
+        "available": True,
+        "window_days": window_days,
+        "sources": out,
+        "source_count": len(out),
+        "total_realized_pnl": total_pnl,
+        "net_positive_sources": sum(1 for r in out if r["realized_pnl"] > 0),
+        "net_negative_sources": sum(1 for r in out if r["realized_pnl"] < 0),
+    }
+
+
+def summarize_source_pnl(days: float = 7.0, limit: int = 50000) -> Dict[str, Any]:
+    """Roll up realized PnL by source over the last ``days`` of
+    decision_outcomes. Best-effort: ``{"available": False}`` if the
+    table is absent -- never raises into a caller."""
+    if not _enabled():
+        return {"available": False, "reason": "journal_disabled"}
+    try:
+        from datetime import timedelta
+
+        from src.data import database as db
+
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(days=float(days))
+        ).isoformat()
+        lim = max(1, min(int(limit or 50000), 200000))
+        with db.get_connection(for_read=True) as conn:
+            rows = conn.execute(
+                """
+                SELECT source, source_key, action_taken, label_win, outcome_pnl
+                FROM decision_outcomes
+                WHERE created_at >= ?
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (cutoff, lim),
+            ).fetchall()
+        norm = [dict(r) if not isinstance(r, dict) else r for r in rows]
+        return _summarize_source_pnl_rows(norm, window_days=float(days))
+    except Exception as exc:
+        _record_write_failure("source_pnl_read", exc)
+        return {"available": False, "reason": str(exc)[:160]}
+
+
 def record_decision_outcome(
     decision_id: str,
     *,

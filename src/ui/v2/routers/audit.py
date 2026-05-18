@@ -249,6 +249,24 @@ async def audit_summary(request: Request, hours: float = 6.0):
     return JSONResponse(payload)
 
 
+@router.get("/api/audit/source-pnl", response_class=JSONResponse)
+async def audit_source_pnl(request: Request, days: float = 7.0):
+    """Per-source realized-PnL attribution over the last ``days`` of
+    decision_outcomes -- "which source actually makes money?". Cheap,
+    read-only, best-effort."""
+    redirect = require_auth(request)
+    if redirect is not None:
+        return JSONResponse({"error": "auth_required"}, status_code=401)
+    try:
+        from src.data import decision_journal
+
+        payload = decision_journal.summarize_source_pnl(days=days)
+    except Exception as exc:
+        logger.debug("audit source-pnl failed: %s", exc)
+        payload = {"available": False, "reason": str(exc)[:160]}
+    return JSONResponse(payload)
+
+
 @router.get("/audit", response_class=HTMLResponse)
 async def audit_page(
     request: Request,

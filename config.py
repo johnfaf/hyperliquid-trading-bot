@@ -542,6 +542,20 @@ REGIME_REVERSAL_TIGHTEN_ENABLED = _safe_env_bool("REGIME_REVERSAL_TIGHTEN_ENABLE
 REGIME_REVERSAL_CLOSE_ENABLED = _safe_env_bool("REGIME_REVERSAL_CLOSE_ENABLED", False)
 REGIME_REVERSAL_REVERSE_ENABLED = _safe_env_bool("REGIME_REVERSAL_REVERSE_ENABLED", False)
 REGIME_REVERSAL_REVERSE_ON_CRASH = _safe_env_bool("REGIME_REVERSAL_REVERSE_ON_CRASH", False)
+# Regime hysteresis (#7): the overall regime label is consumed as hard
+# truth by ~12 gates; in the logs it flipped bullish/crash/neutral cycle
+# to cycle and poisoned the market-side guard. When enabled, a *changed*
+# label must persist REGIME_HYSTERESIS_MIN_STREAK consecutive cycles (or
+# arrive with >= REGIME_HYSTERESIS_OVERRIDE_CONF confidence, so a genuine
+# crash still flips instantly) before the gates see the new label.
+# DEFAULT OFF -> behavior is byte-identical until an operator opts in.
+REGIME_HYSTERESIS_ENABLED = _safe_env_bool("REGIME_HYSTERESIS_ENABLED", False)
+REGIME_HYSTERESIS_MIN_STREAK = int(
+    os.environ.get("REGIME_HYSTERESIS_MIN_STREAK", 2)
+)
+REGIME_HYSTERESIS_OVERRIDE_CONF = _safe_env_float(
+    "REGIME_HYSTERESIS_OVERRIDE_CONF", 0.85, lo=0.0, hi=1.0
+)
 REGIME_REVERSAL_MIN_CONFIDENCE = _safe_env_float(
     "REGIME_REVERSAL_MIN_CONFIDENCE", 0.70, lo=0.0, hi=1.0,
 )
