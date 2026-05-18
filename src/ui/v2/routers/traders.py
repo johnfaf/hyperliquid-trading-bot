@@ -88,8 +88,21 @@ def _summary_payload() -> Dict[str, Any]:
         known_bots = set()
 
     rows: List[Dict[str, Any]] = []
+    low_evidence = 0
     for row in active:
         if not isinstance(row, dict):
+            continue
+        # Hide insufficient-evidence rows (the "100% winrate / 0% ROI"
+        # junk): too few realized closed trades, or degenerate $0-pnl /
+        # 0%-roi. These are NOT bots -- they stay in the active set so
+        # discovery re-evaluates them -- they're just not actionable yet,
+        # so they don't belong in the operator's traders directory.
+        try:
+            is_copyable = db.trader_meets_evidence_bar(row)
+        except Exception:
+            is_copyable = True
+        if not is_copyable:
+            low_evidence += 1
             continue
         rows.append(_format_trader(row, known_bots))
     rows.sort(key=lambda r: (-r["total_pnl"], r["address"]))
@@ -98,7 +111,8 @@ def _summary_payload() -> Dict[str, Any]:
         "active": sum(1 for r in rows if not r["is_known_bot"]),
         "known_bots": len(known_bots),
         "suspect": sum(1 for r in rows if r["bot_tone"] == "suspect"),
-        "total_tracked": len(rows) + len(known_bots),
+        "low_evidence_hidden": low_evidence,
+        "total_tracked": len(rows) + len(known_bots) + low_evidence,
     }
     return {"available": True, "rows": rows, "totals": totals}
 

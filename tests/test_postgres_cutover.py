@@ -605,7 +605,7 @@ def test_active_queries_bind_boolean_parameters(monkeypatch):
         (True,),
     )
     assert dummy.calls[2] == (
-        "SELECT address FROM traders WHERE active = ?",
+        "SELECT address, metadata FROM traders WHERE active = ?",
         (False,),
     )
 

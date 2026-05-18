@@ -292,7 +292,7 @@ class TestPositionCacheTTL:
         }
         mock_state = {"positions": []}
 
-        with patch("src.trading.copy_trader.db.get_active_traders", return_value=[active_trader]), \
+        with patch("src.trading.copy_trader.db.get_copyable_traders", return_value=[active_trader]), \
              patch("src.trading.copy_trader.hl.get_all_mids", return_value={}), \
              patch("src.trading.copy_trader.hl.get_user_state", return_value=mock_state):
             ct.scan_top_traders(top_n=5)
@@ -308,7 +308,7 @@ class TestPositionCacheTTL:
         ct._position_cache[recent_addr] = {"ETH": {"size": 0.5}}
         ct._position_cache_ts[recent_addr] = time.time() - 60  # 1 minute ago
 
-        with patch("src.trading.copy_trader.db.get_active_traders", return_value=[]), \
+        with patch("src.trading.copy_trader.db.get_copyable_traders", return_value=[]), \
              patch("src.trading.copy_trader.hl.get_all_mids", return_value={}):
             ct.scan_top_traders(top_n=5)
 
@@ -329,7 +329,7 @@ class TestPositionCacheTTL:
         }
 
         before = time.time()
-        with patch("src.trading.copy_trader.db.get_active_traders", return_value=[trader]), \
+        with patch("src.trading.copy_trader.db.get_copyable_traders", return_value=[trader]), \
              patch("src.trading.copy_trader.hl.get_all_mids", return_value={"BTC": 50000.0}), \
              patch("src.trading.copy_trader.hl.get_user_state", return_value=mock_state):
             ct.scan_top_traders(top_n=1)
@@ -363,7 +363,7 @@ class TestPositionCacheTTL:
             seen.append(address)
             return mock_state
 
-        with patch("src.trading.copy_trader.db.get_active_traders", return_value=traders), \
+        with patch("src.trading.copy_trader.db.get_copyable_traders", return_value=traders), \
              patch("src.trading.copy_trader.hl.get_all_mids", return_value={"BTC": 50000.0}), \
              patch("src.trading.copy_trader.hl.get_user_state", side_effect=_get_user_state):
             ct.scan_top_traders(top_n=5)
