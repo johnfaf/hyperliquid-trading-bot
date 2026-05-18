@@ -1117,6 +1117,33 @@ FIREWALL_MARKET_SIDE_GUARD_ENABLED = _safe_env_bool(
 FIREWALL_MARKET_SIDE_GUARD_MIN_CONFIDENCE = float(
     os.environ.get("FIREWALL_MARKET_SIDE_GUARD_MIN_CONFIDENCE", 0.60)
 )
+# Market-read inputs for the market-side guard.  Without these a lone
+# regime label (e.g. trending_down @74%) silently vetoes a high-conviction
+# counter-regime entry -- the "BULLISH options flow shown but LONG blocked,
+# only SHORTs persist" bug.  Letting strong fresh options-flow conviction
+# (and the down-weighted synthetic forecaster) count as market-read
+# candidates lets independent bullish/bearish confluence satisfy the guard
+# instead of being unilaterally overridden.  A hard crash/panic carve-out
+# below still refuses to let one options print buy into a confirmed crash.
+FIREWALL_MARKET_READ_USES_OPTIONS_FLOW = _safe_env_bool(
+    "FIREWALL_MARKET_READ_USES_OPTIONS_FLOW", True
+)
+# Minimum options-flow conviction (0-1) before it counts as a market read.
+FIREWALL_OPTIONS_FLOW_READ_MIN_CONVICTION = float(
+    os.environ.get("FIREWALL_OPTIONS_FLOW_READ_MIN_CONVICTION", 0.70)
+)
+# If an opposite-side crash/panic regime read is at/above this confidence,
+# options flow may NOT grant alignment (never buy a confirmed crash on one
+# print).  Options flow can still override a *moderate* trending_down.
+FIREWALL_OPTIONS_FLOW_OVERRIDE_MAX_REGIME_CONF = float(
+    os.environ.get("FIREWALL_OPTIONS_FLOW_OVERRIDE_MAX_REGIME_CONF", 0.85)
+)
+# Synthetic warm-start forecaster is no longer discarded outright; it
+# contributes at this confidence weight (0 = ignore, 1 = full weight).
+# Default 0.5 keeps it able to *align* but not single-handedly *block*.
+FIREWALL_FORECASTER_SYNTHETIC_WEIGHT = float(
+    os.environ.get("FIREWALL_FORECASTER_SYNTHETIC_WEIGHT", 0.5)
+)
 
 # Per-source capital allocator / throttling.
 SOURCE_POLICY_ENABLED = os.environ.get(
@@ -1752,6 +1779,9 @@ def _validate_config_bounds() -> None:
         ("BTC_MARKET_LEADER_MIN_MOMENTUM", 0.0, 1.0, 0.003),
         ("BTC_MARKET_LEADER_MIN_VOLUME_RATIO", 0.0, 100.0, 0.75),
         ("FIREWALL_MARKET_SIDE_GUARD_MIN_CONFIDENCE", 0.0, 1.0, 0.60),
+        ("FIREWALL_OPTIONS_FLOW_READ_MIN_CONVICTION", 0.0, 1.0, 0.70),
+        ("FIREWALL_OPTIONS_FLOW_OVERRIDE_MAX_REGIME_CONF", 0.0, 1.0, 0.85),
+        ("FIREWALL_FORECASTER_SYNTHETIC_WEIGHT", 0.0, 1.0, 0.5),
         ("PAPER_EXECUTION_MAX_TRADES_PER_CYCLE", 0, 100, 3),
         ("TRADE_QUALITY_MIN_EDGE_COST_MULTIPLE", 0.0, 100.0, 1.5),
         ("TRADE_QUALITY_EXPECTED_SLIPPAGE_BPS", 0.0, 1_000.0, PAPER_TRADING_SLIPPAGE_MAX_BPS),

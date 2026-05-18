@@ -199,6 +199,112 @@ def test_market_side_guard_blocks_longs_in_bearish_regime(mock_db):
     assert signal.context["market_side_alignment"]["direction"] == "short"
 
 
+def _msg_guard_fw(**extra):
+    from src.signals.decision_firewall import DecisionFirewall
+    cfg = {
+        "enable_predictive_derisk": False,
+        "funding_risk_enabled": False,
+        "market_side_guard_enabled": True,
+        "market_side_guard_min_confidence": 0.60,
+    }
+    cfg.update(extra)
+    return DecisionFirewall(cfg)
+
+
+def _of_signal(side_val, confidence):
+    s = MockSignal(side_val=side_val, confidence=confidence,
+                    strategy_type="options")
+    s.source = "options_flow"
+    return s
+
+
+def test_options_flow_long_overrides_moderate_downtrend():
+    """The bug: bullish options-flow LONG was vetoed by a lone
+    trending_down@74% read. Strong conviction must now satisfy the guard."""
+    fw = _msg_guard_fw()
+    sig = _of_signal("long", 1.0)  # 100% conviction
+    ok, reason = fw._apply_market_side_guard(
+        sig, "long",
+        regime_data={"overall_regime": "trending_down", "overall_confidence": 0.74},
+    )
+    assert ok is True, reason
+    assert sig.context["market_side_alignment"]["source"] == "options_flow"
+
+
+def test_options_flow_long_still_blocked_by_confirmed_crash():
+    """Crash carve-out: one bullish print must NOT buy a confirmed crash."""
+    fw = _msg_guard_fw()
+    sig = _of_signal("long", 1.0)
+    ok, reason = fw._apply_market_side_guard(
+        sig, "long",
+        regime_data={"overall_regime": "crash", "overall_confidence": 0.90},
+    )
+    assert ok is False
+    assert "blocks long" in reason.lower()
+
+
+def test_low_conviction_options_flow_does_not_override():
+    """Below the conviction floor (0.70) options flow is not a market read."""
+    fw = _msg_guard_fw()
+    sig = _of_signal("long", 0.50)
+    ok, reason = fw._apply_market_side_guard(
+        sig, "long",
+        regime_data={"overall_regime": "trending_down", "overall_confidence": 0.74},
+    )
+    assert ok is False
+    assert "blocks long" in reason.lower()
+
+
+def test_bearish_options_flow_short_overrides_uptrend():
+    """Symmetry: a strong bearish print isn't vetoed by an uptrend read."""
+    fw = _msg_guard_fw()
+    sig = _of_signal("short", 1.0)
+    ok, reason = fw._apply_market_side_guard(
+        sig, "short",
+        regime_data={"overall_regime": "trending_up", "overall_confidence": 0.74},
+    )
+    assert ok is True, reason
+
+
+def test_synthetic_forecaster_now_contributes_when_weighted():
+    """Synthetic warm-start forecaster is no longer discarded outright:
+    weighted >0 it can align a counter-regime entry; weight 0 reverts."""
+    rd = {
+        "overall_regime": "trending_down", "overall_confidence": 0.74,
+        "forecaster_regime": "trending_up", "forecaster_confidence": 1.0,
+        "forecaster_synthetic_warm_start": True,
+    }
+    sig = MockSignal(side_val="long", confidence=0.8, strategy_type="momentum")
+
+    fw_on = _msg_guard_fw(
+        short_hardening_block_override_min_regime_confidence=0.40,
+        forecaster_synthetic_weight=0.5,
+    )
+    ok_on, _ = fw_on._apply_market_side_guard(sig, "long", regime_data=dict(rd))
+    assert ok_on is True  # 1.0 * 0.5 = 0.5 >= 0.40 -> aligns the long
+
+    fw_off = _msg_guard_fw(
+        short_hardening_block_override_min_regime_confidence=0.40,
+        forecaster_synthetic_weight=0.0,
+    )
+    ok_off, reason_off = fw_off._apply_market_side_guard(
+        sig, "long", regime_data=dict(rd))
+    assert ok_off is False and "blocks long" in reason_off.lower()
+
+
+def test_non_options_signal_market_guard_unchanged():
+    """Regression: a non-options signal still blocked by a strong opposite
+    regime read (existing market-side-guard behavior preserved)."""
+    fw = _msg_guard_fw()
+    sig = MockSignal(side_val="long", confidence=0.8, strategy_type="momentum_long")
+    ok, reason = fw._apply_market_side_guard(
+        sig, "long",
+        regime_data={"overall_regime": "trending_down", "overall_confidence": 0.74},
+    )
+    assert ok is False
+    assert "blocks long" in reason.lower()
+
+
 @patch("src.signals.decision_firewall.db")
 def test_firewall_rejects_max_positions(mock_db):
     """Should reject when max positions reached."""
