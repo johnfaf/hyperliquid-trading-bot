@@ -29,7 +29,16 @@ def _cache_ttl(name: str, default: float) -> float:
 
 @router.get("/api/health")
 async def health() -> JSONResponse:
-    return JSONResponse({"status": "ok"})
+    # Surface the running build so "is the bot even on the merged commit?"
+    # is answerable without shelling into the container. Best-effort.
+    version: dict = {}
+    try:
+        from src.core.build_info import get_build_info
+
+        version = get_build_info()
+    except Exception as exc:  # never let health fail on this
+        logger.debug("health: build_info unavailable: %s", exc)
+    return JSONResponse({"status": "ok", "version": version})
 
 
 @router.get("/api/ready")
