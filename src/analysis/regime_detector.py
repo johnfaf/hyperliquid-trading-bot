@@ -288,16 +288,37 @@ class RegimeDetector:
             trend_confidence = 0.5 + (adx - 25) / 50  # 25→0.5, 75→1.0
             trend_confidence = min(trend_confidence, 0.95)
 
-            # Use trend direction + momentum for up/down
-            if trend_dir > 0 and momentum > 0:
-                return Regime.TRENDING_UP, trend_confidence
-            elif trend_dir < 0 and momentum < 0:
-                return Regime.TRENDING_DOWN, trend_confidence
-            elif trend_dir > 0:
-                # Trend up but momentum slowing — less confident
+            # Direction: ADX measures trend STRENGTH, not direction.  Resolve
+            # up/down SYMMETRICALLY from the regression slope, using momentum
+            # only to scale confidence.
+            #
+            # ★ BIAS FIX: the previous logic had a dedicated ``elif
+            # trend_dir > 0`` arm but funnelled *everything else* into an
+            # ``else: return TRENDING_DOWN``.  That meant a flat slope
+            # (trend_dir == 0) OR a downtrend already reversing UP
+            # (trend_dir < 0, momentum > 0) was labelled TRENDING_DOWN at
+            # 0.7x of a high ADX confidence.  Amplified by the 2x BTC/ETH
+            # vote weight in get_market_regime, one such BTC reading drove
+            # overall_regime to high-confidence trending_down, which the
+            # market-side guard then used to veto every long (the "BULLISH
+            # shown but only SHORT trades" report).  trend_dir > 0 and
+            # trend_dir < 0 are now mirror images; a genuinely flat market
+            # is RANGING, never a fabricated high-confidence down trend.
+            if trend_dir > 0:
+                conf = trend_confidence if momentum >= 0 else trend_confidence * 0.7
+                return Regime.TRENDING_UP, conf
+            if trend_dir < 0:
+                conf = trend_confidence if momentum <= 0 else trend_confidence * 0.7
+                return Regime.TRENDING_DOWN, conf
+            # trend_dir == 0 → no directional slope. Fall back to momentum;
+            # if momentum is also flat it is NOT trending — treat as ranging
+            # rather than manufacturing a directional label.
+            if momentum > 0:
                 return Regime.TRENDING_UP, trend_confidence * 0.7
-            else:
+            if momentum < 0:
                 return Regime.TRENDING_DOWN, trend_confidence * 0.7
+            range_confidence = 0.5 + max(0.0, 20 - adx) / 20 * 0.3
+            return Regime.RANGING, min(range_confidence, 0.95)
 
         # 4. Ranging (low ADX)
         if adx < 20:
