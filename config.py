@@ -948,6 +948,20 @@ LIVE_PROMOTION_MIN_WIN_RATE = _safe_env_float(
 LIVE_PROMOTION_MIN_SCORE = _safe_env_float(
     "LIVE_PROMOTION_MIN_SCORE", 0.20, lo=0.0, hi=1.0
 )
+# A5: optional Deflated-Sharpe gate on strategy promotion. DEFAULT OFF.
+# Only ever BLOCKS a promotion the base gate already approved -- it never
+# unblocks. When on, the strategy's recent paper-trade P&L Sharpe must be
+# statistically significant after deflating for selection bias
+# (num_trials). Missing/insufficient history or any compute error fails
+# OPEN (defer to the base gate) so this can only tighten, never break
+# promotion. P&L is a valid input -- Sharpe is scale-invariant.
+PROMOTION_REQUIRE_DSR = _safe_env_bool("PROMOTION_REQUIRE_DSR", False)
+PROMOTION_DSR_NUM_TRIALS = int(
+    os.environ.get("PROMOTION_DSR_NUM_TRIALS", 50)
+)
+PROMOTION_DSR_MIN_OBS = int(
+    os.environ.get("PROMOTION_DSR_MIN_OBS", 20)
+)
 
 # ─── Funding-rate divergence brake ─────────────────────────────
 # Cross-market safety brake: when BTC/ETH funding is meaningfully

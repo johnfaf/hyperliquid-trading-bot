@@ -119,6 +119,58 @@ def _agent_score_promotion_ok(
     return True, "ok"
 
 
+def _dsr_promotion_ok(
+    strategy_id: Any, *, num_trials: int, min_obs: int
+) -> Tuple[bool, str]:
+    """A5: require the strategy's recent paper-trade P&L Sharpe to be
+    statistically significant after deflating for selection bias.
+
+    Strictly conservative: returns ``(True, ...)`` on any missing /
+    insufficient data or computation error (fail OPEN -- defer to the
+    base gate) and only returns ``(False, ...)`` with positive evidence
+    the edge is NOT significant. Raw P&L is a valid input: Sharpe is
+    scale-invariant so the significance test is unaffected by notional.
+    """
+    if strategy_id in (None, ""):
+        return True, "dsr_skip_no_strategy_id"
+    try:
+        with db.get_connection(for_read=True) as conn:
+            rows = conn.execute(
+                "SELECT pnl FROM paper_trades "
+                "WHERE strategy_id = ? AND status != 'open' "
+                "ORDER BY id DESC LIMIT 500",
+                (strategy_id,),
+            ).fetchall()
+    except Exception as exc:
+        logger.debug("DSR paper_trades lookup failed for %s: %s", strategy_id, exc)
+        return True, "dsr_lookup_failed"
+    returns: list = []
+    for r in rows or []:
+        try:
+            val = r["pnl"] if isinstance(r, dict) else (
+                r[0] if not hasattr(r, "keys") else r["pnl"]
+            )
+            returns.append(float(val or 0.0))
+        except (TypeError, ValueError, KeyError, IndexError):
+            continue
+    if len(returns) < max(2, int(min_obs)):
+        return True, f"dsr_insufficient:{len(returns)}/{min_obs}"
+    try:
+        from src.learning.promotion_stats import deflated_sharpe
+
+        res = deflated_sharpe(returns, num_trials=max(1, int(num_trials)))
+    except Exception as exc:
+        logger.debug("DSR computation failed for %s: %s", strategy_id, exc)
+        return True, "dsr_compute_failed"
+    if not getattr(res, "significant_at_95", False):
+        return False, (
+            f"dsr_not_significant:dsr={res.deflated_sharpe:.2f},"
+            f"p={res.p_value:.3f},n={res.num_observations},"
+            f"trials={res.num_trials}"
+        )
+    return True, f"ok_dsr:dsr={res.deflated_sharpe:.2f},p={res.p_value:.3f}"
+
+
 def is_live_promotable(trade: Dict[str, Any]) -> Tuple[bool, str]:
     """Return ``(promotable, reason)`` for a paper trade about to mirror live.
 
@@ -149,12 +201,22 @@ def is_live_promotable(trade: Dict[str, Any]) -> Tuple[bool, str]:
             logger.debug("get_strategy(%s) failed: %s", strategy_id, exc)
             strategy = None
         if strategy:
-            return _strategy_promotion_ok(
+            ok, reason = _strategy_promotion_ok(
                 strategy,
                 min_trades=min_trades,
                 min_win_rate=min_win_rate,
                 min_score=min_score,
             )
+            # A5 (default OFF): only ever downgrade an approved promotion.
+            if ok and bool(getattr(config, "PROMOTION_REQUIRE_DSR", False)):
+                dsr_ok, dsr_reason = _dsr_promotion_ok(
+                    strategy_id,
+                    num_trials=int(getattr(config, "PROMOTION_DSR_NUM_TRIALS", 50)),
+                    min_obs=int(getattr(config, "PROMOTION_DSR_MIN_OBS", 20)),
+                )
+                if not dsr_ok:
+                    return False, dsr_reason
+            return ok, reason
 
     # Path 2: copy-trade source_trader (agent_scorer)
     source_trader = (
