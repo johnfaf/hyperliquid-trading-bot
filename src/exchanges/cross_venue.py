@@ -238,6 +238,60 @@ class CrossVenueConfirmation:
             rates = list(funding_rates.values())
             signal.funding_spread = max(rates) - min(rates)
 
+        # ── A4 shadow: HL ↔ CEX funding-carry telemetry ────────────
+        # Pure logging path. Never mutates `signal` or the routing
+        # decision. Guarded by FUNDING_CARRY_SHADOW_ENABLED (default
+        # OFF). All exceptions are swallowed -- this MUST NEVER break
+        # cross-venue confirmation on a live-money code path.
+        try:
+            import config as _cfg  # local: never break confirm on config load
+            if getattr(_cfg, "FUNDING_CARRY_SHADOW_ENABLED", False) and "hyperliquid" in funding_rates:
+                hl_rate = funding_rates.get("hyperliquid")
+                cex_pairs = [
+                    (v, r) for v, r in funding_rates.items()
+                    if v != "hyperliquid" and r is not None
+                ]
+                if hl_rate is not None and cex_pairs:
+                    from src.signals.funding_carry import (
+                        FundingSnapshot,
+                        evaluate_carry,
+                    )
+                    # HL funds hourly; CEX (Binance/Bybit/Crypto.com) on 8h.
+                    # Tolerate unknown venues by defaulting to 8h cadence.
+                    _hl_snap = FundingSnapshot(
+                        venue="hyperliquid", symbol=coin,
+                        rate_native=float(hl_rate), interval_hours=1.0,
+                    )
+                    min_edge = float(getattr(_cfg, "FUNDING_CARRY_SHADOW_MIN_EDGE_BPS", 8.0))
+                    hold_hours = float(getattr(_cfg, "FUNDING_CARRY_SHADOW_HOLD_HOURS", 4.0))
+                    for cex_venue, cex_rate in cex_pairs:
+                        _cex_snap = FundingSnapshot(
+                            venue=cex_venue, symbol=coin,
+                            rate_native=float(cex_rate), interval_hours=8.0,
+                        )
+                        try:
+                            opp = evaluate_carry(
+                                _hl_snap, _cex_snap,
+                                hold_hours=hold_hours,
+                                min_edge_bps=min_edge,
+                            )
+                            logger.info(
+                                "CARRY_SHADOW [%s] hl↔%s: edge=%.2fbps "
+                                "hold=%.1fh actionable=%s veto=%r "
+                                "long=%s short=%s",
+                                coin, cex_venue,
+                                opp.net_edge_bps, opp.hold_hours,
+                                opp.is_actionable, opp.veto_reason,
+                                opp.long_venue, opp.short_venue,
+                            )
+                        except Exception as _ec:
+                            logger.debug(
+                                "CARRY_SHADOW evaluate_carry failed for "
+                                "[%s] hl↔%s: %s", coin, cex_venue, _ec,
+                            )
+        except Exception as _e:
+            logger.debug("CARRY_SHADOW outer guard caught: %s", _e)
+
         # Weighted composite score.
         # ★ M44 FIX: previously ``min(1.0, signal.funding_spread * 1000)``
         # saturated at 0.001/h spread (~876% annualized) -- realistic

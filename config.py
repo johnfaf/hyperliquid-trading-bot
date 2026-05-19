@@ -564,6 +564,22 @@ ATR_STOP_NOISE_FLOOR_BPS = _safe_env_float(
     "ATR_STOP_NOISE_FLOOR_BPS", 50.0, lo=0.0, hi=1000.0,
 )
 
+# ── A4: HL ↔ CEX funding-carry shadow telemetry ─────────────────────────
+# When enabled, every cross-venue confirmation call that sees both an HL
+# and a CEX funding rate runs evaluate_carry() and logs the resulting
+# CarryOpportunity (actionable / vetoed + edge). PURE TELEMETRY — never
+# mutates the cross-venue signal or routes a real order. Designed for
+# the 2-week shadow-mode validation before any execution wiring lands.
+#
+# DEFAULT OFF. Flip true to populate logs for the shadow evaluator.
+FUNDING_CARRY_SHADOW_ENABLED = _safe_env_bool("FUNDING_CARRY_SHADOW_ENABLED", False)
+FUNDING_CARRY_SHADOW_MIN_EDGE_BPS = _safe_env_float(
+    "FUNDING_CARRY_SHADOW_MIN_EDGE_BPS", 8.0, lo=0.0, hi=500.0,
+)
+FUNDING_CARRY_SHADOW_HOLD_HOURS = _safe_env_float(
+    "FUNDING_CARRY_SHADOW_HOLD_HOURS", 4.0, lo=0.25, hi=24.0,
+)
+
 # Regime reversal supervision for open LIVE positions.
 # Default mode is intentionally staged: detect confirmed opposite regimes and
 # tighten protection, but do not flatten/reverse real capital unless the
