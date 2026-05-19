@@ -3,9 +3,8 @@ import json
 import os
 import sqlite3
 
-import pytest
 
-from src.backtest.replay.replay_db import ReplayDB, ReplayDBError
+from src.backtest.replay.replay_db import ReplayDB
 from src.backtest.replay.strategy_seed import (
     SeedSnapshot, SeedTrader, SeedStrategy,
     build_default_smoke_snapshot,

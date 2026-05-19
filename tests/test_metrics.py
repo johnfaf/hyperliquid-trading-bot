@@ -129,10 +129,6 @@ def test_decision_firewall_rejection_emits_metric(monkeypatch):
     # in isolation by calling signal_rejection_total directly here.
     # (Full firewall integration is exercised by existing firewall tests;
     # this asserts the metric-emit code path is wired.)
-    before = m.signal_rejection_total.labels(
-        stage="rejected_test", reason="unit test", source="copy_trade",
-    )._value.get() if hasattr(m.signal_rejection_total.labels(stage="x", reason="y", source="z"), "_value") else 0  # noqa: E501
-
     m.signal_rejection_total.labels(
         stage="rejected_test", reason="unit test", source="copy_trade",
     ).inc()

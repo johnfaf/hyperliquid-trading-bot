@@ -20,7 +20,6 @@ import pytest
 from src.trading.maker_first_executor import (
     BookState,
     MakerAction,
-    MakerDecision,
     MakerPolicy,
     OrderState,
     decide,

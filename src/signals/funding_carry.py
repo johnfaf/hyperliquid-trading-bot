@@ -42,7 +42,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 
 # ── Constants (defaults; can be overridden by config wiring) ───────
@@ -204,12 +204,12 @@ def evaluate_carry(
         )
 
     if hl_annual < cex_annual:
-        long_venue, long_rate = hl.venue, hl
-        short_venue, short_rate = cex.venue, cex
+        long_venue = hl.venue
+        short_venue = cex.venue
         long_annual, short_annual = hl_annual, cex_annual
     else:
-        long_venue, long_rate = cex.venue, cex
-        short_venue, short_rate = hl.venue, hl
+        long_venue = cex.venue
+        short_venue = hl.venue
         long_annual, short_annual = cex_annual, hl_annual
 
     # 3. Expected carry over the hold window. Long leg *receives*

@@ -10,7 +10,6 @@ from __future__ import annotations
 import pytest
 
 from src.signals.multiplier_trace import (
-    MultiplierEvent,
     cascade_stats_by_source,
     clear_traces,
     detect_cascade,

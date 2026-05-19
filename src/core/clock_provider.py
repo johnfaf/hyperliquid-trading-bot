@@ -22,8 +22,7 @@ orchestrator should call them, before threads are started.
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
-import time as _time
+from datetime import datetime
 from typing import Optional
 
 from src.backtest.replay.clock import Clock, LiveClock
