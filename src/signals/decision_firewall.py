@@ -198,6 +198,49 @@ class DecisionFirewall:
         self.long_hardening_size_multiplier = float(
             cfg.get("long_hardening_size_multiplier", 0.50)
         )
+        # #1 recent-side block deadlock escape. The hardening lookback is
+        # count-based; a blocked side stops trading so the window never
+        # refreshes -> permanent block. After this many continuous hours
+        # blocked, downgrade hard-block -> degraded (reduced-size probe)
+        # so the sample can refresh. 0 disables (legacy permanent block).
+        try:
+            import config as _cfg_mod
+            _rsb_default = float(
+                getattr(_cfg_mod, "FIREWALL_RECENT_SIDE_BLOCK_MAX_HOURS", 24.0)
+            )
+        except Exception:
+            _rsb_default = 24.0
+        self.recent_side_block_max_hours = float(
+            cfg.get("recent_side_block_max_hours", _rsb_default)
+        )
+        self._side_block_since: Dict[str, float] = {}
+        # #2 copy-source-floor synthetic relaxation. DEFAULT OFF: the bulk
+        # of "Source allocator requires 45% confidence for copy_trade" is
+        # the AgentScorer correctly down-weighting UNPROVEN copy sources
+        # (a legitimate control). This optional lever only relaxes the
+        # floor for signals whose confidence was capped by a synthetic /
+        # non-authoritative regime read, and only when an operator opts in.
+        try:
+            import config as _cfg_mod2
+            self.copy_source_floor_synthetic_relax_enabled = bool(
+                cfg.get(
+                    "copy_source_floor_synthetic_relax_enabled",
+                    getattr(_cfg_mod2, "COPY_SOURCE_FLOOR_SYNTHETIC_RELAX_ENABLED", False),
+                )
+            )
+            self.copy_source_floor_synthetic_relax = float(
+                cfg.get(
+                    "copy_source_floor_synthetic_relax",
+                    getattr(_cfg_mod2, "COPY_SOURCE_FLOOR_SYNTHETIC_RELAX", 0.07),
+                )
+            )
+        except Exception:
+            self.copy_source_floor_synthetic_relax_enabled = bool(
+                cfg.get("copy_source_floor_synthetic_relax_enabled", False)
+            )
+            self.copy_source_floor_synthetic_relax = float(
+                cfg.get("copy_source_floor_synthetic_relax", 0.07)
+            )
         self.market_side_guard_enabled = bool(
             cfg.get("market_side_guard_enabled", True)
         )
@@ -1305,6 +1348,44 @@ class DecisionFirewall:
             )
         return True, ""
 
+    def _recent_side_block_escape(self, side: str, status: str) -> str:
+        """#1 deadlock escape for the recent-side hardening block.
+
+        The hardening lookback is count-based (last N closed trades). A
+        blocked side stops trading, so its window never refreshes and the
+        block is permanent (observed: 0 trades in 6h, "Recent longs are
+        underperforming x35"). After a side has been *continuously*
+        blocked ``recent_side_block_max_hours``, downgrade the hard block
+        to ``degraded`` (a reduced-size probe via the existing degrade
+        path) so the sample can refresh and the gate re-evaluates on
+        fresh data. The timer resets on each escape -> roughly one
+        reduced probe per cooldown, never an unbounded re-open. 0 hours
+        disables the escape (legacy permanent block).
+        """
+        max_h = float(self.recent_side_block_max_hours or 0.0)
+        if max_h <= 0.0:
+            return status
+        now = clock_provider.unix_now()
+        if status != "blocked":
+            self._side_block_since[side] = 0.0
+            return status
+        since = float(self._side_block_since.get(side, 0.0) or 0.0)
+        if since <= 0.0:
+            self._side_block_since[side] = now
+            return status
+        blocked_h = (now - since) / 3600.0
+        if blocked_h >= max_h:
+            self._side_block_since[side] = now  # ~one probe per cooldown
+            logger.warning(
+                "Recent-%s-block escape: continuously blocked %.1fh >= "
+                "%.1fh cap -> downgrading hard-block to degraded "
+                "(reduced-size probe to refresh the count-based lookback "
+                "and break the self-reinforcing deadlock)",
+                side, blocked_h, max_h,
+            )
+            return "degraded"
+        return status
+
     def _apply_long_hardening(self, signal: TradeSignal) -> Tuple[bool, str]:
         """Mirror of the short_hardening core gate against the long side.
 
@@ -1320,6 +1401,7 @@ class DecisionFirewall:
 
         policy = self._get_long_side_policy()
         status = str(policy.get("status", "") or "").strip().lower()
+        status = self._recent_side_block_escape("long", status)
 
         if status == "blocked":
             if isinstance(getattr(signal, "context", None), dict):
@@ -1822,6 +1904,23 @@ class DecisionFirewall:
             return False, f"Source allocator paused {source_key} ({status})", policy
 
         min_conf = float(policy.get("min_confidence", 0.0) or 0.0)
+        # #2 (opt-in, default OFF): only when an operator enables it, relax
+        # the floor for copy signals whose confidence was capped by a
+        # synthetic / non-authoritative regime (regime_data_quality ==
+        # "synthetic_warm_start", set by copy_trader). Never relaxes for
+        # genuinely low-weight/unproven sources under a real regime.
+        if (
+            min_conf > 0.0
+            and self.copy_source_floor_synthetic_relax_enabled
+            and str(source_key or "").strip().lower().startswith("copy_trade")
+        ):
+            _ctx = getattr(signal, "context", None)
+            if (
+                isinstance(_ctx, dict)
+                and str(_ctx.get("regime_data_quality") or "").strip().lower()
+                == "synthetic_warm_start"
+            ):
+                min_conf = max(0.0, min_conf - float(self.copy_source_floor_synthetic_relax))
         if signal.confidence + self.confidence_threshold_tolerance < min_conf:
             # Surface confidence_inputs (if any) so operators can diagnose a
             # stuck-rejection pattern without having to grep the source code.
