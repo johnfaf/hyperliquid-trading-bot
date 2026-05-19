@@ -229,10 +229,18 @@ class PaperTrader:
             entry_price = float(sig.get("price", 0.0) or 0.0)
             leverage = float(sig.get("leverage", adjusted.leverage) or adjusted.leverage or 1.0)
             if entry_price > 0:
+                # A1: pass atr_pct from signal context so the ATR-floor
+                # (config.ATR_STOP_FLOOR_ENABLED) can widen tight stops
+                # that would otherwise trip on intra-bar noise.
+                atr_pct_for_stop = (
+                    (adjusted.context or {}).get("atr_pct")
+                    if adjusted.context else None
+                ) or sig.get("atr_pct")
                 sl, tp = adjusted.risk.resolve_trigger_prices(
                     entry_price,
                     str(sig.get("side", "")),
                     leverage,
+                    atr_pct=atr_pct_for_stop,
                 )
                 sig["stop_loss"] = round(sl, 8)
                 sig["take_profit"] = round(tp, 8)
@@ -1783,7 +1791,10 @@ class PaperTrader:
             regime=regime_data.get("overall_regime", "") if regime_data else "",
         )
         trade_signal = self._resolve_trade_signal_risk(trade_signal, regime_data=regime_data)
-        stop_loss, take_profit = trade_signal.risk.resolve_trigger_prices(target_price, side, leverage)
+        stop_loss, take_profit = trade_signal.risk.resolve_trigger_prices(
+            target_price, side, leverage,
+            atr_pct=(trade_signal.context or {}).get("atr_pct"),
+        )
 
         return {
             "coin": target_coin,

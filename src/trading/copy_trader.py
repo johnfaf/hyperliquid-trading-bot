@@ -431,7 +431,13 @@ class CopyTrader:
                     logger.warning("risk_policy_engine.apply() returned None; using original signal")
             except Exception as e:
                 logger.warning("Risk policy apply failed (%s); proceeding with original signal", e)
-        stop_loss, take_profit = trade_signal.risk.resolve_trigger_prices(price, side, leverage)
+        # A1: pass atr_pct through so the ATR-floor (if enabled in config)
+        # can widen the stop on noisy/high-leverage entries instead of
+        # tripping on intra-bar noise.
+        atr_pct_for_stop = (trade_signal.context or {}).get("atr_pct")
+        stop_loss, take_profit = trade_signal.risk.resolve_trigger_prices(
+            price, side, leverage, atr_pct=atr_pct_for_stop,
+        )
         return stop_loss, take_profit, dict((trade_signal.context or {}).get("risk_policy", {}) or {})
 
     @staticmethod

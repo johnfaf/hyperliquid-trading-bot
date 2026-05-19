@@ -6589,10 +6589,14 @@ class LiveTrader:
                     entry_anchor_price,
                 )
 
+            # A1: pass atr_pct from signal context so the ATR-floor
+            # (config.ATR_STOP_FLOOR_ENABLED) can widen tight production
+            # stops that would otherwise trip on intra-bar noise.
             sl_price, tp_price = signal.risk.resolve_trigger_prices(
                 entry_anchor_price,
                 side,
                 signal.leverage,
+                atr_pct=(signal.context or {}).get("atr_pct"),
             )
 
             close_side = "sell" if side == "buy" else "buy"
