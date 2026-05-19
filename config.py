@@ -1000,6 +1000,21 @@ PROMOTION_DSR_NUM_TRIALS = int(
 PROMOTION_DSR_MIN_OBS = int(
     os.environ.get("PROMOTION_DSR_MIN_OBS", 20)
 )
+# Drift-aware promotion gate: consult learning_drift_reports before
+# approving a paper-to-live promotion. When enabled, any recent
+# DriftReport with blocks_promotion=TRUE (created within the last
+# PROMOTION_DRIFT_MAX_AGE_HOURS) downgrades the promotion. This wires
+# the FeatureDriftMonitor's blocks_promotion flag -- previously the
+# monitor computed and persisted the flag but NO code consumed it, so
+# the protection was dead.
+#
+# Strictly downgrade-only: never approves a promotion the base gate
+# rejected. Any error (DB, parse, schema) fails OPEN. Default OFF so
+# behavior is byte-identical until an operator opts in.
+PROMOTION_REQUIRE_DRIFT_OK = _safe_env_bool("PROMOTION_REQUIRE_DRIFT_OK", False)
+PROMOTION_DRIFT_MAX_AGE_HOURS = _safe_env_float(
+    "PROMOTION_DRIFT_MAX_AGE_HOURS", 24.0, lo=0.1, hi=720.0,
+)
 # A2: optional Thompson-sampling source allocator blended into
 # AgentScorer.get_weight(). DEFAULT OFF -> get_weight is byte-identical
 # to the legacy dynamic-weight path. When on, the allocator is fed the

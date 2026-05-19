@@ -171,6 +171,86 @@ def _dsr_promotion_ok(
     return True, f"ok_dsr:dsr={res.deflated_sharpe:.2f},p={res.p_value:.3f}"
 
 
+def _drift_promotion_ok(*, max_age_hours: float) -> Tuple[bool, str]:
+    """Consult FeatureDriftMonitor reports: any recent block kills promotion.
+
+    The drift_monitor module computes a ``blocks_promotion`` flag on every
+    DriftReport and persists it to ``learning_drift_reports`` -- but until
+    this hook landed, NO code consulted that flag. Reports were emitted
+    into a void.
+
+    This helper queries the most recent persisted DriftReport. If it has
+    ``blocks_promotion = TRUE`` and was generated within ``max_age_hours``,
+    we block the promotion. Otherwise we fail OPEN (no recent block, or
+    a stale block that is presumably no longer applicable).
+
+    Strictly conservative on the wiring side: ANY exception (DB error,
+    schema mismatch, parse failure) returns ``(True, "drift_check_skipped")``
+    so a broken drift query never breaks the promotion path.
+    """
+    try:
+        with db.get_connection(for_read=True) as conn:
+            row = conn.execute(
+                """
+                SELECT created_at, blocks_promotion, status, summary,
+                       current_dataset_id, baseline_dataset_id
+                  FROM learning_drift_reports
+                 ORDER BY created_at DESC
+                 LIMIT 1
+                """,
+            ).fetchone()
+    except Exception as exc:
+        logger.debug("drift_check lookup failed: %s", exc)
+        return True, "drift_check_skipped:lookup_failed"
+
+    if row is None:
+        return True, "drift_check_skipped:no_reports"
+
+    try:
+        # Row may be a Mapping or a tuple depending on the DB adapter.
+        if hasattr(row, "keys"):
+            created_at = row["created_at"]
+            blocks = bool(row["blocks_promotion"])
+            status = str(row["status"] or "")
+            summary = row["summary"]
+        else:
+            created_at, blocks, status, summary, *_ = row
+            blocks = bool(blocks)
+            status = str(status or "")
+    except Exception as exc:
+        logger.debug("drift_check row parse failed: %s", exc)
+        return True, "drift_check_skipped:parse_failed"
+
+    if not blocks:
+        return True, f"ok_drift:status={status}"
+
+    # blocks_promotion = TRUE. Check the window.
+    try:
+        from datetime import datetime, timezone
+        if isinstance(created_at, str):
+            created_dt = datetime.fromisoformat(
+                created_at.replace("Z", "+00:00"),
+            )
+        else:
+            created_dt = created_at
+        if created_dt.tzinfo is None:
+            created_dt = created_dt.replace(tzinfo=timezone.utc)
+        age_h = (datetime.now(timezone.utc) - created_dt).total_seconds() / 3600.0
+    except Exception as exc:
+        logger.debug("drift_check age computation failed: %s", exc)
+        # Conservative on age failure with a blocking flag set: BLOCK,
+        # because we'd rather hold a promotion than auto-promote past
+        # an unparseable drift block.
+        return False, "drift_blocked:age_unparseable"
+
+    if age_h <= float(max_age_hours):
+        return False, (
+            f"drift_blocked:status={status},age={age_h:.1f}h"
+            f"<={max_age_hours:.0f}h"
+        )
+    return True, f"ok_drift:stale_block_age={age_h:.1f}h>{max_age_hours:.0f}h"
+
+
 def is_live_promotable(trade: Dict[str, Any]) -> Tuple[bool, str]:
     """Return ``(promotable, reason)`` for a paper trade about to mirror live.
 
@@ -216,6 +296,18 @@ def is_live_promotable(trade: Dict[str, Any]) -> Tuple[bool, str]:
                 )
                 if not dsr_ok:
                     return False, dsr_reason
+            # Drift gate (default OFF): consult learning_drift_reports.
+            # Only downgrades an approved promotion; never upgrades. The
+            # check fails OPEN on any error so a broken drift query
+            # cannot block all promotions.
+            if ok and bool(getattr(config, "PROMOTION_REQUIRE_DRIFT_OK", False)):
+                drift_ok, drift_reason = _drift_promotion_ok(
+                    max_age_hours=float(
+                        getattr(config, "PROMOTION_DRIFT_MAX_AGE_HOURS", 24.0)
+                    ),
+                )
+                if not drift_ok:
+                    return False, drift_reason
             return ok, reason
 
     # Path 2: copy-trade source_trader (agent_scorer)
