@@ -255,15 +255,13 @@ def sync_shadow_book_to_live(container) -> List[Dict]:
 
         existing_meta = _trade_metadata(trade)
 
-        existing_meta.update({
-            "synthetic_reconciliation": True,
-            "reconciliation_reason": "live_reconciled_closed",
-            "reconciliation_exit_price": current_price,
-        })
-        db.update_paper_trade_metadata(trade_id, existing_meta)
-        # BUG-4 FIX: calculate actual PnL instead of hardcoding 0.0.
-        # Without this, reconciled trades permanently lose their PnL
-        # in the DB, making forensic analysis impossible.
+        # Compute reconciliation PnL FIRST so we can stamp the analytics
+        # fields into metadata in the same write as the reconciliation
+        # markers. Previously metadata was updated before reconciled_pnl
+        # was computed, so net_pnl_after_fees / close_reason were never
+        # written and any analytics reading metadata->>'net_pnl_after_fees'
+        # saw $0 for ~80% of copy_trade closes (the reconciliation path
+        # dominates copy_trade close volume).
         entry_price = float(trade.get("entry_price", 0) or 0)
         trade_size = float(trade.get("size", 0) or 0)
         trade_leverage = float(trade.get("leverage", 1) or 1)
@@ -272,6 +270,23 @@ def sync_shadow_book_to_live(container) -> List[Dict]:
         else:
             reconciled_pnl = (entry_price - current_price) * trade_size * trade_leverage
         reconciled_pnl = round(reconciled_pnl, 2)
+
+        existing_meta.update({
+            "synthetic_reconciliation": True,
+            "reconciliation_reason": "live_reconciled_closed",
+            "reconciliation_exit_price": current_price,
+            # Mirror the reconciled PnL into the analytics fields so any
+            # consumer reading metadata (dashboards, scorecards, the
+            # decision-replay diff tool, ad-hoc SQL like
+            # `details->>'net_pnl_after_fees'`) sees the same number that
+            # the `pnl` DB column already has. Fees aren't tracked on the
+            # reconciliation path (the live close paid them, not paper),
+            # so gross == net here.
+            "close_reason": "live_reconciled_closed",
+            "net_pnl_after_fees": reconciled_pnl,
+            "gross_pnl_before_fees": reconciled_pnl,
+        })
+        db.update_paper_trade_metadata(trade_id, existing_meta)
         if not db.close_paper_trade(trade_id, current_price, reconciled_pnl):
             continue
         _notify_manual_close_detected(
