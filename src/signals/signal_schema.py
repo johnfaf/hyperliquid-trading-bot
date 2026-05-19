@@ -120,10 +120,51 @@ class RiskParams:
             return self.take_profit_pct
         return self.take_profit_pct * self._normalized_leverage(leverage)
 
-    def resolve_trigger_prices(self, entry_price: float, side: str, leverage: float) -> tuple[float, float]:
-        """Convert risk targets into absolute trigger prices."""
+    def resolve_trigger_prices(
+        self,
+        entry_price: float,
+        side: str,
+        leverage: float,
+        atr_pct: Optional[float] = None,
+    ) -> tuple[float, float]:
+        """Convert risk targets into absolute trigger prices.
+
+        When config.ATR_STOP_FLOOR_ENABLED is set AND `atr_pct` is a
+        positive recent ATR-as-fraction-of-price (e.g. 0.012 == 1.2%),
+        the stop distance is *widened* (never tightened) to at least
+        ``max(atr_mult * atr_pct, noise_floor_bps/10000)``. If the
+        floor is binding, the take-profit is widened by the same ratio
+        so the configured reward:risk ratio is preserved.
+
+        Default-OFF: behaviour is byte-identical to the prior method
+        when the flag is unset, when ``atr_pct`` is None, or when
+        ``atr_pct <= 0``.
+        """
         stop_loss_pct = self.resolve_price_stop_loss_pct(leverage)
         take_profit_pct = self.resolve_price_take_profit_pct(leverage)
+
+        # ── A1 ATR floor (flag-gated, widens only) ───────────────────
+        if atr_pct is not None:
+            try:
+                atr_val = float(atr_pct)
+            except (TypeError, ValueError):
+                atr_val = 0.0
+            if atr_val > 0:
+                try:
+                    import config as _cfg  # local import: never break trigger resolution on config load
+                    if getattr(_cfg, "ATR_STOP_FLOOR_ENABLED", False):
+                        atr_mult = float(getattr(_cfg, "ATR_STOP_ATR_MULTIPLIER", 2.5))
+                        noise_floor = float(getattr(_cfg, "ATR_STOP_NOISE_FLOOR_BPS", 50.0)) / 10000.0
+                        atr_floor_pct = max(atr_mult * atr_val, noise_floor)
+                        if atr_floor_pct > stop_loss_pct:
+                            # Preserve reward:risk: TP widens by same ratio
+                            if stop_loss_pct > 0:
+                                take_profit_pct = take_profit_pct * (atr_floor_pct / stop_loss_pct)
+                            stop_loss_pct = atr_floor_pct
+                except Exception:
+                    # Never break trigger resolution because of the floor logic.
+                    pass
+
         side_value = str(side or "").strip().lower()
         is_long = side_value in {"buy", "long"}
         if is_long:

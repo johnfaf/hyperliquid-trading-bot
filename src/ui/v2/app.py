@@ -115,6 +115,7 @@ def create_app() -> FastAPI:
     from src.ui.v2.routers import backtest as backtest_router
     from src.ui.v2.routers import calibration as calibration_router
     from src.ui.v2.routers import health as health_router
+    from src.ui.v2.routers import metrics as metrics_router  # A7
     from src.ui.v2.routers import pages as pages_router
     from src.ui.v2.routers import positions as positions_router
     from src.ui.v2.routers import sources as sources_router
@@ -122,6 +123,7 @@ def create_app() -> FastAPI:
     from src.ui.v2.routers import traders as traders_router
 
     app.include_router(health_router.router)
+    app.include_router(metrics_router.router)  # A7: /metrics for Prometheus scraping
     app.include_router(auth_router.router)
     app.include_router(pages_router.router)
     app.include_router(calibration_router.router)

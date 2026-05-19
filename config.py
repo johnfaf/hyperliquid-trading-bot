@@ -543,6 +543,27 @@ LIVE_MAKER_ENTRY_FALLBACK_TO_MARKET = _safe_env_bool(
     "LIVE_MAKER_ENTRY_FALLBACK_TO_MARKET", True,
 )
 
+# ── A1: ATR-aware stop-loss floor ────────────────────────────────────────
+# Why this exists: with the default 4% ROE stop and high leverage (e.g. 25x)
+# the *price* stop becomes 4%/25 = 16 bps — well inside normal 5m noise on
+# most coins. Recent audit found 5 of last week's 8 losses were stop-outs
+# triggered by adverse moves as small as -0.03%, some on the same bar as the
+# entry. This widens the stop (never tightens it) to at least
+# max(ATR_STOP_ATR_MULTIPLIER * recent_ATR, ATR_STOP_NOISE_FLOOR_BPS).
+# TP is widened proportionally so the reward:risk ratio is preserved.
+#
+# DEFAULT OFF: this changes real-money trigger prices, so it ships dark and
+# must be backtest-validated on the 90d window before flipping default ON.
+# Once ATR_STOP_FLOOR_ENABLED=true, no signal can ever be stopped by a move
+# tighter than max(2.5 * ATR, 50 bps) — that's the noise band.
+ATR_STOP_FLOOR_ENABLED = _safe_env_bool("ATR_STOP_FLOOR_ENABLED", False)
+ATR_STOP_ATR_MULTIPLIER = _safe_env_float(
+    "ATR_STOP_ATR_MULTIPLIER", 2.5, lo=0.5, hi=10.0,
+)
+ATR_STOP_NOISE_FLOOR_BPS = _safe_env_float(
+    "ATR_STOP_NOISE_FLOOR_BPS", 50.0, lo=0.0, hi=1000.0,
+)
+
 # Regime reversal supervision for open LIVE positions.
 # Default mode is intentionally staged: detect confirmed opposite regimes and
 # tighten protection, but do not flatten/reverse real capital unless the

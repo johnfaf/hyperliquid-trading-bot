@@ -37,3 +37,10 @@ boto3>=1.34.0
 # Requires: POSTGRES_DSN env var
 psycopg[binary]>=3.1.0
 psycopg_pool>=3.1.0
+
+# ─── A7: Prometheus telemetry ─────────────────────────────────
+# Enable: METRICS_ENABLED=true (default true; module no-ops if
+# prometheus_client is not installed). The /metrics endpoint on the
+# v2 dashboard exposes signal_emit_total, signal_rejection_total,
+# confidence_distribution, decision_latency_seconds, etc.
+prometheus_client>=0.20.0
