@@ -44,9 +44,11 @@ The signal pipeline is deliberately aggressive: of the ~900 strategies generated
 │   └── SCALING_RUNBOOK.md           # Live capital ramp checklist and tier ladder
 ├── fixtures/
 │   └── sample_data.json             # Reproducible sample dataset
+├── .gitattributes                   # Enforces LF in-repo (kills CRLF diff churn)
 ├── scripts/
 │   ├── seed_and_replay.py           # Seed DB + run backtest (one command)
 │   ├── diagnose_rejections.py       # Debug why signals are rejected
+│   ├── prune_low_evidence_traders.py # Dry-run-first prune of 0-evidence/0-ROI trader rows
 │   └── run_crash_monte_carlo.py     # Stress testing
 ├── src/
 │   ├── core/
@@ -57,6 +59,8 @@ The signal pipeline is deliberately aggressive: of the ~900 strategies generated
 │   │   ├── health_reporter.py       # Health endpoint
 │   │   ├── dependency_validator.py  # Boot-time package check
 │   │   ├── env_utils.py             # Safe env-var parsing helpers
+│   │   ├── account_basis.py         # Canonical live-vs-paper account-basis resolver + invariant
+│   │   ├── build_info.py            # Deployed commit/build identity (/api/health, startup banner)
 │   │   ├── task_runner.py           # Background thread manager
 │   │   └── cycles/
 │   │       ├── fast_cycle.py        # Tier 1: SL/TP, copy scanning
@@ -79,6 +83,7 @@ The signal pipeline is deliberately aggressive: of the ~900 strategies generated
 │   │   ├── strategy_identifier.py   # Classify trader strategies
 │   │   ├── strategy_scorer.py       # 5-dimension scoring + time decay
 │   │   ├── regime_detector.py       # Market regime (trending/ranging/volatile)
+│   │   ├── regime_stability.py      # Regime hysteresis/debounce (opt-in)
 │   │   ├── regime_strategy_filter.py # Filter strategies by regime
 │   │   ├── features.py              # Feature engineering
 │   │   ├── sharpe_calculator.py     # Sharpe ratio computation
@@ -95,11 +100,15 @@ The signal pipeline is deliberately aggressive: of the ~900 strategies generated
 │   │   ├── predictive_regime_forecaster.py  # 5-input composite forecaster
 │   │   ├── xgboost_regime_forecaster.py     # ML regime prediction
 │   │   ├── llm_filter.py            # LLM-based signal filtering
+│   │   ├── bandit_allocator.py      # A2: Thompson-sampling source allocator (module-only)
+│   │   ├── funding_carry.py         # A4: HL ↔ CEX funding-carry math (module-only)
+│   │   ├── multiplier_trace.py      # A3: runtime size/confidence multiplier trace
 │   │   └── alpha_arena.py           # Strategy tournament
 │   ├── trading/
 │   │   ├── paper_trader.py          # Paper trading (firewall + slippage)
 │   │   ├── copy_trader.py           # Copy trading engine
 │   │   ├── live_trader.py           # Live execution (agent-wallet signing)
+│   │   ├── maker_first_executor.py  # A6: maker-first execution policy (module-only)
 │   │   ├── scaling_tiers.py         # T0-T4 live scaling ladder
 │   │   ├── cross_venue_hedger.py    # Multi-exchange hedging
 │   │   └── trade_memory.py          # Trade outcome memory
@@ -115,10 +124,15 @@ The signal pipeline is deliberately aggressive: of the ~900 strategies generated
 │   │   ├── backtest_engine.py       # Core backtest engine
 │   │   ├── candle_backtester.py     # Candle-based replay
 │   │   ├── data_fetcher.py          # Historical data fetcher
+│   │   ├── replay/                  # Deterministic full-pipeline replay harness
 │   │   └── monte_carlo.py           # Monte Carlo stress testing
+│   ├── learning/
+│   │   ├── promotion_gate.py        # Paper→live walk-forward promotion gate
+│   │   └── promotion_stats.py       # A5: deflated Sharpe + paired SPRT (module-only)
 │   ├── notifications/
 │   │   ├── telegram_alerts.py       # Telegram alerts
 │   │   ├── telegram_bot.py          # Telegram command handler
+│   │   ├── metrics.py               # A7: Prometheus telemetry (/metrics, no-op fallback)
 │   │   └── ws_position_monitor.py   # WebSocket position monitor
 │   └── ui/
 │       ├── dashboard.py             # Web dashboard
@@ -157,6 +171,8 @@ python scripts/seed_and_replay.py              # Seed sample data + backtest
 python scripts/seed_and_replay.py --seed-only  # Just populate DB
 python scripts/seed_and_replay.py --sweep      # Seed + parameter sweep
 python scripts/diagnose_rejections.py          # Debug signal rejections
+python scripts/prune_low_evidence_traders.py             # Dry-run: list 0-evidence/0-ROI trader rows
+python scripts/prune_low_evidence_traders.py --apply --i-understand-the-risks  # Apply (backs up, reversible)
 python scripts/replay_decision_cycle.py        # Replay recent approve/reject outcomes
 python scripts/run_crash_monte_carlo.py        # Crash stress test
 python scripts/run_rotation_shadow_mode.py     # 7-day rotation shadow mode
@@ -253,6 +269,32 @@ Use `/healthz` to confirm the resolved `active_tier`, `kelly_dampen`, `max_order
 - **Rotation telemetry depth:** replacement decisions capture candidate/incumbent scores, reasons, and post-close outcomes.
 - **Decision replay harness:** `scripts/replay_decision_cycle.py` summarizes approval/rejection reasons and execution attribution by source/regime.
 
+## Observability & Telemetry
+
+The bot answers "what is it doing and why isn't it trading?" without log archaeology:
+
+- **Deployed-build identity:** `GET /api/health` returns a `version` block (`commit`, `short`, `branch`, `deployment_id`, `environment`, `process_started_at`) and `main.py` logs a one-line `BUILD commit=… branch=… deploy=…` banner at startup, sourced from Railway's `RAILWAY_GIT_*` env (local `git` fallback). Confirms the running bot is on the merged commit.
+- **Why-not-trading rollup:** every trading cycle logs `Decision summary (6h): N candidates -> X executed, Y rejected | top blocks: …` and `GET /api/audit/summary?hours=6` returns the same rollup as JSON (counts by `final_status`, top rejection reasons, by source/coin). Best-effort — a journal hiccup never affects trading.
+- **Per-source realized PnL:** `GET /api/audit/source-pnl?days=7` rolls up `decision_outcomes` by source (trades / acted / wins / losses / realized PnL / win-rate) so "which source actually makes money?" is provable, not inferred.
+- **Prometheus (A7):** `GET /metrics` exposes decision/rejection counters and SLOs. Graceful no-op if `prometheus_client` is absent; disable with `METRICS_ENABLED=false`.
+- **Multiplier-cascade trace (A3):** a zero-cost runtime trace records every size/confidence multiplier applied to a signal; a CI linter flags un-traced cascades.
+
+### Alpha & Robustness Lanes (A1–A7)
+
+Shipped as isolated, tested modules so each can be backtested/shadow-tested before it touches live execution:
+
+| Lane | Capability | Status |
+|------|-----------|--------|
+| A1 | ATR-aware stop-loss floor | Flag-gated (`ATR_STOP_FLOOR_ENABLED=false`) |
+| A3 | Multiplier-cascade linter + runtime trace | **Runtime-active** (zero-cost trace; linter in CI) |
+| A7 | Prometheus telemetry + decision SLOs | **Runtime-active** (`/metrics`) |
+| A2 | Thompson-sampling source allocator (`bandit_allocator`) | Module-only (shadow before wiring) |
+| A5 | Deflated Sharpe + paired SPRT (`promotion_stats`) | Module-only (wire behind promotion gate) |
+| A4 | HL ↔ CEX funding-carry math (`funding_carry`) | Module-only (shadow vs live funding) |
+| A6 | Maker-first execution policy (`maker_first_executor`) | Module-only (backtest vs orderbook) |
+
+A deterministic replay harness (`src/backtest/replay/`) reconstructs the full decision pipeline against recorded production state so gate-interaction regressions are caught before prod.
+
 ## Signal Pipeline
 
 Signals flow through 6 layers before execution. Each layer can reject:
@@ -279,16 +321,24 @@ Decision Engine
   │  Min composite threshold: 0.20
   │  Max 3 trades per cycle
   ▼
-Decision Firewall (11-point validation)
-  │  1. Schema valid         7. Cooldown (60s/coin)
-  │  2. Confidence ≥ 15%     8. Regime alignment
-  │  3. Leverage ≤ 5x        9. Source accuracy
-  │  4. Position count ≤ 8   10. Daily drawdown < 3%
-  │  5. Per-coin ≤ 3         11. Funding rate risk
-  │  6. Exposure ≤ 150%
+Decision Firewall (multi-gate validation)
+  │  Core: schema · confidence floor · leverage clamp · position/
+  │        per-coin limits · cooldown · conflict detection
+  │  Risk: aggregate leveraged-notional exposure cap + absolute
+  │        $ floor (FIREWALL_AGGREGATE_EXPOSURE_FLOOR_USD) · margin
+  │        cap · funding-rate risk · daily drawdown · EV gate
+  │  Direction: market-side guard (regime + options-flow + forecaster
+  │        read) · regime hysteresis (opt-in) · long/short hardening
+  │        with a recent-side-block deadlock escape
+  │  Sources: per-source/day cap · calibration quarantine · source
+  │        confidence floor (synthetic-cap exemption for copy) ·
+  │        low-evidence trader gate
+  │  Live-only: account-basis is the real live wallet, never the
+  │        paper balance (require_live_balance) · cold-start clamps
   ▼
 Paper Trader / Live Execution
-   Feature enrichment, arena consensus, Kelly sizing, trade memory
+   Feature enrichment, arena consensus, Kelly sizing, trade memory.
+   Live mirroring re-sizes against the real wallet (account_basis).
 ```
 
 ## Configuration
@@ -380,6 +430,16 @@ DISCOVERY_CYCLE_INTERVAL = 86400     # 24h  (env: DISCOVERY_CYCLE_INTERVAL)
 | `FIREWALL_MAX_SIGNALS_PER_SOURCE_PER_DAY` | `0` | Per-source daily firewall pass cap (`0` disables cap) |
 | `FIREWALL_CANARY_MODE` | `false` | Enable firewall canary constraints |
 | `FIREWALL_CANARY_MAX_POSITIONS` | `2` | Max open positions enforced when firewall canary mode is on |
+| `FIREWALL_AGGREGATE_EXPOSURE_FLOOR_USD` | `5000` | Absolute $ floor for the leveraged-notional exposure cap so a tiny live wallet isn't structurally deadlocked (margin cap stays the real capital-at-risk control) |
+| `FIREWALL_MARKET_READ_USES_OPTIONS_FLOW` | `true` | Let strong options-flow + forecaster feed the market-side guard's "current read" so a lone regime label can't veto high-conviction entries |
+| `FIREWALL_RECENT_SIDE_BLOCK_MAX_HOURS` | `24` | Recent-side hardening block auto-escapes to a reduced-size probe after this many continuous hours, so the count-based lookback can refresh (`0` = legacy permanent block) |
+| `REGIME_HYSTERESIS_ENABLED` | `false` | Debounce a changed overall-regime label N cycles before the ~12 gates act on it (high-strength change still flips instantly) |
+| `COPY_SOURCE_FLOOR_SYNTHETIC_EXEMPT_ENABLED` | `true` | Exempt synthetic-regime-capped copy signals from the source-confidence floor (the cap erases per-signal merit, pinning every copy to a constant below the floor) |
+| `COPY_SOURCE_FLOOR_SYNTHETIC_RELAX_ENABLED` | `true` | Softer fallback to the exemption: relax (not skip) the copy source floor for synthetic-capped signals |
+| `FEATURE_COPY_CANDIDATE_COINS_MAX` | `25` | Fold this many recent copy-candidate coins into the feature-precompute universe so copy signals stop dying on `data_readiness_missing` |
+| `ATR_STOP_FLOOR_ENABLED` | `false` | A1: enforce an ATR-aware minimum stop-loss distance (flag-gated pending backtest) |
+| `METRICS_ENABLED` | `true` | Expose Prometheus `/metrics` (graceful no-op if `prometheus_client` absent) |
+| `DECISION_JOURNAL_ENABLED` | `true` | Record decision snapshots/outcomes that power the why-not-trading and source-PnL rollups |
 | `POLYMARKET_MAX_MARKETS_PER_SCAN` | `100` | Hard cap of ranked markets processed each scan |
 | `ARKHAM_API_KEY` | _(none)_ | Optional: Arkham Intelligence API key |
 | `LOG_FORMAT` | `json` | Log format: `json` (production) or `text` (local) |
@@ -423,6 +483,7 @@ The bot uses SQLite with 13 tables. Key tables:
 **golden_wallets** — Evaluated wallets with penalised equity curves.
 **wallet_fills** — Historical fills for golden wallets (penalised prices, fees).
 **audit_trail** — Immutable INSERT-only trade journal.
+**decision_snapshots / decision_stage_events / decision_outcomes** — Per-decision journal (why-entered/rejected, stage breadcrumbs, realised outcome) powering the why-not-trading and per-source-PnL rollups.
 **experiments** — Backtest results with full config and metrics.
 
 The database auto-backs up to JSON on each cycle and on SIGTERM for Railway persistence.
@@ -454,3 +515,4 @@ docker run -p 8080:8080 -v $(pwd)/data:/data hl-bot
 - The bot is designed to run 24/7 and improve strategy selection over time
 - All logs are structured JSON with automatic secret scrubbing
 - Database backs up to JSON on each cycle for recovery after redeploys
+- CI gates every merge on **lint (ruff E,F,W) + the full test suite + a dependency safety check**; `.gitattributes` normalizes line endings to LF in-repo
