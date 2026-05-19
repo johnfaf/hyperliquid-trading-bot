@@ -48,8 +48,22 @@ def _fw(**over):
     return DecisionFirewall(cfg)
 
 
-def test_default_off_still_rejects_below_floor():
-    fw = _fw()  # relax disabled by default
+def test_default_on_relaxes_synthetic_capped_copy():
+    """Default is now ON. Verified in 30 days of production audit_trail:
+    the bulk of "got 43%" rejections were a structural cascade dead-zone
+    (synthetic-cap + source-side guard + cold-start weight-blend) that
+    collapsed every copy signal to 0.43, regardless of trader quality.
+    Default-OFF would re-trap the bot in that deadlock."""
+    fw = _fw()  # relax should be ON by default
+    assert fw.copy_source_floor_synthetic_relax_enabled is True
+    ok, _, _ = fw._apply_source_policy(_sig(0.42), "copy_trade:0xabc")
+    assert ok is True, "default-ON should let 0.42 pass under synthetic regime"
+
+
+def test_explicit_off_still_rejects_below_floor():
+    """Operator escape hatch: setting the env var to false reverts to the
+    pre-fix behaviour (every cascade-floored copy signal rejects)."""
+    fw = _fw(copy_source_floor_synthetic_relax_enabled=False)
     assert fw.copy_source_floor_synthetic_relax_enabled is False
     ok, reason, _ = fw._apply_source_policy(_sig(0.42), "copy_trade:0xabc")
     assert ok is False

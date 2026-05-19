@@ -585,16 +585,38 @@ FIREWALL_RECENT_SIDE_BLOCK_MAX_HOURS = _safe_env_float(
 FEATURE_COPY_CANDIDATE_COINS_MAX = int(
     os.environ.get("FEATURE_COPY_CANDIDATE_COINS_MAX", 25)
 )
-# Copy-source-floor regime relaxation (#2): DEFAULT OFF. The bulk of
-# "Source allocator requires 45% confidence for copy_trade" rejections is
-# the AgentScorer correctly down-weighting UNPROVEN copy sources -- a
-# legitimate live-money control, not a bug. This optional lever lets an
-# operator who accepts the risk relax the source min-confidence floor by
-# COPY_SOURCE_FLOOR_SYNTHETIC_RELAX *only* for signals whose confidence
-# was capped by a synthetic / non-authoritative regime read. Off by
-# default == zero behavior change.
+# Copy-source-floor regime relaxation (#2): DEFAULT ON.
+#
+# History: this lever shipped default-OFF on the assumption that the
+# 45%-floor rejections were AgentScorer correctly down-weighting
+# unproven copy sources. 30 days of audit_trail forensics disproved
+# that. Across 2 different traders on 8 different coins, the rejected
+# confidence value was EXACTLY 43% every time -- a constant. Tracing
+# the cascade against the log:
+#
+#   raw copy confidence (per trader / coin): 0.64, 0.85, 0.89, ..., 0.95
+#   -> all capped to 0.50 by "synthetic regime non-authoritative"
+#   -> source-side guard x 0.75 = 0.375
+#   -> agent-scorer weight-blend with default 0.5 (cold-start constant)
+#     0.375 * 0.6 + 0.5 * 0.4 = 0.425 ~= 0.43
+#   -> below the 0.45 source-allocator warmup floor -> REJECTED
+#   -> source never accrues closed trades -> stays "unproven" forever
+#
+# The merit signal is erased upstream at the synthetic cap, so the 0.45
+# floor isn't filtering bad sources -- it's rejecting a constant. This
+# is a STRUCTURAL deadlock of the same shape as #1, not a tuning
+# preference. Default-OFF was wrong; flipping to default-ON.
+#
+# The relax only fires when (a) source_key starts with "copy_trade" AND
+# (b) regime_data.forecaster_synthetic_warm_start is True -- i.e. only
+# when the cascade can structurally crush a high-confidence trader
+# signal. Non-synthetic-regime merit gating is unchanged.
+#
+# Operator escape hatch: set
+# COPY_SOURCE_FLOOR_SYNTHETIC_RELAX_ENABLED=false in Railway env vars
+# to revert to the prior conservative behaviour without redeploying.
 COPY_SOURCE_FLOOR_SYNTHETIC_RELAX_ENABLED = _safe_env_bool(
-    "COPY_SOURCE_FLOOR_SYNTHETIC_RELAX_ENABLED", False
+    "COPY_SOURCE_FLOOR_SYNTHETIC_RELAX_ENABLED", True
 )
 COPY_SOURCE_FLOOR_SYNTHETIC_RELAX = _safe_env_float(
     "COPY_SOURCE_FLOOR_SYNTHETIC_RELAX", 0.07, lo=0.0, hi=0.30
