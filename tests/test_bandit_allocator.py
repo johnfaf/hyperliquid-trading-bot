@@ -18,7 +18,6 @@ import random
 import pytest
 
 from src.signals.bandit_allocator import (
-    DEFAULT_DECAY_HALF_LIFE_DAYS,
     DEFAULT_MIN_EVIDENCE_TRADES,
     DEFAULT_PRIOR_ALPHA,
     DEFAULT_PRIOR_BETA,

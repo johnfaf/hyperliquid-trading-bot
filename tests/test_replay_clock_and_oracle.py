@@ -3,7 +3,6 @@
 These are the proofs that the harness can never silently see the future.
 If any of these fail, every replay result is suspect.
 """
-import os
 import sqlite3
 from datetime import datetime, timezone
 
@@ -11,7 +10,7 @@ import pytest
 
 from src.backtest.replay.clock import LiveClock, ReplayClock
 from src.backtest.replay.candle_oracle import (
-    CandleOracle, LookaheadError, OracleCandle, TIMEFRAME_MS,
+    CandleOracle, LookaheadError,
 )
 
 

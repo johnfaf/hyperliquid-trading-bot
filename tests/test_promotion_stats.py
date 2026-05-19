@@ -9,14 +9,11 @@ sample size.
 """
 from __future__ import annotations
 
-import math
 import random
 
-import pytest
 
 from src.learning.promotion_stats import (
     DSRResult,
-    SPRTResult,
     deflated_sharpe,
     sharpe_ratio,
     sprt_pair,
