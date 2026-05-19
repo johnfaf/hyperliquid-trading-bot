@@ -9,7 +9,6 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 
-import pytest
 
 import src.core.cycles.feature_cycle as fc
 import src.data.database as db

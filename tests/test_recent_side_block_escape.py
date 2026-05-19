@@ -11,7 +11,6 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
-import pytest
 
 import src.signals.decision_firewall as dfw
 from src.signals.decision_firewall import DecisionFirewall
