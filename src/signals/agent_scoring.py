@@ -284,10 +284,30 @@ class AgentScorer:
         return signal_id
 
     def record_outcome(self, source_key: str, signal_id: str,
-                        pnl: float, return_pct: float = 0.0):
+                        pnl: float, return_pct: float = 0.0,
+                        close_metadata: dict = None):
         """
         Record the outcome of a trade.
         Call this when a paper trade closes.
+
+        Parameters
+        ----------
+        source_key, signal_id, pnl, return_pct
+            Standard trade outcome fields.
+        close_metadata
+            Optional dict with close-context fields used for loss
+            attribution. Recognised keys (all optional):
+              - close_reason: str
+              - entry_price: float
+              - exit_price: float
+              - atr_pct: float
+              - side: "long" | "short"
+              - leverage: float
+            When BANDIT_SKIP_NOISE_STOPS_ENABLED is True AND the close
+            classifies as NOISE_STOP / RECONCILED, the bandit feed is
+            skipped (the source's posterior is untouched). The static
+            score machinery (correct_signals, total_pnl, weights) is
+            unaffected.
         """
         if source_key not in self.scores:
             self.scores[source_key] = SourceScore(source_key=source_key)
@@ -318,7 +338,48 @@ class AgentScorer:
         # Thompson allocator. Best-effort -- never break score recording.
         if getattr(self, "_bandit_enabled", False):
             try:
-                self._bandit_alloc().update(source_key, won=bool(correct))
+                # Loss attribution gate: if enabled, ask classify_close()
+                # whether this outcome is bandit-worthy. NOISE_STOP and
+                # RECONCILED closes are skipped (the source isn't to
+                # blame for our too-tight stop or a book-keeping close).
+                # Default OFF -> behavior is byte-identical to pre-fix.
+                feed_outcome: bool = True
+                bandit_won = bool(correct)
+                try:
+                    import config as _cfg
+                    if (
+                        getattr(_cfg, "BANDIT_SKIP_NOISE_STOPS_ENABLED", False)
+                        and close_metadata
+                    ):
+                        from src.signals.loss_attribution import (
+                            ClassifyInputs, classify_close, bandit_outcome,
+                        )
+                        ci = ClassifyInputs(
+                            pnl=float(pnl),
+                            close_reason=str(close_metadata.get("close_reason", "")),
+                            entry_price=float(close_metadata.get("entry_price", 0.0)),
+                            exit_price=float(close_metadata.get("exit_price", 0.0)),
+                            atr_pct=float(close_metadata.get("atr_pct", 0.0)),
+                            side=str(close_metadata.get("side", "")),
+                            leverage=float(close_metadata.get("leverage", 1.0)),
+                        )
+                        cls = classify_close(ci)
+                        outcome = bandit_outcome(cls, pnl)
+                        if outcome is None:
+                            feed_outcome = False
+                            logger.info(
+                                "Bandit feed skipped for %s: close class=%s "
+                                "(loss attribution gate)",
+                                source_key, cls.value,
+                            )
+                        else:
+                            bandit_won = bool(outcome)
+                except Exception as _e:
+                    # Classification failure -> behave as if disabled.
+                    logger.debug("loss-attribution gate failed for %s: %s",
+                                 source_key, _e)
+                if feed_outcome:
+                    self._bandit_alloc().update(source_key, won=bandit_won)
             except Exception as exc:
                 logger.debug("bandit update failed for %s: %s", source_key, exc)
 

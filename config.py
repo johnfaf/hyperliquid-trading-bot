@@ -1013,6 +1013,29 @@ AGENT_BANDIT_BLEND = _safe_env_float(
     "AGENT_BANDIT_BLEND", 1.0, lo=0.0, hi=1.0
 )
 
+# ── Loss attribution: don't penalise sources for the bot's tight stops ──
+# When the bot's stop-loss triggers on a sub-noise move (the historical
+# 5-of-8 noise stop-outs from last week, some on -0.03% moves), it isn't
+# the source trader's fault -- it's our own too-tight SL. Without this
+# guard, the bandit (A2) records a loss against the source, lowering
+# its future allocation. This is the structural risk we called out
+# when designing A1: A1 fixes the cause, A2 needs to be aware so it
+# doesn't poison its posterior with our own noise stops while A1 rolls
+# out (or for any signal where ATR data is unavailable / A1 is off).
+#
+# When enabled: a close classified as NOISE_STOP (or RECONCILED) by
+# src.signals.loss_attribution.classify_close() is *skipped* by the
+# bandit feed -- the source's posterior is untouched. SIGNAL_LOSS
+# (a real adverse move beyond the noise band) still feeds the bandit
+# as a loss. TAKE_PROFIT still feeds as a win.
+#
+# DEFAULT OFF: bandit behavior is byte-identical until an operator
+# opts in. Pair this with A1 (ATR_STOP_FLOOR_ENABLED) once both have
+# soaked in shadow.
+BANDIT_SKIP_NOISE_STOPS_ENABLED = _safe_env_bool(
+    "BANDIT_SKIP_NOISE_STOPS_ENABLED", False
+)
+
 # ─── Funding-rate divergence brake ─────────────────────────────
 # Cross-market safety brake: when BTC/ETH funding is meaningfully
 # positive AND price is below the 4h moving average (crowded longs
