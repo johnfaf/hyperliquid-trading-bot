@@ -241,6 +241,22 @@ class DecisionFirewall:
             self.copy_source_floor_synthetic_relax = float(
                 cfg.get("copy_source_floor_synthetic_relax", 0.07)
             )
+        # #1 (default ON): synthetic-capped copy signals are a structural
+        # dead-zone (cap flattens all to 0.50 -> blend pins to a constant
+        # 0.43 < 0.45 floor -> 100% rejected). Exempt them from the source-
+        # confidence floor entirely. Supersedes the #2 relax lever when on.
+        try:
+            import config as _cfg_mod3
+            self.copy_source_floor_synthetic_exempt_enabled = bool(
+                cfg.get(
+                    "copy_source_floor_synthetic_exempt_enabled",
+                    getattr(_cfg_mod3, "COPY_SOURCE_FLOOR_SYNTHETIC_EXEMPT_ENABLED", True),
+                )
+            )
+        except Exception:
+            self.copy_source_floor_synthetic_exempt_enabled = bool(
+                cfg.get("copy_source_floor_synthetic_exempt_enabled", True)
+            )
         self.market_side_guard_enabled = bool(
             cfg.get("market_side_guard_enabled", True)
         )
@@ -1854,6 +1870,7 @@ class DecisionFirewall:
         signal: TradeSignal,
         source_key: str,
         dry_run: bool = False,
+        regime_data: Optional[Dict] = None,
     ) -> Tuple[bool, str, Dict]:
         # Calibration-quality gate. A source above the auto-quarantine
         # ECE bar is treated as paused for live entries — its outcomes
@@ -1904,24 +1921,47 @@ class DecisionFirewall:
             return False, f"Source allocator paused {source_key} ({status})", policy
 
         min_conf = float(policy.get("min_confidence", 0.0) or 0.0)
-        # #2 (opt-in, default OFF): only when an operator enables it, relax
-        # the floor for copy signals whose confidence was capped by a
-        # synthetic / non-authoritative regime (regime_data_quality ==
-        # "synthetic_warm_start", set by copy_trader). Never relaxes for
-        # genuinely low-weight/unproven sources under a real regime.
-        if (
-            min_conf > 0.0
-            and self.copy_source_floor_synthetic_relax_enabled
-            and str(source_key or "").strip().lower().startswith("copy_trade")
-        ):
-            _ctx = getattr(signal, "context", None)
-            if (
-                isinstance(_ctx, dict)
-                and str(_ctx.get("regime_data_quality") or "").strip().lower()
-                == "synthetic_warm_start"
-            ):
+        # #1/#2 synthetic-capped copy handling. copy_trader's synthetic-
+        # regime cap flattens EVERY copy signal's confidence to one value,
+        # which then blends to a constant ~0.43 sitting deterministically
+        # under the 0.45 source floor -> 100% of copy rejected while the
+        # forecaster is synthetic (a structural dead-zone, NOT the
+        # AgentScorer grading merit -- merit was erased upstream). Detect
+        # it authoritatively from regime_data.forecaster_synthetic_warm_
+        # start (always passed on the copy validate path); fall back to
+        # the signal-context marker. (The prior #2 lever gated only on
+        # signal.context, which signal_from_copy_trade never sets -> it
+        # was dead in production; regime_data detection fixes that too.)
+        _is_copy = str(source_key or "").strip().lower().startswith("copy_trade")
+        _synthetic_capped = False
+        if _is_copy and min_conf > 0.0:
+            _rp = regime_data if isinstance(regime_data, dict) else {}
+            if bool(_rp.get("forecaster_synthetic_warm_start")):
+                _synthetic_capped = True
+            else:
+                _ctx = getattr(signal, "context", None)
+                if (
+                    isinstance(_ctx, dict)
+                    and str(_ctx.get("regime_data_quality") or "").strip().lower()
+                    == "synthetic_warm_start"
+                ):
+                    _synthetic_capped = True
+        _floor_exempt = False
+        if _synthetic_capped:
+            if self.copy_source_floor_synthetic_exempt_enabled:
+                # #1 (default ON): the floor cannot meaningfully assess a
+                # signal whose merit the synthetic cap already erased ->
+                # skip it. All other source-policy checks still apply.
+                _floor_exempt = True
+                logger.debug(
+                    "Source-floor exempt: synthetic-capped copy %s "
+                    "(conf=%.0f%%, floor=%.0f%%) -- floor bypassed",
+                    source_key, signal.confidence * 100.0, min_conf * 100.0,
+                )
+            elif self.copy_source_floor_synthetic_relax_enabled:
+                # #2 fallback when exemption disabled: relax, don't skip.
                 min_conf = max(0.0, min_conf - float(self.copy_source_floor_synthetic_relax))
-        if signal.confidence + self.confidence_threshold_tolerance < min_conf:
+        if (not _floor_exempt) and signal.confidence + self.confidence_threshold_tolerance < min_conf:
             # Surface confidence_inputs (if any) so operators can diagnose a
             # stuck-rejection pattern without having to grep the source code.
             # Copy-trader signals carry these via signal.context.confidence_inputs.
@@ -2368,6 +2408,7 @@ class DecisionFirewall:
             signal,
             source_key,
             dry_run=dry_run,
+            regime_data=regime_data,
         )
         if not policy_ok:
             return _reject("rejected_source_policy", policy_reason)
