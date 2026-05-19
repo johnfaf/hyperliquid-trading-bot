@@ -6322,6 +6322,66 @@ class LiveTrader:
                        f"(confidence={signal.confidence:.0%}, "
                        f"leverage={signal.leverage}x)")
 
+            # ── A6 shadow: log MakerExecutionPolicy.decide() recommendation
+            # against a synthesized BBO (mid ± spread/2). PURE TELEMETRY:
+            # the entry order placement below is unchanged. Two layers of
+            # try/except guarantee the shadow can never break entry
+            # execution on a live-money code path.
+            try:
+                import config as _cfg
+                if getattr(_cfg, "MAKER_FIRST_SHADOW_ENABLED", False):
+                    # datetime / timezone are already imported at module level;
+                    # do NOT re-import here -- Python's local-scope rule would
+                    # shadow them across the entire enclosing function and
+                    # break unrelated datetime usage earlier in execute_signal.
+                    from src.trading.maker_first_executor import (
+                        BookState,
+                        decide,
+                        policy_for_source,
+                    )
+                    _mid = self._get_mid_price(coin)
+                    if _mid and _mid > 0:
+                        _spread_bps = float(getattr(
+                            _cfg, "MAKER_FIRST_SHADOW_SPREAD_BPS", 1.0,
+                        ))
+                        _half = _mid * _spread_bps / 20000.0
+                        _book = BookState(bid=_mid - _half, ask=_mid + _half)
+                        _src_key = self._signal_source_key(signal)
+                        _policy = policy_for_source(_src_key)
+                        _sig_age_s = 0.0
+                        try:
+                            _ts = getattr(signal, "timestamp", "")
+                            if _ts:
+                                _sig_dt = datetime.fromisoformat(
+                                    str(_ts).replace("Z", "+00:00"),
+                                )
+                                _sig_age_s = max(
+                                    0.0,
+                                    (datetime.now(timezone.utc) - _sig_dt).total_seconds(),
+                                )
+                        except Exception:
+                            pass
+                        _decision = decide(
+                            side=entry_side,
+                            book=_book,
+                            order=None,
+                            policy=_policy,
+                            signal_age_s=_sig_age_s,
+                        )
+                        _target_str = (
+                            f"{_decision.target_price:.6f}"
+                            if _decision.target_price else "-"
+                        )
+                        logger.info(
+                            "MAKER_SHADOW [%s %s] src=%s age=%.1fs mid=%.6f "
+                            "action=%s reason=%r target=%s",
+                            coin, entry_side, _src_key, _sig_age_s, _mid,
+                            _decision.action.value, _decision.reason,
+                            _target_str,
+                        )
+            except Exception as _e:
+                logger.debug("MAKER_SHADOW outer guard caught: %s", _e)
+
             # 1. Place entry order.  Non-urgent entries use maker-first
             # execution by default to reduce fee drag; emergency exits still
             # use market/reduce-only paths elsewhere.

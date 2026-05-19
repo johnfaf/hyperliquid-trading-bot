@@ -580,6 +580,28 @@ FUNDING_CARRY_SHADOW_HOLD_HOURS = _safe_env_float(
     "FUNDING_CARRY_SHADOW_HOLD_HOURS", 4.0, lo=0.25, hi=24.0,
 )
 
+# ── A6: maker-first execution policy SHADOW telemetry ───────────────────
+# When enabled, every live entry order placement also runs the
+# MakerExecutionPolicy.decide() function against a synthesized BBO
+# (mid ± MAKER_FIRST_SHADOW_SPREAD_BPS / 2) and the source-class
+# default policy, logging the recommended action: POST_ALO / HOLD /
+# REPOST_AT_BBO / TAKER_FALLBACK / ABANDON / FILLED.
+#
+# PURE TELEMETRY -- the actual order placement path is unchanged.
+# Designed to populate a few thousand decisions before any live
+# wiring lands, so we can validate:
+#   1. Are signals reaching the entry order WITHIN max_signal_age_s
+#      under the per-source default policies? (If not, raise the
+#      timeout or admit the lane is too slow for taker fallback.)
+#   2. What's the action histogram per source class? (If it's all
+#      ABANDON-stale, copy_trade is too slow for maker-only.)
+#
+# DEFAULT OFF. Flip true to start populating MAKER_SHADOW logs.
+MAKER_FIRST_SHADOW_ENABLED = _safe_env_bool("MAKER_FIRST_SHADOW_ENABLED", False)
+MAKER_FIRST_SHADOW_SPREAD_BPS = _safe_env_float(
+    "MAKER_FIRST_SHADOW_SPREAD_BPS", 1.0, lo=0.1, hi=100.0,
+)
+
 # Regime reversal supervision for open LIVE positions.
 # Default mode is intentionally staged: detect confirmed opposite regimes and
 # tighten protection, but do not flatten/reverse real capital unless the
