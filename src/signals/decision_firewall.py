@@ -2153,6 +2153,21 @@ class DecisionFirewall:
                     )
                 except Exception:
                     self.stats["audit_log_failures"] += 1
+                # A7: emit Prometheus counter so rejection rate is visible
+                # in real time, not just in the next forensic audit.
+                try:
+                    from src.notifications.metrics import signal_rejection_total
+                    source_str = (
+                        signal.source.value if hasattr(getattr(signal, "source", None), "value")
+                        else str(getattr(signal, "source", "unknown"))
+                    )
+                    signal_rejection_total.labels(
+                        stage=reason_key,
+                        reason=reason_msg[:80],   # bound label cardinality
+                        source=source_str,
+                    ).inc()
+                except Exception:
+                    pass
             return False, reason_msg
 
         # 1. Schema validation
@@ -2715,6 +2730,24 @@ class DecisionFirewall:
                     ),
                 },
             )
+            # A7: emit acceptance + confidence histogram. Pairs with the
+            # rejection counter so accept-rate-per-source is a derived
+            # PromQL query (accepts / (accepts + rejects)).
+            try:
+                from src.notifications.metrics import (
+                    signal_accept_total,
+                    confidence_distribution,
+                )
+                source_str = (
+                    signal.source.value if hasattr(getattr(signal, "source", None), "value")
+                    else str(getattr(signal, "source", "unknown"))
+                )
+                signal_accept_total.labels(source=source_str, symbol=signal.coin).inc()
+                confidence_distribution.labels(source=source_str).observe(
+                    float(getattr(signal, "confidence", 0.0) or 0.0)
+                )
+            except Exception:
+                pass
 
         return True, "approved"
 
