@@ -556,6 +556,39 @@ REGIME_HYSTERESIS_MIN_STREAK = int(
 REGIME_HYSTERESIS_OVERRIDE_CONF = _safe_env_float(
     "REGIME_HYSTERESIS_OVERRIDE_CONF", 0.85, lo=0.0, hi=1.0
 )
+# Recent-side block escape (#1): long/short hardening blocks a whole side
+# from a count-based lookback of the last N closed trades. When a side is
+# blocked it stops trading -> no new closes -> the count-based window
+# never refreshes -> the block is PERMANENT (the live deadlock: 0 trades
+# in 6h, "Recent longs are underperforming x35"). After a side has been
+# continuously blocked this many hours, downgrade the hard block to
+# "degraded" (reduced-size probe) so the sample can refresh and the gate
+# re-evaluates on fresh data. ~one reduced probe per cooldown. 0 disables
+# (legacy permanent block).
+FIREWALL_RECENT_SIDE_BLOCK_MAX_HOURS = _safe_env_float(
+    "FIREWALL_RECENT_SIDE_BLOCK_MAX_HOURS", 24.0, lo=0.0, hi=720.0
+)
+# Feature precompute coverage (#3): cap how many recent copy-trade
+# candidate coins to fold into the watched/feature-precompute universe so
+# copy signals on the broad tracked-trader coin set stop being dropped
+# with data_readiness_missing:candles,feature_vector.
+FEATURE_COPY_CANDIDATE_COINS_MAX = int(
+    os.environ.get("FEATURE_COPY_CANDIDATE_COINS_MAX", 25)
+)
+# Copy-source-floor regime relaxation (#2): DEFAULT OFF. The bulk of
+# "Source allocator requires 45% confidence for copy_trade" rejections is
+# the AgentScorer correctly down-weighting UNPROVEN copy sources -- a
+# legitimate live-money control, not a bug. This optional lever lets an
+# operator who accepts the risk relax the source min-confidence floor by
+# COPY_SOURCE_FLOOR_SYNTHETIC_RELAX *only* for signals whose confidence
+# was capped by a synthetic / non-authoritative regime read. Off by
+# default == zero behavior change.
+COPY_SOURCE_FLOOR_SYNTHETIC_RELAX_ENABLED = _safe_env_bool(
+    "COPY_SOURCE_FLOOR_SYNTHETIC_RELAX_ENABLED", False
+)
+COPY_SOURCE_FLOOR_SYNTHETIC_RELAX = _safe_env_float(
+    "COPY_SOURCE_FLOOR_SYNTHETIC_RELAX", 0.07, lo=0.0, hi=0.30
+)
 REGIME_REVERSAL_MIN_CONFIDENCE = _safe_env_float(
     "REGIME_REVERSAL_MIN_CONFIDENCE", 0.70, lo=0.0, hi=1.0,
 )

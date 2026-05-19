@@ -102,6 +102,37 @@ def _get_watched_coins(container=None) -> List[str]:
     except Exception:
         pass
 
+    # #3: fold in recently-evaluated copy-trade candidate coins so the
+    # broad tracked-trader coin set gets feature precompute. Without this
+    # copy signals on those coins (ALGO/FARTCOIN/POL/ADA/PUMP/STRK...) are
+    # dropped with data_readiness_missing:candles,feature_vector and never
+    # become live trades. Best-effort, bounded by config + _MAX_COINS.
+    try:
+        from src.data import database as db
+        import config as _cfg
+        _copy_cap = int(getattr(_cfg, "FEATURE_COPY_CANDIDATE_COINS_MAX", 25))
+        if _copy_cap > 0:
+            with db.get_connection() as conn:
+                if db.table_exists("decision_snapshots"):
+                    rows = conn.execute(
+                        """
+                        SELECT coin, MAX(created_at) AS m
+                        FROM decision_snapshots
+                        WHERE source LIKE 'copy_trade%'
+                          AND coin IS NOT NULL AND coin != ''
+                        GROUP BY coin
+                        ORDER BY m DESC
+                        LIMIT ?
+                        """,
+                        (_copy_cap,),
+                    ).fetchall()
+                    for r in rows:
+                        c = r["coin"] if isinstance(r, dict) else r[0]
+                        if c:
+                            coins.add(str(c).strip().upper())
+    except Exception:
+        pass
+
     # Add top coins by volume if we don't have enough
     if len(coins) < 10:
         try:
