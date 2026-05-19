@@ -642,6 +642,21 @@ COPY_SOURCE_FLOOR_SYNTHETIC_RELAX_ENABLED = _safe_env_bool(
 COPY_SOURCE_FLOOR_SYNTHETIC_RELAX = _safe_env_float(
     "COPY_SOURCE_FLOOR_SYNTHETIC_RELAX", 0.07, lo=0.0, hi=0.30
 )
+# Copy-source-floor synthetic EXEMPTION (#1, the real fix). Evidence
+# (logs.1779171559187): every copy signal -- raw 0.64..0.95, all coins,
+# all source traders -- is flattened to 0.50 by the synthetic-regime cap,
+# then blended to a CONSTANT 0.43 that is deterministically 2pts under
+# the 0.45 source floor -> 100% of copy signals rejected forever while
+# the forecaster stays synthetic. That is NOT the AgentScorer grading
+# source merit (the merit signal was erased upstream by the cap); it is a
+# structural dead-zone. So when a copy signal's confidence was capped by
+# a synthetic / non-authoritative regime read, SKIP the source-confidence
+# floor entirely (other source-policy checks -- paused/blocked/
+# quarantine/day-cap -- still apply). DEFAULT ON to break the deadlock;
+# flag-gated so an operator can revert to the legacy floor if desired.
+COPY_SOURCE_FLOOR_SYNTHETIC_EXEMPT_ENABLED = _safe_env_bool(
+    "COPY_SOURCE_FLOOR_SYNTHETIC_EXEMPT_ENABLED", True
+)
 REGIME_REVERSAL_MIN_CONFIDENCE = _safe_env_float(
     "REGIME_REVERSAL_MIN_CONFIDENCE", 0.70, lo=0.0, hi=1.0,
 )
