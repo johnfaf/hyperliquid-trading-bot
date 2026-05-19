@@ -962,6 +962,18 @@ PROMOTION_DSR_NUM_TRIALS = int(
 PROMOTION_DSR_MIN_OBS = int(
     os.environ.get("PROMOTION_DSR_MIN_OBS", 20)
 )
+# A2: optional Thompson-sampling source allocator blended into
+# AgentScorer.get_weight(). DEFAULT OFF -> get_weight is byte-identical
+# to the legacy dynamic-weight path. When on, the allocator is fed the
+# same per-source win/loss outcomes and its posterior sample is blended
+# with the legacy weight by AGENT_BANDIT_BLEND (1.0 = pure Thompson,
+# 0.0 = legacy). Lazy: no allocator object/state exists unless enabled.
+AGENT_BANDIT_ALLOCATOR_ENABLED = _safe_env_bool(
+    "AGENT_BANDIT_ALLOCATOR_ENABLED", False
+)
+AGENT_BANDIT_BLEND = _safe_env_float(
+    "AGENT_BANDIT_BLEND", 1.0, lo=0.0, hi=1.0
+)
 
 # ─── Funding-rate divergence brake ─────────────────────────────
 # Cross-market safety brake: when BTC/ETH funding is meaningfully

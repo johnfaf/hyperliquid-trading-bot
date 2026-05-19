@@ -74,6 +74,23 @@ class AgentScorer:
         # Trade-level tracking for time decay
         self._trade_history: Dict[str, List[Dict]] = defaultdict(list)
 
+        # A2 Thompson-sampling allocator (default OFF -> get_weight stays
+        # byte-identical; allocator is lazy so no object/state unless on).
+        try:
+            import config as _cfg_mod
+            self._bandit_enabled = bool(cfg.get(
+                "bandit_allocator_enabled",
+                getattr(_cfg_mod, "AGENT_BANDIT_ALLOCATOR_ENABLED", False),
+            ))
+            self._bandit_blend = float(cfg.get(
+                "bandit_blend",
+                getattr(_cfg_mod, "AGENT_BANDIT_BLEND", 1.0),
+            ))
+        except Exception:
+            self._bandit_enabled = bool(cfg.get("bandit_allocator_enabled", False))
+            self._bandit_blend = float(cfg.get("bandit_blend", 1.0))
+        self._bandit = None
+
         # Source policy thresholds. These gate weak sources before they keep
         # consuming paper/live capacity.
         self.policy_enabled = bool(cfg.get("policy_enabled", True))
@@ -297,6 +314,14 @@ class AgentScorer:
         self._recalculate(source_key)
         self._save_score(source_key)
 
+        # A2 (default OFF): feed the same win/loss outcome into the
+        # Thompson allocator. Best-effort -- never break score recording.
+        if getattr(self, "_bandit_enabled", False):
+            try:
+                self._bandit_alloc().update(source_key, won=bool(correct))
+            except Exception as exc:
+                logger.debug("bandit update failed for %s: %s", source_key, exc)
+
         logger.info(f"Agent score update [{source_key}]: pnl=${pnl:.2f}, "
                     f"accuracy={score.accuracy:.0%}, weight={score.dynamic_weight:.2f}")
 
@@ -364,7 +389,30 @@ class AgentScorer:
 
     # ─── Query ────────────────────────────────────────────────
 
+    def _bandit_alloc(self):
+        """Lazily build the Thompson allocator (only when A2 is enabled)."""
+        if self._bandit is None:
+            from src.signals.bandit_allocator import ThompsonAllocator
+            self._bandit = ThompsonAllocator()
+        return self._bandit
+
     def get_weight(self, source_key: str) -> float:
+        """Source weight. Default == the legacy dynamic-weight path
+        (byte-identical). With A2 enabled, blend in a Thompson posterior
+        sample by ``self._bandit_blend`` (best-effort: any allocator
+        error falls back to the legacy weight)."""
+        legacy = self._legacy_get_weight(source_key)
+        if not getattr(self, "_bandit_enabled", False):
+            return legacy
+        try:
+            s = float(self._bandit_alloc().sample(source_key))
+            b = max(0.0, min(1.0, float(self._bandit_blend)))
+            return max(0.0, min(1.0, (1.0 - b) * legacy + b * s))
+        except Exception as exc:
+            logger.debug("bandit get_weight blend failed for %s: %s", source_key, exc)
+            return legacy
+
+    def _legacy_get_weight(self, source_key: str) -> float:
         """Get the current dynamic weight for a signal source.
 
         Applies calendar decay on top of the stored dynamic_weight: idle
