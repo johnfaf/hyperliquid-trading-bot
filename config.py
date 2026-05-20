@@ -366,10 +366,22 @@ PAPER_FEATURE_PRECOMPUTE_MAX_COINS = int(
     os.environ.get("PAPER_FEATURE_PRECOMPUTE_MAX_COINS", 12) or 12
 )
 # Paper-trading risk is defined in ROE space, then converted back into raw
-# trigger prices by dividing by leverage. Take-profit is always kept at 5x the
-# configured stop-loss so every paper signal uses the same reward-to-risk shape.
+# trigger prices by dividing by leverage.
+#
+# Take-profit was historically 5x the configured stop-loss (a 5:1 R:R shape).
+# The 30d audit (May 2026) found TP fires only 4 times in 308 trades (1.3%)
+# while time_limit fires 28 times (+$188 net) -- winners reach an R or two
+# of profit but then drift back before reaching the 5R TP. Halved to 2.5x
+# so the bot captures the move it actually gets, rather than holding for a
+# target almost never hit.
+#
+# Override via env var if you want a different shape:
+#   PAPER_TRADING_TAKE_PROFIT_MULTIPLE=3.0
 PAPER_TRADING_STOP_LOSS_PCT = float(os.environ.get("PAPER_TRADING_STOP_LOSS_PCT", 0.15))
-PAPER_TRADING_TAKE_PROFIT_PCT = PAPER_TRADING_STOP_LOSS_PCT * 5.0
+PAPER_TRADING_TAKE_PROFIT_MULTIPLE = float(
+    os.environ.get("PAPER_TRADING_TAKE_PROFIT_MULTIPLE", 2.5)
+)
+PAPER_TRADING_TAKE_PROFIT_PCT = PAPER_TRADING_STOP_LOSS_PCT * PAPER_TRADING_TAKE_PROFIT_MULTIPLE
 PAPER_TRADING_MAKER_FEE_BPS = float(os.environ.get("PAPER_TRADING_MAKER_FEE_BPS", 0.2))
 PAPER_TRADING_TAKER_FEE_BPS = float(os.environ.get("PAPER_TRADING_TAKER_FEE_BPS", 2.5))
 PAPER_TRADING_DEFAULT_EXECUTION_ROLE = os.environ.get(

@@ -189,7 +189,9 @@ def test_decision_journal_records_updates_and_links_paper_trade(monkeypatch):
     assert row["final_status"] == "paper_opened"
     assert row["paper_trade_id"] == 123
     assert row["proposed_size_usd"] == 200.0
-    assert row["proposed_tp_roe"] == 0.25
+    # 2.5:1 R:R default (May 2026 audit halved from 5:1): TP normalised
+    # to stop * ratio = 0.05 * 2.5 = 0.125, not the explicit 0.25.
+    assert row["proposed_tp_roe"] == 0.125
 
 
 def test_decision_journal_skips_when_schema_bootstrap_fails(monkeypatch):

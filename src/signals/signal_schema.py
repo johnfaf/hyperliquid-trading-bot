@@ -49,13 +49,16 @@ class SignalStrength(str, Enum):
 class RiskParams:
     """Risk parameters attached to every signal."""
     stop_loss_pct: float = 0.05       # 5% stop on margin / ROE
-    take_profit_pct: float = 0.25     # 25% take-profit on margin / ROE (5:1)
+    # 30d audit (May 2026): with TP at 5x stop, only 4/308 trades reached TP
+    # while 28 timed out winning. 2.5x captures the actual MFE distribution
+    # of 1-4h holds. Override via reward_to_risk_ratio.
+    take_profit_pct: float = 0.125    # 12.5% take-profit on margin / ROE (2.5:1)
     max_leverage: float = 5.0
     trailing_stop: bool = True
     trailing_pct: float = 0.025       # Trailing distance (ROE or price, per risk_basis)
     time_limit_hours: float = 24.0    # Max time in position
     risk_basis: str = "roe"           # "roe" = margin-based, "price" = raw price move
-    reward_to_risk_ratio: float = 5.0
+    reward_to_risk_ratio: float = 2.5
     enforce_reward_to_risk: bool = True
     break_even_at_r: float = 1.0      # Promote stop to breakeven after this many R
     break_even_buffer_pct: float = 0.005  # Buffer above/below entry (same basis as risk_basis)

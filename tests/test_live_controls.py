@@ -1783,8 +1783,10 @@ def test_execute_options_flow_paper_trade_preserves_precise_stops(monkeypatch):
 
     _execute_options_flow_trades(container, {"overall_regime": "neutral"})
 
+    # Stop 2.5% / TP 6.25% (2.5:1 R:R -- shape changed from 5:1 in
+    # May 2026 audit; TP fires <2% under 5:1, so defaults were halved).
     assert abs(opened["stop_loss"] - (price * 0.975)) < 1e-12
-    assert abs(opened["take_profit"] - (price * 1.125)) < 1e-12
+    assert abs(opened["take_profit"] - (price * 1.0625)) < 1e-12
 
 
 def test_run_alpha_arena_live_path_executes_signal(monkeypatch):
@@ -1919,8 +1921,9 @@ def test_run_alpha_arena_paper_trade_preserves_precise_stops(monkeypatch):
 
     _run_alpha_arena(container, {"overall_regime": "neutral"})
 
+    # Short side: stop +2.5% / TP -6.25% (2.5:1, halved from 5:1 in May 2026 audit)
     assert abs(opened["stop_loss"] - (price * 1.025)) < 1e-12
-    assert abs(opened["take_profit"] - (price * 0.875)) < 1e-12
+    assert abs(opened["take_profit"] - (price * 0.9375)) < 1e-12
 
 
 def test_run_alpha_arena_passes_multi_coin_candle_map(monkeypatch):
@@ -3644,8 +3647,13 @@ def test_copy_trade_preserves_precise_stops_for_low_priced_assets(monkeypatch):
         [],
     )
 
+    # Copy-trade RiskParams: explicit stop_loss_pct=0.04 but
+    # take_profit_pct=0.20 gets normalised by __post_init__'s
+    # sync_reward_to_risk() to stop * reward_to_risk_ratio.
+    # As of the May 2026 audit, reward_to_risk_ratio=2.5 (down from 5.0)
+    # so TP becomes 0.04 * 2.5 = 0.10 (not 0.20).
     expected_stop_loss = price * (1 - 0.04 / leverage)
-    expected_take_profit = price * (1 + 0.20 / leverage)
+    expected_take_profit = price * (1 + 0.10 / leverage)
 
     assert trade is not None
     assert abs(opened["stop_loss"] - expected_stop_loss) < 1e-12
@@ -3655,7 +3663,7 @@ def test_copy_trade_preserves_precise_stops_for_low_priced_assets(monkeypatch):
 
     signal = signal_from_execution_dict(trade)
     assert abs(signal.risk.stop_loss_pct - (0.04 / leverage)) < 1e-12
-    assert abs(signal.risk.take_profit_pct - (0.20 / leverage)) < 1e-12
+    assert abs(signal.risk.take_profit_pct - (0.10 / leverage)) < 1e-12
 
 
 def test_discovery_time_persistence_round_trips_through_db_context(monkeypatch):

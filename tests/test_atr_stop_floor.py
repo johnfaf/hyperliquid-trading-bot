@@ -57,10 +57,13 @@ def test_base_stop_wider_than_atr_floor_wins(monkeypatch):
     monkeypatch.setattr(config, "ATR_STOP_ATR_MULTIPLIER", 2.5, raising=False)
     monkeypatch.setattr(config, "ATR_STOP_NOISE_FLOOR_BPS", 10.0, raising=False)
     # 1x leverage on price-basis 5% stop -> 5% price move. ATR floor = 2.5 * 0.01 = 2.5%.
+    # Default reward_to_risk_ratio=2.5 (halved from 5.0 in May 2026 audit) so
+    # the explicit take_profit_pct=0.25 gets normalised by sync_reward_to_risk()
+    # to stop * ratio = 0.05 * 2.5 = 0.125 -> price TP = 100 * 1.125 = 112.5.
     risk = RiskParams(stop_loss_pct=0.05, take_profit_pct=0.25, risk_basis="price")
     sl, tp = risk.resolve_trigger_prices(100.0, "long", 1.0, atr_pct=0.01)
     assert sl == pytest.approx(95.0)
-    assert tp == pytest.approx(125.0)
+    assert tp == pytest.approx(112.5)
 
 
 def test_atr_floor_widens_tight_high_leverage_stop(monkeypatch):
@@ -73,12 +76,14 @@ def test_atr_floor_widens_tight_high_leverage_stop(monkeypatch):
     sl, tp = risk.resolve_trigger_prices(100.0, "long", 25.0, atr_pct=0.015)
     # ATR floor = max(2.5 * 0.015, 0.005) = 0.0375 -> sl_price = 100 * (1 - 0.0375) = 96.25
     assert sl == pytest.approx(96.25)
-    # Reward:risk was 5:1 (TP 0.20/SL 0.04 in ROE). Base price TP would be
-    # 0.20/25 = 0.008 (so 100.8); preserved ratio gives TP * (0.0375/0.0016) = 0.1875
-    # -> 118.75
-    assert tp == pytest.approx(118.75)
-    # And reward:risk is preserved (within float epsilon)
-    assert (tp - 100.0) / (100.0 - sl) == pytest.approx(5.0, rel=1e-6)
+    # As of May 2026, default reward_to_risk_ratio=2.5 (halved from 5). The
+    # explicit TP=0.20 gets normalised by sync_reward_to_risk() to
+    # 0.04*2.5 = 0.10 ROE = 0.10/25 = 0.004 price. ATR widens stop by
+    # 0.0375/0.0016 = 23.4375x; TP widens by the same ratio:
+    # 0.004 * 23.4375 = 0.09375 -> price TP = 100 * 1.09375 = 109.375.
+    assert tp == pytest.approx(109.375)
+    # And the (now 2.5:1) reward:risk ratio is preserved
+    assert (tp - 100.0) / (100.0 - sl) == pytest.approx(2.5, rel=1e-6)
 
 
 def test_noise_floor_binds_when_atr_too_small(monkeypatch):
@@ -103,8 +108,9 @@ def test_short_side_widens_in_correct_direction(monkeypatch):
     risk = RiskParams(stop_loss_pct=0.04, take_profit_pct=0.20, risk_basis="roe")
     sl, tp = risk.resolve_trigger_prices(100.0, "short", 25.0, atr_pct=0.015)
     # short stop is ABOVE entry, TP is BELOW
+    # 2.5:1 R:R -> TP at 9.375% (vs 18.75% pre-fix when ratio was 5:1)
     assert sl == pytest.approx(103.75)
-    assert tp == pytest.approx(81.25)
+    assert tp == pytest.approx(90.625)
 
 
 def test_floor_never_tightens_stop(monkeypatch):
