@@ -137,7 +137,6 @@ def main(argv: list[str]) -> int:
     # Outliers (best/worst close)
     sorted_closes = sorted(closes, key=lambda x: x["closedPnl"])
     best = sorted_closes[-1] if sorted_closes else None
-    worst = sorted_closes[0] if sorted_closes else None
 
     # Top winners/losers excluded view
     pnl_excl_best = realized - (best["closedPnl"] if best else 0.0)
@@ -151,7 +150,7 @@ def main(argv: list[str]) -> int:
     print(f" Trade rows:       {len(rows)}  ({len(opens)} opens / {len(closes)} closes)")
     print(f" Avg open notional: ${avg_open_ntl:.2f}")
     print()
-    print(f" === BOT ===")
+    print(" === BOT ===")
     print(f"  Realized PnL:    ${realized:+.3f}")
     print(f"  PnL excl. best:  ${pnl_excl_best:+.3f}  "
           f"(best was {best['coin']} {best['dir']} ${best['closedPnl']:+.2f})")
@@ -160,13 +159,13 @@ def main(argv: list[str]) -> int:
     print(f"  Sharpe (annu):   {sharpe:.2f}")
     print(f"  Max drawdown:    ${mdd:+.3f}")
     print()
-    print(f" === BTC BUY-AND-HOLD (same period) ===")
+    print(" === BTC BUY-AND-HOLD (same period) ===")
     print(f"  Entry / exit:    ${entry_px:,.2f} -> ${exit_px:,.2f}")
     print(f"  Return:          {buy_and_hold_pct * 100:+.2f}%")
     print(f"  PnL on avg ntl ${avg_open_ntl:.2f}: ${bnh_pnl_at_avg_ntl:+.2f}")
     print(f"  PnL on ${bot_capital:.0f} capital:  ${bnh_pnl_at_capital:+.2f}")
     print()
-    print(f" === VERDICT ===")
+    print(" === VERDICT ===")
     if realized > bnh_pnl_at_avg_ntl:
         margin = realized - bnh_pnl_at_avg_ntl
         print(f"  Bot beat buy-and-hold by ${margin:+.3f} at matched notional.")
