@@ -35,7 +35,8 @@ anthropic>=0.39.0
 # PyTorch for LSTM direction forecaster and DQN sizer
 # (graceful fallback to rule-based/Kelly if not installed)
 # CPU-only build keeps the image small (~200MB vs ~2GB for CUDA)
-torch>=2.1.0
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.6.0+cpu
 
 # ─── Optional extras (see requirements-optional.txt) ──────────
 # Install separately:  pip install -r requirements-optional.txt

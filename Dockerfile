@@ -4,7 +4,14 @@ WORKDIR /app
 
 # Install locked dependencies first (cached layer unless requirements change)
 COPY requirements.txt requirements.lock .
+# Install all non-torch dependencies with hash verification for security
 RUN pip install --no-cache-dir --require-hashes -r requirements.lock
+# Install PyTorch CPU-only wheel separately — the CPU index uses local-version
+# suffixes (+cpu) that pip-compile cannot resolve cross-platform, so we pin
+# the version here and skip hash checking for this single package.
+RUN pip install --no-cache-dir \
+    --extra-index-url https://download.pytorch.org/whl/cpu \
+    "torch==2.6.0+cpu"
 
 # Copy application code
 COPY . .
