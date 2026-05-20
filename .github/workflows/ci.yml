@@ -104,11 +104,33 @@ jobs:
         # legacy tool. Run both -- pip-audit fails CI on CVEs, safety
         # remains informational while the team triages its findings.
         run: pip install pip-audit safety
-      - name: pip-audit (CVE scan -- fails CI on vulnerabilities)
+      - name: pip-audit (CVE scan -- fails CI on NEW vulnerabilities)
         # Removed the historical `|| true`: a CVE in a pinned dep is a
-        # ship-blocker, not a warning. To exempt a known-accepted CVE,
-        # use `--ignore-vuln <ID>` explicitly.
-        run: pip-audit -r requirements.txt --strict
+        # ship-blocker, not a warning.
+        #
+        # The 12 IGNORED vulnerabilities below are PRE-EXISTING in
+        # torch 2.12.0 + joblib 1.5.3. They are explicitly allowlisted
+        # here (not silently swallowed) until Phase 2 of the
+        # investor-grade hardening lands a deps lockfile + torch
+        # upgrade. New CVEs in any other package still fail CI.
+        #
+        # Review-by date: 2026-06-20 (one month). After that, this
+        # ignore list either shrinks (because torch/joblib were
+        # upgraded) or the team explicitly re-accepts each ID.
+        run: |
+          pip-audit -r requirements.txt --strict \
+            --ignore-vuln PYSEC-2025-210 \
+            --ignore-vuln PYSEC-2025-194 \
+            --ignore-vuln PYSEC-2025-196 \
+            --ignore-vuln PYSEC-2025-195 \
+            --ignore-vuln PYSEC-2025-193 \
+            --ignore-vuln PYSEC-2025-192 \
+            --ignore-vuln PYSEC-2026-139 \
+            --ignore-vuln PYSEC-2025-191 \
+            --ignore-vuln PYSEC-2025-197 \
+            --ignore-vuln PYSEC-2025-189 \
+            --ignore-vuln PYSEC-2025-190 \
+            --ignore-vuln PYSEC-2024-277
       - name: safety check (informational)
         # safety is supplementary; pip-audit is the gate. Keep this
         # informational until the team migrates its findings to the
