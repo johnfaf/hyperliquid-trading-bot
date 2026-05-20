@@ -88,7 +88,7 @@ def test_no_raw_copy_trade_fstring_in_src():
     # the wiring lands incrementally). We lock in the COUNT as of ship.
     # When you wire one of these to use the builder, decrement
     # MAX_KNOWN_LEGACY_SITES.
-    MAX_KNOWN_LEGACY_SITES = 6
+    MAX_KNOWN_LEGACY_SITES = 3
     msg = (
         f"Found {len(offenders)} raw copy_trade f-string / concat sites in src/.\n"
         f"Ratchet: must be <= {MAX_KNOWN_LEGACY_SITES} until each is migrated.\n"

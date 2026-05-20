@@ -1703,7 +1703,12 @@ def _execute_options_flow_trades(container, regime_data):
                 size_usd = account["balance"] * flow_signal.effective_size
                 size = size_usd / price
                 side = flow_signal.side.value
-                sl, tp = flow_signal.risk.resolve_trigger_prices(price, side, flow_signal.leverage)
+                # A1: pass atr_pct so the ATR floor (if enabled) widens
+                # tight options-flow stops.
+                sl, tp = flow_signal.risk.resolve_trigger_prices(
+                    price, side, flow_signal.leverage,
+                    atr_pct=(flow_signal.context or {}).get("atr_pct"),
+                )
                 trade_id = db.open_paper_trade(
                     strategy_id=None, coin=conv["ticker"], side=side,
                     entry_price=price, size=size, leverage=flow_signal.leverage,
@@ -1827,7 +1832,15 @@ def _process_closed_trades(container, closed):
             source_key = str(meta.get("source_key") or "").strip().lower()
             if not source_key:
                 if source == "copy_trade":
-                    source_key = f"copy_trade:{trader}" if trader else "copy_trade:untagged"
+                    # Use the canonical builder so truncated addresses
+                    # (the historical [:10] fragmentation bug) fall back
+                    # to the safe untagged key instead of becoming a
+                    # split agent_scores row. Builder also normalises
+                    # the untagged form to "copy_trade" (no ":untagged"
+                    # suffix) so we don't fragment the unknown-trader
+                    # bucket either.
+                    from src.signals.source_key import copy_trade_source_key
+                    source_key = str(copy_trade_source_key(trader))
                 elif source:
                     source_key = source if stype == "unknown" else f"{source}:{stype}"
                 elif stype != "unknown":
@@ -1971,7 +1984,12 @@ def _run_alpha_arena(container, regime_data):
                                 regime=regime_data.get("overall_regime", "") if regime_data else "",
                             )
                             live_signal = _apply_dynamic_risk_policy(container, live_signal, regime_data=regime_data)
-                            sl, tp = live_signal.risk.resolve_trigger_prices(price, side, live_signal.leverage)
+                            # A1: pass atr_pct so the ATR floor widens
+                            # tight live-arena stops.
+                            sl, tp = live_signal.risk.resolve_trigger_prices(
+                                price, side, live_signal.leverage,
+                                atr_pct=(live_signal.context or {}).get("atr_pct"),
+                            )
                             position_pct = 0.05 * conf
                             # ★ M17 FIX: for live trading, size against real account value
                             # not PAPER_TRADING_INITIAL_BALANCE constant. For paper mode,
