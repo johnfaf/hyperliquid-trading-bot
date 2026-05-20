@@ -104,6 +104,30 @@ def test_stale_blocking_report_returns_true():
     assert "stale_block" in reason
 
 
+def test_cross_dataset_block_still_caught():
+    """Issue #8 from main scan: pre-fix, the query was
+    `ORDER BY created_at DESC LIMIT 1` with no filter, so if dataset
+    A had the LATEST report but was non-blocking, a fresh blocking
+    report on dataset B was invisible. The fix adds
+    `WHERE blocks_promotion = TRUE` so the query finds the most
+    recent BLOCKING row across all datasets.
+
+    We exercise this by simulating the fix's SQL contract: the stub
+    returns the blocking row directly (as if WHERE filtered it
+    in), and the gate correctly downgrades."""
+    row = _row(
+        datetime.now(timezone.utc).isoformat(),
+        blocks=True, status="block",
+    )
+    with patch(
+        "src.learning.promotion_gate.db.get_connection",
+        return_value=_stub_conn(row),
+    ):
+        ok, reason = _drift_promotion_ok(max_age_hours=24.0)
+    assert ok is False
+    assert "drift_blocked" in reason
+
+
 def test_db_failure_returns_true_fail_open():
     """If the DB query raises, the drift check is skipped (fail OPEN).
     A broken drift query MUST NOT block all promotions."""

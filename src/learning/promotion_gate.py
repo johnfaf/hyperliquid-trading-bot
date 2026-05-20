@@ -190,11 +190,16 @@ def _drift_promotion_ok(*, max_age_hours: float) -> Tuple[bool, str]:
     """
     try:
         with db.get_connection(for_read=True) as conn:
+            # Look for any recent BLOCKING report, not just the latest
+            # report. The pre-fix query took the most recent row only --
+            # if dataset A's latest was non-blocking but dataset B had a
+            # fresh blocks_promotion=TRUE row, the gate would miss it.
             row = conn.execute(
                 """
                 SELECT created_at, blocks_promotion, status, summary,
                        current_dataset_id, baseline_dataset_id
                   FROM learning_drift_reports
+                 WHERE blocks_promotion = TRUE
                  ORDER BY created_at DESC
                  LIMIT 1
                 """,

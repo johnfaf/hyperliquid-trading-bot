@@ -184,12 +184,19 @@ def test_drift_sentinel_grep_matches_registry():
     # must grow to cover them. The current line count is a snapshot;
     # if a new `confidence *= X` appears and registry doesn't grow,
     # this test fails.
+    # Tight ratchet: count must not exceed the snapshot. The pre-fix
+    # bound was `SNAPSHOT_LINE_COUNT + len(KNOWN_MULTIPLIERS)` (= 32),
+    # which left 18 free slots -- a slow regression could land 18 new
+    # `confidence *=` sites without tripping CI. Now the snapshot itself
+    # is the cap; each new site must EXPLICITLY raise SNAPSHOT_LINE_COUNT
+    # (and is audited at PR review time).
     SNAPSHOT_LINE_COUNT = 14  # measured at A3 ship time
-    assert len(hits) <= SNAPSHOT_LINE_COUNT + len(KNOWN_MULTIPLIERS), (
-        f"Found {len(hits)} `confidence *=` sites in src/signals/ but the "
-        f"registry has only {len(KNOWN_MULTIPLIERS)} entries — drift! "
-        f"Either add the new site to KNOWN_MULTIPLIERS or remove the dead "
-        f"multiplier. Sites:\n" + "\n".join(f"  {h}" for h in hits)
+    assert len(hits) <= SNAPSHOT_LINE_COUNT, (
+        f"Found {len(hits)} `confidence *=` sites in src/signals/, "
+        f"snapshot is {SNAPSHOT_LINE_COUNT}. Either add the new site to "
+        f"KNOWN_MULTIPLIERS AND raise SNAPSHOT_LINE_COUNT (audit required), "
+        f"or remove the dead multiplier. Sites:\n"
+        + "\n".join(f"  {h}" for h in hits)
     )
 
 
