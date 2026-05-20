@@ -256,8 +256,20 @@ class CrossVenueConfirmation:
                         FundingSnapshot,
                         evaluate_carry,
                     )
-                    # HL funds hourly; CEX (Binance/Bybit/Crypto.com) on 8h.
-                    # Tolerate unknown venues by defaulting to 8h cadence.
+                    # Per-venue native funding cadence (hours). Hyperliquid
+                    # is hourly; Binance/Bybit/Crypto.com pay every 8h;
+                    # dYdX pays hourly. Unknown venues are SKIPPED (not
+                    # hard-coded to 8h) because the wrong interval makes
+                    # annualised rates -- and thus edge_bps -- materially
+                    # wrong. Skipping is the conservative shadow choice.
+                    _VENUE_INTERVALS_H = {
+                        "hyperliquid": 1.0,
+                        "binance": 8.0,
+                        "bybit": 8.0,
+                        "cryptocom": 8.0,
+                        "crypto.com": 8.0,
+                        "dydx": 1.0,
+                    }
                     _hl_snap = FundingSnapshot(
                         venue="hyperliquid", symbol=coin,
                         rate_native=float(hl_rate), interval_hours=1.0,
@@ -265,9 +277,20 @@ class CrossVenueConfirmation:
                     min_edge = float(getattr(_cfg, "FUNDING_CARRY_SHADOW_MIN_EDGE_BPS", 8.0))
                     hold_hours = float(getattr(_cfg, "FUNDING_CARRY_SHADOW_HOLD_HOURS", 4.0))
                     for cex_venue, cex_rate in cex_pairs:
+                        _interval_h = _VENUE_INTERVALS_H.get(
+                            str(cex_venue).lower().strip(),
+                        )
+                        if _interval_h is None:
+                            logger.debug(
+                                "CARRY_SHADOW skipping %s: unknown funding "
+                                "cadence (add to _VENUE_INTERVALS_H to enable)",
+                                cex_venue,
+                            )
+                            continue
                         _cex_snap = FundingSnapshot(
                             venue=cex_venue, symbol=coin,
-                            rate_native=float(cex_rate), interval_hours=8.0,
+                            rate_native=float(cex_rate),
+                            interval_hours=_interval_h,
                         )
                         try:
                             opp = evaluate_carry(

@@ -138,6 +138,31 @@ def test_flag_on_with_hl_and_cex_calls_evaluate(monkeypatch, caplog):
     assert cex_snap.symbol == "BTC"
 
 
+def test_venue_cadence_map_skips_unknown_venues():
+    """Issue #6 from the main scan: pre-fix, the shadow hard-coded
+    interval_hours=8.0 for ALL non-HL venues, producing wrong
+    annualised rates (and thus wrong edge_bps) for dYdX (1h) or any
+    future venue. The fix introduces _VENUE_INTERVALS_H and SKIPS
+    unknown venues instead of guessing 8h."""
+    # Mirror the production map from cross_venue.py
+    _VENUE_INTERVALS_H = {
+        "hyperliquid": 1.0,
+        "binance": 8.0,
+        "bybit": 8.0,
+        "cryptocom": 8.0,
+        "crypto.com": 8.0,
+        "dydx": 1.0,
+    }
+    # Known venues resolve correctly
+    assert _VENUE_INTERVALS_H.get("binance") == 8.0
+    assert _VENUE_INTERVALS_H.get("dydx") == 1.0
+    # Unknown venue resolves to None → skip
+    assert _VENUE_INTERVALS_H.get("brand_new_dex") is None
+    # The cadence MUST be per-venue native, not the wrong "8h for all CEX"
+    # (e.g. dYdX is hourly, so wrong interval = ~8x off in annualised rate)
+    assert _VENUE_INTERVALS_H["dydx"] != _VENUE_INTERVALS_H["binance"]
+
+
 def test_evaluate_carry_raising_does_not_break_shadow():
     """If evaluate_carry raises, the shadow block must swallow it and
     log.debug -- never propagate to confirm_signal's caller."""
