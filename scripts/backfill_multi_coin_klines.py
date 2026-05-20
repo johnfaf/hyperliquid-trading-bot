@@ -29,7 +29,7 @@ import sqlite3
 import sys
 import time
 import zipfile
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Iterable, Optional, Tuple
 
@@ -143,7 +143,7 @@ def _insert_rows(db_path: str, coin: str, rows: list) -> int:
             """INSERT OR IGNORE INTO candles
                (coin, timeframe, timestamp_ms, open, high, low, close, volume)
                VALUES (?, '1m', ?, ?, ?, ?, ?, ?)""",
-            [(coin, ts, o, h, l, c, v) for (ts, o, h, l, c, v) in rows],
+            [(coin, ts, o, h, l, c, v) for (ts, o, h, l, c, v) in rows],  # noqa: E741
         )
         conn.commit()
         return cur.rowcount or 0
@@ -224,7 +224,8 @@ def main(argv: list[str] | None = None) -> int:
     start_d = datetime.strptime(args.start, "%Y-%m-%d").date()
     end_d = datetime.strptime(args.end, "%Y-%m-%d").date()
     if end_d < start_d:
-        logger.error("end before start"); return 2
+        logger.error("end before start")
+        return 2
 
     coins = [c.strip().upper() for c in args.coins.split(",") if c.strip()]
     _ensure_cache_schema(args.cache_db)

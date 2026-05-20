@@ -48,8 +48,32 @@ jobs:
         if: steps.lint_targets.outputs.count == '0'
         run: echo "No changed Python files under src/ or tests/."
 
+  # Investor-grade addition: lint the WHOLE repo on every push to main.
+  # The diff-based lint above protects PRs; this catches drift in
+  # files not touched by the latest PR.
+  lint_full:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+      - name: Install ruff
+        run: pip install ruff
+      - name: Lint full repo (src + tests + scripts)
+        run: python -m ruff check --select E,F,W --ignore E501,E402 src/ tests/ scripts/
+
   test:
     runs-on: ubuntu-latest
+    env:
+      # Pin Python hash seed for replay determinism. Without this, any
+      # code path that iterates a `set` of source_keys, dict-ordered
+      # config, or hashes for cache keys produces a different ordering
+      # per CI run -- which can mask non-deterministic bugs in the
+      # decision pipeline and replay harness.
+      PYTHONHASHSEED: "0"
     steps:
       - uses: actions/checkout@v4
       - name: Set up Python
@@ -75,7 +99,18 @@ jobs:
         uses: actions/setup-python@v4
         with:
           python-version: '3.11'
-      - name: Install safety
-        run: pip install safety
-      - name: Check dependencies
+      - name: Install scanners
+        # pip-audit is the modern PyPA-maintained scanner; safety is the
+        # legacy tool. Run both -- pip-audit fails CI on CVEs, safety
+        # remains informational while the team triages its findings.
+        run: pip install pip-audit safety
+      - name: pip-audit (CVE scan -- fails CI on vulnerabilities)
+        # Removed the historical `|| true`: a CVE in a pinned dep is a
+        # ship-blocker, not a warning. To exempt a known-accepted CVE,
+        # use `--ignore-vuln <ID>` explicitly.
+        run: pip-audit -r requirements.txt --strict
+      - name: safety check (informational)
+        # safety is supplementary; pip-audit is the gate. Keep this
+        # informational until the team migrates its findings to the
+        # explicit ignore list.
         run: safety check -r requirements.txt || true
