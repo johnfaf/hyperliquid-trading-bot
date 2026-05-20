@@ -335,6 +335,40 @@ class PaperTrader:
         direction = 1.0 if str(trade.get("side", "")).lower() == "long" else -1.0
         return ((float(price) - entry) / entry) * leverage * direction
 
+    # Minimum stop_roe_pct considered "valid" for R-multiple math. Below
+    # this, the stop is either missing or implausibly tight (1e-9 floor
+    # from a previous bug); dividing the ROE by it produces -410k garbage.
+    # 1 bp ROE (0.0001) is the floor: anything tighter is data quality
+    # issue, not a real stop.
+    _MIN_VALID_STOP_ROE = 1e-4
+
+    @classmethod
+    def _safe_r_multiple(cls, roe_pct: float, stop_roe_pct: float) -> Optional[float]:
+        """Return ``roe_pct / stop_roe_pct``, or ``None`` if the stop is
+        missing or implausibly tight.
+
+        Background
+        ----------
+        Pre-fix, three call sites in this module floored ``stop_roe_pct``
+        to ``1e-9`` to avoid divide-by-zero, then computed
+        ``current_roe / stop_roe_pct``. With a legitimately-missing stop,
+        a -0.04% ROE adverse move became -410,000 R, which then got
+        stamped into ``metadata.min_r_multiple`` for every affected trade
+        and poisoned dashboards, agent_scorer, the A1 retro-sweep, and
+        loss-attribution. A missing/invalid stop is *data quality
+        information*; surface it as None so consumers know to skip.
+        """
+        try:
+            stop = float(stop_roe_pct or 0.0)
+        except (TypeError, ValueError):
+            return None
+        if stop < cls._MIN_VALID_STOP_ROE:
+            return None
+        try:
+            return float(roe_pct) / stop
+        except (TypeError, ValueError, ZeroDivisionError):
+            return None
+
     def _update_trade_excursion(
         self,
         trade: Dict,
@@ -350,7 +384,9 @@ class PaperTrader:
             current_roe = self._price_roe_pct(trade, current_price)
             prev_mfe_roe = float(meta.get("mfe_roe_pct", 0.0) or 0.0)
             prev_mae_roe = float(meta.get("mae_roe_pct", 0.0) or 0.0)
-            stop_roe_pct = max(float(risk_policy.get("stop_roe_pct", 0.0) or 0.0), 1e-9)
+            # No 1e-9 floor: a missing/invalid stop yields None below
+            # rather than -410k garbage written to metadata.
+            stop_roe_pct = float(risk_policy.get("stop_roe_pct", 0.0) or 0.0)
 
             updates: Dict[str, Any] = {
                 "last_path_price": round(float(current_price), 8),
@@ -359,23 +395,25 @@ class PaperTrader:
             }
 
             if current_roe >= prev_mfe_roe:
-                updates.update(
-                    {
-                        "mfe_price": round(float(current_price), 8),
-                        "mfe_roe_pct": round(float(current_roe), 6),
-                        "max_r_multiple": round(float(current_roe) / stop_roe_pct, 6),
-                        "mfe_updated_at": now_utc.isoformat(),
-                    }
-                )
+                mfe_r = self._safe_r_multiple(current_roe, stop_roe_pct)
+                row: Dict[str, Any] = {
+                    "mfe_price": round(float(current_price), 8),
+                    "mfe_roe_pct": round(float(current_roe), 6),
+                    "mfe_updated_at": now_utc.isoformat(),
+                }
+                if mfe_r is not None:
+                    row["max_r_multiple"] = round(mfe_r, 6)
+                updates.update(row)
             if current_roe <= prev_mae_roe:
-                updates.update(
-                    {
-                        "mae_price": round(float(current_price), 8),
-                        "mae_roe_pct": round(float(current_roe), 6),
-                        "min_r_multiple": round(float(current_roe) / stop_roe_pct, 6),
-                        "mae_updated_at": now_utc.isoformat(),
-                    }
-                )
+                mae_r = self._safe_r_multiple(current_roe, stop_roe_pct)
+                row = {
+                    "mae_price": round(float(current_price), 8),
+                    "mae_roe_pct": round(float(current_roe), 6),
+                    "mae_updated_at": now_utc.isoformat(),
+                }
+                if mae_r is not None:
+                    row["min_r_multiple"] = round(mae_r, 6)
+                updates.update(row)
 
             db.update_paper_trade_metadata(trade["id"], updates)
         except Exception as exc:
@@ -2065,24 +2103,40 @@ class PaperTrader:
         risk_policy = self._resolve_trade_risk_policy(
             {**trade, "metadata": trade_meta}
         )
-        stop_roe_pct = max(float(risk_policy.get("stop_roe_pct", 0.0) or 0.0), 1e-9)
+        # No 1e-9 floor: when the stop is missing/invalid, _safe_r_multiple
+        # returns None and we record the R-multiples as None rather than
+        # garbage. Prior to this fix, missing-stop trades stamped values
+        # like -410,000 into metadata.min_r_multiple.
+        stop_roe_pct = float(risk_policy.get("stop_roe_pct", 0.0) or 0.0)
         exit_roe_pct = self._price_roe_pct(trade, slipped_exit)
-        exit_r_multiple = exit_roe_pct / stop_roe_pct
-        max_r_multiple = float(trade_meta.get("max_r_multiple", max(exit_r_multiple, 0.0)) or 0.0)
-        min_r_multiple = float(trade_meta.get("min_r_multiple", min(exit_r_multiple, 0.0)) or 0.0)
-        realized_max_r = max(max_r_multiple, exit_r_multiple)
-        realized_min_r = min(min_r_multiple, exit_r_multiple)
+        exit_r_multiple = self._safe_r_multiple(exit_roe_pct, stop_roe_pct)
+        exit_r_for_aggregation = exit_r_multiple if exit_r_multiple is not None else 0.0
+        max_r_multiple = float(
+            trade_meta.get("max_r_multiple", max(exit_r_for_aggregation, 0.0)) or 0.0
+        )
+        min_r_multiple = float(
+            trade_meta.get("min_r_multiple", min(exit_r_for_aggregation, 0.0)) or 0.0
+        )
+        realized_max_r = max(max_r_multiple, exit_r_for_aggregation)
+        realized_min_r = min(min_r_multiple, exit_r_for_aggregation)
         path_capture_ratio = (
-            exit_r_multiple / realized_max_r
-            if realized_max_r > 0 and exit_r_multiple > 0
+            exit_r_for_aggregation / realized_max_r
+            if realized_max_r > 0 and exit_r_for_aggregation > 0
             else 0.0
         )
         path_metrics = {
             "exit_roe_pct": round(exit_roe_pct, 6),
-            "exit_r_multiple": round(exit_r_multiple, 6),
-            "max_r_multiple": round(realized_max_r, 6),
-            "min_r_multiple": round(realized_min_r, 6),
+            "exit_r_multiple": (
+                round(exit_r_multiple, 6) if exit_r_multiple is not None else None
+            ),
+            "max_r_multiple": (
+                round(realized_max_r, 6) if exit_r_multiple is not None else None
+            ),
+            "min_r_multiple": (
+                round(realized_min_r, 6) if exit_r_multiple is not None else None
+            ),
             "path_capture_ratio": round(path_capture_ratio, 6),
+            "r_multiple_valid": exit_r_multiple is not None,
             "close_reason": close_reason,
         }
 
