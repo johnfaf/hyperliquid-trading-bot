@@ -2109,10 +2109,12 @@ def test_sync_shadow_book_stamps_pnl_analytics_into_reconciliation_metadata(monk
 
     reconciled = sync_shadow_book_to_live(container)
 
+    # Fees: (2000*0.1*5 + 2100*0.1*5) * 2.5bps = 2050 * 0.00025 = 0.5125
+    # gross = +50.0, net = 50.0 - 0.5125 = 49.49 (rounded to 2dp)
     # Returned dict carries the same PnL as the DB write
     assert len(reconciled) == 1
-    assert reconciled[0]["pnl"] == 50.0
-    assert closed == [(11, 2100.0, 50.0)]
+    assert reconciled[0]["pnl"] == 49.49
+    assert closed == [(11, 2100.0, 49.49)]
 
     # ── The actual regression assertions ──────────────────────────────
     assert len(metadata_updates) == 1, "exactly one metadata write per reconciled trade"
@@ -2123,8 +2125,9 @@ def test_sync_shadow_book_stamps_pnl_analytics_into_reconciliation_metadata(monk
     assert meta["reconciliation_exit_price"] == 2100.0
     # NEW: analytics fields now mirrored into metadata
     assert meta["close_reason"] == "live_reconciled_closed"
-    assert meta["net_pnl_after_fees"] == 50.0
     assert meta["gross_pnl_before_fees"] == 50.0
+    assert meta["net_pnl_after_fees"] == 49.49
+    assert meta["reconciled_fees_estimated"] == pytest.approx(0.5125, abs=0.01)
 
 
 def test_sync_shadow_book_stamps_negative_pnl_for_short_underwater(monkeypatch):
@@ -2180,12 +2183,16 @@ def test_sync_shadow_book_stamps_negative_pnl_for_short_underwater(monkeypatch):
 
     reconciled = sync_shadow_book_to_live(container)
 
-    assert closed == [(13, 60500.0, -20.0)]
-    assert reconciled[0]["pnl"] == -20.0
+    # Fees: notional_in + notional_out = 60000*0.01*4 + 60500*0.01*4
+    # = 4820; 2.5 bps round trip taker = 4820 * 0.00025 = 1.205
+    # gross = -20.0, net = -21.2 (rounded)
+    assert closed == [(13, 60500.0, -21.2)]
+    assert reconciled[0]["pnl"] == -21.2
     _, meta = metadata_updates[0]
     assert meta["close_reason"] == "live_reconciled_closed"
-    assert meta["net_pnl_after_fees"] == -20.0
     assert meta["gross_pnl_before_fees"] == -20.0
+    assert meta["net_pnl_after_fees"] == -21.2
+    assert meta["reconciled_fees_estimated"] == pytest.approx(1.205, abs=0.01)
 
 
 def test_sync_shadow_book_creates_synthetic_trade_for_orphan_live_position(monkeypatch):
@@ -2396,6 +2403,11 @@ def test_process_closed_trades_uses_copy_source_key_for_agent_scorer():
         },
     )()
 
+    # Use a full 42-char ETH address. Pre-fix this test used a truncated
+    # "0xabc123" form that the SourceKey validator now correctly rejects
+    # (coercing to the safe "copy_trade" untagged key). A real production
+    # address shape passes through to the canonical key.
+    full_addr = "0xabc123" + "0" * 34  # 42 chars total
     _process_closed_trades(
         container,
         [
@@ -2409,18 +2421,19 @@ def test_process_closed_trades_uses_copy_source_key_for_agent_scorer():
                 "leverage": 5,
                 "pnl": 0.5,
                 "strategy_type": "unknown",
-                "trader_address": "0xabc123",
+                "trader_address": full_addr,
                 "metadata": {
                     "source": "copy_trade",
-                    "source_trader": "0xabc123",
+                    "source_trader": full_addr,
                     "signal_id": "sig-1",
                 },
             }
         ],
     )
 
-    assert container.agent_scorer.calls[0][0] == "copy_trade:0xabc123"
-    assert container.kelly_sizer.calls[0]["strategy_key"] == "copy_trade:0xabc123"
+    expected_key = f"copy_trade:{full_addr.lower()}"
+    assert container.agent_scorer.calls[0][0] == expected_key
+    assert container.kelly_sizer.calls[0]["strategy_key"] == expected_key
 
 
 def test_firewall_uses_explicit_live_positions_without_falling_back(monkeypatch):

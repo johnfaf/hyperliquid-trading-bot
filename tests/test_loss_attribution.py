@@ -238,3 +238,69 @@ def test_record_outcome_reconciled_skipped_when_enabled(scorer, monkeypatch):
         close_metadata={"close_reason": "live_reconciled_closed"},
     )
     scorer._bandit.update.assert_not_called()
+
+
+# ── Static scorer gating (Issue #4 fix) ───────────────────────────
+
+
+def test_record_outcome_flag_on_skips_static_counters_for_noise_stop(scorer, monkeypatch):
+    """When gate is ON and close is NOISE_STOP, the static scorer's
+    correct_signals / total_pnl must NOT be incremented either. Pre-fix,
+    only the bandit was protected -- legacy dynamic_weight still degraded
+    for sources hit by noise stops."""
+    monkeypatch.setattr(config, "BANDIT_SKIP_NOISE_STOPS_ENABLED", True, raising=False)
+    scorer.record_outcome(
+        "copy_trade:0xA", "sig1", pnl=-1.0,
+        close_metadata={
+            "close_reason": "stop_loss_hit",
+            "entry_price": 100.0,
+            "exit_price": 99.97,
+            "atr_pct": 0.015,
+        },
+    )
+    s = scorer.scores["copy_trade:0xA"]
+    # Static counters untouched
+    assert s.correct_signals == 0
+    assert s.total_pnl == 0.0
+    assert s.total_return == 0.0
+    # _recalculate / _save_score skipped too
+    scorer._recalculate.assert_not_called()
+    scorer._save_score.assert_not_called()
+    scorer._bandit.update.assert_not_called()
+
+
+def test_record_outcome_flag_on_still_updates_static_for_signal_loss(scorer, monkeypatch):
+    """A real adverse move (SIGNAL_LOSS) still updates static counters."""
+    monkeypatch.setattr(config, "BANDIT_SKIP_NOISE_STOPS_ENABLED", True, raising=False)
+    scorer.record_outcome(
+        "copy_trade:0xA", "sig1", pnl=-10.0,
+        close_metadata={
+            "close_reason": "stop_loss_hit",
+            "entry_price": 100.0,
+            "exit_price": 95.0,
+            "atr_pct": 0.015,
+        },
+    )
+    s = scorer.scores["copy_trade:0xA"]
+    assert s.total_pnl == -10.0
+    assert s.correct_signals == 0   # not a win
+    scorer._recalculate.assert_called_once_with("copy_trade:0xA")
+    scorer._bandit.update.assert_called_once_with("copy_trade:0xA", won=False)
+
+
+def test_record_outcome_flag_off_always_updates_static(scorer, monkeypatch):
+    """Default-OFF posture: even on a noise-shaped close, the static
+    counters still update (legacy byte-identical behavior)."""
+    monkeypatch.setattr(config, "BANDIT_SKIP_NOISE_STOPS_ENABLED", False, raising=False)
+    scorer.record_outcome(
+        "copy_trade:0xA", "sig1", pnl=-1.0,
+        close_metadata={
+            "close_reason": "stop_loss_hit",
+            "entry_price": 100.0,
+            "exit_price": 99.97,
+            "atr_pct": 0.015,
+        },
+    )
+    s = scorer.scores["copy_trade:0xA"]
+    assert s.total_pnl == -1.0
+    scorer._bandit.update.assert_called_once()

@@ -303,11 +303,19 @@ class AgentScorer:
               - atr_pct: float
               - side: "long" | "short"
               - leverage: float
-            When BANDIT_SKIP_NOISE_STOPS_ENABLED is True AND the close
-            classifies as NOISE_STOP / RECONCILED, the bandit feed is
-            skipped (the source's posterior is untouched). The static
-            score machinery (correct_signals, total_pnl, weights) is
-            unaffected.
+
+        Loss-attribution gate
+        ---------------------
+        When BANDIT_SKIP_NOISE_STOPS_ENABLED is True AND close_metadata is
+        provided AND the close classifies as NOISE_STOP / RECONCILED, BOTH
+        the static scorer counters (correct_signals / total_pnl /
+        dynamic_weight) AND the bandit feed are skipped. The source isn't
+        penalised either way for the bot's own too-tight stop or a
+        book-keeping reconciliation close.
+
+        Default-OFF: when the flag is False or no close_metadata is
+        provided, behaviour is byte-identical to the legacy implementation
+        (both static and bandit update on every outcome).
         """
         if source_key not in self.scores:
             self.scores[source_key] = SourceScore(source_key=source_key)
@@ -315,73 +323,70 @@ class AgentScorer:
         score = self.scores[source_key]
         correct = pnl > 0
 
-        # Update running totals
-        if correct:
-            score.correct_signals += 1
-        score.total_pnl += pnl
-        score.total_return += return_pct
+        # ── Loss-attribution gate (flag-gated, default OFF) ──
+        skip_outcome: bool = False
+        bandit_won = bool(correct)
+        try:
+            import config as _cfg
+            if (
+                getattr(_cfg, "BANDIT_SKIP_NOISE_STOPS_ENABLED", False)
+                and close_metadata
+            ):
+                from src.signals.loss_attribution import (
+                    ClassifyInputs, classify_close, bandit_outcome,
+                )
+                ci = ClassifyInputs(
+                    pnl=float(pnl),
+                    close_reason=str(close_metadata.get("close_reason", "")),
+                    entry_price=float(close_metadata.get("entry_price", 0.0)),
+                    exit_price=float(close_metadata.get("exit_price", 0.0)),
+                    atr_pct=float(close_metadata.get("atr_pct", 0.0)),
+                    side=str(close_metadata.get("side", "")),
+                    leverage=float(close_metadata.get("leverage", 1.0)),
+                )
+                cls = classify_close(ci)
+                outcome = bandit_outcome(cls, pnl)
+                if outcome is None:
+                    # NOISE_STOP or RECONCILED: skip BOTH static and bandit.
+                    skip_outcome = True
+                    logger.info(
+                        "Outcome skipped for %s: close class=%s "
+                        "(loss attribution gate -- legacy + bandit both ignored)",
+                        source_key, cls.value,
+                    )
+                else:
+                    bandit_won = bool(outcome)
+        except Exception as _e:
+            logger.debug("loss-attribution gate failed for %s: %s",
+                         source_key, _e)
 
-        # Update trade history
-        history = self._trade_history[source_key]
-        for entry in reversed(history):
-            if entry["signal_id"] == signal_id:
-                entry["pnl"] = pnl
-                entry["correct"] = correct
-                entry["return_pct"] = return_pct
-                break
+        if not skip_outcome:
+            # Update running totals
+            if correct:
+                score.correct_signals += 1
+            score.total_pnl += pnl
+            score.total_return += return_pct
 
-        # Recalculate scores with time decay
-        self._recalculate(source_key)
-        self._save_score(source_key)
+            # Update trade history
+            history = self._trade_history[source_key]
+            for entry in reversed(history):
+                if entry["signal_id"] == signal_id:
+                    entry["pnl"] = pnl
+                    entry["correct"] = correct
+                    entry["return_pct"] = return_pct
+                    break
 
-        # A2 (default OFF): feed the same win/loss outcome into the
-        # Thompson allocator. Best-effort -- never break score recording.
-        if getattr(self, "_bandit_enabled", False):
-            try:
-                # Loss attribution gate: if enabled, ask classify_close()
-                # whether this outcome is bandit-worthy. NOISE_STOP and
-                # RECONCILED closes are skipped (the source isn't to
-                # blame for our too-tight stop or a book-keeping close).
-                # Default OFF -> behavior is byte-identical to pre-fix.
-                feed_outcome: bool = True
-                bandit_won = bool(correct)
+            # Recalculate scores with time decay
+            self._recalculate(source_key)
+            self._save_score(source_key)
+
+            # A2 (default OFF): feed the same win/loss outcome into the
+            # Thompson allocator. Best-effort -- never break score recording.
+            if getattr(self, "_bandit_enabled", False):
                 try:
-                    import config as _cfg
-                    if (
-                        getattr(_cfg, "BANDIT_SKIP_NOISE_STOPS_ENABLED", False)
-                        and close_metadata
-                    ):
-                        from src.signals.loss_attribution import (
-                            ClassifyInputs, classify_close, bandit_outcome,
-                        )
-                        ci = ClassifyInputs(
-                            pnl=float(pnl),
-                            close_reason=str(close_metadata.get("close_reason", "")),
-                            entry_price=float(close_metadata.get("entry_price", 0.0)),
-                            exit_price=float(close_metadata.get("exit_price", 0.0)),
-                            atr_pct=float(close_metadata.get("atr_pct", 0.0)),
-                            side=str(close_metadata.get("side", "")),
-                            leverage=float(close_metadata.get("leverage", 1.0)),
-                        )
-                        cls = classify_close(ci)
-                        outcome = bandit_outcome(cls, pnl)
-                        if outcome is None:
-                            feed_outcome = False
-                            logger.info(
-                                "Bandit feed skipped for %s: close class=%s "
-                                "(loss attribution gate)",
-                                source_key, cls.value,
-                            )
-                        else:
-                            bandit_won = bool(outcome)
-                except Exception as _e:
-                    # Classification failure -> behave as if disabled.
-                    logger.debug("loss-attribution gate failed for %s: %s",
-                                 source_key, _e)
-                if feed_outcome:
                     self._bandit_alloc().update(source_key, won=bandit_won)
-            except Exception as exc:
-                logger.debug("bandit update failed for %s: %s", source_key, exc)
+                except Exception as exc:
+                    logger.debug("bandit update failed for %s: %s", source_key, exc)
 
         logger.info(f"Agent score update [{source_key}]: pnl=${pnl:.2f}, "
                     f"accuracy={score.accuracy:.0%}, weight={score.dynamic_weight:.2f}")

@@ -266,10 +266,29 @@ def sync_shadow_book_to_live(container) -> List[Dict]:
         trade_size = float(trade.get("size", 0) or 0)
         trade_leverage = float(trade.get("leverage", 1) or 1)
         if trade.get("side") == "long":
-            reconciled_pnl = (current_price - entry_price) * trade_size * trade_leverage
+            gross_reconciled_pnl = (current_price - entry_price) * trade_size * trade_leverage
         else:
-            reconciled_pnl = (entry_price - current_price) * trade_size * trade_leverage
-        reconciled_pnl = round(reconciled_pnl, 2)
+            gross_reconciled_pnl = (entry_price - current_price) * trade_size * trade_leverage
+        gross_reconciled_pnl = round(gross_reconciled_pnl, 2)
+
+        # Estimate the round-trip live fee so net_pnl_after_fees in
+        # metadata reflects actual fee drag, not just gross PnL at mid.
+        # Hyperliquid live closes are typically taker on the exit leg
+        # (forced reduce-only) so we use TAKER_FEE_BPS for both legs
+        # as a conservative upper bound.
+        try:
+            import config as _cfg
+            taker_bps = float(getattr(_cfg, "PAPER_TRADING_TAKER_FEE_BPS", 4.5))
+        except Exception:
+            taker_bps = 4.5
+        fee_rate = taker_bps / 10_000.0
+        entry_notional = entry_price * trade_size * trade_leverage
+        exit_notional = current_price * trade_size * trade_leverage
+        reconciled_fees = round(
+            (max(entry_notional, 0.0) + max(exit_notional, 0.0)) * fee_rate, 4,
+        )
+        net_reconciled_pnl = round(gross_reconciled_pnl - reconciled_fees, 2)
+        reconciled_pnl = net_reconciled_pnl  # legacy alias used below
 
         existing_meta.update({
             "synthetic_reconciliation": True,
@@ -279,12 +298,15 @@ def sync_shadow_book_to_live(container) -> List[Dict]:
             # consumer reading metadata (dashboards, scorecards, the
             # decision-replay diff tool, ad-hoc SQL like
             # `details->>'net_pnl_after_fees'`) sees the same number that
-            # the `pnl` DB column already has. Fees aren't tracked on the
-            # reconciliation path (the live close paid them, not paper),
-            # so gross == net here.
+            # the `pnl` DB column already has. We estimate the live
+            # round-trip fee from PAPER_TRADING_TAKER_FEE_BPS so
+            # net_pnl_after_fees reflects real fee drag and gross/net
+            # differ correctly. Prior to this fix gross == net silently
+            # under-reported fee cost in analytics.
             "close_reason": "live_reconciled_closed",
-            "net_pnl_after_fees": reconciled_pnl,
-            "gross_pnl_before_fees": reconciled_pnl,
+            "net_pnl_after_fees": net_reconciled_pnl,
+            "gross_pnl_before_fees": gross_reconciled_pnl,
+            "reconciled_fees_estimated": reconciled_fees,
         })
         db.update_paper_trade_metadata(trade_id, existing_meta)
         if not db.close_paper_trade(trade_id, current_price, reconciled_pnl):
