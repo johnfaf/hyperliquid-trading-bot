@@ -1007,6 +1007,34 @@ LIVE_PROMOTION_MIN_WIN_RATE = _safe_env_float(
 LIVE_PROMOTION_MIN_SCORE = _safe_env_float(
     "LIVE_PROMOTION_MIN_SCORE", 0.20, lo=0.0, hi=1.0
 )
+
+# Promotion bootstrap tier (DEFAULT OFF).
+# ────────────────────────────────────────────────────────────────
+# The standard promotion gate requires 30 paper trades + 45% win rate to
+# qualify a source for live mirror. In a defensive posture where the
+# firewall blocks ~95% of candidates, sources accumulate paper trades
+# slowly enough that nothing ever reaches live (~weeks per source).
+# The bootstrap tier provides an alternative path: a smaller sample
+# (default 5 trades) at a HIGHER accuracy bar (default 60%) earns a
+# fractional-size live mirror (default 0.25× standard size). The source
+# can graduate to the full tier later by accumulating 30 trades.
+#
+# Off by default because mirroring live with less evidence is a real
+# risk trade-off — operator must opt in by setting
+# PROMOTION_BOOTSTRAP_TIER_ENABLED=true.
+PROMOTION_BOOTSTRAP_TIER_ENABLED = _safe_env_bool(
+    "PROMOTION_BOOTSTRAP_TIER_ENABLED", False,
+)
+PROMOTION_BOOTSTRAP_MIN_TRADES = int(
+    os.environ.get("PROMOTION_BOOTSTRAP_MIN_TRADES", 5)
+)
+PROMOTION_BOOTSTRAP_MIN_WIN_RATE = _safe_env_float(
+    "PROMOTION_BOOTSTRAP_MIN_WIN_RATE", 0.60, lo=0.0, hi=1.0
+)
+PROMOTION_BOOTSTRAP_SIZE_SCALE = _safe_env_float(
+    "PROMOTION_BOOTSTRAP_SIZE_SCALE", 0.25, lo=0.01, hi=1.0
+)
+
 # A5: optional Deflated-Sharpe gate on strategy promotion. DEFAULT OFF.
 # Only ever BLOCKS a promotion the base gate already approved -- it never
 # unblocks. When on, the strategy's recent paper-trade P&L Sharpe must be

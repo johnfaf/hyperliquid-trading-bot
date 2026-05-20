@@ -119,6 +119,89 @@ def _agent_score_promotion_ok(
     return True, "ok"
 
 
+# ── Bootstrap tier ────────────────────────────────────────────
+# Sources that don't yet meet the standard 30-trades / 45%-WR bar can
+# earn a small live foothold by passing a SMALLER sample at a HIGHER
+# accuracy bar (defaults: 5 trades, 60% WR -> 0.25x size). This is
+# guarded by PROMOTION_BOOTSTRAP_TIER_ENABLED (default False); when
+# off the helpers below are never called.
+#
+# Reason format: ``ok_bootstrap:scale=<float>`` -- callers (currently
+# only ``src/core/live_execution.py``) parse the scale from the reason
+# and multiply the rescaled trade size by it before sending to live.
+# Using the reason string as the side-channel keeps the public
+# ``is_live_promotable`` API at ``(bool, str)`` so existing call sites
+# and tests stay unchanged.
+
+_BOOTSTRAP_PREFIX = "ok_bootstrap:scale="
+
+
+def _bootstrap_agent_score_ok(
+    source_key: str,
+    *,
+    min_trades: int,
+    min_win_rate: float,
+    scale: float,
+) -> Tuple[bool, str]:
+    """Lower-sample / higher-accuracy variant of ``_agent_score_promotion_ok``.
+
+    Returns ``(True, "ok_bootstrap:scale=X")`` on pass so the caller can
+    apply the size scale modifier.  All other paths reuse the standard
+    rejection reasons so logs stay consistent between tiers.
+    """
+    if not source_key:
+        return False, "missing_source_key"
+    try:
+        with db.get_connection(for_read=True) as conn:
+            row = conn.execute(
+                "SELECT total_signals, correct_signals, accuracy "
+                "FROM agent_scores WHERE source_key = ?",
+                (source_key,),
+            ).fetchone()
+    except Exception as exc:
+        logger.debug("agent_scores lookup failed for %s: %s", source_key, exc)
+        return False, "agent_score_lookup_failed"
+    if not row:
+        return False, "no_agent_score_row"
+    row_dict = dict(row)
+    total = int(_float(row_dict.get("total_signals"), 0.0))
+    accuracy = _float(row_dict.get("accuracy"), 0.0)
+    if total < min_trades:
+        return False, f"insufficient_signals_bootstrap:{total}/{min_trades}"
+    if accuracy < min_win_rate:
+        return False, (
+            f"bootstrap_accuracy_too_low:{accuracy:.2%}<{min_win_rate:.2%}"
+        )
+    return True, f"{_BOOTSTRAP_PREFIX}{scale:.4f}"
+
+
+def get_bootstrap_scale(reason: str) -> float:
+    """Extract the size scale modifier from an ``ok_bootstrap:scale=`` reason.
+
+    Returns the parsed scale clamped to ``(0, 1]``.  Any parse error
+    yields 1.0 (full size) -- this is the conservative default for
+    *standard* promotions; bootstrap-promoted trades should already
+    have passed parse-time validation in :func:`_bootstrap_agent_score_ok`.
+    Callers that need to fail-closed should check whether the reason
+    starts with :data:`_BOOTSTRAP_PREFIX` before applying the scale.
+    """
+    if not isinstance(reason, str) or not reason.startswith(_BOOTSTRAP_PREFIX):
+        return 1.0
+    raw = reason[len(_BOOTSTRAP_PREFIX):]
+    # Strip anything after the first comma in case future extensions
+    # append additional key=value pairs to the reason.
+    raw = raw.split(",", 1)[0]
+    try:
+        scale = float(raw)
+    except (TypeError, ValueError):
+        return 1.0
+    if scale <= 0.0:
+        return 1.0
+    if scale > 1.0:
+        return 1.0
+    return scale
+
+
 def _dsr_promotion_ok(
     strategy_id: Any, *, num_trials: int, min_obs: int
 ) -> Tuple[bool, str]:
@@ -323,22 +406,74 @@ def is_live_promotable(trade: Dict[str, Any]) -> Tuple[bool, str]:
     )
     source = str(metadata.get("source") or trade.get("source") or "").strip().lower()
     if source == "copy_trade" and source_trader:
-        return _agent_score_promotion_ok(
-            f"copy_trade:{str(source_trader).strip().lower()}",
+        source_key = f"copy_trade:{str(source_trader).strip().lower()}"
+        ok, reason = _agent_score_promotion_ok(
+            source_key,
             min_trades=min_trades,
             min_win_rate=min_win_rate,
         )
+        if not ok:
+            ok, reason = _maybe_bootstrap_tier(source_key, base_reason=reason)
+        return ok, reason
 
     # Path 3: strategy_type tag (agent_scorer under strategy:<type>)
     strategy_type = str(
         metadata.get("strategy_type") or trade.get("strategy_type") or ""
     ).strip().lower()
     if strategy_type and strategy_type not in {"unknown", "untagged"}:
-        return _agent_score_promotion_ok(
-            f"strategy:{strategy_type}",
+        source_key = f"strategy:{strategy_type}"
+        ok, reason = _agent_score_promotion_ok(
+            source_key,
             min_trades=min_trades,
             min_win_rate=min_win_rate,
         )
+        if not ok:
+            ok, reason = _maybe_bootstrap_tier(source_key, base_reason=reason)
+        return ok, reason
 
     # No promotion data resolvable — fail closed for live.
     return False, "no_promotion_data"
+
+
+def _maybe_bootstrap_tier(
+    source_key: str, *, base_reason: str,
+) -> Tuple[bool, str]:
+    """Try the bootstrap tier when the standard tier rejected the source.
+
+    Returns the standard ``base_reason`` unchanged when the bootstrap
+    tier is off OR when the bootstrap tier also rejects.  Only returns
+    ``(True, "ok_bootstrap:scale=X")`` when the bootstrap tier passes.
+
+    Sentinel reasons that mean "data missing, not 'fails by policy'" --
+    ``agent_score_lookup_failed``, ``missing_source_key`` -- are passed
+    through without retrying so a transient DB error never escalates
+    into a bootstrap promotion.
+    """
+    if not bool(getattr(config, "PROMOTION_BOOTSTRAP_TIER_ENABLED", False)):
+        return False, base_reason
+    if base_reason in ("agent_score_lookup_failed", "missing_source_key"):
+        return False, base_reason
+
+    boot_min_trades = int(
+        getattr(config, "PROMOTION_BOOTSTRAP_MIN_TRADES", 5)
+    )
+    boot_min_wr = float(
+        getattr(config, "PROMOTION_BOOTSTRAP_MIN_WIN_RATE", 0.60)
+    )
+    boot_scale = float(
+        getattr(config, "PROMOTION_BOOTSTRAP_SIZE_SCALE", 0.25)
+    )
+    # Defense in depth: the env loader clamps these, but a direct
+    # ``setattr(config, ...)`` (tests, hotfix consoles) can bypass the
+    # clamp.  Re-clamp here so we never send full-size when the operator
+    # meant a fraction.
+    boot_scale = max(0.01, min(1.0, boot_scale))
+    boot_min_wr = max(0.0, min(1.0, boot_min_wr))
+    boot_min_trades = max(1, boot_min_trades)
+
+    return _bootstrap_agent_score_ok(
+        source_key,
+        min_trades=boot_min_trades,
+        min_win_rate=boot_min_wr,
+        scale=boot_scale,
+    )
