@@ -152,11 +152,19 @@ class DQNetwork:
         indices = np.random.choice(len(self._buffer), self.batch_size, replace=False)
         batch = [self._buffer[i] for i in indices]
 
-        states = _torch.FloatTensor([b[0] for b in batch]).to(self.device)
-        actions = _torch.LongTensor([b[1] for b in batch]).to(self.device)
-        rewards = _torch.FloatTensor([b[2] for b in batch]).to(self.device)
-        next_states = _torch.FloatTensor([b[3] for b in batch]).to(self.device)
-        dones = _torch.FloatTensor([b[4] for b in batch]).to(self.device)
+        # Stack into a single ndarray BEFORE handing to torch.  Constructing
+        # a FloatTensor from a Python list of np.ndarrays triggers a
+        # `UserWarning: Creating a tensor from a list of numpy.ndarrays is
+        # extremely slow` (PyTorch >= 2.0) and goes through a quadratic
+        # per-element copy.  np.asarray on the list is O(N) and lands the
+        # data in a contiguous buffer torch can wrap zero-copy.
+        states_arr = np.asarray([b[0] for b in batch], dtype=np.float32)
+        next_states_arr = np.asarray([b[3] for b in batch], dtype=np.float32)
+        states = _torch.from_numpy(states_arr).to(self.device)
+        actions = _torch.as_tensor([b[1] for b in batch], dtype=_torch.long).to(self.device)
+        rewards = _torch.as_tensor([b[2] for b in batch], dtype=_torch.float32).to(self.device)
+        next_states = _torch.from_numpy(next_states_arr).to(self.device)
+        dones = _torch.as_tensor([b[4] for b in batch], dtype=_torch.float32).to(self.device)
 
         # Current Q values
         q_values = self.q_net(states).gather(1, actions.unsqueeze(1)).squeeze()

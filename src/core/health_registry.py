@@ -36,6 +36,13 @@ class SubsystemStatus:
     startup_status: str = "PENDING"
     dependency_ready: bool = False
     affects_trading: bool = True
+    # Expected cadence of heartbeats for this subsystem (seconds).
+    # When set, ``check_stale`` uses ``max(timeout, 1.5 * expected_interval_s)``
+    # as the per-subsystem stale threshold so a long-cadence worker (e.g. a
+    # 6-hour auto-backtest loop that heartbeats only after each cycle) doesn't
+    # trip the global 5–10 minute timeout every interval.  None means use the
+    # caller-provided ``timeout_seconds`` unchanged.
+    expected_interval_s: Optional[float] = None
     registered_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
     def is_trading_safe(self) -> bool:
@@ -83,14 +90,26 @@ class SubsystemHealthRegistry:
         """
         self._on_failure_callback = callback
 
-    def register(self, name: str, affects_trading: bool = True) -> SubsystemStatus:
+    def register(
+        self,
+        name: str,
+        affects_trading: bool = True,
+        *,
+        expected_interval_s: Optional[float] = None,
+    ) -> SubsystemStatus:
         """
         Register a subsystem.  Idempotent — re-registering the same name
-        updates ``affects_trading`` but does not raise.
+        updates ``affects_trading`` and ``expected_interval_s`` but does not
+        raise.
 
         Args:
             name: Unique identifier for the subsystem
             affects_trading: Whether this subsystem's outputs can affect trading decisions
+            expected_interval_s: How often this subsystem heartbeats, in seconds.
+                When set, ``check_stale`` uses ``max(timeout, 1.5 * expected_interval_s)``
+                for THIS subsystem so long-cadence workers (e.g. 6-hour auto-backtest)
+                don't trip the global stale timeout between cycles.  Leave as None
+                for typical sub-minute heartbeat tasks.
 
         Returns:
             SubsystemStatus: The created or updated status object
@@ -99,7 +118,12 @@ class SubsystemHealthRegistry:
             if name in self._subsystems:
                 # Idempotent update — no error on re-registration
                 self._subsystems[name].affects_trading = affects_trading
-                logger.debug("Re-registered subsystem '%s' (affects_trading=%s)", name, affects_trading)
+                if expected_interval_s is not None:
+                    self._subsystems[name].expected_interval_s = float(expected_interval_s)
+                logger.debug(
+                    "Re-registered subsystem '%s' (affects_trading=%s, expected_interval_s=%s)",
+                    name, affects_trading, expected_interval_s,
+                )
                 return self._subsystems[name]
 
             status = SubsystemStatus(
@@ -108,10 +132,16 @@ class SubsystemHealthRegistry:
                 startup_status="PENDING",
                 dependency_ready=False,
                 affects_trading=affects_trading,
+                expected_interval_s=(
+                    float(expected_interval_s) if expected_interval_s is not None else None
+                ),
                 registered_at=datetime.now(timezone.utc)
             )
             self._subsystems[name] = status
-            logger.debug("Registered subsystem '%s' (affects_trading=%s)", name, affects_trading)
+            logger.debug(
+                "Registered subsystem '%s' (affects_trading=%s, expected_interval_s=%s)",
+                name, affects_trading, expected_interval_s,
+            )
             return status
 
     def heartbeat(self, name: str) -> None:
@@ -296,14 +326,27 @@ class SubsystemHealthRegistry:
                     degraded[name] = False
                     continue
 
+                # Per-subsystem stale threshold: long-cadence workers (e.g. a
+                # 6-hour auto-backtest cycle) override the global timeout via
+                # ``expected_interval_s`` at registration time.  Use 1.5x the
+                # cadence so a single skipped cycle is tolerated; below the
+                # global threshold the global value still wins (we never
+                # SHORTEN the freshness window per subsystem).
+                effective_timeout = timeout_seconds
+                if status.expected_interval_s is not None:
+                    effective_timeout = max(
+                        float(timeout_seconds),
+                        1.5 * float(status.expected_interval_s),
+                    )
+
                 # Check if heartbeat is missing or stale
                 if status.last_heartbeat is None:
                     # Never received a heartbeat
                     time_since_registration = (
                         now - status.registered_at
                     ).total_seconds()
-                    if time_since_registration > timeout_seconds:
-                        stale_reason = f"No heartbeat for {timeout_seconds}s"
+                    if time_since_registration > effective_timeout:
+                        stale_reason = f"No heartbeat for {int(effective_timeout)}s"
                         already_stale = (
                             status.state == SubsystemState.DEGRADED
                             and status.reason == stale_reason
@@ -322,7 +365,7 @@ class SubsystemHealthRegistry:
                     time_since_heartbeat = (
                         now - status.last_heartbeat
                     ).total_seconds()
-                    if time_since_heartbeat > timeout_seconds:
+                    if time_since_heartbeat > effective_timeout:
                         stale_reason = f"Stale heartbeat ({time_since_heartbeat:.0f}s ago)"
                         already_stale = (
                             status.state == SubsystemState.DEGRADED
