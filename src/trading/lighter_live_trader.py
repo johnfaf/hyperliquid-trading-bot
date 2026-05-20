@@ -481,7 +481,11 @@ class LighterLiveTrader:
         if entry.get("status") not in {"submitted", "dry_run"}:
             return entry
 
-        sl_price, tp_price = trade_signal.risk.resolve_trigger_prices(entry_price, side, leverage)
+        # A1: pass atr_pct so the ATR-floor widens tight Lighter stops too.
+        sl_price, tp_price = trade_signal.risk.resolve_trigger_prices(
+            entry_price, side, leverage,
+            atr_pct=(trade_signal.context or {}).get("atr_pct"),
+        )
         close_side = "sell" if side == "long" else "buy"
         sl = self.place_trigger_order(trade_signal.coin, close_side, size, sl_price, tp_or_sl="sl")
         tp = self.place_trigger_order(trade_signal.coin, close_side, size, tp_price, tp_or_sl="tp")

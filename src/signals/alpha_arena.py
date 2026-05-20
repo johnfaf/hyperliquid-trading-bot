@@ -1213,10 +1213,15 @@ class Backtester:
         size = agent.capital_allocated * pos_pct / entry_price
         side = signal["side"]
 
+        # A1: pass atr_pct so the ATR-floor (config.ATR_STOP_FLOOR_ENABLED)
+        # can widen tight stops on alpha-arena signals too. Previously the
+        # floor was only wired at copy_trader / paper_trader / live_trader,
+        # leaving alpha_arena signals on the un-floored path.
         stop_price, take_profit_price = trade_signal.risk.resolve_trigger_prices(
             entry_price,
             side,
             leverage,
+            atr_pct=(trade_signal.context or {}).get("atr_pct"),
         )
         stop_roe_pct = max(trade_signal.risk.resolve_roe_stop_loss_pct(leverage), 1e-9)
         break_even_at_r = float(trade_signal.risk.break_even_at_r or 0.0)
