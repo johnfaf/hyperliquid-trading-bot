@@ -33,7 +33,10 @@ class Artifact:
 
 
 def utc_now() -> datetime:
-    return datetime.now(UTC)
+    # Route through the canonical clock provider so replay swaps the
+    # source consistently across the four audited trees.
+    from src.core import clock_provider
+    return clock_provider.utc_now()
 
 
 def utc_now_slug() -> str:

@@ -4586,7 +4586,11 @@ class LiveTrader:
         """
         raw_timeout = self.schedule_cancel_entry_timeout_s if timeout_s is None else float(timeout_s)
         timeout = max(5.0, raw_timeout)
-        deadline_ms = int((time.time() + timeout) * 1000)
+        # Use the canonical clock provider so the dead-man deadline tracks the
+        # replay clock under the OOS harness while keeping wall-clock behaviour
+        # in production (LiveClock backend).
+        from src.core import clock_provider
+        deadline_ms = int((clock_provider.unix_now() + timeout) * 1000)
         action = {"type": "scheduleCancel", "time": deadline_ms}
         result = self._post_order(action)
         if self._is_order_result_success(result):

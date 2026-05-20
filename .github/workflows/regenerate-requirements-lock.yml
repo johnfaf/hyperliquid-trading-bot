@@ -1,0 +1,93 @@
+name: Regenerate requirements.lock (Linux)
+
+# Why this exists
+# ────────────────
+# pip-compile resolves transitive deps for the host OS.  When the lockfile
+# is generated on macOS, Linux-conditional packages (e.g. NVIDIA CUDA deps
+# pulled in by torch) are missing, and the Railway/Docker build then fails
+# under `pip install --require-hashes` because those packages have no hash
+# entries in requirements.lock.
+#
+# This workflow regenerates requirements.lock on ubuntu-latest with the
+# runtime Python (3.11), so the lockfile is consistent with what actually
+# gets installed in the production container.  It runs on:
+#
+#   - workflow_dispatch (manual trigger, useful for one-off regens), and
+#   - push to any non-main branch when requirements.txt or this workflow
+#     itself changes (so a PR touching requirements.txt auto-refreshes
+#     its own lockfile before CI runs against it).
+#
+# The job never writes to main directly — protection branches-ignore.
+
+on:
+  workflow_dispatch: {}
+  push:
+    branches-ignore:
+      - main
+    paths:
+      - requirements.txt
+      - .github/workflows/regenerate-requirements-lock.yml
+
+permissions:
+  contents: write
+
+concurrency:
+  group: regen-lock-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  regenerate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (with push token)
+        uses: actions/checkout@v4
+        with:
+          # The default GITHUB_TOKEN can push to the same branch as long
+          # as `permissions.contents: write` is granted above.
+          token: ${{ secrets.GITHUB_TOKEN }}
+          # Fetch full history so we can push without rewriting.
+          fetch-depth: 0
+
+      - name: Set up Python 3.11 (matches Dockerfile + CI runtime)
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install pip-tools
+        # NB: pip-tools must be compatible with the system pip.  pip-tools
+        # 7.5.1 accesses InstallRequirement.use_pep517 which was renamed in
+        # recent pip, so let pip resolve the latest pip-tools that supports
+        # the currently-installed pip.  If this ever breaks again, pin both
+        # pip and pip-tools to a known-compatible pair.
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --upgrade pip-tools
+
+      - name: Regenerate requirements.lock
+        run: |
+          # Same flags as the original lockfile header so behaviour is
+          # identical apart from the host-OS resolution.
+          python -m piptools compile \
+            --allow-unsafe \
+            --generate-hashes \
+            --output-file=requirements.lock \
+            --strip-extras \
+            requirements.txt
+
+      - name: Show diff (for the build log)
+        run: |
+          git --no-pager diff --stat requirements.lock || true
+          echo "---"
+          git --no-pager diff requirements.lock | head -200 || true
+
+      - name: Commit & push regenerated lockfile
+        run: |
+          if git diff --quiet requirements.lock; then
+            echo "requirements.lock is unchanged — nothing to commit."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add requirements.lock
+          git commit -m "ci: regenerate requirements.lock on Linux (auto)"
+          git push origin HEAD:${{ github.ref_name }}
