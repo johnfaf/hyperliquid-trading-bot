@@ -4,9 +4,14 @@ on:
   push:
     branches:
       - main
+    tags:
+      - '*'
   pull_request:
     branches:
       - main
+
+env:
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
 
 jobs:
   lint:
@@ -20,7 +25,7 @@ jobs:
         with:
           python-version: '3.11'
       - name: Install ruff
-        run: pip install ruff
+        run: python -m pip install ruff==0.15.13
       - name: Determine lint targets
         id: lint_targets
         shell: bash
@@ -58,8 +63,8 @@ jobs:
           python-version: '3.11'
       - name: Install dependencies
         run: |
-          pip install -r requirements.txt
-          pip install pytest
+          python -m pip install --require-hashes -r requirements.lock
+          python -m pip install pytest==9.0.2
       - name: Run full test suite
         # Gate merges on the ENTIRE suite, not a ~6-file subset. Every
         # incident this cycle was a cross-file gate interaction that the
@@ -67,7 +72,7 @@ jobs:
         # is the regression net that actually catches them.
         run: python -m pytest tests/ -q --tb=short --durations=15
 
-  safety:
+  dependency-audit:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -75,7 +80,49 @@ jobs:
         uses: actions/setup-python@v4
         with:
           python-version: '3.11'
-      - name: Install safety
-        run: pip install safety
-      - name: Check dependencies
-        run: safety check -r requirements.txt || true
+      - name: Install pip-audit
+        run: python -m pip install pip-audit==2.10.0
+      - name: Generate dependency audit report
+        run: |
+          python -m pip_audit \
+            --no-deps \
+            --require-hashes \
+            -r requirements.lock \
+            --format json \
+            --output dependency-audit.json || true
+      - name: Upload dependency audit artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dependency-audit-${{ github.sha }}
+          path: dependency-audit.json
+          if-no-files-found: error
+
+  sbom:
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    needs:
+      - test
+      - dependency-audit
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+      - name: Install CycloneDX generator
+        run: python -m pip install cyclonedx-bom==7.3.0
+      - name: Generate SBOM
+        run: |
+          python -m cyclonedx_py requirements requirements.lock \
+            --output-reproducible \
+            --of JSON \
+            -o sbom.cdx.json
+          sha256sum requirements.lock sbom.cdx.json > sbom.SHA256SUMS
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-${{ github.ref_name }}
+          path: |
+            sbom.cdx.json
+            sbom.SHA256SUMS
+          if-no-files-found: error

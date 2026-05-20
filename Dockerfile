@@ -2,9 +2,9 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Install dependencies first (cached layer unless requirements change)
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# Install locked dependencies first (cached layer unless requirements change)
+COPY requirements.txt requirements.lock .
+RUN pip install --no-cache-dir --require-hashes -r requirements.lock
 
 # Copy application code
 COPY . .
