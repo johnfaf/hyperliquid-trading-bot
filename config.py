@@ -554,6 +554,15 @@ LIVE_MAKER_ENTRY_TIMEOUT_S = _safe_env_float(
 LIVE_MAKER_ENTRY_FALLBACK_TO_MARKET = _safe_env_bool(
     "LIVE_MAKER_ENTRY_FALLBACK_TO_MARKET", True,
 )
+LIVE_SCHEDULE_CANCEL_ENABLED = _safe_env_bool(
+    "LIVE_SCHEDULE_CANCEL_ENABLED", False,
+)
+LIVE_SCHEDULE_CANCEL_ENTRY_TIMEOUT_S = _safe_env_float(
+    "LIVE_SCHEDULE_CANCEL_ENTRY_TIMEOUT_S", 60.0, lo=5.0, hi=86_400.0,
+)
+LIVE_SCHEDULE_CANCEL_WORKING_TIMEOUT_S = _safe_env_float(
+    "LIVE_SCHEDULE_CANCEL_WORKING_TIMEOUT_S", 300.0, lo=5.0, hi=86_400.0,
+)
 
 # ── A1: ATR-aware stop-loss floor ────────────────────────────────────────
 # Why this exists: with the default 4% ROE stop and high leverage (e.g. 25x)
@@ -1944,6 +1953,8 @@ def _validate_config_bounds() -> None:
         ("LIVE_ANALYTICS_LOOKBACK_TRADES", 10, 5_000, 200),
         ("LIVE_MAKER_ENTRY_OFFSET_BPS", 0.0, 100.0, 1.0),
         ("LIVE_MAKER_ENTRY_TIMEOUT_S", 0.0, 30.0, 2.5),
+        ("LIVE_SCHEDULE_CANCEL_ENTRY_TIMEOUT_S", 5.0, 86_400.0, 60.0),
+        ("LIVE_SCHEDULE_CANCEL_WORKING_TIMEOUT_S", 5.0, 86_400.0, 300.0),
         ("REGIME_REVERSAL_MIN_CONFIDENCE", 0.0, 1.0, 0.70),
         ("REGIME_REVERSAL_REVERSE_CONFIDENCE", 0.0, 1.0, 0.82),
         ("REGIME_REVERSAL_CONFIRM_CYCLES", 1, 100, 3),

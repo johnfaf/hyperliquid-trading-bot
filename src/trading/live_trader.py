@@ -430,6 +430,16 @@ class LiveTrader:
         self._default_leverage_is_cross = os.environ.get(
             "LIVE_LEVERAGE_IS_CROSS", "true"
         ).strip().lower() in {"1", "true", "yes"}
+        self.schedule_cancel_enabled = bool(
+            getattr(config, "LIVE_SCHEDULE_CANCEL_ENABLED", False)
+        )
+        self.schedule_cancel_entry_timeout_s = float(
+            getattr(config, "LIVE_SCHEDULE_CANCEL_ENTRY_TIMEOUT_S", 60.0)
+        )
+        self.schedule_cancel_working_timeout_s = float(
+            getattr(config, "LIVE_SCHEDULE_CANCEL_WORKING_TIMEOUT_S", 300.0)
+        )
+        self._last_schedule_cancel_deadline_ms = 0
 
         # Price sanity state (instance-level; class-level cache leaks across traders).
         self._price_history: Dict[str, float] = {}  # coin -> last known good mid
@@ -4561,6 +4571,64 @@ class LiveTrader:
             "raw_result": result,
         }
 
+    def schedule_dead_man_cancel(
+        self,
+        timeout_s: Optional[float] = None,
+        *,
+        reason: str = "order",
+    ) -> Dict[str, Any]:
+        """Schedule Hyperliquid's server-side cancel-all dead-man switch.
+
+        Hyperliquid's ``scheduleCancel`` action cancels all open orders at a
+        future millisecond timestamp.  The exchange requires the deadline to be
+        at least five seconds ahead; we clamp locally so operator-provided
+        timeouts fail closed less often.
+        """
+        raw_timeout = self.schedule_cancel_entry_timeout_s if timeout_s is None else float(timeout_s)
+        timeout = max(5.0, raw_timeout)
+        deadline_ms = int((time.time() + timeout) * 1000)
+        action = {"type": "scheduleCancel", "time": deadline_ms}
+        result = self._post_order(action)
+        if self._is_order_result_success(result):
+            self._last_schedule_cancel_deadline_ms = deadline_ms
+            logger.info(
+                "Hyperliquid scheduleCancel registered for %s: deadline_ms=%d timeout=%.1fs",
+                reason,
+                deadline_ms,
+                timeout,
+            )
+        else:
+            logger.error(
+                "Hyperliquid scheduleCancel failed before %s order: %s",
+                reason,
+                result,
+            )
+        return result
+
+    def clear_dead_man_cancel(self) -> Dict[str, Any]:
+        """Remove a pending Hyperliquid scheduleCancel deadline."""
+        result = self._post_order({"type": "scheduleCancel"})
+        if self._is_order_result_success(result):
+            self._last_schedule_cancel_deadline_ms = 0
+        return result
+
+    def _schedule_dead_man_for_order(self, order_kind: str) -> Optional[Dict[str, Any]]:
+        if not self.schedule_cancel_enabled:
+            return None
+        timeout = (
+            self.schedule_cancel_entry_timeout_s
+            if order_kind == "entry"
+            else self.schedule_cancel_working_timeout_s
+        )
+        result = self.schedule_dead_man_cancel(timeout, reason=order_kind)
+        if self._is_order_result_success(result):
+            return None
+        return {
+            "status": "rejected",
+            "reason": "schedule_cancel_failed",
+            "schedule_cancel_result": result,
+        }
+
     def place_market_order(self, coin: str, side: str, size: float,
                            leverage: float = 1, reduce_only: bool = False) -> Dict:
         """
@@ -4760,6 +4828,9 @@ class LiveTrader:
             notional,
             cloid[:10],
         )
+        dead_man_rejection = self._schedule_dead_man_for_order("entry")
+        if dead_man_rejection:
+            return dead_man_rejection
         result = self._post_order(action)
         if isinstance(result, dict):
             result = dict(result)
@@ -5030,6 +5101,9 @@ class LiveTrader:
             "post-only" if post_only else "GTC",
             coin, side, size, price, notional, cloid[:10],
         )
+        dead_man_rejection = self._schedule_dead_man_for_order("working")
+        if dead_man_rejection:
+            return dead_man_rejection
         result = self._post_order(action)
         if isinstance(result, dict):
             result = dict(result)
@@ -5155,6 +5229,9 @@ class LiveTrader:
             tp_or_sl, coin, side, wire_size, wire_trigger_px, wire_limit_px,
             cloid[:10] + "…",
         )
+        dead_man_rejection = self._schedule_dead_man_for_order("working")
+        if dead_man_rejection:
+            return dead_man_rejection
         result = self._post_order(action)
 
         return result

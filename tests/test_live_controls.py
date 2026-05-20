@@ -5,6 +5,7 @@ import sqlite3
 import sys
 import tempfile
 import threading
+import time
 import types
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -42,6 +43,7 @@ from src.signals.signal_schema import (
     signal_from_execution_dict,
 )
 from src.signals.agent_scoring import AgentScorer, SourceScore
+from src.trading.portfolio_rotation import PortfolioRotationManager, RotationDecision
 from src.trading.live_trader import (
     HyperliquidSigner,
     LiveTrader,
@@ -66,7 +68,6 @@ def _bypass_promotion_gate(monkeypatch):
     # market data. Each gate has its own dedicated test module.
     monkeypatch.setattr(config, "DATA_READINESS_GATE_ENABLED", False, raising=False)
     monkeypatch.setattr(config, "EV_GATE_ENABLED", False, raising=False)
-from src.trading.portfolio_rotation import PortfolioRotationManager, RotationDecision
 
 
 @pytest.fixture(autouse=True)
@@ -3919,6 +3920,40 @@ def test_place_market_order_uses_wire_format_price_and_size(monkeypatch):
     # Critical: NO trailing zeros, NO sig-fig overflow
     assert "." not in order["p"] or not order["p"].endswith("0")
     assert "." not in order["s"] or not order["s"].endswith("0")
+
+
+def test_schedule_cancel_registered_before_enabled_market_order(monkeypatch):
+    captured_actions = []
+
+    class FakeFirewall:
+        def validate(self, signal, **kwargs):
+            return True, "ok"
+
+    monkeypatch.setattr(config, "LIVE_SCHEDULE_CANCEL_ENABLED", True, raising=False)
+    monkeypatch.setattr(config, "LIVE_SCHEDULE_CANCEL_ENTRY_TIMEOUT_S", 60.0, raising=False)
+    monkeypatch.setattr(config, "LIVE_SCHEDULE_CANCEL_WORKING_TIMEOUT_S", 300.0, raising=False)
+    monkeypatch.setattr(LiveTrader, "_load_credentials", _fake_live_credentials)
+    monkeypatch.setattr(LiveTrader, "_load_asset_index_map", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "reconcile_positions", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "_get_mid_price", lambda self, coin: 50_000.0)
+
+    def fake_post(self, action, dry_run_override=None):
+        captured_actions.append(action)
+        return {"status": "ok", "response": {"type": action["type"]}}
+
+    monkeypatch.setattr(LiveTrader, "_post_order", fake_post)
+
+    trader = LiveTrader(firewall=FakeFirewall(), dry_run=False, max_order_usd=20_000.0)
+    trader.asset_index_map = {"BTC": 0}
+    trader.sz_decimals_map = {"BTC": 5}
+
+    result = trader.place_market_order("BTC", "buy", 0.01)
+
+    assert result.get("status") == "ok"
+    assert [a["type"] for a in captured_actions] == ["updateLeverage", "scheduleCancel", "order"]
+    scheduled = captured_actions[1]
+    assert scheduled["time"] >= int(time.time() * 1000) + 4_000
+    assert scheduled["time"] <= int(time.time() * 1000) + 65_000
 
 
 def test_place_market_order_reports_submitted_and_exchange_fill_size(monkeypatch):

@@ -503,6 +503,8 @@ def run_db_repair_cli(args) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Hyperliquid Auto-Research Trading Bot")
+    parser.add_argument("command", nargs="?", choices=["investor_report"],
+                        help="Optional command: investor_report")
     parser.add_argument("--once", action="store_true", help="Run a single cycle then exit")
     parser.add_argument("--report", action="store_true", help="Generate a report and exit")
     parser.add_argument("--status", action="store_true", help="Print current status and exit")
@@ -561,4 +563,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--diagnose-json", action="store_true",
                         help="Print --diagnose output as JSON")
+    parser.add_argument("--window", default="90d",
+                        help="Investor-report lookback window, e.g. 30d or 90d")
+    parser.add_argument("--out", default=None,
+                        help="Investor-report markdown output path")
+    parser.add_argument("--capital", type=float, default=10_000.0,
+                        help="Investor-report benchmark capital")
+    parser.add_argument("--num-trials", type=int, default=1,
+                        help="Number of tried strategies/configs for DSR deflation")
+    parser.add_argument("--dataset-dir", default=None,
+                        help="Investor-report dataset artifact directory")
+    parser.add_argument("--candle-cache-db", default="data/candle_cache.db",
+                        help="Investor-report BTC/ETH candle cache DB")
+    parser.add_argument("--require-parquet", action="store_true",
+                        help="Investor-report fails if Parquet cannot be written")
     return parser

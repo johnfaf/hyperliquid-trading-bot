@@ -908,6 +908,29 @@ def main():
     args = parser.parse_args()
 
     # Commands that don't need the full bot
+    if getattr(args, "command", None) == "investor_report":
+        import json as _json
+
+        from scripts.investor_report import generate_investor_report
+
+        result = generate_investor_report(
+            window=args.window,
+            out=args.out,
+            capital=args.capital,
+            num_trials=args.num_trials,
+            candle_cache_db=args.candle_cache_db,
+            dataset_dir=args.dataset_dir,
+            require_parquet=args.require_parquet,
+        )
+        print(_json.dumps({
+            "out": result["out"],
+            "dataset_sha256": result["dataset_sha256"],
+            "trade_csv": result["trade_csv"],
+            "signature_path": result["signature_path"],
+            "signed": result["signed"],
+        }, indent=2))
+        return
+
     if args.bootstrap:
         logger = setup_logging()
         bootstrap_seed_data(logger, days=args.bootstrap_days)
