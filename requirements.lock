@@ -345,6 +345,9 @@ ckzg==2.1.7 \
     --hash=sha256:f959a3bbc6d7aa7a653946e67dadaa78c0c79828aaa93b125a26f171a602b8fa \
     --hash=sha256:fb67250207b93d2df7f694bb74bd6b4a15fb2bb67d6a78977ae8ff431678c7e7
     # via eth-account
+cuda-toolkit==13.0.2 \
+    --hash=sha256:b198824cf2f54003f50d64ada3a0f184b42ca0846c1c94192fa269ecd97a66eb
+    # via torch
 click==8.4.0 \
     --hash=sha256:40c50b7c6c6adac2823d411041ec84f3f103f1b280d5e9ce0d7f998995832f81 \
     --hash=sha256:638f1338fe1235c8f4e008e4a8a254fb5c5fbdcbb40ece3c9142ebb78e792973
