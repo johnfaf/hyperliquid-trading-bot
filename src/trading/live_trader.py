@@ -6327,6 +6327,14 @@ class LiveTrader:
             # the entry order placement below is unchanged. Two layers of
             # try/except guarantee the shadow can never break entry
             # execution on a live-money code path.
+            #
+            # Mid sourcing: prefer signal.entry_price (already computed
+            # upstream by sizing/firewall) over a fresh API call. The
+            # original implementation called self._get_mid_price(coin),
+            # which issues an extra allMids HTTP round-trip per entry --
+            # doubling per-entry API cost when the flag was ON, for pure
+            # telemetry. We fall back to a fresh fetch ONLY if the
+            # signal has no entry_price stamped (rare, but covered).
             try:
                 import config as _cfg
                 if getattr(_cfg, "MAKER_FIRST_SHADOW_ENABLED", False):
@@ -6339,7 +6347,11 @@ class LiveTrader:
                         decide,
                         policy_for_source,
                     )
-                    _mid = self._get_mid_price(coin)
+                    _mid = float(getattr(signal, "entry_price", 0.0) or 0.0)
+                    if _mid <= 0:
+                        # Fallback (rare): no upstream mid available. Only
+                        # then do we issue the extra API call.
+                        _mid = self._get_mid_price(coin) or 0.0
                     if _mid and _mid > 0:
                         _spread_bps = float(getattr(
                             _cfg, "MAKER_FIRST_SHADOW_SPREAD_BPS", 1.0,

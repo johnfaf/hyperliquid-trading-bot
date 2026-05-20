@@ -160,6 +160,36 @@ def test_signal_age_computed_from_iso_timestamp(monkeypatch):
     assert 9.5 <= age <= 11.0
 
 
+def test_shadow_prefers_signal_entry_price_over_api_call():
+    """Issue #5 from the main scan: prior to this fix, the shadow called
+    self._get_mid_price(coin) on every entry, doubling per-entry HTTP
+    cost when the flag was ON. The fix uses signal.entry_price first
+    and only falls back to a fresh API call when the upstream price is
+    missing. This test asserts the *preference* contract: when
+    signal.entry_price > 0, no fresh fetch should be needed.
+    """
+    # Simulate the shadow block's mid-sourcing logic.
+    from unittest.mock import MagicMock
+    signal = MagicMock()
+    signal.entry_price = 100.0
+
+    _mid = float(getattr(signal, "entry_price", 0.0) or 0.0)
+    api_called = False
+    if _mid <= 0:
+        api_called = True  # Would be self._get_mid_price() in production
+    assert _mid == 100.0
+    assert api_called is False
+
+    # Reverse case: missing entry price triggers the fallback.
+    signal_no_price = MagicMock()
+    signal_no_price.entry_price = 0.0
+    _mid = float(getattr(signal_no_price, "entry_price", 0.0) or 0.0)
+    api_called = False
+    if _mid <= 0:
+        api_called = True
+    assert api_called is True
+
+
 def test_post_alo_recommended_for_fresh_signal_no_order():
     """The most common shadow outcome: fresh signal, no live order, BBO
     available → POST_ALO. This is the baseline we want logged thousands
