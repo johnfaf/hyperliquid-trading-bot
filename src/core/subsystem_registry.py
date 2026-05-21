@@ -428,6 +428,34 @@ def build_subsystems(
             "max_signals_per_source_per_day": getattr(
                 _fw_cfg, "FIREWALL_MAX_SIGNALS_PER_SOURCE_PER_DAY", 0
             ),
+            # Long-side hardening (mirror of short-side block below).  The
+            # firewall reads cfg.get("long_hardening_enabled", True), so when
+            # this key is absent the gate defaults ON.  Wiring it here lets
+            # operators flip LONG_HARDENING_ENABLED=false to release the
+            # long-side throttle when the recent-window history is
+            # contaminated (e.g. after a deploy thrash).
+            "long_hardening_enabled": bool(getattr(_fw_cfg, "LONG_HARDENING_ENABLED", True)),
+            "long_hardening_lookback_trades": int(
+                getattr(_fw_cfg, "LONG_HARDENING_LOOKBACK_TRADES", 120)
+            ),
+            "long_hardening_min_closed_trades": int(
+                getattr(_fw_cfg, "LONG_HARDENING_MIN_CLOSED_TRADES", 12)
+            ),
+            "long_hardening_degrade_win_rate": float(
+                getattr(_fw_cfg, "LONG_HARDENING_DEGRADE_WIN_RATE", 0.48)
+            ),
+            "long_hardening_block_win_rate": float(
+                getattr(_fw_cfg, "LONG_HARDENING_BLOCK_WIN_RATE", 0.40)
+            ),
+            "long_hardening_block_net_pnl": float(
+                getattr(_fw_cfg, "LONG_HARDENING_BLOCK_NET_PNL", -0.5)
+            ),
+            "long_hardening_confidence_multiplier": float(
+                getattr(_fw_cfg, "LONG_HARDENING_CONFIDENCE_MULTIPLIER", 0.80)
+            ),
+            "long_hardening_size_multiplier": float(
+                getattr(_fw_cfg, "LONG_HARDENING_SIZE_MULTIPLIER", 0.50)
+            ),
             "short_hardening_enabled": bool(getattr(_fw_cfg, "SHORT_HARDENING_ENABLED", True)),
             "short_hardening_lookback_trades": int(
                 getattr(_fw_cfg, "SHORT_HARDENING_LOOKBACK_TRADES", 120)
