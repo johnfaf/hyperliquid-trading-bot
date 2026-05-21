@@ -31,7 +31,7 @@ live-mirror code runs.
 from __future__ import annotations
 
 from contextlib import contextmanager
-from typing import Any, Dict, List, Optional, Tuple
+from typing import List, Tuple
 
 import pytest
 
