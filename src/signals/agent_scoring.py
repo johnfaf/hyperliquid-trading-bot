@@ -261,6 +261,16 @@ class AgentScorer:
         """
         Record that a signal was generated. Returns a signal_id for tracking.
         Call this when a signal is about to be executed.
+
+        Persists the score row to the DB immediately so that downstream
+        consumers reading ``agent_scores`` (notably the live-mirror
+        promotion gate in ``src/learning/promotion_gate.py``) see a row
+        with ``total_signals >= 1`` from the very first call.  Before
+        this persistence, the live-mirror check that runs *immediately
+        after* the paper trade fires would SELECT NULL and reject with
+        ``no_agent_score_row`` even though the in-memory counter had
+        already incremented — meaning even brand-new sources could never
+        accumulate the row needed for bootstrap-tier promotion.
         """
         if source_key not in self.scores:
             self.scores[source_key] = SourceScore(source_key=source_key)
@@ -280,6 +290,12 @@ class AgentScorer:
             "pnl": None,  # Filled when outcome is recorded
             "correct": None,
         })
+
+        # Persist immediately so the promotion gate sees this signal in
+        # the same trading cycle.  ``_save_score`` is the same writer
+        # ``record_outcome`` uses, with INSERT ... ON CONFLICT DO UPDATE,
+        # so the cost is one UPSERT per emitted signal (a few ms).
+        self._save_score(source_key)
 
         return signal_id
 
