@@ -350,7 +350,15 @@ class HyperliquidResearchBot:
                     max_retries=2,
                     auto_recover_cooldown_s=max(300.0, auto_bt_config.interval_seconds / 2.0),
                 )
-                health_registry.register("bg-auto-backtest", affects_trading=False)
+                # Long-cadence worker: only heartbeats AFTER each cycle completes,
+                # so the global 5–10 min stale threshold would warn every interval.
+                # Tell the registry the expected cadence so stale-check uses 1.5×
+                # the cycle interval (e.g. 6h cycle → 9h stale threshold).
+                health_registry.register(
+                    "bg-auto-backtest",
+                    affects_trading=False,
+                    expected_interval_s=float(auto_bt_config.interval_seconds),
+                )
                 self._startup_background_task_names.append("bg-auto-backtest")
                 self.logger.info(
                     "Auto-backtest loop enabled: interval=%ss startup_delay=%ss",
