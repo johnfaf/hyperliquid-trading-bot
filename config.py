@@ -1199,6 +1199,28 @@ CALIBRATION_TREND_DERISK_MULTIPLIER = _safe_env_float(
 FIREWALL_MAX_SIGNALS_PER_SOURCE_PER_DAY = int(
     os.environ.get("FIREWALL_MAX_SIGNALS_PER_SOURCE_PER_DAY", 0)
 )
+# Long-side hardening — symmetric mirror of SHORT_HARDENING_*.
+# The firewall's _apply_long_hardening already supports per-knob tuning;
+# this block wires them to env vars so operators can override the same
+# way the short-side ones are overridable.  Defaults track the values
+# baked into ``DecisionFirewall.__init__`` so existing behaviour is
+# unchanged when nothing is set.
+#
+# Disable entirely with LONG_HARDENING_ENABLED=false when the recent
+# long-trade history is contaminated (e.g. after a deploy thrash) and
+# the operator wants to let new longs back through so the rolling
+# 120-trade lookback can refresh.
+LONG_HARDENING_ENABLED = os.environ.get("LONG_HARDENING_ENABLED", "true").lower() in ("true", "1", "yes")
+LONG_HARDENING_LOOKBACK_TRADES = int(os.environ.get("LONG_HARDENING_LOOKBACK_TRADES", 120))
+LONG_HARDENING_MIN_CLOSED_TRADES = int(os.environ.get("LONG_HARDENING_MIN_CLOSED_TRADES", 12))
+LONG_HARDENING_DEGRADE_WIN_RATE = float(os.environ.get("LONG_HARDENING_DEGRADE_WIN_RATE", 0.48))
+LONG_HARDENING_BLOCK_WIN_RATE = float(os.environ.get("LONG_HARDENING_BLOCK_WIN_RATE", 0.40))
+LONG_HARDENING_BLOCK_NET_PNL = float(os.environ.get("LONG_HARDENING_BLOCK_NET_PNL", -0.5))
+LONG_HARDENING_CONFIDENCE_MULTIPLIER = float(
+    os.environ.get("LONG_HARDENING_CONFIDENCE_MULTIPLIER", 0.80)
+)
+LONG_HARDENING_SIZE_MULTIPLIER = float(os.environ.get("LONG_HARDENING_SIZE_MULTIPLIER", 0.50))
+
 SHORT_HARDENING_ENABLED = os.environ.get("SHORT_HARDENING_ENABLED", "true").lower() in ("true", "1", "yes")
 SHORT_HARDENING_LOOKBACK_TRADES = int(os.environ.get("SHORT_HARDENING_LOOKBACK_TRADES", 120))
 SHORT_HARDENING_MIN_CLOSED_TRADES = int(os.environ.get("SHORT_HARDENING_MIN_CLOSED_TRADES", 12))
