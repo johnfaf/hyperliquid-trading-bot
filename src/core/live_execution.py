@@ -487,9 +487,11 @@ def _rescale_size_for_live(trade: Dict, trader) -> Optional[Dict]:
     # so the source keeps accumulating outcomes; only the live mirror
     # is gated. Bypass via ``LIVE_PROMOTION_GATE_ENABLED=false`` if you
     # need to bootstrap a new source.
+    promotion_scale = 1.0  # bootstrap-tier size modifier; 1.0 = full
     try:
-        from src.learning.promotion_gate import is_live_promotable
+        from src.learning.promotion_gate import is_live_promotable, get_bootstrap_scale
         promotable, reason = is_live_promotable(trade)
+        promotion_scale = get_bootstrap_scale(reason)
     except Exception as exc:
         logger.debug("Promotion gate check failed (fail-open): %s", exc)
         promotable, reason = True, "gate_error_fail_open"
@@ -502,6 +504,13 @@ def _rescale_size_for_live(trade: Dict, trader) -> Optional[Dict]:
             reason,
         )
         return None
+    if promotion_scale < 1.0:
+        logger.info(
+            "Bootstrap-tier promotion for %s: applying %.2fx size scale (%s). "
+            "Full-size promotion unlocks once the source meets the standard "
+            "30-trade / 45%% win-rate bar.",
+            trade.get("coin", "?"), promotion_scale, reason,
+        )
 
     paper_account = db.get_paper_account()
     paper_balance = float((paper_account or {}).get("balance", 0) or 0)
@@ -565,6 +574,13 @@ def _rescale_size_for_live(trade: Dict, trader) -> Optional[Dict]:
 
     # H6: scale on symmetric "new-trade capacity" on both sides.
     scale = live_free_margin / paper_free_balance
+    # Bootstrap-tier promotion: multiply the rescale by the bootstrap scale
+    # so the live mirror size becomes (paper_scale * bootstrap_fraction).
+    # Floor-up below may still raise this back to min_order_usd if the
+    # result lands under the exchange minimum -- by design, since refusing
+    # every bootstrap mirror on a small wallet would defeat the tier.
+    if promotion_scale < 1.0:
+        scale *= promotion_scale
     # H7: Clamp scale to 1.0 when live free margin exceeds the paper
     # reference unless the operator explicitly opts in via
     # LIVE_ALLOW_SCALE_ABOVE_PAPER=1.  The paper book is the source of our
