@@ -991,6 +991,17 @@ def run_trading_cycle(container, cycle_count: int) -> None:
         except Exception as _bes_exc:
             logger.debug("break_even_stop hook skipped: %s", _bes_exc)
 
+        # ── Phase 3d6: Time-decay SL Tightening (default OFF) ──
+        # Tighten SL on positions whose trade thesis has gone stale,
+        # banded by age.  Layered SL policy PR C; runs AFTER break-even
+        # so a newly-promoted at-entry SL is the floor time-decay
+        # tightens from.  No-op when TIME_DECAY_SL_ENABLED is false.
+        try:
+            from src.trading.time_decay_sl import evaluate_time_decay_sl
+            evaluate_time_decay_sl(container)
+        except Exception as _tds_exc:
+            logger.debug("time_decay_sl hook skipped: %s", _tds_exc)
+
         # Cross-venue hedging
         _run_hedger(container, regime_data)
 

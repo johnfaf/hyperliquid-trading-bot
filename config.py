@@ -1408,6 +1408,50 @@ BREAK_EVEN_STOP_BUFFER_PCT = _safe_env_float(
     "BREAK_EVEN_STOP_BUFFER_PCT", 0.001, lo=0.0, hi=0.05,
 )
 
+# Time-decay SL tightening policy (DEFAULT OFF).
+# ────────────────────────────────────────────────────────────────
+# The longer a position is held without resolution (no SL/TP/reconcile/
+# break-even promotion), the tighter its SL becomes.  Caps slow-bleed
+# losses on positions whose trade thesis has gone stale.
+#
+# Discrete bands, not continuous trailing -- each cancel/replace is a
+# meaningful step (not whipsaw-prone) and API rate stays bounded.
+#
+# Band schedule expressed as (age_seconds, distance_factor).  Factor is
+# the fraction of the CURRENT SL distance the new SL keeps after
+# tightening.  Smaller factor = tighter SL.  At factor=0.25 a position
+# whose SL was 3% away ends up at ~0.75% from current price.
+TIME_DECAY_SL_ENABLED = _safe_env_bool("TIME_DECAY_SL_ENABLED", False)
+TIME_DECAY_SL_DRY_RUN = _safe_env_bool("TIME_DECAY_SL_DRY_RUN", True)
+# Band 1: 30 min -> 75% of current SL distance
+TIME_DECAY_SL_BAND1_SECONDS = int(
+    os.environ.get("TIME_DECAY_SL_BAND1_SECONDS", 1800)
+)
+TIME_DECAY_SL_BAND1_FACTOR = _safe_env_float(
+    "TIME_DECAY_SL_BAND1_FACTOR", 0.75, lo=0.10, hi=1.00,
+)
+# Band 2: 90 min -> 50%
+TIME_DECAY_SL_BAND2_SECONDS = int(
+    os.environ.get("TIME_DECAY_SL_BAND2_SECONDS", 5400)
+)
+TIME_DECAY_SL_BAND2_FACTOR = _safe_env_float(
+    "TIME_DECAY_SL_BAND2_FACTOR", 0.50, lo=0.05, hi=1.00,
+)
+# Band 3: 180 min -> 25%
+TIME_DECAY_SL_BAND3_SECONDS = int(
+    os.environ.get("TIME_DECAY_SL_BAND3_SECONDS", 10800)
+)
+TIME_DECAY_SL_BAND3_FACTOR = _safe_env_float(
+    "TIME_DECAY_SL_BAND3_FACTOR", 0.25, lo=0.05, hi=1.00,
+)
+# Band 4: 240 min -> 25% (no further tightening beyond this)
+TIME_DECAY_SL_BAND4_SECONDS = int(
+    os.environ.get("TIME_DECAY_SL_BAND4_SECONDS", 14400)
+)
+TIME_DECAY_SL_BAND4_FACTOR = _safe_env_float(
+    "TIME_DECAY_SL_BAND4_FACTOR", 0.25, lo=0.05, hi=1.00,
+)
+
 # Cross-asset momentum override: when core majors break out together, block
 # countertrend entries and pause mean-reversion-style fades. Auto-closing
 # countertrend live positions is available but off by default.
