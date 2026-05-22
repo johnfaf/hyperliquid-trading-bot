@@ -1348,6 +1348,46 @@ FIREWALL_SIDE_IMBALANCE_SIZE_MULTIPLIER = float(
     os.environ.get("FIREWALL_SIDE_IMBALANCE_SIZE_MULTIPLIER", 0.50)
 )
 
+# Regime-flip exit on live positions (DEFAULT OFF).
+# ────────────────────────────────────────────────────────────────
+# Closes a live position via reduce-only market order when the bot's
+# regime detector AND forecaster both flip against the position's
+# direction with high confidence for a sustained number of cycles.
+# In addition to (not a replacement for) the SL/TP brackets already
+# placed at entry.  When OFF: no positions are closed by this code
+# path; existing SL/TP behavior is byte-identical to before.
+#
+# Layered gates (ALL must pass before close):
+#   1. min hold time (anti-whipsaw on fresh entries)
+#   2. coin's regime is opposite to position side
+#   3. coin's regime confidence >= REGIME_FLIP_EXIT_MIN_CONFIDENCE
+#   4. forecaster signal points against position (optional, default ON)
+#   5. against-direction has persisted >= MIN_CONSECUTIVE_CYCLES
+#
+# When DRY_RUN=true (default), the module logs what it WOULD close
+# but never sends the order -- safe to enable for observation.
+REGIME_FLIP_EXIT_ENABLED = _safe_env_bool(
+    "REGIME_FLIP_EXIT_ENABLED", False,
+)
+REGIME_FLIP_EXIT_DRY_RUN = _safe_env_bool(
+    "REGIME_FLIP_EXIT_DRY_RUN", True,
+)
+REGIME_FLIP_EXIT_MIN_CONFIDENCE = _safe_env_float(
+    "REGIME_FLIP_EXIT_MIN_CONFIDENCE", 0.70, lo=0.0, hi=1.0,
+)
+REGIME_FLIP_EXIT_MIN_CONSECUTIVE_CYCLES = int(
+    os.environ.get("REGIME_FLIP_EXIT_MIN_CONSECUTIVE_CYCLES", 2)
+)
+REGIME_FLIP_EXIT_MIN_HOLD_SECONDS = int(
+    os.environ.get("REGIME_FLIP_EXIT_MIN_HOLD_SECONDS", 300)
+)
+REGIME_FLIP_EXIT_REQUIRE_FORECASTER_AGREE = _safe_env_bool(
+    "REGIME_FLIP_EXIT_REQUIRE_FORECASTER_AGREE", True,
+)
+REGIME_FLIP_EXIT_FORECASTER_MIN_SIGNAL = _safe_env_float(
+    "REGIME_FLIP_EXIT_FORECASTER_MIN_SIGNAL", 0.20, lo=0.0, hi=1.0,
+)
+
 # Cross-asset momentum override: when core majors break out together, block
 # countertrend entries and pause mean-reversion-style fades. Auto-closing
 # countertrend live positions is available but off by default.
