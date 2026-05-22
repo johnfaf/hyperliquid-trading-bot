@@ -1002,6 +1002,18 @@ def run_trading_cycle(container, cycle_count: int) -> None:
         except Exception as _tds_exc:
             logger.debug("time_decay_sl hook skipped: %s", _tds_exc)
 
+        # ── Phase 3d7: Trailing Stop (default OFF) ──
+        # Trail SL behind favourable-direction high/low-water mark.
+        # Layered SL policy PR D; runs LAST in the SL-policy chain so
+        # it can ratchet up from whatever floor break-even and
+        # time-decay have established.  No-op when TRAILING_STOP_ENABLED
+        # is false; never raises.
+        try:
+            from src.trading.trailing_stop import evaluate_trailing_stop
+            evaluate_trailing_stop(container)
+        except Exception as _ts_exc:
+            logger.debug("trailing_stop hook skipped: %s", _ts_exc)
+
         # Cross-venue hedging
         _run_hedger(container, regime_data)
 

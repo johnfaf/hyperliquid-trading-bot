@@ -1452,6 +1452,34 @@ TIME_DECAY_SL_BAND4_FACTOR = _safe_env_float(
     "TIME_DECAY_SL_BAND4_FACTOR", 0.25, lo=0.05, hi=1.00,
 )
 
+# Trailing stop policy (DEFAULT OFF).
+# ────────────────────────────────────────────────────────────────
+# Trail SL behind the favourable-direction high/low-water mark by a
+# fixed offset.  Captures profit on positions that run past the
+# original TP distance.  Activates only after a position is already
+# in profit by >= TRAILING_STOP_ACTIVATION_PROFIT_PCT so it doesn't
+# fight the break-even path on early moves.
+#
+# Min-step throttle prevents tiny SL adjustments on noise -- only
+# moves SL when the proposed change is at least MIN_STEP_PCT past
+# the current SL.
+TRAILING_STOP_ENABLED = _safe_env_bool("TRAILING_STOP_ENABLED", False)
+TRAILING_STOP_DRY_RUN = _safe_env_bool("TRAILING_STOP_DRY_RUN", True)
+# Profit % required before the trail activates.  Below this we leave
+# SL alone (break-even handles the 0-1% zone).
+TRAILING_STOP_ACTIVATION_PROFIT_PCT = _safe_env_float(
+    "TRAILING_STOP_ACTIVATION_PROFIT_PCT", 0.01, lo=0.0, hi=0.50,
+)
+# Distance from HWM/LWM at which the trailing SL sits.
+TRAILING_STOP_OFFSET_PCT = _safe_env_float(
+    "TRAILING_STOP_OFFSET_PCT", 0.01, lo=0.001, hi=0.20,
+)
+# Minimum SL move (% of current SL) before we cancel+replace.  Stops
+# the policy from spamming the exchange on every tiny tick.
+TRAILING_STOP_MIN_STEP_PCT = _safe_env_float(
+    "TRAILING_STOP_MIN_STEP_PCT", 0.002, lo=0.0, hi=0.05,
+)
+
 # Cross-asset momentum override: when core majors break out together, block
 # countertrend entries and pause mean-reversion-style fades. Auto-closing
 # countertrend live positions is available but off by default.
