@@ -970,6 +970,17 @@ def run_trading_cycle(container, cycle_count: int) -> None:
         regime_data = _apply_macro_regime_overlay(container, regime_data)
         regime_data = _apply_global_momentum_override(container, regime_data)
 
+        # ── Phase 3d4: Regime-Flip Exit (default OFF) ──
+        # Closes existing live positions when the bot's regime + forecaster
+        # agree that the trade thesis has flipped against them.  Runs AFTER
+        # all regime overlays so we use the final reconciled read.  No-op
+        # when REGIME_FLIP_EXIT_ENABLED is false; never raises.
+        try:
+            from src.trading.regime_flip_exit import evaluate_regime_flip_exits
+            evaluate_regime_flip_exits(container, regime_data)
+        except Exception as _rfe_exc:
+            logger.debug("regime_flip_exit hook skipped: %s", _rfe_exc)
+
         # Cross-venue hedging
         _run_hedger(container, regime_data)
 
