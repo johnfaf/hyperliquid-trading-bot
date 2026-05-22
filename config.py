@@ -1388,6 +1388,26 @@ REGIME_FLIP_EXIT_FORECASTER_MIN_SIGNAL = _safe_env_float(
     "REGIME_FLIP_EXIT_FORECASTER_MIN_SIGNAL", 0.20, lo=0.0, hi=1.0,
 )
 
+# Break-even stop policy (DEFAULT OFF).
+# ────────────────────────────────────────────────────────────────
+# When a live position is profitable by >= BREAK_EVEN_STOP_TRIGGER_PCT,
+# move its stop-loss to the entry price (plus a small buffer to cover
+# fees).  The position then has a guaranteed non-loss floor while
+# remaining open to capture additional upside.
+#
+# This is the safest of the layered SL policies because it can only
+# IMPROVE outcomes -- it never moves SL further from price.  The
+# sl_is_tighter guard in src/trading/sl_management.py refuses any
+# attempt to loosen the SL.
+BREAK_EVEN_STOP_ENABLED = _safe_env_bool("BREAK_EVEN_STOP_ENABLED", False)
+BREAK_EVEN_STOP_DRY_RUN = _safe_env_bool("BREAK_EVEN_STOP_DRY_RUN", True)
+BREAK_EVEN_STOP_TRIGGER_PCT = _safe_env_float(
+    "BREAK_EVEN_STOP_TRIGGER_PCT", 0.01, lo=0.001, hi=0.50,
+)
+BREAK_EVEN_STOP_BUFFER_PCT = _safe_env_float(
+    "BREAK_EVEN_STOP_BUFFER_PCT", 0.001, lo=0.0, hi=0.05,
+)
+
 # Cross-asset momentum override: when core majors break out together, block
 # countertrend entries and pause mean-reversion-style fades. Auto-closing
 # countertrend live positions is available but off by default.

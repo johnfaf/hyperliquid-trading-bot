@@ -981,6 +981,16 @@ def run_trading_cycle(container, cycle_count: int) -> None:
         except Exception as _rfe_exc:
             logger.debug("regime_flip_exit hook skipped: %s", _rfe_exc)
 
+        # ── Phase 3d5: Break-even Stop Promotion (default OFF) ──
+        # Once a live position is profitable, promote SL to entry price so
+        # the worst-case outcome is non-negative.  Layered SL policy PR B;
+        # no-op when BREAK_EVEN_STOP_ENABLED is false; never raises.
+        try:
+            from src.trading.break_even_stop import evaluate_break_even_stop
+            evaluate_break_even_stop(container)
+        except Exception as _bes_exc:
+            logger.debug("break_even_stop hook skipped: %s", _bes_exc)
+
         # Cross-venue hedging
         _run_hedger(container, regime_data)
 
