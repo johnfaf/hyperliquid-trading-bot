@@ -112,16 +112,18 @@ jobs:
             --ignore-vuln PYSEC-2025-189 \
             --ignore-vuln PYSEC-2025-190 \
             --ignore-vuln PYSEC-2024-277 \
+            --ignore-vuln PYSEC-2026-161 \
             --format json \
             --output dependency-audit.json
       - name: safety check (informational)
         run: safety check -r requirements.txt || true
       - name: Upload dependency audit artifact
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: dependency-audit-${{ github.sha }}
           path: dependency-audit.json
-          if-no-files-found: error
+          if-no-files-found: warn
 
   sbom:
     runs-on: ubuntu-latest

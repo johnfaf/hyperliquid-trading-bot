@@ -176,6 +176,35 @@ def evaluate_trailing_stop(container) -> None:
             if new_sl <= 0:
                 continue
 
+            # Side-of-price safety guard.
+            #
+            # An SL on the WRONG side of current price would close the
+            # position INSTANTLY when sent to the exchange (the price has
+            # already "crossed" the trigger).  This happens when price
+            # reverses enough from the water-mark extreme that the
+            # trail offset places the proposed SL inside the unfavourable
+            # side.  Example observed in dry-run:
+            #   SHORT SOL  hwm=81.65  current_price=84.17
+            #   computed new_sl = 81.65 * 1.01 = 82.47
+            #   but 82.47 < 84.17 -- SL would auto-trigger on placement.
+            # We must NEVER ship such an SL even if it passes the
+            # ``sl_is_tighter`` check (which only compares old_sl vs new_sl,
+            # not new_sl vs current_price).
+            epsilon = 1e-9
+            wrong_side_long = side == "long" and new_sl >= current - epsilon
+            wrong_side_short = side == "short" and new_sl <= current + epsilon
+            if wrong_side_long or wrong_side_short:
+                logger.debug(
+                    "trailing_stop: %s %s skipping -- proposed new_sl=%.6f on "
+                    "wrong side of current_price=%.6f (water_mark=%.6f, "
+                    "offset=%.2f%%).  Price reversed enough that the trail "
+                    "would land inside the unfavourable side; waiting for "
+                    "favourable resumption.",
+                    side.upper(), coin, new_sl, current, water,
+                    offset_pct * 100.0,
+                )
+                continue
+
             # Fetch the active SL.
             _pos2, sl_order = fetch_position_and_sl(trader, coin)
             if sl_order is None:
