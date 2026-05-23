@@ -167,6 +167,90 @@ def test_full_gate_pass_trails_sl_short(monkeypatch):
     assert trigger == pytest.approx(90_900.0)
 
 
+def test_wrong_side_guard_blocks_short_when_price_reverses(monkeypatch):
+    """REGRESSION: production dry-run captured a SHORT SOL trailing-stop
+    proposal where new_sl (82.47) was BELOW current_price (84.17) -- the
+    SL would have auto-triggered on placement.
+
+    Scenario: short SOL at 85.05 entry, LWM hit 81.65 earlier, but price
+    has since reversed back up to 84.17.  With offset=1.00%, the
+    computed trail SL is 81.65 * 1.01 = 82.47 -- on the WRONG side of
+    current price for a short (must be ABOVE current).
+
+    The side-of-price guard must skip this move.  Without the guard,
+    the position would have closed instantly when SL was placed."""
+    container = _StubContainer(_StubTrader([], []))
+
+    # Cycle 1: price drops to 81.65, hwm/lwm tracks the low.
+    monkeypatch.setattr(ts, "get_all_mids", lambda: {"SOL": 81.65})
+    container.live_trader = _StubTrader(
+        positions=[{"coin": "SOL", "side": "short", "entry_price": 85.05, "size": 1.0}],
+        orders=[{"coin": "SOL", "side": "B", "triggerPx": 86.57, "reduceOnly": True,
+                 "orderType": "Stop Market", "oid": 11111}],
+    )
+    evaluate_trailing_stop(container)
+    # First cycle SHOULD move the SL because price (81.65) is well below
+    # the proposed new SL (82.47), so SL is correctly above price.
+    assert container.live_trader.place_calls, (
+        "First cycle should move SL when LWM = current price"
+    )
+    container.live_trader.place_calls.clear()
+    container.live_trader.cancel_calls.clear()
+
+    # Cycle 2: price has reversed back up to 84.17 (above the locked-in
+    # SL of 82.47).  HWM/LWM stays at 81.65 (favourable-only update).
+    # The computed new SL based on LWM is still 82.47 -- but 82.47 is
+    # now BELOW current 84.17 = wrong side for a short.  Must skip.
+    monkeypatch.setattr(ts, "get_all_mids", lambda: {"SOL": 84.17})
+    # Pretend the previous cycle moved SL to ~82.47; here we keep the
+    # ORIGINAL 86.57 in order to exercise the wrong-side guard.  In
+    # practice the previous cycle would have done the same skip the
+    # first time price reversed past the proposed SL.
+    container.live_trader = _StubTrader(
+        positions=[{"coin": "SOL", "side": "short", "entry_price": 85.05, "size": 1.0}],
+        orders=[{"coin": "SOL", "side": "B", "triggerPx": 86.57, "reduceOnly": True,
+                 "orderType": "Stop Market", "oid": 11111}],
+    )
+    evaluate_trailing_stop(container)
+    assert container.live_trader.place_calls == [], (
+        "Second cycle must NOT place an SL on the wrong side of price"
+    )
+    assert container.live_trader.cancel_calls == [], (
+        "Second cycle must NOT cancel the existing SL just to skip placement"
+    )
+
+
+def test_wrong_side_guard_blocks_long_when_price_reverses(monkeypatch):
+    """Symmetric: long BTC trailing SL at 99k when price reversed back
+    down to 98k means the proposed SL (99k) would be ABOVE current
+    price (98k) -- a long SL must be BELOW current price."""
+    container = _StubContainer(_StubTrader([], []))
+
+    # Establish HWM = 100k.
+    monkeypatch.setattr(ts, "get_all_mids", lambda: {"BTC": 100_000.0})
+    container.live_trader = _StubTrader(
+        positions=[{"coin": "BTC", "side": "long", "entry_price": 90_000, "size": 0.001}],
+        orders=[{"coin": "BTC", "side": "A", "triggerPx": 85_000, "reduceOnly": True,
+                 "orderType": "Stop Market", "oid": 22222}],
+    )
+    evaluate_trailing_stop(container)
+    container.live_trader.place_calls.clear()
+    container.live_trader.cancel_calls.clear()
+
+    # Price reverses to 98k.  HWM stays at 100k.  Proposed trail SL =
+    # 100_000 * 0.99 = 99_000.  But 99_000 > 98_000 = wrong side for a long.
+    monkeypatch.setattr(ts, "get_all_mids", lambda: {"BTC": 98_000.0})
+    container.live_trader = _StubTrader(
+        positions=[{"coin": "BTC", "side": "long", "entry_price": 90_000, "size": 0.001}],
+        orders=[{"coin": "BTC", "side": "A", "triggerPx": 85_000, "reduceOnly": True,
+                 "orderType": "Stop Market", "oid": 22222}],
+    )
+    evaluate_trailing_stop(container)
+    assert container.live_trader.place_calls == [], (
+        "Trailing SL on the wrong side of price (long) must be skipped"
+    )
+
+
 def test_hwm_persists_across_cycles_long(monkeypatch):
     """Long at 100k.  Cycle 1: price 110k -> HWM 110k.  Cycle 2: price 108k
     (drop, but still above entry+1%).  HWM should STAY at 110k (favourable-only
