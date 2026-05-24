@@ -85,12 +85,30 @@ def run_discovery(container) -> None:
                         "positions": state["positions"],
                         "position_analysis": container.discovery._analyze_positions(state["positions"]),
                         "bot_score": bot_score,
+                        # Pull every characteristic the discovery cycle
+                        # computed and persisted to the trader's metadata.
+                        # Before this fix ``trading_frequency`` was
+                        # hard-coded to "unknown" here, which structurally
+                        # disabled the scalper / swing_trader /
+                        # position_trader branches in
+                        # ``strategy_identifier.py`` -- every newly-identified
+                        # strategy ended up classified as ``momentum_*`` no
+                        # matter what kind of trader it actually was.  The
+                        # H27 FIX (profit_factor) is preserved: we still
+                        # pass ``None`` when not measured.
                         "trade_analysis": {
                             "total_trades": trader["trade_count"],
                             "win_rate": trader["win_rate"],
                             "total_closed_pnl": trader["total_pnl"],
-                            "trading_frequency": "unknown",
+                            "trading_frequency": trader_meta.get(
+                                "trading_frequency", "unknown",
+                            ),
                             "profit_factor": None,
+                            "avg_trade_size": trader_meta.get("avg_trade_size", 0),
+                            "trades_per_day": trader_meta.get("trades_per_day", 0.0),
+                            "liquidations": trader_meta.get("liquidations", 0),
+                            "avg_win": trader_meta.get("avg_win", 0.0),
+                            "avg_loss": trader_meta.get("avg_loss", 0.0),
                             "raw_fill_count": trader_meta.get("raw_fill_count", 0),
                             "closed_trade_count": trader_meta.get("closed_trade_count", trader["trade_count"]),
                             "sample_is_capped": trader_meta.get("sample_is_capped", False),

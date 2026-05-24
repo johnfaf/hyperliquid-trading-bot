@@ -734,6 +734,22 @@ class TraderDiscovery:
                 "raw_fill_count": trade_analysis.get("raw_fill_count", 0),
                 "closed_trade_count": trade_analysis.get("closed_trade_count", 0),
                 "sample_is_capped": trade_analysis.get("sample_is_capped", False),
+                # Persist the analyzed trade characteristics so the research
+                # cycle's Phase 2 (StrategyIdentifier) can read them from the
+                # DB instead of falling back to "unknown" / 0 placeholders.
+                # Without these fields, the scalper / swing_trader /
+                # position_trader detection branches in
+                # strategy_identifier.py were structurally unreachable
+                # because they gate on ``trading_frequency`` -- which until
+                # this fix was never persisted. The visible symptom: every
+                # newly identified strategy was classified as ``momentum_*``,
+                # silently disabling half the strategy pool.
+                "trading_frequency": trade_analysis.get("trading_frequency", "unknown"),
+                "avg_trade_size": trade_analysis.get("avg_trade_size", 0),
+                "trades_per_day": trade_analysis.get("trades_per_day", 0.0),
+                "liquidations": trade_analysis.get("liquidations", 0),
+                "avg_win": trade_analysis.get("avg_win", 0.0),
+                "avg_loss": trade_analysis.get("avg_loss", 0.0),
             },
             is_active=bot_score < float(getattr(config, "BOT_THRESHOLD", 3)),
         )
