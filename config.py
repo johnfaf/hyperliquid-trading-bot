@@ -169,6 +169,23 @@ BOOT_DB_AUDIT_SKIP = os.environ.get(
     "BOOT_DB_AUDIT_SKIP", "false"
 ).lower() in ("true", "1", "yes")
 
+# ★ AUDIT FIX (May 2026): per-trader cap on strategies identified by
+# ``StrategyIdentifier.identify_strategies``.  The 9 detectors
+# (momentum, mean_reversion, scalping, swing_trading, funding_arb,
+# delta_neutral, concentrated_bet, trend_following, breakout) are NOT
+# mutually exclusive; a single trader routinely trips 3-5 of them.
+# Without a cap, the 2026-05-24 discovery saved 1817 strategies for
+# 775 humans (~2.3 per trader), which bloated /data/bot.db enough to
+# stall safe-repair and audit on boot for 10+ minutes.
+#
+# Default 2 keeps the trader's PRIMARY + SECONDARY trading pattern
+# while pruning lower-confidence overlapping classifications.  Set to
+# 1 to collapse to a single dominant strategy per trader, or >= 9 to
+# restore the legacy behaviour (no cap).
+STRATEGY_PER_TRADER_CAP = int(
+    os.environ.get("STRATEGY_PER_TRADER_CAP", 2)
+)
+
 # ─── Feature Store (Postgres-only, auto-enabled when POSTGRES_DSN set) ─
 FEATURE_STORE_COINS = os.environ.get("FEATURE_STORE_COINS", "").strip()
 FEATURE_STORE_MAX_COINS = int(os.environ.get("FEATURE_STORE_MAX_COINS", 30))
