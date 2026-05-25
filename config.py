@@ -154,6 +154,20 @@ DB_REPAIR_STARTUP_STRATEGY_PRUNE_LIMIT = int(
 BOOT_DB_AUDIT_INCLUDE_CANDLE_CACHE = os.environ.get(
     "BOOT_DB_AUDIT_INCLUDE_CANDLE_CACHE", "false"
 ).lower() in ("true", "1", "yes")
+# ★ MITIGATION (May 2026): when the runtime SQLite DB at /data/bot.db grows
+# past a few thousand strategies + traders, the startup ``run_db_audit``
+# call in ``main.py`` can hang for 10+ minutes on the PRAGMA
+# integrity_check pass + the per-table scans, preventing the bot from
+# ever reaching its trading cycles.  Observed in production on
+# 2026-05-25 after a heavy discovery cycle saved 1817 strategies.  The
+# audit is informational (it only logs findings, never blocks the bot)
+# so skipping it on boot is safe; the bot still runs the same audit on
+# demand via the CLI / readiness endpoints.  Default OFF (audit runs)
+# to preserve current behaviour; set ``BOOT_DB_AUDIT_SKIP=true`` to
+# bypass when the DB is large enough to cause the hang.
+BOOT_DB_AUDIT_SKIP = os.environ.get(
+    "BOOT_DB_AUDIT_SKIP", "false"
+).lower() in ("true", "1", "yes")
 
 # ─── Feature Store (Postgres-only, auto-enabled when POSTGRES_DSN set) ─
 FEATURE_STORE_COINS = os.environ.get("FEATURE_STORE_COINS", "").strip()

@@ -195,34 +195,51 @@ class HyperliquidResearchBot:
         log_persistence_info(self.logger)
         validate_dependencies(self.logger)
         init_database(self.logger)
-        try:
-            from src.data.db_audit import format_db_audit_report, run_db_audit
+        # ★ MITIGATION (May 2026): on large /data/bot.db (1800+
+        # strategies + 1300+ traders) ``run_db_audit`` can hang for
+        # 10+ minutes on PRAGMA integrity_check and per-table
+        # scans, blocking the bot from reaching its trading cycles.
+        # The audit is informational only -- it never blocks the bot --
+        # so when ``BOOT_DB_AUDIT_SKIP=true`` we skip it on boot
+        # entirely.  The same audit is still available via the CLI
+        # (`python -m main --audit-db`) and readiness endpoints.
+        # Default OFF (audit runs as before) to preserve behaviour for
+        # smaller-DB deployments.
+        if getattr(config, "BOOT_DB_AUDIT_SKIP", False):
+            self.logger.warning(
+                "Skipping startup DB audit (BOOT_DB_AUDIT_SKIP=true). "
+                "Run it on demand via the readiness CLI when the DB is "
+                "quieter."
+            )
+        else:
+            try:
+                from src.data.db_audit import format_db_audit_report, run_db_audit
 
-            include_candle_cache = bool(
-                getattr(config, "BOOT_DB_AUDIT_INCLUDE_CANDLE_CACHE", False)
-            )
-            self.logger.info(
-                "Running startup DB audit (candle_cache=%s)...",
-                include_candle_cache,
-            )
-            audit_report = run_db_audit(
-                include_candle_cache=include_candle_cache,
-                include_code_scan=False,
-            )
-            block_severity = getattr(config, "READINESS_DB_AUDIT_BLOCK_SEVERITY", "high")
-            if audit_report.findings_at_or_above(block_severity):
-                self.logger.warning(
-                    "Database audit found readiness blockers:\n%s",
-                    format_db_audit_report(audit_report, block_severity=block_severity),
+                include_candle_cache = bool(
+                    getattr(config, "BOOT_DB_AUDIT_INCLUDE_CANDLE_CACHE", False)
                 )
-            else:
                 self.logger.info(
-                    "Database audit passed readiness threshold (%s): %d finding(s)",
-                    block_severity,
-                    len(audit_report.findings),
+                    "Running startup DB audit (candle_cache=%s)...",
+                    include_candle_cache,
                 )
-        except Exception as exc:
-            self.logger.warning("Database audit skipped during boot: %s", exc)
+                audit_report = run_db_audit(
+                    include_candle_cache=include_candle_cache,
+                    include_code_scan=False,
+                )
+                block_severity = getattr(config, "READINESS_DB_AUDIT_BLOCK_SEVERITY", "high")
+                if audit_report.findings_at_or_above(block_severity):
+                    self.logger.warning(
+                        "Database audit found readiness blockers:\n%s",
+                        format_db_audit_report(audit_report, block_severity=block_severity),
+                    )
+                else:
+                    self.logger.info(
+                        "Database audit passed readiness threshold (%s): %d finding(s)",
+                        block_severity,
+                        len(audit_report.findings),
+                    )
+            except Exception as exc:
+                self.logger.warning("Database audit skipped during boot: %s", exc)
 
         # ── Build subsystems ──
         effective_profile = profile or FULL_PROFILE
