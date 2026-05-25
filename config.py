@@ -145,6 +145,18 @@ DB_AUDIT_DUALWRITE_MAX_FAILURES = int(
 DB_SAFE_AUTO_REPAIR_ON_BOOT = os.environ.get(
     "DB_SAFE_AUTO_REPAIR_ON_BOOT", "true"
 ).lower() in ("true", "1", "yes")
+# ★ MITIGATION (May 2026): on a large /data/bot.db the boot-time
+# ``run_startup_safe_repair`` call can take 10+ minutes scanning
+# bloated tables (strategies, strategy_scores, paper_trades,
+# pending_decisions, source_health).  Safe-repair is purely cleanup
+# (idempotent, bounded per-call), so running it on a daemon thread
+# lets boot proceed immediately and the repair completes whenever
+# the DB is available.  Default ON (non-blocking).  Set to false to
+# restore the legacy blocking behaviour, or use
+# DB_SAFE_AUTO_REPAIR_ON_BOOT=false to skip safe-repair entirely.
+BOOT_SAFE_REPAIR_BACKGROUND = os.environ.get(
+    "BOOT_SAFE_REPAIR_BACKGROUND", "true"
+).lower() in ("true", "1", "yes")
 DB_REPAIR_KEEP_MISSING_SOURCE_STRATEGIES = int(
     os.environ.get("DB_REPAIR_KEEP_MISSING_SOURCE_STRATEGIES", 500)
 )
