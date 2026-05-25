@@ -52,21 +52,52 @@ class AdaptiveBotDetector:
         Initialize the detector.
 
         Args:
-            threshold: Bot probability threshold (default from env or 0.60).
+            threshold: Bot probability threshold (default from env or 0.45).
                       Probabilities >= threshold are classified as bots.
+
+        ★ AUDIT FIX (May 2026): the original threshold of 0.60 and even
+        weights produced a 5% bot rate on the 816-trader pool (41 bots)
+        -- far below the 20-40% industry norm for crypto perps DEXs.
+        Observed cases like 0x261af68f (932 trades/day, classified
+        "Likely human" with prob=0.27) showed that the previous weights
+        let a maxed-out ``trade_frequency`` signal contribute only 0.25
+        to the total, below threshold even though 932 trades/day is
+        physically impossible for a human.
+
+        Retuning:
+
+          * Threshold 0.60 -> 0.45.  A continuous-prob score with weighted
+            features doesn't get to 0.60 unless multiple feature scorers
+            agree at high values; 0.45 captures the "uncertain" band
+            which observation showed contained many obvious bots.
+          * trade_frequency 0.25 -> 0.35 (strongest signal).
+          * pnl_pattern     0.20 -> 0.25 (MM / arb detection).
+          * session_pattern 0.10 -> 0.05 (24/7 crypto trading is normal
+            for humans following Telegram/TradingView signals).
+          * size_uniformity 0.15 -> 0.10 (its midpoint=0.05 is too tight
+            in practice; reduced weight here + relaxed midpoint in
+            ``_score_size_uniformity``).
+          * timing_regularity 0.20 -> 0.15.
+          * liquidation_rate unchanged at 0.10.  Sum: 1.00.
+
+        Every tunable is env-var overridable so the operator can
+        re-tighten without redeploying.
         """
         if threshold is None:
-            threshold = float(os.environ.get("BOT_PROB_THRESHOLD", "0.60"))
+            threshold = float(os.environ.get("BOT_PROB_THRESHOLD", "0.45"))
         self.threshold = threshold
         self.weights = {
-            "trade_frequency": 0.25,
-            "timing_regularity": 0.20,
-            "size_uniformity": 0.15,
-            "pnl_pattern": 0.20,
-            "liquidation_rate": 0.10,
-            "session_pattern": 0.10,
+            "trade_frequency":   float(os.environ.get("BOT_WEIGHT_TRADE_FREQUENCY",   "0.35")),
+            "timing_regularity": float(os.environ.get("BOT_WEIGHT_TIMING_REGULARITY", "0.15")),
+            "size_uniformity":   float(os.environ.get("BOT_WEIGHT_SIZE_UNIFORMITY",   "0.10")),
+            "pnl_pattern":       float(os.environ.get("BOT_WEIGHT_PNL_PATTERN",       "0.25")),
+            "liquidation_rate":  float(os.environ.get("BOT_WEIGHT_LIQUIDATION_RATE",  "0.10")),
+            "session_pattern":   float(os.environ.get("BOT_WEIGHT_SESSION_PATTERN",   "0.05")),
         }
-        logger.info(f"AdaptiveBotDetector initialized with threshold={self.threshold:.2f}")
+        logger.info(
+            f"AdaptiveBotDetector initialized with threshold={self.threshold:.2f}, "
+            f"weights={ {k: round(v, 2) for k, v in self.weights.items()} }"
+        )
 
     def detect(
         self,
@@ -98,6 +129,36 @@ class AdaptiveBotDetector:
 
         addr_short = address[:10] if address else "unknown"
         signals = {}
+
+        # ★ AUDIT FIX: hard-cutoff short-circuit.  Previously the
+        # ``BOT_HARD_CUTOFF_TRADES`` config only capped the
+        # ``trade_frequency`` feature score at 1.0, but the weighted
+        # contribution was still bounded by the feature weight (0.25 of
+        # the total).  A trader doing 932 trades/day could therefore
+        # score prob=0.25 and pass as "Likely human" if no other
+        # feature fired -- which is exactly what we observed on
+        # 0x261af68f.  The hard cutoff is meant to be a *certainty
+        # gate*: above it, no further evidence is needed.  Force the
+        # whole verdict to is_bot=True before the weighted aggregation.
+        tpd = self._compute_trades_per_day(fills)
+        if tpd > config.BOT_HARD_CUTOFF_TRADES:
+            reason = (
+                f"Hard cutoff: {tpd:.0f} trades/day > "
+                f"{config.BOT_HARD_CUTOFF_TRADES} (BOT_HARD_CUTOFF_TRADES) -- "
+                f"physically implausible for a human"
+            )
+            logger.info(
+                f"Bot detection for {addr_short}: prob=1.00 (True, hard-cutoff) "
+                f"-- {tpd:.0f} trades/day exceeds BOT_HARD_CUTOFF_TRADES="
+                f"{config.BOT_HARD_CUTOFF_TRADES}"
+            )
+            return BotResult(
+                bot_probability=1.0,
+                is_bot=True,
+                confidence=0.95,
+                signals={"trade_frequency": 1.0},
+                reason=reason,
+            )
 
         # Compute each feature's bot probability (0.0-1.0)
         signals["trade_frequency"] = self._score_trade_frequency(fills)
@@ -234,10 +295,15 @@ class AdaptiveBotDetector:
         std_size = statistics.stdev(sizes) if len(sizes) > 1 else 0
         cv = std_size / mean_size
 
-        # Map CV to bot probability (same as timing_regularity)
+        # Map CV to bot probability (same as timing_regularity).
+        # ★ AUDIT FIX: midpoint widened from 0.05 -> 0.15 because the old
+        # value only caught CV<0.07 (very tight uniformity), missing
+        # bots with CV=0.1-0.2 which are still suspiciously uniform.
+        # Steepness widened from 0.02 -> 0.05 so the transition is less
+        # binary and partial uniformity still contributes.
         import math
-        midpoint = 0.05  # For sizes, even lower CV is suspicious
-        steepness = 0.02
+        midpoint = float(os.environ.get("BOT_SIZE_UNIFORMITY_MIDPOINT", "0.15"))
+        steepness = float(os.environ.get("BOT_SIZE_UNIFORMITY_STEEPNESS", "0.05"))
         uniformity_score = 1.0 / (1.0 + math.exp(-(midpoint - cv) / steepness))
         return uniformity_score
 

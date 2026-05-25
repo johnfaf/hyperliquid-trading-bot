@@ -284,10 +284,16 @@ MAX_TRACKED_TRADERS = 2000  # Scan top 2000 — bots are skipped via DB, APIMana
 LEADERBOARD_REFRESH_INTERVAL = 3600  # 1 hour
 
 # ─── Bot Detection (tunable thresholds) ──────────────────────
-BOT_HARD_CUTOFF_TRADES = int(os.environ.get("BOT_HARD_CUTOFF_TRADES", 100))   # >N trades/day = instant bot
+# ★ AUDIT FIX (May 2026): hard cutoff tightened from 100 -> 80
+# trades/day.  Observed cases with 100-150 trades/day classified as
+# "Uncertain" instead of bot; 80/day is still aggressive but well
+# above human plausibility (a discretionary human placing manual
+# orders 10 hours/day at peak attention does ~30-40 trades).  Elevated
+# frequency signal threshold dropped 50 -> 30 to align.
+BOT_HARD_CUTOFF_TRADES = int(os.environ.get("BOT_HARD_CUTOFF_TRADES", 80))    # >N trades/day = instant bot
 BOT_THRESHOLD = int(os.environ.get("BOT_THRESHOLD", 3))                        # signal score >= N = bot
 BOT_MM_PNL_THRESHOLD = float(os.environ.get("BOT_MM_PNL_THRESHOLD", 0.0))     # median PnL < N = spread/MM
-BOT_ELEVATED_FREQ = int(os.environ.get("BOT_ELEVATED_FREQ", 50))              # trades/day for elevated freq signal
+BOT_ELEVATED_FREQ = int(os.environ.get("BOT_ELEVATED_FREQ", 30))              # trades/day for elevated freq signal
 # Statistical-anomaly separation (catches accounts the frequency-based
 # detectors miss): a ~100% win rate sustained over a meaningful closed
 # sample is statistically implausible for a real directional trader -- it
@@ -2104,9 +2110,9 @@ def _validate_config_bounds() -> None:
         ("PAPER_TRADING_MAKER_FEE_BPS", 0.0, 100.0, 0.2),
         ("PAPER_TRADING_TAKER_FEE_BPS", 0.0, 100.0, 2.5),
         ("BOT_MM_PNL_THRESHOLD", -1e6, 1e6, 0.0),
-        ("BOT_HARD_CUTOFF_TRADES", 1, 100_000, 100),
+        ("BOT_HARD_CUTOFF_TRADES", 1, 100_000, 80),
         ("BOT_THRESHOLD", 1, 100, 3),
-        ("BOT_ELEVATED_FREQ", 1, 100_000, 50),
+        ("BOT_ELEVATED_FREQ", 1, 100_000, 30),
         ("BOT_PERFECT_WINRATE", 0.50, 1.0, 0.98),
         ("BOT_PERFECT_WINRATE_MIN_TRADES", 1, 100_000, 15),
         ("TRADER_MIN_CLOSED_TRADES", 0, 100_000, 10),
