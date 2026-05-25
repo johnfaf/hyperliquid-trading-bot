@@ -29,8 +29,6 @@ of the analysis (the trader profile is already persisted).
 """
 from __future__ import annotations
 
-import sys
-import types
 from unittest.mock import MagicMock
 
 import pytest
