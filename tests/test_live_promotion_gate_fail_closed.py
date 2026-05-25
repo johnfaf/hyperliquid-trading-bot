@@ -28,8 +28,6 @@ where the operator explicitly wants to bypass.
 """
 from __future__ import annotations
 
-import pytest
-
 from src.core import live_execution
 
 
