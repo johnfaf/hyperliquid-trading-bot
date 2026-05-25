@@ -29,7 +29,7 @@ import logging
 import json
 import os
 import time
-from typing import Dict, Optional
+from typing import Dict, List, Optional, Tuple
 from pathlib import Path
 
 import numpy as np
@@ -208,8 +208,23 @@ class XGBoostRegimeForecaster:
         # Get base prediction + features from the fallback forecaster
         base = self.fallback.predict_regime(coin)
 
-        # Extract the full 8-feature vector
-        features = self._extract_features(coin, base)
+        # Extract the full 8-feature vector + list of features whose
+        # underlying API/parse failed.  ★ AUDIT FIX: see _extract_features
+        # docstring -- previously this returned only ``features`` and any
+        # 0.0 substitution from a failed fetch was invisible to the
+        # consumer.
+        features, missing_features = self._extract_features(coin, base)
+        feature_fetch_degraded = bool(missing_features)
+        if feature_fetch_degraded:
+            logger.warning(
+                "XGBoost forecaster %s: %d/%d external features unavailable "
+                "(%s) -- prediction will be flagged degraded and confidence "
+                "capped so downstream consumers can de-rate.",
+                coin,
+                len(missing_features),
+                3,  # the three external fetchers we explicitly track
+                ", ".join(missing_features),
+            )
 
         # Auto-retrain check
         if (HAS_XGBOOST and
@@ -230,6 +245,27 @@ class XGBoostRegimeForecaster:
                 confidence = raw_confidence
                 if self._model_uses_synthetic_warm_start:
                     confidence = min(confidence, self._synthetic_max_confidence)
+                # ★ AUDIT FIX: cap confidence by the fraction of external
+                # features that actually arrived.  Each missing feature
+                # (funding_rate / volatility_5m / basis_spread) costs 1/3
+                # of the maximum.  All three missing => confidence floored
+                # at 1/3 of raw, so downstream EV/risk-sizing code can
+                # de-rate even though XGBoost is happy to spit out a
+                # confident-looking probability on a zero-padded vector.
+                if feature_fetch_degraded:
+                    coverage = max(0.0, 1.0 - len(missing_features) / 3.0)
+                    # Floor at 1/3 so a single API blip doesn't zero the
+                    # signal; a complete external-feature outage takes
+                    # the model down to roughly the base rate.
+                    confidence = min(confidence, max(coverage, 1.0 / 3.0) * confidence)
+
+                degraded_reasons = []
+                if self._model_uses_synthetic_warm_start:
+                    degraded_reasons.append("synthetic_warm_start")
+                if feature_fetch_degraded:
+                    degraded_reasons.append(
+                        "missing_features:" + ",".join(missing_features)
+                    )
 
                 result = {
                     "signal": confidence if regime == "bullish"
@@ -242,13 +278,13 @@ class XGBoostRegimeForecaster:
                     "training_source": self._model_training_source,
                     "observed_training_rows": int(self._model_observed_rows),
                     "synthetic_warm_start": bool(self._model_uses_synthetic_warm_start),
-                    "authoritative": not bool(self._model_uses_synthetic_warm_start),
-                    "degraded": bool(self._model_uses_synthetic_warm_start),
-                    "degraded_reason": (
-                        "synthetic_warm_start"
-                        if self._model_uses_synthetic_warm_start
-                        else ""
+                    "authoritative": (
+                        not bool(self._model_uses_synthetic_warm_start)
+                        and not feature_fetch_degraded
                     ),
+                    "degraded": bool(degraded_reasons),
+                    "degraded_reason": ";".join(degraded_reasons),
+                    "missing_features": list(missing_features),
                     "probabilities": {
                         "crash": round(float(proba[0]), 4),
                         "neutral": round(float(proba[1]), 4),
@@ -281,6 +317,35 @@ class XGBoostRegimeForecaster:
         base["model"] = "weighted_signal"
         base.setdefault("training_source", "fallback")
         base.setdefault("observed_training_rows", int(self._model_observed_rows))
+        # ★ AUDIT FIX: propagate feature-fetch degradation to the
+        # fallback path too.  The weighted-signal forecaster uses some
+        # of the same components and the consumer should see a single,
+        # consistent degraded flag regardless of which model branch ran.
+        if feature_fetch_degraded:
+            base["degraded"] = True
+            existing_reason = base.get("degraded_reason", "") or ""
+            extra = "missing_features:" + ",".join(missing_features)
+            base["degraded_reason"] = (
+                ";".join([existing_reason, extra]) if existing_reason else extra
+            )
+            base["missing_features"] = list(missing_features)
+            # Cap confidence proportionally (same 1/3 floor as the XGB path).
+            try:
+                conf = float(base.get("confidence", 0.0) or 0.0)
+                coverage = max(0.0, 1.0 - len(missing_features) / 3.0)
+                base["confidence"] = round(
+                    conf * max(coverage, 1.0 / 3.0), 4,
+                )
+                # Recompute signal magnitude with the capped confidence
+                # so it stays consistent with the published confidence.
+                regime = base.get("regime", "neutral")
+                base["signal"] = (
+                    base["confidence"] if regime == "bullish"
+                    else -base["confidence"] if regime == "crash"
+                    else 0.0
+                )
+            except (TypeError, ValueError):
+                pass
         base.setdefault("synthetic_warm_start", False)
         self.prediction_cache[coin] = {"data": base, "ts": now}
 
@@ -291,11 +356,32 @@ class XGBoostRegimeForecaster:
 
     # ─── Feature Extraction ─────────────────────────────────────────
 
-    def _extract_features(self, coin: str, base_prediction: Dict) -> Dict:
+    def _extract_features(self, coin: str, base_prediction: Dict) -> Tuple[Dict, List[str]]:
         """
         Extract the full 8-feature vector from current market state.
         Reuses the base forecaster's components + adds volatility & basis.
         Enhanced with cross-exchange validation from Crypto.com.
+
+        ★ AUDIT FIX: previously the three fetchers ``_get_funding_rate``,
+        ``_get_5m_volatility``, and ``_get_basis_spread`` silently
+        returned 0.0 on any exception (network timeout, HTTP 429, parse
+        error).  The XGBoost model trained on real values, so at inference
+        a silent 0.0 substitution produced a confident-looking prediction
+        on a corrupted feature vector.  ~1-5% of predictions were
+        affected during transient API issues and the consumer had no way
+        to know.
+
+        Now the fetchers return ``Optional[float]`` (``None`` on failure)
+        and this method tracks which features were unavailable.  The
+        caller in ``predict_regime`` uses the missing-feature list to:
+          1. substitute 0.0 only for the model input (preserve model
+             contract) so XGBoost still produces *some* prediction;
+          2. flag the prediction as ``degraded=True`` so downstream
+             consumers can choose to skip it; and
+          3. cap confidence so a single API outage doesn't crown a
+             corrupt prediction the regime-of-the-cycle.
+
+        Returns a tuple ``(features, missing_features)``.
         """
         components = base_prediction.get("components", {})
 
@@ -308,33 +394,59 @@ class XGBoostRegimeForecaster:
             "options_flow_conviction": components.get("options_flow", 0.0),
         }
 
+        missing_features: List[str] = []
+
         # Funding rate (raw, not slope)
-        features["funding_rate"] = self._get_funding_rate(coin)
+        funding_rate = self._get_funding_rate(coin)
+        if funding_rate is None:
+            missing_features.append("funding_rate")
+            features["funding_rate"] = 0.0
+        else:
+            features["funding_rate"] = funding_rate
 
         # 5-minute volatility (from HL candle API)
-        features["volatility_5m"] = self._get_5m_volatility(coin)
+        volatility_5m = self._get_5m_volatility(coin)
+        if volatility_5m is None:
+            missing_features.append("volatility_5m")
+            features["volatility_5m"] = 0.0
+        else:
+            features["volatility_5m"] = volatility_5m
 
         # CEX-DEX basis spread (HL vs Binance)
-        features["basis_spread"] = self._get_basis_spread(coin)
+        basis_spread = self._get_basis_spread(coin)
+        if basis_spread is None:
+            missing_features.append("basis_spread")
+            features["basis_spread"] = 0.0
+        else:
+            features["basis_spread"] = basis_spread
 
-        # Cross-exchange volatility from Crypto.com (validation signal)
+        # Cross-exchange volatility from Crypto.com (validation signal).
+        # If HL volatility failed but CDC provides a real value, count
+        # the feature as recovered (remove from missing list).
         if HAS_CRYPTOCOM:
             try:
                 cdc_vol = _cryptocom.get_5m_volatility(coin)
                 if cdc_vol > 0:
-                    # Blend with existing volatility: average of both sources
                     existing_vol = features.get("volatility_5m", 0)
                     if existing_vol > 0:
                         features["volatility_5m"] = (existing_vol + cdc_vol) / 2
                     else:
                         features["volatility_5m"] = cdc_vol
+                    # Recovered via CDC — drop from missing if listed.
+                    if "volatility_5m" in missing_features:
+                        missing_features.remove("volatility_5m")
             except Exception:
                 pass
 
-        return features
+        return features, missing_features
 
-    def _get_funding_rate(self, coin: str) -> float:
-        """Get current funding rate from Hyperliquid."""
+    def _get_funding_rate(self, coin: str) -> Optional[float]:
+        """Get current funding rate from Hyperliquid.
+
+        Returns ``None`` when the API call or parse fails, so the caller
+        can mark the prediction degraded rather than substitute a silent
+        0.0 that looks like a real measurement.
+        """
         try:
             resp = get_manager().post(
                 {"type": "metaAndAssetCtxs"},
@@ -348,14 +460,17 @@ class XGBoostRegimeForecaster:
                     for i, asset in enumerate(meta.get("universe", [])):
                         if asset.get("name", "").upper() == coin.upper() and i < len(asset_ctxs):
                             return float(asset_ctxs[i].get("funding", 0))
-        except Exception:
-            pass
-        return 0.0
+        except Exception as exc:
+            logger.debug("_get_funding_rate(%s) failed: %s", coin, exc)
+            return None
+        # Asset not found in universe -- treat as missing, not 0.0.
+        return None
 
-    def _get_5m_volatility(self, coin: str) -> float:
+    def _get_5m_volatility(self, coin: str) -> Optional[float]:
         """
         Compute recent 5-min return volatility from Hyperliquid candle data.
-        Returns normalized value in [0, 1] range.
+        Returns normalized value in [0, 1] range, or ``None`` when the
+        underlying API or parse fails.
         """
         try:
             now_ms = int(time.time() * 1000)
@@ -380,15 +495,19 @@ class XGBoostRegimeForecaster:
                         vol = float(np.std(returns))
                         # Normalize: typical 5-min vol ~0.001-0.01
                         return min(vol * 100, 1.0)
-        except Exception:
-            pass
-        return 0.0
+        except Exception as exc:
+            logger.debug("_get_5m_volatility(%s) failed: %s", coin, exc)
+            return None
+        return None
 
-    def _get_basis_spread(self, coin: str) -> float:
+    def _get_basis_spread(self, coin: str) -> Optional[float]:
         """
         CEX-DEX basis: Hyperliquid funding minus Binance funding, enhanced with Crypto.com data.
         Positive = HL funding higher (shorts pay more on HL vs Binance).
         Multi-exchange basis uses weighted average if crypto.com data is available.
+
+        Returns ``None`` when the dependent calls fail so the caller can
+        flag the prediction degraded.
         """
         try:
             import requests as req
@@ -398,7 +517,12 @@ class XGBoostRegimeForecaster:
             if coin in hist and hist[coin]:
                 hl_funding = hist[coin][-1]
             else:
-                hl_funding = self._get_funding_rate(coin)
+                hl_funding_fetched = self._get_funding_rate(coin)
+                if hl_funding_fetched is None:
+                    # If HL funding itself is unavailable we can't compute
+                    # the basis at all -- mark missing.
+                    return None
+                hl_funding = hl_funding_fetched
 
             # Binance funding (public endpoint, no API key needed)
             resp = req.get(
@@ -417,24 +541,23 @@ class XGBoostRegimeForecaster:
                         if ticker:
                             cdc_price = ticker.get("price", 0)
                             if cdc_price > 0:
-                                # Try to get orderbook imbalance from Crypto.com as additional signal
                                 cdc_imbalance = 0.0
                                 try:
                                     cdc_imbalance = _cryptocom.get_orderbook_imbalance(coin)
                                 except Exception:
                                     pass
 
-                                # Multi-exchange basis: average HL-Binance funding spread with CDC orderbook imbalance
-                                # Blend: 70% funding basis + 30% orderbook imbalance signal
                                 if cdc_imbalance != 0:
                                     basis = basis * 0.7 + cdc_imbalance * 0.0003 * 0.3
                     except Exception:
                         pass
 
                 return max(min(basis * 10_000, 1.0), -1.0)
-        except Exception:
-            pass
-        return 0.0
+        except Exception as exc:
+            logger.debug("_get_basis_spread(%s) failed: %s", coin, exc)
+            return None
+        # Binance response not OK -- treat as missing.
+        return None
 
     # ─── Model Training (DB-backed walk-forward) ────────────────────
 
