@@ -168,6 +168,17 @@ BOOT_DB_AUDIT_INCLUDE_CANDLE_CACHE = os.environ.get(
 BOOT_DB_AUDIT_SKIP = os.environ.get(
     "BOOT_DB_AUDIT_SKIP", "false"
 ).lower() in ("true", "1", "yes")
+# ★ MITIGATION (May 2026): on large /data/bot.db the boot DB audit
+# can take 10+ minutes (PRAGMA integrity_check + per-table scans).
+# Since the audit is purely informational (it never blocks trades or
+# mutates state, just logs findings), running it on a daemon thread
+# lets boot proceed immediately and the audit reports its findings
+# when it eventually finishes.  Default ON (non-blocking) -- set to
+# false to restore the legacy blocking behaviour, or use
+# BOOT_DB_AUDIT_SKIP=true to skip it entirely.
+BOOT_DB_AUDIT_BACKGROUND = os.environ.get(
+    "BOOT_DB_AUDIT_BACKGROUND", "true"
+).lower() in ("true", "1", "yes")
 
 # ★ AUDIT FIX (May 2026): per-trader cap on strategies identified by
 # ``StrategyIdentifier.identify_strategies``.  The 9 detectors

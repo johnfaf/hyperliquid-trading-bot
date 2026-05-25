@@ -195,51 +195,32 @@ class HyperliquidResearchBot:
         log_persistence_info(self.logger)
         validate_dependencies(self.logger)
         init_database(self.logger)
-        # ★ MITIGATION (May 2026): on large /data/bot.db (1800+
-        # strategies + 1300+ traders) ``run_db_audit`` can hang for
-        # 10+ minutes on PRAGMA integrity_check and per-table
-        # scans, blocking the bot from reaching its trading cycles.
-        # The audit is informational only -- it never blocks the bot --
-        # so when ``BOOT_DB_AUDIT_SKIP=true`` we skip it on boot
-        # entirely.  The same audit is still available via the CLI
-        # (`python -m main --audit-db`) and readiness endpoints.
-        # Default OFF (audit runs as before) to preserve behaviour for
-        # smaller-DB deployments.
+        # ★ MITIGATION (May 2026): on a large /data/bot.db the
+        # ``run_db_audit`` call can take 10+ minutes (PRAGMA
+        # integrity_check + per-table scans), blocking the bot from
+        # reaching its trading cycles.  The audit is purely
+        # informational -- it never mutates state and never blocks
+        # trading; it just logs findings.  Two operator controls:
+        #
+        #   * ``BOOT_DB_AUDIT_SKIP=true`` -> skip it entirely
+        #     (introduced in PR #23 as the emergency bypass)
+        #   * ``BOOT_DB_AUDIT_BACKGROUND=true`` (default) -> run the
+        #     audit asynchronously in a daemon thread so boot proceeds
+        #     immediately.  Findings still get logged when the audit
+        #     finishes; the bot is already trading by then.
+        #
+        # Setting both flags to ``false`` restores the legacy
+        # blocking behaviour (audit runs synchronously during boot).
         if getattr(config, "BOOT_DB_AUDIT_SKIP", False):
             self.logger.warning(
                 "Skipping startup DB audit (BOOT_DB_AUDIT_SKIP=true). "
                 "Run it on demand via the readiness CLI when the DB is "
                 "quieter."
             )
+        elif getattr(config, "BOOT_DB_AUDIT_BACKGROUND", True):
+            self._launch_background_db_audit()
         else:
-            try:
-                from src.data.db_audit import format_db_audit_report, run_db_audit
-
-                include_candle_cache = bool(
-                    getattr(config, "BOOT_DB_AUDIT_INCLUDE_CANDLE_CACHE", False)
-                )
-                self.logger.info(
-                    "Running startup DB audit (candle_cache=%s)...",
-                    include_candle_cache,
-                )
-                audit_report = run_db_audit(
-                    include_candle_cache=include_candle_cache,
-                    include_code_scan=False,
-                )
-                block_severity = getattr(config, "READINESS_DB_AUDIT_BLOCK_SEVERITY", "high")
-                if audit_report.findings_at_or_above(block_severity):
-                    self.logger.warning(
-                        "Database audit found readiness blockers:\n%s",
-                        format_db_audit_report(audit_report, block_severity=block_severity),
-                    )
-                else:
-                    self.logger.info(
-                        "Database audit passed readiness threshold (%s): %d finding(s)",
-                        block_severity,
-                        len(audit_report.findings),
-                    )
-            except Exception as exc:
-                self.logger.warning("Database audit skipped during boot: %s", exc)
+            self._run_blocking_db_audit()
 
         # ── Build subsystems ──
         effective_profile = profile or FULL_PROFILE
@@ -715,6 +696,106 @@ class HyperliquidResearchBot:
                 "Startup KILL_SWITCH file cleared; resuming bot startup. "
                 "Persisted live-trader kill-switch state, if any, still applies."
             )
+
+    def _run_blocking_db_audit(self) -> None:
+        """Run the boot DB audit synchronously and log the result.
+
+        This is the legacy behaviour: the audit runs on the boot
+        thread and blocks subsystem initialisation until it returns.
+        Kept for operators who explicitly want blocking semantics
+        (set ``BOOT_DB_AUDIT_BACKGROUND=false``).
+        """
+        try:
+            from src.data.db_audit import format_db_audit_report, run_db_audit
+            include_candle_cache = bool(
+                getattr(config, "BOOT_DB_AUDIT_INCLUDE_CANDLE_CACHE", False)
+            )
+            self.logger.info(
+                "Running startup DB audit (candle_cache=%s, blocking)...",
+                include_candle_cache,
+            )
+            audit_report = run_db_audit(
+                include_candle_cache=include_candle_cache,
+                include_code_scan=False,
+            )
+            block_severity = getattr(
+                config, "READINESS_DB_AUDIT_BLOCK_SEVERITY", "high",
+            )
+            if audit_report.findings_at_or_above(block_severity):
+                self.logger.warning(
+                    "Database audit found readiness blockers:\n%s",
+                    format_db_audit_report(audit_report, block_severity=block_severity),
+                )
+            else:
+                self.logger.info(
+                    "Database audit passed readiness threshold (%s): %d finding(s)",
+                    block_severity,
+                    len(audit_report.findings),
+                )
+        except Exception as exc:
+            self.logger.warning("Database audit skipped during boot: %s", exc)
+
+    def _launch_background_db_audit(self) -> None:
+        """Run the boot DB audit in a daemon thread.
+
+        The audit is purely informational and never blocks the bot,
+        so deferring it off the boot path lets the trading cycles
+        start immediately.  Findings get logged when the audit
+        finishes, by which point the bot is already trading.
+
+        Marked daemon so the thread doesn't keep the process alive
+        on shutdown -- if the audit is still running when the bot
+        exits, it just gets cut off (the audit is read-only against
+        the DB, so there's nothing to clean up).
+        """
+        import threading
+
+        include_candle_cache = bool(
+            getattr(config, "BOOT_DB_AUDIT_INCLUDE_CANDLE_CACHE", False)
+        )
+        self.logger.info(
+            "Scheduling startup DB audit in background "
+            "(candle_cache=%s, non-blocking) -- boot continues immediately. "
+            "Set BOOT_DB_AUDIT_BACKGROUND=false to run blocking instead.",
+            include_candle_cache,
+        )
+
+        def _bg_audit() -> None:
+            try:
+                from src.data.db_audit import format_db_audit_report, run_db_audit
+                audit_report = run_db_audit(
+                    include_candle_cache=include_candle_cache,
+                    include_code_scan=False,
+                )
+                block_severity = getattr(
+                    config, "READINESS_DB_AUDIT_BLOCK_SEVERITY", "high",
+                )
+                if audit_report.findings_at_or_above(block_severity):
+                    self.logger.warning(
+                        "Background DB audit found readiness blockers:\n%s",
+                        format_db_audit_report(
+                            audit_report, block_severity=block_severity,
+                        ),
+                    )
+                else:
+                    self.logger.info(
+                        "Background DB audit passed readiness threshold (%s): "
+                        "%d finding(s)",
+                        block_severity,
+                        len(audit_report.findings),
+                    )
+            except Exception as exc:
+                self.logger.warning("Background DB audit failed: %s", exc)
+
+        thread = threading.Thread(
+            target=_bg_audit,
+            name="boot-db-audit",
+            daemon=True,
+        )
+        thread.start()
+        # Hold a reference so the thread isn't garbage-collected if
+        # something weird happens; daemon=True still applies.
+        self._boot_db_audit_thread = thread
 
     def run_once(self):
         """Run discovery + trading cycle (CLI --once)."""
