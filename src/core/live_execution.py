@@ -488,13 +488,49 @@ def _rescale_size_for_live(trade: Dict, trader) -> Optional[Dict]:
     # is gated. Bypass via ``LIVE_PROMOTION_GATE_ENABLED=false`` if you
     # need to bootstrap a new source.
     promotion_scale = 1.0  # bootstrap-tier size modifier; 1.0 = full
+    # ★ AUDIT FIX (live-mirror fail-closed): the previous behaviour
+    # caught ANY exception from ``is_live_promotable`` and forced
+    # ``promotable=True`` with reason ``gate_error_fail_open``, silently
+    # bypassing the entire live-promotion safety system on transient DB
+    # errors, import failures, or any other gate-internal exception.
+    # ``is_live_promotable`` is *itself* fail-closed (returns False on
+    # exceptions); the wrapper here was overriding that into a
+    # fail-OPEN-to-live default, which is exactly the failure mode the
+    # gate exists to prevent.
+    #
+    # New default: fail-CLOSED for live.  An exception while evaluating
+    # the gate skips the live mirror; the paper trade continues so the
+    # source keeps accumulating outcomes and can promote on the next
+    # cycle.  Operators can opt back into the legacy fail-open behaviour
+    # via ``LIVE_PROMOTION_GATE_FAIL_OPEN=1`` (e.g. for a one-off
+    # bootstrap of a fresh source while the gate's underlying DB schema
+    # is being migrated).
     try:
         from src.learning.promotion_gate import is_live_promotable, get_bootstrap_scale
         promotable, reason = is_live_promotable(trade)
         promotion_scale = get_bootstrap_scale(reason)
     except Exception as exc:
-        logger.debug("Promotion gate check failed (fail-open): %s", exc)
-        promotable, reason = True, "gate_error_fail_open"
+        fail_open = str(
+            os.environ.get("LIVE_PROMOTION_GATE_FAIL_OPEN", "0")
+        ).strip().lower() in {"1", "true", "yes"}
+        if fail_open:
+            logger.warning(
+                "Promotion gate check failed for %s but LIVE_PROMOTION_GATE_FAIL_OPEN=1 "
+                "is set -- proceeding to live mirror at full size (legacy "
+                "fail-open behaviour, %s)",
+                trade.get("coin", "?"),
+                exc,
+            )
+            promotable, reason = True, "gate_error_fail_open"
+        else:
+            logger.error(
+                "Promotion gate check failed for %s -- skipping live mirror "
+                "(fail-closed for live safety; set LIVE_PROMOTION_GATE_FAIL_OPEN=1 "
+                "to override): %s",
+                trade.get("coin", "?"),
+                exc,
+            )
+            return None
     if not promotable:
         logger.info(
             "Skipping live mirror for %s: promotion gate blocked (%s). "
