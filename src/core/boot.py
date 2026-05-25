@@ -227,38 +227,80 @@ def validate_wallet_security_controls(logger: logging.Logger) -> None:
     )
 
 
+def _run_safe_repair_inline(logger: logging.Logger) -> None:
+    """Run startup DB safe-repair synchronously and log the outcome.
+
+    Extracted so both the blocking-mode path and the background-mode
+    daemon thread share the same logic.  Safe-repair is bounded
+    (each ``_repair_*`` function caps at a few hundred rows) and
+    fully idempotent, so re-running it is harmless.
+    """
+    try:
+        from src.data.db_audit import run_startup_safe_repair
+
+        actions = run_startup_safe_repair()
+        applied = [a for a in actions if str(a.status).lower() == "applied"]
+        failed = [a for a in actions if str(a.status).lower() == "failed"]
+        if applied:
+            benign_actions = {
+                "source_health_history",
+                "stale_pending_decisions",
+                "stale_regime_history",
+            }
+            log = logger.info if all(a.action in benign_actions for a in applied) else logger.warning
+            log(
+                "Startup DB safe-repair applied: %s",
+                ", ".join(a.action for a in applied),
+            )
+        if failed:
+            logger.warning(
+                "Startup DB safe-repair failures: %s",
+                ", ".join(f"{a.action}:{a.details.get('error', '')[:80]}" for a in failed),
+            )
+    except Exception as exc:
+        logger.warning("Startup DB safe-repair failed: %s", exc)
+
+
 def init_database(logger: logging.Logger) -> None:
     """Initialize DB and restore from backup if needed."""
     from src.data.database import init_db, restore_from_json
     init_db()
     if restore_from_json():
         logger.info("Restored DB from backup (post-deploy recovery)")
-    if getattr(config, "DB_SAFE_AUTO_REPAIR_ON_BOOT", True):
-        try:
-            from src.data.db_audit import run_startup_safe_repair
+    if not getattr(config, "DB_SAFE_AUTO_REPAIR_ON_BOOT", True):
+        return
 
-            logger.info("Running startup DB safe-repair...")
-            actions = run_startup_safe_repair()
-            applied = [a for a in actions if str(a.status).lower() == "applied"]
-            failed = [a for a in actions if str(a.status).lower() == "failed"]
-            if applied:
-                benign_actions = {
-                    "source_health_history",
-                    "stale_pending_decisions",
-                    "stale_regime_history",
-                }
-                log = logger.info if all(a.action in benign_actions for a in applied) else logger.warning
-                log(
-                    "Startup DB safe-repair applied: %s",
-                    ", ".join(a.action for a in applied),
-                )
-            if failed:
-                logger.warning(
-                    "Startup DB safe-repair failures: %s",
-                    ", ".join(f"{a.action}:{a.details.get('error', '')[:80]}" for a in failed),
-                )
-        except Exception as exc:
-            logger.warning("Startup DB safe-repair failed: %s", exc)
+    # ★ MITIGATION (May 2026): on a large /data/bot.db the
+    # ``run_startup_safe_repair`` call walks several tables (strategies,
+    # strategy_scores, paper_trades, pending_decisions, source_health)
+    # and can take 10+ minutes when those tables are bloated.  Like the
+    # boot DB audit (PR #27), safe-repair is informational from the
+    # bot's perspective -- the repaired state matters for cycle N+1,
+    # not the boot itself -- so deferring it to a daemon thread lets
+    # boot continue immediately.
+    #
+    # Operator controls:
+    #   * DB_SAFE_AUTO_REPAIR_ON_BOOT=false -> skip entirely (PR #23)
+    #   * BOOT_SAFE_REPAIR_BACKGROUND=true (default) -> daemon thread
+    #   * BOOT_SAFE_REPAIR_BACKGROUND=false -> legacy blocking behaviour
+    if getattr(config, "BOOT_SAFE_REPAIR_BACKGROUND", True):
+        import threading
+
+        logger.info(
+            "Scheduling startup DB safe-repair in background "
+            "(non-blocking) -- boot continues immediately.  Set "
+            "BOOT_SAFE_REPAIR_BACKGROUND=false to run blocking instead."
+        )
+        thread = threading.Thread(
+            target=_run_safe_repair_inline,
+            args=(logger,),
+            name="boot-safe-repair",
+            daemon=True,
+        )
+        thread.start()
+    else:
+        logger.info("Running startup DB safe-repair...")
+        _run_safe_repair_inline(logger)
 
 
 def log_persistence_info(logger: logging.Logger) -> None:
