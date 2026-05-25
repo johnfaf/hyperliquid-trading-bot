@@ -28,8 +28,6 @@ All tunables are env-var overridable.
 """
 from __future__ import annotations
 
-import os
-
 import pytest
 
 from src.discovery.adaptive_bot_detector import AdaptiveBotDetector
