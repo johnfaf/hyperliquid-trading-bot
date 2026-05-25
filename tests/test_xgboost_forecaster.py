@@ -133,9 +133,12 @@ class TestXGBoostRegimeForecaster:
         forecaster.model = mock_model
         forecaster._last_train_ts = time.time()
 
-        # Mock the feature extraction
+        # Mock the feature extraction.  ★ AUDIT FIX: _extract_features now
+        # returns ``(features, missing_features)`` so callers can flag
+        # predictions degraded when an upstream API failed.  Tests that
+        # mock this method must return the tuple shape.
         features = {f: 0.5 for f in FEATURE_NAMES}
-        with patch.object(forecaster, "_extract_features", return_value=features):
+        with patch.object(forecaster, "_extract_features", return_value=(features, [])):
             with patch.object(forecaster, "_store_prediction"):
                 # Clear prediction cache so we get a fresh prediction
                 forecaster.prediction_cache.clear()
@@ -160,7 +163,7 @@ class TestXGBoostRegimeForecaster:
         forecaster._last_train_ts = time.time()
 
         features = {f: 0.0 for f in FEATURE_NAMES}
-        with patch.object(forecaster, "_extract_features", return_value=features):
+        with patch.object(forecaster, "_extract_features", return_value=(features, [])):
             with patch.object(forecaster, "_store_prediction"):
                 forecaster.prediction_cache.clear()
                 result = forecaster.predict_regime("BTC")
@@ -184,7 +187,7 @@ class TestXGBoostRegimeForecaster:
         forecaster._synthetic_max_confidence = 0.60
 
         features = {f: 0.0 for f in FEATURE_NAMES}
-        with patch.object(forecaster, "_extract_features", return_value=features):
+        with patch.object(forecaster, "_extract_features", return_value=(features, [])):
             with patch.object(forecaster, "_store_prediction"):
                 forecaster.prediction_cache.clear()
                 result = forecaster.predict_regime("BTC")
