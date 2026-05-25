@@ -165,6 +165,41 @@ class StrategyIdentifier:
             strategy["bot_score"] = trader_profile.get("bot_score", 0)
         strategies.sort(key=lambda s: s.get("confidence", 0), reverse=True)
 
+        # ★ AUDIT FIX (May 2026): cap to top-N strategies per trader.
+        #
+        # The 9 detectors (_detect_momentum, _detect_mean_reversion,
+        # _detect_scalping, _detect_swing_trading, _detect_funding_arb,
+        # _detect_delta_neutral, _detect_concentrated_bet,
+        # _detect_trend_following, _detect_breakout) are NOT mutually
+        # exclusive -- a single trader can trigger multiple detectors
+        # at once.  A momentum trader who also concentrates positions
+        # at high leverage routinely trips 3-5 detectors.
+        #
+        # The 2026-05-24 discovery cycle saved 1817 strategies for ~775
+        # human traders (2.3 strategies per trader).  That bloat caused
+        # the boot-time DB safe-repair AND db_audit to hang on the
+        # next 5 deploys (see PR #23 mitigation).
+        #
+        # Capping at the highest-confidence N strategies keeps the
+        # trader's DOMINANT trading patterns while pruning lower-
+        # confidence overlapping classifications.  Default N=2 keeps
+        # primary + secondary pattern; N=1 collapses to a single
+        # strategy per trader; N >= 9 restores the legacy behaviour.
+        try:
+            per_trader_cap = int(
+                getattr(config, "STRATEGY_PER_TRADER_CAP", 2) or 0
+            )
+        except (TypeError, ValueError):
+            per_trader_cap = 2
+        if per_trader_cap > 0 and len(strategies) > per_trader_cap:
+            dropped = len(strategies) - per_trader_cap
+            logger.debug(
+                "Capping %s... to top %d/%d strategies (dropped %d lower-"
+                "confidence overlapping classifications)",
+                address[:10], per_trader_cap, len(strategies), dropped,
+            )
+            strategies = strategies[:per_trader_cap]
+
         if strategies:
             logger.debug(f"Identified {len(strategies)} strategies for trader {address[:10]}")
         return strategies
