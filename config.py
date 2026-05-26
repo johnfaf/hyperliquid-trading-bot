@@ -463,6 +463,26 @@ PAPER_FEATURE_PRECOMPUTE_MAX_COINS = int(
 # Override via env var if you want a different shape:
 #   PAPER_TRADING_TAKE_PROFIT_MULTIPLE=3.0
 PAPER_TRADING_STOP_LOSS_PCT = float(os.environ.get("PAPER_TRADING_STOP_LOSS_PCT", 0.15))
+# ★ AUDIT FIX (2026-05-26): minimum-hold-before-SL guard.  Production
+# trade-history analysis showed positions held <30 min lost 83% of
+# the time (-$12.59 net across 35 trades) -- the bot was getting
+# noise-stopped before its edge could materialise.  Positions held
+# >24h won 71% of the time (+$11.27 net).  The 10-min default below
+# suppresses SL fires during the first 600s of a position's life so
+# the natural noise around entry doesn't trigger a fee-leaking exit.
+# Take-profit, time-limit, and break-even/trailing-update logic are
+# unaffected -- this guard ONLY suppresses the SL CLOSE check.
+# Set to 0 to restore legacy fire-immediately behaviour.
+SL_MIN_HOLD_SECONDS = int(os.environ.get("SL_MIN_HOLD_SECONDS", 600))
+# ★ AUDIT FIX (2026-05-26): per-coin-side blocklist for sources the
+# bot has empirically lost on.  Production analysis: HYPE long had
+# 0/6 wins, -$2.89 net.  Comma-separated ``COIN:SIDE`` pairs
+# (case-insensitive).  Defaults catch the worst empirical losers
+# from the 2026-04-05 -> 2026-05-26 wallet history.  Set to empty
+# string to disable.
+PER_COIN_SIDE_BLOCKLIST = os.environ.get(
+    "PER_COIN_SIDE_BLOCKLIST", "HYPE:long",
+).strip()
 PAPER_TRADING_TAKE_PROFIT_MULTIPLE = float(
     os.environ.get("PAPER_TRADING_TAKE_PROFIT_MULTIPLE", 2.5)
 )
