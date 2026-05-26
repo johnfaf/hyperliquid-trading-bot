@@ -36,24 +36,26 @@ def _setup_polymarket_test_db(tmp_path, monkeypatch):
     db_path = tmp_path / "test_polymarket.db"
     conn0 = sqlite3.connect(str(db_path))
     conn0.row_factory = sqlite3.Row
-    # High-frequency tables: subject to pruning
+    # High-frequency tables: subject to pruning.  Uses the REAL
+    # production composite-PK schema (no id, no rowid alias) so the
+    # prune SQL exercises the same shape it would on prod.
     conn0.execute("""
         CREATE TABLE polymarket_price_points (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
             token_id TEXT,
             timestamp_ms INTEGER,
             price REAL,
             source TEXT,
-            metadata TEXT
+            metadata TEXT,
+            PRIMARY KEY (token_id, timestamp_ms, source)
         )
     """)
     conn0.execute("""
         CREATE TABLE polymarket_market_snapshots (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
             market_id TEXT,
             observed_at_ms INTEGER,
             probability REAL,
-            raw_market TEXT
+            raw_market TEXT,
+            PRIMARY KEY (market_id, observed_at_ms)
         )
     """)
     # Dimension tables: NEVER pruned
@@ -278,43 +280,55 @@ def test_prune_no_rows_to_delete_returns_zero(tmp_path, monkeypatch):
 
 
 def test_row_exactly_at_cutoff_uses_strict_less_than(tmp_path, monkeypatch):
-    """The DELETE uses ``timestamp_ms < cutoff_ms``, not ``<=``.
+    """The ranged DELETE uses strict ``< cutoff_ms``, not ``<=``.
 
-    We can't pin "exactly the cutoff" precisely (the prune function
-    recomputes the cutoff at call time using ``time.time()``), but
-    we can verify the inequality is strict by checking the SQL the
-    function builds.  This guarantees a row right at the boundary
-    survives in the typical case where the test seeded it slightly
-    AFTER the prune's cutoff.
+    A row right at the cutoff timestamp must survive.  The current
+    implementation builds the SQL as ``{ts_col} >= ? AND {ts_col} <
+    ?`` with the upper bound bound to ``cutoff_ms``, so a row at
+    exactly the cutoff is excluded from the slice.
     """
     import inspect
     from src.data import polymarket_history
 
     src = inspect.getsource(polymarket_history.prune_polymarket_history)
-    assert "timestamp_ms < ?" in src, (
-        "DELETE must use strict '< cutoff_ms', not '<='; an inclusive "
-        "cutoff would delete rows right at the boundary"
+    # The upper bound of each time slice uses strict <, not <=.
+    assert "{ts_col} < ?" in src or "ts_col} < ?" in src, (
+        "DELETE must use strict '< cutoff_ms'; an inclusive cutoff "
+        "would delete rows right at the boundary.  Source did not "
+        "contain the expected upper-bound predicate."
     )
-    assert "observed_at_ms < ?" in src
 
 
-def test_delete_uses_id_not_rowid(tmp_path, monkeypatch):
-    """SQL must use the ``id`` PK, not SQLite-only ``rowid``.
+def test_delete_uses_no_rowid_no_id_subquery(tmp_path, monkeypatch):
+    """SQL must not reference rowid OR id, since the production tables
+    have neither -- composite PKs only.
 
-    Production runs SQLite + Postgres dualwrite.  Postgres has no
-    ``rowid`` pseudo-column, so an earlier version of the prune
-    failed on the mirror with ``UndefinedColumn: column "rowid"
-    does not exist`` (observed 2026-05-26).  Both target tables
-    have a numeric ``id`` PK which works on both backends.
+    Production runs SQLite + Postgres dualwrite.  Two consecutive
+    regressions observed on 2026-05-26:
+      1. ``WHERE rowid IN (SELECT rowid ...)`` -- failed on Postgres
+         (no rowid pseudo-column)
+      2. ``WHERE id IN (SELECT id ...)`` -- failed on SQLite
+         (no id column, the PK is composite)
+
+    The correct cross-backend form is a plain ranged DELETE on the
+    timestamp column with no subquery and no PK enumeration.
     """
     import inspect
     from src.data import polymarket_history
 
     src = inspect.getsource(polymarket_history.prune_polymarket_history)
     assert "WHERE rowid" not in src and "SELECT rowid" not in src, (
-        "Prune must not reference rowid -- it's SQLite-only and breaks "
-        "the dualwrite Postgres mirror"
+        "Prune must not reference rowid -- it's SQLite-only"
     )
-    assert "WHERE id IN" in src
-    assert "SELECT id FROM polymarket_price_points" in src
-    assert "SELECT id FROM polymarket_market_snapshots" in src
+    assert "WHERE id IN" not in src and "SELECT id FROM polymarket" not in src, (
+        "Prune must not reference an ``id`` column -- the production "
+        "polymarket tables use composite PKs, no id is declared"
+    )
+    # The correct form: ranged DELETE on the timestamp column via an
+    # f-string that interpolates the table name and ts_col.
+    assert "polymarket_price_points" in src
+    assert "polymarket_market_snapshots" in src
+    assert "timestamp_ms" in src and "observed_at_ms" in src
+    # The DELETE statement uses ``>= ? AND ... < ?`` as the slice
+    # predicate.
+    assert ">= ? AND" in src and "< ?" in src

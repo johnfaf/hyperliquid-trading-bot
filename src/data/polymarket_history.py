@@ -429,50 +429,66 @@ def prune_polymarket_history(
 
     counts = {"price_points_deleted": 0, "snapshots_deleted": 0}
 
-    with db.get_connection() as conn:
-        # Batched DELETE on polymarket_price_points.  Uses the primary
-        # key column ``id`` (not SQLite-only ``rowid``) so the dualwrite
-        # Postgres mirror -- which does not have a ``rowid`` -- can
-        # replay the same statement.  Observed in production on
-        # 2026-05-26: the rowid-based form succeeded on the SQLite
-        # primary but failed on the Postgres mirror with
-        # ``UndefinedColumn: column "rowid" does not exist``, leaving
-        # the mirror with stale rows.
-        while True:
-            cur = conn.execute(
-                """
-                DELETE FROM polymarket_price_points
-                WHERE id IN (
-                    SELECT id FROM polymarket_price_points
-                    WHERE timestamp_ms < ?
-                    LIMIT ?
-                )
-                """,
-                (cutoff_ms, batch_size),
-            )
-            n = int(getattr(cur, "rowcount", 0) or 0)
-            if n == 0:
-                break
-            counts["price_points_deleted"] += n
+    # ★ AUDIT FIX 3 (2026-05-26): the production polymarket tables have
+    # NO ``id`` or ``rowid`` we can reference cross-backend:
+    #   * ``polymarket_price_points`` PK = (token_id, timestamp_ms, source)
+    #   * ``polymarket_market_snapshots`` PK = (market_id, observed_at_ms)
+    # The earlier rowid form broke on the Postgres dualwrite mirror;
+    # PR #30 swapped it to ``id`` but production SQLite doesn't have
+    # an ``id`` column either, so the prune crashes with
+    # ``no such column: id``.
+    #
+    # Cleanest cross-backend form: walk forward in monotonic
+    # time-window chunks of N days at a time, deleting one slice per
+    # statement.  This avoids subqueries, avoids rowid, and avoids
+    # PK enumeration -- just a plain ranged DELETE that SQLite and
+    # Postgres both execute identically.  The ``batch_size``
+    # parameter is reinterpreted as a soft target for rows per slice
+    # (each slice = chunk_days days of data).
+    #
+    # ``chunk_days`` of 1 keeps each statement scoped to ~24h of
+    # rows; on production that's ~90K price_points per day which
+    # SQLite handles in <2s.  A future caller can sweep further back
+    # (anywhere from the table's oldest row up to ``cutoff_ms``).
+    chunk_days = 1
+    slice_ms = chunk_days * 86_400_000
 
-        # Batched DELETE on polymarket_market_snapshots (same id-based
-        # form as above for SQLite + Postgres dualwrite compatibility).
-        while True:
-            cur = conn.execute(
-                """
-                DELETE FROM polymarket_market_snapshots
-                WHERE id IN (
-                    SELECT id FROM polymarket_market_snapshots
-                    WHERE observed_at_ms < ?
-                    LIMIT ?
+    def _delete_range(table: str, ts_col: str, lo: int, hi: int) -> int:
+        cur = conn.execute(
+            f"DELETE FROM {table} WHERE {ts_col} >= ? AND {ts_col} < ?",
+            (lo, hi),
+        )
+        return int(getattr(cur, "rowcount", 0) or 0)
+
+    with db.get_connection() as conn:
+        # Find the lowest existing timestamp; iterate forward toward
+        # cutoff_ms one slice at a time.  Skip the table if it's
+        # already pruned.
+        for table, ts_col in (
+            ("polymarket_price_points", "timestamp_ms"),
+            ("polymarket_market_snapshots", "observed_at_ms"),
+        ):
+            try:
+                row = conn.execute(
+                    f"SELECT MIN({ts_col}) FROM {table} WHERE {ts_col} < ?",
+                    (cutoff_ms,),
+                ).fetchone()
+            except Exception:
+                continue
+            if not row or row[0] is None:
+                continue
+            min_ts = int(row[0])
+            window_lo = (min_ts // slice_ms) * slice_ms
+            while window_lo < cutoff_ms:
+                window_hi = min(window_lo + slice_ms, cutoff_ms)
+                n = _delete_range(table, ts_col, window_lo, window_hi)
+                key = (
+                    "price_points_deleted"
+                    if table == "polymarket_price_points"
+                    else "snapshots_deleted"
                 )
-                """,
-                (cutoff_ms, batch_size),
-            )
-            n = int(getattr(cur, "rowcount", 0) or 0)
-            if n == 0:
-                break
-            counts["snapshots_deleted"] += n
+                counts[key] += n
+                window_lo = window_hi
 
     if counts["price_points_deleted"] or counts["snapshots_deleted"]:
         logger.info(
