@@ -194,6 +194,17 @@ def _reconcile_regimes(regime_data: dict, container) -> dict:
     pred_conf = float(pred.get("confidence", 0))
     pred_synthetic = bool(pred.get("synthetic_warm_start", False))
     pred_training_source = pred.get("training_source", "unknown")
+    # ★ AUDIT FIX (PR #20 propagation): the forecaster sets
+    # ``degraded=True`` when external feature fetchers
+    # (funding_rate / volatility_5m / basis_spread) fail.  PR #20
+    # also caps ``confidence`` proportionally, but ``_reconcile_regimes``
+    # was making the override decision purely off ``pred_conf`` without
+    # knowing the prediction was built on a corrupted (zero-padded)
+    # feature vector.  A degraded forecaster should not be authoritative
+    # enough to override a healthy detector reading -- treat it like the
+    # synthetic-warm-start guard: log + skip the override.
+    pred_degraded = bool(pred.get("degraded", False))
+    pred_missing_features = pred.get("missing_features") or []
     det_regime = regime_data.get("overall_regime", "unknown")  # trending_up / trending_down / ranging / volatile / ...
     det_conf = float(regime_data.get("overall_confidence", 0))
 
@@ -208,6 +219,9 @@ def _reconcile_regimes(regime_data: dict, container) -> dict:
     regime_data["regime_agreement"] = agree
     regime_data["forecaster_training_source"] = pred_training_source
     regime_data["forecaster_synthetic_warm_start"] = pred_synthetic
+    regime_data["forecaster_degraded"] = pred_degraded
+    if pred_missing_features:
+        regime_data["forecaster_missing_features"] = list(pred_missing_features)
 
     if not agree and min(pred_conf, det_conf) >= 0.5:
         # Conservative policy: if forecaster says crash, override to crash-equivalent.
@@ -222,6 +236,19 @@ def _reconcile_regimes(regime_data: dict, container) -> dict:
                 "  REGIME DISAGREEMENT: detector=%s (%.0f%%) vs forecaster=%s "
                 "(%.0f%%, source=%s) -- synthetic warm-start cannot override detector",
                 det_regime, det_conf * 100, pred_regime, pred_conf * 100, pred_training_source,
+            )
+        elif pred_degraded and pred_regime == "crash":
+            # ★ AUDIT FIX: same guard as synthetic warm-start.  A degraded
+            # forecaster (PR #20) was built from a zero-padded feature
+            # vector after an external API failure -- the regime label is
+            # untrustworthy.  Don't let it override a healthy detector
+            # reading; log so the operator can see the suppressed override.
+            logger.info(
+                "  REGIME DISAGREEMENT: detector=%s (%.0f%%) vs forecaster=%s "
+                "(%.0f%%, degraded -- missing: %s) -- degraded forecaster cannot "
+                "override detector",
+                det_regime, det_conf * 100, pred_regime, pred_conf * 100,
+                ",".join(pred_missing_features) or "n/a",
             )
         elif pred_regime == "crash" and pred_conf >= 0.75:
             logger.warning(
@@ -533,6 +560,36 @@ def _run_hedger(container, regime_data):
                 "regime": regime_data.get("overall_regime", "neutral"),
                 "confidence": regime_data.get("overall_confidence", 0),
             }
+
+        # ★ AUDIT FIX (PR #20 propagation): if the forecaster's external
+        # feature fetchers failed (funding_rate / volatility_5m /
+        # basis_spread), the prediction was built on a zero-padded
+        # feature vector.  PR #20 caps confidence + sets ``degraded=True``
+        # so consumers can de-rate.  The hedger MUST honor this --
+        # otherwise:
+        #
+        #   * a degraded "crash" prediction can trigger spurious hedges
+        #     on real positions when the actual regime is fine
+        #   * a degraded "neutral" prediction can CLOSE existing crash
+        #     hedges during a real crash that the forecaster can't
+        #     see because its inputs are missing
+        #
+        # Conservative behaviour: skip the hedger entirely while
+        # degraded.  Existing hedges stay open; no new hedges are
+        # opened.  Once the feature fetchers recover the hedger
+        # resumes normally on the next cycle.
+        if isinstance(pred_regime, dict) and pred_regime.get("degraded"):
+            missing = pred_regime.get("missing_features") or []
+            logger.warning(
+                "  Hedger: skipping cycle because forecaster is degraded "
+                "(regime=%s, conf=%.2f, missing_features=%s).  Existing "
+                "hedges are preserved; no new hedges are placed.",
+                pred_regime.get("regime", "?"),
+                float(pred_regime.get("confidence", 0) or 0),
+                ",".join(missing) or "n/a",
+            )
+            return
+
         open_trades = get_execution_open_positions(container)
         hedge_result = hedger.check_and_hedge(pred_regime, open_trades)
         if hedge_result.get("action") != "idle":
