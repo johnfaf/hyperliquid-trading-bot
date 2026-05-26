@@ -222,8 +222,22 @@ POLYMARKET_HISTORY_RETENTION_DAYS = int(
 
 # ─── Feature Store (Postgres-only, auto-enabled when POSTGRES_DSN set) ─
 FEATURE_STORE_COINS = os.environ.get("FEATURE_STORE_COINS", "").strip()
-FEATURE_STORE_MAX_COINS = int(os.environ.get("FEATURE_STORE_MAX_COINS", 30))
+# ★ AUDIT FIX (2026-05-26): cap raised 30 -> 80 because production
+# saw signals fire on coins outside the 30-coin watched set (BCH,
+# VVV observed) -> data_readiness_missing rejection every cycle.
+# 80 covers the typical copy-trader candidate long tail without
+# meaningfully increasing API load (1h candle fetch is ~80 calls
+# per cycle).
+FEATURE_STORE_MAX_COINS = int(os.environ.get("FEATURE_STORE_MAX_COINS", 80))
 FEATURE_STORE_BOOTSTRAP_TOP_COINS = int(os.environ.get("FEATURE_STORE_BOOTSTRAP_TOP_COINS", 8))
+# ★ AUDIT FIX (2026-05-26): coins from recent tracked-trader
+# position_snapshots get added to the watched-coin set as
+# CANDIDATEs.  This is what was missing for the BCH / VVV signals
+# observed in production -- a wallet opens a position and the bot
+# signals on it before any decision_snapshot exists.
+FEATURE_POSITION_SNAPSHOT_COINS_MAX = int(
+    os.environ.get("FEATURE_POSITION_SNAPSHOT_COINS_MAX", 50)
+)
 FEATURE_STORE_BACKFILL_5M_DAYS = int(os.environ.get("FEATURE_STORE_BACKFILL_5M_DAYS", 7))
 FEATURE_STORE_BACKFILL_1H_DAYS = int(os.environ.get("FEATURE_STORE_BACKFILL_1H_DAYS", 30))
 FEATURE_STORE_BACKFILL_4H_DAYS = int(os.environ.get("FEATURE_STORE_BACKFILL_4H_DAYS", 90))
@@ -734,7 +748,11 @@ FIREWALL_RECENT_SIDE_BLOCK_MAX_HOURS = _safe_env_float(
 # copy signals on the broad tracked-trader coin set stop being dropped
 # with data_readiness_missing:candles,feature_vector.
 FEATURE_COPY_CANDIDATE_COINS_MAX = int(
-    os.environ.get("FEATURE_COPY_CANDIDATE_COINS_MAX", 25)
+    # ★ AUDIT FIX (2026-05-26): raised 25 -> 60 to match the broader
+    # 80-coin watched universe (FEATURE_STORE_MAX_COINS).  Combined
+    # with the new FEATURE_POSITION_SNAPSHOT_COINS_MAX path the
+    # data_readiness_missing rejection class drops to near zero.
+    os.environ.get("FEATURE_COPY_CANDIDATE_COINS_MAX", 60)
 )
 # Copy-source-floor regime relaxation (#2): DEFAULT ON.
 #
