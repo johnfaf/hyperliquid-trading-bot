@@ -296,3 +296,25 @@ def test_row_exactly_at_cutoff_uses_strict_less_than(tmp_path, monkeypatch):
         "cutoff would delete rows right at the boundary"
     )
     assert "observed_at_ms < ?" in src
+
+
+def test_delete_uses_id_not_rowid(tmp_path, monkeypatch):
+    """SQL must use the ``id`` PK, not SQLite-only ``rowid``.
+
+    Production runs SQLite + Postgres dualwrite.  Postgres has no
+    ``rowid`` pseudo-column, so an earlier version of the prune
+    failed on the mirror with ``UndefinedColumn: column "rowid"
+    does not exist`` (observed 2026-05-26).  Both target tables
+    have a numeric ``id`` PK which works on both backends.
+    """
+    import inspect
+    from src.data import polymarket_history
+
+    src = inspect.getsource(polymarket_history.prune_polymarket_history)
+    assert "WHERE rowid" not in src and "SELECT rowid" not in src, (
+        "Prune must not reference rowid -- it's SQLite-only and breaks "
+        "the dualwrite Postgres mirror"
+    )
+    assert "WHERE id IN" in src
+    assert "SELECT id FROM polymarket_price_points" in src
+    assert "SELECT id FROM polymarket_market_snapshots" in src
