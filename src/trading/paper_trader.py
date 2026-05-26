@@ -2609,14 +2609,76 @@ class PaperTrader:
                 except Exception as exc:
                     logger.debug("Funding accrual failed for trade %s: %s", trade.get("id"), exc)
 
+            # ★ AUDIT FIX (2026-05-26): minimum-hold-before-SL guard.
+            # Production trade-history analysis: positions held <30 min
+            # had a 17% WR (-$12.59 net), positions held >24h had a 71%
+            # WR (+$11.27 net).  The bot was closing positions on
+            # noise-stop hits before they had a chance to work.
+            #
+            # New behaviour: during the first
+            # ``SL_MIN_HOLD_SECONDS`` seconds (default 600 = 10 min)
+            # the stop-loss is INACTIVE.  Trailing-stop / break-even
+            # updates above are still allowed to compute the new SL,
+            # but it cannot CLOSE the position during the grace
+            # window.  Take-profit and time-limit exits are
+            # unaffected.  Set ``SL_MIN_HOLD_SECONDS=0`` to restore the
+            # legacy fire-immediately behaviour.
+            sl_min_hold_s = max(
+                0, int(getattr(config, "SL_MIN_HOLD_SECONDS", 600) or 0)
+            )
+            position_age_s = 0.0
+            if sl_min_hold_s > 0 and trade.get("opened_at"):
+                try:
+                    _opened = datetime.fromisoformat(str(trade["opened_at"]))
+                    if _opened.tzinfo is None:
+                        _opened = _opened.replace(tzinfo=timezone.utc)
+                    position_age_s = (
+                        clock_provider.utc_now() - _opened
+                    ).total_seconds()
+                except (ValueError, TypeError):
+                    position_age_s = sl_min_hold_s + 1   # treat unparseable as old
+
+            sl_armed = position_age_s >= sl_min_hold_s if sl_min_hold_s > 0 else True
+
             # Check stop loss (using potentially updated SL)
-            if sl:
+            if sl and sl_armed:
                 if trade["side"] == "long" and current_price <= sl:
                     should_close = True
                     close_reason = "trailing_stop" if sl > trade["stop_loss"] else "stop_loss"
                 elif trade["side"] == "short" and current_price >= sl:
                     should_close = True
                     close_reason = "trailing_stop" if sl < trade["stop_loss"] else "stop_loss"
+            elif sl and not sl_armed and sl_min_hold_s > 0:
+                # Log the first time we suppress a would-be stop-out so
+                # the operator can see how often this guard fires.
+                would_stop = False
+                if trade["side"] == "long" and current_price <= sl:
+                    would_stop = True
+                elif trade["side"] == "short" and current_price >= sl:
+                    would_stop = True
+                if would_stop:
+                    try:
+                        meta_raw = trade.get("metadata", "{}")
+                        t_meta = (
+                            json.loads(meta_raw) if isinstance(meta_raw, str)
+                            else dict(meta_raw or {})
+                        )
+                        if not t_meta.get("sl_suppressed_logged"):
+                            logger.info(
+                                "SL noise-suppress: %s %s held %.0fs < "
+                                "SL_MIN_HOLD_SECONDS=%ds, would_stop_at_%.6f",
+                                trade.get("side", "?"),
+                                trade.get("coin", "?"),
+                                position_age_s,
+                                sl_min_hold_s,
+                                sl,
+                            )
+                            db.update_paper_trade_metadata(
+                                trade["id"],
+                                {"sl_suppressed_logged": True},
+                            )
+                    except Exception:
+                        pass
 
             # Check take profit
             if trade["take_profit"] and not should_close:

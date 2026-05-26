@@ -450,6 +450,8 @@ class DecisionFirewall:
             "rejected_bucketed_confidence": 0,
             "rejected_data_readiness": 0,
             "rejected_ev_gate": 0,
+            # ★ AUDIT FIX (2026-05-26): per-coin-side blocklist counter.
+            "rejected_coin_side_blocklist": 0,
             # LOW-FIX LOW-1: count audit-log write failures so ops can detect
             # when the audit trail is silently broken (DB full, locked, etc.)
             "audit_log_failures": 0,
@@ -2213,6 +2215,44 @@ class DecisionFirewall:
         # 1. Schema validation
         if not signal.validate():
             return _reject("rejected_schema", f"Invalid signal schema: {signal.coin} {signal.side.value}")
+
+        # 1a. ★ AUDIT FIX (2026-05-26): per-coin-side blocklist for
+        # empirically lost-on combinations.  Production wallet history
+        # 2026-04-05 -> 2026-05-26 showed HYPE long was 0/6 wins,
+        # -$2.89 net -- a hard-to-shake pattern that the source
+        # allocator's per-source tracking can't catch when the same
+        # coin/side comes through multiple source keys.  Blocklist is
+        # comma-separated COIN:SIDE pairs from
+        # ``PER_COIN_SIDE_BLOCKLIST`` env (default ``HYPE:long``).
+        try:
+            import config as _bl_cfg
+            raw_blocklist = str(
+                getattr(_bl_cfg, "PER_COIN_SIDE_BLOCKLIST", "") or ""
+            ).strip()
+            if raw_blocklist:
+                blocklist = {
+                    tuple(part.strip().split(":", 1))
+                    for part in raw_blocklist.split(",")
+                    if ":" in part
+                }
+                blocklist_norm = {
+                    (c.strip().upper(), s.strip().lower())
+                    for c, s in blocklist
+                    if c and s
+                }
+                coin_norm = str(getattr(signal, "coin", "") or "").upper()
+                side_norm = str(
+                    signal.side.value if hasattr(signal.side, "value")
+                    else signal.side
+                ).lower()
+                if (coin_norm, side_norm) in blocklist_norm:
+                    return _reject(
+                        "rejected_coin_side_blocklist",
+                        f"{coin_norm} {side_norm} is on the per-coin-side "
+                        f"blocklist (PER_COIN_SIDE_BLOCKLIST)",
+                    )
+        except Exception as exc:
+            logger.debug("Per-coin-side blocklist check failed: %s", exc)
 
         # 1b. Data-readiness gate -- prop-firm rule: no trade if inputs
         # are incomplete. Reject upfront so we don't evaluate downstream
