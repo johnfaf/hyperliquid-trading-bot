@@ -123,6 +123,23 @@ CREATE TABLE IF NOT EXISTS polymarket_price_points (
 );
 CREATE INDEX IF NOT EXISTS idx_polymarket_price_points_recent
     ON polymarket_price_points (token_id, timestamp_ms DESC);
+-- ★ MITIGATION (2026-05-26): the (token_id, timestamp_ms DESC) compound
+-- index above leads with token_id, so a range scan on timestamp_ms
+-- alone (e.g. the retention prune in src/data/polymarket_history.py)
+-- cannot use it and falls back to a sequential scan on the full
+-- table.  On the production Postgres mirror with ~2.7M rows that
+-- exceeded the default statement_timeout and left the dualwrite
+-- prune ~2.3M rows behind the SQLite primary on 2026-05-26.
+-- This timestamp-only index makes ranged DELETE / SELECT fast on
+-- both backends.  Created CONCURRENTLY on prod via:
+--   railway ssh "python -c 'from src.data.db.postgres import _get_pool; ...
+--   CREATE INDEX CONCURRENTLY IF NOT EXISTS
+--     idx_polymarket_price_points_ts
+--     ON polymarket_price_points (timestamp_ms)'"
+-- ; this DDL persists it in the canonical schema so a fresh deploy
+-- (or a developer's local SQLite) gets the same shape automatically.
+CREATE INDEX IF NOT EXISTS idx_polymarket_price_points_ts
+    ON polymarket_price_points (timestamp_ms);
 
 CREATE TABLE IF NOT EXISTS funding_history (
     source TEXT NOT NULL,
