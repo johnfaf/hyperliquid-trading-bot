@@ -28,8 +28,14 @@ _BACKFILL_DAYS = {
     "1d": int(getattr(config, "FEATURE_STORE_BACKFILL_1D_DAYS", 365)),
 }
 
-# Cap watched coins to avoid API flooding
-_MAX_COINS = int(getattr(config, "FEATURE_STORE_MAX_COINS", 30))
+# Cap watched coins to avoid API flooding.
+# ★ AUDIT FIX (2026-05-26): cap raised 30 -> 80 because production
+# showed signals firing on coins outside the watched set
+# (e.g. BCH, VVV) -> data_readiness_missing rejection every cycle.
+# 80 covers the typical long tail of copy-trader candidates without
+# meaningfully increasing API load (1h candle fetch is ~80 calls
+# per cycle = ~5 RPS, well under HL's rate limit).
+_MAX_COINS = int(getattr(config, "FEATURE_STORE_MAX_COINS", 80))
 _BOOTSTRAP_TOP_COINS = int(getattr(config, "FEATURE_STORE_BOOTSTRAP_TOP_COINS", 8))
 
 
@@ -40,21 +46,34 @@ def _get_watched_coins(container=None) -> List[str]:
 
     Pulls from:
       * Explicit ``FEATURE_STORE_COINS`` env var (comma-separated)
-      * Open paper/live positions
-      * Active strategies with recent scores
+      * Open paper/live positions          (priority: ACTIVE)
+      * Active strategies with recent scores   (priority: ACTIVE)
+      * Recent copy-trade decision snapshots   (priority: CANDIDATE)
+      * Bot's tracked-trader OPEN POSITIONS from position_snapshots
+        (priority: CANDIDATE, new in this PR)
+      * Top coins by volume (priority: BOOTSTRAP)
 
-    Capped at ``FEATURE_STORE_MAX_COINS``.
+    Capped at ``FEATURE_STORE_MAX_COINS``.  Truncation is
+    PRIORITY-ORDERED -- ACTIVE coins survive truncation first,
+    then CANDIDATE, then BOOTSTRAP (instead of alphabetic).
     """
+    # Three priority tiers; tuples (priority_rank, coin) get sorted
+    # so lower rank = higher priority and we keep them when capping.
+    active_coins: set = set()
+    candidate_coins: set = set()
+    bootstrap_coins: set = set()
+
     override = getattr(config, "FEATURE_STORE_COINS", "").strip()
     if override:
-        coins = set(c.strip().upper() for c in override.split(",") if c.strip())
-    else:
-        coins = set()
+        # Explicit operator pin: highest priority.
+        active_coins.update(
+            c.strip().upper() for c in override.split(",") if c.strip()
+        )
 
-    # Always watch BTC + ETH (needed for cross-asset features)
-    coins.update({"BTC", "ETH"})
+    # Always watch BTC + ETH (needed for cross-asset features).
+    active_coins.update({"BTC", "ETH"})
 
-    # Add coins from open positions
+    # ACTIVE: open paper trades
     try:
         from src.data import database as db
         with db.get_connection() as conn:
@@ -62,13 +81,14 @@ def _get_watched_coins(container=None) -> List[str]:
                 "SELECT DISTINCT coin FROM paper_trades WHERE status='open'"
             ).fetchall()
             for r in rows:
-                coins.add(r["coin"] if isinstance(r, dict) else r[0])
+                coin = r["coin"] if isinstance(r, dict) else r[0]
+                if coin:
+                    active_coins.add(str(coin).strip().upper())
     except Exception:
         pass
 
-    # Add coins from the execution source of truth.  In live mode this reads
-    # exchange positions, so active live exposure keeps receiving candles even
-    # if the paper shadow book is stale or missing.
+    # ACTIVE: execution source of truth (live exchange positions when
+    # live mode is on; falls back to paper open positions).
     if container is not None:
         try:
             from src.core.live_execution import get_execution_open_positions
@@ -80,11 +100,11 @@ def _get_watched_coins(container=None) -> List[str]:
                     coin = getattr(pos, "coin", "") or getattr(pos, "symbol", "")
                 coin = str(coin or "").upper().strip()
                 if coin:
-                    coins.add(coin)
+                    active_coins.add(coin)
         except Exception as exc:
             logger.debug("execution watched-coin lookup failed: %s", exc)
 
-    # Add coins from recent strategies
+    # CANDIDATE: coins parsed out of active strategy names.
     try:
         from src.data import database as db
         with db.get_connection() as conn:
@@ -93,24 +113,21 @@ def _get_watched_coins(container=None) -> List[str]:
                 (True,),
             ).fetchall()
             for r in rows:
-                # Strategy names often contain the coin
                 name = r["name"] if isinstance(r, dict) else r[0]
                 parts = name.upper().split("_")
                 for p in parts:
                     if len(p) >= 2 and len(p) <= 10 and p.isalpha():
-                        coins.add(p)
+                        candidate_coins.add(p)
     except Exception:
         pass
 
-    # #3: fold in recently-evaluated copy-trade candidate coins so the
-    # broad tracked-trader coin set gets feature precompute. Without this
-    # copy signals on those coins (ALGO/FARTCOIN/POL/ADA/PUMP/STRK...) are
-    # dropped with data_readiness_missing:candles,feature_vector and never
-    # become live trades. Best-effort, bounded by config + _MAX_COINS.
+    # CANDIDATE: coins from recent copy-trade decision snapshots.
+    # ★ AUDIT FIX (2026-05-26): default cap raised 25 -> 60 to match
+    # the broader watched-coin universe.
     try:
         from src.data import database as db
         import config as _cfg
-        _copy_cap = int(getattr(_cfg, "FEATURE_COPY_CANDIDATE_COINS_MAX", 25))
+        _copy_cap = int(getattr(_cfg, "FEATURE_COPY_CANDIDATE_COINS_MAX", 60))
         if _copy_cap > 0:
             with db.get_connection() as conn:
                 if db.table_exists("decision_snapshots"):
@@ -129,25 +146,77 @@ def _get_watched_coins(container=None) -> List[str]:
                     for r in rows:
                         c = r["coin"] if isinstance(r, dict) else r[0]
                         if c:
-                            coins.add(str(c).strip().upper())
+                            candidate_coins.add(str(c).strip().upper())
     except Exception:
         pass
 
-    # Add top coins by volume if we don't have enough
-    if len(coins) < 10:
+    # CANDIDATE: coins from RECENT tracked-trader open positions.
+    # ★ AUDIT FIX (2026-05-26): the copy-trade decision_snapshots path
+    # only sees coins where the bot already EVALUATED a signal for
+    # them, but a wallet that just opened a position is the very FIRST
+    # event the bot processes -- so the signal arrives BEFORE any
+    # decision_snapshot exists.  Read position_snapshots directly for
+    # the coins our tracked traders currently hold.  Last 6 hours +
+    # current top-up keeps the query cheap.  This is what was missing
+    # for the BCH / VVV signals observed on 2026-05-26.
+    try:
+        from src.data import database as db
+        import config as _cfg
+        _pos_cap = int(getattr(_cfg, "FEATURE_POSITION_SNAPSHOT_COINS_MAX", 50))
+        if _pos_cap > 0:
+            with db.get_connection() as conn:
+                if db.table_exists("position_snapshots"):
+                    rows = conn.execute(
+                        """
+                        SELECT coin, MAX(timestamp) AS m
+                        FROM position_snapshots
+                        WHERE coin IS NOT NULL AND coin != ''
+                          AND size > 0
+                          AND timestamp >= datetime('now', '-12 hours')
+                        GROUP BY coin
+                        ORDER BY m DESC
+                        LIMIT ?
+                        """,
+                        (_pos_cap,),
+                    ).fetchall()
+                    for r in rows:
+                        c = r["coin"] if isinstance(r, dict) else r[0]
+                        if c:
+                            candidate_coins.add(str(c).strip().upper())
+    except Exception:
+        pass
+
+    # BOOTSTRAP: top coins by volume if we don't have enough yet.
+    total_so_far = len(active_coins) + len(candidate_coins)
+    if total_so_far < 10:
         try:
             from src.data import hyperliquid_client as hl
             all_coins = hl.get_all_coins()
             if all_coins:
                 target_total = min(_BOOTSTRAP_TOP_COINS, _MAX_COINS)
                 for c in all_coins:
-                    if len(coins) >= target_total:
+                    if total_so_far + len(bootstrap_coins) >= target_total:
                         break
-                    coins.add(c.upper())
+                    bootstrap_coins.add(c.upper())
         except Exception:
             pass
 
-    return sorted(coins)[:_MAX_COINS]
+    # Priority-ordered truncation: ACTIVE first, then CANDIDATE, then
+    # BOOTSTRAP.  Within a tier, alphabetic for stability.  Bug
+    # being fixed: ``sorted(coins)[:_MAX_COINS]`` was alphabetic across
+    # all tiers -- so an ACTIVE position on ZRX could be dropped in
+    # favour of a BOOTSTRAP coin starting with A.
+    out: List[str] = []
+    seen: set = set()
+    for tier in (sorted(active_coins), sorted(candidate_coins), sorted(bootstrap_coins)):
+        for c in tier:
+            if c in seen:
+                continue
+            seen.add(c)
+            out.append(c)
+            if len(out) >= _MAX_COINS:
+                return out
+    return out
 
 
 # ─── Asset context cache (one API call, shared across all coins) ─
