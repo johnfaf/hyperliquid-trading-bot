@@ -476,6 +476,27 @@ class PolymarketScanner:
         except Exception as exc:
             logger.warning("Polymarket history persistence failed: %s", exc)
 
+        # ★ AUDIT FIX (May 2026): the bot's signal generation only
+        # consults RECENT polymarket data (last few hours).  Without
+        # pruning, the high-frequency tables (polymarket_price_points,
+        # polymarket_market_snapshots) accumulate millions of rows
+        # over weeks -- production saw ~4.5M rows / 15 GB DB by
+        # 2026-05-25.  Run an opportunistic retention prune after
+        # every persisted scan, batched so it never holds the write
+        # lock for long.  Retention window is configurable via the
+        # POLYMARKET_HISTORY_RETENTION_DAYS env var (default 30).
+        # Set to 0 to disable pruning entirely (preserves history).
+        try:
+            import config as _cfg
+            retention_days = int(
+                getattr(_cfg, "POLYMARKET_HISTORY_RETENTION_DAYS", 30) or 0
+            )
+            if retention_days > 0:
+                from src.data.polymarket_history import prune_polymarket_history
+                prune_polymarket_history(retention_days)
+        except Exception as exc:
+            logger.debug("Polymarket retention prune skipped: %s", exc)
+
         enriched = []
         crypto_count = 0
 

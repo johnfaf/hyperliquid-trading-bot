@@ -208,6 +208,17 @@ BOOT_DB_AUDIT_BACKGROUND = os.environ.get(
 STRATEGY_PER_TRADER_CAP = int(
     os.environ.get("STRATEGY_PER_TRADER_CAP", 2)
 )
+# ★ AUDIT FIX (May 2026): polymarket history tables
+# (polymarket_price_points, polymarket_market_snapshots) accumulate
+# rows on every scan with no built-in retention.  Production saw
+# ~4.5M rows and a 15 GB SQLite DB on 2026-05-25.  The bot only
+# consults the most recent polymarket data for signal generation
+# (last few hours -> last 24-48 h max), so older rows are pure
+# storage cost.  Default 30 days keeps a generous buffer.  Set to
+# 0 to disable retention pruning entirely (preserves all history).
+POLYMARKET_HISTORY_RETENTION_DAYS = int(
+    os.environ.get("POLYMARKET_HISTORY_RETENTION_DAYS", 30)
+)
 
 # ─── Feature Store (Postgres-only, auto-enabled when POSTGRES_DSN set) ─
 FEATURE_STORE_COINS = os.environ.get("FEATURE_STORE_COINS", "").strip()

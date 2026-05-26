@@ -388,6 +388,95 @@ def store_markets(raw_markets: Iterable[Dict[str, Any]], observed_at_ms: Optiona
     return count
 
 
+def prune_polymarket_history(
+    retention_days: int,
+    *,
+    batch_size: int = 5000,
+) -> Dict[str, int]:
+    """Delete polymarket history older than ``retention_days``.
+
+    The bot's signal generation only consults RECENT polymarket data
+    (last few hours for regime sentiment, last 24-48h for activity
+    scoring).  Older rows are pure storage cost.
+
+    Without pruning the high-frequency tables ``polymarket_price_points``
+    and ``polymarket_market_snapshots`` accumulate millions of rows
+    over weeks; production saw ~4.5M rows and a 15 GB DB on
+    2026-05-25.
+
+    This function deletes rows older than the cutoff in bounded
+    batches so a single call never holds the write lock for long.
+    Live writers compete normally with each batch -- by design.
+
+    Tables pruned (high-frequency history only):
+      * ``polymarket_price_points``     (keyed by ``timestamp_ms``)
+      * ``polymarket_market_snapshots`` (keyed by ``observed_at_ms``)
+
+    Tables NOT pruned (low-frequency dimension data):
+      * ``polymarket_markets``  -- one row per market, kept forever
+      * ``polymarket_tokens``   -- one row per token, kept forever
+      * ``polymarket_trades``   -- low-volume, kept for analysis
+
+    Returns a dict with the per-table delete counts.
+    """
+    from src.data import database as db
+
+    if retention_days <= 0:
+        return {"price_points_deleted": 0, "snapshots_deleted": 0}
+
+    cutoff_ms = _now_ms() - int(retention_days) * 86_400_000
+    batch_size = max(100, int(batch_size))
+
+    counts = {"price_points_deleted": 0, "snapshots_deleted": 0}
+
+    with db.get_connection() as conn:
+        # Batched DELETE on polymarket_price_points
+        while True:
+            cur = conn.execute(
+                """
+                DELETE FROM polymarket_price_points
+                WHERE rowid IN (
+                    SELECT rowid FROM polymarket_price_points
+                    WHERE timestamp_ms < ?
+                    LIMIT ?
+                )
+                """,
+                (cutoff_ms, batch_size),
+            )
+            n = int(getattr(cur, "rowcount", 0) or 0)
+            if n == 0:
+                break
+            counts["price_points_deleted"] += n
+
+        # Batched DELETE on polymarket_market_snapshots
+        while True:
+            cur = conn.execute(
+                """
+                DELETE FROM polymarket_market_snapshots
+                WHERE rowid IN (
+                    SELECT rowid FROM polymarket_market_snapshots
+                    WHERE observed_at_ms < ?
+                    LIMIT ?
+                )
+                """,
+                (cutoff_ms, batch_size),
+            )
+            n = int(getattr(cur, "rowcount", 0) or 0)
+            if n == 0:
+                break
+            counts["snapshots_deleted"] += n
+
+    if counts["price_points_deleted"] or counts["snapshots_deleted"]:
+        logger.info(
+            "Polymarket history pruned (>%d days): %d price_points + "
+            "%d market_snapshots deleted",
+            retention_days,
+            counts["price_points_deleted"],
+            counts["snapshots_deleted"],
+        )
+    return counts
+
+
 def store_trades(raw_trades: Iterable[Dict[str, Any]]) -> int:
     """Upsert Polymarket trade prints when available from a downloader."""
     from src.data import database as db
