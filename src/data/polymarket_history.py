@@ -430,13 +430,20 @@ def prune_polymarket_history(
     counts = {"price_points_deleted": 0, "snapshots_deleted": 0}
 
     with db.get_connection() as conn:
-        # Batched DELETE on polymarket_price_points
+        # Batched DELETE on polymarket_price_points.  Uses the primary
+        # key column ``id`` (not SQLite-only ``rowid``) so the dualwrite
+        # Postgres mirror -- which does not have a ``rowid`` -- can
+        # replay the same statement.  Observed in production on
+        # 2026-05-26: the rowid-based form succeeded on the SQLite
+        # primary but failed on the Postgres mirror with
+        # ``UndefinedColumn: column "rowid" does not exist``, leaving
+        # the mirror with stale rows.
         while True:
             cur = conn.execute(
                 """
                 DELETE FROM polymarket_price_points
-                WHERE rowid IN (
-                    SELECT rowid FROM polymarket_price_points
+                WHERE id IN (
+                    SELECT id FROM polymarket_price_points
                     WHERE timestamp_ms < ?
                     LIMIT ?
                 )
@@ -448,13 +455,14 @@ def prune_polymarket_history(
                 break
             counts["price_points_deleted"] += n
 
-        # Batched DELETE on polymarket_market_snapshots
+        # Batched DELETE on polymarket_market_snapshots (same id-based
+        # form as above for SQLite + Postgres dualwrite compatibility).
         while True:
             cur = conn.execute(
                 """
                 DELETE FROM polymarket_market_snapshots
-                WHERE rowid IN (
-                    SELECT rowid FROM polymarket_market_snapshots
+                WHERE id IN (
+                    SELECT id FROM polymarket_market_snapshots
                     WHERE observed_at_ms < ?
                     LIMIT ?
                 )
