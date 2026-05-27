@@ -10,6 +10,7 @@ Data sources:
 """
 import logging
 import math
+import os as _os
 import time
 import threading
 from datetime import datetime, timedelta, timezone
@@ -33,7 +34,6 @@ TIER_LARGE = 100_000
 
 # Minimum filters. Both env-overridable so we don't have to redeploy when
 # Deribit volumes are quiet and the scanner returns 0 unusual prints.
-import os as _os
 MIN_VOL_OI_RATIO = float(_os.environ.get("OPTIONS_FLOW_MIN_VOL_OI_RATIO", 0.08))
 MIN_NOTIONAL = int(_os.environ.get("OPTIONS_FLOW_MIN_NOTIONAL", 10_000))
 

@@ -48,6 +48,7 @@ from src.trading.live_trader import (
     _hl_format_price,
     _hl_format_size,
 )
+from src.trading.portfolio_rotation import PortfolioRotationManager, RotationDecision
 
 
 @pytest.fixture(autouse=True)
@@ -66,7 +67,6 @@ def _bypass_promotion_gate(monkeypatch):
     # market data. Each gate has its own dedicated test module.
     monkeypatch.setattr(config, "DATA_READINESS_GATE_ENABLED", False, raising=False)
     monkeypatch.setattr(config, "EV_GATE_ENABLED", False, raising=False)
-from src.trading.portfolio_rotation import PortfolioRotationManager, RotationDecision
 
 
 @pytest.fixture(autouse=True)

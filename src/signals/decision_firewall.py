@@ -16,6 +16,7 @@ Flow: Signal Source → TradeSignal → DecisionFirewall → Execution
 """
 import logging
 import threading
+from datetime import datetime, timezone
 from src.core import clock_provider
 from typing import Iterable, List, Dict, Optional, Tuple
 from collections import defaultdict
@@ -37,6 +38,11 @@ except ImportError:
     HAS_FORECASTER = False
 
 logger = logging.getLogger(__name__)
+
+
+def _is_live_execution_signal(signal: TradeSignal) -> bool:
+    ctx = getattr(signal, "context", None)
+    return isinstance(ctx, dict) and bool(ctx.get("live_execution") or ctx.get("live_mirror"))
 
 
 class DecisionFirewall:
@@ -451,7 +457,9 @@ class DecisionFirewall:
             "rejected_unknown_source": 0,
             "rejected_bucketed_confidence": 0,
             "rejected_data_readiness": 0,
+            "rejected_data_readiness_error": 0,
             "rejected_ev_gate": 0,
+            "rejected_ev_gate_error": 0,
             # LOW-FIX LOW-1: count audit-log write failures so ops can detect
             # when the audit trail is silently broken (DB full, locked, etc.)
             "audit_log_failures": 0,
@@ -521,7 +529,13 @@ class DecisionFirewall:
     def set_event_scanner(self, event_scanner) -> None:
         self.event_scanner = event_scanner
 
-    def set_live_fill_history(self, fills: Iterable[Dict], *, limit: int = 200) -> None:
+    def set_live_fill_history(
+        self,
+        fills: Iterable[Dict],
+        *,
+        limit: int = 200,
+        subtract_fees: bool = True,
+    ) -> None:
         """Inject recent exchange fills so live-mode policies see live outcomes.
 
         ``paper_trades`` can be empty or incomplete on a restarted live bot.
@@ -531,7 +545,11 @@ class DecisionFirewall:
         firewall the exchange truth it already fetched for the daily loss guard.
         """
         try:
-            rows = normalise_hyperliquid_fill_history(fills, limit=limit)
+            rows = normalise_hyperliquid_fill_history(
+                fills,
+                limit=limit,
+                subtract_fees=bool(subtract_fees),
+            )
         except Exception as exc:
             logger.debug("Live fill history normalization failed: %s", exc)
             rows = []
@@ -899,9 +917,22 @@ class DecisionFirewall:
 
         def _sort_key(row: Dict) -> float:
             try:
-                return float(row.get("time_ms", 0) or 0)
+                time_ms = float(row.get("time_ms", 0) or 0)
+                if time_ms > 0:
+                    return time_ms
             except (TypeError, ValueError):
-                return 0.0
+                pass
+            closed_at = row.get("closed_at") or row.get("timestamp") or ""
+            if isinstance(closed_at, datetime):
+                dt = closed_at
+            else:
+                try:
+                    dt = datetime.fromisoformat(str(closed_at).replace("Z", "+00:00"))
+                except (TypeError, ValueError):
+                    return 0.0
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.timestamp() * 1000.0
 
         merged.sort(key=_sort_key, reverse=True)
         return merged[: max(1, int(limit or 1))]
@@ -2214,7 +2245,7 @@ class DecisionFirewall:
                     },
                 )
             if not dry_run:
-                self.stats[reason_key] += 1
+                self.stats[reason_key] = self.stats.get(reason_key, 0) + 1
                 try:
                     db.audit_log(
                         action="signal_rejected",
@@ -2259,6 +2290,11 @@ class DecisionFirewall:
             if not ready:
                 return _reject("rejected_data_readiness", ready_reason)
         except Exception as exc:
+            if _is_live_execution_signal(signal):
+                return _reject(
+                    "rejected_data_readiness_error",
+                    f"Data-readiness check failed for live signal: {exc}",
+                )
             logger.debug("Data-readiness check failed (fail-open): %s", exc)
 
         predictive_regime = None
@@ -2452,6 +2488,11 @@ class DecisionFirewall:
                 except Exception as exc:
                     logger.debug("Cold-start leverage clamp skipped: %s", exc)
         except Exception as exc:
+            if _is_live_execution_signal(signal):
+                return _reject(
+                    "rejected_ev_gate_error",
+                    f"EV gate check failed for live signal: {exc}",
+                )
             logger.debug("EV gate check failed (fail-open): %s", exc)
 
         # 2b. Per-source/day throughput cap (approved signals).

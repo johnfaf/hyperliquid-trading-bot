@@ -89,6 +89,7 @@ def test_lighter_execute_signal_places_entry_and_protective_orders(monkeypatch):
     assert order_calls[2]["order_type"] == 4
     assert order_calls[1]["reduce_only"] is True
     assert order_calls[2]["reduce_only"] is True
+    assert signal.context["live_execution"] is True
 
 
 def test_lighter_execute_signal_runs_firewall_by_default(monkeypatch):
@@ -98,9 +99,11 @@ def test_lighter_execute_signal_runs_firewall_by_default(monkeypatch):
     monkeypatch.setattr(config, "LIGHTER_LIVE_TRADING_DUAL_CONTROL_CONFIRM", True, raising=False)
 
     class _Firewall:
-        def validate(self, *args, **kwargs):
+        def validate(self, signal, *args, **kwargs):
+            seen_live_context.append(bool(signal.context.get("live_execution")))
             return False, "unit-test-block"
 
+    seen_live_context = []
     trader = LighterLiveTrader(
         dry_run=False,
         account_index=7,
@@ -127,3 +130,4 @@ def test_lighter_execute_signal_runs_firewall_by_default(monkeypatch):
 
     assert trader.execute_signal(signal) is None
     assert [name for name, _ in calls if name == "create_order"] == []
+    assert seen_live_context == [True]

@@ -4040,7 +4040,17 @@ class LiveTrader:
 
         if hasattr(self.firewall, "set_live_fill_history"):
             try:
-                self.firewall.set_live_fill_history(fills, limit=limit)
+                subtract_fees = bool(getattr(config, "LIVE_SUBTRACT_FEES_FROM_PNL", True))
+                try:
+                    self.firewall.set_live_fill_history(
+                        fills,
+                        limit=limit,
+                        subtract_fees=subtract_fees,
+                    )
+                except TypeError as type_exc:
+                    if "subtract_fees" not in str(type_exc):
+                        raise
+                    self.firewall.set_live_fill_history(fills, limit=limit)
             except Exception as exc:
                 logger.debug("Could not inject live fill history into firewall: %s", exc)
 

@@ -46,12 +46,9 @@ LOOKBACK_DAYS = 90
 # New values: 15s delay + 15 bps total penalty. Both can be tuned via env
 # vars (HL_GOLDEN_EXEC_DELAY_MS, HL_GOLDEN_FEE_SLIPPAGE_BPS) so you can
 # recalibrate against observed live-vs-backtest performance over time.
-import os as _os
-
-
 def _env_float(name: str, default: float) -> float:
     try:
-        return float(_os.environ.get(name, default) or default)
+        return float(os.environ.get(name, default) or default)
     except (TypeError, ValueError):
         return float(default)
 

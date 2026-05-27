@@ -301,6 +301,106 @@ def test_live_fill_history_blocks_losing_live_short_side(mock_db):
     assert "underperforming" in reason.lower()
 
 
+def test_live_fill_history_can_preserve_gross_pnl_when_configured():
+    from src.signals.decision_firewall import DecisionFirewall
+
+    fw = DecisionFirewall({"enable_predictive_derisk": False, "funding_risk_enabled": False})
+    fw.set_live_fill_history(
+        [
+            {
+                "coin": "BTC",
+                "dir": "Close Long",
+                "side": "sell",
+                "closedPnl": "1.00",
+                "fee": "0.40",
+                "time": 1,
+            }
+        ],
+        subtract_fees=False,
+    )
+
+    assert fw._live_fill_history[0]["pnl"] == pytest.approx(1.0)
+
+
+@patch("src.signals.decision_firewall.db")
+def test_policy_closed_history_sorts_db_closed_at_with_live_fills(mock_db):
+    mock_db.get_paper_trade_history.return_value = [
+        {
+            "coin": "NEW",
+            "side": "long",
+            "pnl": 1.0,
+            "closed_at": "2099-01-01T00:00:00+00:00",
+            "metadata": "{}",
+        }
+    ]
+    mock_db._resolve_history_mode_for_runtime.return_value = "live"
+
+    from src.signals.decision_firewall import DecisionFirewall
+
+    fw = DecisionFirewall({"enable_predictive_derisk": False, "funding_risk_enabled": False})
+    fw.set_live_fill_history([
+        {"coin": "OLD", "dir": "Close Long", "side": "sell", "closedPnl": "-1.0", "fee": "0", "time": 1}
+    ])
+
+    assert fw._policy_closed_history(1)[0]["coin"] == "NEW"
+
+
+@patch("src.signals.decision_firewall.db")
+def test_live_signal_rejects_when_data_readiness_errors(mock_db, monkeypatch):
+    mock_db.audit_log = MagicMock()
+    monkeypatch.setattr(config, "DATA_READINESS_GATE_ENABLED", True, raising=False)
+
+    def _boom(_signal):
+        raise RuntimeError("readiness boom")
+
+    monkeypatch.setattr("src.signals.data_readiness.is_signal_data_ready", _boom)
+
+    from src.signals.decision_firewall import DecisionFirewall
+
+    fw = DecisionFirewall({"enable_predictive_derisk": False, "funding_risk_enabled": False})
+    signal = MockSignal(confidence=0.9, context={"live_execution": True})
+
+    passed, reason = fw.validate(signal, open_positions=[], account_balance=1000000)
+
+    assert passed is False
+    assert "data-readiness check failed" in reason.lower()
+
+
+@patch("src.signals.decision_firewall.db")
+def test_live_signal_rejects_when_ev_gate_errors(mock_db, monkeypatch):
+    mock_db.get_open_paper_trades.return_value = []
+    mock_db.get_paper_account.return_value = {"balance": 1000000}
+    mock_db.audit_log = MagicMock()
+    monkeypatch.setattr(config, "DATA_READINESS_GATE_ENABLED", False, raising=False)
+    monkeypatch.setattr(config, "EV_GATE_ENABLED", True, raising=False)
+
+    def _boom(*_args, **_kwargs):
+        raise RuntimeError("ev boom")
+
+    monkeypatch.setattr("src.signals.ev_gate.evaluate_signal_ev", _boom)
+
+    from src.signals.decision_firewall import DecisionFirewall
+
+    fw = DecisionFirewall({
+        "enable_predictive_derisk": False,
+        "funding_risk_enabled": False,
+        "event_risk_enabled": False,
+        "short_hardening_enabled": False,
+        "long_hardening_enabled": False,
+        "market_side_guard_enabled": False,
+        "use_bucketed_thresholds": False,
+        "block_unknown_sources": False,
+        "cooldown_seconds": 0,
+        "same_side_cooldown_seconds": 0,
+    })
+    signal = MockSignal(confidence=0.9, context={"live_execution": True})
+
+    passed, reason = fw.validate(signal, open_positions=[], account_balance=1000000)
+
+    assert passed is False
+    assert "ev gate check failed" in reason.lower()
+
+
 def test_synthetic_forecaster_now_contributes_when_weighted():
     """Synthetic warm-start forecaster is no longer discarded outright:
     weighted >0 it can align a counter-regime entry; weight 0 reverts."""

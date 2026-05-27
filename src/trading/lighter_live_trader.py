@@ -490,6 +490,10 @@ class LighterLiveTrader:
 
     def execute_signal(self, signal: TradeSignal | Dict[str, Any], bypass_firewall: bool = False) -> Optional[Dict[str, Any]]:
         trade_signal = signal if isinstance(signal, TradeSignal) else signal_from_execution_dict(signal)
+        if isinstance(getattr(trade_signal, "context", None), dict):
+            trade_signal.context["live_execution"] = True
+        else:
+            trade_signal.context = {"live_execution": True}
         if self.check_daily_loss():
             logger.warning("Lighter live safety stop active - rejecting signal")
             return None

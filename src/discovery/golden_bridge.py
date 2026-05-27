@@ -33,12 +33,9 @@ GOLDEN_CONFIDENCE_BOOST = 0.15
 # DD <= 20% (capital-preservation discipline).  Override via env vars
 # `GOLDEN_BRIDGE_MIN_SHARPE` / `GOLDEN_BRIDGE_MAX_DD` if you want the
 # old looser bar back during data-build phases.
-import os as _os
-
-
 def _env_float(name: str, default: float) -> float:
     try:
-        return float(_os.environ.get(name, default) or default)
+        return float(os.environ.get(name, default) or default)
     except (TypeError, ValueError):
         return float(default)
 
