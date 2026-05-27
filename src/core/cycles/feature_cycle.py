@@ -187,7 +187,13 @@ def _get_watched_coins(container=None) -> List[str]:
         pass
 
     # BOOTSTRAP: top coins by volume if we don't have enough yet.
-    total_so_far = len(active_coins) + len(candidate_coins)
+    # ★ CI FIX (2026-05-27): when a higher-priority tier already
+    # contains BTC/ETH (or any other volume-top coin), we must not
+    # count duplicates toward target_total or the bootstrap loop
+    # exits short and the caller ends up with fewer unique coins
+    # than _BOOTSTRAP_TOP_COINS.
+    known = active_coins | candidate_coins
+    total_so_far = len(known)
     if total_so_far < 10:
         try:
             from src.data import hyperliquid_client as hl
@@ -195,9 +201,13 @@ def _get_watched_coins(container=None) -> List[str]:
             if all_coins:
                 target_total = min(_BOOTSTRAP_TOP_COINS, _MAX_COINS)
                 for c in all_coins:
+                    coin_upper = c.upper()
+                    # Skip coins already counted in higher tiers.
+                    if coin_upper in known or coin_upper in bootstrap_coins:
+                        continue
                     if total_so_far + len(bootstrap_coins) >= target_total:
                         break
-                    bootstrap_coins.add(c.upper())
+                    bootstrap_coins.add(coin_upper)
         except Exception:
             pass
 

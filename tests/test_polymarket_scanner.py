@@ -247,7 +247,18 @@ def test_generate_signals_inverts_bearish_market_odds_moves(monkeypatch):
 
 def test_generate_signals_uses_persisted_price_points_after_restart(monkeypatch):
     conn = _memory_db(monkeypatch)
-    old_ts = 1_776_000_000_000
+    # ★ CI FIX (2026-05-27): the scanner runs an opportunistic retention
+    # prune on every scan, default 30 days.  A hardcoded historical
+    # ``old_ts`` ages out of retention over time and breaks this test.
+    # Disable the prune for this unit test so it stays time-stable;
+    # the production behaviour (prune as configured) is exercised
+    # elsewhere.
+    import config as _cfg
+    monkeypatch.setattr(_cfg, "POLYMARKET_HISTORY_RETENTION_DAYS", 0, raising=False)
+    # Use a fresh "old" timestamp 60 s in the past so it always sits
+    # inside whatever retention window is configured.
+    import time as _time
+    old_ts = int(_time.time() * 1000) - 60_000
     store_markets(
         [
             _raw_market_with_price(
