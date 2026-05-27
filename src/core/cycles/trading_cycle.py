@@ -16,6 +16,7 @@ from src.data import database as db
 from src.core.live_execution import (
     get_execution_open_positions,
     get_live_trader,
+    is_confirmed_live_execution_result,
     is_live_trading_active,
     mirror_executed_trades_to_live,
     sync_shadow_book_to_live,
@@ -798,7 +799,7 @@ def _execute_signal_live(container, trade_signal, source_label: str, bypass_fire
         )
         return None
 
-    if result and result.get("status") not in ("error", "rejected"):
+    if is_confirmed_live_execution_result(result):
         logger.info(
             "  LIVE %s executed: %s %s (%s)",
             source_label,
@@ -807,6 +808,17 @@ def _execute_signal_live(container, trade_signal, source_label: str, bypass_fire
             result.get("status", "ok"),
         )
         return result
+
+    status = str(result.get("status", "") or "").lower()
+    if status not in {"error", "rejected"}:
+        logger.warning(
+            "  LIVE %s not confirmed: %s %s -> %s",
+            source_label,
+            side_label,
+            trade_signal.coin,
+            result,
+        )
+        return None
 
     if result.get("status") == "rejected":
         if _is_insufficient_margin_rejection(result):

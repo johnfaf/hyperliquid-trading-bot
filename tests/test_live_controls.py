@@ -1473,6 +1473,34 @@ def test_execute_signal_live_logs_warning_for_insufficient_margin(monkeypatch, c
     assert "insufficient margin" in caplog.text.lower()
 
 
+def test_execute_signal_live_pending_fill_is_not_reported_executed(caplog):
+    class FakeLiveTrader:
+        def is_live_enabled(self):
+            return True
+
+        def is_deployable(self):
+            return True
+
+        def execute_signal(self, signal, bypass_firewall=False):
+            return {"status": "pending_fill", "message": "fill_unconfirmed"}
+
+    container = type("Container", (), {"live_trader": FakeLiveTrader()})()
+    signal = TradeSignal(
+        coin="ETH",
+        side=SignalSide.LONG,
+        confidence=0.8,
+        source=SignalSource.STRATEGY,
+        reason="test",
+    )
+
+    with caplog.at_level(logging.WARNING):
+        result = _execute_signal_live(container, signal, "OPTIONS FLOW", bypass_firewall=False)
+
+    assert result is None
+    assert "not confirmed" in caplog.text.lower()
+    assert "executed" not in caplog.text.lower()
+
+
 def test_mirror_executed_trades_uses_account_value_without_wallet_alias():
     class FakeLiveTrader:
         def __init__(self):
@@ -1569,6 +1597,150 @@ def test_mirror_executed_trades_marks_successful_paper_trade_as_live(monkeypatch
     assert metadata_updates[0][1]["live_mirror"] is True
     assert metadata_updates[0][1]["live_mirror_status"] == "success"
     assert metadata_updates[0][1]["live_mirror_order_id"] == "live-123"
+
+
+def test_mirror_executed_trades_closes_pending_fill_flat(monkeypatch):
+    class FakeLiveTrader:
+        def __init__(self):
+            self.executed = []
+
+        def is_live_enabled(self):
+            return True
+
+        def is_deployable(self):
+            return True
+
+        def get_account_value(self):
+            return 250.0
+
+        def execute_signal(self, signal, bypass_firewall=False):
+            self.executed.append((signal.coin, signal.side.value, bypass_firewall))
+            return {
+                "status": "pending_fill",
+                "message": "fill_unconfirmed_sltp_deferred",
+            }
+
+    metadata_updates = []
+    closed = []
+
+    def _close_paper_trade(trade_id, exit_price, pnl):
+        closed.append((trade_id, exit_price, pnl))
+        return True
+
+    monkeypatch.setattr(
+        "src.core.live_execution._rescale_size_for_live",
+        lambda trade, _trader: trade,
+    )
+    monkeypatch.setattr(
+        "src.core.live_execution.db.update_paper_trade_metadata",
+        lambda trade_id, extra: metadata_updates.append((trade_id, dict(extra))),
+    )
+    monkeypatch.setattr(
+        "src.core.live_execution.db.close_paper_trade",
+        _close_paper_trade,
+    )
+
+    trader = FakeLiveTrader()
+    container = type("Container", (), {"live_trader": trader})()
+    executed = [{
+        "id": 88,
+        "coin": "ETH",
+        "side": "long",
+        "confidence": 0.7,
+        "entry_price": 2000.0,
+        "size": 0.01,
+        "leverage": 2,
+        "strategy_type": "mirror_test",
+    }]
+
+    mirror_executed_trades_to_live(
+        container,
+        executed,
+        success_label="LIVE",
+        skip_label="SKIP",
+    )
+
+    assert trader.executed == [("ETH", "long", True)]
+    assert closed == [(88, 2000.0, 0.0)]
+    assert metadata_updates[0][0] == 88
+    meta = metadata_updates[0][1]
+    assert meta["live_mirror"] is False
+    assert meta["live_mirror_attempted"] is True
+    assert meta["live_mirror_status"] == "pending_fill"
+    assert meta["live_mirror_closed_flat"] is True
+    assert meta["close_reason"] == "live_mirror_unconfirmed"
+    assert meta["net_pnl_after_fees"] == 0.0
+
+
+def test_mirror_executed_trades_accepts_lighter_submitted_with_protection(monkeypatch):
+    class FakeLiveTrader:
+        def __init__(self):
+            self.executed = []
+
+        def is_live_enabled(self):
+            return True
+
+        def is_deployable(self):
+            return True
+
+        def get_account_value(self):
+            return 250.0
+
+        def execute_signal(self, signal, bypass_firewall=False):
+            self.executed.append((signal.coin, signal.side.value, bypass_firewall))
+            return {
+                "status": "submitted",
+                "venue": "lighter",
+                "entry": {"status": "submitted"},
+                "stop_loss": {"status": "submitted"},
+                "take_profit": {"status": "submitted"},
+            }
+
+    metadata_updates = []
+    closed = []
+
+    def _close_paper_trade(trade_id, exit_price, pnl):
+        closed.append((trade_id, exit_price, pnl))
+        return True
+
+    monkeypatch.setattr(
+        "src.core.live_execution._rescale_size_for_live",
+        lambda trade, _trader: trade,
+    )
+    monkeypatch.setattr(
+        "src.core.live_execution.db.update_paper_trade_metadata",
+        lambda trade_id, extra: metadata_updates.append((trade_id, dict(extra))),
+    )
+    monkeypatch.setattr(
+        "src.core.live_execution.db.close_paper_trade",
+        _close_paper_trade,
+    )
+
+    trader = FakeLiveTrader()
+    container = type("Container", (), {"live_trader": trader})()
+    executed = [{
+        "id": 89,
+        "coin": "BTC",
+        "side": "short",
+        "confidence": 0.7,
+        "entry_price": 60000.0,
+        "size": 0.001,
+        "leverage": 2,
+        "strategy_type": "mirror_test",
+    }]
+
+    mirror_executed_trades_to_live(
+        container,
+        executed,
+        success_label="LIVE",
+        skip_label="SKIP",
+    )
+
+    assert trader.executed == [("BTC", "short", True)]
+    assert closed == []
+    assert metadata_updates[0][0] == 89
+    assert metadata_updates[0][1]["live_mirror"] is True
+    assert metadata_updates[0][1]["live_mirror_status"] == "submitted"
 
 
 def test_mirror_executed_trades_logs_warning_for_insufficient_margin(monkeypatch, caplog):
@@ -1992,6 +2164,48 @@ def test_execution_open_positions_prefer_live_state_when_deployable():
     assert positions == [{"coin": "BTC", "side": "long", "size": 0.25}]
 
 
+def test_sync_shadow_book_skips_unmirrored_paper_trade(monkeypatch):
+    metadata_updates = []
+    closed = []
+
+    class FakeLiveTrader:
+        def is_live_enabled(self):
+            return True
+
+        def is_deployable(self):
+            return True
+
+        def get_positions(self):
+            return []
+
+        def get_account_value(self):
+            return 500.0
+
+    container = type(
+        "Container",
+        (),
+        {"live_trader": FakeLiveTrader(), "paper_trader": object()},
+    )()
+
+    monkeypatch.setattr(
+        "src.core.live_execution.db.get_open_paper_trades",
+        lambda: [{"id": 5, "coin": "ETH", "side": "long", "entry_price": 2000.0}],
+    )
+    monkeypatch.setattr("src.core.live_execution.get_all_mids", lambda: {"ETH": 1900.0})
+    monkeypatch.setattr(
+        "src.core.live_execution.db.update_paper_trade_metadata",
+        lambda trade_id, meta: metadata_updates.append((trade_id, meta)),
+    )
+    monkeypatch.setattr(
+        "src.core.live_execution.db.close_paper_trade",
+        lambda trade_id, exit_price, pnl: closed.append((trade_id, exit_price, pnl)) or True,
+    )
+
+    assert sync_shadow_book_to_live(container) == []
+    assert closed == []
+    assert metadata_updates == []
+
+
 def test_sync_shadow_book_closes_paper_trade_when_live_position_missing(monkeypatch):
     metadata_updates = []
     closed = []
@@ -2018,7 +2232,13 @@ def test_sync_shadow_book_closes_paper_trade_when_live_position_missing(monkeypa
 
     monkeypatch.setattr(
         "src.core.live_execution.db.get_open_paper_trades",
-        lambda: [{"id": 7, "coin": "ETH", "side": "long", "entry_price": 2000.0}],
+        lambda: [{
+            "id": 7,
+            "coin": "ETH",
+            "side": "long",
+            "entry_price": 2000.0,
+            "metadata": {"live_mirror": True},
+        }],
     )
     monkeypatch.setattr(
         "src.core.live_execution.get_all_mids",
@@ -2091,6 +2311,7 @@ def test_sync_shadow_book_stamps_pnl_analytics_into_reconciliation_metadata(monk
         lambda: [{
             "id": 11, "coin": "ETH", "side": "long",
             "entry_price": 2000.0, "size": 0.1, "leverage": 5,
+            "metadata": {"live_mirror": True},
         }],
     )
     monkeypatch.setattr(
@@ -2165,6 +2386,7 @@ def test_sync_shadow_book_stamps_negative_pnl_for_short_underwater(monkeypatch):
         lambda: [{
             "id": 13, "coin": "BTC", "side": "short",
             "entry_price": 60000.0, "size": 0.01, "leverage": 4,
+            "metadata": {"live_mirror": True},
         }],
     )
     monkeypatch.setattr(
