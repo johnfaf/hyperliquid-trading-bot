@@ -1287,6 +1287,76 @@ def test_execute_lcrs_signals_live_path_executes_signal(monkeypatch):
     assert executed == [("ETH", "long", True)]
 
 
+def test_execute_lcrs_live_sizing_uses_live_account_balance(monkeypatch):
+    seen = {}
+    executed = []
+
+    class FakeLiveTrader:
+        def is_live_enabled(self):
+            return True
+
+        def is_deployable(self):
+            return True
+
+        def get_account_value(self):
+            return 42.0
+
+        def execute_signal(self, signal, bypass_firewall=False):
+            executed.append((signal.coin, signal.position_pct))
+            return {"status": "success", "coin": signal.coin}
+
+    class FakeFirewall:
+        def validate(self, signal, **kwargs):
+            return True, "ok"
+
+    class FakeKellySizer:
+        def get_sizing(self, strategy_key, account_balance, signal_confidence):
+            seen["strategy_key"] = strategy_key
+            seen["account_balance"] = account_balance
+            seen["signal_confidence"] = signal_confidence
+            return types.SimpleNamespace(position_pct=0.123)
+
+    container = type(
+        "Container",
+        (),
+        {
+            "live_trader": FakeLiveTrader(),
+            "firewall": FakeFirewall(),
+            "kelly_sizer": FakeKellySizer(),
+            "rl_sizer": None,
+            "trade_memory": None,
+            "llm_filter": None,
+        },
+    )()
+
+    monkeypatch.setattr("src.core.cycles.trading_cycle.is_live_trading_active", lambda container: True)
+    monkeypatch.setattr("src.core.cycles.trading_cycle.get_execution_open_positions", lambda container: [])
+    monkeypatch.setattr("src.core.cycles.trading_cycle.db.get_paper_account", lambda: {"balance": 10_000.0})
+    monkeypatch.setattr("src.notifications.telegram_bot.is_configured", lambda: False)
+
+    _execute_lcrs_signals(
+        container,
+        [
+            {
+                "coin": "ETH",
+                "side": "long",
+                "confidence": 0.7,
+                "price": 2000.0,
+                "leverage": 2,
+                "stop_loss": 1950.0,
+                "take_profit": 2100.0,
+                "features": {"setup_type": "reversal", "volatility": 0.02},
+            }
+        ],
+        {"overall_regime": "neutral"},
+    )
+
+    assert seen["strategy_key"] == "liquidation_reversal"
+    assert seen["account_balance"] == 42.0
+    assert seen["signal_confidence"] == 0.7
+    assert executed == [("ETH", 0.123)]
+
+
 def test_execute_options_flow_live_path_executes_signal(monkeypatch):
     executed = []
 
@@ -1979,18 +2049,38 @@ def test_run_alpha_arena_passes_multi_coin_candle_map(monkeypatch):
 
 def test_execution_open_positions_prefer_live_state_when_deployable():
     class FakeLiveTrader:
+        def __init__(self):
+            self.force_fresh_seen = None
+
         def is_live_enabled(self):
             return True
 
         def is_deployable(self):
             return True
 
-        def get_positions(self):
+        def get_positions(self, *, force_fresh=False):
+            self.force_fresh_seen = force_fresh
             return [{"coin": "BTC", "side": "long", "size": 0.25}]
 
-    container = type("Container", (), {"live_trader": FakeLiveTrader()})()
+    trader = FakeLiveTrader()
+    container = type("Container", (), {"live_trader": trader})()
     positions = get_execution_open_positions(container)
     assert positions == [{"coin": "BTC", "side": "long", "size": 0.25}]
+    assert trader.force_fresh_seen is True
+
+
+def test_live_trader_firewall_positions_force_fresh():
+    trader = LiveTrader.__new__(LiveTrader)
+    seen = []
+
+    def fake_get_positions(*, force_fresh=False):
+        seen.append(force_fresh)
+        return [{"coin": "ETH", "side": "short", "size": 0.1}]
+
+    trader.get_positions = fake_get_positions
+
+    assert trader.get_firewall_positions() == [{"coin": "ETH", "side": "short", "size": 0.1}]
+    assert seen == [True]
 
 
 def test_sync_shadow_book_closes_paper_trade_when_live_position_missing(monkeypatch):
@@ -2019,7 +2109,13 @@ def test_sync_shadow_book_closes_paper_trade_when_live_position_missing(monkeypa
 
     monkeypatch.setattr(
         "src.core.live_execution.db.get_open_paper_trades",
-        lambda: [{"id": 7, "coin": "ETH", "side": "long", "entry_price": 2000.0}],
+        lambda: [{
+            "id": 7,
+            "coin": "ETH",
+            "side": "long",
+            "entry_price": 2000.0,
+            "metadata": {"live_mirror": True},
+        }],
     )
     monkeypatch.setattr(
         "src.core.live_execution.get_all_mids",
@@ -2049,6 +2145,42 @@ def test_sync_shadow_book_closes_paper_trade_when_live_position_missing(monkeypa
     assert metadata_updates[0][0] == 7
     assert metadata_updates[0][1]["synthetic_reconciliation"] is True
     assert metadata_updates[0][1]["reconciliation_reason"] == "live_reconciled_closed"
+
+
+def test_sync_shadow_book_skips_unmirrored_paper_trade(monkeypatch):
+    closed = []
+
+    class FakeLiveTrader:
+        def is_live_enabled(self):
+            return True
+
+        def is_deployable(self):
+            return True
+
+        def get_positions(self, *, force_fresh=False):
+            return []
+
+        def get_account_value(self):
+            return 500.0
+
+    container = type(
+        "Container",
+        (),
+        {"live_trader": FakeLiveTrader(), "paper_trader": object()},
+    )()
+
+    monkeypatch.setattr(
+        "src.core.live_execution.db.get_open_paper_trades",
+        lambda: [{"id": 99, "coin": "ETH", "side": "long", "entry_price": 2000.0}],
+    )
+    monkeypatch.setattr("src.core.live_execution.get_all_mids", lambda: {"ETH": 2100.0})
+    monkeypatch.setattr(
+        "src.core.live_execution.db.close_paper_trade",
+        lambda trade_id, exit_price, pnl: closed.append((trade_id, exit_price, pnl)) or True,
+    )
+
+    assert sync_shadow_book_to_live(container) == []
+    assert closed == []
 
 
 def test_sync_shadow_book_stamps_pnl_analytics_into_reconciliation_metadata(monkeypatch):
@@ -2089,10 +2221,11 @@ def test_sync_shadow_book_stamps_pnl_analytics_into_reconciliation_metadata(monk
     # => reconciled_pnl = (2100 - 2000) * 0.1 * 5 = 50.0
     monkeypatch.setattr(
         "src.core.live_execution.db.get_open_paper_trades",
-        lambda: [{
-            "id": 11, "coin": "ETH", "side": "long",
-            "entry_price": 2000.0, "size": 0.1, "leverage": 5,
-        }],
+            lambda: [{
+                "id": 11, "coin": "ETH", "side": "long",
+                "entry_price": 2000.0, "size": 0.1, "leverage": 5,
+                "metadata": {"live_mirror": True},
+            }],
     )
     monkeypatch.setattr(
         "src.core.live_execution.get_all_mids",
@@ -2163,10 +2296,11 @@ def test_sync_shadow_book_stamps_negative_pnl_for_short_underwater(monkeypatch):
     # => reconciled_pnl = (60000 - 60500) * 0.01 * 4 = -20.0
     monkeypatch.setattr(
         "src.core.live_execution.db.get_open_paper_trades",
-        lambda: [{
-            "id": 13, "coin": "BTC", "side": "short",
-            "entry_price": 60000.0, "size": 0.01, "leverage": 4,
-        }],
+            lambda: [{
+                "id": 13, "coin": "BTC", "side": "short",
+                "entry_price": 60000.0, "size": 0.01, "leverage": 4,
+                "metadata": {"live_mirror": True},
+            }],
     )
     monkeypatch.setattr(
         "src.core.live_execution.get_all_mids",
@@ -5244,6 +5378,93 @@ def test_daily_pnl_refresh_failure_streak_resets_on_success(monkeypatch):
     assert trader.update_daily_pnl_from_fills() is True
     assert trader._daily_pnl_refresh_failure_streak == 0
     assert trader.kill_switch_active is False
+
+
+def test_daily_pnl_refresh_counts_fees_and_uses_fresh_positions(monkeypatch):
+    seen_force_fresh = []
+
+    class FakeFirewall:
+        def validate(self, signal, **kwargs):
+            return True, "ok"
+
+        def set_daily_losses(self, value):
+            pass
+
+    class FillApiManager:
+        def post(self, payload, *args, **kwargs):
+            if payload.get("type") == "userFills":
+                now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+                return [
+                    {"time": now_ms, "closedPnl": "-1.00", "fee": "0.25"},
+                    {"time": now_ms, "closedPnl": "0.50", "fee": "0.10"},
+                ]
+            return {}
+
+    def fake_get_positions(self, *, force_fresh=False):
+        seen_force_fresh.append(force_fresh)
+        return [{"coin": "ETH", "side": "long", "unrealized_pnl": "-3.50"}]
+
+    monkeypatch.setattr(LiveTrader, "_load_credentials", _fake_live_credentials)
+    monkeypatch.setattr(LiveTrader, "_load_asset_index_map", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "reconcile_positions", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "get_positions", fake_get_positions)
+    monkeypatch.setattr(LiveTrader, "check_daily_loss", lambda self, **kw: False)
+
+    trader = LiveTrader(firewall=FakeFirewall(), dry_run=False, max_order_usd=1_000_000)
+    trader.api_manager = FillApiManager()
+
+    assert trader.update_daily_pnl_from_fills() is True
+    assert seen_force_fresh == [True]
+    assert trader.daily_realized_pnl == pytest.approx(-0.85)
+    assert trader.daily_fees_paid == pytest.approx(0.35)
+    assert trader.daily_unrealized_pnl == pytest.approx(-3.5)
+    assert trader.daily_pnl == pytest.approx(-4.35)
+
+
+def test_execute_signal_blocks_firewall_bypass_after_recent_live_side_net_loss(monkeypatch):
+    class FakeFirewall:
+        def validate(self, signal, **kwargs):
+            raise AssertionError("mirror path should bypass firewall validation")
+
+    def _refresh_daily_pnl(self, trigger_check=True):
+        self.daily_pnl = 0.0
+        self._recent_live_fill_trades = [
+            {"coin": "ETH", "side": "short", "pnl": 0.10, "metadata": {"source_key": "live_fill"}},
+            {"coin": "BTC", "side": "short", "pnl": 0.10, "metadata": {"source_key": "live_fill"}},
+            {"coin": "SOL", "side": "short", "pnl": 0.10, "metadata": {"source_key": "live_fill"}},
+            {"coin": "DOGE", "side": "short", "pnl": 0.10, "metadata": {"source_key": "live_fill"}},
+            {"coin": "AVAX", "side": "short", "pnl": -6.00, "metadata": {"source_key": "live_fill"}},
+        ]
+        return True
+
+    monkeypatch.setattr(config, "LIVE_RECENT_LOSS_GUARD_ENABLED", True, raising=False)
+    monkeypatch.setattr(config, "LIVE_RECENT_LOSS_SIDE_MIN_CLOSED", 5, raising=False)
+    monkeypatch.setattr(config, "LIVE_RECENT_LOSS_SIDE_BLOCK_NET_PNL", -5.0, raising=False)
+    monkeypatch.setattr(config, "LIVE_RECENT_LOSS_SIDE_BLOCK_WIN_RATE", 0.40, raising=False)
+    monkeypatch.setattr(config, "LIVE_RECENT_LOSS_COIN_SIDE_MIN_CLOSED", 99, raising=False)
+    monkeypatch.setattr(LiveTrader, "_load_credentials", _fake_live_credentials)
+    monkeypatch.setattr(LiveTrader, "_load_asset_index_map", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "reconcile_positions", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "get_firewall_positions", lambda self: [])
+    monkeypatch.setattr(LiveTrader, "update_daily_pnl_from_fills", _refresh_daily_pnl)
+
+    trader = LiveTrader(firewall=FakeFirewall(), dry_run=False, max_order_usd=1_000_000)
+    result = trader.execute_signal(
+        {
+            "coin": "SOL",
+            "side": "short",
+            "confidence": 0.9,
+            "entry_price": 150.0,
+            "position_pct": 0.05,
+            "leverage": 2,
+            "size": 0.1,
+            "context": {"live_mirror": True},
+        },
+        bypass_firewall=True,
+    )
+
+    assert result is None
+    assert trader.get_stats()["entry_metrics"]["rejected_recent_live_loss"] == 1
 
 
 def test_live_trader_source_day_cap_blocks_second_entry(monkeypatch):

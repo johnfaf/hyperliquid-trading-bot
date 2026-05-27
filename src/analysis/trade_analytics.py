@@ -8,8 +8,9 @@ without duplicating parsing logic.
 from __future__ import annotations
 
 import json
-from collections import Counter, defaultdict
-from typing import Dict, Iterable, List, Mapping
+from collections import Counter, defaultdict, deque
+from datetime import datetime, timezone
+from typing import Dict, Iterable, List, Mapping, Optional
 
 
 def _coerce_float(value, default: float = 0.0) -> float:
@@ -87,6 +88,172 @@ def _trade_source_key(trade: Dict) -> str:
         if strategy_type:
             return f"strategy:{strategy_type}"
     return key
+
+
+def _fill_direction(fill: Mapping) -> str:
+    return str(fill.get("dir", fill.get("direction", "")) or "")
+
+
+def _fill_closed_side(fill: Mapping) -> Optional[str]:
+    direction = _fill_direction(fill).lower()
+    if "close long" in direction or "long > short" in direction:
+        return "long"
+    if "close short" in direction or "short > long" in direction:
+        return "short"
+    if "open long" in direction or "open short" in direction:
+        return None
+
+    closed_pnl = _coerce_float(
+        fill.get("closedPnl", fill.get("closed_pnl", 0.0))
+    )
+    if abs(closed_pnl) <= 1e-12:
+        return None
+
+    order_side = str(fill.get("side", "") or "").strip().lower()
+    if order_side == "sell":
+        return "long"
+    if order_side == "buy":
+        return "short"
+    return None
+
+
+def _fill_open_side(fill: Mapping) -> Optional[str]:
+    direction = _fill_direction(fill).lower()
+    if "open long" in direction:
+        return "long"
+    if "open short" in direction:
+        return "short"
+
+    closed_pnl = _coerce_float(
+        fill.get("closedPnl", fill.get("closed_pnl", 0.0))
+    )
+    if abs(closed_pnl) > 1e-12:
+        return None
+
+    order_side = str(fill.get("side", "") or "").strip().lower()
+    if order_side == "buy":
+        return "long"
+    if order_side == "sell":
+        return "short"
+    return None
+
+
+def _fill_size(fill: Mapping) -> float:
+    return abs(_coerce_float(
+        fill.get(
+            "sz",
+            fill.get("size", fill.get("qty", fill.get("quantity", 0.0))),
+        )
+    ))
+
+
+def _fill_time_ms(fill: Mapping) -> int:
+    try:
+        return int(float(fill.get("time", fill.get("time_ms", 0)) or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _fill_closed_at_iso(fill: Mapping) -> str:
+    time_ms = _fill_time_ms(fill)
+    if time_ms > 0:
+        try:
+            return datetime.fromtimestamp(time_ms / 1000, tz=timezone.utc).isoformat()
+        except Exception:
+            pass
+    raw_time = fill.get("time", fill.get("time_ms", ""))
+    return str(raw_time or "")
+
+
+def normalise_hyperliquid_fill_history(
+    fills: Iterable[Mapping],
+    *,
+    limit: int = 200,
+    subtract_fees: bool = True,
+) -> List[Dict]:
+    """Convert Hyperliquid fills into closed-trade rows for recent policies.
+
+    Hyperliquid exposes opening fills with fee-only negative ``closedPnl`` in
+    CSV/API exports.  Those rows are not realized losses.  Opening fills are
+    tracked FIFO by coin/side so their fees can be charged to later closes
+    when both legs are present in the lookback.
+    """
+    rows: List[Dict] = []
+    open_fee_lots: Dict[tuple, deque] = defaultdict(deque)
+    ordered_fills = [
+        fill for fill in (fills or [])
+        if isinstance(fill, Mapping)
+    ]
+    ordered_fills.sort(key=_fill_time_ms)
+
+    for fill in ordered_fills:
+        coin = str(fill.get("coin", "") or "UNKNOWN").strip().upper() or "UNKNOWN"
+        fill_size = _fill_size(fill)
+        fee = abs(_coerce_float(fill.get("fee", 0.0)))
+        side = _fill_closed_side(fill)
+        open_side = _fill_open_side(fill)
+
+        if open_side in {"long", "short"} and fill_size > 0 and fee > 0:
+            open_fee_lots[(coin, open_side)].append({
+                "remaining_size": fill_size,
+                "fee_remaining": fee,
+            })
+
+        if side not in {"long", "short"}:
+            continue
+
+        closed_pnl = _coerce_float(
+            fill.get("closedPnl", fill.get("closed_pnl", 0.0))
+        )
+        entry_fee = 0.0
+        remaining_to_close = fill_size
+        lots = open_fee_lots[(coin, side)]
+        while subtract_fees and remaining_to_close > 0 and lots:
+            lot = lots[0]
+            lot_size = _coerce_float(lot.get("remaining_size", 0.0))
+            lot_fee = _coerce_float(lot.get("fee_remaining", 0.0))
+            if lot_size <= 0 or lot_fee <= 0:
+                lots.popleft()
+                continue
+            matched_size = min(remaining_to_close, lot_size)
+            matched_fee = lot_fee * (matched_size / lot_size)
+            entry_fee += matched_fee
+            remaining_to_close -= matched_size
+            lot["remaining_size"] = lot_size - matched_size
+            lot["fee_remaining"] = lot_fee - matched_fee
+            if lot["remaining_size"] <= 1e-12 or lot["fee_remaining"] <= 1e-12:
+                lots.popleft()
+
+        total_fees = fee + entry_fee
+        net_pnl = closed_pnl - total_fees if subtract_fees else closed_pnl
+        direction = _fill_direction(fill)
+        time_ms = _fill_time_ms(fill)
+
+        rows.append(
+            {
+                "coin": coin,
+                "side": side,
+                "pnl": net_pnl,
+                "closed_at": _fill_closed_at_iso(fill),
+                "time_ms": time_ms,
+                "metadata": {
+                    "source": "live_fill",
+                    "source_key": "live_fill",
+                    "direction": direction,
+                    "gross_pnl_before_fees": closed_pnl,
+                    "total_fees_paid": total_fees,
+                    "close_fee_paid": fee,
+                    "matched_entry_fee_paid": entry_fee,
+                    "hyperliquid_fill_hash": fill.get("hash", ""),
+                    "hyperliquid_order_id": fill.get("oid", ""),
+                },
+            }
+        )
+
+    rows.sort(key=lambda row: int(row.get("time_ms", 0) or 0), reverse=True)
+    if limit and limit > 0:
+        rows = rows[: int(limit)]
+    return rows
 
 
 def _new_bucket() -> Dict:

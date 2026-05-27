@@ -708,7 +708,8 @@ class PaperTrader:
     def execute_strategy_signals(self, strategies: List[Dict], exchange_agg=None,
                                   options_scanner=None,
                                   regime_data: Optional[Dict] = None,
-                                  arena=None) -> List[Dict]:
+                                  arena=None,
+                                  execution_open_positions: Optional[List[Dict]] = None) -> List[Dict]:
         """
         Generate and execute paper trades based on top strategies.
 
@@ -726,7 +727,11 @@ class PaperTrader:
         if not account:
             return []
 
-        open_trades = db.get_open_paper_trades()
+        open_trades = (
+            list(execution_open_positions)
+            if execution_open_positions is not None
+            else db.get_open_paper_trades()
+        )
         executed = []
         rotation_candidates = []
 

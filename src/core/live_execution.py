@@ -89,6 +89,123 @@ def _paper_trade_id_from_live_mirror(execution, live_signal=None) -> Optional[in
     return None
 
 
+def _execution_entry_price(execution=None, live_signal=None) -> float:
+    """Best-effort entry price for closing an unmirrored shadow row flat."""
+    candidates = []
+    if isinstance(execution, dict):
+        candidates.extend(
+            execution.get(key)
+            for key in ("entry_price", "price", "fill_price")
+        )
+    for attr in ("entry_price", "price", "fill_price"):
+        candidates.append(getattr(live_signal, attr, None))
+
+    for value in candidates:
+        try:
+            price = float(value or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if price > 0:
+            return price
+    return 0.0
+
+
+def is_confirmed_live_execution_result(live_result: Dict) -> bool:
+    """Return True only when the live entry is durable enough to shadow."""
+    if not isinstance(live_result, dict):
+        return False
+    status = str(live_result.get("status", "") or "").strip().lower()
+    if status == "success":
+        return True
+    if status != "submitted":
+        return False
+    if str(live_result.get("venue", "") or "").lower() != "lighter":
+        return False
+    for leg_key in ("entry", "stop_loss", "take_profit"):
+        leg = live_result.get(leg_key)
+        if not isinstance(leg, dict):
+            return False
+        leg_status = str(leg.get("status", "") or "").strip().lower()
+        if leg_status != "submitted":
+            return False
+    return True
+
+
+def _is_confirmed_live_mirror_result(live_result: Dict) -> bool:
+    """Backward-compatible alias for older tests/imports."""
+    return is_confirmed_live_execution_result(live_result)
+
+
+def _close_unmirrored_paper_trade(
+    trade_id: Optional[int],
+    live_signal=None,
+    reason: str = "live_mirror_not_opened",
+    live_result: Optional[Dict] = None,
+    entry_price: Optional[float] = None,
+) -> None:
+    """Close a paper trade flat when its live mirror never became real."""
+    if not trade_id:
+        return
+
+    flat_price = float(entry_price or 0.0)
+    if flat_price <= 0:
+        flat_price = _execution_entry_price(live_signal=live_signal)
+    if flat_price <= 0:
+        logger.warning(
+            "Could not close unmirrored paper trade %s flat: missing entry price",
+            trade_id,
+        )
+        return
+
+    now = datetime.now(timezone.utc).isoformat()
+    metadata = {
+        "live_mirror": False,
+        "live_mirror_attempted": True,
+        "live_mirror_failed_at": now,
+        "live_mirror_blocked_reason": reason,
+        "live_mirror_closed_flat": True,
+        "close_reason": reason,
+        "gross_pnl_before_fees": 0.0,
+        "net_pnl_after_fees": 0.0,
+    }
+    if live_signal is not None:
+        metadata.update({
+            "live_mirror_coin": getattr(live_signal, "coin", None),
+            "live_mirror_side": (
+                getattr(getattr(live_signal, "side", None), "value", None)
+                or str(getattr(live_signal, "side", "") or "")
+            ),
+        })
+    if isinstance(live_result, dict):
+        metadata["live_mirror_status"] = live_result.get("status")
+        for key in ("reason", "message", "entry_order_type"):
+            value = live_result.get(key)
+            if value not in (None, ""):
+                metadata[f"live_mirror_{key}"] = value
+        errors = live_result.get("errors")
+        if errors:
+            metadata["live_mirror_errors"] = errors
+    else:
+        metadata["live_mirror_status"] = "no_result"
+
+    try:
+        db.update_paper_trade_metadata(int(trade_id), metadata)
+        if db.close_paper_trade(int(trade_id), flat_price, 0.0):
+            logger.info(
+                "Closed unmirrored paper trade %s flat (%s) so it cannot "
+                "be reconciled as live PnL later",
+                trade_id,
+                reason,
+            )
+    except Exception as exc:
+        logger.warning(
+            "Could not close unmirrored paper trade %s flat (%s): %s",
+            trade_id,
+            reason,
+            exc,
+        )
+
+
 def _mark_paper_trade_live_mirrored(
     trade_id: Optional[int],
     live_signal,
@@ -102,6 +219,7 @@ def _mark_paper_trade_live_mirrored(
 
     metadata = {
         "live_mirror": True,
+        "live_mirror_attempted": True,
         "live_mirror_marked_at": datetime.now(timezone.utc).isoformat(),
         "live_mirror_status": live_result.get("status"),
         "live_mirror_coin": getattr(live_signal, "coin", None),
@@ -170,7 +288,10 @@ def get_execution_open_positions(container) -> List[Dict]:
     """Use exchange positions as the source of truth when live trading is active."""
     trader = get_live_trader(container)
     if trader and is_live_trading_active(container):
-        return trader.get_positions() or []
+        try:
+            return trader.get_positions(force_fresh=True) or []
+        except TypeError:
+            return trader.get_positions() or []
     return db.get_open_paper_trades()
 
 
@@ -178,9 +299,11 @@ def get_execution_account_balance(container) -> Optional[float]:
     """Use live account value when available, otherwise fall back to paper balance."""
     trader = get_live_trader(container)
     if trader and is_live_trading_active(container):
-        value = trader.get_account_value()
-        if value is not None:
-            return float(value)
+        get_value = getattr(trader, "get_account_value", None)
+        if callable(get_value):
+            value = get_value()
+            if value is not None:
+                return float(value)
 
     account = db.get_paper_account()
     if not account:
@@ -213,7 +336,10 @@ def sync_shadow_book_to_live(container) -> List[Dict]:
     if account_value is None or account_value <= 0:
         return []
 
-    fetched_positions = trader.get_positions() if trader else None
+    try:
+        fetched_positions = trader.get_positions(force_fresh=True) if trader else None
+    except TypeError:
+        fetched_positions = trader.get_positions() if trader else None
     if fetched_positions is None:
         logger.warning("Skipping shadow/live reconciliation: exchange positions unavailable")
         return []
@@ -231,6 +357,20 @@ def sync_shadow_book_to_live(container) -> List[Dict]:
     closed = []
     matched_live_keys = set()
     for trade in open_trades:
+        existing_meta = _trade_metadata(trade)
+        is_live_shadow = bool(
+            existing_meta.get("live_mirror") or existing_meta.get("orphan_found")
+        )
+        if not is_live_shadow:
+            logger.debug(
+                "Skipping shadow/live reconciliation for unmirrored paper "
+                "trade_id=%s coin=%s side=%s",
+                trade.get("id"),
+                trade.get("coin", "?"),
+                trade.get("side", "?"),
+            )
+            continue
+
         live_pos = live_positions.get(trade.get("coin", ""))
         if live_pos and live_pos.get("side") == trade.get("side"):
             matched_live_keys.add(
@@ -252,8 +392,6 @@ def sync_shadow_book_to_live(container) -> List[Dict]:
         trade_id = trade.get("id")
         if trade_id is None:
             continue
-
-        existing_meta = _trade_metadata(trade)
 
         # Compute reconciliation PnL FIRST so we can stamp the analytics
         # fields into metadata in the same write as the reconciliation
@@ -953,7 +1091,7 @@ def mirror_executed_trades_to_live(
                 # mirrored trade as "COIN traded Ns ago" — the paper trade that
                 # triggered the mirror.  Kill-switch and daily loss still apply.
                 live_result = trader.execute_signal(live_signal, bypass_firewall=True)
-                if live_result and live_result.get("status") not in ("error", "rejected"):
+                if is_confirmed_live_execution_result(live_result):
                     _mark_paper_trade_live_mirrored(
                         item.get("paper_trade_id"),
                         live_signal,
@@ -967,6 +1105,12 @@ def mirror_executed_trades_to_live(
                         live_signal.side.value,
                     )
                 else:
+                    _close_unmirrored_paper_trade(
+                        item.get("paper_trade_id"),
+                        live_signal=live_signal,
+                        reason="live_mirror_not_opened",
+                        live_result=live_result if isinstance(live_result, dict) else None,
+                    )
                     if live_result is None:
                         logger.info(
                             "%s skipped: %s %s blocked by live guardrails (no execution result)",

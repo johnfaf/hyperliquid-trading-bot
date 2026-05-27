@@ -4,6 +4,7 @@ from src.analysis.trade_analytics import (
     evaluate_short_side_policy,
     evaluate_side_source_policy,
     evaluate_source_policy,
+    normalise_hyperliquid_fill_history,
 )
 
 
@@ -62,6 +63,62 @@ def test_compute_trade_analytics_groups_by_side_and_source():
         if row["label"] == "copy_trade:0xabc short"
     )
     assert exact_side_row["net_pnl"] == -0.8
+
+
+def test_normalise_hyperliquid_fill_history_maps_closed_side_and_fees():
+    rows = normalise_hyperliquid_fill_history(
+        [
+            {
+                "coin": "SOL",
+                "dir": "Open Short",
+                "side": "sell",
+                "time": 1700000000000,
+                "closedPnl": "0",
+                "fee": "0.10",
+            },
+            {
+                "coin": "SOL",
+                "dir": "Close Short",
+                "side": "buy",
+                "time": 1700000001000,
+                "closedPnl": "-2.00",
+                "fee": "0.40",
+                "hash": "h2",
+                "oid": 456,
+            },
+            {
+                "coin": "ETH",
+                "dir": "Open Long",
+                "side": "buy",
+                "time": 1700000002000,
+                "sz": "2.0",
+                "closedPnl": "-0.10",
+                "fee": "0.10",
+            },
+            {
+                "coin": "ETH",
+                "dir": "Close Long",
+                "side": "sell",
+                "time": 1700000003000,
+                "sz": "2.0",
+                "closedPnl": "1.50",
+                "fee": "0.25",
+                "hash": "h1",
+                "oid": 123,
+            },
+        ],
+        limit=10,
+        subtract_fees=True,
+    )
+
+    assert [row["coin"] for row in rows] == ["ETH", "SOL"]
+    assert rows[0]["side"] == "long"
+    assert rows[0]["pnl"] == 1.15
+    assert rows[0]["metadata"]["total_fees_paid"] == 0.35
+    assert rows[0]["metadata"]["matched_entry_fee_paid"] == 0.1
+    assert rows[1]["side"] == "short"
+    assert rows[1]["pnl"] == -2.4
+    assert rows[1]["metadata"]["gross_pnl_before_fees"] == -2.0
 
 
 def test_compute_trade_analytics_includes_tp_sl_path_metrics():

@@ -14,6 +14,7 @@ import config
 from src.core import clock_provider
 from src.data import database as db
 from src.core.live_execution import (
+    get_execution_account_balance,
     get_execution_open_positions,
     is_live_trading_active,
     mirror_executed_trades_to_live,
@@ -1234,6 +1235,7 @@ def run_trading_cycle(container, cycle_count: int) -> None:
                 top_strategies, exchange_agg=container.exchange_agg,
                 options_scanner=container.options_scanner,
                 regime_data=regime_data, arena=container.arena,
+                execution_open_positions=open_trades,
             )
             logger.info("  Executed %d new paper trades", len(executed))
 
@@ -1586,18 +1588,20 @@ def _execute_lcrs_signals(container, lcrs_signals, regime_data):
                         logger.info("  LCRS firewall rejected %s: %s", sig["coin"], reason)
                         continue
 
-                if account and (container.kelly_sizer or getattr(container, "rl_sizer", None)):
-                    sizing = _get_dynamic_sizing(
-                        container,
-                        "liquidation_reversal",
-                        account["balance"],
-                        trade_signal.confidence,
-                        regime_data=regime_data,
-                        coin=sig["coin"],
-                        volatility=sig.get("features", {}).get("volatility", 0.02),
-                    )
-                    if sizing:
-                        trade_signal.position_pct = sizing.position_pct
+                if container.kelly_sizer or getattr(container, "rl_sizer", None):
+                    sizing_balance = get_execution_account_balance(container)
+                    if sizing_balance is not None:
+                        sizing = _get_dynamic_sizing(
+                            container,
+                            "liquidation_reversal",
+                            sizing_balance,
+                            trade_signal.confidence,
+                            regime_data=regime_data,
+                            coin=sig["coin"],
+                            volatility=sig.get("features", {}).get("volatility", 0.02),
+                        )
+                        if sizing:
+                            trade_signal.position_pct = sizing.position_pct
 
                 if container.trade_memory:
                     mem = container.trade_memory.find_similar(
@@ -1862,7 +1866,11 @@ def _run_copy_trading(container, regime_data):
         logger.debug("  Golden bridge skipped: %s", exc)
 
     if copy_signals and container.copy_trader:
-        copy_executed = container.copy_trader.execute_copy_signals(copy_signals, regime_data=regime_data)
+        copy_executed = container.copy_trader.execute_copy_signals(
+            copy_signals,
+            regime_data=regime_data,
+            execution_open_positions=get_execution_open_positions(container),
+        )
         logger.info("  Executed %d copy trades", len(copy_executed))
         if tg.is_configured():
             for t in copy_executed:

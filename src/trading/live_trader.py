@@ -98,6 +98,7 @@ except ImportError:  # pragma: no cover
 import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import config
+from src.analysis.trade_analytics import evaluate_side_source_policy, normalise_hyperliquid_fill_history
 from src.data import database as db
 from src.core.api_manager import Priority, get_manager
 from src.core.secret_manager import SecretManagerError, load_agent_private_key
@@ -391,6 +392,7 @@ class LiveTrader:
         self.daily_pnl = 0.0
         self.daily_realized_pnl = 0.0
         self.daily_unrealized_pnl = 0.0
+        self.daily_fees_paid = 0.0
         self.daily_reset_date = ""
         self.kill_switch_active = False
         self.orders_today = 0
@@ -406,6 +408,31 @@ class LiveTrader:
 
         # Track realized PnL from closed positions for daily loss enforcement
         self._last_known_positions: Dict[str, Dict] = {}  # coin -> position snapshot
+        self._recent_live_fill_trades: List[Dict[str, Any]] = []
+        self._live_recent_loss_guard_enabled = bool(
+            getattr(config, "LIVE_RECENT_LOSS_GUARD_ENABLED", True)
+        )
+        self._live_recent_loss_lookback_fills = int(
+            getattr(config, "LIVE_RECENT_LOSS_LOOKBACK_FILLS", 200)
+        )
+        self._live_recent_loss_side_min_closed = int(
+            getattr(config, "LIVE_RECENT_LOSS_SIDE_MIN_CLOSED", 5)
+        )
+        self._live_recent_loss_side_block_win_rate = float(
+            getattr(config, "LIVE_RECENT_LOSS_SIDE_BLOCK_WIN_RATE", 0.40)
+        )
+        self._live_recent_loss_side_block_net_pnl = float(
+            getattr(config, "LIVE_RECENT_LOSS_SIDE_BLOCK_NET_PNL", -5.0)
+        )
+        self._live_recent_loss_coin_side_min_closed = int(
+            getattr(config, "LIVE_RECENT_LOSS_COIN_SIDE_MIN_CLOSED", 2)
+        )
+        self._live_recent_loss_coin_side_block_win_rate = float(
+            getattr(config, "LIVE_RECENT_LOSS_COIN_SIDE_BLOCK_WIN_RATE", 0.50)
+        )
+        self._live_recent_loss_coin_side_block_net_pnl = float(
+            getattr(config, "LIVE_RECENT_LOSS_COIN_SIDE_BLOCK_NET_PNL", -2.0)
+        )
 
         # Order idempotency: prevent duplicate orders from timeout/retry
         # Maps action_hash -> (timestamp, result) for recent orders
@@ -1892,8 +1919,11 @@ class LiveTrader:
         }
 
     def get_firewall_positions(self) -> Optional[List[Dict[str, Any]]]:
-        """Return normalized live positions in the format the firewall expects."""
-        return self.get_positions()
+        """Return fresh normalized live positions in the format the firewall expects."""
+        try:
+            return self.get_positions(force_fresh=True)
+        except TypeError:
+            return self.get_positions()
 
     def _get_asset_index(self, coin: str) -> Optional[int]:
         """Get asset index for a coin."""
@@ -2135,7 +2165,10 @@ class LiveTrader:
     ) -> Optional[Dict[str, Any]]:
         positions = open_positions
         if positions is None:
-            positions = self.get_positions()
+            try:
+                positions = self.get_positions(force_fresh=True)
+            except TypeError:
+                positions = self.get_positions()
         if not positions:
             return None
 
@@ -3995,6 +4028,114 @@ class LiveTrader:
         except Exception as exc:
             logger.error("Deferred protective resize error for %s: %s", coin, exc)
 
+    def _refresh_recent_live_fill_history(self, fills: List[Dict[str, Any]]) -> None:
+        limit = max(1, int(self._live_recent_loss_lookback_fills or 1))
+        try:
+            rows = normalise_hyperliquid_fill_history(
+                fills,
+                limit=limit,
+                subtract_fees=bool(getattr(config, "LIVE_SUBTRACT_FEES_FROM_PNL", True)),
+            )
+        except Exception as exc:
+            logger.debug("Could not normalize recent live fills: %s", exc)
+            rows = []
+
+        with self._state_lock:
+            self._recent_live_fill_trades = rows
+
+        if hasattr(self.firewall, "set_live_fill_history"):
+            try:
+                subtract_fees = bool(getattr(config, "LIVE_SUBTRACT_FEES_FROM_PNL", True))
+                try:
+                    self.firewall.set_live_fill_history(
+                        fills,
+                        limit=limit,
+                        subtract_fees=subtract_fees,
+                    )
+                except TypeError as type_exc:
+                    if "subtract_fees" not in str(type_exc):
+                        raise
+                    self.firewall.set_live_fill_history(fills, limit=limit)
+            except Exception as exc:
+                logger.debug("Could not inject live fill history into firewall: %s", exc)
+
+    def _passes_live_recent_loss_guard(self, signal: TradeSignal) -> Tuple[bool, str]:
+        """Block fresh live entries after recent real-money losses.
+
+        This lives in ``LiveTrader`` as well as the firewall so paper-to-live
+        mirrors, which intentionally bypass firewall cooldowns, still respect
+        the exchange's actual losing streaks.
+        """
+        if not self._live_recent_loss_guard_enabled:
+            return True, ""
+
+        side = self._signal_side_value(signal)
+        if side not in {"long", "short"}:
+            return True, ""
+
+        coin = str(getattr(signal, "coin", "") or "").strip().upper()
+        with self._state_lock:
+            trades = list(self._recent_live_fill_trades or [])
+        if not trades:
+            return True, ""
+
+        def _net_loss_breached(policy: Dict[str, Any], min_trades: int, block_net_pnl: float) -> Tuple[bool, str]:
+            metrics = policy.get("metrics", {}) or {}
+            try:
+                count = int(metrics.get("count", 0) or 0)
+            except Exception:
+                count = 0
+            try:
+                net_pnl = float(metrics.get("net_pnl", 0.0) or 0.0)
+            except Exception:
+                net_pnl = 0.0
+            threshold = float(block_net_pnl)
+            if count >= int(min_trades) and net_pnl <= threshold:
+                return True, (
+                    f"{count} closed trades net {net_pnl:.2f} breached "
+                    f"loss floor {threshold:.2f}"
+                )
+            return False, ""
+
+        coin_policy = evaluate_side_source_policy(
+            trades,
+            side=side,
+            coin=coin,
+            min_trades=self._live_recent_loss_coin_side_min_closed,
+            degrade_win_rate=self._live_recent_loss_coin_side_block_win_rate,
+            block_win_rate=self._live_recent_loss_coin_side_block_win_rate,
+            block_net_pnl=self._live_recent_loss_coin_side_block_net_pnl,
+        )
+        if str(coin_policy.get("status", "")).lower() == "blocked":
+            return False, f"recent_live_coin_side_loss:{coin_policy.get('reason')}"
+        breached, reason = _net_loss_breached(
+            coin_policy,
+            self._live_recent_loss_coin_side_min_closed,
+            self._live_recent_loss_coin_side_block_net_pnl,
+        )
+        if breached:
+            return False, f"recent_live_coin_side_net_loss:{reason}"
+
+        side_policy = evaluate_side_source_policy(
+            trades,
+            side=side,
+            min_trades=self._live_recent_loss_side_min_closed,
+            degrade_win_rate=self._live_recent_loss_side_block_win_rate,
+            block_win_rate=self._live_recent_loss_side_block_win_rate,
+            block_net_pnl=self._live_recent_loss_side_block_net_pnl,
+        )
+        if str(side_policy.get("status", "")).lower() == "blocked":
+            return False, f"recent_live_side_loss:{side_policy.get('reason')}"
+        breached, reason = _net_loss_breached(
+            side_policy,
+            self._live_recent_loss_side_min_closed,
+            self._live_recent_loss_side_block_net_pnl,
+        )
+        if breached:
+            return False, f"recent_live_side_net_loss:{reason}"
+
+        return True, ""
+
     def update_daily_pnl_from_fills(self, trigger_check: bool = True):
         """
         Fetch recent fills from the exchange and update daily_pnl.
@@ -4022,10 +4163,14 @@ class LiveTrader:
             )
             if not isinstance(fills, list):
                 raise RuntimeError(f"userFills returned {type(fills).__name__}, expected list")
+            self._refresh_recent_live_fill_history(fills)
 
-            # Sum realized closed PnL from today's fills.
+            # Sum realized closed PnL from today's fills.  Hyperliquid exposes
+            # fees separately; include them so the circuit breaker reacts to
+            # true net live bleed, not closedPnl-only.
             today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-            today_realized = 0.0
+            today_realized_gross = 0.0
+            today_fees = 0.0
             for fill in fills:
                 fill_time = fill.get("time", "")
                 if isinstance(fill_time, (int, float)):
@@ -4038,13 +4183,26 @@ class LiveTrader:
                     continue
 
                 if fill_date == today:
-                    closed_pnl = float(fill.get("closedPnl", 0))
-                    today_realized += closed_pnl
+                    closed_pnl = self._coerce_float(
+                        fill.get("closedPnl", fill.get("closed_pnl", 0)),
+                        0.0,
+                    )
+                    fee = abs(self._coerce_float(fill.get("fee", 0), 0.0))
+                    today_realized_gross += closed_pnl
+                    today_fees += fee
+
+            if bool(getattr(config, "LIVE_SUBTRACT_FEES_FROM_PNL", True)):
+                today_realized = today_realized_gross - today_fees
+            else:
+                today_realized = today_realized_gross
 
             # Include current unrealized PnL so daily loss controls react to
             # open-position drawdowns, not only realized closes.
             unrealized = self.daily_unrealized_pnl
-            positions = self.get_positions()
+            try:
+                positions = self.get_positions(force_fresh=True)
+            except TypeError:
+                positions = self.get_positions()
             if positions is None:
                 logger.warning(
                     "Could not refresh positions for unrealized PnL - keeping prior estimate %+.2f",
@@ -4063,6 +4221,7 @@ class LiveTrader:
                 old_pnl = self.daily_pnl
                 self.daily_realized_pnl = today_realized
                 self.daily_unrealized_pnl = unrealized
+                self.daily_fees_paid = today_fees
                 self.daily_pnl = today_pnl
                 current_daily_pnl = self.daily_pnl
                 current_realized = self.daily_realized_pnl
@@ -6203,6 +6362,17 @@ class LiveTrader:
             logger.warning("Live safety stop (%s) - rejecting signal", reason)
             return None
 
+        live_loss_ok, live_loss_reason = self._passes_live_recent_loss_guard(signal)
+        if not live_loss_ok:
+            self._incr_entry_metric("rejected_recent_live_loss")
+            logger.warning(
+                "Recent live loss guard - rejecting %s %s (%s)",
+                signal.coin,
+                self._signal_side_value(signal),
+                live_loss_reason,
+            )
+            return None
+
         # Soft calibration pause: not sticky, just blocks live entries
         # while global ECE is above the live-pause threshold. Set by
         # the trading cycle (or any caller that touches calibration).
@@ -6225,15 +6395,17 @@ class LiveTrader:
             )
             return None
 
-        if not bypass_firewall:
-            live_positions = self.get_firewall_positions() if self.is_deployable() else None
-            live_account_value = self.get_account_value() if self.is_deployable() else None
-            if self.is_deployable() and live_positions is None:
+        if self.is_deployable():
+            live_positions = self.get_firewall_positions()
+            if live_positions is None:
                 self._incr_entry_metric("rejected_positions_unavailable")
                 logger.warning(
                     "Live positions unavailable - rejecting signal rather than trading blind"
                 )
                 return None
+
+        if not bypass_firewall:
+            live_account_value = self.get_account_value() if self.is_deployable() else None
 
             # Validate through firewall
             passed, reason = self.firewall.validate(

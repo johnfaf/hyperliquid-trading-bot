@@ -12,6 +12,7 @@ import threading
 import time
 
 from src.core.live_execution import (
+    get_execution_open_positions,
     is_live_trading_active,
     mirror_executed_trades_to_live,
     sync_shadow_book_to_live,
@@ -393,7 +394,10 @@ def run_fast_cycle(container, cycle_count: int) -> None:
         if container.copy_trader:
             copy_signals = container.copy_trader.scan_top_traders(top_n=10)
             if copy_signals:
-                copy_executed = container.copy_trader.execute_copy_signals(copy_signals)
+                copy_executed = container.copy_trader.execute_copy_signals(
+                    copy_signals,
+                    execution_open_positions=get_execution_open_positions(container),
+                )
                 if copy_executed:
                     logger.info("[fast] Copy-traded %d positions", len(copy_executed))
                     mirror_executed_trades_to_live(
