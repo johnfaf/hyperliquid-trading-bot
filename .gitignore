@@ -12,6 +12,7 @@ data/*.db
 data/*.db-journal
 data/*.db-wal
 data/*.db-shm
+data/bot_backup*.json
 
 # Bulk imported / regeneratable data
 data/*.csv
@@ -34,6 +35,7 @@ env/
 # IDE
 .vscode/
 .idea/
+.claude/
 *.swp
 *.swo
 
