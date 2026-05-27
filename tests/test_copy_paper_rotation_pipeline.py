@@ -414,3 +414,162 @@ def test_paper_trader_replaces_existing_strategy_position_instead_of_dropping(mo
     assert firewall_calls[0]["open_positions"] == []
     assert len(firewall_calls[1]["open_positions"]) == 7
     assert closed == [(11, "rotation_out:ETH")]
+
+
+def test_paper_trader_execution_firewall_uses_exchange_positions(monkeypatch):
+    account = {"balance": 10_000.0}
+    live_positions = [
+        {
+            "coin": "BTC",
+            "side": "long",
+            "size": 0.001,
+            "entry_price": 65_000.0,
+            "leverage": 2,
+        }
+    ]
+    firewall_calls = []
+
+    class FakeFirewall:
+        def validate(self, signal, **kwargs):
+            firewall_calls.append(kwargs)
+            positions = kwargs.get("open_positions") or []
+            side = signal.side.value if hasattr(signal.side, "value") else str(signal.side)
+            if not kwargs.get("dry_run") and any(
+                pos.get("coin") == signal.coin
+                and str(pos.get("side", "")).lower() == side
+                for pos in positions
+            ):
+                return False, "Pyramiding blocked in exchange book"
+            return True, "ok"
+
+    monkeypatch.setattr("src.trading.paper_trader.db.get_paper_account", lambda: account)
+    monkeypatch.setattr("src.trading.paper_trader.db.get_open_paper_trades", lambda: [])
+    monkeypatch.setattr("src.trading.paper_trader.hl.get_all_mids", lambda: {"BTC": 65_000.0})
+
+    trader = PaperTrader(firewall=FakeFirewall())
+    monkeypatch.setattr(trader, "_annotate_open_trades", lambda trades, mids: None)
+    monkeypatch.setattr(
+        trader,
+        "_generate_signal",
+        lambda strategy, mids, regime_data=None: {
+            "coin": "BTC",
+            "side": "long",
+            "price": 65_000.0,
+            "size": 0.001,
+            "leverage": 2,
+            "stop_loss": 63_000.0,
+            "take_profit": 69_000.0,
+            "strategy_type": "momentum_long",
+            "confidence": 0.8,
+        },
+    )
+    monkeypatch.setattr(
+        trader,
+        "_passes_trade_quality_gate",
+        lambda trade_signal, sig: (
+            True,
+            {
+                "reason": "test",
+                "edge_bps": 10.0,
+                "cost_bps": 1.0,
+                "minimum_edge_bps": 1.0,
+            },
+        ),
+    )
+    monkeypatch.setattr(
+        trader.rotation_manager,
+        "decide",
+        lambda *args, **kwargs: RotationDecision(
+            action="open",
+            reason="test open",
+            candidate_score=0.9,
+        ),
+    )
+    monkeypatch.setattr(
+        trader,
+        "_execute_paper_trade",
+        lambda *args, **kwargs: pytest.fail("duplicate live exposure must not open paper trade"),
+    )
+
+    executed = trader.execute_strategy_signals(
+        [{"id": 1, "name": "Momentum", "current_score": 0.8}],
+        regime_data={"overall_regime": "neutral"},
+        execution_open_positions=live_positions,
+    )
+
+    assert executed == []
+    assert firewall_calls[0]["dry_run"] is True
+    assert firewall_calls[0]["open_positions"] == []
+    assert firewall_calls[1]["open_positions"] == live_positions
+
+
+def test_copy_trader_execution_firewall_uses_exchange_positions(monkeypatch):
+    live_positions = [
+        {
+            "coin": "BTC",
+            "side": "long",
+            "size": 0.001,
+            "entry_price": 65_000.0,
+            "leverage": 2,
+        }
+    ]
+    firewall_calls = []
+
+    class FakeFirewall:
+        def validate(self, signal, **kwargs):
+            firewall_calls.append(kwargs)
+            positions = kwargs.get("open_positions") or []
+            side = signal.side.value if hasattr(signal.side, "value") else str(signal.side)
+            if not kwargs.get("dry_run") and any(
+                pos.get("coin") == signal.coin
+                and str(pos.get("side", "")).lower() == side
+                for pos in positions
+            ):
+                return False, "Pyramiding blocked in exchange book"
+            return True, "ok"
+
+    monkeypatch.setattr(
+        "src.trading.copy_trader.db.get_paper_account",
+        lambda: {"balance": 10_000.0},
+    )
+    monkeypatch.setattr("src.trading.copy_trader.db.get_open_paper_trades", lambda: [])
+    monkeypatch.setattr("src.trading.copy_trader.hl.get_all_mids", lambda: {"BTC": 65_000.0})
+
+    trader = CopyTrader(firewall=FakeFirewall())
+    monkeypatch.setattr(trader, "_refresh_copy_guardrail_status", lambda: {"status": "active"})
+    monkeypatch.setattr(trader, "_annotate_open_trades", lambda trades, mids: None)
+    monkeypatch.setattr(
+        trader.rotation_manager,
+        "decide",
+        lambda *args, **kwargs: RotationDecision(
+            action="open",
+            reason="test open",
+            candidate_score=0.9,
+        ),
+    )
+    monkeypatch.setattr(
+        trader,
+        "_open_copy_trade",
+        lambda *args, **kwargs: pytest.fail("duplicate live copy exposure must not open paper trade"),
+    )
+
+    executed = trader.execute_copy_signals(
+        [
+            {
+                "type": "copy_open",
+                "coin": "BTC",
+                "side": "long",
+                "price": 65_000.0,
+                "leverage": 2,
+                "confidence": 0.8,
+                "source_trader": COPY_ADDR_A,
+            }
+        ],
+        regime_data={"overall_regime": "neutral"},
+        execution_open_positions=live_positions,
+    )
+
+    assert executed == []
+    assert firewall_calls[0]["dry_run"] is True
+    assert firewall_calls[0]["open_positions"] == []
+    assert firewall_calls[1]["open_positions"] == live_positions

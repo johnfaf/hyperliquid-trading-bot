@@ -708,7 +708,8 @@ class PaperTrader:
     def execute_strategy_signals(self, strategies: List[Dict], exchange_agg=None,
                                   options_scanner=None,
                                   regime_data: Optional[Dict] = None,
-                                  arena=None) -> List[Dict]:
+                                  arena=None,
+                                  execution_open_positions: Optional[List[Dict]] = None) -> List[Dict]:
         """
         Generate and execute paper trades based on top strategies.
 
@@ -727,6 +728,11 @@ class PaperTrader:
             return []
 
         open_trades = db.get_open_paper_trades()
+        risk_open_positions = (
+            list(execution_open_positions)
+            if execution_open_positions is not None
+            else list(open_trades)
+        )
         executed = []
         rotation_candidates = []
 
@@ -1257,7 +1263,7 @@ class PaperTrader:
                         llm_context = {
                             "regime_data": regime_data,
                             "memory_result": memory_result.to_dict() if hasattr(memory_result, 'to_dict') and memory_result else None,
-                            "open_positions": open_trades,
+                            "open_positions": risk_open_positions,
                             "all_signals": raw_signals,
                         }
                         llm_approved, llm_conf, llm_reason = self.llm_filter.filter(sig, llm_context)
@@ -1379,7 +1385,7 @@ class PaperTrader:
             sig = candidate["signal"]
             victim = None
             closed_victim_event = None
-            candidate_open_positions = open_trades
+            candidate_open_positions = risk_open_positions
             decision_reason = ""
             decision_candidate_score = None
             decision_incumbent_score = None
@@ -1421,7 +1427,7 @@ class PaperTrader:
                     )
                     continue
                 candidate_open_positions = [
-                    trade for trade in open_trades if trade.get("id") != victim.get("id")
+                    trade for trade in risk_open_positions if trade.get("id") != victim.get("id")
                 ]
                 decision_reason = (
                     f"strategy refresh: replace {victim.get('coin')} "
@@ -1535,7 +1541,7 @@ class PaperTrader:
                         continue
 
                     candidate_open_positions = [
-                        trade for trade in open_trades if trade.get("id") != victim.get("id")
+                        trade for trade in risk_open_positions if trade.get("id") != victim.get("id")
                     ]
                 decision_reason = decision.reason
 
@@ -1617,6 +1623,9 @@ class PaperTrader:
                 # Remove closed victim from working position list immediately so
                 # subsequent firewall checks in this batch don't double-count it.
                 open_trades = [t for t in open_trades if t.get("id") != victim.get("id")]
+                risk_open_positions = [
+                    t for t in risk_open_positions if t.get("id") != victim.get("id")
+                ]
 
             trade = self._execute_paper_trade(account, sig["strategy"], sig)
             if trade:
@@ -1626,6 +1635,7 @@ class PaperTrader:
                 executed.append(trade)
                 self._annotate_open_trades([trade], mids)
                 open_trades.append(trade)
+                risk_open_positions.append(trade)
 
                 if victim:
                     replacements_used += 1

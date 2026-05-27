@@ -929,7 +929,8 @@ class CopyTrader:
         return signal
 
     def execute_copy_signals(self, signals: List[Dict],
-                              regime_data: Optional[Dict] = None) -> List[Dict]:
+                              regime_data: Optional[Dict] = None,
+                              execution_open_positions: Optional[List[Dict]] = None) -> List[Dict]:
         """
         Execute copy-trade signals as paper trades.
         V2: Routes open signals through DecisionFirewall before execution.
@@ -943,6 +944,11 @@ class CopyTrader:
             return []
 
         open_trades = db.get_open_paper_trades()
+        risk_open_positions = (
+            list(execution_open_positions)
+            if execution_open_positions is not None
+            else list(open_trades)
+        )
         mids = hl.get_all_mids() or {}
         executed = []
         pending_entries = []
@@ -972,6 +978,9 @@ class CopyTrader:
                     closed = self._close_copy_trades(signal, open_trades, mids, close_reason=reason)
                     closed_ids = {trade["trade_id"] for trade in closed}
                     open_trades = [trade for trade in open_trades if trade.get("id") not in closed_ids]
+                    risk_open_positions = [
+                        trade for trade in risk_open_positions if trade.get("id") not in closed_ids
+                    ]
                     continue
 
                 if signal["type"] in ("copy_open", "copy_scale_in", "copy_flip", "golden_copy"):
@@ -1133,7 +1142,8 @@ class CopyTrader:
                 replacements_used=replacements_used,
             )
             victim = None
-            candidate_open_positions = open_trades
+            candidate_risk_positions = risk_open_positions
+            candidate_paper_positions = open_trades
             shadow_bypass_open = (
                 shadow_mode
                 and self.rotation_manager.should_bypass_reject_in_shadow_mode(
@@ -1197,12 +1207,15 @@ class CopyTrader:
                     logger.info("  Rotation skipped copy %s: incumbent not found", signal["coin"])
                     continue
 
-                candidate_open_positions = [
+                candidate_paper_positions = [
                     trade for trade in open_trades if trade.get("id") != victim.get("id")
+                ]
+                candidate_risk_positions = [
+                    trade for trade in risk_open_positions if trade.get("id") != victim.get("id")
                 ]
 
             if self.max_concurrent_trades > 0:
-                projected_copy_count = self._open_copy_trade_count(candidate_open_positions)
+                projected_copy_count = self._open_copy_trade_count(candidate_paper_positions)
                 if projected_copy_count >= self.max_concurrent_trades:
                     logger.info(
                         "  Copy-trader cap reached (%d/%d open copy trades); skipping %s %s",
@@ -1217,7 +1230,7 @@ class CopyTrader:
                 passed, reason = self.firewall.validate(
                     trade_signal,
                     regime_data=regime_data,
-                    open_positions=candidate_open_positions,
+                    open_positions=candidate_risk_positions,
                 )
                 if not passed:
                     logger.info(
@@ -1251,42 +1264,39 @@ class CopyTrader:
                 signal["_signal_id"] = signal_id
                 signal["_source_key"] = source_key
 
+            closed_trade = None
+            if victim:
+                current_price = float(
+                    mids.get(victim["coin"], victim.get("entry_price", 0)) or victim.get("entry_price", 0)
+                )
+                closed_trade = self._close_trade(
+                    victim,
+                    exit_price=current_price,
+                    close_reason=f"rotation_out:{signal['coin']}",
+                )
+                if not closed_trade:
+                    logger.warning(
+                        "  Rotation victim close failed for %s -- skipping copy replacement with %s",
+                        victim.get("coin"),
+                        signal["coin"],
+                    )
+                    continue
+                open_trades = [t for t in open_trades if t.get("id") != victim.get("id")]
+                risk_open_positions = [
+                    t for t in risk_open_positions if t.get("id") != victim.get("id")
+                ]
+                candidate_paper_positions = [
+                    t for t in candidate_paper_positions if t.get("id") != victim.get("id")
+                ]
+
             account = db.get_paper_account() or account
-            trade = self._open_copy_trade(account, signal, candidate_open_positions)
+            trade = self._open_copy_trade(account, signal, candidate_paper_positions)
             if trade:
                 executed.append(trade)
                 self._annotate_open_trades([trade], mids)
                 open_trades.append(trade)
+                risk_open_positions.append(trade)
                 if victim:
-                    current_price = float(
-                        mids.get(victim["coin"], victim.get("entry_price", 0)) or victim.get("entry_price", 0)
-                    )
-                    closed_trade = self._close_trade(
-                        victim,
-                        exit_price=current_price,
-                        close_reason=f"rotation_out:{signal['coin']}",
-                    )
-                    if not closed_trade:
-                        logger.warning(
-                            "  Rotation close failed after opening copy %s; rolling back trade %s",
-                            signal["coin"],
-                            trade.get("id"),
-                        )
-                        rollback = self._close_trade(
-                            trade,
-                            exit_price=float(
-                                signal.get("price", trade.get("entry_price", 0))
-                                or trade.get("entry_price", 0)
-                            ),
-                            close_reason=f"rotation_rollback:{victim.get('coin', 'unknown')}",
-                        )
-                        open_trades = [t for t in open_trades if t.get("id") != trade.get("id")]
-                        executed = [t for t in executed if t.get("id") != trade.get("id")]
-                        if not rollback:
-                            logger.error("  Rollback close also failed for copy trade %s", trade.get("id"))
-                        continue
-
-                    open_trades = [t for t in open_trades if t.get("id") != victim.get("id")]
                     replacements_used += 1
                     self.rotation_manager.register_replacement(
                         replaced_trade=victim,

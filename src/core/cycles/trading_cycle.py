@@ -1163,6 +1163,7 @@ def run_trading_cycle(container, cycle_count: int) -> None:
                 top_strategies, exchange_agg=container.exchange_agg,
                 options_scanner=container.options_scanner,
                 regime_data=regime_data, arena=container.arena,
+                execution_open_positions=open_trades,
             )
             logger.info("  Executed %d new paper trades", len(executed))
 
@@ -1791,7 +1792,11 @@ def _run_copy_trading(container, regime_data):
         logger.debug("  Golden bridge skipped: %s", exc)
 
     if copy_signals and container.copy_trader:
-        copy_executed = container.copy_trader.execute_copy_signals(copy_signals, regime_data=regime_data)
+        copy_executed = container.copy_trader.execute_copy_signals(
+            copy_signals,
+            regime_data=regime_data,
+            execution_open_positions=get_execution_open_positions(container),
+        )
         logger.info("  Executed %d copy trades", len(copy_executed))
         if tg.is_configured():
             for t in copy_executed:
