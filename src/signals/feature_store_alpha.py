@@ -152,12 +152,18 @@ class FeatureStoreAlphaPipeline:
             cfg.get("artifact_hmac_key")
             or os.environ.get("ALPHA_MODEL_ARTIFACT_HMAC_KEY", "")
         )
-        self.require_signed_artifacts = str(
+        require_signed_requested = str(
             cfg.get(
                 "require_signed_artifacts",
                 os.environ.get("ALPHA_MODEL_REQUIRE_SIGNED_ARTIFACTS", "true"),
             )
         ).strip().lower() not in {"0", "false", "no", "off"}
+        if not require_signed_requested:
+            logger.warning(
+                "ALPHA_MODEL_REQUIRE_SIGNED_ARTIFACTS=false is no longer honored; "
+                "alpha model artifacts must have a valid HMAC signature."
+            )
+        self.require_signed_artifacts = True
 
         self._ensemble_specs = cfg.get(
             "ensemble_specs",

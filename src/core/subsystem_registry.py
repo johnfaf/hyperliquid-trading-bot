@@ -870,7 +870,7 @@ def build_subsystems(
             lighter_effective = lighter_requested and lighter_confirmed
             c.lighter_live_trader = _safe_init(
                 "lighter_live_trader",
-                lambda: LighterLiveTrader(dry_run=not lighter_effective),
+                lambda: LighterLiveTrader(firewall=c.firewall, dry_run=not lighter_effective),
                 health,
                 affects_trading=lighter_effective,
             )
@@ -1019,6 +1019,11 @@ def build_subsystems(
         try:
             from src.ui.v2 import set_components as _set_v2_components
             from src.ui.v2 import start_server as _start_v2_server
+            execution_trader = (
+                c.lighter_live_trader
+                if getattr(config, "LIVE_EXECUTION_VENUE", "hyperliquid") == "lighter"
+                else c.live_trader
+            )
             _set_v2_components(
                 firewall=c.firewall,
                 calibration=c.calibration,
@@ -1037,7 +1042,7 @@ def build_subsystems(
                 liquidation_strategy=c.liquidation_strategy,
                 options_scanner=c.options_scanner,
                 copy_trader=c.copy_trader,
-                live_trader=c.live_trader,
+                live_trader=execution_trader,
                 health_registry=health,
             )
             c.dashboard_v2 = _start_v2_server()

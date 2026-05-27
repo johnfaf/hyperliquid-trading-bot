@@ -24,6 +24,7 @@ from typing import Any, Dict, List, Optional
 
 import config
 from src.data import database as db
+from src.core.live_execution import get_live_trader
 
 logger = logging.getLogger(__name__)
 
@@ -88,7 +89,7 @@ def reap_orphan_positions(container) -> List[Dict[str, Any]]:
     if not bool(getattr(config, "ORPHAN_REAPER_ENABLED", False)):
         return []
 
-    trader = getattr(container, "live_trader", None)
+    trader = get_live_trader(container)
     if not trader:
         return []
 

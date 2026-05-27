@@ -12,6 +12,7 @@ import threading
 import time
 
 from src.core.live_execution import (
+    get_live_trader,
     is_live_trading_active,
     mirror_executed_trades_to_live,
     sync_shadow_book_to_live,
@@ -168,7 +169,7 @@ def cancel_live_orders_once(container, reason: str, *, force: bool = False) -> b
     with _order_cancel_lock:
         if getattr(container, "_shutdown_orders_cancelled", False):
             return False
-        live_trader = getattr(container, "live_trader", None)
+        live_trader = get_live_trader(container)
         if not live_trader:
             setattr(container, "_shutdown_orders_cancelled", True)
             return False
@@ -247,7 +248,7 @@ def check_file_kill_switch(container) -> bool:
 
     logger.critical("[fast] KILL_SWITCH file detected at %s", path)
 
-    live_trader = getattr(container, "live_trader", None)
+    live_trader = get_live_trader(container)
     if live_trader:
         try:
             reason = f"file:{path}"
@@ -318,7 +319,7 @@ def _record_fast_cycle_failure(container, exc: Exception) -> None:
                 logger.error("[fast] mark_failed('bg-fast') failed: %s", mark_exc)
         # Trip the live kill switch so no new orders ship while the risk
         # loop is broken.  activate_kill_switch is idempotent.
-        live_trader = getattr(container, "live_trader", None)
+        live_trader = get_live_trader(container)
         if live_trader is not None:
             try:
                 live_trader.activate_kill_switch(
@@ -349,6 +350,9 @@ def run_fast_cycle(container, cycle_count: int) -> None:
                 logger.info("[fast] Closed %d positions (SL/TP)", len(closed))
 
         if is_live_trading_active(container):
+            live_trader = get_live_trader(container)
+            if live_trader is None:
+                return
             # Refresh the cached wallet snapshot (perps + spot + total) so the
             # dashboard and logs always see fresh numbers.  snapshot_balance
             # self-rate-limits INFO logs to once every 5 min to avoid spam.
@@ -356,7 +360,9 @@ def run_fast_cycle(container, cycle_count: int) -> None:
             next_allowed, prior_failures = _get_snapshot_backoff_state(container)
             if now_ts >= next_allowed:
                 try:
-                    container.live_trader.snapshot_balance()
+                    snapshot = getattr(live_trader, "snapshot_balance", None)
+                    if callable(snapshot):
+                        snapshot()
                     _set_snapshot_backoff_state(container, next_try=0.0, failures=0)
                 except Exception as exc:
                     failures = prior_failures + 1
@@ -372,14 +378,17 @@ def run_fast_cycle(container, cycle_count: int) -> None:
                         exc,
                         backoff,
                     )
-            container.live_trader.update_daily_pnl_from_fills()
+            update_pnl = getattr(live_trader, "update_daily_pnl_from_fills", None)
+            if callable(update_pnl):
+                update_pnl()
             reconciled = sync_shadow_book_to_live(container)
             if reconciled:
                 logger.info("[fast] Reconciled %d shadow trades to exchange", len(reconciled))
-            manage_summary = container.live_trader.manage_open_positions()
+            manage_positions = getattr(live_trader, "manage_open_positions", None)
+            manage_summary = manage_positions() if callable(manage_positions) else {}
             if manage_summary.get("updated") or manage_summary.get("closed") or manage_summary.get("failed"):
                 logger.info("[fast] Live risk management summary: %s", manage_summary)
-            audit_fn = getattr(container.live_trader, "audit_live_order_hygiene", None)
+            audit_fn = getattr(live_trader, "audit_live_order_hygiene", None)
             if callable(audit_fn):
                 interval = _live_order_hygiene_audit_interval_cycles()
                 if cycle_count % interval == 0:

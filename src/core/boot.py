@@ -77,6 +77,10 @@ def setup_logging() -> logging.Logger:
     """Configure root logger with file + console handlers. Returns module logger."""
     os.makedirs(config.LOG_DIR, exist_ok=True)
     log_file = os.path.join(config.LOG_DIR, f"bot_{datetime.now(timezone.utc).strftime('%Y%m%d')}.log")
+    root = logging.getLogger()
+    root.setLevel(logging.DEBUG)
+    if any(getattr(handler, "_hyperliquid_bot_boot_handler", False) for handler in root.handlers):
+        return logging.getLogger("boot")
 
     json_fmt = JSONFormatter()
     text_fmt = logging.Formatter(
@@ -85,16 +89,16 @@ def setup_logging() -> logging.Logger:
     )
 
     fh = logging.FileHandler(log_file)
+    fh._hyperliquid_bot_boot_handler = True
     fh.setLevel(logging.DEBUG)
     fh.setFormatter(text_fmt)
 
     ch = logging.StreamHandler(sys.stdout)
+    ch._hyperliquid_bot_boot_handler = True
     ch.setLevel(getattr(logging, config.LOG_LEVEL))
     use_json = os.environ.get("LOG_FORMAT", "json").lower() != "text"
     ch.setFormatter(json_fmt if use_json else text_fmt)
 
-    root = logging.getLogger()
-    root.setLevel(logging.DEBUG)
     root.addHandler(fh)
     root.addHandler(ch)
 

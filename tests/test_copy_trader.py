@@ -589,3 +589,33 @@ def test_open_copy_trade_logs_sizer_fallback(monkeypatch, caplog):
     assert trade["id"] == 123
     assert ct._sizer_fallback_count == 1
     assert "Copy-trader sizing failed" in caplog.text
+
+
+def test_open_copy_trade_skips_duplicate_open_from_same_source(monkeypatch):
+    ct = CopyTrader()
+    opened = []
+    monkeypatch.setattr(ct, "_resolve_copy_trade_risk", lambda *args, **kwargs: (90.0, 110.0, {}))
+    monkeypatch.setattr("src.trading.copy_trader.db.open_paper_trade", lambda **kwargs: opened.append(kwargs) or 123)
+
+    signal = {
+        "type": "copy_open",
+        "coin": "BTC",
+        "side": "long",
+        "price": 100.0,
+        "leverage": 2,
+        "confidence": 0.8,
+        "source_trader": "0xabc",
+    }
+    existing = [{
+        "id": 7,
+        "coin": "BTC",
+        "side": "long",
+        "metadata": {
+            "source": "copy_trade",
+            "is_copy_trade": True,
+            "source_trader": "0xabc",
+        },
+    }]
+
+    assert ct._open_copy_trade({"balance": 10_000.0}, signal, existing) is None
+    assert opened == []

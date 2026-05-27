@@ -187,7 +187,15 @@ class LiveTrader:
         )
         max_position_env = os.environ.get("LIVE_MAX_POSITION_SIZE_USD") or os.environ.get("HL_MAX_POSITION_SIZE")
         self._max_position_size_configured = max_position_env is not None
-        self.max_position_size = float(max_position_env) if max_position_env is not None else float(max_position_size)
+        fallback_max_position = _safe_env_float(
+            "HL_MAX_POSITION_SIZE", max_position_size, lo=1.0, hi=10_000_000.0,
+        )
+        self.max_position_size = _safe_env_float(
+            "LIVE_MAX_POSITION_SIZE_USD",
+            fallback_max_position,
+            lo=1.0,
+            hi=10_000_000.0,
+        )
         # Exchange-enforced minimum notional per order.  Hyperliquid silently
         # drops any order below $10 — we keep a small buffer (default $11)
         # so rounding and price drift do not push us under the floor.
@@ -195,15 +203,14 @@ class LiveTrader:
             getattr(config, "LIVE_MIN_ORDER_USD", 11.0)
         )
         # Hard per-order $ cap (safety net during live bootstrap).
-        env_max_order = os.environ.get("LIVE_MAX_ORDER_USD")
-        if env_max_order is not None:
-            self.max_order_usd = float(env_max_order)
-        elif max_order_usd is not None:
-            self.max_order_usd = float(max_order_usd)
-        else:
-            self.max_order_usd = float(
-                getattr(config, "LIVE_MAX_ORDER_USD", self.max_position_size)
-            )
+        self.max_order_usd = _safe_env_float(
+            "LIVE_MAX_ORDER_USD",
+            max_order_usd
+            if max_order_usd is not None
+            else float(getattr(config, "LIVE_MAX_ORDER_USD", self.max_position_size)),
+            lo=1.0,
+            hi=10_000_000.0,
+        )
         # Guard: the exchange enforces a hard minimum notional, so any cap
         # below that would make live trading physically impossible (every
         # order would be dropped by the matching engine, then fail fill
@@ -4724,15 +4731,12 @@ class LiveTrader:
         # H1 (audit): attach an exchange-level ``cloid`` derived
         # deterministically from the order's canonical wire form.  Retries
         # of the same logical order reproduce the same cloid and benefit
-        # from Hyperliquid's server-side dedup, but genuinely-different
-        # orders get distinct cloids.  The time-bucket salt (1 s) keeps
-        # the cloid stable across retry jitter while guaranteeing a new
-        # cloid if the caller intentionally re-submits the exact same
-        # order ~seconds apart.
-        time_bucket = int(time.time())
+        # from Hyperliquid's server-side dedup, including after process
+        # restarts. Do not include a wall-clock bucket here: a retry that
+        # crosses a one-second boundary is still the same logical order.
         cloid = self._make_cloid(
             "market", coin, side.lower(), wire_size, wire_price,
-            bool(reduce_only), time_bucket,
+            bool(reduce_only),
         )
         order = {
             "a": asset_idx,
@@ -5004,10 +5008,9 @@ class LiveTrader:
 
         # H1: exchange-level cloid for retry idempotency.
         tif = OrderType.LIMIT_ALO.value if post_only else OrderType.LIMIT_GTC.value
-        time_bucket = int(time.time())
         cloid = self._make_cloid(
             "limit", coin, side.lower(), wire_size, wire_price,
-            bool(reduce_only), tif, time_bucket,
+            bool(reduce_only), tif,
         )
         order = {
             "a": asset_idx,
@@ -5123,10 +5126,9 @@ class LiveTrader:
         # cloid per (coin, leg, trigger) tuple lets the exchange reject
         # a redundant second submission instead of letting us stack
         # duplicate SL/TP legs.
-        time_bucket = int(time.time())
         cloid = self._make_cloid(
             "trigger", tp_or_sl, coin, side.lower(), wire_size,
-            wire_trigger_px, wire_limit_px, time_bucket,
+            wire_trigger_px, wire_limit_px,
         )
         order = {
             "a": asset_idx,

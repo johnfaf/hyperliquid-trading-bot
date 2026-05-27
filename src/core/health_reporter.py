@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 import config
-from src.core.live_execution import is_live_trading_active
+from src.core.live_execution import get_live_trader, is_live_trading_active
 from src.core.readiness import evaluate_readiness
 from src.analysis.trade_analytics import compute_trade_analytics
 
@@ -38,11 +38,12 @@ def _account_report(container, live_active: bool) -> Dict[str, Any]:
 
     source = "paper"
     account = None
-    if live_active and getattr(container, "live_trader", None):
-        balance = container.live_trader.get_account_value()
+    live_trader = get_live_trader(container)
+    if live_active and live_trader:
+        balance = live_trader.get_account_value()
         if balance is not None:
             source = "live"
-            live_stats = container.live_trader.get_stats()
+            live_stats = live_trader.get_stats()
             account = {
                 "balance": balance,
                 "total_pnl": live_stats.get("daily_pnl", 0),
@@ -81,8 +82,9 @@ def _positions_report(container, live_active: bool) -> Dict[str, Any]:
 
     mids = get_all_mids() or {}
     source = "paper"
-    if live_active and getattr(container, "live_trader", None):
-        open_trades = container.live_trader.get_positions() or []
+    live_trader = get_live_trader(container)
+    if live_active and live_trader:
+        open_trades = live_trader.get_positions() or []
         source = "live"
     else:
         open_trades = db.get_open_paper_trades()
@@ -322,8 +324,9 @@ def write_health_report(
         _record_collection_failure("shadow_tracker", exc)
 
     try:
-        if getattr(container, "live_trader", None):
-            live_stats = container.live_trader.get_stats()
+        live_trader = get_live_trader(container)
+        if live_trader:
+            live_stats = live_trader.get_stats()
             report["live_trading"] = live_stats
             order_visibility = live_stats.get("order_visibility", {}) or {}
             orphan_protection = live_stats.get("orphan_protection", {}) or {}

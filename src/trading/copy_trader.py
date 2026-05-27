@@ -452,6 +452,40 @@ class CopyTrader:
         source = str(meta.get("source") or trade.get("source") or "").strip().lower()
         return bool(meta.get("is_copy_trade")) or source.startswith("copy_trade")
 
+    @staticmethod
+    def _copy_trade_metadata(trade: Dict) -> Dict:
+        meta = trade.get("metadata", {})
+        if isinstance(meta, str):
+            try:
+                meta = json.loads(meta or "{}")
+            except (json.JSONDecodeError, TypeError):
+                meta = {}
+        return dict(meta or {})
+
+    def _has_open_copy_from_source(
+        self,
+        open_trades: List[Dict],
+        *,
+        source_trader: str,
+        coin: str,
+        side: str,
+    ) -> bool:
+        source_norm = str(source_trader or "").strip().lower()
+        coin_norm = str(coin or "").strip().upper()
+        side_norm = str(side or "").strip().lower()
+        if not source_norm or not coin_norm or not side_norm:
+            return False
+        for trade in open_trades or []:
+            if not self._is_copy_trade(trade):
+                continue
+            meta = self._copy_trade_metadata(trade)
+            trade_source = str(meta.get("source_trader") or trade.get("trader_address") or "").strip().lower()
+            trade_coin = str(trade.get("coin") or "").strip().upper()
+            trade_side = str(trade.get("side") or "").strip().lower()
+            if trade_source == source_norm and trade_coin == coin_norm and trade_side == side_norm:
+                return True
+        return False
+
     def _open_copy_trade_count(self, trades: List[Dict]) -> int:
         return sum(1 for trade in (trades or []) if self._is_copy_trade(trade))
 
@@ -1382,6 +1416,20 @@ class CopyTrader:
         side_norm = (
             side.value if hasattr(side, "value") else str(side)
         ).strip().lower()
+
+        if signal.get("type") == "copy_open" and self._has_open_copy_from_source(
+            open_trades,
+            source_trader=signal.get("source_trader", ""),
+            coin=signal["coin"],
+            side=side_norm,
+        ):
+            logger.info(
+                "Copy trade skipped: %s %s from %s is already open",
+                side_norm,
+                signal["coin"],
+                signal.get("source_trader", ""),
+            )
+            return None
 
         # CRITICAL: No conflicting sides on same asset
         for t in open_trades:

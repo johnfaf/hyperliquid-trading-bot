@@ -41,6 +41,11 @@ _STATIC_DIR = _BASE_DIR / "static"
 _templates: Optional[Jinja2Templates] = None
 
 
+def _host_is_public(host: str) -> bool:
+    normalized = (host or "").strip().lower()
+    return normalized in {"0.0.0.0", "::", "[::]", ""}
+
+
 def _configure_stdio_encoding() -> None:
     """Keep Windows consoles from crashing on Unicode log messages."""
     for stream in (sys.stdout, sys.stderr):
@@ -170,8 +175,15 @@ def start_server(
     """
     import uvicorn
 
-    bind_host = host or os.environ.get("DASHBOARD_V2_HOST", "0.0.0.0")
+    bind_host = host or os.environ.get("DASHBOARD_V2_HOST", "127.0.0.1")
     bind_port = int(port or os.environ.get("DASHBOARD_V2_PORT", "8081"))
+    if _host_is_public(bind_host):
+        from src.ui.v2.auth import auth_configured
+
+        if not auth_configured():
+            raise RuntimeError(
+                "DASHBOARD_AUTH_TOKEN is required before binding dashboard v2 to a public interface"
+            )
 
     _configure_stdio_encoding()
     app = create_app()

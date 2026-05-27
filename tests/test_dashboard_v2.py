@@ -22,7 +22,7 @@ from src.ui.v2.app import create_app
 @pytest.fixture
 def app(tmp_path, monkeypatch):
     monkeypatch.delenv("DASHBOARD_AUTH_TOKEN", raising=False)
-    monkeypatch.delenv("DASHBOARD_PUBLIC_READ", raising=False)
+    monkeypatch.setenv("DASHBOARD_PUBLIC_READ", "true")
     v2_state.reset_components()
     cal = CalibrationTracker(db_path=str(tmp_path / "cal.db"))
     # Seed enough records that the global summary returns non-None.
@@ -36,6 +36,15 @@ def app(tmp_path, monkeypatch):
 @pytest.fixture
 def client(app):
     return TestClient(app)
+
+
+@pytest.fixture
+def authed_client(app, monkeypatch):
+    monkeypatch.setenv("DASHBOARD_AUTH_TOKEN", "secret123")
+    client = TestClient(app)
+    r = client.post("/api/auth/login", data={"token": "secret123"}, follow_redirects=False)
+    assert r.status_code == 303
+    return client
 
 
 def test_health_open_without_auth(client):
@@ -150,6 +159,7 @@ def test_dashboard_websocket_rejects_when_private_and_no_cookie(monkeypatch):
 
 def test_login_redirect_when_token_required_and_no_cookie(monkeypatch, app):
     monkeypatch.setenv("DASHBOARD_AUTH_TOKEN", "secret123")
+    monkeypatch.delenv("DASHBOARD_PUBLIC_READ", raising=False)
     client = TestClient(app)
     r = client.get("/", follow_redirects=False)
     assert r.status_code == 303
@@ -174,6 +184,7 @@ def test_login_round_trip_sets_session_cookie(monkeypatch, app):
 
 def test_calibration_unavailable_when_component_not_set(monkeypatch, tmp_path):
     monkeypatch.delenv("DASHBOARD_AUTH_TOKEN", raising=False)
+    monkeypatch.setenv("DASHBOARD_PUBLIC_READ", "true")
     v2_state.reset_components()
     app = create_app()
     client = TestClient(app)
@@ -209,8 +220,8 @@ def test_positions_page_renders_without_live_trader(client):
     assert "Open positions" in r.text
 
 
-def test_clear_kill_switch_requires_live_trader(client):
-    r = client.post(
+def test_clear_kill_switch_requires_live_trader(authed_client):
+    r = authed_client.post(
         "/api/operator/clear_kill_switch",
         data={"audit_reason": "investigating root cause"},
     )
@@ -218,7 +229,7 @@ def test_clear_kill_switch_requires_live_trader(client):
     assert r.json()["error"] == "live_trader_unavailable"
 
 
-def test_clear_kill_switch_rejects_short_reason(client):
+def test_clear_kill_switch_rejects_short_reason(authed_client):
     # Inject a stub live_trader so we exercise the audit-reason gate
     # without pulling in the full LiveTrader stack.
     class _Stub:
@@ -226,7 +237,7 @@ def test_clear_kill_switch_rejects_short_reason(client):
             return {"cleared": True, "previous_reason": None,
                     "ts": "0", "operator": operator, "audit_reason": reason}
     v2_state.set_components(live_trader=_Stub())
-    r = client.post(
+    r = authed_client.post(
         "/api/operator/clear_kill_switch",
         data={"audit_reason": "ok"},
     )
@@ -234,7 +245,7 @@ def test_clear_kill_switch_rejects_short_reason(client):
     assert r.json()["error"] == "audit_reason_required"
 
 
-def test_clear_kill_switch_calls_through_with_audit_reason(client):
+def test_clear_kill_switch_calls_through_with_audit_reason(authed_client):
     calls = []
 
     class _Stub:
@@ -250,7 +261,7 @@ def test_clear_kill_switch_calls_through_with_audit_reason(client):
             }
 
     v2_state.set_components(live_trader=_Stub())
-    r = client.post(
+    r = authed_client.post(
         "/api/operator/clear_kill_switch",
         data={"audit_reason": "userFills API recovered, verified by hand"},
     )
@@ -261,7 +272,7 @@ def test_clear_kill_switch_calls_through_with_audit_reason(client):
     assert calls and calls[0]["reason"].startswith("userFills")
 
 
-def test_close_position_operator_override_calls_live_trader(client):
+def test_close_position_operator_override_calls_live_trader(authed_client):
     calls = []
 
     class _Stub:
@@ -274,7 +285,7 @@ def test_close_position_operator_override_calls_live_trader(client):
             return {"status": "ok", "coin": coin}
 
     v2_state.set_components(live_trader=_Stub())
-    r = client.post(
+    r = authed_client.post(
         "/api/operator/close_position",
         data={"coin": "btc", "audit_reason": "manual stuck sltp override"},
     )
@@ -300,6 +311,7 @@ def test_sources_endpoint_aggregates_calibration(monkeypatch, tmp_path):
     calibrator state.
     """
     monkeypatch.delenv("DASHBOARD_AUTH_TOKEN", raising=False)
+    monkeypatch.setenv("DASHBOARD_PUBLIC_READ", "true")
     v2_state.reset_components()
     cal = CalibrationTracker(db_path=str(tmp_path / "cal.db"))
     for _ in range(20):
@@ -410,7 +422,7 @@ def test_auto_backtest_status_endpoint(client):
     assert payload["safety"] == "offline_only_no_live_config_mutation"
 
 
-def test_replay_run_starts_dashboard_job(client, monkeypatch):
+def test_replay_run_starts_dashboard_job(authed_client, monkeypatch):
     from src.ui.v2.routers import backtest as backtest_router
 
     calls = []
@@ -420,7 +432,7 @@ def test_replay_run_starts_dashboard_job(client, monkeypatch):
         return {"status": "started", "started_at": 123.0, "params": params.__dict__}
 
     monkeypatch.setattr(backtest_router, "start_replay_validation", _fake_start)
-    r = client.post(
+    r = authed_client.post(
         "/api/replay/run",
         data={"coins": "BTC,ETH", "window_days": 3, "step": "1h"},
     )
@@ -443,6 +455,12 @@ def test_backtest_run_requires_auth_when_token_set(monkeypatch, app):
     client = TestClient(app)
     r = client.post("/api/backtest/run", data={"max_wallets": 5})
     assert r.status_code == 401
+
+
+def test_post_requires_auth_without_token_configured(client):
+    r = client.post("/api/replay/run", data={"coins": "BTC"})
+    assert r.status_code == 401
+    assert r.json()["error"] == "auth_required"
 
 
 def test_backtest_page_renders(client):
@@ -480,8 +498,8 @@ def test_health_strip_uses_lightweight_readiness_by_default(monkeypatch, client)
     assert calls == [False]
 
 
-def test_clear_quarantine_requires_audit_reason(client):
-    r = client.post(
+def test_clear_quarantine_requires_audit_reason(authed_client):
+    r = authed_client.post(
         "/api/sources/clear_quarantine",
         data={"key": "strategy:m|long|trend", "audit_reason": "x"},
     )
@@ -489,9 +507,9 @@ def test_clear_quarantine_requires_audit_reason(client):
     assert r.json()["error"] == "audit_reason_required"
 
 
-def test_clear_quarantine_requires_calibration(client):
+def test_clear_quarantine_requires_calibration(authed_client):
     v2_state.reset_components()
-    r = client.post(
+    r = authed_client.post(
         "/api/sources/clear_quarantine",
         data={"key": "strategy:m|long|trend", "audit_reason": "post-incident review"},
     )
@@ -500,7 +518,8 @@ def test_clear_quarantine_requires_calibration(client):
 
 
 def test_clear_quarantine_drops_records(monkeypatch, tmp_path):
-    monkeypatch.delenv("DASHBOARD_AUTH_TOKEN", raising=False)
+    monkeypatch.setenv("DASHBOARD_AUTH_TOKEN", "secret123")
+    monkeypatch.setenv("DASHBOARD_PUBLIC_READ", "true")
     v2_state.reset_components()
     cal = CalibrationTracker(
         db_path=str(tmp_path / "cal.db"),
@@ -512,6 +531,8 @@ def test_clear_quarantine_drops_records(monkeypatch, tmp_path):
     v2_state.set_components(calibration=cal)
     app = create_app()
     client = TestClient(app)
+    login = client.post("/api/auth/login", data={"token": "secret123"}, follow_redirects=False)
+    assert login.status_code == 303
     r = client.post(
         "/api/sources/clear_quarantine",
         data={"key": "strategy:m|long|trend", "audit_reason": "data quality fix"},

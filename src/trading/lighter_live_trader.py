@@ -99,11 +99,13 @@ class LighterLiveTrader:
         api_key_index: Optional[int] = None,
         private_key: Optional[str] = None,
         l1_address: Optional[str] = None,
+        firewall: Any = None,
         max_order_usd: Optional[float] = None,
         default_leverage: Optional[float] = None,
         max_slippage_bps: Optional[float] = None,
     ) -> None:
         self.dry_run = bool(dry_run)
+        self.firewall = firewall
         self.base_url = (base_url or config.LIGHTER_BASE_URL).rstrip("/")
         self.account_index = int(account_index if account_index is not None else config.LIGHTER_ACCOUNT_INDEX)
         self.api_key_index = int(api_key_index if api_key_index is not None else config.LIGHTER_API_KEY_INDEX)
@@ -125,6 +127,8 @@ class LighterLiveTrader:
         self._submitted_triggers = 0
         self._failed_orders = 0
         self._tracked_orders: list[dict[str, Any]] = []
+        self.kill_switch_active = False
+        self._kill_switch_reason = ""
         self.status_reason = ""
         self._client_order_counter = 0
         self._load_sdk()
@@ -157,6 +161,26 @@ class LighterLiveTrader:
             self.status_reason = "lighter_sdk_missing"
             return False
         return True
+
+    def activate_kill_switch(self, reason: str, *, status_reason: str = "operator_kill_switch") -> None:
+        self.kill_switch_active = True
+        self._kill_switch_reason = str(reason or status_reason)
+        self.status_reason = status_reason
+
+    def _kill_switch_is_active(self) -> bool:
+        return bool(self.kill_switch_active)
+
+    def check_daily_loss(self, *_, **__) -> bool:
+        return self._kill_switch_is_active()
+
+    def update_daily_pnl_from_fills(self) -> None:
+        return None
+
+    def snapshot_balance(self) -> Dict[str, Any]:
+        return self._account_snapshot()
+
+    def manage_open_positions(self) -> Dict[str, Any]:
+        return {"updated": 0, "closed": 0, "failed": 0, "venue": "lighter"}
 
     def _sdk_constant(self, *names: str, default: Any = None) -> Any:
         for name in names:
@@ -408,9 +432,10 @@ class LighterLiveTrader:
             order_expiry = self._sdk_constant("DEFAULT_28_DAY_ORDER_EXPIRY", default=0)
 
             async def _submit():
+                client_order_index = self._client_order_index()
                 response = await _maybe_await(client.create_order(
                     market_index=precision.order_book_index,
-                    client_order_index=self._client_order_index(),
+                    client_order_index=client_order_index,
                     base_amount=amount_int,
                     price=price_int,
                     is_ask=is_ask,
@@ -420,9 +445,10 @@ class LighterLiveTrader:
                     trigger_price=trigger_price_int,
                     order_expiry=order_expiry,
                 ))
-                return response
+                return client_order_index, response
 
-            tx, tx_hash, err = _tuple_result(_run_async(_submit()))
+            client_order_index, response = _run_async(_submit())
+            tx, tx_hash, err = _tuple_result(response)
             if err:
                 self._failed_orders += 1
                 self._last_error = str(err)
@@ -437,6 +463,8 @@ class LighterLiveTrader:
                 "notional": notional,
                 "order_type": order_type,
                 "reduce_only": bool(reduce_only),
+                "client_order_index": client_order_index,
+                "market_index": precision.order_book_index,
                 "tx": tx,
                 "tx_hash": tx_hash,
             }
@@ -462,6 +490,31 @@ class LighterLiveTrader:
 
     def execute_signal(self, signal: TradeSignal | Dict[str, Any], bypass_firewall: bool = False) -> Optional[Dict[str, Any]]:
         trade_signal = signal if isinstance(signal, TradeSignal) else signal_from_execution_dict(signal)
+        if self.check_daily_loss():
+            logger.warning("Lighter live safety stop active - rejecting signal")
+            return None
+        if getattr(self, "_calibration_live_paused_this_cycle", False):
+            logger.warning("Lighter live calibration pause - rejecting %s", trade_signal.coin)
+            return None
+        if not bypass_firewall:
+            if self.firewall is None:
+                logger.warning("Lighter live firewall unavailable - rejecting signal")
+                return {"status": "rejected", "reason": "firewall_unavailable", "venue": "lighter"}
+            live_account_value = self.get_account_value() if self.is_deployable() else None
+            if self.is_deployable() and live_account_value is None:
+                logger.warning("Lighter live account value unavailable - rejecting signal")
+                return {"status": "rejected", "reason": "live_balance_unavailable", "venue": "lighter"}
+            passed, reason = self.firewall.validate(
+                trade_signal,
+                open_positions=self.get_positions(force_fresh=True),
+                account_balance=live_account_value,
+                require_live_balance=self.is_deployable(),
+            )
+            if not passed:
+                logger.info("Lighter signal rejected by firewall: %s", reason)
+                return None
+        else:
+            logger.debug("Lighter firewall bypass active for mirror signal %s", trade_signal.coin)
         side = _side_value(trade_signal.side)
         size = abs(float(getattr(trade_signal, "size", 0.0) or 0.0))
         entry_price = float(getattr(trade_signal, "entry_price", 0.0) or 0.0) or self._market_mid(trade_signal.coin)
@@ -506,14 +559,83 @@ class LighterLiveTrader:
         side = "sell" if str(pos.get("side")).lower() == "long" else "buy"
         return self.place_market_order(coin, side, abs(float(pos.get("size", 0) or 0)), reduce_only=True)
 
-    def cancel_all_orders(self, coin: Optional[str] = None) -> int:
+    def _cancel_tracked_order(self, order: Dict[str, Any]) -> None:
+        client = self._get_client()
+        cancel_order = getattr(client, "cancel_order", None)
+        if not callable(cancel_order):
+            raise NotImplementedError("lighter_cancel_order_unavailable")
+
+        async def _cancel():
+            return await _maybe_await(cancel_order(
+                market_index=int(order.get("market_index")),
+                client_order_index=int(order.get("client_order_index")),
+            ))
+
+        _run_async(_cancel())
+
+    def cancel_all_orders_detailed(self, coin: Optional[str] = None) -> Dict[str, Any]:
         target = str(coin or "").upper()
-        before = len(self._tracked_orders)
-        if target:
-            self._tracked_orders = [o for o in self._tracked_orders if str(o.get("coin") or "").upper() != target]
-        else:
-            self._tracked_orders.clear()
-        return before - len(self._tracked_orders)
+        orders = [
+            order for order in self._tracked_orders
+            if not target or str(order.get("coin") or "").upper() == target
+        ]
+        if not orders:
+            return {
+                "success": True,
+                "fetch_succeeded": True,
+                "open_orders_seen": 0,
+                "cancelled_count": 0,
+                "failed_count": 0,
+                "reason": "no_tracked_orders",
+                "venue": "lighter",
+            }
+        if not self.is_deployable():
+            if self.dry_run:
+                cancelled = len(orders)
+                self._tracked_orders = [order for order in self._tracked_orders if order not in orders]
+                return {
+                    "success": True,
+                    "fetch_succeeded": True,
+                    "open_orders_seen": cancelled,
+                    "cancelled_count": cancelled,
+                    "failed_count": 0,
+                    "reason": "dry_run_local_clear",
+                    "venue": "lighter",
+                }
+            return {
+                "success": False,
+                "fetch_succeeded": True,
+                "open_orders_seen": len(orders),
+                "cancelled_count": 0,
+                "failed_count": len(orders),
+                "reason": self.status_reason or "lighter_not_deployable",
+                "venue": "lighter",
+            }
+
+        cancelled = 0
+        failed = 0
+        for order in list(orders):
+            try:
+                self._cancel_tracked_order(order)
+                self._tracked_orders.remove(order)
+                cancelled += 1
+            except Exception as exc:
+                failed += 1
+                self._last_error = str(exc)
+                logger.error("Lighter cancel failed for %s: %s", order.get("coin"), exc)
+        return {
+            "success": failed == 0,
+            "fetch_succeeded": True,
+            "open_orders_seen": len(orders),
+            "cancelled_count": cancelled,
+            "failed_count": failed,
+            "reason": "cancelled" if failed == 0 else "lighter_cancel_failed",
+            "venue": "lighter",
+        }
+
+    def cancel_all_orders(self, coin: Optional[str] = None) -> int:
+        result = self.cancel_all_orders_detailed(coin=coin)
+        return int(result.get("cancelled_count", 0) or 0)
 
     def get_stats(self) -> Dict[str, Any]:
         return {
@@ -531,4 +653,7 @@ class LighterLiveTrader:
             "tracked_orders": len(self._tracked_orders),
             "last_error": self._last_error,
             "max_order_usd": self.max_order_usd,
+            "firewall_configured": self.firewall is not None,
+            "kill_switch_active": self.kill_switch_active,
+            "kill_switch_reason": self._kill_switch_reason,
         }

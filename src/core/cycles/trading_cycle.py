@@ -15,6 +15,7 @@ from src.core import clock_provider
 from src.data import database as db
 from src.core.live_execution import (
     get_execution_open_positions,
+    get_live_trader,
     is_live_trading_active,
     mirror_executed_trades_to_live,
     sync_shadow_book_to_live,
@@ -504,14 +505,16 @@ def _apply_global_momentum_override(container, regime_data: dict) -> dict:
     if (
         bool(getattr(config, "GLOBAL_MOMENTUM_CLOSE_COUNTERTREND", False))
         and is_live_trading_active(container)
-        and getattr(container, "live_trader", None)
     ):
+        live_trader = get_live_trader(container)
+        if not live_trader:
+            return regime_data
         try:
             for pos in get_execution_open_positions(container):
                 coin = str(pos.get("coin") or "").upper()
                 side = str(pos.get("side") or "").strip().lower()
                 if coin and side == block_side:
-                    container.live_trader.close_position(coin)
+                    live_trader.close_position(coin)
                     logger.warning("  GLOBAL MOMENTUM: closed countertrend %s %s", side, coin)
         except Exception as exc:
             logger.warning("  Global momentum close-countertrend failed: %s", exc)
@@ -697,22 +700,22 @@ def _train_rl_sizer_if_due(container):
         logger.warning("  RL sizer training kickoff error: %s", exc)
 
 
-def _execute_signal_live(container, trade_signal, source_label: str, bypass_firewall: bool = True):
+def _execute_signal_live(container, trade_signal, source_label: str, bypass_firewall: bool = False):
     """Execute a TradeSignal directly on the live trader and log the outcome.
 
     Note: this is the direct-to-live path used by LCRS, Options Flow, and
-    Alpha Arena -- it bypasses both the paper executor and (by default)
-    the DecisionFirewall. Without the safety brakes below it would skip
-    every gate added for the paper->live mirror path. The funding-
-    divergence and unknown-source gates are applied here too because
-    they're cheap, asymmetric (only block), and the same risks apply
-    regardless of which path the signal came in on. Promotion gate is
-    *not* applied here because LCRS/options/arena don't have the same
-    strategy_id/agent_score tracking model as paper-mirror trades.
+    Alpha Arena.  Unlike the paper->live mirror path, these signals have not
+    already passed the live firewall, so the default is to run full firewall
+    validation in the selected venue trader.
     """
-    trader = getattr(container, "live_trader", None)
+    trader = get_live_trader(container)
     if not trader or not is_live_trading_active(container):
         return None
+    side_label = (
+        trade_signal.side.value
+        if hasattr(trade_signal.side, "value")
+        else str(trade_signal.side)
+    ).upper()
 
     # Funding-divergence safety brake -- block longs into crowded
     # selloffs / shorts into crowded rallies regardless of source.
@@ -734,7 +737,12 @@ def _execute_signal_live(container, trade_signal, source_label: str, bypass_fire
             )
             return None
     except Exception as exc:
-        logger.debug("Funding-divergence check failed for %s (fail-open): %s", source_label, exc)
+        logger.warning(
+            "  LIVE %s blocked because funding-divergence check failed: %s",
+            source_label,
+            exc,
+        )
+        return None
 
     # Unknown-source gate -- mirror the firewall check at the direct
     # live path so an untagged signal can't slip past via this shortcut.
@@ -762,7 +770,12 @@ def _execute_signal_live(container, trade_signal, source_label: str, bypass_fire
             )
             return None
     except Exception as exc:
-        logger.debug("Unknown-source check failed for %s (fail-open): %s", source_label, exc)
+        logger.warning(
+            "  LIVE %s blocked because unknown-source check failed: %s",
+            source_label,
+            exc,
+        )
+        return None
 
     try:
         result = trader.execute_signal(trade_signal, bypass_firewall=bypass_firewall)
@@ -770,7 +783,7 @@ def _execute_signal_live(container, trade_signal, source_label: str, bypass_fire
         logger.error(
             "  LIVE %s execution error for %s %s: %s",
             source_label,
-            trade_signal.side.value.upper(),
+            side_label,
             trade_signal.coin,
             exc,
         )
@@ -780,7 +793,7 @@ def _execute_signal_live(container, trade_signal, source_label: str, bypass_fire
         logger.info(
             "  LIVE %s skipped: %s %s (no execution result)",
             source_label,
-            trade_signal.side.value.upper(),
+            side_label,
             trade_signal.coin,
         )
         return None
@@ -789,7 +802,7 @@ def _execute_signal_live(container, trade_signal, source_label: str, bypass_fire
         logger.info(
             "  LIVE %s executed: %s %s (%s)",
             source_label,
-            trade_signal.side.value.upper(),
+            side_label,
             trade_signal.coin,
             result.get("status", "ok"),
         )
@@ -800,14 +813,14 @@ def _execute_signal_live(container, trade_signal, source_label: str, bypass_fire
             logger.warning(
                 "  LIVE %s skipped due to insufficient margin: %s %s",
                 source_label,
-                trade_signal.side.value.upper(),
+                side_label,
                 trade_signal.coin,
             )
         else:
             logger.warning(
                 "  LIVE %s rejected: %s %s -> %s",
                 source_label,
-                trade_signal.side.value.upper(),
+                side_label,
                 trade_signal.coin,
                 result,
             )
@@ -816,7 +829,7 @@ def _execute_signal_live(container, trade_signal, source_label: str, bypass_fire
     logger.error(
         "  LIVE %s failed: %s %s -> %s",
         source_label,
-        trade_signal.side.value.upper(),
+        side_label,
         trade_signal.coin,
         result,
     )
@@ -834,12 +847,15 @@ def run_trading_cycle(container, cycle_count: int) -> None:
     from src.notifications import telegram_bot as tg
 
     # Kill switch check
-    if container.live_trader and not container.live_trader.dry_run:
-        container.live_trader.update_daily_pnl_from_fills()
-        if container.live_trader.check_daily_loss():
+    live_trader = get_live_trader(container)
+    if live_trader and not getattr(live_trader, "dry_run", True):
+        update_pnl = getattr(live_trader, "update_daily_pnl_from_fills", None)
+        if callable(update_pnl):
+            update_pnl()
+        if live_trader.check_daily_loss():
             logger.warning(
                 "LIVE SAFETY STOP -- %s; skipping new live entries",
-                _live_safety_stop_reason(container.live_trader),
+                _live_safety_stop_reason(live_trader),
             )
 
     # Soft calibration pause -- not sticky, recovers automatically when
@@ -849,8 +865,8 @@ def run_trading_cycle(container, cycle_count: int) -> None:
     if (
         cal is not None
         and getattr(cal, "is_live_paused", None)
-        and container.live_trader
-        and not container.live_trader.dry_run
+        and live_trader
+        and not getattr(live_trader, "dry_run", True)
     ):
         try:
             if cal.is_live_paused():
@@ -862,9 +878,9 @@ def run_trading_cycle(container, cycle_count: int) -> None:
                     ece if ece is not None else float("nan"),
                     cal.live_pause_ece,
                 )
-                container.live_trader._calibration_live_paused_this_cycle = True
+                live_trader._calibration_live_paused_this_cycle = True
             else:
-                container.live_trader._calibration_live_paused_this_cycle = False
+                live_trader._calibration_live_paused_this_cycle = False
         except Exception as exc:
             logger.debug("Calibration live-pause check failed: %s", exc)
 
@@ -874,7 +890,9 @@ def run_trading_cycle(container, cycle_count: int) -> None:
         # protect_orphaned_positions checks for existing reduce-only
         # orders and no-ops for protected positions.
         try:
-            container.live_trader.protect_orphaned_positions()
+            protect = getattr(live_trader, "protect_orphaned_positions", None)
+            if callable(protect):
+                protect()
         except Exception as exc:
             logger.warning("Orphan protection sweep failed: %s", exc)
 
@@ -1997,13 +2015,14 @@ def _run_alpha_arena(container, regime_data):
                             live_active = is_live_trading_active(container)
                             if getattr(container, "kelly_sizer", None) or getattr(container, "rl_sizer", None):
                                 try:
-                                    if live_active and container.live_trader is not None:
+                                    selected_live_trader = get_live_trader(container)
+                                    if live_active and selected_live_trader is not None:
                                         try:
                                             fm = None
-                                            if hasattr(container.live_trader, "get_free_margin"):
-                                                fm = container.live_trader.get_free_margin()
-                                            if fm is None and hasattr(container.live_trader, "get_account_value"):
-                                                fm = container.live_trader.get_account_value()
+                                            if hasattr(selected_live_trader, "get_free_margin"):
+                                                fm = selected_live_trader.get_free_margin()
+                                            if fm is None and hasattr(selected_live_trader, "get_account_value"):
+                                                fm = selected_live_trader.get_account_value()
                                             account_balance = float(fm) if fm is not None else float(
                                                 getattr(config, "PAPER_TRADING_INITIAL_BALANCE", 10_000.0)
                                             )

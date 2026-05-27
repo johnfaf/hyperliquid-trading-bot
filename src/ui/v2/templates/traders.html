@@ -208,7 +208,7 @@
           const resp = await fetch(`/api/traders/${encodeURIComponent(address)}`);
           const data = await resp.json().catch(() => ({}));
           if (!resp.ok) {
-            bodyEl.innerHTML = `<p class="text-rose-300">${data.message || data.error || 'Detail failed.'}</p>`;
+            bodyEl.innerHTML = `<p class="text-rose-300">${esc(data.message || data.error || 'Detail failed.')}</p>`;
             return;
           }
           renderDetail(data);

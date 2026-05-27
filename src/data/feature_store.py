@@ -102,6 +102,23 @@ def _pg_available() -> bool:
 #  Layer 1 — Candle Storage
 # =====================================================================
 
+def _normalise_candle_row(coin: str, timeframe: str, candle: dict) -> Optional[tuple]:
+    try:
+        timestamp_ms = int(candle["t"])
+        open_px = float(candle["o"])
+        high_px = float(candle["h"])
+        low_px = float(candle["l"])
+        close_px = float(candle["c"])
+        volume = float(candle.get("v", 0) or 0)
+        values = (open_px, high_px, low_px, close_px, volume)
+        if timestamp_ms <= 0 or any(not math.isfinite(v) for v in values):
+            raise ValueError("non-finite candle value")
+        return (coin, timeframe, timestamp_ms, open_px, high_px, low_px, close_px, volume)
+    except (KeyError, TypeError, ValueError) as exc:
+        logger.debug("Skipping malformed candle for %s/%s: %s", coin, timeframe, exc)
+        return None
+
+
 def store_candles(coin: str, timeframe: str, candles: List[dict]) -> int:
     """Upsert OHLCV candles into Postgres.  Returns count written."""
     if not candles:
@@ -121,20 +138,11 @@ def store_candles(coin: str, timeframe: str, candles: List[dict]) -> int:
         rows = []
         malformed = 0
         for c in candles:
-            try:
-                timestamp_ms = int(c["t"])
-                open_px = float(c["o"])
-                high_px = float(c["h"])
-                low_px = float(c["l"])
-                close_px = float(c["c"])
-                volume = float(c.get("v", 0) or 0)
-                values = (open_px, high_px, low_px, close_px, volume)
-                if timestamp_ms <= 0 or any(not math.isfinite(v) for v in values):
-                    raise ValueError("non-finite candle value")
-                rows.append((coin, timeframe, timestamp_ms, open_px, high_px, low_px, close_px, volume))
-            except (KeyError, TypeError, ValueError) as exc:
+            row = _normalise_candle_row(coin, timeframe, c)
+            if row is None:
                 malformed += 1
-                logger.debug("Skipping malformed candle for %s/%s: %s", coin, timeframe, exc)
+                continue
+            rows.append(row)
         if malformed:
             logger.warning(
                 "store_candles(%s/%s) skipped %d malformed candle(s)",
@@ -725,9 +733,13 @@ def collect_candles_for_coin(coin: str, timeframe: str,
 
     stored = store_candles(coin, timeframe, raw)
     if stored > 0 and raw:
-        # Update watermark to the latest candle timestamp
-        max_ts = max(int(c["t"]) for c in raw)
-        set_sync_watermark(coin, timeframe, max_ts)
+        valid_ts = [
+            row[2]
+            for row in (_normalise_candle_row(coin, timeframe, candle) for candle in raw)
+            if row is not None
+        ]
+        if valid_ts:
+            set_sync_watermark(coin, timeframe, max(valid_ts))
 
     return stored
 

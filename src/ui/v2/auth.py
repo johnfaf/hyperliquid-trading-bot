@@ -30,6 +30,10 @@ def _server_token() -> str:
     return os.environ.get("DASHBOARD_AUTH_TOKEN", "").strip()
 
 
+def auth_configured() -> bool:
+    return bool(_server_token())
+
+
 def _session_ttl_s() -> int:
     try:
         raw = int(os.environ.get("DASHBOARD_SESSION_TTL_S", str(DEFAULT_TTL_S)))
@@ -41,6 +45,10 @@ def _session_ttl_s() -> int:
 def _public_read_enabled() -> bool:
     val = os.environ.get("DASHBOARD_PUBLIC_READ", "").strip().lower()
     return val in ("1", "true", "yes", "on")
+
+
+def public_read_enabled() -> bool:
+    return _public_read_enabled()
 
 
 def _sign(payload: str, token: str) -> str:
@@ -75,8 +83,7 @@ def clear_cookie(response: Response) -> None:
 def verify_cookie(request: Request) -> bool:
     token = _server_token()
     if not token:
-        # No token configured -- the operator hasn't enabled auth.
-        return True
+        return False
     raw = request.cookies.get(COOKIE_NAME)
     if not raw:
         return False
@@ -115,7 +122,7 @@ def login_with_token(submitted_token: str) -> bool:
     """Constant-time compare submitted token against the server token."""
     expected = _server_token()
     if not expected:
-        return True
+        return False
     return hmac.compare_digest(submitted_token, expected)
 
 

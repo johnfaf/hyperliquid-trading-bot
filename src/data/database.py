@@ -875,7 +875,7 @@ def _ensure_postgres_strategy_parent(strategy_id) -> None:
 def get_active_traders(*, valid_only: bool = False, quarantine_invalid: bool = False):
     if quarantine_invalid:
         quarantine_invalid_traders()
-    with get_connection() as conn:
+    with get_connection(for_read=True) as conn:
         rows = conn.execute(
             "SELECT * FROM traders WHERE active = ? ORDER BY total_pnl DESC",
             (True,),
@@ -887,7 +887,7 @@ def get_active_traders(*, valid_only: bool = False, quarantine_invalid: bool = F
 
 
 def get_trader(address):
-    with get_connection() as conn:
+    with get_connection(for_read=True) as conn:
         row = conn.execute("SELECT * FROM traders WHERE address = ?", (address,)).fetchone()
     return dict(row) if row else None
 
@@ -969,7 +969,7 @@ def get_known_bot_addresses() -> set:
     a thin trader who later builds a real track record must be able to
     return to the active/copyable set automatically.
     """
-    with get_connection() as conn:
+    with get_connection(for_read=True) as conn:
         rows = conn.execute(
             "SELECT address, metadata FROM traders WHERE active = ?",
             (False,),
@@ -987,7 +987,7 @@ def get_known_bot_addresses() -> set:
 
 def get_all_traders_including_bots():
     """Get ALL traders (active and inactive) for backup purposes."""
-    with get_connection() as conn:
+    with get_connection(for_read=True) as conn:
         rows = conn.execute(
             "SELECT * FROM traders ORDER BY total_pnl DESC"
         ).fetchall()
@@ -1010,7 +1010,7 @@ def save_position_snapshot(trader_address, coin, side, size, entry_price,
 
 
 def get_trader_position_history(trader_address, limit=100):
-    with get_connection() as conn:
+    with get_connection(for_read=True) as conn:
         rows = conn.execute("""
             SELECT * FROM position_snapshots
             WHERE trader_address = ?
@@ -1230,7 +1230,7 @@ def get_bot_state(key: str, default=None):
     migrations have run — a missing table is treated as "no value".
     """
     try:
-        with get_connection() as conn:
+        with get_connection(for_read=True) as conn:
             row = conn.execute(
                 "SELECT value FROM bot_state WHERE key = ?", (str(key),)
             ).fetchone()
@@ -1292,7 +1292,7 @@ def init_paper_account(balance):
 
 
 def get_paper_account():
-    with get_connection() as conn:
+    with get_connection(for_read=True) as conn:
         row = conn.execute("SELECT * FROM paper_account WHERE id = 1").fetchone()
     return dict(row) if row else None
 
@@ -1633,7 +1633,7 @@ def close_paper_trade_and_credit_account(trade_id, exit_price, pnl) -> bool:
 
 
 def get_open_paper_trades():
-    with get_connection() as conn:
+    with get_connection(for_read=True) as conn:
         rows = conn.execute(
             "SELECT * FROM paper_trades WHERE status = 'open'"
         ).fetchall()
@@ -1663,7 +1663,7 @@ def get_paper_trade_history(limit=100, mode: str = "any"):
 
     # If "any", we can take the fast path and apply the LIMIT in SQL.
     if mode == "any":
-        with get_connection() as conn:
+        with get_connection(for_read=True) as conn:
             rows = conn.execute(
                 """
                 SELECT * FROM paper_trades WHERE status = 'closed'
@@ -1677,7 +1677,7 @@ def get_paper_trade_history(limit=100, mode: str = "any"):
     # 5x the requested limit is enough to cover typical live/paper ratios
     # without scanning the whole history.
     fetch_limit = max(int(limit) * 5, 500)
-    with get_connection() as conn:
+    with get_connection(for_read=True) as conn:
         rows = conn.execute(
             """
             SELECT * FROM paper_trades WHERE status = 'closed'

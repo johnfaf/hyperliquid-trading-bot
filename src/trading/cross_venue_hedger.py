@@ -271,7 +271,7 @@ class CrossVenueHedger:
         success = False
 
         if self.kraken_enabled:
-            if self._place_kraken_hedge(coin, hedge_side, hedge_size):
+            if self._place_kraken_hedge(coin, hedge_side, hedge_size, reduce_only=False):
                 success = True
                 self._active_hedges[HedgeVenue.KRAKEN.value][coin] = {
                     "side": hedge_side,
@@ -334,8 +334,15 @@ class CrossVenueHedger:
         mac = hmac.new(secret_decoded, sha, hashlib.sha512).digest()
         return base64.b64encode(mac).decode("ascii")
 
-    def _place_kraken_hedge(self, coin: str, side: str, size: float) -> bool:
-        """Place a reduce-only order on Kraken Futures.
+    def _place_kraken_hedge(
+        self,
+        coin: str,
+        side: str,
+        size: float,
+        *,
+        reduce_only: bool = False,
+    ) -> bool:
+        """Place a hedge order on Kraken Futures.
 
         Endpoint: POST https://futures.kraken.com/derivatives/api/v3/sendorder
         Auth: APIKey + Authent (HMAC-SHA512 over SHA256(post + nonce + path)).
@@ -344,6 +351,7 @@ class CrossVenueHedger:
             coin: Internal coin symbol (e.g. "BTC", "ETH").
             side: "BUY" or "SELL" (we pass through as lowercase).
             size: Order quantity in contracts.
+            reduce_only: True only when closing an existing hedge.
 
         Returns:
             True on accepted order or on dry-run; False on any error path.
@@ -356,7 +364,7 @@ class CrossVenueHedger:
             if self.dry_run:
                 logger.info(
                     f"[DRY-RUN] Kraken hedge order: {kraken_side} {size} {symbol} "
-                    f"(reduce-only, type={self.kraken_order_type})"
+                    f"(reduce_only={reduce_only}, type={self.kraken_order_type})"
                 )
                 return True
 
@@ -370,7 +378,7 @@ class CrossVenueHedger:
                 "symbol": symbol,
                 "side": kraken_side,
                 "size": str(size),
-                "reduceOnly": "true",
+                "reduceOnly": "true" if reduce_only else "false",
             }
             post_data = urllib.parse.urlencode(params)
             # Nonce: monotonically-increasing string. Microsecond ts is fine.
@@ -519,7 +527,12 @@ class CrossVenueHedger:
         success = False
         try:
             if venue == HedgeVenue.KRAKEN.value:
-                success = self._place_kraken_hedge(coin, close_side, original_size)
+                success = self._place_kraken_hedge(
+                    coin,
+                    close_side,
+                    original_size,
+                    reduce_only=True,
+                )
             elif venue == HedgeVenue.BINANCE.value:
                 success = self._place_binance_hedge(coin, close_side, original_size)
             elif venue == HedgeVenue.BYBIT.value:

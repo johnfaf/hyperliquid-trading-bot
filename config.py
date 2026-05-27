@@ -4,6 +4,12 @@ Configuration for the Hyperliquid Trading Research Bot.
 import os
 import math
 
+from src.core.env_utils import (
+    safe_env_bool as _safe_env_bool,
+    safe_env_float as _safe_env_float,
+    safe_env_int as _safe_env_int,
+)
+
 
 def _parse_coin_list(raw_value: str) -> list[str]:
     return [
@@ -94,22 +100,20 @@ if _raw_db_backend in ("dualwrite", "postgres") and not POSTGRES_DSN:
     )
 else:
     DB_BACKEND = _raw_db_backend
-POSTGRES_POOL_MIN = int(os.environ.get("POSTGRES_POOL_MIN", 2))
-POSTGRES_POOL_MAX = int(os.environ.get("POSTGRES_POOL_MAX", 10))
-POSTGRES_POOL_TIMEOUT_SEC = float(os.environ.get("POSTGRES_POOL_TIMEOUT_SEC", 3.0))
-POSTGRES_CONNECT_TIMEOUT_SEC = int(float(os.environ.get("POSTGRES_CONNECT_TIMEOUT_SEC", 3)))
-POSTGRES_STATEMENT_TIMEOUT_MS = int(os.environ.get("POSTGRES_STATEMENT_TIMEOUT_MS", 5000))
+POSTGRES_POOL_MIN = _safe_env_int("POSTGRES_POOL_MIN", 2, lo=1, hi=100)
+POSTGRES_POOL_MAX = _safe_env_int(
+    "POSTGRES_POOL_MAX", max(POSTGRES_POOL_MIN, 10), lo=POSTGRES_POOL_MIN, hi=500
+)
+POSTGRES_POOL_TIMEOUT_SEC = _safe_env_float("POSTGRES_POOL_TIMEOUT_SEC", 3.0, lo=0.1, hi=120.0)
+POSTGRES_CONNECT_TIMEOUT_SEC = _safe_env_int("POSTGRES_CONNECT_TIMEOUT_SEC", 3, lo=1, hi=120)
+POSTGRES_STATEMENT_TIMEOUT_MS = _safe_env_int("POSTGRES_STATEMENT_TIMEOUT_MS", 5000, lo=100, hi=600_000)
 POSTGRES_APP_NAME = os.environ.get("POSTGRES_APP_NAME", "hyperliquid-bot").strip()
 
 # Runtime DB audit/readiness guardrails. The audit is read-only; readiness
 # blocks when findings at or above READINESS_DB_AUDIT_BLOCK_SEVERITY are found.
-READINESS_DB_AUDIT_ENABLED = os.environ.get(
-    "READINESS_DB_AUDIT_ENABLED", "true"
-).lower() in ("true", "1", "yes")
-READINESS_DB_AUDIT_AUTO_REPAIR = os.environ.get(
-    "READINESS_DB_AUDIT_AUTO_REPAIR", "true"
-).lower() in ("true", "1", "yes")
-READINESS_DB_AUDIT_TTL_S = int(os.environ.get("READINESS_DB_AUDIT_TTL_S", 300))
+READINESS_DB_AUDIT_ENABLED = _safe_env_bool("READINESS_DB_AUDIT_ENABLED", True)
+READINESS_DB_AUDIT_AUTO_REPAIR = _safe_env_bool("READINESS_DB_AUDIT_AUTO_REPAIR", True)
+READINESS_DB_AUDIT_TTL_S = _safe_env_int("READINESS_DB_AUDIT_TTL_S", 300, lo=1, hi=86_400)
 READINESS_DB_AUDIT_BLOCK_SEVERITY = os.environ.get(
     "READINESS_DB_AUDIT_BLOCK_SEVERITY", "high"
 ).strip().lower()
@@ -120,58 +124,52 @@ DB_AUDIT_CANDLE_CACHE_MISSING_ACTIVE_SEVERITY = os.environ.get(
 ).strip().lower()
 if DB_AUDIT_CANDLE_CACHE_MISSING_ACTIVE_SEVERITY not in {"low", "medium", "high", "critical"}:
     DB_AUDIT_CANDLE_CACHE_MISSING_ACTIVE_SEVERITY = "medium"
-DB_AUDIT_PENDING_DECISION_MAX_AGE_MINUTES = float(
-    os.environ.get("DB_AUDIT_PENDING_DECISION_MAX_AGE_MINUTES", 30.0)
+DB_AUDIT_PENDING_DECISION_MAX_AGE_MINUTES = _safe_env_float(
+    "DB_AUDIT_PENDING_DECISION_MAX_AGE_MINUTES", 30.0, lo=1.0, hi=10_080.0
 )
-DB_AUDIT_REGIME_MAX_AGE_HOURS = float(
-    os.environ.get("DB_AUDIT_REGIME_MAX_AGE_HOURS", 24.0)
+DB_AUDIT_REGIME_MAX_AGE_HOURS = _safe_env_float(
+    "DB_AUDIT_REGIME_MAX_AGE_HOURS", 24.0, lo=1.0, hi=720.0
 )
-DB_AUDIT_NON_ACTIVE_REGIME_RETENTION_DAYS = float(
-    os.environ.get("DB_AUDIT_NON_ACTIVE_REGIME_RETENTION_DAYS", 7.0)
+DB_AUDIT_NON_ACTIVE_REGIME_RETENTION_DAYS = _safe_env_float(
+    "DB_AUDIT_NON_ACTIVE_REGIME_RETENTION_DAYS", 7.0, lo=1.0, hi=365.0
 )
-DB_AUDIT_SOURCE_STALE_MULTIPLIER = float(
-    os.environ.get("DB_AUDIT_SOURCE_STALE_MULTIPLIER", 2.0)
+DB_AUDIT_SOURCE_STALE_MULTIPLIER = _safe_env_float(
+    "DB_AUDIT_SOURCE_STALE_MULTIPLIER", 2.0, lo=0.1, hi=100.0
 )
-SOURCE_HEALTH_SNAPSHOT_INTERVAL_S = int(
-    os.environ.get("SOURCE_HEALTH_SNAPSHOT_INTERVAL_S", 60)
+SOURCE_HEALTH_SNAPSHOT_INTERVAL_S = _safe_env_int(
+    "SOURCE_HEALTH_SNAPSHOT_INTERVAL_S", 60, lo=1, hi=86_400
 )
-DB_AUDIT_MIN_CANDLE_COINS = int(os.environ.get("DB_AUDIT_MIN_CANDLE_COINS", 2))
-DB_AUDIT_DUALWRITE_HEALTH_WINDOW_S = float(
-    os.environ.get("DB_AUDIT_DUALWRITE_HEALTH_WINDOW_S", 300.0)
+DB_AUDIT_MIN_CANDLE_COINS = _safe_env_int("DB_AUDIT_MIN_CANDLE_COINS", 2, lo=0, hi=10_000)
+DB_AUDIT_DUALWRITE_HEALTH_WINDOW_S = _safe_env_float(
+    "DB_AUDIT_DUALWRITE_HEALTH_WINDOW_S", 300.0, lo=1.0, hi=86_400.0
 )
-DB_AUDIT_DUALWRITE_MAX_FAILURES = int(
-    os.environ.get("DB_AUDIT_DUALWRITE_MAX_FAILURES", 5)
+DB_AUDIT_DUALWRITE_MAX_FAILURES = _safe_env_int(
+    "DB_AUDIT_DUALWRITE_MAX_FAILURES", 5, lo=1, hi=1_000_000,
 )
-DB_SAFE_AUTO_REPAIR_ON_BOOT = os.environ.get(
-    "DB_SAFE_AUTO_REPAIR_ON_BOOT", "true"
-).lower() in ("true", "1", "yes")
-DB_REPAIR_KEEP_MISSING_SOURCE_STRATEGIES = int(
-    os.environ.get("DB_REPAIR_KEEP_MISSING_SOURCE_STRATEGIES", 500)
+DB_SAFE_AUTO_REPAIR_ON_BOOT = _safe_env_bool("DB_SAFE_AUTO_REPAIR_ON_BOOT", True)
+DB_REPAIR_KEEP_MISSING_SOURCE_STRATEGIES = _safe_env_int(
+    "DB_REPAIR_KEEP_MISSING_SOURCE_STRATEGIES", 500, lo=0, hi=1_000_000,
 )
-DB_REPAIR_STARTUP_STRATEGY_PRUNE_LIMIT = int(
-    os.environ.get("DB_REPAIR_STARTUP_STRATEGY_PRUNE_LIMIT", 1000)
+DB_REPAIR_STARTUP_STRATEGY_PRUNE_LIMIT = _safe_env_int(
+    "DB_REPAIR_STARTUP_STRATEGY_PRUNE_LIMIT", 1000, lo=0, hi=1_000_000,
 )
-BOOT_DB_AUDIT_INCLUDE_CANDLE_CACHE = os.environ.get(
-    "BOOT_DB_AUDIT_INCLUDE_CANDLE_CACHE", "false"
-).lower() in ("true", "1", "yes")
+BOOT_DB_AUDIT_INCLUDE_CANDLE_CACHE = _safe_env_bool("BOOT_DB_AUDIT_INCLUDE_CANDLE_CACHE", False)
 
 # ─── Feature Store (Postgres-only, auto-enabled when POSTGRES_DSN set) ─
 FEATURE_STORE_COINS = os.environ.get("FEATURE_STORE_COINS", "").strip()
-FEATURE_STORE_MAX_COINS = int(os.environ.get("FEATURE_STORE_MAX_COINS", 30))
-FEATURE_STORE_BOOTSTRAP_TOP_COINS = int(os.environ.get("FEATURE_STORE_BOOTSTRAP_TOP_COINS", 8))
-FEATURE_STORE_BACKFILL_5M_DAYS = int(os.environ.get("FEATURE_STORE_BACKFILL_5M_DAYS", 7))
-FEATURE_STORE_BACKFILL_1H_DAYS = int(os.environ.get("FEATURE_STORE_BACKFILL_1H_DAYS", 30))
-FEATURE_STORE_BACKFILL_4H_DAYS = int(os.environ.get("FEATURE_STORE_BACKFILL_4H_DAYS", 90))
-FEATURE_STORE_BACKFILL_1D_DAYS = int(os.environ.get("FEATURE_STORE_BACKFILL_1D_DAYS", 365))
+FEATURE_STORE_MAX_COINS = _safe_env_int("FEATURE_STORE_MAX_COINS", 30, lo=1, hi=10_000)
+FEATURE_STORE_BOOTSTRAP_TOP_COINS = _safe_env_int("FEATURE_STORE_BOOTSTRAP_TOP_COINS", 8, lo=0, hi=10_000)
+FEATURE_STORE_BACKFILL_5M_DAYS = _safe_env_int("FEATURE_STORE_BACKFILL_5M_DAYS", 7, lo=0, hi=3650)
+FEATURE_STORE_BACKFILL_1H_DAYS = _safe_env_int("FEATURE_STORE_BACKFILL_1H_DAYS", 30, lo=0, hi=3650)
+FEATURE_STORE_BACKFILL_4H_DAYS = _safe_env_int("FEATURE_STORE_BACKFILL_4H_DAYS", 90, lo=0, hi=3650)
+FEATURE_STORE_BACKFILL_1D_DAYS = _safe_env_int("FEATURE_STORE_BACKFILL_1D_DAYS", 365, lo=0, hi=3650)
 
 # Runtime backup size guard.  Wallet fills are the largest backup component;
 # keeping the newest rows preserves redeploy continuity without writing a
 # hundreds-of-MB JSON file on every reporting cycle.  Set 0 to disable capping.
-HL_BOT_BACKUP_MAX_WALLET_FILLS = int(os.environ.get("HL_BOT_BACKUP_MAX_WALLET_FILLS", 5000))
-HL_BOT_BACKUP_MAX_GOLDEN_WALLETS = int(os.environ.get("HL_BOT_BACKUP_MAX_GOLDEN_WALLETS", 200))
-HL_BOT_BACKUP_INCLUDE_EQUITY_CURVES = os.environ.get(
-    "HL_BOT_BACKUP_INCLUDE_EQUITY_CURVES", "false"
-).lower() in ("true", "1", "yes")
+HL_BOT_BACKUP_MAX_WALLET_FILLS = _safe_env_int("HL_BOT_BACKUP_MAX_WALLET_FILLS", 5000, lo=0, hi=1_000_000)
+HL_BOT_BACKUP_MAX_GOLDEN_WALLETS = _safe_env_int("HL_BOT_BACKUP_MAX_GOLDEN_WALLETS", 200, lo=0, hi=1_000_000)
+HL_BOT_BACKUP_INCLUDE_EQUITY_CURVES = _safe_env_bool("HL_BOT_BACKUP_INCLUDE_EQUITY_CURVES", False)
 
 # Dynamic risk policy engine
 RISK_POLICY_DEFAULT_REWARD_MULTIPLE = float(
@@ -449,12 +447,6 @@ LIVE_TRADING_DUAL_CONTROL_CONFIRM = os.environ.get(
 # so a typo at redeploy can't crash boot and leave positions unmanaged.
 # The helper logs a warning and falls back to the module default rather
 # than raising ValueError at import time.
-from src.core.env_utils import (  # noqa: E402 -- must follow sys.path setup above
-    safe_env_bool as _safe_env_bool,
-    safe_env_float as _safe_env_float,
-    safe_env_int as _safe_env_int,
-)
-
 LIVE_MIN_ORDER_USD = _safe_env_float("LIVE_MIN_ORDER_USD", 11.0, lo=1.0, hi=10_000.0)
 
 # Hard ceiling on the notional ($ USDC) of any single live order.  This is a
@@ -466,25 +458,15 @@ LIVE_MIN_ORDER_USD = _safe_env_float("LIVE_MIN_ORDER_USD", 11.0, lo=1.0, hi=10_0
 # NOTE: a value below LIVE_MIN_ORDER_USD is impossible to honor — the
 # LiveTrader will raise it to LIVE_MIN_ORDER_USD at startup with a warning.
 LIVE_MAX_ORDER_USD = _safe_env_float("LIVE_MAX_ORDER_USD", 150.0, lo=1.0, hi=1_000_000.0)
-_live_max_position_default = os.environ.get(
-    "HL_MAX_POSITION_SIZE", str(LIVE_MAX_ORDER_USD)
+_live_max_position_default = _safe_env_float(
+    "HL_MAX_POSITION_SIZE", LIVE_MAX_ORDER_USD, lo=1.0, hi=10_000_000.0
 )
-_raw_live_max_position = os.environ.get("LIVE_MAX_POSITION_SIZE_USD", _live_max_position_default)
-try:
-    LIVE_MAX_POSITION_SIZE_USD = float(_raw_live_max_position)
-    if LIVE_MAX_POSITION_SIZE_USD < 1.0:
-        raise ValueError("below floor")
-    if LIVE_MAX_POSITION_SIZE_USD > 10_000_000.0:
-        raise ValueError("above ceiling")
-except (TypeError, ValueError):
-    import sys as _sys
-    print(
-        f"[config] WARNING: LIVE_MAX_POSITION_SIZE_USD={_raw_live_max_position!r} "
-        f"out of [1,1e7] range or non-numeric; falling back to "
-        f"LIVE_MAX_ORDER_USD=${LIVE_MAX_ORDER_USD}.",
-        file=_sys.stderr,
-    )
-    LIVE_MAX_POSITION_SIZE_USD = float(LIVE_MAX_ORDER_USD)
+LIVE_MAX_POSITION_SIZE_USD = _safe_env_float(
+    "LIVE_MAX_POSITION_SIZE_USD",
+    _live_max_position_default,
+    lo=1.0,
+    hi=10_000_000.0,
+)
 # Daily loss limit for the live account in USD (forwarded to LiveTrader).
 LIVE_MAX_DAILY_LOSS_USD = _safe_env_float(
     "LIVE_MAX_DAILY_LOSS_USD", 100.0, lo=0.01, hi=10_000_000.0,
@@ -498,8 +480,8 @@ LIVE_CANARY_MAX_ORDER_USD = _safe_env_float(
 LIVE_CANARY_MAX_SIGNALS_PER_DAY = _safe_env_int(
     "LIVE_CANARY_MAX_SIGNALS_PER_DAY", 25, lo=0, hi=100_000,
 )
-LIVE_MAX_ORDERS_PER_SOURCE_PER_DAY = int(
-    os.environ.get("LIVE_MAX_ORDERS_PER_SOURCE_PER_DAY", 0)
+LIVE_MAX_ORDERS_PER_SOURCE_PER_DAY = _safe_env_int(
+    "LIVE_MAX_ORDERS_PER_SOURCE_PER_DAY", 0, lo=0, hi=1_000_000,
 )
 LIVE_RISK_SIZING_ENABLED = _safe_env_bool("LIVE_RISK_SIZING_ENABLED", True)
 LIVE_RISK_PER_TRADE_PCT = _safe_env_float(
@@ -520,11 +502,11 @@ LIVE_ORDER_HYGIENE_AUDIT_INTERVAL_CYCLES = _safe_env_int(
 LIVE_MIN_ORDER_TOP_TIER_ENABLED = os.environ.get(
     "LIVE_MIN_ORDER_TOP_TIER_ENABLED", "true"
 ).lower() in ("true", "1", "yes")
-LIVE_MIN_ORDER_TOP_TIER_MIN_CONFIDENCE = float(
-    os.environ.get("LIVE_MIN_ORDER_TOP_TIER_MIN_CONFIDENCE", 0.72)
+LIVE_MIN_ORDER_TOP_TIER_MIN_CONFIDENCE = _safe_env_float(
+    "LIVE_MIN_ORDER_TOP_TIER_MIN_CONFIDENCE", 0.72, lo=0.0, hi=1.0,
 )
-LIVE_MIN_ORDER_TOP_TIER_MAX_BUMP_MULTIPLIER = float(
-    os.environ.get("LIVE_MIN_ORDER_TOP_TIER_MAX_BUMP_MULTIPLIER", 1.35)
+LIVE_MIN_ORDER_TOP_TIER_MAX_BUMP_MULTIPLIER = _safe_env_float(
+    "LIVE_MIN_ORDER_TOP_TIER_MAX_BUMP_MULTIPLIER", 1.35, lo=1.0, hi=10.0,
 )
 LIVE_MIN_ORDER_ALLOW_DEGRADED_SOURCES = os.environ.get(
     "LIVE_MIN_ORDER_ALLOW_DEGRADED_SOURCES", "false"
@@ -532,16 +514,16 @@ LIVE_MIN_ORDER_ALLOW_DEGRADED_SOURCES = os.environ.get(
 LIVE_MIN_ORDER_ALLOW_POLICY_ERROR_FLOORUP = os.environ.get(
     "LIVE_MIN_ORDER_ALLOW_POLICY_ERROR_FLOORUP", "false"
 ).lower() in ("true", "1", "yes")
-LIVE_MIN_ORDER_SHORT_MIN_CONFIDENCE = float(
-    os.environ.get("LIVE_MIN_ORDER_SHORT_MIN_CONFIDENCE", 0.75)
+LIVE_MIN_ORDER_SHORT_MIN_CONFIDENCE = _safe_env_float(
+    "LIVE_MIN_ORDER_SHORT_MIN_CONFIDENCE", 0.75, lo=0.0, hi=1.0,
 )
 LIVE_MIN_ORDER_SAME_SIDE_MERGE_ENABLED = os.environ.get(
     "LIVE_MIN_ORDER_SAME_SIDE_MERGE_ENABLED", "true"
 ).lower() in ("true", "1", "yes")
-LIVE_MIN_ORDER_SAME_SIDE_MAX_BUMP_MULTIPLIER = float(
-    os.environ.get("LIVE_MIN_ORDER_SAME_SIDE_MAX_BUMP_MULTIPLIER", 2.5)
+LIVE_MIN_ORDER_SAME_SIDE_MAX_BUMP_MULTIPLIER = _safe_env_float(
+    "LIVE_MIN_ORDER_SAME_SIDE_MAX_BUMP_MULTIPLIER", 2.5, lo=1.0, hi=25.0,
 )
-LIVE_ANALYTICS_LOOKBACK_TRADES = int(os.environ.get("LIVE_ANALYTICS_LOOKBACK_TRADES", 200))
+LIVE_ANALYTICS_LOOKBACK_TRADES = _safe_env_int("LIVE_ANALYTICS_LOOKBACK_TRADES", 200, lo=1, hi=100_000)
 LIVE_ENTRY_EXECUTION_MODE = os.environ.get(
     "LIVE_ENTRY_EXECUTION_MODE", "maker_then_market"
 ).strip().lower()
@@ -631,9 +613,7 @@ REGIME_REVERSAL_REVERSE_ON_CRASH = _safe_env_bool("REGIME_REVERSAL_REVERSE_ON_CR
 # crash still flips instantly) before the gates see the new label.
 # DEFAULT OFF -> behavior is byte-identical until an operator opts in.
 REGIME_HYSTERESIS_ENABLED = _safe_env_bool("REGIME_HYSTERESIS_ENABLED", False)
-REGIME_HYSTERESIS_MIN_STREAK = int(
-    os.environ.get("REGIME_HYSTERESIS_MIN_STREAK", 2)
-)
+REGIME_HYSTERESIS_MIN_STREAK = _safe_env_int("REGIME_HYSTERESIS_MIN_STREAK", 2, lo=1, hi=100)
 REGIME_HYSTERESIS_OVERRIDE_CONF = _safe_env_float(
     "REGIME_HYSTERESIS_OVERRIDE_CONF", 0.85, lo=0.0, hi=1.0
 )
@@ -653,9 +633,7 @@ FIREWALL_RECENT_SIDE_BLOCK_MAX_HOURS = _safe_env_float(
 # candidate coins to fold into the watched/feature-precompute universe so
 # copy signals on the broad tracked-trader coin set stop being dropped
 # with data_readiness_missing:candles,feature_vector.
-FEATURE_COPY_CANDIDATE_COINS_MAX = int(
-    os.environ.get("FEATURE_COPY_CANDIDATE_COINS_MAX", 25)
-)
+FEATURE_COPY_CANDIDATE_COINS_MAX = _safe_env_int("FEATURE_COPY_CANDIDATE_COINS_MAX", 25, lo=0, hi=10_000)
 # Copy-source-floor regime relaxation (#2): DEFAULT ON.
 #
 # History: this lever shipped default-OFF on the assumption that the

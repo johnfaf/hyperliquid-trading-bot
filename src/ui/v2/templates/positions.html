@@ -210,6 +210,12 @@
   // Polls /api/fills/recent every 8s; bumped to immediately on a
   // ``cycle`` WS event so the ticker reflects new fills the moment
   // the trading cycle records them.
+  function esc(value) {
+    return String(value ?? '').replace(/[&<>"']/g, (ch) => ({
+      '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+    }[ch]));
+  }
+
   async function refreshFillsTicker() {
     const status = document.getElementById('fills-status');
     const list = document.getElementById('fills-ticker');
@@ -231,18 +237,21 @@
         const sideClass = (f.side === 'B' || f.side === 'long')
           ? 'bg-emerald-900/60 text-emerald-200'
           : 'bg-rose-900/60 text-rose-200';
-        const pnlClass = f.closed_pnl > 0 ? 'text-emerald-300'
-                       : f.closed_pnl < 0 ? 'text-rose-300'
+        const closedPnl = Number(f.closed_pnl || 0);
+        const pnlClass = closedPnl > 0 ? 'text-emerald-300'
+                       : closedPnl < 0 ? 'text-rose-300'
                        : 'text-slate-400';
-        const pnlStr = f.closed_pnl
-          ? `${f.closed_pnl > 0 ? '+' : ''}${f.closed_pnl.toFixed(2)}`
+        const pnlStr = closedPnl
+          ? `${closedPnl > 0 ? '+' : ''}${closedPnl.toFixed(2)}`
           : '';
+        const size = Number(f.size || 0);
+        const price = Number(f.price || 0);
         return `
           <li class="py-1.5 px-3 flex items-center gap-3 hover:bg-slate-800/40">
-            <span class="text-slate-500 font-mono text-[10px] w-16">${ts}</span>
-            <span class="font-semibold text-slate-200 w-16">${f.coin}</span>
-            <span class="inline-block px-1.5 py-0.5 rounded text-[10px] ${sideClass}">${sideTag}</span>
-            <span class="text-slate-300 font-mono text-[11px] flex-1">${f.size.toFixed(4)} @ $${f.price.toFixed(2)}</span>
+            <span class="text-slate-500 font-mono text-[10px] w-16">${esc(ts)}</span>
+            <span class="font-semibold text-slate-200 w-16">${esc(f.coin)}</span>
+            <span class="inline-block px-1.5 py-0.5 rounded text-[10px] ${sideClass}">${esc(sideTag)}</span>
+            <span class="text-slate-300 font-mono text-[11px] flex-1">${size.toFixed(4)} @ $${price.toFixed(2)}</span>
             <span class="font-mono ${pnlClass}">${pnlStr}</span>
           </li>`;
       }).join('') || '<li class="py-3 px-3 text-center text-slate-500">No recent fills.</li>';

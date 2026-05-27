@@ -89,3 +89,41 @@ def test_lighter_execute_signal_places_entry_and_protective_orders(monkeypatch):
     assert order_calls[2]["order_type"] == 4
     assert order_calls[1]["reduce_only"] is True
     assert order_calls[2]["reduce_only"] is True
+
+
+def test_lighter_execute_signal_runs_firewall_by_default(monkeypatch):
+    calls = []
+    _install_fake_lighter_sdk(monkeypatch, calls)
+    monkeypatch.setattr(config, "LIGHTER_LIVE_TRADING_ENABLED", True, raising=False)
+    monkeypatch.setattr(config, "LIGHTER_LIVE_TRADING_DUAL_CONTROL_CONFIRM", True, raising=False)
+
+    class _Firewall:
+        def validate(self, *args, **kwargs):
+            return False, "unit-test-block"
+
+    trader = LighterLiveTrader(
+        dry_run=False,
+        account_index=7,
+        api_key_index=3,
+        private_key="secret",
+        firewall=_Firewall(),
+        max_order_usd=1_000,
+    )
+    monkeypatch.setattr(trader, "get_account_value", lambda: 1_000.0)
+    monkeypatch.setattr(trader, "get_positions", lambda *_, **__: [])
+    monkeypatch.setattr(trader, "_market_mid", lambda coin: 100.0)
+
+    signal = TradeSignal(
+        coin="BTC",
+        side=SignalSide.LONG,
+        confidence=0.8,
+        source=SignalSource.MANUAL,
+        reason="test",
+        entry_price=100.0,
+        size=0.1,
+        leverage=5,
+        risk=RiskParams(stop_loss_pct=0.05, take_profit_pct=0.25, risk_basis="roe"),
+    )
+
+    assert trader.execute_signal(signal) is None
+    assert [name for name, _ in calls if name == "create_order"] == []

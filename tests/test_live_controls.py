@@ -1283,7 +1283,7 @@ def test_execute_lcrs_signals_live_path_executes_signal(monkeypatch):
         {"overall_regime": "neutral"},
     )
 
-    assert executed == [("ETH", "long", True)]
+    assert executed == [("ETH", "long", False)]
 
 
 def test_execute_options_flow_live_path_executes_signal(monkeypatch):
@@ -1853,7 +1853,7 @@ def test_run_alpha_arena_live_path_executes_signal(monkeypatch):
 
     _run_alpha_arena(container, {"overall_regime": "neutral"})
 
-    assert executed == [("FART", "long", True, 0.03)]
+    assert executed == [("FART", "long", False, 0.03)]
 
 
 def test_run_alpha_arena_paper_trade_preserves_precise_stops(monkeypatch):
