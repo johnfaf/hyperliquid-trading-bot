@@ -266,6 +266,41 @@ def test_bearish_options_flow_short_overrides_uptrend():
     assert ok is True, reason
 
 
+@patch("src.signals.decision_firewall.db")
+def test_live_fill_history_blocks_losing_live_short_side(mock_db):
+    mock_db.get_open_paper_trades.return_value = []
+    mock_db.get_paper_account.return_value = {"balance": 1000000}
+    mock_db.get_paper_trade_history.return_value = []
+    mock_db._resolve_history_mode_for_runtime.return_value = "live"
+    mock_db.audit_log = MagicMock()
+
+    from src.signals.decision_firewall import DecisionFirewall
+
+    fw = DecisionFirewall({
+        "enable_predictive_derisk": False,
+        "funding_risk_enabled": False,
+        "short_hardening_enabled": True,
+        "short_hardening_min_closed_trades": 3,
+        "short_hardening_block_win_rate": 0.40,
+        "short_hardening_block_net_pnl": -2.0,
+        "short_hardening_block_override_enabled": False,
+        "market_side_guard_enabled": False,
+        "cooldown_seconds": 0,
+        "same_side_cooldown_seconds": 0,
+    })
+    fw.set_live_fill_history([
+        {"coin": "BTC", "dir": "Close Short", "side": "buy", "closedPnl": "-0.90", "fee": "0.10", "time": 1},
+        {"coin": "ETH", "dir": "Close Short", "side": "buy", "closedPnl": "-0.80", "fee": "0.10", "time": 2},
+        {"coin": "SOL", "dir": "Close Short", "side": "buy", "closedPnl": "-0.70", "fee": "0.10", "time": 3},
+    ])
+
+    signal = MockSignal(coin="SOL", side_val="short", confidence=0.9)
+    passed, reason = fw.validate(signal, open_positions=[], account_balance=1000000)
+
+    assert passed is False
+    assert "underperforming" in reason.lower()
+
+
 def test_synthetic_forecaster_now_contributes_when_weighted():
     """Synthetic warm-start forecaster is no longer discarded outright:
     weighted >0 it can align a counter-regime entry; weight 0 reverts."""

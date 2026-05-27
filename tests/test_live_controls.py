@@ -5211,6 +5211,96 @@ def test_daily_pnl_refresh_failure_streak_resets_on_success(monkeypatch):
     assert trader.kill_switch_active is False
 
 
+def test_daily_pnl_refresh_counts_fees_against_live_loss(monkeypatch):
+    class FakeFirewall:
+        def __init__(self):
+            self.losses = None
+            self.fills = None
+
+        def validate(self, signal, **kwargs):
+            return True, "ok"
+
+        def set_daily_losses(self, value):
+            self.losses = value
+
+        def set_live_fill_history(self, fills, *, limit=200):
+            self.fills = list(fills)
+
+    class FeeApiManager:
+        def post(self, payload, *args, **kwargs):
+            if payload.get("type") == "userFills":
+                now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+                return [
+                    {
+                        "coin": "BTC",
+                        "dir": "Close Long",
+                        "side": "sell",
+                        "time": now_ms,
+                        "closedPnl": "1.00",
+                        "fee": "1.25",
+                    },
+                ]
+            return {}
+
+    monkeypatch.setattr(config, "LIVE_SUBTRACT_FEES_FROM_PNL", True, raising=False)
+    monkeypatch.setattr(LiveTrader, "_load_credentials", _fake_live_credentials)
+    monkeypatch.setattr(LiveTrader, "_load_asset_index_map", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "reconcile_positions", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "get_positions", lambda self: [])
+    monkeypatch.setattr(LiveTrader, "check_daily_loss", lambda self, **kw: False)
+
+    firewall = FakeFirewall()
+    trader = LiveTrader(firewall=firewall, dry_run=False, max_order_usd=1_000_000)
+    trader.api_manager = FeeApiManager()
+
+    assert trader.update_daily_pnl_from_fills() is True
+    assert trader.daily_realized_pnl == pytest.approx(-0.25)
+    assert trader.daily_fees_paid == pytest.approx(1.25)
+    assert firewall.losses == pytest.approx(0.25)
+    assert len(firewall.fills) == 1
+
+
+def test_execute_signal_blocks_firewall_bypass_after_recent_live_coin_losses(monkeypatch):
+    class FakeFirewall:
+        def validate(self, signal, **kwargs):
+            raise AssertionError("mirror path should bypass firewall validation")
+
+    def _refresh_daily_pnl(self, trigger_check=True):
+        self.daily_pnl = 0.0
+        self._recent_live_fill_trades = [
+            {"coin": "SOL", "side": "short", "pnl": -1.25, "metadata": {"source_key": "live_fill"}},
+            {"coin": "SOL", "side": "short", "pnl": -1.10, "metadata": {"source_key": "live_fill"}},
+        ]
+        return True
+
+    monkeypatch.setattr(config, "LIVE_RECENT_LOSS_GUARD_ENABLED", True, raising=False)
+    monkeypatch.setattr(config, "LIVE_RECENT_LOSS_COIN_SIDE_MIN_CLOSED", 2, raising=False)
+    monkeypatch.setattr(config, "LIVE_RECENT_LOSS_COIN_SIDE_BLOCK_NET_PNL", -2.0, raising=False)
+    monkeypatch.setattr(config, "LIVE_RECENT_LOSS_COIN_SIDE_BLOCK_WIN_RATE", 0.50, raising=False)
+    monkeypatch.setattr(LiveTrader, "_load_credentials", _fake_live_credentials)
+    monkeypatch.setattr(LiveTrader, "_load_asset_index_map", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "reconcile_positions", lambda self: None)
+    monkeypatch.setattr(LiveTrader, "update_daily_pnl_from_fills", _refresh_daily_pnl)
+
+    trader = LiveTrader(firewall=FakeFirewall(), dry_run=False, max_order_usd=1_000_000)
+    result = trader.execute_signal(
+        {
+            "coin": "SOL",
+            "side": "short",
+            "confidence": 0.9,
+            "entry_price": 150.0,
+            "position_pct": 0.05,
+            "leverage": 2,
+            "size": 0.1,
+            "context": {"live_mirror": True},
+        },
+        bypass_firewall=True,
+    )
+
+    assert result is None
+    assert trader.get_stats()["entry_metrics"]["rejected_recent_live_loss"] == 1
+
+
 def test_live_trader_source_day_cap_blocks_second_entry(monkeypatch):
     class FakeFirewall:
         def validate(self, signal, **kwargs):

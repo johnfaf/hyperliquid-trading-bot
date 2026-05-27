@@ -9,12 +9,20 @@ from __future__ import annotations
 
 import json
 from collections import Counter, defaultdict
-from typing import Dict, Iterable, List, Mapping
+from datetime import datetime, timezone
+from typing import Dict, Iterable, List, Mapping, Optional
 
 
 def _coerce_float(value, default: float = 0.0) -> float:
     try:
         return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _coerce_int(value, default: int = 0) -> int:
+    try:
+        return int(float(value))
     except (TypeError, ValueError):
         return default
 
@@ -87,6 +95,114 @@ def _trade_source_key(trade: Dict) -> str:
         if strategy_type:
             return f"strategy:{strategy_type}"
     return key
+
+
+def _fill_direction(fill: Mapping) -> str:
+    return str(
+        fill.get("dir")
+        or fill.get("direction")
+        or ""
+    ).strip()
+
+
+def _fill_closed_side(fill: Mapping) -> Optional[str]:
+    """Resolve the position side closed by a Hyperliquid fill.
+
+    Hyperliquid's ``side`` is order side (buy/sell), while the risk policy
+    needs position side (long/short).  The ``dir`` field carries that intent:
+    ``Close Long`` and ``Long > Short`` close a long; ``Close Short`` and
+    ``Short > Long`` close a short.
+    """
+    direction = _fill_direction(fill).lower()
+    if "close long" in direction or "long > short" in direction:
+        return "long"
+    if "close short" in direction or "short > long" in direction:
+        return "short"
+
+    closed_pnl = _coerce_float(
+        fill.get("closedPnl", fill.get("closed_pnl", 0.0))
+    )
+    if abs(closed_pnl) <= 1e-12:
+        return None
+
+    order_side = str(fill.get("side", "") or "").strip().lower()
+    if order_side == "sell":
+        return "long"
+    if order_side == "buy":
+        return "short"
+    return None
+
+
+def _fill_time_ms(fill: Mapping) -> int:
+    return _coerce_int(fill.get("time", fill.get("time_ms", 0)), 0)
+
+
+def _fill_closed_at_iso(fill: Mapping) -> str:
+    time_ms = _fill_time_ms(fill)
+    if time_ms > 0:
+        try:
+            return datetime.fromtimestamp(
+                time_ms / 1000.0, tz=timezone.utc
+            ).isoformat()
+        except Exception:
+            return ""
+    return str(fill.get("closed_at") or fill.get("timestamp") or "")
+
+
+def normalise_hyperliquid_fill_history(
+    fills: Iterable[Mapping],
+    *,
+    limit: int = 200,
+    subtract_fees: bool = True,
+) -> List[Dict]:
+    """Convert Hyperliquid ``userFills`` rows into closed-trade rows.
+
+    The dashboard/export CSV exposed the exact failure mode: fees were large
+    enough to turn a noisy book into a persistent bleed.  ``closedPnl`` alone
+    misses that cost, so the normalized ``pnl`` is net of the fill fee by
+    default.  Opening fills are skipped here; they are accounted for in the
+    daily PnL guard, while this helper is for recent realized close policies.
+    """
+    rows: List[Dict] = []
+    for fill in fills or []:
+        if not isinstance(fill, Mapping):
+            continue
+        side = _fill_closed_side(fill)
+        if side not in {"long", "short"}:
+            continue
+
+        closed_pnl = _coerce_float(
+            fill.get("closedPnl", fill.get("closed_pnl", 0.0))
+        )
+        fee = abs(_coerce_float(fill.get("fee", 0.0)))
+        net_pnl = closed_pnl - fee if subtract_fees else closed_pnl
+        coin = str(fill.get("coin", "") or "UNKNOWN").strip().upper() or "UNKNOWN"
+        direction = _fill_direction(fill)
+        time_ms = _fill_time_ms(fill)
+
+        rows.append(
+            {
+                "coin": coin,
+                "side": side,
+                "pnl": net_pnl,
+                "closed_at": _fill_closed_at_iso(fill),
+                "time_ms": time_ms,
+                "metadata": {
+                    "source": "live_fill",
+                    "source_key": "live_fill",
+                    "direction": direction,
+                    "gross_pnl_before_fees": closed_pnl,
+                    "total_fees_paid": fee,
+                    "hyperliquid_fill_hash": fill.get("hash", ""),
+                    "hyperliquid_order_id": fill.get("oid", ""),
+                },
+            }
+        )
+
+    rows.sort(key=lambda row: int(row.get("time_ms", 0) or 0), reverse=True)
+    if limit and limit > 0:
+        rows = rows[: int(limit)]
+    return rows
 
 
 def _new_bucket() -> Dict:

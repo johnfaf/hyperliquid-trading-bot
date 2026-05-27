@@ -4,6 +4,7 @@ from src.analysis.trade_analytics import (
     evaluate_short_side_policy,
     evaluate_side_source_policy,
     evaluate_source_policy,
+    normalise_hyperliquid_fill_history,
 )
 
 
@@ -100,6 +101,46 @@ def test_compute_trade_analytics_includes_tp_sl_path_metrics():
     assert summary["avg_mae_r"] == -0.7
     assert summary["avg_exit_r"] == 0.25
     assert summary["avg_path_capture_ratio"] == 0.3
+
+
+def test_normalise_hyperliquid_fill_history_maps_closed_side_and_fees():
+    fills = [
+        {
+            "coin": "SOL",
+            "dir": "Open Long",
+            "side": "buy",
+            "time": 1700000000000,
+            "closedPnl": "0",
+            "fee": "0.10",
+        },
+        {
+            "coin": "SOL",
+            "dir": "Close Long",
+            "side": "sell",
+            "time": 1700000001000,
+            "closedPnl": "1.50",
+            "fee": "0.25",
+            "hash": "h1",
+        },
+        {
+            "coin": "BTC",
+            "dir": "Short > Long",
+            "side": "buy",
+            "time": 1700000002000,
+            "closedPnl": "-2.00",
+            "fee": "0.40",
+        },
+    ]
+
+    rows = normalise_hyperliquid_fill_history(fills)
+
+    assert [row["coin"] for row in rows] == ["BTC", "SOL"]
+    assert rows[0]["side"] == "short"
+    assert rows[0]["pnl"] == -2.40
+    assert rows[0]["metadata"]["gross_pnl_before_fees"] == -2.0
+    assert rows[0]["metadata"]["total_fees_paid"] == 0.4
+    assert rows[1]["side"] == "long"
+    assert rows[1]["pnl"] == 1.25
 
 
 def test_evaluate_short_side_policy_blocks_bad_short_run():

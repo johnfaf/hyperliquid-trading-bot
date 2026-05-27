@@ -17,11 +17,12 @@ Flow: Signal Source → TradeSignal → DecisionFirewall → Execution
 import logging
 import threading
 from src.core import clock_provider
-from typing import List, Dict, Optional, Tuple
+from typing import Iterable, List, Dict, Optional, Tuple
 from collections import defaultdict
 
 from src.analysis.trade_analytics import (
     evaluate_long_side_policy,
+    normalise_hyperliquid_fill_history,
     evaluate_short_side_policy,
     evaluate_side_source_policy,
 )
@@ -423,6 +424,7 @@ class DecisionFirewall:
             "scoped": {},
         }
         self._side_policy_cache_ttl_s = 300.0
+        self._live_fill_history: List[Dict] = []
 
         # Stats
         self.stats = {
@@ -518,6 +520,24 @@ class DecisionFirewall:
 
     def set_event_scanner(self, event_scanner) -> None:
         self.event_scanner = event_scanner
+
+    def set_live_fill_history(self, fills: Iterable[Dict], *, limit: int = 200) -> None:
+        """Inject recent exchange fills so live-mode policies see live outcomes.
+
+        ``paper_trades`` can be empty or incomplete on a restarted live bot.
+        When that happens the recent-side hardening gates silently become
+        "insufficient history" even while Hyperliquid has a losing fill stream.
+        This setter lets ``LiveTrader.update_daily_pnl_from_fills`` feed the
+        firewall the exchange truth it already fetched for the daily loss guard.
+        """
+        try:
+            rows = normalise_hyperliquid_fill_history(fills, limit=limit)
+        except Exception as exc:
+            logger.debug("Live fill history normalization failed: %s", exc)
+            rows = []
+        with self._lock:
+            self._live_fill_history = rows
+            self._side_policy_cache = {"ts": 0.0, "closed": [], "short": {}, "scoped": {}}
 
     def apply_runtime_overrides(self, overrides: Dict) -> None:
         """Apply hot-reloadable config values without recreating the firewall."""
@@ -864,6 +884,28 @@ class DecisionFirewall:
             self.market_side_guard_enabled,
         )
 
+    def _policy_closed_history(self, limit: int) -> List[Dict]:
+        mode = db._resolve_history_mode_for_runtime()
+        try:
+            closed = db.get_paper_trade_history(limit=limit, mode=mode)
+        except Exception:
+            closed = []
+
+        live_rows = list(self._live_fill_history or []) if mode == "live" else []
+        if not live_rows:
+            return list(closed or [])
+
+        merged = list(live_rows) + list(closed or [])
+
+        def _sort_key(row: Dict) -> float:
+            try:
+                return float(row.get("time_ms", 0) or 0)
+            except (TypeError, ValueError):
+                return 0.0
+
+        merged.sort(key=_sort_key, reverse=True)
+        return merged[: max(1, int(limit or 1))]
+
     def _get_short_policy_cache(self) -> Dict[str, object]:
         now = clock_provider.unix_now()
         cached_ts = float(self._side_policy_cache.get("ts", 0.0) or 0.0)
@@ -874,10 +916,7 @@ class DecisionFirewall:
             return dict(self._side_policy_cache)
 
         try:
-            closed = db.get_paper_trade_history(
-                limit=self.short_hardening_lookback_trades,
-                mode=db._resolve_history_mode_for_runtime(),
-            )
+            closed = self._policy_closed_history(self.short_hardening_lookback_trades)
             policy = evaluate_short_side_policy(
                 closed,
                 min_trades=self.short_hardening_min_closed_trades,
@@ -926,10 +965,7 @@ class DecisionFirewall:
             return dict(self._side_policy_cache)
 
         try:
-            closed = db.get_paper_trade_history(
-                limit=self.long_hardening_lookback_trades,
-                mode=db._resolve_history_mode_for_runtime(),
-            )
+            closed = self._policy_closed_history(self.long_hardening_lookback_trades)
             policy = evaluate_long_side_policy(
                 closed,
                 min_trades=self.long_hardening_min_closed_trades,

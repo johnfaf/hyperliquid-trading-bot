@@ -98,6 +98,10 @@ except ImportError:  # pragma: no cover
 import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import config
+from src.analysis.trade_analytics import (
+    evaluate_side_source_policy,
+    normalise_hyperliquid_fill_history,
+)
 from src.data import database as db
 from src.core.api_manager import Priority, get_manager
 from src.core.secret_manager import SecretManagerError, load_agent_private_key
@@ -398,6 +402,7 @@ class LiveTrader:
         self.daily_pnl = 0.0
         self.daily_realized_pnl = 0.0
         self.daily_unrealized_pnl = 0.0
+        self.daily_fees_paid = 0.0
         self.daily_reset_date = ""
         self.kill_switch_active = False
         self.orders_today = 0
@@ -413,6 +418,31 @@ class LiveTrader:
 
         # Track realized PnL from closed positions for daily loss enforcement
         self._last_known_positions: Dict[str, Dict] = {}  # coin -> position snapshot
+        self._recent_live_fill_trades: List[Dict[str, Any]] = []
+        self._live_recent_loss_guard_enabled = bool(
+            getattr(config, "LIVE_RECENT_LOSS_GUARD_ENABLED", True)
+        )
+        self._live_recent_loss_lookback_fills = int(
+            getattr(config, "LIVE_RECENT_LOSS_LOOKBACK_FILLS", 200)
+        )
+        self._live_recent_loss_side_min_closed = int(
+            getattr(config, "LIVE_RECENT_LOSS_SIDE_MIN_CLOSED", 5)
+        )
+        self._live_recent_loss_side_block_win_rate = float(
+            getattr(config, "LIVE_RECENT_LOSS_SIDE_BLOCK_WIN_RATE", 0.40)
+        )
+        self._live_recent_loss_side_block_net_pnl = float(
+            getattr(config, "LIVE_RECENT_LOSS_SIDE_BLOCK_NET_PNL", -5.0)
+        )
+        self._live_recent_loss_coin_side_min_closed = int(
+            getattr(config, "LIVE_RECENT_LOSS_COIN_SIDE_MIN_CLOSED", 2)
+        )
+        self._live_recent_loss_coin_side_block_win_rate = float(
+            getattr(config, "LIVE_RECENT_LOSS_COIN_SIDE_BLOCK_WIN_RATE", 0.50)
+        )
+        self._live_recent_loss_coin_side_block_net_pnl = float(
+            getattr(config, "LIVE_RECENT_LOSS_COIN_SIDE_BLOCK_NET_PNL", -2.0)
+        )
 
         # Order idempotency: prevent duplicate orders from timeout/retry
         # Maps action_hash -> (timestamp, result) for recent orders
@@ -2213,6 +2243,7 @@ class LiveTrader:
                 self.daily_pnl = 0.0
                 self.daily_realized_pnl = 0.0
                 self.daily_unrealized_pnl = 0.0
+                self.daily_fees_paid = 0.0
                 self.orders_today = 0
                 self.fills_today = 0
                 self._source_orders_today.clear()
@@ -3992,6 +4023,72 @@ class LiveTrader:
         except Exception as exc:
             logger.error("Deferred protective resize error for %s: %s", coin, exc)
 
+    def _refresh_recent_live_fill_history(self, fills: List[Dict[str, Any]]) -> None:
+        limit = max(1, int(self._live_recent_loss_lookback_fills or 1))
+        try:
+            rows = normalise_hyperliquid_fill_history(
+                fills,
+                limit=limit,
+                subtract_fees=bool(getattr(config, "LIVE_SUBTRACT_FEES_FROM_PNL", True)),
+            )
+        except Exception as exc:
+            logger.debug("Could not normalize recent live fills: %s", exc)
+            rows = []
+
+        with self._state_lock:
+            self._recent_live_fill_trades = rows
+
+        if hasattr(self.firewall, "set_live_fill_history"):
+            try:
+                self.firewall.set_live_fill_history(fills, limit=limit)
+            except Exception as exc:
+                logger.debug("Could not inject live fill history into firewall: %s", exc)
+
+    def _passes_live_recent_loss_guard(self, signal: TradeSignal) -> Tuple[bool, str]:
+        """Block fresh live entries after recent real-money losses.
+
+        This sits in ``LiveTrader`` as well as the firewall so paper-to-live
+        mirrors, which intentionally bypass firewall cooldowns, still respect
+        the exchange's actual losing streaks.
+        """
+        if not self._live_recent_loss_guard_enabled:
+            return True, ""
+
+        side = self._signal_side_value(signal)
+        if side not in {"long", "short"}:
+            return True, ""
+
+        coin = str(getattr(signal, "coin", "") or "").strip().upper()
+        with self._state_lock:
+            trades = list(self._recent_live_fill_trades or [])
+        if not trades:
+            return True, ""
+
+        coin_policy = evaluate_side_source_policy(
+            trades,
+            side=side,
+            coin=coin,
+            min_trades=self._live_recent_loss_coin_side_min_closed,
+            degrade_win_rate=self._live_recent_loss_coin_side_block_win_rate,
+            block_win_rate=self._live_recent_loss_coin_side_block_win_rate,
+            block_net_pnl=self._live_recent_loss_coin_side_block_net_pnl,
+        )
+        if str(coin_policy.get("status", "")).lower() == "blocked":
+            return False, f"recent_live_coin_side_loss:{coin_policy.get('reason')}"
+
+        side_policy = evaluate_side_source_policy(
+            trades,
+            side=side,
+            min_trades=self._live_recent_loss_side_min_closed,
+            degrade_win_rate=self._live_recent_loss_side_block_win_rate,
+            block_win_rate=self._live_recent_loss_side_block_win_rate,
+            block_net_pnl=self._live_recent_loss_side_block_net_pnl,
+        )
+        if str(side_policy.get("status", "")).lower() == "blocked":
+            return False, f"recent_live_side_loss:{side_policy.get('reason')}"
+
+        return True, ""
+
     def update_daily_pnl_from_fills(self, trigger_check: bool = True):
         """
         Fetch recent fills from the exchange and update daily_pnl.
@@ -4019,10 +4116,15 @@ class LiveTrader:
             )
             if not isinstance(fills, list):
                 raise RuntimeError(f"userFills returned {type(fills).__name__}, expected list")
+            self._refresh_recent_live_fill_history(fills)
 
-            # Sum realized closed PnL from today's fills.
+            # Sum realized closed PnL from today's fills.  Hyperliquid exposes
+            # fees separately, and the May trade export showed fee drag was a
+            # large part of the live bleed, so default the daily circuit breaker
+            # to net-after-fees instead of closedPnl-only.
             today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-            today_realized = 0.0
+            today_realized_gross = 0.0
+            today_fees = 0.0
             for fill in fills:
                 fill_time = fill.get("time", "")
                 if isinstance(fill_time, (int, float)):
@@ -4035,8 +4137,18 @@ class LiveTrader:
                     continue
 
                 if fill_date == today:
-                    closed_pnl = float(fill.get("closedPnl", 0))
-                    today_realized += closed_pnl
+                    closed_pnl = self._coerce_float(
+                        fill.get("closedPnl", fill.get("closed_pnl", 0)),
+                        0.0,
+                    )
+                    fee = abs(self._coerce_float(fill.get("fee", 0), 0.0))
+                    today_realized_gross += closed_pnl
+                    today_fees += fee
+
+            if bool(getattr(config, "LIVE_SUBTRACT_FEES_FROM_PNL", True)):
+                today_realized = today_realized_gross - today_fees
+            else:
+                today_realized = today_realized_gross
 
             # Include current unrealized PnL so daily loss controls react to
             # open-position drawdowns, not only realized closes.
@@ -4060,17 +4172,20 @@ class LiveTrader:
                 old_pnl = self.daily_pnl
                 self.daily_realized_pnl = today_realized
                 self.daily_unrealized_pnl = unrealized
+                self.daily_fees_paid = today_fees
                 self.daily_pnl = today_pnl
                 current_daily_pnl = self.daily_pnl
                 current_realized = self.daily_realized_pnl
                 current_unrealized = self.daily_unrealized_pnl
+                current_fees = self.daily_fees_paid
 
             if abs(current_daily_pnl) > 0 and abs(current_daily_pnl - old_pnl) > 0.01:
                 logger.info(
-                    "Daily PnL updated: total=%+.2f (realized=%+.2f, unrealized=%+.2f)",
+                    "Daily PnL updated: total=%+.2f (realized_net=%+.2f, unrealized=%+.2f, fees=$%.2f)",
                     current_daily_pnl,
                     current_realized,
                     current_unrealized,
+                    current_fees,
                 )
 
             # Keep the firewall on the same realized-loss snapshot instead of
@@ -6108,6 +6223,10 @@ class LiveTrader:
             Execution result dict or None if rejected
         """
         signal = self._coerce_signal(signal)
+        if isinstance(getattr(signal, "context", None), dict):
+            signal.context["live_execution"] = True
+        else:
+            signal.context = {"live_execution": True}
         source_key = self._signal_source_key(signal)
         self._incr_entry_metric("attempted_entry_signals")
         live_positions: Optional[List[Dict[str, Any]]] = None
@@ -6122,6 +6241,17 @@ class LiveTrader:
             else:
                 self._incr_entry_metric("rejected_kill_switch")
             logger.warning("Live safety stop (%s) - rejecting signal", reason)
+            return None
+
+        live_loss_ok, live_loss_reason = self._passes_live_recent_loss_guard(signal)
+        if not live_loss_ok:
+            self._incr_entry_metric("rejected_recent_live_loss")
+            logger.warning(
+                "Recent live loss guard - rejecting %s %s (%s)",
+                signal.coin,
+                self._signal_side_value(signal),
+                live_loss_reason,
+            )
             return None
 
         # Soft calibration pause: not sticky, just blocks live entries
@@ -6820,6 +6950,7 @@ class LiveTrader:
                 "daily_pnl": round(self.daily_pnl, 2),
                 "daily_realized_pnl": round(self.daily_realized_pnl, 2),
                 "daily_unrealized_pnl": round(self.daily_unrealized_pnl, 2),
+                "daily_fees_paid": round(self.daily_fees_paid, 2),
                 "orders_today": self.orders_today,
                 "fills_today": self.fills_today,
                 "source_orders_today": dict(self._source_orders_today),
@@ -6848,6 +6979,7 @@ class LiveTrader:
             "daily_pnl": state_snapshot["daily_pnl"],
             "daily_realized_pnl": state_snapshot["daily_realized_pnl"],
             "daily_unrealized_pnl": state_snapshot["daily_unrealized_pnl"],
+            "daily_fees_paid": state_snapshot["daily_fees_paid"],
             "daily_pnl_limit": self.max_daily_loss,
             "orders_today": state_snapshot["orders_today"],
             "fills_today": state_snapshot["fills_today"],

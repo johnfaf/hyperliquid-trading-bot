@@ -73,7 +73,7 @@ def _live_sigma_multiplier() -> float:
 
 def _is_live_mirror(signal: Any) -> bool:
     ctx = getattr(signal, "context", None)
-    if isinstance(ctx, dict) and ctx.get("live_mirror"):
+    if isinstance(ctx, dict) and (ctx.get("live_mirror") or ctx.get("live_execution")):
         return True
     return False
 
