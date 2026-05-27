@@ -8,7 +8,7 @@ without duplicating parsing logic.
 from __future__ import annotations
 
 import json
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, deque
 from datetime import datetime, timezone
 from typing import Dict, Iterable, List, Mapping, Optional
 
@@ -118,6 +118,8 @@ def _fill_closed_side(fill: Mapping) -> Optional[str]:
         return "long"
     if "close short" in direction or "short > long" in direction:
         return "short"
+    if "open long" in direction or "open short" in direction:
+        return None
 
     closed_pnl = _coerce_float(
         fill.get("closedPnl", fill.get("closed_pnl", 0.0))
@@ -131,6 +133,36 @@ def _fill_closed_side(fill: Mapping) -> Optional[str]:
     if order_side == "buy":
         return "short"
     return None
+
+
+def _fill_open_side(fill: Mapping) -> Optional[str]:
+    direction = _fill_direction(fill).lower()
+    if "open long" in direction:
+        return "long"
+    if "open short" in direction:
+        return "short"
+
+    closed_pnl = _coerce_float(
+        fill.get("closedPnl", fill.get("closed_pnl", 0.0))
+    )
+    if abs(closed_pnl) > 1e-12:
+        return None
+
+    order_side = str(fill.get("side", "") or "").strip().lower()
+    if order_side == "buy":
+        return "long"
+    if order_side == "sell":
+        return "short"
+    return None
+
+
+def _fill_size(fill: Mapping) -> float:
+    return abs(_coerce_float(
+        fill.get(
+            "sz",
+            fill.get("size", fill.get("qty", fill.get("quantity", 0.0))),
+        )
+    ))
 
 
 def _fill_time_ms(fill: Mapping) -> int:
@@ -159,24 +191,60 @@ def normalise_hyperliquid_fill_history(
 
     The dashboard/export CSV exposed the exact failure mode: fees were large
     enough to turn a noisy book into a persistent bleed.  ``closedPnl`` alone
-    misses that cost, so the normalized ``pnl`` is net of the fill fee by
-    default.  Opening fills are skipped here; they are accounted for in the
-    daily PnL guard, while this helper is for recent realized close policies.
+    misses that cost, so the normalized ``pnl`` is net of fees by default.
+    Opening fills are matched FIFO by coin/side and their fees are charged to
+    the later close when the open is present in the lookback window.
     """
     rows: List[Dict] = []
-    for fill in fills or []:
+    open_fee_lots: Dict[tuple, deque] = defaultdict(deque)
+    ordered_fills = [
+        fill for fill in (fills or [])
+        if isinstance(fill, Mapping)
+    ]
+    ordered_fills.sort(key=_fill_time_ms)
+
+    for fill in ordered_fills:
         if not isinstance(fill, Mapping):
             continue
+        coin = str(fill.get("coin", "") or "UNKNOWN").strip().upper() or "UNKNOWN"
+        fill_size = _fill_size(fill)
+        fee = abs(_coerce_float(fill.get("fee", 0.0)))
         side = _fill_closed_side(fill)
+        open_side = _fill_open_side(fill)
+
+        if open_side in {"long", "short"} and fill_size > 0 and fee > 0:
+            open_fee_lots[(coin, open_side)].append({
+                "remaining_size": fill_size,
+                "fee_remaining": fee,
+            })
+
         if side not in {"long", "short"}:
             continue
 
         closed_pnl = _coerce_float(
             fill.get("closedPnl", fill.get("closed_pnl", 0.0))
         )
-        fee = abs(_coerce_float(fill.get("fee", 0.0)))
-        net_pnl = closed_pnl - fee if subtract_fees else closed_pnl
-        coin = str(fill.get("coin", "") or "UNKNOWN").strip().upper() or "UNKNOWN"
+        entry_fee = 0.0
+        remaining_to_close = fill_size
+        lots = open_fee_lots[(coin, side)]
+        while subtract_fees and remaining_to_close > 0 and lots:
+            lot = lots[0]
+            lot_size = _coerce_float(lot.get("remaining_size", 0.0))
+            lot_fee = _coerce_float(lot.get("fee_remaining", 0.0))
+            if lot_size <= 0 or lot_fee <= 0:
+                lots.popleft()
+                continue
+            matched_size = min(remaining_to_close, lot_size)
+            matched_fee = lot_fee * (matched_size / lot_size)
+            entry_fee += matched_fee
+            remaining_to_close -= matched_size
+            lot["remaining_size"] = lot_size - matched_size
+            lot["fee_remaining"] = lot_fee - matched_fee
+            if lot["remaining_size"] <= 1e-12 or lot["fee_remaining"] <= 1e-12:
+                lots.popleft()
+
+        total_fees = fee + entry_fee
+        net_pnl = closed_pnl - total_fees if subtract_fees else closed_pnl
         direction = _fill_direction(fill)
         time_ms = _fill_time_ms(fill)
 
@@ -192,7 +260,9 @@ def normalise_hyperliquid_fill_history(
                     "source_key": "live_fill",
                     "direction": direction,
                     "gross_pnl_before_fees": closed_pnl,
-                    "total_fees_paid": fee,
+                    "total_fees_paid": total_fees,
+                    "close_fee_paid": fee,
+                    "matched_entry_fee_paid": entry_fee,
                     "hyperliquid_fill_hash": fill.get("hash", ""),
                     "hyperliquid_order_id": fill.get("oid", ""),
                 },

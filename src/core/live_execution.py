@@ -291,7 +291,10 @@ def get_execution_open_positions(container) -> List[Dict]:
     """Use exchange positions as the source of truth when live trading is active."""
     trader = get_live_trader(container)
     if trader and is_live_trading_active(container):
-        return trader.get_positions() or []
+        try:
+            return trader.get_positions(force_fresh=True) or []
+        except TypeError:
+            return trader.get_positions() or []
     return db.get_open_paper_trades()
 
 
@@ -299,9 +302,11 @@ def get_execution_account_balance(container) -> Optional[float]:
     """Use live account value when available, otherwise fall back to paper balance."""
     trader = get_live_trader(container)
     if trader and is_live_trading_active(container):
-        value = trader.get_account_value()
-        if value is not None:
-            return float(value)
+        get_value = getattr(trader, "get_account_value", None)
+        if callable(get_value):
+            value = get_value()
+            if value is not None:
+                return float(value)
 
     account = db.get_paper_account()
     if not account:
@@ -334,7 +339,10 @@ def sync_shadow_book_to_live(container) -> List[Dict]:
     if account_value is None or account_value <= 0:
         return []
 
-    fetched_positions = trader.get_positions() if trader else None
+    try:
+        fetched_positions = trader.get_positions(force_fresh=True) if trader else None
+    except TypeError:
+        fetched_positions = trader.get_positions() if trader else None
     if fetched_positions is None:
         logger.warning("Skipping shadow/live reconciliation: exchange positions unavailable")
         return []

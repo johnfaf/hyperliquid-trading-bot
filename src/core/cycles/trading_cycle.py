@@ -14,6 +14,7 @@ import config
 from src.core import clock_provider
 from src.data import database as db
 from src.core.live_execution import (
+    get_execution_account_balance,
     get_execution_open_positions,
     get_live_trader,
     is_confirmed_live_execution_result,
@@ -1516,18 +1517,20 @@ def _execute_lcrs_signals(container, lcrs_signals, regime_data):
                         logger.info("  LCRS firewall rejected %s: %s", sig["coin"], reason)
                         continue
 
-                if account and (container.kelly_sizer or getattr(container, "rl_sizer", None)):
-                    sizing = _get_dynamic_sizing(
-                        container,
-                        "liquidation_reversal",
-                        account["balance"],
-                        trade_signal.confidence,
-                        regime_data=regime_data,
-                        coin=sig["coin"],
-                        volatility=sig.get("features", {}).get("volatility", 0.02),
-                    )
-                    if sizing:
-                        trade_signal.position_pct = sizing.position_pct
+                if container.kelly_sizer or getattr(container, "rl_sizer", None):
+                    sizing_balance = get_execution_account_balance(container)
+                    if sizing_balance is not None:
+                        sizing = _get_dynamic_sizing(
+                            container,
+                            "liquidation_reversal",
+                            sizing_balance,
+                            trade_signal.confidence,
+                            regime_data=regime_data,
+                            coin=sig["coin"],
+                            volatility=sig.get("features", {}).get("volatility", 0.02),
+                        )
+                        if sizing:
+                            trade_signal.position_pct = sizing.position_pct
 
                 if container.trade_memory:
                     mem = container.trade_memory.find_similar(

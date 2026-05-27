@@ -1919,8 +1919,11 @@ class LiveTrader:
         }
 
     def get_firewall_positions(self) -> Optional[List[Dict[str, Any]]]:
-        """Return normalized live positions in the format the firewall expects."""
-        return self.get_positions()
+        """Return fresh normalized live positions in the format the firewall expects."""
+        try:
+            return self.get_positions(force_fresh=True)
+        except TypeError:
+            return self.get_positions()
 
     def _get_asset_index(self, coin: str) -> Optional[int]:
         """Get asset index for a coin."""
@@ -2162,7 +2165,10 @@ class LiveTrader:
     ) -> Optional[Dict[str, Any]]:
         positions = open_positions
         if positions is None:
-            positions = self.get_positions()
+            try:
+                positions = self.get_positions(force_fresh=True)
+            except TypeError:
+                positions = self.get_positions()
         if not positions:
             return None
 
@@ -4074,6 +4080,24 @@ class LiveTrader:
         if not trades:
             return True, ""
 
+        def _net_loss_breached(policy: Dict[str, Any], min_trades: int, block_net_pnl: float) -> Tuple[bool, str]:
+            metrics = policy.get("metrics", {}) or {}
+            try:
+                count = int(metrics.get("count", 0) or 0)
+            except Exception:
+                count = 0
+            try:
+                net_pnl = float(metrics.get("net_pnl", 0.0) or 0.0)
+            except Exception:
+                net_pnl = 0.0
+            threshold = float(block_net_pnl)
+            if count >= int(min_trades) and net_pnl <= threshold:
+                return True, (
+                    f"{count} closed trades net {net_pnl:.2f} breached "
+                    f"loss floor {threshold:.2f}"
+                )
+            return False, ""
+
         coin_policy = evaluate_side_source_policy(
             trades,
             side=side,
@@ -4085,6 +4109,13 @@ class LiveTrader:
         )
         if str(coin_policy.get("status", "")).lower() == "blocked":
             return False, f"recent_live_coin_side_loss:{coin_policy.get('reason')}"
+        breached, reason = _net_loss_breached(
+            coin_policy,
+            self._live_recent_loss_coin_side_min_closed,
+            self._live_recent_loss_coin_side_block_net_pnl,
+        )
+        if breached:
+            return False, f"recent_live_coin_side_net_loss:{reason}"
 
         side_policy = evaluate_side_source_policy(
             trades,
@@ -4096,6 +4127,13 @@ class LiveTrader:
         )
         if str(side_policy.get("status", "")).lower() == "blocked":
             return False, f"recent_live_side_loss:{side_policy.get('reason')}"
+        breached, reason = _net_loss_breached(
+            side_policy,
+            self._live_recent_loss_side_min_closed,
+            self._live_recent_loss_side_block_net_pnl,
+        )
+        if breached:
+            return False, f"recent_live_side_net_loss:{reason}"
 
         return True, ""
 
@@ -4163,7 +4201,10 @@ class LiveTrader:
             # Include current unrealized PnL so daily loss controls react to
             # open-position drawdowns, not only realized closes.
             unrealized = self.daily_unrealized_pnl
-            positions = self.get_positions()
+            try:
+                positions = self.get_positions(force_fresh=True)
+            except TypeError:
+                positions = self.get_positions()
             if positions is None:
                 logger.warning(
                     "Could not refresh positions for unrealized PnL - keeping prior estimate %+.2f",
@@ -6286,15 +6327,17 @@ class LiveTrader:
             )
             return None
 
-        if not bypass_firewall:
-            live_positions = self.get_firewall_positions() if self.is_deployable() else None
-            live_account_value = self.get_account_value() if self.is_deployable() else None
-            if self.is_deployable() and live_positions is None:
+        if self.is_deployable():
+            live_positions = self.get_firewall_positions()
+            if live_positions is None:
                 self._incr_entry_metric("rejected_positions_unavailable")
                 logger.warning(
                     "Live positions unavailable - rejecting signal rather than trading blind"
                 )
                 return None
+
+        if not bypass_firewall:
+            live_account_value = self.get_account_value() if self.is_deployable() else None
 
             # Validate through firewall
             passed, reason = self.firewall.validate(

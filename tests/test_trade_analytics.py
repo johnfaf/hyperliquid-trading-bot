@@ -110,7 +110,8 @@ def test_normalise_hyperliquid_fill_history_maps_closed_side_and_fees():
             "dir": "Open Long",
             "side": "buy",
             "time": 1700000000000,
-            "closedPnl": "0",
+            "sz": "2.0",
+            "closedPnl": "-0.10",
             "fee": "0.10",
         },
         {
@@ -118,6 +119,7 @@ def test_normalise_hyperliquid_fill_history_maps_closed_side_and_fees():
             "dir": "Close Long",
             "side": "sell",
             "time": 1700000001000,
+            "sz": "2.0",
             "closedPnl": "1.50",
             "fee": "0.25",
             "hash": "h1",
@@ -140,7 +142,9 @@ def test_normalise_hyperliquid_fill_history_maps_closed_side_and_fees():
     assert rows[0]["metadata"]["gross_pnl_before_fees"] == -2.0
     assert rows[0]["metadata"]["total_fees_paid"] == 0.4
     assert rows[1]["side"] == "long"
-    assert rows[1]["pnl"] == 1.25
+    assert rows[1]["pnl"] == 1.15
+    assert rows[1]["metadata"]["total_fees_paid"] == 0.35
+    assert rows[1]["metadata"]["matched_entry_fee_paid"] == 0.1
 
 
 def test_evaluate_short_side_policy_blocks_bad_short_run():
