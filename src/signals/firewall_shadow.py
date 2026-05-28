@@ -52,9 +52,10 @@ from __future__ import annotations
 import logging
 import os
 import random
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from typing import Optional
 
+from src.core.clock_provider import utc_now
 from src.data import database as db
 from src.data.hyperliquid_client import get_all_mids
 
@@ -222,7 +223,7 @@ def record_shadow_signal(
         if entry_price <= 0:
             return False
 
-        opened_at = datetime.now(timezone.utc).isoformat()
+        opened_at = utc_now().isoformat()
         with db.get_connection() as conn:
             _ensure_schema(conn)
             conn.execute(
@@ -290,9 +291,9 @@ def evaluate_pending_shadow_signals(
     hold_minutes = shadow_hold_minutes()
     win_bps = shadow_win_bps()
     cap = max_per_call or shadow_max_eval_per_cycle()
-    cutoff = (now or datetime.now(timezone.utc)) - timedelta(minutes=hold_minutes)
+    cutoff = (now or utc_now()) - timedelta(minutes=hold_minutes)
     cutoff_iso = cutoff.isoformat()
-    eval_now_iso = (now or datetime.now(timezone.utc)).isoformat()
+    eval_now_iso = (now or utc_now()).isoformat()
 
     try:
         mids = get_all_mids() or {}
