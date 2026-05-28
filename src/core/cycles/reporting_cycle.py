@@ -106,6 +106,44 @@ def run_reporting(container, cycle_count: int, health_registry=None) -> None:
     except Exception:
         pass
 
+    # ── XGBoost forecaster catchup-labeler ──
+    # The forecaster's auto-retrain only fires every 24h, which means the
+    # forward-return labeler runs once a day at best.  With production
+    # accumulating ~400 new regime_history rows per day, the labeler can
+    # never catch up its backlog in that cadence and the model stays
+    # stuck on synthetic warm-start (conf=45%, source=synthetic).
+    # Calling the labeler from the reporting cycle (every ~3 min) chews
+    # through the backlog independently so train() always sees fresh
+    # labelled rows.  Gated by env, default ON.  The container attr is
+    # ``predictive_forecaster`` for both the XGBoost and the fallback
+    # forecaster paths -- only the XGBoost one exposes the labeler.
+    try:
+        import config as _cfg
+        forecaster = getattr(container, "predictive_forecaster", None)
+        if (
+            getattr(_cfg, "FORECASTER_REPORTING_LABELER_ENABLED", True)
+            and forecaster is not None
+            and hasattr(forecaster, "label_predictions_with_forward_returns")
+        ):
+            batch = int(getattr(
+                _cfg, "FORECASTER_REPORTING_LABELER_BATCH_SIZE", 500,
+            ) or 500)
+            stats = forecaster.label_predictions_with_forward_returns(
+                batch_size=batch,
+            )
+            scanned = int(stats.get("scanned", 0) or 0)
+            labeled = int(stats.get("labeled", 0) or 0)
+            if scanned > 0:
+                logger.info(
+                    "  Forecaster catchup-labeler: scanned=%d labeled=%d "
+                    "no_data=%d errors=%d",
+                    scanned, labeled,
+                    int(stats.get("no_data", 0) or 0),
+                    int(stats.get("errors", 0) or 0),
+                )
+    except Exception as exc:
+        logger.debug("Forecaster catchup-labeler skipped: %s", exc)
+
     # ── API manager stats ──
     try:
         api_s = get_api_stats() if get_api_stats else None
