@@ -2109,6 +2109,10 @@ def test_sync_shadow_book_closes_paper_trade_when_live_position_missing(monkeypa
 
     monkeypatch.setattr(
         "src.core.live_execution.db.get_open_paper_trades",
+        # ★ Reconciler-fix (3d3e493): trades must carry live_mirror=True
+        # (or orphan_found=True) to opt into reconciliation; unmirrored
+        # paper trades are skipped (see test_sync_shadow_book_skips_*
+        # below).
         lambda: [{
             "id": 7,
             "coin": "ETH",
@@ -2221,11 +2225,11 @@ def test_sync_shadow_book_stamps_pnl_analytics_into_reconciliation_metadata(monk
     # => reconciled_pnl = (2100 - 2000) * 0.1 * 5 = 50.0
     monkeypatch.setattr(
         "src.core.live_execution.db.get_open_paper_trades",
-            lambda: [{
-                "id": 11, "coin": "ETH", "side": "long",
-                "entry_price": 2000.0, "size": 0.1, "leverage": 5,
-                "metadata": {"live_mirror": True},
-            }],
+        lambda: [{
+            "id": 11, "coin": "ETH", "side": "long",
+            "entry_price": 2000.0, "size": 0.1, "leverage": 5,
+            "metadata": {"live_mirror": True},
+        }],
     )
     monkeypatch.setattr(
         "src.core.live_execution.get_all_mids",
@@ -2296,11 +2300,11 @@ def test_sync_shadow_book_stamps_negative_pnl_for_short_underwater(monkeypatch):
     # => reconciled_pnl = (60000 - 60500) * 0.01 * 4 = -20.0
     monkeypatch.setattr(
         "src.core.live_execution.db.get_open_paper_trades",
-            lambda: [{
-                "id": 13, "coin": "BTC", "side": "short",
-                "entry_price": 60000.0, "size": 0.01, "leverage": 4,
-                "metadata": {"live_mirror": True},
-            }],
+        lambda: [{
+            "id": 13, "coin": "BTC", "side": "short",
+            "entry_price": 60000.0, "size": 0.01, "leverage": 4,
+            "metadata": {"live_mirror": True},
+        }],
     )
     monkeypatch.setattr(
         "src.core.live_execution.get_all_mids",
@@ -2331,6 +2335,170 @@ def test_sync_shadow_book_stamps_negative_pnl_for_short_underwater(monkeypatch):
     assert meta["gross_pnl_before_fees"] == -20.0
     assert meta["net_pnl_after_fees"] == -21.2
     assert meta["reconciled_fees_estimated"] == pytest.approx(1.205, abs=0.01)
+
+
+# ── Reconciler fix: skip non-mirrored paper trades ─────────────
+
+
+def _fake_live_trader_no_positions():
+    class _Trader:
+        def is_live_enabled(self):
+            return True
+
+        def is_deployable(self):
+            return True
+
+        def get_positions(self):
+            return []
+
+        def get_account_value(self):
+            return 500.0
+
+    return _Trader()
+
+
+def test_sync_shadow_book_skips_non_mirrored_trade(monkeypatch):
+    """Reconciler-fix regression:
+    A paper trade with NO live_mirror_status in metadata was never
+    attempted on the live exchange (promotion gate / mirror declined).
+    The reconciler must leave it alone instead of force-closing it at
+    the current mid-price.
+
+    Before this fix, ~89% of paper trades fell into this bucket and
+    were silently reconciled-killed, contributing -$735 of fake losses
+    to the firewall's recent-loss windows.
+    """
+    closed: list = []
+    metadata_updates: list = []
+
+    container = type(
+        "Container",
+        (),
+        {"live_trader": _fake_live_trader_no_positions(), "paper_trader": object()},
+    )()
+
+    monkeypatch.setattr(
+        "src.core.live_execution.db.get_open_paper_trades",
+        # Bare trade with no metadata: simulates a promotion-gated paper
+        # trade that never reached the live exchange.
+        lambda: [{
+            "id": 101, "coin": "ETH", "side": "long",
+            "entry_price": 2000.0, "size": 0.1, "leverage": 5,
+        }],
+    )
+    monkeypatch.setattr(
+        "src.core.live_execution.get_all_mids",
+        lambda: {"ETH": 1900.0},  # adverse: would yield big loss if reconciled
+    )
+    monkeypatch.setattr(
+        "src.core.live_execution.db.update_paper_trade_metadata",
+        lambda trade_id, meta: metadata_updates.append((trade_id, meta)),
+    )
+    monkeypatch.setattr(
+        "src.core.live_execution.db.close_paper_trade",
+        lambda trade_id, exit_price, pnl: closed.append((trade_id, exit_price, pnl)) or True,
+    )
+    monkeypatch.setattr(
+        "src.core.live_execution._notify_manual_close_detected",
+        lambda trade, exit_price: None,
+    )
+
+    reconciled = sync_shadow_book_to_live(container)
+
+    assert reconciled == []
+    assert closed == [], "non-mirrored trade must NOT be force-closed"
+    assert metadata_updates == [], "no metadata write on a skipped trade"
+
+
+def test_sync_shadow_book_reconciles_mirrored_trade_when_live_position_missing(monkeypatch):
+    """Reconciler-fix companion:
+    A paper trade WITH live_mirror=True that has no matching live
+    position truly is an anomaly (live close fired without notifying
+    the bot, manual close, etc.) and MUST be reconciled.
+    """
+    closed: list = []
+    container = type(
+        "Container",
+        (),
+        {"live_trader": _fake_live_trader_no_positions(), "paper_trader": object()},
+    )()
+    monkeypatch.setattr(
+        "src.core.live_execution.db.get_open_paper_trades",
+        lambda: [{
+            "id": 202, "coin": "SOL", "side": "long",
+            "entry_price": 100.0, "size": 1.0, "leverage": 2,
+            "metadata": {
+                "live_mirror": True,
+                "live_mirror_status": "success",
+                "live_mirror_order_id": "abc123",
+            },
+        }],
+    )
+    monkeypatch.setattr(
+        "src.core.live_execution.get_all_mids",
+        lambda: {"SOL": 95.0},
+    )
+    monkeypatch.setattr(
+        "src.core.live_execution.db.update_paper_trade_metadata",
+        lambda trade_id, meta: None,
+    )
+    monkeypatch.setattr(
+        "src.core.live_execution.db.close_paper_trade",
+        lambda trade_id, exit_price, pnl: closed.append((trade_id, exit_price, pnl)) or True,
+    )
+    monkeypatch.setattr(
+        "src.core.live_execution._notify_manual_close_detected",
+        lambda trade, exit_price: None,
+    )
+
+    reconciled = sync_shadow_book_to_live(container)
+
+    assert len(reconciled) == 1
+    assert reconciled[0]["coin"] == "SOL"
+    assert reconciled[0]["reason"] == "live_reconciled_closed"
+    assert closed and closed[0][0] == 202, "mirrored trade WITH missing live pos must close"
+
+
+def test_sync_shadow_book_reconciles_orphan_found_trade(monkeypatch):
+    """orphan_found=True also opts a trade into reconciliation (it's
+    a synthetic shadow created from a discovered live position; if
+    the live position later vanishes, reconcile it)."""
+    closed: list = []
+    container = type(
+        "Container",
+        (),
+        {"live_trader": _fake_live_trader_no_positions(), "paper_trader": object()},
+    )()
+
+    monkeypatch.setattr(
+        "src.core.live_execution.db.get_open_paper_trades",
+        lambda: [{
+            "id": 404, "coin": "XRP", "side": "short",
+            "entry_price": 0.50, "size": 100.0, "leverage": 3,
+            "metadata": {"orphan_found": True},
+        }],
+    )
+    monkeypatch.setattr(
+        "src.core.live_execution.get_all_mids",
+        lambda: {"XRP": 0.51},
+    )
+    monkeypatch.setattr(
+        "src.core.live_execution.db.update_paper_trade_metadata",
+        lambda trade_id, meta: None,
+    )
+    monkeypatch.setattr(
+        "src.core.live_execution.db.close_paper_trade",
+        lambda trade_id, exit_price, pnl: closed.append((trade_id, exit_price, pnl)) or True,
+    )
+    monkeypatch.setattr(
+        "src.core.live_execution._notify_manual_close_detected",
+        lambda trade, exit_price: None,
+    )
+
+    reconciled = sync_shadow_book_to_live(container)
+
+    assert len(reconciled) == 1, "orphan_found trade must opt into reconciliation"
+    assert closed and closed[0][0] == 404
 
 
 def test_sync_shadow_book_creates_synthetic_trade_for_orphan_live_position(monkeypatch):

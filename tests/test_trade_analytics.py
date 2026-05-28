@@ -8,6 +8,80 @@ from src.analysis.trade_analytics import (
 )
 
 
+# ── Tainted-trade fix: ensure analytics gates ignore artefacts ──
+
+
+def _losing_trade(idx: int, *, tainted: bool = False, source: str = "strategy:momentum_short") -> dict:
+    """Build a single losing-short trade with optional tainted flag."""
+    meta = {"source_key": source, "close_reason": "live_reconciled_closed"}
+    if tainted:
+        meta["tainted"] = True
+        meta["taint_reason"] = "reconciler_kill_pre_fix"
+    return {
+        "side": "short",
+        "coin": "BTC",
+        "pnl": -5.0 - idx * 0.1,
+        "metadata": meta,
+    }
+
+
+def test_tainted_trades_excluded_from_summary():
+    trades = [_losing_trade(i, tainted=True) for i in range(20)] + [
+        {"side": "short", "coin": "BTC", "pnl": +3.0,
+         "metadata": {"source_key": "strategy:momentum_short", "close_reason": "take_profit"}},
+    ]
+    analytics = compute_trade_analytics(trades, source_limit=5)
+    # The 20 tainted -$5 trades should NOT appear in the count.
+    assert analytics["summary"]["count"] == 1
+    assert analytics["summary"]["net_pnl"] == 3.0
+
+
+def test_tainted_trades_excluded_from_side_source_policy():
+    """Regression: pre-fix, 18 tainted reconciler kills made the
+    side-source gate read 28% WR / -$142 and block every
+    strategy:momentum_short signal forever.  With the taint filter
+    those trades are excluded and the gate returns 'insufficient' /
+    'healthy' depending on what's left."""
+    tainted = [_losing_trade(i, tainted=True) for i in range(18)]
+    result = evaluate_side_source_policy(
+        tainted,
+        side="short",
+        source_key="strategy:momentum_short",
+        min_trades=5,
+        degrade_win_rate=0.40,
+        block_win_rate=0.30,
+        block_net_pnl=-50.0,
+        exact_source=True,
+    )
+    # Tainted-only history is filtered to empty → "insufficient" sample.
+    assert result["status"] == "insufficient"
+    assert result["metrics"]["count"] == 0
+
+
+def test_tainted_trades_excluded_from_source_policy():
+    tainted = [_losing_trade(i, tainted=True, source="strategy") for i in range(15)]
+    result = evaluate_source_policy(
+        tainted,
+        source_label="strategy",
+        min_trades=5,
+        degrade_win_rate=0.40,
+        block_win_rate=0.30,
+        block_net_pnl=-50.0,
+    )
+    assert result["status"] == "insufficient"
+    assert result["metrics"]["count"] == 0
+
+
+def test_analytics_include_tainted_env_opt_in_restores_legacy(monkeypatch):
+    """Operators can force analytics to count tainted trades again via
+    ANALYTICS_INCLUDE_TAINTED=1 (forensic comparisons)."""
+    monkeypatch.setenv("ANALYTICS_INCLUDE_TAINTED", "1")
+    trades = [_losing_trade(i, tainted=True) for i in range(5)]
+    analytics = compute_trade_analytics(trades, source_limit=5)
+    assert analytics["summary"]["count"] == 5
+    assert analytics["summary"]["net_pnl"] < 0
+
+
 def test_compute_trade_analytics_groups_by_side_and_source():
     trades = [
         {
