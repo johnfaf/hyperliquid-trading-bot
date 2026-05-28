@@ -14,6 +14,25 @@ import logging
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _reset_pipeline_health_streak():
+    """Reset the module-level streak counter so this file's tests
+    don't pollute the false-positive stale-warning test in
+    tests/test_live_controls.py.  See PR #40 CI investigation."""
+    from src.core.cycles import reporting_cycle as rc
+    saved_streak = dict(rc._PIPELINE_HEALTH_STREAK)
+    saved_prev = dict(rc._PIPELINE_HEALTH_PREV)
+    rc._PIPELINE_HEALTH_STREAK.clear()
+    rc._PIPELINE_HEALTH_PREV.clear()
+    yield
+    rc._PIPELINE_HEALTH_STREAK.clear()
+    rc._PIPELINE_HEALTH_STREAK.update(saved_streak)
+    rc._PIPELINE_HEALTH_PREV.clear()
+    rc._PIPELINE_HEALTH_PREV.update(saved_prev)
+
 
 # ── min_training_samples defaults ───────────────────────────────
 
