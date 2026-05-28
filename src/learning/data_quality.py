@@ -4,11 +4,80 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from src.learning.dataset_builder import DatasetBuildResult, LearningExample
+
+
+# ── Env-driven threshold overrides ──────────────────────────────
+
+
+def _env_float(name: str, default: float, lo: float, hi: float) -> float:
+    """Return env value clamped to [lo, hi], or default if unset/invalid."""
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return float(default)
+    try:
+        return max(lo, min(hi, float(raw)))
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _env_int(name: str, default: int, lo: int, hi: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return int(default)
+    try:
+        return max(lo, min(hi, int(float(raw))))
+    except (TypeError, ValueError):
+        return int(default)
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = str(os.environ.get(name, "") or "").strip().lower()
+    if not raw:
+        return default
+    return raw in {"1", "true", "yes", "on"}
+
+
+# ── Threshold presets ───────────────────────────────────────────
+
+
+# Strict / production defaults.  Mirror the legacy hard-coded values
+# so existing operators see no behaviour change unless they opt in.
+_STRICT_THRESHOLDS = dict(
+    min_rows=50,
+    min_labelled=30,
+    max_missing_feature_ratio=0.15,
+    min_positive_ratio=0.20,
+    max_positive_ratio=0.80,
+    max_data_gap_ratio=0.05,
+)
+
+
+# Research-mode preset.  Used during the cold-start window where
+# decision_outcomes is sparse (only paper-closed trades have labels),
+# the bot has been losing (positive ratio near 0%), and signal cadence
+# is uneven (high data_gap_ratio).  Set
+# ``LEARNING_QUALITY_RESEARCH_MODE=1`` to apply.
+#
+# Looser bars are SAFE because the auditor only gates the offline
+# learning loop's progression to building promotion packages -- it
+# never touches live behaviour.  Even with a passing dataset, every
+# downstream stage (replay backtest, shadow eval, promotion decision)
+# applies its own safety gates before a candidate policy would ever
+# affect live trading.
+_RESEARCH_THRESHOLDS = dict(
+    min_rows=50,
+    min_labelled=20,
+    max_missing_feature_ratio=0.60,
+    min_positive_ratio=0.05,
+    max_positive_ratio=0.95,
+    max_data_gap_ratio=0.80,
+)
 
 
 def _now() -> str:
@@ -49,9 +118,9 @@ class DatasetQualityAuditor:
     def __init__(
         self,
         *,
-        min_rows: int = 50,
-        min_labelled: int = 30,
-        max_missing_feature_ratio: float = 0.15,
+        min_rows: Optional[int] = None,
+        min_labelled: Optional[int] = None,
+        max_missing_feature_ratio: Optional[float] = None,
         # ★ M21 FIX: was 0.05 / 0.95.  A dataset of 95% wins (or 5%) was
         # passing the balance check, even though such an extreme ratio is
         # strongly suggestive of label leakage, broken close-detection, or
@@ -61,16 +130,70 @@ class DatasetQualityAuditor:
         # plenty of small losses) while rejecting suspect distributions.
         # Also tightened max_missing_feature_ratio 0.35 -> 0.15 (mirrors
         # M11 in dataset_builder).
-        min_positive_ratio: float = 0.20,
-        max_positive_ratio: float = 0.80,
-        max_data_gap_ratio: float = 0.05,
+        #
+        # ★ PHASE 4 FIX: all six thresholds are now operator-tunable
+        # via env so production can run with looser bars while the
+        # upstream data shape improves.  Set
+        # ``LEARNING_QUALITY_RESEARCH_MODE=1`` to apply the looser
+        # research preset in one switch.  See _RESEARCH_THRESHOLDS for
+        # the values and the safety rationale.
+        min_positive_ratio: Optional[float] = None,
+        max_positive_ratio: Optional[float] = None,
+        max_data_gap_ratio: Optional[float] = None,
     ):
-        self.min_rows = int(min_rows)
-        self.min_labelled = int(min_labelled)
-        self.max_missing_feature_ratio = float(max_missing_feature_ratio)
-        self.min_positive_ratio = float(min_positive_ratio)
-        self.max_positive_ratio = float(max_positive_ratio)
-        self.max_data_gap_ratio = float(max_data_gap_ratio)
+        preset = (
+            _RESEARCH_THRESHOLDS
+            if _env_bool("LEARNING_QUALITY_RESEARCH_MODE", default=False)
+            else _STRICT_THRESHOLDS
+        )
+        # Resolution order: explicit kwarg > per-knob env > preset.
+        self.min_rows = int(
+            min_rows
+            if min_rows is not None
+            else _env_int(
+                "LEARNING_QUALITY_MIN_ROWS", preset["min_rows"], 1, 1_000_000,
+            )
+        )
+        self.min_labelled = int(
+            min_labelled
+            if min_labelled is not None
+            else _env_int(
+                "LEARNING_QUALITY_MIN_LABELLED",
+                preset["min_labelled"], 1, 1_000_000,
+            )
+        )
+        self.max_missing_feature_ratio = float(
+            max_missing_feature_ratio
+            if max_missing_feature_ratio is not None
+            else _env_float(
+                "LEARNING_QUALITY_MAX_MISSING_FEATURE_RATIO",
+                preset["max_missing_feature_ratio"], 0.0, 1.0,
+            )
+        )
+        self.min_positive_ratio = float(
+            min_positive_ratio
+            if min_positive_ratio is not None
+            else _env_float(
+                "LEARNING_QUALITY_MIN_POSITIVE_RATIO",
+                preset["min_positive_ratio"], 0.0, 1.0,
+            )
+        )
+        self.max_positive_ratio = float(
+            max_positive_ratio
+            if max_positive_ratio is not None
+            else _env_float(
+                "LEARNING_QUALITY_MAX_POSITIVE_RATIO",
+                preset["max_positive_ratio"], 0.0, 1.0,
+            )
+        )
+        self.max_data_gap_ratio = float(
+            max_data_gap_ratio
+            if max_data_gap_ratio is not None
+            else _env_float(
+                "LEARNING_QUALITY_MAX_DATA_GAP_RATIO",
+                preset["max_data_gap_ratio"], 0.0, 1.0,
+            )
+        )
 
     @staticmethod
     def _feature_missing_ratio(examples: List[LearningExample], feature_names: List[str]) -> float:
