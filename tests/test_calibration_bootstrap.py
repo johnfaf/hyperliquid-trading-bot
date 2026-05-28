@@ -190,15 +190,31 @@ def test_lookback_window_excludes_old_trades(paper_trades_db):
 
 
 def test_derives_copy_trade_address_for_source_key(paper_trades_db):
+    full_addr = "0x" + "ab" * 20  # canonical: 0x + 40 hex chars
     _insert_trade(
         paper_trades_db, tid=1, coin="HYPE", side="long", pnl=1.5,
         metadata={"source": "copy_trade",
-                  "source_trader": "0xABCDEF",
+                  "source_trader": full_addr,
                   "confidence": 0.6},
     )
     cal = _FakeCalibration()
     cb.bootstrap_calibration_from_history(cal)
-    assert cal.records[0]["source_key"] == "copy_trade:0xabcdef"
+    assert cal.records[0]["source_key"] == f"copy_trade:{full_addr}"
+
+
+def test_falls_back_to_bare_copy_trade_for_malformed_address(paper_trades_db):
+    """Truncated 0x addresses must fall back to the bare 'copy_trade'
+    key (NOT a fragmented form).  Enforces the canonical-builder
+    invariant from the historical address-truncation bug."""
+    _insert_trade(
+        paper_trades_db, tid=1, coin="HYPE", side="long", pnl=1.5,
+        metadata={"source": "copy_trade",
+                  "source_trader": "0xABCDEF",   # truncated, not valid
+                  "confidence": 0.6},
+    )
+    cal = _FakeCalibration()
+    cb.bootstrap_calibration_from_history(cal)
+    assert cal.records[0]["source_key"] == "copy_trade"
 
 
 def test_skips_trades_missing_critical_fields(paper_trades_db):

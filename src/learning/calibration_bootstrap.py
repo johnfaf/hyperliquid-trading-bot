@@ -33,10 +33,12 @@ import json
 import logging
 import os
 from collections import defaultdict
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
 from typing import Any, Dict, Iterable, Optional
 
+from src.core.clock_provider import utc_now
 from src.data import database as db
+from src.signals.source_key import copy_trade_source_key
 
 logger = logging.getLogger(__name__)
 
@@ -102,9 +104,11 @@ def _derive_source_key(trade: Dict[str, Any]) -> str:
     )
     key = str(raw or "unknown").strip().lower() or "unknown"
     if key == "copy_trade":
-        trader = str(meta.get("source_trader") or "").strip().lower()
+        trader = str(meta.get("source_trader") or "").strip()
         if trader:
-            return f"copy_trade:{trader}"
+            # Canonical builder enforces full-address invariant + falls
+            # back to bare "copy_trade" on malformed input.
+            return str(copy_trade_source_key(trader, strict=False))
     elif key == "strategy":
         st = str(meta.get("strategy_type") or trade.get("strategy_type") or "").strip().lower()
         if st:
@@ -137,7 +141,7 @@ def _fetch_clean_closed_trades(
 ) -> Iterable[Dict[str, Any]]:
     """Return closed paper_trades from the lookback window, excluding
     tainted ones."""
-    cutoff = datetime.now(timezone.utc) - timedelta(days=lookback_days_v)
+    cutoff = utc_now() - timedelta(days=lookback_days_v)
     cutoff_iso = cutoff.isoformat()
     try:
         with db.get_connection(for_read=True) as conn:
