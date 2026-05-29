@@ -141,5 +141,19 @@ def _health_strip_include_db_audit() -> bool:
 
 def _evaluate_readiness(*, include_db_audit: bool = True) -> dict:
     from src.core.readiness import evaluate_readiness
+    from src.ui.v2.state import get_components
 
-    return evaluate_readiness(include_db_audit=include_db_audit)
+    # Pass the live component container so readiness can actually see the
+    # live trader.  Without it, evaluate_readiness has no handle on
+    # ``container.live_trader`` (there is no fallback for it) and reports
+    # ``live_requested=false`` / ``live_ready=false`` even when the bot is
+    # running in LIVE mode -- which is exactly the stale reading the
+    # /api/live_ready endpoint was serving.  ``get_stats()`` is in-memory
+    # (state-lock read, no network), so this stays cheap.  health_registry
+    # falls back to the global singleton inside evaluate_readiness when None.
+    components = get_components()
+    return evaluate_readiness(
+        container=components,
+        health_registry=getattr(components, "health_registry", None),
+        include_db_audit=include_db_audit,
+    )
