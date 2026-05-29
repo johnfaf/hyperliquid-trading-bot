@@ -770,7 +770,19 @@ class PaperTrader:
                     _cu = str(_c or "").strip().upper()
                     if _cu and _cu != "UNKNOWN":
                         _extra.add(_cu)
-            _cap = max(3, int(getattr(config, "PAPER_FEATURE_PRECOMPUTE_MAX_COINS", 12)))
+            # ★ PHASE 5 FIX: previous default 12 was too small for the
+            # bot's ~25 active strategies.  After ``feature_coins[:_cap]``
+            # the alphabetically-first 9 extra coins survived; late-
+            # alphabet coins (VVV, ZEC, ...) were silently cut and any
+            # signal they emitted reached the journal with empty
+            # features.  Production audit found those rows account for
+            # ~35% of decision_outcomes -- the bulk of the auditor's
+            # ``missing_feature_ratio`` failure (0.49 vs strict 0.15).
+            # Bumped default 12 -> 32 so the full active-strategy fan-
+            # out fits.  At a default cycle of 15min that's at most
+            # 32 * (24*60/15) = 3072 candle-snapshot calls/day, still
+            # comfortably under the HL rate budget.
+            _cap = max(3, int(getattr(config, "PAPER_FEATURE_PRECOMPUTE_MAX_COINS", 32)))
             feature_coins = ["BTC", "ETH", "SOL"] + sorted(_extra - _core)
             feature_coins = feature_coins[:_cap]
         except Exception as exc:
