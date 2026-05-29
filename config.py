@@ -448,7 +448,12 @@ PAPER_TRADING_MAX_LEVERAGE = float(os.environ.get("PAPER_TRADING_MAX_LEVERAGE", 
 # coins this cycle's strategies target. Cap protects the candle API
 # from a large strategy fan-out.
 PAPER_FEATURE_PRECOMPUTE_MAX_COINS = int(
-    os.environ.get("PAPER_FEATURE_PRECOMPUTE_MAX_COINS", 12) or 12
+    # ★ PHASE 5 FIX: bumped default 12 -> 32.  At 12, the bot's ~25
+    # active strategies blew past the cap and the alphabetically-late
+    # coins (VVV, ZEC, ...) were silently cut, leaving their signals
+    # with empty features in decision_outcomes -- the bulk of the
+    # learning auditor's missing-feature failure (0.49 vs strict 0.15).
+    os.environ.get("PAPER_FEATURE_PRECOMPUTE_MAX_COINS", 32) or 32
 )
 # Paper-trading risk is defined in ROE space, then converted back into raw
 # trigger prices by dividing by leverage.
