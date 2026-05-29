@@ -446,6 +446,76 @@ class AgentScorer:
         logger.info(f"Agent score update [{source_key}]: pnl=${pnl:.2f}, "
                     f"accuracy={score.accuracy:.0%}, weight={score.dynamic_weight:.2f}")
 
+    def rebuild_source_from_trades(
+        self,
+        source_key: str,
+        completed_trades: List[Dict],
+        *,
+        persist: bool = True,
+    ) -> SourceScore:
+        """Rebuild a single source's score from an authoritative trade list.
+
+        Used by ``scripts/recompute_agent_scores.py`` to repair the
+        decoupling production audit found between the agent_scores DB
+        columns and the actual paper_trades outcomes (e.g.
+        ``strategy:unknown`` showed total_signals=0 / correct_signals=103,
+        and momentum_short showed total_pnl=+468 while paper_trades had
+        only one matching completed entry).
+
+        ``completed_trades`` is a list of dicts in CHRONOLOGICAL order,
+        each with at least ``pnl`` and optionally ``coin``, ``side``,
+        ``confidence``, ``return_pct``, ``timestamp``, ``signal_id``.
+        Caller is responsible for excluding tainted / reconciler-close
+        rows before passing them in.
+
+        Reuses the canonical ``_recalculate`` so the resulting
+        dynamic_weight / accuracy / sharpe match exactly what the live
+        path would produce.  Returns the rebuilt SourceScore.
+        """
+        score = SourceScore(source_key=source_key)
+        history: List[Dict] = []
+        correct = 0
+        total_pnl = 0.0
+        total_return = 0.0
+        for i, t in enumerate(completed_trades):
+            pnl = float(t.get("pnl", 0.0) or 0.0)
+            ret = float(t.get("return_pct", 0.0) or 0.0)
+            is_win = pnl > 0
+            if is_win:
+                correct += 1
+            total_pnl += pnl
+            total_return += ret
+            history.append({
+                "signal_id": str(t.get("signal_id") or f"{source_key}:{i+1}"),
+                "timestamp": str(t.get("timestamp") or ""),
+                "coin": str(t.get("coin", "") or ""),
+                "side": str(t.get("side", "") or ""),
+                "confidence": float(t.get("confidence", 0.0) or 0.0),
+                "pnl": pnl,
+                "correct": is_win,
+                "return_pct": ret,
+            })
+        score.total_signals = len(history)
+        score.correct_signals = correct
+        score.total_pnl = round(total_pnl, 4)
+        score.total_return = round(total_return, 6)
+        if history:
+            score.last_updated = history[-1].get("timestamp") or datetime.now(
+                timezone.utc
+            ).isoformat()
+        else:
+            score.last_updated = datetime.now(timezone.utc).isoformat()
+
+        # Install the rebuilt state, then run the canonical recompute so
+        # accuracy / weighted_accuracy / sharpe / dynamic_weight are
+        # derived with identical math to the live path.
+        self.scores[source_key] = score
+        self._trade_history[source_key] = history[-200:]
+        self._recalculate(source_key)
+        if persist:
+            self._save_score(source_key)
+        return self.scores[source_key]
+
     # ─── Scoring ──────────────────────────────────────────────
 
     def _recalculate(self, source_key: str):
