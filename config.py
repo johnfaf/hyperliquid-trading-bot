@@ -1968,6 +1968,27 @@ XGBOOST_LABELER_CRASH_PCT = float(
 XGBOOST_LABELER_BULLISH_PCT = float(
     os.environ.get("XGBOOST_LABELER_BULLISH_PCT", 0.015)  # +1.5%
 )
+# ── Volatility-relative labeling ────────────────────────────────────────
+# A fixed ±1.5%/60min bar is ~2-3 sigma for BTC, so in practice it labeled
+# ~100% of forward windows "neutral" -> single-class data -> the XGBoost
+# regime model could never train (it fell back to the weighted-signal
+# forecaster permanently).  Volatility-relative mode classifies crash/bullish
+# by how large the forward return is *relative to the coin's own realized
+# volatility* (>= VOL_K forward-sigmas) rather than a fixed percentage, which
+# yields a balanced 3-class label set across coins and vol regimes.
+# Default ON; set XGBOOST_LABELER_VOL_RELATIVE=false to restore fixed-% bars.
+XGBOOST_LABELER_VOL_RELATIVE = os.environ.get(
+    "XGBOOST_LABELER_VOL_RELATIVE", "true"
+).strip().lower() in ("1", "true", "yes", "on")
+# Crash/bullish trigger at >= VOL_K * forward-sigma (1.0 ~= a 1-sigma move).
+XGBOOST_LABELER_VOL_K = float(
+    os.environ.get("XGBOOST_LABELER_VOL_K", 1.0)
+)
+# Absolute floor (fraction): a move below this is always neutral, so sub-fee
+# noise in dead-flat windows is never labeled directional even at 1+ sigma.
+XGBOOST_LABELER_MIN_ABS_MOVE = float(
+    os.environ.get("XGBOOST_LABELER_MIN_ABS_MOVE", 0.001)  # 0.1%
+)
 XGBOOST_LABELER_BATCH_SIZE = int(
     os.environ.get("XGBOOST_LABELER_BATCH_SIZE", 200)
 )
