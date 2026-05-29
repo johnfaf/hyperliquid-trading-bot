@@ -480,6 +480,51 @@ def test_health_strip_uses_lightweight_readiness_by_default(monkeypatch, client)
     assert calls == [False]
 
 
+def test_evaluate_readiness_passes_live_container(monkeypatch):
+    """Regression: the v2 readiness path must hand evaluate_readiness the
+    live component container.  Before this fix it called
+    evaluate_readiness() with no container, so ``container.live_trader``
+    was always None and /api/live_ready reported live_requested=false even
+    while the bot ran in LIVE mode."""
+    from types import SimpleNamespace
+
+    import src.core.readiness as readiness_mod
+    from src.ui.v2.routers import health as health_router
+
+    captured = {}
+
+    def fake_eval(*, container=None, health_registry=None, include_db_audit=True):
+        captured["container"] = container
+        captured["health_registry"] = health_registry
+        captured["include_db_audit"] = include_db_audit
+        lt = getattr(container, "live_trader", None)
+        live = bool(lt.get_stats().get("live_enabled")) if lt is not None else False
+        return {
+            "ready": True,
+            "live_ready": live,
+            "live_requested": live,
+            "reasons": [],
+        }
+
+    monkeypatch.setattr(readiness_mod, "evaluate_readiness", fake_eval)
+
+    live_trader = SimpleNamespace(get_stats=lambda: {"live_enabled": True})
+    v2_state.reset_components()
+    v2_state.set_components(live_trader=live_trader, health_registry="HR")
+    try:
+        out = health_router._evaluate_readiness(include_db_audit=False)
+    finally:
+        v2_state.reset_components()
+
+    # The exact wiring that was missing: container is the live registry and
+    # carries the live trader through to readiness.
+    assert captured["container"].live_trader is live_trader
+    assert captured["health_registry"] == "HR"
+    assert captured["include_db_audit"] is False
+    assert out["live_requested"] is True
+    assert out["live_ready"] is True
+
+
 def test_clear_quarantine_requires_audit_reason(client):
     r = client.post(
         "/api/sources/clear_quarantine",
