@@ -358,6 +358,15 @@ def sync_shadow_book_to_live(container) -> List[Dict]:
     matched_live_keys = set()
     for trade in open_trades:
         existing_meta = _trade_metadata(trade)
+        # ★ RECONCILER FIX (origin/main 3d3e493): skip paper trades that
+        # were never attempted on live (e.g. promotion-gate-blocked
+        # sources, untagged sources, bootstrap-tier-deferred copies).
+        # For these the absence of a live position is expected by
+        # design, not an anomaly to close out.  Without this guard the
+        # reconciler force-closes ~89% of paper trades at adverse
+        # mid-prices ~3 minutes after open, poisoning the firewall's
+        # recent-loss windows and the agent_scorer's outcome history
+        # with -$735 of fake losses.
         is_live_shadow = bool(
             existing_meta.get("live_mirror") or existing_meta.get("orphan_found")
         )

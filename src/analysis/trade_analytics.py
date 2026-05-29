@@ -33,6 +33,33 @@ def _trade_metadata(trade: Dict) -> Dict:
     return {}
 
 
+def _is_trade_tainted(trade: Dict) -> bool:
+    """Return True if the trade is flagged as tainted analytics data.
+
+    A trade is tainted when its outcome was driven by a known upstream
+    bug (e.g. the pre-fix reconciler force-closing un-mirrored paper
+    trades at adverse mid-prices) rather than the strategy / source
+    actually performing.  Tainted trades are excluded from the
+    firewall's recent-loss gates and the agent_scorer's outcome history
+    so the bot doesn't keep pausing strategies on artefacts of fixed
+    bugs.
+
+    The tainted flag is written to ``metadata.tainted=True`` (with an
+    optional ``taint_reason``) by the one-time migration in
+    ``scripts/mark_tainted_trades.py``.
+
+    Env opt-out: set ``ANALYTICS_INCLUDE_TAINTED=1`` to include tainted
+    trades again (e.g. for forensic comparison).
+    """
+    import os as _os
+    if str(_os.environ.get("ANALYTICS_INCLUDE_TAINTED", "0") or "0").strip().lower() in {
+        "1", "true", "yes", "on",
+    }:
+        return False
+    meta = _trade_metadata(trade)
+    return bool(meta.get("tainted"))
+
+
 def _normalize_source_label(value) -> str:
     raw = str(value or "").strip().lower()
     if not raw:
@@ -330,6 +357,12 @@ def compute_trade_analytics(
     by_coin_side = defaultdict(_new_bucket)
 
     for trade in trades or []:
+        # ★ Tainted-trade fix: skip outcomes flagged as artefacts of a
+        # known upstream bug (e.g. pre-fix reconciler kills) so they
+        # don't poison source/side performance windows.  See
+        # _is_trade_tainted docstring + scripts/mark_tainted_trades.py.
+        if _is_trade_tainted(trade):
+            continue
         pnl = _coerce_float(trade.get("pnl", 0.0))
         side = str(trade.get("side", "") or "unknown").strip().lower() or "unknown"
         coin = str(trade.get("coin", "") or "unknown").strip().upper() or "UNKNOWN"
@@ -468,6 +501,9 @@ def evaluate_side_source_policy(
     filtered: List[Dict] = []
 
     for trade in trades or []:
+        # ★ Tainted-trade fix: skip artefacts of fixed upstream bugs.
+        if _is_trade_tainted(trade):
+            continue
         trade_side = str(trade.get("side", "") or "").strip().lower()
         if normalized_side and trade_side != normalized_side:
             continue
@@ -556,9 +592,12 @@ def evaluate_source_policy(
     block_net_pnl: float,
 ) -> Dict:
     normalized = _normalize_source_label(source_label)
+    # ★ Tainted-trade fix: exclude trades flagged as artefacts of fixed
+    # bugs.  compute_trade_analytics also filters, but this filter
+    # bounds the source-label lookup too.
     source_trades = [
         trade for trade in (trades or [])
-        if _trade_source_label(trade) == normalized
+        if _trade_source_label(trade) == normalized and not _is_trade_tainted(trade)
     ]
     analytics = compute_trade_analytics(source_trades, source_limit=8)
     summary = analytics["summary"]
