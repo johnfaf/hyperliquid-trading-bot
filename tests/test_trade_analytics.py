@@ -82,6 +82,75 @@ def test_analytics_include_tainted_env_opt_in_restores_legacy(monkeypatch):
     assert analytics["summary"]["net_pnl"] < 0
 
 
+# ── Phase 6 expansion: ANY reconciler-closed trade is tainted ──
+
+
+def test_reconciler_close_with_mirror_success_is_still_tainted():
+    """A 'mirrored successfully' trade closed via live_reconciled_closed
+    has PnL = mid-snapshot, not real exit fill.  Treat as tainted."""
+    trades = [
+        # NOT tainted flag, mirror succeeded, but close_reason makes it suspect.
+        {
+            "side": "short", "coin": "BTC", "pnl": -30.0,
+            "metadata": {
+                "source_key": "strategy:momentum_short",
+                "close_reason": "live_reconciled_closed",
+                "live_mirror_status": "success",
+            },
+        },
+        # A clean TP close — must stay counted.
+        {
+            "side": "short", "coin": "BTC", "pnl": +5.0,
+            "metadata": {
+                "source_key": "strategy:momentum_short",
+                "close_reason": "take_profit",
+            },
+        },
+    ]
+    analytics = compute_trade_analytics(trades, source_limit=5)
+    assert analytics["summary"]["count"] == 1
+    assert analytics["summary"]["net_pnl"] == 5.0
+
+
+def test_reconciler_close_via_reconciliation_reason_alias():
+    """Legacy rows used `reconciliation_reason` instead of
+    `close_reason`. Both must trigger the taint."""
+    trades = [{
+        "side": "long", "coin": "ETH", "pnl": -50.0,
+        "metadata": {
+            "source_key": "strategy:momentum_long",
+            "reconciliation_reason": "live_reconciled_closed",
+            "live_mirror_status": "success",
+        },
+    }]
+    analytics = compute_trade_analytics(trades, source_limit=5)
+    assert analytics["summary"]["count"] == 0
+
+
+def test_reconciler_close_taint_excluded_from_side_source_gate():
+    """The downstream firewall gate must read this lower count too."""
+    trades = [
+        {"side": "short", "coin": "BTC", "pnl": -30.0,
+         "metadata": {"source_key": "strategy:momentum_short",
+                      "close_reason": "live_reconciled_closed",
+                      "live_mirror_status": "success"}}
+        for _ in range(10)
+    ]
+    # All 10 are reconciler closes -> filtered to empty -> "insufficient" sample.
+    result = evaluate_side_source_policy(
+        trades,
+        side="short",
+        source_key="strategy:momentum_short",
+        min_trades=5,
+        degrade_win_rate=0.40,
+        block_win_rate=0.30,
+        block_net_pnl=-50.0,
+        exact_source=True,
+    )
+    assert result["status"] == "insufficient"
+    assert result["metrics"]["count"] == 0
+
+
 def test_compute_trade_analytics_groups_by_side_and_source():
     trades = [
         {
