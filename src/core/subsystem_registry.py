@@ -654,6 +654,22 @@ def build_subsystems(
             except Exception as exc:
                 logger.debug("Could not attach calibration to firewall: %s", exc)
 
+        # ★ Phase 1.3: optional boot-time calibration bootstrap.
+        # When CALIBRATION_BOOTSTRAP_ON_BOOT=1, seed empty bins from
+        # clean closed paper_trades so the EV gate's bucketed floor
+        # has realistic priors immediately.  Idempotent -- skips
+        # buckets that already have enough data.  Default OFF.
+        if c.calibration is not None:
+            try:
+                from src.learning.calibration_bootstrap import (
+                    bootstrap_calibration_from_history,
+                    bootstrap_enabled_on_boot,
+                )
+                if bootstrap_enabled_on_boot():
+                    bootstrap_calibration_from_history(c.calibration)
+            except Exception as exc:
+                logger.debug("Calibration bootstrap on boot skipped: %s", exc)
+
     if "llm_filter" in profile:
         from src.signals.llm_filter import LLMFilter
         c.llm_filter = _safe_init("llm_filter", LLMFilter, health)
