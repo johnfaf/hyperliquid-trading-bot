@@ -12,11 +12,15 @@ This is what turns the system from "equal voting" into "meritocratic voting."
 import logging
 import math
 import json
-import time
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 from collections import defaultdict
 from dataclasses import dataclass, asdict
+
+# ★ Clock-injection discipline (CI ratchet): use the swappable clock
+# provider instead of raw stdlib wall-clock reads so the replay
+# harness can slide all time reads to a deterministic window.
+from src.core.clock_provider import unix_now, utc_now
 
 from src.data import database as db
 
@@ -251,7 +255,7 @@ class AgentScorer:
                 """, (source_key, score.total_signals, score.correct_signals,
                       score.total_pnl, score.total_return, score.accuracy, score.sharpe,
                       score.dynamic_weight, history_json,
-                      datetime.now(timezone.utc).isoformat()))
+                      utc_now().isoformat()))
         except Exception as e:
             logger.warning(f"Could not save agent score for {source_key}: {e}")
 
@@ -277,13 +281,13 @@ class AgentScorer:
 
         score = self.scores[source_key]
         score.total_signals += 1
-        score.last_updated = datetime.now(timezone.utc).isoformat()
+        score.last_updated = utc_now().isoformat()
 
-        signal_id = f"{source_key}:{score.total_signals}:{int(time.time())}"
+        signal_id = f"{source_key}:{score.total_signals}:{int(unix_now())}"
 
         self._trade_history[source_key].append({
             "signal_id": signal_id,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "timestamp": utc_now().isoformat(),
             "coin": signal_data.get("coin", ""),
             "side": signal_data.get("side", ""),
             "confidence": signal_data.get("confidence", 0),
@@ -408,7 +412,7 @@ class AgentScorer:
                 fallback = close_metadata or {}
                 history.append({
                     "signal_id": signal_id,
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "timestamp": utc_now().isoformat(),
                     "coin": str(fallback.get("coin", "") or ""),
                     "side": str(fallback.get("side", "") or ""),
                     "confidence": float(fallback.get("confidence", 0.0) or 0.0),
@@ -500,11 +504,9 @@ class AgentScorer:
         score.total_pnl = round(total_pnl, 4)
         score.total_return = round(total_return, 6)
         if history:
-            score.last_updated = history[-1].get("timestamp") or datetime.now(
-                timezone.utc
-            ).isoformat()
+            score.last_updated = history[-1].get("timestamp") or utc_now().isoformat()
         else:
-            score.last_updated = datetime.now(timezone.utc).isoformat()
+            score.last_updated = utc_now().isoformat()
 
         # Install the rebuilt state, then run the canonical recompute so
         # accuracy / weighted_accuracy / sharpe / dynamic_weight are
@@ -639,7 +641,7 @@ class AgentScorer:
             dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
             if dt.tzinfo is None:
                 dt = dt.replace(tzinfo=timezone.utc)
-            delta = datetime.now(timezone.utc) - dt
+            delta = utc_now() - dt
             return max(0.0, delta.total_seconds() / 86400.0)
         except (TypeError, ValueError):
             return None
