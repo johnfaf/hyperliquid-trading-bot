@@ -385,12 +385,51 @@ class AgentScorer:
 
             # Update trade history
             history = self._trade_history[source_key]
+            matched = False
             for entry in reversed(history):
                 if entry["signal_id"] == signal_id:
                     entry["pnl"] = pnl
                     entry["correct"] = correct
                     entry["return_pct"] = return_pct
+                    matched = True
                     break
+
+            if not matched:
+                # ★ PHASE 5 FIX: signal_id never went through
+                # record_signal() for this source.  Production audit
+                # found this happens for live_orphan, strategy:unknown,
+                # mis-tagged copy_trade flows, etc -- yielding the
+                # impossible invariant ``correct_signals > total_signals``
+                # (43 rows in prod, e.g. strategy:unknown n=0 corr=103).
+                # Synthesise a history entry so _recalculate sees the
+                # outcome and accuracy stays accurate, then sync
+                # total_signals up to history length so the basic
+                # n >= correct invariant holds.
+                fallback = close_metadata or {}
+                history.append({
+                    "signal_id": signal_id,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "coin": str(fallback.get("coin", "") or ""),
+                    "side": str(fallback.get("side", "") or ""),
+                    "confidence": float(fallback.get("confidence", 0.0) or 0.0),
+                    "pnl": pnl,
+                    "correct": correct,
+                    "return_pct": return_pct,
+                    "synthetic_signal": True,
+                })
+                logger.debug(
+                    "Synthesised history entry for %s signal_id=%s "
+                    "(no prior record_signal call)",
+                    source_key, signal_id,
+                )
+
+            # Enforce the invariant total_signals >= correct_signals
+            # AND total_signals >= len(completed_history).
+            score.total_signals = max(
+                score.total_signals,
+                score.correct_signals,
+                len(history),
+            )
 
             # Recalculate scores with time decay
             self._recalculate(source_key)
