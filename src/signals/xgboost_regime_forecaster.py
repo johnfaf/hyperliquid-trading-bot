@@ -131,7 +131,22 @@ class XGBoostRegimeForecaster:
         cfg = config or {}
 
         self.model_path = cfg.get("model_path", "models/regime_xgboost.json")
-        self.min_samples = cfg.get("min_training_samples", 100)
+        # ★ Phase 2 fix: the previous default (100) was too high given the
+        # labeler's ~3-min cadence and the bot's typically narrow regime
+        # distribution.  Production saw 0 of 15,484 prediction rows reach
+        # the threshold, so the forecaster was permanently stuck in
+        # synthetic warm-start mode.  Operators can still tune via env.
+        try:
+            import os as _os
+            _env_min = _os.environ.get("XGBOOST_MIN_TRAINING_SAMPLES")
+            _env_min_int = int(_env_min) if _env_min else None
+        except (TypeError, ValueError):
+            _env_min_int = None
+        self.min_samples = (
+            cfg.get("min_training_samples")
+            or _env_min_int
+            or 30
+        )
         self.retrain_interval = cfg.get("retrain_interval", 86400)  # 24h
         self.cache_ttl = cfg.get("cache_ttl", 120)  # 2 min prediction cache
         self.prediction_cache: Dict[str, Dict] = {}
