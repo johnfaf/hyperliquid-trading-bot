@@ -129,8 +129,16 @@ def test_baseline_report_contains_required_benchmarks():
     assert "Baseline Benchmark Report" in render_baseline_markdown(report)
 
 
-def test_snapshot_walkforward_and_live_pack_write_artifacts(tmp_path):
+def test_snapshot_walkforward_and_live_pack_write_artifacts(tmp_path, monkeypatch):
     conn = _conn()
+
+    # Hermetic: this test asserts the UNSIGNED evidence path, so it must
+    # guarantee no agent signing key is reachable -- independent of the
+    # ambient shell env or any earlier test that leaked
+    # HL_AGENT_PRIVATE_KEY into os.environ.  (build_live_evidence_pack
+    # signs the pack whenever that key resolves; CI runs without it but
+    # a developer machine / Railway shell may have it set.)
+    monkeypatch.delenv("HL_AGENT_PRIVATE_KEY", raising=False)
 
     manifest = snapshot_dataset(conn, tmp_path / "dataset", window_days=30)
     walk = build_walk_forward_report(conn, window_days=30, starting_capital=10_000)
