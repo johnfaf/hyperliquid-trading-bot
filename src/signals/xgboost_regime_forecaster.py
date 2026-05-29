@@ -890,6 +890,21 @@ class XGBoostRegimeForecaster:
             if backend == "postgres"
             else f"datetime('now', '-{min_age_minutes} minutes')"
         )
+        # ★ PHASE 5 FIX: process NEWEST predictions first.  With ASC
+        # ordering the labeler chewed on the 6-week-old April rows
+        # every cycle -- Hyperliquid's 1m candle window only retains
+        # ~30 days, so every fetch returned ``no_data`` and the model
+        # never got fresh training labels.  DESC pulls predictions
+        # whose forward-return candles ARE still available, so labels
+        # accumulate and train() sees real data on the next retrain.
+        # Operators can flip back via XGBOOST_LABELER_ORDER=ASC if
+        # they want to retroactively backfill an old window.
+        _order = (
+            "DESC"
+            if str(os.environ.get("XGBOOST_LABELER_ORDER", "DESC") or "DESC").strip().upper()
+            != "ASC"
+            else "ASC"
+        )
         try:
             with get_connection(for_read=True) as conn:
                 rows = conn.execute(
@@ -899,7 +914,7 @@ class XGBoostRegimeForecaster:
                     WHERE label_source = 'predicted'
                       AND regime_label IS NULL
                       AND timestamp <= {cutoff_sql}
-                    ORDER BY timestamp ASC
+                    ORDER BY timestamp {_order}
                     LIMIT {int(batch_size)}
                     """
                 ).fetchall()
