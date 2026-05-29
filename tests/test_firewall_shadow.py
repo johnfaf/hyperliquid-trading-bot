@@ -47,9 +47,12 @@ def shadow_db(monkeypatch):
         lambda: "sqlite",
         raising=False,
     )
-    # Bootstrap the schema once so tests can query directly.
-    firewall_shadow._ensure_schema(conn)
+    # Each test gets a fresh in-memory DB, so force schema creation
+    # past the process-level _SCHEMA_READY guard.
+    firewall_shadow._SCHEMA_READY = False
+    firewall_shadow._ensure_schema(conn, force=True)
     yield conn
+    firewall_shadow._SCHEMA_READY = False
 
 
 def _signal(coin="BTC", side="long", confidence=0.65, source="strategy",
