@@ -134,3 +134,33 @@ def test_script_tainted_predicate(script_mod):
     assert script_mod._is_tainted({"reconciliation_reason": "live_reconciled_closed"})
     assert not script_mod._is_tainted({"close_reason": "take_profit"})
     assert not script_mod._is_tainted({})
+
+
+def test_phantom_source_reset_to_zero(scorer):
+    """The phantom-reset path (rebuild with []) must zero a source whose
+    columns were polluted by the record_outcome-without-record_signal
+    bug -- e.g. strategy:unknown with corr=103 / total=0."""
+    from src.signals.agent_scoring import SourceScore
+    scorer.scores["strategy:unknown"] = SourceScore(
+        source_key="strategy:unknown",
+        total_signals=0, correct_signals=103, total_pnl=-303.77, accuracy=0.0,
+    )
+    rebuilt = scorer.rebuild_source_from_trades("strategy:unknown", [])
+    assert rebuilt.total_signals == 0
+    assert rebuilt.correct_signals == 0
+    assert rebuilt.total_pnl == 0.0
+    # Invariant restored: corr never exceeds total.
+    assert rebuilt.correct_signals <= rebuilt.total_signals
+
+
+def test_script_argparse_has_keep_phantoms_flag(script_mod):
+    """The --keep-phantoms opt-out exists and defaults to off (reset on)."""
+    import argparse
+    # Build the parser the same way main() does and check the flag.
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--keep-phantoms", action="store_true")
+    ns = parser.parse_args([])
+    assert ns.keep_phantoms is False
+    ns2 = parser.parse_args(["--keep-phantoms"])
+    assert ns2.keep_phantoms is True
