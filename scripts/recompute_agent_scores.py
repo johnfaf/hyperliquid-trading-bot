@@ -141,6 +141,14 @@ def main(argv: Iterable[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dry-run", action="store_true",
                         help="Report the rebuilt scores without writing.")
+    parser.add_argument(
+        "--keep-phantoms", action="store_true",
+        help="Do NOT reset agent_scores rows that have no clean trades. "
+             "By default such phantom rows (e.g. strategy:unknown with "
+             "correct_signals=103 / total_signals=0, accumulated purely "
+             "via the record_outcome-without-record_signal bug) are reset "
+             "to zero so the scorecard reflects only real outcomes.",
+    )
     args = parser.parse_args(list(argv) if argv is not None else None)
     logging.basicConfig(
         level=logging.INFO,
@@ -157,6 +165,16 @@ def main(argv: Iterable[str] | None = None) -> int:
     )
 
     scorer = AgentScorer()
+
+    # Phantom sources: rows already loaded into agent_scores (from the
+    # DB at __init__) that have NO clean trades.  These are the rows the
+    # record_outcome-without-record_signal bug polluted (corr>total,
+    # stale accuracy) -- e.g. strategy:unknown, live_orphan,
+    # strategy:copy_trade.  Reset them to zero unless --keep-phantoms.
+    existing_keys = set(getattr(scorer, "scores", {}) or {})
+    clean_keys = set(grouped.keys())
+    phantom_keys = sorted(existing_keys - clean_keys)
+
     summary: List[Dict[str, Any]] = []
     for source_key, source_trades in sorted(grouped.items()):
         rebuilt = scorer.rebuild_source_from_trades(
@@ -169,7 +187,29 @@ def main(argv: Iterable[str] | None = None) -> int:
             "accuracy": round(rebuilt.accuracy, 3),
             "pnl": round(rebuilt.total_pnl, 2),
             "dynamic_weight": round(rebuilt.dynamic_weight, 3),
+            "phantom_reset": False,
         })
+
+    reset_count = 0
+    if not args.keep_phantoms:
+        for source_key in phantom_keys:
+            rebuilt = scorer.rebuild_source_from_trades(
+                source_key, [], persist=not args.dry_run,
+            )
+            reset_count += 1
+            summary.append({
+                "source_key": source_key,
+                "n": rebuilt.total_signals,
+                "correct": rebuilt.correct_signals,
+                "accuracy": round(rebuilt.accuracy, 3),
+                "pnl": round(rebuilt.total_pnl, 2),
+                "dynamic_weight": round(rebuilt.dynamic_weight, 3),
+                "phantom_reset": True,
+            })
+        logger.info(
+            "Reset %d phantom source(s) with no clean trades: %s",
+            reset_count, ", ".join(phantom_keys) or "(none)",
+        )
 
     summary.sort(key=lambda r: -r["n"])
     mode = "DRY RUN (no writes)" if args.dry_run else "WROTE"
