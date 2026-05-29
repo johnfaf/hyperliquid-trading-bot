@@ -2210,6 +2210,31 @@ class DecisionFirewall:
                     ).inc()
                 except Exception:
                     pass
+
+            # ★ Shadow mode: sample a fraction of rejected signals into
+            # a side table so calibration can rebuild on synthetic-but-
+            # clean outcomes.  Default OFF
+            # (FIREWALL_SHADOW_MODE_FRACTION=0).  Fail-open by design --
+            # if shadow recording errors, it must not block the
+            # firewall's hot path.
+            if not dry_run:
+                try:
+                    from src.signals.firewall_shadow import record_shadow_signal
+                    _regime_str = None
+                    if isinstance(regime_data, dict):
+                        _regime_str = str(
+                            regime_data.get("overall_regime")
+                            or regime_data.get("regime")
+                            or ""
+                        ) or None
+                    record_shadow_signal(
+                        signal,
+                        rejection_reason=reason_msg,
+                        regime=_regime_str,
+                    )
+                except Exception:
+                    pass
+
             return False, reason_msg
 
         # 1. Schema validation

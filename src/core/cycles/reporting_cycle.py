@@ -95,6 +95,30 @@ def run_reporting(container, cycle_count: int, health_registry=None) -> None:
     except Exception:
         pass
 
+    # ── Firewall shadow mode evaluator ──
+    # When FIREWALL_SHADOW_MODE_FRACTION > 0, evaluate aged shadow
+    # signals and feed simulated outcomes to the calibration tracker
+    # so ECE/Brier can recover even when no real trades are flowing.
+    # Fail-open: this is observability only, never blocks the cycle.
+    try:
+        from src.signals.firewall_shadow import (
+            evaluate_pending_shadow_signals,
+            shadow_fraction,
+        )
+        if shadow_fraction() > 0.0:
+            stats = evaluate_pending_shadow_signals(
+                calibration_tracker=getattr(container, "calibration", None),
+            )
+            if stats.get("evaluated", 0) > 0:
+                logger.info(
+                    "  Firewall shadow: %d outcomes fed to calibration "
+                    "(%d wins, %d losses, %d skipped)",
+                    stats["evaluated"], stats["wins"],
+                    stats["losses"], stats["skipped"],
+                )
+    except Exception as exc:
+        logger.debug("Firewall shadow evaluator skipped: %s", exc)
+
     # ── Golden wallet stats ──
     try:
         gs = golden_stats() if golden_stats else None
