@@ -36,20 +36,34 @@ def _trade_metadata(trade: Dict) -> Dict:
 def _is_trade_tainted(trade: Dict) -> bool:
     """Return True if the trade is flagged as tainted analytics data.
 
-    A trade is tainted when its outcome was driven by a known upstream
-    bug (e.g. the pre-fix reconciler force-closing un-mirrored paper
-    trades at adverse mid-prices) rather than the strategy / source
-    actually performing.  Tainted trades are excluded from the
-    firewall's recent-loss gates and the agent_scorer's outcome history
-    so the bot doesn't keep pausing strategies on artefacts of fixed
-    bugs.
+    A trade is tainted when its recorded PnL is not a real reflection
+    of the strategy / source's performance.  Two distinct reasons
+    trigger this:
 
-    The tainted flag is written to ``metadata.tainted=True`` (with an
-    optional ``taint_reason``) by the one-time migration in
-    ``scripts/mark_tainted_trades.py``.
+    1. Explicit flag (``metadata.tainted = True``) — written by the
+       one-time migration in ``scripts/mark_tainted_trades.py`` for
+       pre-fix reconciler kills that happened on UNMIRRORED paper
+       trades.
 
-    Env opt-out: set ``ANALYTICS_INCLUDE_TAINTED=1`` to include tainted
-    trades again (e.g. for forensic comparison).
+    2. ★ EXPANDED FIX (Phase 6): any ``close_reason ==
+       'live_reconciled_closed'`` row, regardless of mirror status.
+       The reconciler stamps PnL = (current_mid - entry_price), not
+       the actual live exit price.  Even on a mirrored trade where
+       the live position genuinely closed externally (HL SL hit,
+       manual close, kill-switch), the recorded PnL is the bot's
+       mid-snapshot at reconcile-tick time — NOT the real exit fill.
+       Production audit found 9 such ``mirror_status=success`` rows
+       on ``strategy:momentum_short`` alone, totalling -$277 and
+       contributing ~70% of the firewall's "underperforming" gate
+       reading.  Treat the whole class as tainted so the gate sees
+       real strategy performance, not reconciler-mid artefacts.
+
+    Tainted trades are excluded from the firewall's recent-loss
+    gates and the agent_scorer's outcome history so the bot doesn't
+    keep pausing strategies on artefacts of fixed bugs.
+
+    Env opt-out: ``ANALYTICS_INCLUDE_TAINTED=1`` restores legacy
+    (include) behaviour for forensic comparisons.
     """
     import os as _os
     if str(_os.environ.get("ANALYTICS_INCLUDE_TAINTED", "0") or "0").strip().lower() in {
@@ -57,7 +71,16 @@ def _is_trade_tainted(trade: Dict) -> bool:
     }:
         return False
     meta = _trade_metadata(trade)
-    return bool(meta.get("tainted"))
+    if meta.get("tainted"):
+        return True
+    close_reason = str(
+        meta.get("close_reason")
+        or meta.get("reconciliation_reason")
+        or ""
+    ).strip().lower()
+    if close_reason == "live_reconciled_closed":
+        return True
+    return False
 
 
 def _normalize_source_label(value) -> str:
