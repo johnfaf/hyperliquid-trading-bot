@@ -99,14 +99,25 @@ def shadow_max_eval_per_cycle() -> int:
 
 # ── Schema (lazy, idempotent) ───────────────────────────────────
 
+# Process-level guard so the CREATE TABLE / CREATE INDEX DDL runs at
+# most once per process instead of on every record / evaluate call.
+# Without this, an enabled shadow mode (FIREWALL_SHADOW_MODE_FRACTION
+# > 0) issues a CREATE TABLE IF NOT EXISTS on the firewall's hot path
+# for every sampled rejection -- ~10 redundant DDL statements / cycle,
+# each taking a lock on Postgres.  ``force`` lets tests bypass it.
+_SCHEMA_READY = False
 
-def _ensure_schema(conn) -> None:
-    """Create the firewall_shadow_signals table if missing.
+
+def _ensure_schema(conn, *, force: bool = False) -> None:
+    """Create the firewall_shadow_signals table if missing (once/process).
 
     Both Postgres and SQLite use compatible-enough syntax that one
     statement works for both via ``executescript`` (SQLite) / direct
     ``execute`` (Postgres).  Indexes are split out for portability.
     """
+    global _SCHEMA_READY
+    if _SCHEMA_READY and not force:
+        return
     backend = db.get_backend_name() if hasattr(db, "get_backend_name") else "sqlite"
     if backend == "postgres":
         conn.execute(
@@ -158,6 +169,8 @@ def _ensure_schema(conn) -> None:
             "CREATE INDEX IF NOT EXISTS idx_firewall_shadow_pending "
             "ON firewall_shadow_signals (evaluated, opened_at)"
         )
+
+    _SCHEMA_READY = True
 
 
 # ── Public API ──────────────────────────────────────────────────
