@@ -160,6 +160,13 @@ class XGBoostRegimeForecaster:
         self._model_training_source = "untrained"
         self._model_observed_rows = 0
         self._model_uses_synthetic_warm_start = False
+        # Phase 5 fix: when train() detects fewer than 3 unique label
+        # classes (e.g. recent market is neutral / bullish only -- no
+        # crashes), it densely re-encodes labels to [0, k-1] and
+        # records the dense->canonical map here.  predict_regime maps
+        # back so downstream consumers always see canonical
+        # {0=crash, 1=neutral, 2=bullish} indices.
+        self._imbalanced_class_map: Optional[Dict[int, int]] = None
         try:
             self._synthetic_max_confidence = float(
                 cfg.get(
@@ -255,6 +262,15 @@ class XGBoostRegimeForecaster:
                 X = np.array([[features.get(f, 0.0) for f in FEATURE_NAMES]])
                 proba = self.model.predict_proba(X)[0]
                 pred_class = int(np.argmax(proba))
+                # ★ PHASE 5 FIX: when the model was trained on an
+                # imbalanced label set (e.g. [1, 2] only), the dense
+                # remapping in train() stored a mapping from the
+                # model's internal index -> canonical regime index.
+                # Apply it here so the bot's downstream consumers
+                # always see {0=crash, 1=neutral, 2=bullish}.
+                cls_map = getattr(self, "_imbalanced_class_map", None)
+                if cls_map:
+                    pred_class = int(cls_map.get(pred_class, pred_class))
                 regime = REGIME_NAMES[pred_class]
                 raw_confidence = float(proba[pred_class])
                 confidence = raw_confidence
@@ -622,36 +638,107 @@ class XGBoostRegimeForecaster:
         )
         self.model = xgb.XGBClassifier(**model_kwargs)
 
-        # Time-series walk-forward validation (if enough chronologically-labeled data)
+        # ★ PHASE 5 FIX: detect class imbalance BEFORE picking a CV
+        # strategy.  The labeler can legitimately return y with only
+        # 1-2 unique regime classes (e.g. a 30-day window with no
+        # crash events labels everything as neutral / bullish).
+        # XGBoost's walk-forward CV then fails with "Invalid classes
+        # inferred from unique values of y. Expected: [0 1], got
+        # [1 2]" because each CV fold's internal class-set check
+        # against ``num_class=3`` rejects the non-contiguous label
+        # set.  When this happens, fall back to a single
+        # train-on-prefix / eval-on-suffix split instead of refusing
+        # to save -- a model trained on imbalanced real data is
+        # strictly better than the synthetic warm-start fallback.
+        unique_classes = sorted(int(c) for c in np.unique(y))
+        imbalanced = len(unique_classes) < 3
+        if len(unique_classes) < 2:
+            # Single-class data: a "classifier" with one target label
+            # is meaningless (it's a constant predictor).  Refuse to
+            # save rather than ship a degenerate model.
+            logger.warning(
+                "XGBoost training data has only 1 unique class %s -- "
+                "skipping training (model would be degenerate).",
+                unique_classes,
+            )
+            self.model = None
+            return None
+        if imbalanced:
+            logger.info(
+                "XGBoost training data has only %d unique class(es) %s -- "
+                "using single train/test split instead of walk-forward CV.",
+                len(unique_classes), unique_classes,
+            )
+
         cv_mean = 0.0
         cv_failed = False
         try:
             from sklearn.metrics import accuracy_score
-            from sklearn.model_selection import TimeSeriesSplit
 
-            n_splits = min(5, max(2, len(X) // 50))
-            tscv = TimeSeriesSplit(n_splits=n_splits)
-            fold_scores = []
+            if imbalanced:
+                # ★ Re-encode the sparse labels to dense [0, 1, ..., k-1]
+                # so XGBoost's internal class-set validation passes.
+                # E.g.  y=[1, 2, 2, 1, 2]  ->  y_dense=[0, 1, 1, 0, 1]
+                # with num_class=2.  Pick the appropriate objective
+                # for the dense class count to avoid XGBoost's
+                # softprob-vs-binary metric confusion.
+                label_map = {orig: idx for idx, orig in enumerate(unique_classes)}
+                y_dense = np.array([label_map[int(c)] for c in y], dtype=np.int32)
+                dense_kwargs = dict(model_kwargs)
+                if len(unique_classes) == 2:
+                    dense_kwargs["objective"] = "binary:logistic"
+                    dense_kwargs["eval_metric"] = "logloss"
+                    dense_kwargs.pop("num_class", None)
+                else:
+                    dense_kwargs["num_class"] = len(unique_classes)
 
-            for train_idx, test_idx in tscv.split(X):
-                if len(train_idx) < 20 or len(test_idx) < 5:
-                    continue
-                fold_model = xgb.XGBClassifier(**model_kwargs)
-                fold_model.fit(X[train_idx], y[train_idx])
-                preds = fold_model.predict(X[test_idx])
-                fold_scores.append(float(accuracy_score(y[test_idx], preds)))
-
-            if fold_scores:
-                cv_mean = float(np.mean(fold_scores))
-                logger.info(
-                    "XGBoost walk-forward accuracy: %.3f (+/- %.3f, folds=%d)",
-                    cv_mean,
-                    float(np.std(fold_scores)),
-                    len(fold_scores),
-                )
+                # Simple 80/20 chronological split.  No CV folds because
+                # they'd shrink the eval window too much for the tiny
+                # post-recovery dataset (~30-200 rows).
+                split_at = max(20, int(len(X) * 0.8))
+                if split_at >= len(X) - 5:
+                    cv_failed = True
+                    logger.warning(
+                        "Imbalanced-class training: not enough data for "
+                        "80/20 split (n=%d).",
+                        len(X),
+                    )
+                else:
+                    fold_model = xgb.XGBClassifier(**dense_kwargs)
+                    fold_model.fit(X[:split_at], y_dense[:split_at])
+                    preds = np.asarray(fold_model.predict(X[split_at:])).ravel()
+                    cv_mean = float(accuracy_score(y_dense[split_at:], preds))
+                    logger.info(
+                        "XGBoost imbalanced-class split accuracy: %.3f "
+                        "(train=%d, test=%d, source_classes=%s)",
+                        cv_mean, split_at, len(X) - split_at, unique_classes,
+                    )
             else:
-                cv_failed = True
-                logger.warning("XGBoost walk-forward: no folds completed")
+                from sklearn.model_selection import TimeSeriesSplit
+
+                n_splits = min(5, max(2, len(X) // 50))
+                tscv = TimeSeriesSplit(n_splits=n_splits)
+                fold_scores = []
+
+                for train_idx, test_idx in tscv.split(X):
+                    if len(train_idx) < 20 or len(test_idx) < 5:
+                        continue
+                    fold_model = xgb.XGBClassifier(**model_kwargs)
+                    fold_model.fit(X[train_idx], y[train_idx])
+                    preds = fold_model.predict(X[test_idx])
+                    fold_scores.append(float(accuracy_score(y[test_idx], preds)))
+
+                if fold_scores:
+                    cv_mean = float(np.mean(fold_scores))
+                    logger.info(
+                        "XGBoost walk-forward accuracy: %.3f (+/- %.3f, folds=%d)",
+                        cv_mean,
+                        float(np.std(fold_scores)),
+                        len(fold_scores),
+                    )
+                else:
+                    cv_failed = True
+                    logger.warning("XGBoost walk-forward: no folds completed")
         except Exception as exc:
             # ★ M9 FIX: was logger.debug — CV failure should be loud, not silent
             cv_failed = True
@@ -666,8 +753,21 @@ class XGBoostRegimeForecaster:
             self.model = None
             return None
 
-        # Train on full data
-        self.model.fit(X, y)
+        # Train on full data.  When imbalanced, reuse the same
+        # dense-encoded labels + dense-num_class kwargs so the saved
+        # model and the CV-validated model use identical class spaces.
+        # Store the source-class mapping on the instance so
+        # predict_regime can map dense predictions back to the
+        # canonical {crash, neutral, bullish} regime names.
+        if imbalanced:
+            self.model = xgb.XGBClassifier(**dense_kwargs)
+            self.model.fit(X, y_dense)
+            self._imbalanced_class_map = {
+                idx: orig for orig, idx in label_map.items()
+            }
+        else:
+            self.model.fit(X, y)
+            self._imbalanced_class_map = None
         self._last_train_ts = time.time()
 
         # Save model
