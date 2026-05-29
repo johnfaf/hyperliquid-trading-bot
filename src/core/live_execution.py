@@ -64,6 +64,71 @@ def _is_insufficient_margin_rejection(result) -> bool:
     return any("insufficient margin" in msg.lower() for msg in messages)
 
 
+# ── Live-only conviction + re-entry-cooldown gate ────────────────
+#
+# The CSV audit of the live wallet (May 2026) found ~70% of the loss
+# was FEES from over-trading: 277 live opens, mostly small positions
+# churned faster than they could clear the ~5bps round-trip taker fee,
+# which bled the wallet ~$10-16 and tripped the drawdown kill switch.
+#
+# These two gates throttle the LIVE mirror path ONLY -- paper trades
+# (and therefore the learning/calibration loop) keep running at full
+# rate.  Live becomes selective: it only mirrors higher-conviction
+# signals, and never re-enters the same coin within a cooldown.  Both
+# default OFF so behaviour is unchanged unless an operator opts in.
+import time as _time
+
+_LAST_LIVE_MIRROR_TS: Dict[str, float] = {}
+
+
+def _live_mirror_min_confidence() -> float:
+    try:
+        return max(0.0, min(1.0, float(os.environ.get("LIVE_MIRROR_MIN_CONFIDENCE", "0") or 0)))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _live_mirror_reentry_seconds() -> float:
+    try:
+        return max(0.0, float(os.environ.get("LIVE_MIRROR_MIN_REENTRY_SECONDS", "0") or 0))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _live_mirror_conviction_gate(live_signal) -> tuple[bool, str]:
+    """Return (allow, reason) for the live-only conviction/churn gate.
+
+    Default OFF (both envs 0).  Never raises.
+    """
+    min_conf = _live_mirror_min_confidence()
+    reentry_s = _live_mirror_reentry_seconds()
+    if min_conf <= 0.0 and reentry_s <= 0.0:
+        return True, ""
+    try:
+        coin = str(getattr(live_signal, "coin", "") or "").upper()
+        if min_conf > 0.0:
+            conf = float(getattr(live_signal, "confidence", 0.0) or 0.0)
+            if conf < min_conf:
+                return False, f"conviction {conf:.2f} < live floor {min_conf:.2f}"
+        if reentry_s > 0.0 and coin:
+            last = _LAST_LIVE_MIRROR_TS.get(coin)
+            if last is not None and (_time.time() - last) < reentry_s:
+                wait = reentry_s - (_time.time() - last)
+                return False, f"re-entry cooldown {wait:.0f}s left for {coin}"
+    except Exception:
+        return True, ""  # fail-open: gate must never block by erroring
+    return True, ""
+
+
+def _mark_live_mirror_time(live_signal) -> None:
+    try:
+        coin = str(getattr(live_signal, "coin", "") or "").upper()
+        if coin:
+            _LAST_LIVE_MIRROR_TS[coin] = _time.time()
+    except Exception:
+        pass
+
+
 def _paper_trade_id_from_live_mirror(execution, live_signal=None) -> Optional[int]:
     """Extract the paper trade id that produced a live mirror attempt."""
     candidates = []
@@ -1021,6 +1086,20 @@ def mirror_executed_trades_to_live(
                     or (scaled_trade.get("entry_price", scaled_trade.get("price", 0)) if isinstance(scaled_trade, dict) else 0)
                     or 0
                 )
+                # Live-only conviction / re-entry-cooldown gate (default
+                # OFF).  Skips mirroring low-conviction or churned-coin
+                # signals to cut the fee bleed; the paper trade stands.
+                allow, gate_reason = _live_mirror_conviction_gate(live_signal)
+                if not allow:
+                    logger.info(
+                        "%s skipped (live conviction gate): %s %s -- %s",
+                        success_label,
+                        getattr(live_signal, "coin", "?"),
+                        getattr(getattr(live_signal, "side", None), "value", live_signal.side)
+                        if hasattr(live_signal, "side") else "?",
+                        gate_reason,
+                    )
+                    continue
                 size = abs(float(getattr(live_signal, "size", 0) or 0))
                 leverage = max(1.0, float(getattr(live_signal, "leverage", 1.0) or 1.0))
                 notional = max(0.0, size * entry_price)
@@ -1101,6 +1180,7 @@ def mirror_executed_trades_to_live(
                 # triggered the mirror.  Kill-switch and daily loss still apply.
                 live_result = trader.execute_signal(live_signal, bypass_firewall=True)
                 if is_confirmed_live_execution_result(live_result):
+                    _mark_live_mirror_time(live_signal)  # start re-entry cooldown
                     _mark_paper_trade_live_mirrored(
                         item.get("paper_trade_id"),
                         live_signal,
