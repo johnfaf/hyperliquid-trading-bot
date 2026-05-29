@@ -933,6 +933,9 @@ class XGBoostRegimeForecaster:
         bullish_pct: Optional[float] = None,
         batch_size: Optional[int] = None,
         min_age_minutes: Optional[int] = None,
+        vol_relative: Optional[bool] = None,
+        vol_k: Optional[float] = None,
+        min_abs_move: Optional[float] = None,
     ) -> Dict[str, int]:
         """Promote past predictions to observed training labels.
 
@@ -972,6 +975,21 @@ class XGBoostRegimeForecaster:
             min_age_minutes
             if min_age_minutes is not None
             else getattr(_cfg, "XGBOOST_LABELER_MIN_AGE_MINUTES", forward_minutes + 5)
+        )
+        vol_relative = bool(
+            vol_relative
+            if vol_relative is not None
+            else getattr(_cfg, "XGBOOST_LABELER_VOL_RELATIVE", True)
+        )
+        vol_k = float(
+            vol_k
+            if vol_k is not None
+            else getattr(_cfg, "XGBOOST_LABELER_VOL_K", 1.0)
+        )
+        min_abs_move = float(
+            min_abs_move
+            if min_abs_move is not None
+            else getattr(_cfg, "XGBOOST_LABELER_MIN_ABS_MOVE", 0.001)
         )
 
         stats = {"scanned": 0, "labeled": 0, "no_data": 0, "errors": 0}
@@ -1082,6 +1100,10 @@ class XGBoostRegimeForecaster:
                 stats["errors"] += len(items)
                 continue
 
+            # One realized-vol estimate per coin (cheap; reused for every
+            # row of this coin).  0.0 => fall back to fixed-% thresholds.
+            sigma_fwd = self._forward_sigma(candle_list, forward_minutes)
+
             for row_id, ts_dt in items:
                 pred_ms = int(ts_dt.timestamp() * 1000)
                 target_ms = pred_ms + forward_minutes * 60_000
@@ -1091,12 +1113,15 @@ class XGBoostRegimeForecaster:
                     stats["no_data"] += 1
                     continue
                 ret = (exit_ - entry) / entry
-                if ret <= crash_pct:
-                    label = REGIME_LABELS["crash"]
-                elif ret >= bullish_pct:
-                    label = REGIME_LABELS["bullish"]
-                else:
-                    label = REGIME_LABELS["neutral"]
+                label = self._classify_forward_return(
+                    ret,
+                    sigma_fwd,
+                    vol_relative=vol_relative,
+                    vol_k=vol_k,
+                    crash_pct=crash_pct,
+                    bullish_pct=bullish_pct,
+                    min_abs_move=min_abs_move,
+                )
                 updates.append((row_id, label))
 
         if updates:
@@ -1119,16 +1144,19 @@ class XGBoostRegimeForecaster:
                 logger.warning("Labeler write-back failed: %s", exc)
                 stats["errors"] += len(updates)
         if stats["scanned"]:
+            if vol_relative:
+                mode = f"vol-relative(k={vol_k:g}, floor={min_abs_move * 100:.2f}%)"
+            else:
+                mode = f"fixed(crash<={crash_pct * 100:.2f}%, bullish>={bullish_pct * 100:.2f}%)"
             logger.info(
                 "XGBoost labeler: scanned=%d labeled=%d no_data=%d errors=%d "
-                "(forward=%dm, crash<=%.2f%%, bullish>=%.2f%%)",
+                "(forward=%dm, mode=%s)",
                 stats["scanned"],
                 stats["labeled"],
                 stats["no_data"],
                 stats["errors"],
                 forward_minutes,
-                crash_pct * 100,
-                bullish_pct * 100,
+                mode,
             )
         return stats
 
@@ -1146,6 +1174,66 @@ class XGBoostRegimeForecaster:
                 break
             best = close
         return best
+
+    @staticmethod
+    def _forward_sigma(sorted_candles: list, forward_minutes: int) -> float:
+        """Estimate the stddev of the forward return over ``forward_minutes``.
+
+        Computed from per-minute log-return volatility and scaled to the
+        forward horizon via sqrt-time (random-walk assumption).  Returns
+        0.0 when there aren't enough candles to estimate -- the caller then
+        falls back to fixed-percentage thresholds.
+        """
+        if not sorted_candles or len(sorted_candles) < 10:
+            return 0.0
+        closes = [float(c) for _, c in sorted_candles if c and c > 0]
+        if len(closes) < 10:
+            return 0.0
+        arr = np.asarray(closes, dtype=float)
+        logret = np.diff(np.log(arr))
+        if logret.size < 5:
+            return 0.0
+        sigma_1m = float(np.std(logret))
+        if not np.isfinite(sigma_1m) or sigma_1m <= 0.0:
+            return 0.0
+        return sigma_1m * float(np.sqrt(max(1, int(forward_minutes))))
+
+    @staticmethod
+    def _classify_forward_return(
+        ret: float,
+        sigma_fwd: float,
+        *,
+        vol_relative: bool,
+        vol_k: float,
+        crash_pct: float,
+        bullish_pct: float,
+        min_abs_move: float,
+    ) -> int:
+        """Map a forward return to a regime label {0 crash, 1 neutral, 2 bullish}.
+
+        Volatility-relative mode (preferred): a move is crash/bullish when it
+        exceeds ``vol_k * sigma_fwd`` (the coin's own expected forward move)
+        AND clears ``min_abs_move`` so sub-fee noise in dead-flat windows is
+        never labeled directional.  Falls back to the fixed crash_pct /
+        bullish_pct bars when sigma can't be estimated (sigma_fwd <= 0).
+        """
+        crash = REGIME_LABELS["crash"]
+        neutral = REGIME_LABELS["neutral"]
+        bullish = REGIME_LABELS["bullish"]
+        if vol_relative and sigma_fwd and sigma_fwd > 0.0:
+            thr = float(vol_k) * float(sigma_fwd)
+            floor = abs(float(min_abs_move))
+            if ret <= -thr and ret <= -floor:
+                return crash
+            if ret >= thr and ret >= floor:
+                return bullish
+            return neutral
+        # Absolute fallback (legacy behavior).
+        if ret <= crash_pct:
+            return crash
+        if ret >= bullish_pct:
+            return bullish
+        return neutral
 
     # ─── DB Schema ──────────────────────────────────────────────────
 
