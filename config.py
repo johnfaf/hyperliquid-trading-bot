@@ -1978,6 +1978,14 @@ XGBOOST_LABELER_CRASH_PCT = float(
 XGBOOST_LABELER_BULLISH_PCT = float(
     os.environ.get("XGBOOST_LABELER_BULLISH_PCT", 0.015)  # +1.5%
 )
+# Class-balanced training: even with vol-relative labels, prod regime data is
+# ~84% neutral / 8% crash / 8% bullish, so an unweighted XGBoost minimises
+# logloss by predicting neutral for almost everything (signal=0.000).  When
+# enabled, train() applies inverse-frequency sample weights so the model
+# actually learns the minority crash/bullish regimes.  Default ON.
+XGBOOST_CLASS_BALANCED = os.environ.get(
+    "XGBOOST_CLASS_BALANCED", "true"
+).strip().lower() in ("1", "true", "yes", "on")
 # ── Volatility-relative labeling ────────────────────────────────────────
 # A fixed ±1.5%/60min bar is ~2-3 sigma for BTC, so in practice it labeled
 # ~100% of forward windows "neutral" -> single-class data -> the XGBoost

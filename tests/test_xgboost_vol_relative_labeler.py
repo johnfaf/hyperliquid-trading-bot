@@ -30,6 +30,32 @@ BULLISH = REGIME_LABELS["bullish"]  # 2
 
 _clf = XGBoostRegimeForecaster._classify_forward_return
 _sigma = XGBoostRegimeForecaster._forward_sigma
+_cw = XGBoostRegimeForecaster._class_balanced_weights
+
+
+# ── _class_balanced_weights ─────────────────────────────────────
+
+
+def test_class_weights_inverse_frequency():
+    # 8 neutral(1), 1 crash(0), 1 bullish(2)  -> minority upweighted.
+    y = [1] * 8 + [0, 2]
+    w = _cw(y)
+    assert w is not None and len(w) == 10
+    # weight = N / (K * count[class]); N=10, K=3
+    assert w[0] == pytest.approx(10 / (3 * 8))   # neutral (majority) ~0.417
+    assert w[8] == pytest.approx(10 / (3 * 1))   # crash (minority)   ~3.333
+    assert w[9] == pytest.approx(10 / (3 * 1))   # bullish (minority) ~3.333
+    assert w[8] > w[0] and w[9] > w[0]
+
+
+def test_class_weights_balanced_is_uniform():
+    w = _cw([0, 1, 2, 0, 1, 2])
+    assert all(x == pytest.approx(1.0) for x in w)
+
+
+def test_class_weights_degenerate_returns_none():
+    assert _cw([1, 1, 1]) is None   # single class
+    assert _cw([]) is None          # empty
 
 
 def _vr(ret, sigma_fwd, *, vol_k=1.0, min_abs_move=0.001):
