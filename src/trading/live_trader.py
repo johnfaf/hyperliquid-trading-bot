@@ -30,7 +30,7 @@ import math
 import random
 import threading
 from collections import defaultdict, deque
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Any, Deque, Dict, List, Optional, Tuple, Union
 
 import requests
@@ -414,6 +414,9 @@ class LiveTrader:
         )
         self._live_recent_loss_lookback_fills = int(
             getattr(config, "LIVE_RECENT_LOSS_LOOKBACK_FILLS", 200)
+        )
+        self._live_recent_loss_lookback_hours = float(
+            getattr(config, "LIVE_RECENT_LOSS_LOOKBACK_HOURS", 48.0)
         )
         self._live_recent_loss_side_min_closed = int(
             getattr(config, "LIVE_RECENT_LOSS_SIDE_MIN_CLOSED", 5)
@@ -4028,6 +4031,58 @@ class LiveTrader:
         except Exception as exc:
             logger.error("Deferred protective resize error for %s: %s", coin, exc)
 
+    @staticmethod
+    def _fill_row_closed_dt(row: Dict[str, Any]) -> Optional[datetime]:
+        """Parse a normalized fill row's close time to a tz-aware datetime."""
+        if not isinstance(row, dict):
+            return None
+        raw = row.get("closed_at") or row.get("timestamp")
+        if not raw:
+            return None
+        try:
+            dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        except (ValueError, TypeError):
+            return None
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+
+    def _drop_stale_fill_rows(self, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Drop closed-fill rows older than the recent-loss lookback window.
+
+        The fills window is count-based, so when live trading goes quiet the
+        guard would keep treating weeks-old fills as "recent" forever -- after
+        a freeze/bug-fix it would judge the FIXED system on pre-fix fills.  This
+        time bound makes the guard reflect current performance and re-engage
+        only on fresh losses.  Rows with an unparseable close time are kept
+        (fail-safe: don't silently discard loss evidence).  Uses clock_provider
+        so it remains clock-injectable for tests/replay.
+        """
+        try:
+            hours = float(self._live_recent_loss_lookback_hours or 0)
+        except (TypeError, ValueError):
+            hours = 0.0
+        if hours <= 0 or not rows:
+            return rows
+        from src.core import clock_provider
+
+        cutoff = clock_provider.utc_now() - timedelta(hours=hours)
+        kept: List[Dict[str, Any]] = []
+        dropped = 0
+        for row in rows:
+            ts = self._fill_row_closed_dt(row)
+            if ts is None or ts >= cutoff:
+                kept.append(row)
+            else:
+                dropped += 1
+        if dropped:
+            logger.info(
+                "Recent-loss guard: aged out %d fill(s) older than %.0fh (kept %d) "
+                "so the guard reflects current performance, not stale trades",
+                dropped, hours, len(kept),
+            )
+        return kept
+
     def _refresh_recent_live_fill_history(self, fills: List[Dict[str, Any]]) -> None:
         limit = max(1, int(self._live_recent_loss_lookback_fills or 1))
         try:
@@ -4039,6 +4094,8 @@ class LiveTrader:
         except Exception as exc:
             logger.debug("Could not normalize recent live fills: %s", exc)
             rows = []
+
+        rows = self._drop_stale_fill_rows(rows)
 
         with self._state_lock:
             self._recent_live_fill_trades = rows
