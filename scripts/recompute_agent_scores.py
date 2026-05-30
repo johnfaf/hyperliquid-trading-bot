@@ -137,6 +137,54 @@ def _group_clean_trades(trades: Iterable[Dict[str, Any]]) -> Dict[str, List[Dict
     return grouped
 
 
+def _canonicalize_grouped_keys(
+    grouped: Dict[str, List[Dict]]
+) -> Dict[str, List[Dict]]:
+    """Fold fragmented copy_trade keys into their canonical full-address key.
+
+    The historical address-truncation bug stored the same trader under both a
+    truncated key (``copy_trade:0x1ee7a73c``) and its full key
+    (``copy_trade:0x1ee7a73cb5b0...``), splitting the stats so neither
+    graduated from warmup.  A truncated key is merged into the UNIQUE full
+    key that shares its prefix.  Truncated keys with no (or an ambiguous)
+    full match are left untouched.  The merged-away truncated keys then fall
+    into the recompute's phantom-reset set and zero out.
+    """
+    from src.signals.source_key import is_truncated_address
+
+    prefix = "copy_trade:"
+
+    def _addr(key: str) -> str:
+        return key[len(prefix):] if key.startswith(prefix) else ""
+
+    full_addrs = [
+        a for a in (_addr(k) for k in grouped)
+        if a.startswith("0x") and len(a) == 42
+    ]
+
+    remap: Dict[str, str] = {}
+    for key in grouped:
+        if not key.startswith(prefix) or not is_truncated_address(key):
+            continue
+        short = _addr(key)
+        matches = [f for f in full_addrs if f.startswith(short)]
+        if len(matches) == 1:
+            remap[key] = prefix + matches[0]
+
+    if not remap:
+        return grouped
+
+    merged: Dict[str, List[Dict]] = defaultdict(list)
+    for key, trades in grouped.items():
+        merged[remap.get(key, key)].extend(trades)
+    for src, dst in remap.items():
+        logger.info(
+            "Merged fragmented key %s -> %s (%d trades consolidated)",
+            src, dst, len(grouped[src]),
+        )
+    return dict(merged)
+
+
 def main(argv: Iterable[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dry-run", action="store_true",
@@ -159,8 +207,9 @@ def main(argv: Iterable[str] | None = None) -> int:
 
     trades = _load_closed_trades()
     grouped = _group_clean_trades(trades)
+    grouped = _canonicalize_grouped_keys(grouped)
     logger.info(
-        "Loaded %d closed trades -> %d sources after tainted filter",
+        "Loaded %d closed trades -> %d sources after tainted filter + key merge",
         len(trades), len(grouped),
     )
 
