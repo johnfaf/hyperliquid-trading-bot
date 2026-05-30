@@ -670,6 +670,20 @@ class XGBoostRegimeForecaster:
                 len(unique_classes), unique_classes,
             )
 
+        # Class-balanced sample weights: prod regime labels are ~84% neutral,
+        # so an unweighted fit collapses to always-neutral (signal=0.000).
+        # Inverse-frequency weights make the model learn crash/bullish too.
+        # Applied to BOTH the CV folds and the final fit so validation matches
+        # what ships.  Default ON; XGBOOST_CLASS_BALANCED=false to disable.
+        try:
+            import config as _cfg
+            _balanced = bool(getattr(_cfg, "XGBOOST_CLASS_BALANCED", True))
+        except Exception:
+            _balanced = True
+
+        def _w(labels):
+            return self._class_balanced_weights(labels) if _balanced else None
+
         cv_mean = 0.0
         cv_failed = False
         try:
@@ -705,7 +719,10 @@ class XGBoostRegimeForecaster:
                     )
                 else:
                     fold_model = xgb.XGBClassifier(**dense_kwargs)
-                    fold_model.fit(X[:split_at], y_dense[:split_at])
+                    fold_model.fit(
+                        X[:split_at], y_dense[:split_at],
+                        sample_weight=_w(y_dense[:split_at]),
+                    )
                     preds = np.asarray(fold_model.predict(X[split_at:])).ravel()
                     cv_mean = float(accuracy_score(y_dense[split_at:], preds))
                     logger.info(
@@ -724,7 +741,10 @@ class XGBoostRegimeForecaster:
                     if len(train_idx) < 20 or len(test_idx) < 5:
                         continue
                     fold_model = xgb.XGBClassifier(**model_kwargs)
-                    fold_model.fit(X[train_idx], y[train_idx])
+                    fold_model.fit(
+                        X[train_idx], y[train_idx],
+                        sample_weight=_w(y[train_idx]),
+                    )
                     preds = fold_model.predict(X[test_idx])
                     fold_scores.append(float(accuracy_score(y[test_idx], preds)))
 
@@ -761,12 +781,12 @@ class XGBoostRegimeForecaster:
         # canonical {crash, neutral, bullish} regime names.
         if imbalanced:
             self.model = xgb.XGBClassifier(**dense_kwargs)
-            self.model.fit(X, y_dense)
+            self.model.fit(X, y_dense, sample_weight=_w(y_dense))
             self._imbalanced_class_map = {
                 idx: orig for orig, idx in label_map.items()
             }
         else:
-            self.model.fit(X, y)
+            self.model.fit(X, y, sample_weight=_w(y))
             self._imbalanced_class_map = None
         self._last_train_ts = time.time()
 
@@ -1209,6 +1229,26 @@ class XGBoostRegimeForecaster:
                 break
             best = close
         return best
+
+    @staticmethod
+    def _class_balanced_weights(y) -> Optional["np.ndarray"]:
+        """Per-sample inverse-frequency weights so a neutral-heavy label set
+        (prod: ~84% neutral) doesn't bias the model into always predicting the
+        majority class.  ``weight_i = N / (K * count[class_i])`` (mean ~1.0).
+        Returns None for degenerate (<2 class) input so callers can skip it.
+        """
+        arr = np.asarray(y)
+        if arr.size == 0:
+            return None
+        classes, counts = np.unique(arr, return_counts=True)
+        k = len(classes)
+        if k <= 1:
+            return None
+        n = int(arr.size)
+        freq = {int(c): int(cnt) for c, cnt in zip(classes, counts)}
+        return np.array(
+            [n / (k * freq[int(v)]) for v in arr], dtype=float
+        )
 
     @staticmethod
     def _forward_sigma(sorted_candles: list, forward_minutes: int) -> float:
