@@ -217,3 +217,37 @@ def test_shim_at_every_tick_only_serves_past(tmp_path):
             f"At tick {i} (t={opens[i]}), shim returned {mids['BTC']} "
             f"but should have returned {expected}"
         )
+
+
+# --- Copy-trade position oracle ---------------------------------------
+
+def test_shim_clearinghouse_serves_oracle_positions(tmp_path):
+    """With a position oracle wired, clearinghouseState returns the requested
+    trader's reconstructed positions so copy-trade signals fire in replay."""
+    from src.backtest.replay.position_oracle import TraderPositionOracle
+
+    db = _make_cache(tmp_path, _bar("BTC", "1m", 1_700_000_000_000, 1000.0))
+    clk = ReplayClock(start_ts_ms=1_700_000_060_000)
+    oracle = CandleOracle(db, clk)
+    addr = "0x" + "ab" * 20
+    pos_oracle = TraderPositionOracle({addr: [
+        {"coin": "BTC", "direction": "Open Long", "size": 2.0,
+         "original_price": 1000.0, "time_ms": 1_699_999_000_000, "side": "B"},
+    ]})
+    shim = ReplayAPIManager(oracle, clk, known_coins=["BTC"], position_oracle=pos_oracle)
+
+    chs = shim.post({"type": "clearinghouseState", "user": addr})
+    aps = chs["assetPositions"]
+    assert len(aps) == 1 and aps[0]["position"]["coin"] == "BTC"
+    assert float(aps[0]["position"]["szi"]) == 2.0
+    # An unknown trader still resolves (to empty), never errors.
+    assert shim.post({"type": "clearinghouseState", "user": "0xdead"})["assetPositions"] == []
+
+
+def test_shim_clearinghouse_empty_without_oracle(tmp_path):
+    """No oracle wired -> legacy empty positions (strategy-only backtest)."""
+    db = _make_cache(tmp_path, _bar("BTC", "1m", 1_700_000_000_000, 1000.0))
+    clk = ReplayClock(start_ts_ms=1_700_000_060_000)
+    shim = ReplayAPIManager(CandleOracle(db, clk), clk, known_coins=["BTC"])
+    chs = shim.post({"type": "clearinghouseState", "user": "0x" + "ab" * 20})
+    assert chs["assetPositions"] == []
