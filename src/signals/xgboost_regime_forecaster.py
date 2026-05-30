@@ -991,8 +991,9 @@ class XGBoostRegimeForecaster:
             if min_abs_move is not None
             else getattr(_cfg, "XGBOOST_LABELER_MIN_ABS_MOVE", 0.001)
         )
+        max_age_hours = float(getattr(_cfg, "XGBOOST_LABELER_MAX_AGE_HOURS", 72) or 0)
 
-        stats = {"scanned": 0, "labeled": 0, "no_data": 0, "errors": 0}
+        stats = {"scanned": 0, "labeled": 0, "no_data": 0, "errors": 0, "expired": 0}
         try:
             from src.data import database as db
             from src.data.database import get_connection
@@ -1008,6 +1009,37 @@ class XGBoostRegimeForecaster:
             if backend == "postgres"
             else f"datetime('now', '-{min_age_minutes} minutes')"
         )
+        # Lower age bound: predictions older than this can never be labeled
+        # (their 1m forward candles have aged out of Hyperliquid's ~3.5d
+        # retention).  When >0 we both exclude them from the scan and mark
+        # them 'expired' so they stop clogging the batch every cycle.
+        _max_age_minutes = int(max_age_hours * 60) if max_age_hours > 0 else 0
+        max_age_sql = (
+            (
+                f"now() - INTERVAL '{_max_age_minutes} minutes'"
+                if backend == "postgres"
+                else f"datetime('now', '-{_max_age_minutes} minutes')"
+            )
+            if _max_age_minutes > 0
+            else None
+        )
+        # One-shot cleanup: retire the un-labelable backlog so the DESC scan
+        # below stops burning its batch on rows whose candles are long gone.
+        if max_age_sql is not None:
+            try:
+                with get_connection() as _conn:
+                    cur = _conn.execute(
+                        f"""
+                        UPDATE regime_history
+                        SET label_source = 'expired'
+                        WHERE label_source = 'predicted'
+                          AND regime_label IS NULL
+                          AND timestamp < {max_age_sql}
+                        """
+                    )
+                    stats["expired"] = int(getattr(cur, "rowcount", 0) or 0)
+            except Exception as exc:
+                logger.debug("Labeler expiry sweep skipped: %s", exc)
         # ★ PHASE 5 FIX: process NEWEST predictions first.  With ASC
         # ordering the labeler chewed on the 6-week-old April rows
         # every cycle -- Hyperliquid's 1m candle window only retains
@@ -1023,6 +1055,7 @@ class XGBoostRegimeForecaster:
             != "ASC"
             else "ASC"
         )
+        floor_clause = f"AND timestamp > {max_age_sql}" if max_age_sql is not None else ""
         try:
             with get_connection(for_read=True) as conn:
                 rows = conn.execute(
@@ -1032,6 +1065,7 @@ class XGBoostRegimeForecaster:
                     WHERE label_source = 'predicted'
                       AND regime_label IS NULL
                       AND timestamp <= {cutoff_sql}
+                      {floor_clause}
                     ORDER BY timestamp {_order}
                     LIMIT {int(batch_size)}
                     """
@@ -1143,18 +1177,19 @@ class XGBoostRegimeForecaster:
             except Exception as exc:
                 logger.warning("Labeler write-back failed: %s", exc)
                 stats["errors"] += len(updates)
-        if stats["scanned"]:
+        if stats["scanned"] or stats["expired"]:
             if vol_relative:
                 mode = f"vol-relative(k={vol_k:g}, floor={min_abs_move * 100:.2f}%)"
             else:
                 mode = f"fixed(crash<={crash_pct * 100:.2f}%, bullish>={bullish_pct * 100:.2f}%)"
             logger.info(
-                "XGBoost labeler: scanned=%d labeled=%d no_data=%d errors=%d "
+                "XGBoost labeler: scanned=%d labeled=%d no_data=%d errors=%d expired=%d "
                 "(forward=%dm, mode=%s)",
                 stats["scanned"],
                 stats["labeled"],
                 stats["no_data"],
                 stats["errors"],
+                stats["expired"],
                 forward_minutes,
                 mode,
             )
