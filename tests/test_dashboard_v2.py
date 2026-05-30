@@ -480,6 +480,40 @@ def test_health_strip_uses_lightweight_readiness_by_default(monkeypatch, client)
     assert calls == [False]
 
 
+def test_why_not_trading_endpoint(monkeypatch, client):
+    from src.ui.v2.routers import health as health_router
+
+    monkeypatch.setattr(
+        health_router,
+        "_cached_why_not_trading",
+        lambda hours: {
+            "window_hours": hours,
+            "total": 20,
+            "executed": 3,
+            "rejected": 17,
+            "execution_rate": 0.15,
+            "top_reasons": [{"reason": "ev_below_threshold", "count": 2}],
+        },
+    )
+    r = client.get("/api/why_not_trading?hours=6")
+    assert r.status_code == 200
+    d = r.json()
+    assert d["total"] == 20 and d["executed"] == 3 and d["rejected"] == 17
+    assert d["top_reasons"][0]["reason"] == "ev_below_threshold"
+
+
+def test_why_not_trading_endpoint_degrades(monkeypatch, client):
+    from src.ui.v2.routers import health as health_router
+
+    def boom(hours):
+        raise RuntimeError("db down")
+
+    monkeypatch.setattr(health_router, "_cached_why_not_trading", boom)
+    r = client.get("/api/why_not_trading")
+    assert r.status_code == 503
+    assert "error" in r.json()
+
+
 def test_evaluate_readiness_passes_live_container(monkeypatch):
     """Regression: the v2 readiness path must hand evaluate_readiness the
     live component container.  Before this fix it called
