@@ -80,9 +80,14 @@ class ReplayAPIManager:
         # Set False to allow unhandled request types (returns None instead of raising).
         # In the default strict mode we fail loud on anything we didn't anticipate.
         strict: bool = True,
+        # Optional TraderPositionOracle: when set, clearinghouseState/userState
+        # return the requested trader's reconstructed historical positions so
+        # copy-trade signals fire in replay.  None -> legacy empty positions.
+        position_oracle: Any = None,
     ):
         self._oracle = oracle
         self._clock = clock
+        self._position_oracle = position_oracle
         self._funding_rate_8h = float(funding_rate_8h)
         self._strict = bool(strict)
         self._lock = threading.Lock()
@@ -257,13 +262,29 @@ class ReplayAPIManager:
         return []
 
     def _handle_clearinghouse_state(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        # When a position oracle is wired, serve the requested trader's
+        # reconstructed historical positions as of the current replay tick so
+        # copy-trade signals fire.  Falls back to the empty default otherwise
+        # (or on any error -- a bad lookup must never break the cycle).
+        now_ms = self._clock.now_ms()
+        if self._position_oracle is not None:
+            addr = ""
+            if isinstance(payload, dict):
+                addr = str(payload.get("user") or payload.get("address") or "")
+            if addr:
+                try:
+                    return self._position_oracle.clearinghouse_state(
+                        addr, now_ms, now_ms=now_ms
+                    )
+                except Exception:
+                    pass
         # Paper mode reads this for parity checks; empty + zero is the safe default.
         return {
             "marginSummary": {"accountValue": "0", "totalRawUsd": "0", "totalNtlPos": "0"},
             "crossMarginSummary": {"accountValue": "0"},
             "assetPositions": [],
             "withdrawable": "0",
-            "time": self._clock.now_ms(),
+            "time": now_ms,
         }
 
     def _handle_user_state(self, payload: Dict[str, Any]) -> Dict[str, Any]:

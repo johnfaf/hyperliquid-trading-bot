@@ -103,6 +103,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
         keep_replay_db=not args.discard_replay_db,
         strict_api=not args.lax_api,
         frozen_xgb_model=args.frozen_xgb_model,
+        fills_db=args.fills_db,
     ) as h:
         seed_into(str(h.replay_db.db_path), snapshot)
 
@@ -347,6 +348,12 @@ def main(argv: list[str] | None = None) -> int:
                              "(produced by scripts/freeze_replay_models.py --train-xgboost). "
                              "When set, the predictive_forecaster stub is bypassed and the "
                              "frozen model serves regime forecasts at decision time.")
+    parser.add_argument("--fills-db",
+                        help="Path to a DB with a wallet_fills table (e.g. the live "
+                             "bot.db). When set, the replay reconstructs each tracked "
+                             "trader's historical positions from their fills so "
+                             "COPY-TRADE signals fire during the backtest. Omit to keep "
+                             "the legacy empty-clearinghouse behavior (strategy-only).")
 
     # Output
     parser.add_argument("--report-out",

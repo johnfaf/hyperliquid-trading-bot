@@ -108,6 +108,7 @@ class ReplayHarness:
         run_id: Optional[str] = None,
         keep_replay_db: bool = True,
         frozen_xgb_model: Optional[str] = None,
+        fills_db: Optional[str] = None,
     ):
         if end_ts_ms <= start_ts_ms:
             raise ValueError(f"end_ts_ms ({end_ts_ms}) must be > start_ts_ms ({start_ts_ms})")
@@ -123,6 +124,7 @@ class ReplayHarness:
         self._run_id = run_id
         self._keep_replay_db = bool(keep_replay_db)
         self._frozen_xgb_model = frozen_xgb_model
+        self._fills_db = fills_db
 
         # Lazy-built in __enter__
         self.clock: Optional[ReplayClock] = None
@@ -155,12 +157,23 @@ class ReplayHarness:
         # 3. candle oracle
         self.oracle = CandleOracle(self.cache_db, self.clock)
 
-        # 4. api shim + singleton swap
+        # 4. api shim + singleton swap.  When a fills DB is supplied, build a
+        # trader-position oracle so clearinghouseState serves the source
+        # traders' reconstructed historical positions -> copy trades fire.
+        position_oracle = None
+        if self._fills_db:
+            from src.backtest.replay.position_oracle import TraderPositionOracle
+            position_oracle = TraderPositionOracle.from_db(self._fills_db)
+            logger.info(
+                "Replay position oracle: loaded %d trader(s) from %s",
+                len(position_oracle.addresses()), self._fills_db,
+            )
         self.api = ReplayAPIManager(
             self.oracle, self.clock,
             known_coins=self.coins,
             funding_rate_8h=self.funding_rate_8h,
             strict=self.strict_api,
+            position_oracle=position_oracle,
         )
         install_replay_manager(self.api)
 
