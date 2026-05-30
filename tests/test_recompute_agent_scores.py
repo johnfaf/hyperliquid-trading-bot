@@ -164,3 +164,69 @@ def test_script_argparse_has_keep_phantoms_flag(script_mod):
     assert ns.keep_phantoms is False
     ns2 = parser.parse_args(["--keep-phantoms"])
     assert ns2.keep_phantoms is True
+
+
+# ── source-key fragmentation merge ──────────────────────────────
+
+
+def test_canonicalize_merges_truncated_into_full(script_mod):
+    """A truncated copy_trade key folds into the unique full-address key
+    that shares its prefix -- the historical fragmentation fix."""
+    full = "0x" + "1e" * 20      # full 0x + 40 hex
+    short = full[:10]            # 0x + 8 hex truncated prefix
+    grouped = {
+        f"copy_trade:{full}": [{"pnl": 5.0}],
+        f"copy_trade:{short}": [{"pnl": 3.0}, {"pnl": -1.0}],
+        "strategy:momentum_long": [{"pnl": 1.0}],
+    }
+    merged = script_mod._canonicalize_grouped_keys(grouped)
+    assert f"copy_trade:{short}" not in merged              # folded away
+    assert len(merged[f"copy_trade:{full}"]) == 3            # 1 + 2 consolidated
+    assert merged["strategy:momentum_long"] == [{"pnl": 1.0}]  # untouched
+
+
+def test_canonicalize_leaves_ambiguous_truncated(script_mod):
+    """If a truncated prefix matches 2+ full addresses it's left alone."""
+    short = "0xabcdef12"
+    full1 = short + "00" * 16    # both 0x + 40 hex sharing the prefix
+    full2 = short + "11" * 16
+    grouped = {
+        f"copy_trade:{full1}": [{"pnl": 1.0}],
+        f"copy_trade:{full2}": [{"pnl": 2.0}],
+        f"copy_trade:{short}": [{"pnl": 9.0}],
+    }
+    merged = script_mod._canonicalize_grouped_keys(grouped)
+    assert f"copy_trade:{short}" in merged                   # ambiguous -> kept
+
+
+def test_canonicalize_no_full_match_keeps_truncated(script_mod):
+    short = "0xdeadbeef"
+    grouped = {f"copy_trade:{short}": [{"pnl": 1.0}]}
+    merged = script_mod._canonicalize_grouped_keys(grouped)
+    assert merged == {f"copy_trade:{short}": [{"pnl": 1.0}]}
+
+
+def test_canonicalize_noop_without_truncated(script_mod):
+    full = "0x" + "ab" * 20
+    grouped = {f"copy_trade:{full}": [{"pnl": 1.0}], "strategy:x": [{"pnl": 2.0}]}
+    assert script_mod._canonicalize_grouped_keys(grouped) == grouped
+
+
+# ── agent_scorer get_source_key canonicalization (forward fix) ──
+
+
+def test_get_source_key_full_address_passthrough():
+    from src.signals.agent_scoring import AgentScorer
+    s = AgentScorer()
+    full = "0x" + "cd" * 20
+    sig = {"source": "copy_trade", "source_trader": full}
+    assert s.get_source_key(sig) == f"copy_trade:{full}"
+
+
+def test_get_source_key_truncated_falls_back_to_untagged():
+    """A truncated address must NOT become copy_trade:0x<short> (the
+    fragmentation bug) -- it falls back to the canonical untagged key."""
+    from src.signals.agent_scoring import AgentScorer
+    s = AgentScorer()
+    sig = {"source": "copy_trade", "source_trader": "0x1ee7a73c"}
+    assert s.get_source_key(sig) == "copy_trade"

@@ -675,9 +675,13 @@ class AgentScorer:
         trader_address = str(trader_address or "").strip().lower()
 
         if source == "copy_trade":
-            if trader_address:
-                return f"{source}:{trader_address}"
-            return source
+            # Route through the canonical builder so a truncated address can
+            # never re-fragment agent_scorer state (the historical address[:10]
+            # bug).  Full addresses pass through as copy_trade:0x<40hex>;
+            # truncated/malformed fall back to the untagged "copy_trade" key.
+            # strict=False keeps the scoring hot path from ever raising.
+            from src.signals.source_key import copy_trade_source_key
+            return str(copy_trade_source_key(trader_address, strict=False))
         stype = str(stype or "").strip().lower()
         if stype and stype != "unknown":
             return f"{source}:{stype}"
