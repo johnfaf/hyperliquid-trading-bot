@@ -1998,6 +1998,29 @@ XGBOOST_LABELER_MIN_AGE_MINUTES = int(
     os.environ.get("XGBOOST_LABELER_MIN_AGE_MINUTES", 65)
 )
 
+# ── Multi-coin regime warm-up ───────────────────────────────────────────
+# The two periodic predict_regime() calls in the trading cycle use BTC as a
+# market-regime proxy, so regime_history accumulated BTC-only rows (~9/day
+# after the May freeze).  That starved the XGBoost trainer of coin diversity
+# even after vol-relative labeling unblocked the class balance.  This warm-up
+# periodically stores predictions for a few extra coins purely to feed the
+# labeler/trainer -- it does NOT drive any trade decision (those still use the
+# per-signal predict_regime(signal.coin) path).  Default ON; fully tunable.
+XGBOOST_REGIME_WARMUP_ENABLED = os.environ.get(
+    "XGBOOST_REGIME_WARMUP_ENABLED", "true"
+).strip().lower() in ("1", "true", "yes", "on")
+# Run the warm-up every Nth reporting cycle (cycles are ~3min, so 5 ~= 15min).
+# Cycle-count based (not wall-clock) so it adds no datetime/time calls.
+XGBOOST_REGIME_WARMUP_EVERY_N_CYCLES = int(
+    os.environ.get("XGBOOST_REGIME_WARMUP_EVERY_N_CYCLES", 5)
+)
+# Comma-separated coin list; empty => fall back to ARENA_COIN_UNIVERSE.
+XGBOOST_REGIME_WARMUP_COINS = os.environ.get("XGBOOST_REGIME_WARMUP_COINS", "")
+# Hard cap so a fat env list can't blow up per-cycle external API calls.
+XGBOOST_REGIME_WARMUP_MAX_COINS = int(
+    os.environ.get("XGBOOST_REGIME_WARMUP_MAX_COINS", 5)
+)
+
 # --- Feature Store Alpha Pipeline (Phase B) ---
 ENABLE_ALPHA_PIPELINE = os.environ.get("ENABLE_ALPHA_PIPELINE", "true").lower() in ("true", "1", "yes")
 ALPHA_TIMEFRAME = os.environ.get("ALPHA_TIMEFRAME", "1h")

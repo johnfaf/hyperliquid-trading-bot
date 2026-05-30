@@ -16,6 +16,67 @@ logger = logging.getLogger(__name__)
 logger.addHandler(logging.NullHandler())
 
 
+def _warmup_regime_coins() -> list:
+    """Coins to warm up regime predictions for.
+
+    Explicit ``XGBOOST_REGIME_WARMUP_COINS`` env list wins; otherwise fall
+    back to the arena universe (BTC/ETH/SOL).  De-duped and capped so a fat
+    env list can't balloon per-cycle external API calls.
+    """
+    import config as _cfg
+
+    raw = str(getattr(_cfg, "XGBOOST_REGIME_WARMUP_COINS", "") or "").strip()
+    if raw:
+        coins = [c.strip().upper() for c in raw.split(",") if c.strip()]
+    else:
+        coins = [
+            str(c).upper().strip()
+            for c in getattr(_cfg, "ARENA_COIN_UNIVERSE", ["BTC", "ETH", "SOL"])
+            if str(c).strip()
+        ]
+    out: list = []
+    for c in coins:
+        if c and c not in out:
+            out.append(c)
+    cap = max(1, int(getattr(_cfg, "XGBOOST_REGIME_WARMUP_MAX_COINS", 5) or 5))
+    return out[:cap]
+
+
+def _warmup_regime_predictions(container, cycle_count: int) -> int:
+    """Store regime predictions for a few extra coins so the XGBoost labeler
+    and trainer see multi-coin data, not just the BTC market-regime proxy the
+    trading cycle emits.  ``predict_regime`` persists each prediction to
+    regime_history internally, which the catchup-labeler later promotes to
+    observed training labels.
+
+    Decision-neutral (trades use the per-signal predict_regime path) and
+    fail-open: any error is swallowed so it can never disrupt the cycle.
+    Returns the number of coins warmed up (0 when skipped).
+    """
+    import config as _cfg
+
+    if not getattr(_cfg, "XGBOOST_REGIME_WARMUP_ENABLED", True):
+        return 0
+    every_n = max(1, int(getattr(_cfg, "XGBOOST_REGIME_WARMUP_EVERY_N_CYCLES", 5) or 5))
+    # Cycle-count cadence (no wall-clock) keeps this ratchet-safe.
+    if int(cycle_count) % every_n != 0:
+        return 0
+    forecaster = getattr(container, "predictive_forecaster", None)
+    if forecaster is None or not hasattr(forecaster, "predict_regime"):
+        return 0
+
+    stored = 0
+    for coin in _warmup_regime_coins():
+        try:
+            forecaster.predict_regime(coin)
+            stored += 1
+        except Exception as exc:
+            logger.debug("Regime warm-up predict failed for %s: %s", coin, exc)
+    if stored:
+        logger.info("  Regime warm-up: stored predictions for %d coin(s)", stored)
+    return stored
+
+
 def run_reporting(container, cycle_count: int, health_registry=None) -> None:
     """
     Phase 6+: status update, module stats, alerts, backup.
@@ -129,6 +190,16 @@ def run_reporting(container, cycle_count: int, health_registry=None) -> None:
             )
     except Exception:
         pass
+
+    # ── Multi-coin regime warm-up ──
+    # Persist regime predictions for a few extra coins (default BTC/ETH/SOL)
+    # so the labeler/trainer below sees coin diversity, not just the BTC
+    # market-regime proxy the trading cycle emits.  Decision-neutral and
+    # fail-open; gated by env + an every-Nth-cycle cadence.
+    try:
+        _warmup_regime_predictions(container, cycle_count)
+    except Exception as exc:
+        logger.debug("Regime warm-up skipped: %s", exc)
 
     # ── XGBoost forecaster catchup-labeler ──
     # The forecaster's auto-retrain only fires every 24h, which means the
