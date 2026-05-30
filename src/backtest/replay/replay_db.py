@@ -102,8 +102,29 @@ class ReplayDB:
             return
         self._prev_env = os.environ.get("HL_BOT_DB")
         os.environ["HL_BOT_DB"] = str(self.db_path)
+
+        # ISOLATION: force sqlite-only so replay writes never dualwrite into the
+        # production Postgres mirror.  Without this, running a replay in an
+        # environment configured for dualwrite (e.g. in-container) mirrors every
+        # replay INSERT to the live Postgres -- which crashes the run on primary-
+        # key collisions ("strategy_scores_pkey ... already exists") and pollutes
+        # prod.  The router reads config.DB_BACKEND live, and install() runs
+        # before the pg pool opens, so pinning it here keeps the pool from ever
+        # opening.
+        self._prev_backend_env = os.environ.get("DB_BACKEND")
+        os.environ["DB_BACKEND"] = "sqlite"
+        try:
+            import config as _cfg
+            self._prev_backend_cfg = getattr(_cfg, "DB_BACKEND", None)
+            _cfg.DB_BACKEND = "sqlite"
+        except Exception:
+            self._prev_backend_cfg = None
+
         self._installed = True
-        logger.info("ReplayDB installed: HL_BOT_DB=%s (run_id=%s)", self.db_path, self.run_id)
+        logger.info(
+            "ReplayDB installed: HL_BOT_DB=%s DB_BACKEND=sqlite (run_id=%s)",
+            self.db_path, self.run_id,
+        )
 
         # If `src.data.database` was already imported in this process, its
         # captured `_DB_PATH` is now stale. We patch it in place so the
@@ -128,6 +149,17 @@ class ReplayDB:
                 os.environ.pop("HL_BOT_DB", None)
             else:
                 os.environ["HL_BOT_DB"] = self._prev_env
+            # Restore the dualwrite backend pinned in install().
+            if getattr(self, "_prev_backend_env", None) is None:
+                os.environ.pop("DB_BACKEND", None)
+            else:
+                os.environ["DB_BACKEND"] = self._prev_backend_env
+            if getattr(self, "_prev_backend_cfg", None) is not None:
+                try:
+                    import config as _cfg
+                    _cfg.DB_BACKEND = self._prev_backend_cfg
+                except Exception:
+                    pass
         finally:
             self._installed = False
             if not self.keep_on_exit and self.db_path.exists():
