@@ -97,6 +97,46 @@ def test_summarize_zero_decisions_is_safe(monkeypatch):
     assert out["top_reasons"] == []
 
 
+def test_summarize_with_real_sqlite_rows(monkeypatch):
+    """Regression: a real sqlite3.Row names a COUNT(*) column "COUNT(*)",
+    not "count" -- the old r["count"] raised KeyError ('No item with that
+    key') in prod.  Positional r[0] must work."""
+    import sqlite3
+    from src.data import database as db_mod
+
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.execute(
+        "CREATE TABLE decision_outcomes "
+        "(created_at TEXT, action_taken INTEGER, rejection_reason TEXT)"
+    )
+    conn.executemany(
+        "INSERT INTO decision_outcomes (created_at, action_taken, rejection_reason) "
+        "VALUES (datetime('now'), ?, ?)",
+        [
+            (1, None),                                   # executed
+            (0, "ev_below_threshold:ev=1.8"),
+            (0, "ev_below_threshold:ev=0.4"),
+            (0, "Source allocator paused strategy:m (paused)"),
+        ],
+    )
+    conn.commit()
+
+    @contextmanager
+    def fake_get_connection(*a, **k):
+        yield conn
+
+    monkeypatch.setattr(db_mod, "get_backend_name", lambda: "sqlite")
+    monkeypatch.setattr(db_mod, "get_connection", fake_get_connection)
+
+    out = summarize_recent_decisions(hours=6)
+    assert "error" not in out
+    assert out["total"] == 4 and out["executed"] == 1 and out["rejected"] == 3
+    reasons = {r["reason"]: r["count"] for r in out["top_reasons"]}
+    assert reasons["ev_below_threshold"] == 2
+    assert reasons["Source allocator paused"] == 1
+
+
 def test_summarize_degrades_on_db_error(monkeypatch):
     from src.data import database as db_mod
 

@@ -64,9 +64,11 @@ def summarize_recent_decisions(hours: float = 6.0, top_n: int = 12) -> Dict[str,
 
         with get_connection(for_read=True) as conn:
             def _one(sql: str) -> int:
+                # COUNT(*) -> always a single positional column.  (Don't index
+                # by name: a sqlite3.Row names this column "COUNT(*)", not
+                # "count", so r["count"] raised KeyError in prod.)
                 r = conn.execute(sql).fetchone()
-                v = (r[0] if not hasattr(r, "keys") else r["count"]) if r else 0
-                return int(v or 0)
+                return int(r[0]) if r and r[0] is not None else 0
 
             out["total"] = _one(
                 f"SELECT COUNT(*) FROM decision_outcomes WHERE created_at > {cutoff}"
@@ -88,7 +90,7 @@ def summarize_recent_decisions(hours: float = 6.0, top_n: int = 12) -> Dict[str,
 
         counts: Dict[str, int] = {}
         for r in reason_rows:
-            raw = r[0] if not hasattr(r, "keys") else r["rejection_reason"]
+            raw = r[0]  # single positional column; works for tuple + sqlite3.Row
             fam = _normalise_reason(raw)
             counts[fam] = counts.get(fam, 0) + 1
         ranked: List[Dict[str, Any]] = sorted(
