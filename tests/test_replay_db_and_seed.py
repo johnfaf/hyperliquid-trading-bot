@@ -191,3 +191,22 @@ def test_export_from_live_db(tmp_path, monkeypatch):
         # Same counts (active=1 in default snapshot)
         assert len(exported.traders) == 3
         assert len(exported.strategies) == 10
+
+
+def test_replay_db_forces_sqlite_isolation(tmp_path, monkeypatch):
+    """ReplayDB must pin DB_BACKEND=sqlite so replay writes never dualwrite
+    into the production Postgres mirror (which crashed runs on PK collisions
+    like 'strategy_scores_pkey already exists' and leaked replay rows to prod)."""
+    import os
+    import config as cfg
+
+    monkeypatch.setattr(cfg, "DB_BACKEND", "dualwrite", raising=False)
+    monkeypatch.setenv("DB_BACKEND", "dualwrite")
+
+    with ReplayDB(run_id="iso", data_dir=str(tmp_path)):
+        assert cfg.DB_BACKEND == "sqlite"          # mirror disabled in-run
+        assert os.environ["DB_BACKEND"] == "sqlite"
+
+    # Restored after the run so the live process keeps dualwriting.
+    assert cfg.DB_BACKEND == "dualwrite"
+    assert os.environ["DB_BACKEND"] == "dualwrite"
