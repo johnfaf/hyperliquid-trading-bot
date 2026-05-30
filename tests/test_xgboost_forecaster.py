@@ -77,6 +77,85 @@ def test_labeler_classifies_forward_returns(monkeypatch):
     assert by_id[33] == REGIME_LABELS["neutral"]  # SOL +0.5%
 
 
+def _labeler_fc():
+    with patch.object(XGBoostRegimeForecaster, "_ensure_regime_history_table"), \
+         patch.object(XGBoostRegimeForecaster, "_load_model"), \
+         patch.object(XGBoostRegimeForecaster, "train"):
+        return XGBoostRegimeForecaster({"min_training_samples": 10})
+
+
+def _wire_labeler_db(monkeypatch, *, expire_rowcount=0):
+    """Fake DB/candles for the labeler; records every executed SQL string."""
+    from src.data import database as db_mod
+    from src.data import hyperliquid_client as hl_mod
+
+    executed = []
+
+    class _Cur:
+        def __init__(self, rowcount=0):
+            self.rowcount = rowcount
+
+        def fetchall(self):
+            return []  # no labelable rows -> isolate expiry + scan wiring
+
+    class _FakeConn:
+        def execute(self, sql, params=()):
+            executed.append(sql)
+            if "'expired'" in sql:
+                return _Cur(rowcount=expire_rowcount)
+            return _Cur()
+
+        def executemany(self, sql, seq):
+            pass
+
+    @contextmanager
+    def fake_get_connection(*a, **k):
+        yield _FakeConn()
+
+    monkeypatch.setattr(db_mod, "get_backend_name", lambda: "sqlite")
+    monkeypatch.setattr(db_mod, "get_connection", fake_get_connection)
+    monkeypatch.setattr(hl_mod, "get_candles", lambda coin, **kw: [])
+    return executed
+
+
+def test_labeler_expires_and_bounds_old_backlog(monkeypatch):
+    """Rows older than MAX_AGE are marked 'expired' and the scan carries a
+    lower age bound, so the labeler stops burning its batch on un-labelable
+    old rows (the prod no_data=500 treadmill)."""
+    import config as cfg
+    monkeypatch.setattr(cfg, "XGBOOST_LABELER_MAX_AGE_HOURS", 72, raising=False)
+
+    executed = _wire_labeler_db(monkeypatch, expire_rowcount=13618)
+    fc = _labeler_fc()
+
+    stats = fc.label_predictions_with_forward_returns(batch_size=500, min_age_minutes=65)
+
+    # Expiry sweep ran and counted the dead backlog.
+    assert stats["expired"] == 13618
+    assert any("'expired'" in s and "timestamp <" in s for s in executed)
+    # Scan query carries the lower age bound (timestamp > max_age cutoff).
+    scan = [s for s in executed if "label_source = 'predicted'" in s and "ORDER BY" in s]
+    assert scan, "scan query not executed"
+    assert any("timestamp >" in s for s in scan)
+
+
+def test_labeler_max_age_zero_disables_bound(monkeypatch):
+    """MAX_AGE_HOURS=0 restores legacy behavior: no expiry sweep, no floor."""
+    import config as cfg
+    monkeypatch.setattr(cfg, "XGBOOST_LABELER_MAX_AGE_HOURS", 0, raising=False)
+
+    executed = _wire_labeler_db(monkeypatch, expire_rowcount=999)
+    fc = _labeler_fc()
+
+    stats = fc.label_predictions_with_forward_returns(batch_size=500, min_age_minutes=65)
+
+    assert stats["expired"] == 0
+    assert not any("'expired'" in s for s in executed)
+    scan = [s for s in executed if "label_source = 'predicted'" in s and "ORDER BY" in s]
+    assert scan, "scan query not executed"
+    assert not any("timestamp >" in s for s in scan)  # no lower bound
+
+
 class TestXGBoostRegimeForecaster:
     """Test suite for XGBoost regime forecaster (LOW-12)."""
 

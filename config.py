@@ -1997,6 +1997,17 @@ XGBOOST_LABELER_BATCH_SIZE = int(
 XGBOOST_LABELER_MIN_AGE_MINUTES = int(
     os.environ.get("XGBOOST_LABELER_MIN_AGE_MINUTES", 65)
 )
+# Maximum age of a prediction we'll still TRY to label.  Hyperliquid retains
+# only ~3.5 days of 1m candles, so older predictions can never get a forward
+# return -- their candles are gone.  A prod audit found 13.6k such rows (back
+# to April) sitting as label_source='predicted', and the DESC scan burned its
+# whole 500-row batch on them every cycle (no_data~500, labeled~0).  Rows older
+# than this are excluded from the scan and marked 'expired' so the labeler
+# works only the window where candles still exist.  72h leaves margin under the
+# ~83h (5000x1m) cap.  Set 0 to disable the bound (legacy behavior).
+XGBOOST_LABELER_MAX_AGE_HOURS = float(
+    os.environ.get("XGBOOST_LABELER_MAX_AGE_HOURS", 72)
+)
 
 # ── Multi-coin regime warm-up ───────────────────────────────────────────
 # The two periodic predict_regime() calls in the trading cycle use BTC as a
