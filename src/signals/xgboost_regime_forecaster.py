@@ -1045,17 +1045,21 @@ class XGBoostRegimeForecaster:
         )
         # One-shot cleanup: retire the un-labelable backlog so the DESC scan
         # below stops burning its batch on rows whose candles are long gone.
-        if max_age_sql is not None:
+        # NOTE: this is a WRITE, so under dualwrite it runs against BOTH sqlite
+        # and the postgres mirror -- we must NOT embed sqlite-only datetime()
+        # in it (that broke the PG mirror).  Compute the cutoff in Python and
+        # pass it as a bound parameter; ``?`` is translated for the mirror.
+        if _max_age_minutes > 0:
             try:
+                from src.core import clock_provider
+                cutoff_dt = clock_provider.utc_now() - timedelta(minutes=_max_age_minutes)
+                cutoff_str = cutoff_dt.strftime("%Y-%m-%d %H:%M:%S")
                 with get_connection() as _conn:
                     cur = _conn.execute(
-                        f"""
-                        UPDATE regime_history
-                        SET label_source = 'expired'
-                        WHERE label_source = 'predicted'
-                          AND regime_label IS NULL
-                          AND timestamp < {max_age_sql}
-                        """
+                        "UPDATE regime_history SET label_source = 'expired' "
+                        "WHERE label_source = 'predicted' AND regime_label IS NULL "
+                        "AND timestamp < ?",
+                        (cutoff_str,),
                     )
                     stats["expired"] = int(getattr(cur, "rowcount", 0) or 0)
             except Exception as exc:
