@@ -124,6 +124,31 @@ async def health_strip() -> JSONResponse:
     return JSONResponse(payload)
 
 
+@router.get("/api/why_not_trading")
+async def why_not_trading(hours: float = 6.0) -> JSONResponse:
+    """Decision-funnel breakdown for a quiet bot: how many candidate
+    decisions executed vs were rejected in the last ``hours``, and the top
+    rejection reasons -- the "Decision summary" log line, made queryable so
+    you can see *why* nothing is trading without grepping logs."""
+    try:
+        result = await run_in_threadpool(_cached_why_not_trading, float(hours))
+    except Exception as exc:
+        logger.warning("why_not_trading failed: %s", exc)
+        return JSONResponse({"error": str(exc)[:160]}, status_code=503)
+    return JSONResponse(result)
+
+
+def _cached_why_not_trading(hours: float) -> dict:
+    from src.analysis.decision_diagnostics import summarize_recent_decisions
+
+    ttl = _cache_ttl("DASHBOARD_V2_WHY_NOT_TRADING_CACHE_SECONDS", 30.0)
+    return get_ttl(
+        f"why_not_trading:{hours}",
+        ttl,
+        lambda: summarize_recent_decisions(hours=hours),
+    )
+
+
 def _cached_readiness(key: str, ttl_s: float, include_db_audit: bool = True) -> dict:
     return get_ttl(
         key,
