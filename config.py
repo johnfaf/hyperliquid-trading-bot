@@ -604,6 +604,16 @@ LIVE_RECENT_LOSS_GUARD_ENABLED = _safe_env_bool("LIVE_RECENT_LOSS_GUARD_ENABLED"
 LIVE_RECENT_LOSS_LOOKBACK_FILLS = _safe_env_int(
     "LIVE_RECENT_LOSS_LOOKBACK_FILLS", 200, lo=1, hi=100_000,
 )
+# Time-recency bound for the recent-loss guard.  The fills window above is
+# count-only, so when live trading goes quiet the guard keeps judging new
+# entries on stale fills forever -- e.g. after the May freeze + bug fixes it
+# still blocked shorts on 108 pre-fix bug-era fills (last traded May 27).
+# Fills whose close is older than this are dropped so the guard reflects the
+# CURRENT (fixed) system's performance, and re-engages only on fresh losses.
+# 0 disables the time bound (legacy count-only behavior).
+LIVE_RECENT_LOSS_LOOKBACK_HOURS = _safe_env_float(
+    "LIVE_RECENT_LOSS_LOOKBACK_HOURS", 48.0, lo=0.0, hi=8760.0,
+)
 LIVE_RECENT_LOSS_SIDE_MIN_CLOSED = _safe_env_int(
     "LIVE_RECENT_LOSS_SIDE_MIN_CLOSED", 5, lo=1, hi=1_000,
 )
