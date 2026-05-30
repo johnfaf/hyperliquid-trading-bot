@@ -95,11 +95,66 @@ def _live_mirror_reentry_seconds() -> float:
         return 0.0
 
 
-def _live_mirror_conviction_gate(live_signal) -> tuple[bool, str]:
-    """Return (allow, reason) for the live-only conviction/churn gate.
-
-    Default OFF (both envs 0).  Never raises.
+def _signal_bucket(live_signal) -> tuple[str, str, str]:
+    """Derive (source, side, regime) for a live signal, namespaced like the
+    edge-analysis buckets (e.g. ``strategy:momentum_long`` / ``copy_trade``).
     """
+    src = getattr(live_signal, "source", None)
+    src = getattr(src, "value", src)
+    src = str(src or "").strip().lower()
+    stype = str(getattr(live_signal, "strategy_type", "") or "").strip().lower()
+    if src == "strategy" and stype:
+        src = f"strategy:{stype}"
+    side = getattr(live_signal, "side", "")
+    side = str(getattr(side, "value", side) or "").strip().lower()
+    regime = str(getattr(live_signal, "regime", "") or "").strip().lower()
+    return src, side, regime
+
+
+def _src_matches(pattern: str, src: str) -> bool:
+    """A blocklist source matches the signal source either exactly, or as a
+    namespace prefix (``copy_trade`` matches ``copy_trade:0xabc...``)."""
+    if pattern == src:
+        return True
+    return ":" not in pattern and src.startswith(pattern + ":")
+
+
+def _live_mirror_bucket_blocked(live_signal) -> tuple[bool, str]:
+    """Block live mirroring for (source|side[|regime]) buckets the operator
+    has flagged via LIVE_MIRROR_BUCKET_BLOCKLIST -- e.g. proven-loser buckets
+    from scripts/analyze_edge.py (``copy_trade|short``, ``strategy:momentum_long|long``).
+    Empty env => OFF.  ``*`` is a wildcard for side/regime.  Fail-open.
+    """
+    raw = str(os.environ.get("LIVE_MIRROR_BUCKET_BLOCKLIST", "") or "").strip()
+    if not raw:
+        return False, ""
+    try:
+        src, side, regime = _signal_bucket(live_signal)
+        for entry in (e.strip().lower() for e in raw.split(",") if e.strip()):
+            parts = entry.split("|")
+            b_src = parts[0]
+            b_side = parts[1] if len(parts) > 1 else "*"
+            b_reg = parts[2] if len(parts) > 2 else "*"
+            if (
+                _src_matches(b_src, src)
+                and b_side in ("*", side)
+                and b_reg in ("*", regime)
+            ):
+                return True, f"bucket blocklisted ({entry})"
+    except Exception:
+        return False, ""  # fail-open
+    return False, ""
+
+
+def _live_mirror_conviction_gate(live_signal) -> tuple[bool, str]:
+    """Return (allow, reason) for the live-only mirror gate: edge-bucket
+    blocklist + conviction floor + re-entry cooldown.
+
+    All components default OFF.  Never raises.
+    """
+    blocked, breason = _live_mirror_bucket_blocked(live_signal)
+    if blocked:
+        return False, breason
     min_conf = _live_mirror_min_confidence()
     reentry_s = _live_mirror_reentry_seconds()
     if min_conf <= 0.0 and reentry_s <= 0.0:
