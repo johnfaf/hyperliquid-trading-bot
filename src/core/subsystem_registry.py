@@ -65,6 +65,10 @@ FULL_PROFILE = FUNDABLE_CORE | {
 # external data source the harness cannot replay.
 REPLAY_PROFILE = {
     "strategy_scorer", "decision_firewall", "paper_trader",
+    # copy_trader is built so copy-trade signals are simulated in replay
+    # (its source positions come from the harness TraderPositionOracle when
+    # --fills-db is set; harmless no-op otherwise -- the oracle returns empty).
+    "copy_trader",
     "regime_detector", "feature_engine", "agent_scorer",
     "decision_engine", "signal_processor", "risk_policy_engine",
     "kelly_sizer", "trade_memory", "calibration", "regime_strategy_filter",

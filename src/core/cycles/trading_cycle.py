@@ -1851,8 +1851,9 @@ def _run_copy_trading(container, regime_data):
         ws_signals = container.position_monitor.drain_signals()
         if ws_signals:
             logger.info("  WebSocket: %d real-time signals", len(ws_signals))
+    _copy_top_n = int(getattr(config, "COPY_TRADER_SCAN_TOP_N", 10) or 10)
     copy_signals = ws_signals + (
-        container.copy_trader.scan_top_traders(top_n=10) if container.copy_trader else []
+        container.copy_trader.scan_top_traders(top_n=_copy_top_n) if container.copy_trader else []
     )
 
     try:
