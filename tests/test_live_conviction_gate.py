@@ -22,14 +22,77 @@ def _sig(coin="BTC", side="long", confidence=0.65):
     )
 
 
+def _bsig(source="copy_trade", side="short", strategy_type="", regime="", coin="BTC", confidence=0.65):
+    return SimpleNamespace(
+        coin=coin,
+        side=SimpleNamespace(value=side),
+        confidence=confidence,
+        source=SimpleNamespace(value=source),
+        strategy_type=strategy_type,
+        regime=regime,
+    )
+
+
 @pytest.fixture(autouse=True)
 def _reset_state(monkeypatch):
     # Clear the module-level cooldown cache between tests.
     le._LAST_LIVE_MIRROR_TS.clear()
-    for k in ("LIVE_MIRROR_MIN_CONFIDENCE", "LIVE_MIRROR_MIN_REENTRY_SECONDS"):
+    for k in (
+        "LIVE_MIRROR_MIN_CONFIDENCE",
+        "LIVE_MIRROR_MIN_REENTRY_SECONDS",
+        "LIVE_MIRROR_BUCKET_BLOCKLIST",
+    ):
         monkeypatch.delenv(k, raising=False)
     yield
     le._LAST_LIVE_MIRROR_TS.clear()
+
+
+# ── Edge-bucket blocklist ───────────────────────────────────────
+
+
+def test_bucket_blocklist_off_by_default():
+    allow, reason = le._live_mirror_conviction_gate(_bsig(source="copy_trade", side="short"))
+    assert allow is True and reason == ""
+
+
+def test_bucket_blocklist_blocks_source_side(monkeypatch):
+    monkeypatch.setenv("LIVE_MIRROR_BUCKET_BLOCKLIST", "copy_trade|short")
+    allow, reason = le._live_mirror_conviction_gate(_bsig(source="copy_trade", side="short"))
+    assert allow is False and "blocklist" in reason
+
+
+def test_bucket_blocklist_namespace_prefix_matches_specific_trader(monkeypatch):
+    monkeypatch.setenv("LIVE_MIRROR_BUCKET_BLOCKLIST", "copy_trade|short")
+    s = _bsig(source="copy_trade:0xabc123", side="short")
+    assert le._live_mirror_conviction_gate(s)[0] is False
+
+
+def test_bucket_blocklist_allows_other_side(monkeypatch):
+    monkeypatch.setenv("LIVE_MIRROR_BUCKET_BLOCKLIST", "copy_trade|short")
+    assert le._live_mirror_conviction_gate(_bsig(source="copy_trade", side="long"))[0] is True
+
+
+def test_bucket_blocklist_strategy_with_type(monkeypatch):
+    monkeypatch.setenv("LIVE_MIRROR_BUCKET_BLOCKLIST", "strategy:momentum_long|long")
+    s = _bsig(source="strategy", strategy_type="momentum_long", side="long")
+    assert le._live_mirror_conviction_gate(s)[0] is False
+    # A different strategy type is unaffected.
+    s2 = _bsig(source="strategy", strategy_type="scalping", side="long")
+    assert le._live_mirror_conviction_gate(s2)[0] is True
+
+
+def test_bucket_blocklist_regime_specific(monkeypatch):
+    monkeypatch.setenv("LIVE_MIRROR_BUCKET_BLOCKLIST", "copy_trade|short|bear")
+    assert le._live_mirror_conviction_gate(_bsig(side="short", regime="bear"))[0] is False
+    assert le._live_mirror_conviction_gate(_bsig(side="short", regime="bull"))[0] is True
+
+
+def test_bucket_blocklist_multiple_entries(monkeypatch):
+    monkeypatch.setenv("LIVE_MIRROR_BUCKET_BLOCKLIST", "copy_trade|short, strategy:momentum_long|long")
+    assert le._live_mirror_conviction_gate(_bsig(source="copy_trade", side="short"))[0] is False
+    s = _bsig(source="strategy", strategy_type="momentum_long", side="long")
+    assert le._live_mirror_conviction_gate(s)[0] is False
+    assert le._live_mirror_conviction_gate(_bsig(source="copy_trade", side="long"))[0] is True
 
 
 # ── Default OFF ─────────────────────────────────────────────────
