@@ -1073,6 +1073,23 @@ LEVERAGE_EDGE_PROPORTIONAL_ENABLED = os.environ.get(
 ).lower() in ("true", "1", "yes")
 LEVERAGE_EDGE_MIN_CONF = float(os.environ.get("LEVERAGE_EDGE_MIN_CONF", "0.50"))
 LEVERAGE_EDGE_FULL_CONF = float(os.environ.get("LEVERAGE_EDGE_FULL_CONF", "0.65"))
+# ── Require-proven live-mirror gate (algo #1, default OFF) ──
+# A source must accumulate real evidence before it risks LIVE capital: only
+# mirror to live if its calibration shows >= LIVE_MIRROR_PROVEN_MIN_SAMPLES
+# source+side outcomes AND a calibrated edge >= LIVE_MIRROR_PROVEN_MIN_EDGE.
+# Unproven sources keep PAPER-trading (accumulating the outcomes that feed
+# calibration) but don't risk the live account until they graduate. Pairs with
+# #2 (edge borrows strength up the ladder) and #6 (shadow/paper outcomes build
+# the sample). OFF => no proven requirement (legacy).
+LIVE_MIRROR_REQUIRE_PROVEN_ENABLED = os.environ.get(
+    "LIVE_MIRROR_REQUIRE_PROVEN_ENABLED", "false"
+).lower() in ("true", "1", "yes")
+LIVE_MIRROR_PROVEN_MIN_SAMPLES = float(
+    os.environ.get("LIVE_MIRROR_PROVEN_MIN_SAMPLES", "30")
+)
+LIVE_MIRROR_PROVEN_MIN_EDGE = float(
+    os.environ.get("LIVE_MIRROR_PROVEN_MIN_EDGE", "0.50")
+)
 # Auto-quarantine sources whose ECE crosses this threshold once they
 # have at least CALIBRATION_QUARANTINE_MIN_SAMPLES outcomes. Quarantined
 # sources are routed to shadow only until ECE recovers.

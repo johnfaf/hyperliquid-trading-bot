@@ -146,15 +146,51 @@ def _live_mirror_bucket_blocked(live_signal) -> tuple[bool, str]:
     return False, ""
 
 
-def _live_mirror_conviction_gate(live_signal) -> tuple[bool, str]:
+def _container_calibration(container):
+    """Best-effort calibration tracker from the container (or its firewall)."""
+    return (getattr(container, "calibration", None)
+            or getattr(getattr(container, "firewall", None), "calibration", None))
+
+
+def _live_mirror_require_proven(live_signal, calibration) -> tuple[bool, str]:
+    """Block live mirroring of sources without proven edge (algo #1).
+
+    Unproven sources keep paper-trading -- accumulating the calibration
+    outcomes that let them graduate -- but don't risk live capital until they
+    show >= LIVE_MIRROR_PROVEN_MIN_SAMPLES source+side outcomes AND a calibrated
+    edge >= LIVE_MIRROR_PROVEN_MIN_EDGE. Fail-open when disabled or when no
+    calibration tracker is available. Default OFF.
+    """
+    if str(os.environ.get("LIVE_MIRROR_REQUIRE_PROVEN_ENABLED", "false")).strip().lower() not in ("true", "1", "yes"):
+        return True, ""
+    if calibration is None or not hasattr(calibration, "proven_evidence"):
+        return True, ""  # can't assess -> fail-open
+    try:
+        min_samples = float(os.environ.get("LIVE_MIRROR_PROVEN_MIN_SAMPLES", "30") or 30)
+        min_edge = float(os.environ.get("LIVE_MIRROR_PROVEN_MIN_EDGE", "0.50") or 0.50)
+        src, side, regime = _signal_bucket(live_signal)
+        edge, n = calibration.proven_evidence(src, side, regime)
+        if float(n) < min_samples:
+            return False, f"unproven source ({float(n):.0f} < {min_samples:.0f} samples)"
+        if float(edge) < min_edge:
+            return False, f"unproven edge ({float(edge):.2f} < {min_edge:.2f})"
+    except Exception:
+        return True, ""  # fail-open
+    return True, ""
+
+
+def _live_mirror_conviction_gate(live_signal, calibration=None) -> tuple[bool, str]:
     """Return (allow, reason) for the live-only mirror gate: edge-bucket
-    blocklist + conviction floor + re-entry cooldown.
+    blocklist + require-proven + conviction floor + re-entry cooldown.
 
     All components default OFF.  Never raises.
     """
     blocked, breason = _live_mirror_bucket_blocked(live_signal)
     if blocked:
         return False, breason
+    allow, preason = _live_mirror_require_proven(live_signal, calibration)
+    if not allow:
+        return False, preason
     min_conf = _live_mirror_min_confidence()
     reentry_s = _live_mirror_reentry_seconds()
     if min_conf <= 0.0 and reentry_s <= 0.0:
@@ -1144,7 +1180,8 @@ def mirror_executed_trades_to_live(
                 # Live-only conviction / re-entry-cooldown gate (default
                 # OFF).  Skips mirroring low-conviction or churned-coin
                 # signals to cut the fee bleed; the paper trade stands.
-                allow, gate_reason = _live_mirror_conviction_gate(live_signal)
+                allow, gate_reason = _live_mirror_conviction_gate(
+                    live_signal, calibration=_container_calibration(container))
                 if not allow:
                     logger.info(
                         "%s skipped (live conviction gate): %s %s -- %s",
