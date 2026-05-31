@@ -893,6 +893,12 @@ COPY_TRADER_ENABLED = os.environ.get(
 COPY_TRADER_MAX_CONCURRENT_TRADES = int(
     os.environ.get("COPY_TRADER_MAX_CONCURRENT_TRADES", 5)
 )
+# How many top traders copy_trader scans per cycle.  Default 10 (live).  In a
+# copy backtest the tracked-copy wallet set can be larger, so this is tunable
+# (e.g. COPY_TRADER_SCAN_TOP_N=40) to scan all seeded fills-wallets.
+COPY_TRADER_SCAN_TOP_N = int(
+    os.environ.get("COPY_TRADER_SCAN_TOP_N", 10)
+)
 COPY_TRADER_MAX_NEW_TRADES_PER_CYCLE = int(
     os.environ.get("COPY_TRADER_MAX_NEW_TRADES_PER_CYCLE", 1)
 )

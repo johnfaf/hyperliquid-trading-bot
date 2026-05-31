@@ -88,6 +88,17 @@ def _cmd_run(args: argparse.Namespace) -> int:
         if args.strategy_snapshot
         else build_default_smoke_snapshot()
     )
+    # For a COPY backtest, the trader pool must be the wallets the position
+    # oracle can serve (those in --fills-db); the discovery-ranked snapshot
+    # traders barely overlap them, so copy_trader would scan the wrong set and
+    # fire no copy signals.  Replace the trader pool with the fills wallets.
+    if args.fills_db:
+        from src.backtest.replay.strategy_seed import build_traders_from_fills
+        fills_traders = build_traders_from_fills(args.fills_db)
+        if fills_traders:
+            snapshot.traders = fills_traders
+            logger.info("Copy backtest: trader pool set to %d fills-wallets (from %s)",
+                        len(fills_traders), args.fills_db)
     logger.info("Strategy pool: %d strategies, %d traders (from %s)",
                 len(snapshot.strategies), len(snapshot.traders),
                 args.strategy_snapshot or "default smoke snapshot")

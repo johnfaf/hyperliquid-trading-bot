@@ -164,6 +164,46 @@ def save_snapshot(snapshot: SeedSnapshot, path: str) -> str:
     return str(p)
 
 
+def build_traders_from_fills(fills_db_path: str) -> List[SeedTrader]:
+    """Build copyable SeedTraders from the wallets in a fills DB's wallet_fills.
+
+    For a COPY backtest the trader pool must BE the wallets the position oracle
+    can serve.  Otherwise copy_trader scans the discovery top-N (ranked by PnL),
+    which barely overlaps the tracked-copy wallets, so it never queries the
+    oracle's wallets and no copy signals fire.  Each wallet is emitted as an
+    active, evidence-bar-clearing trader ranked by fill activity (so the most
+    active copy sources sort into copy_trader's top-N scan).
+    """
+    out: List[SeedTrader] = []
+    p = Path(fills_db_path)
+    if not p.exists():
+        return out
+    try:
+        with sqlite3.connect(f"file:{p}?mode=ro", uri=True) as conn:
+            rows = conn.execute(
+                "SELECT wallet_address, COUNT(*) AS n FROM wallet_fills "
+                "WHERE wallet_address IS NOT NULL AND wallet_address <> '' "
+                "GROUP BY wallet_address"
+            ).fetchall()
+    except Exception:
+        return out
+    for addr, n in rows:
+        a = str(addr or "").strip()
+        if not a:
+            continue
+        cnt = int(n or 0)
+        out.append(SeedTrader(
+            address=a,
+            total_pnl=float(max(1, cnt)),     # positive => clears the evidence bar; ranks by activity
+            roi_pct=0.10,
+            win_rate=0.55,
+            trade_count=max(10, cnt),          # >= TRADER_MIN_CLOSED_TRADES (default 10)
+            active=1,
+            metadata={"source": "replay_fills"},
+        ))
+    return out
+
+
 def export_from_live_db(live_db_path: str, snapshot_date: str, description: str = "") -> SeedSnapshot:
     """Dump the live bot's current strategy + trader pool into a snapshot.
 
