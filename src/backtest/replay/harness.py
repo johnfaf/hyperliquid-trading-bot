@@ -167,6 +167,21 @@ class ReplayHarness:
             _cfg.DATA_READINESS_GATE_ENABLED = False
             logger.info("ReplayHarness: data-readiness gate disabled for replay")
 
+        # 2c. seed the process RNGs from the (fixed) window start so the replay
+        # is fully reproducible.  paper_trader's slippage model draws from the
+        # global `random` module; left unseeded, two runs of the same window
+        # produced slightly different fill prices.  The regime-cache fix already
+        # made *which* trades fire deterministic; this pins the fill prices too,
+        # so a re-run reproduces a backtest bit-for-bit.  Replay-only -- nothing
+        # in production constructs a ReplayHarness.
+        import random as _random
+        _random.seed(self.start_ts_ms)
+        try:
+            import numpy as _np
+            _np.random.seed(self.start_ts_ms & 0xFFFFFFFF)
+        except Exception:
+            pass
+
         # 3. candle oracle
         self.oracle = CandleOracle(self.cache_db, self.clock)
 
