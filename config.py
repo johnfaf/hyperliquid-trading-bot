@@ -1090,6 +1090,21 @@ LIVE_MIRROR_PROVEN_MIN_SAMPLES = float(
 LIVE_MIRROR_PROVEN_MIN_EDGE = float(
     os.environ.get("LIVE_MIRROR_PROVEN_MIN_EDGE", "0.50")
 )
+# ── Copy-trader edge-ranked selection (algo #4, default OFF) ──
+# scan_top_traders takes the top-N copyable wallets by raw PnL. When enabled,
+# re-rank the candidate pool by a SHRUNK win-rate edge -- beta-binomial
+# shrinkage toward 0.5 by trade_count, so a 3/3 wallet can't outrank a 45/60
+# one -- and drop wallets below COPY_TRADER_MIN_SHRUNK_EDGE. Concentrates
+# copying on robustly-good traders. OFF => legacy top-N-by-PnL.
+COPY_TRADER_EDGE_RANK_ENABLED = os.environ.get(
+    "COPY_TRADER_EDGE_RANK_ENABLED", "false"
+).lower() in ("true", "1", "yes")
+COPY_TRADER_EDGE_SHRINKAGE = float(
+    os.environ.get("COPY_TRADER_EDGE_SHRINKAGE", "20.0")
+)
+COPY_TRADER_MIN_SHRUNK_EDGE = float(
+    os.environ.get("COPY_TRADER_MIN_SHRUNK_EDGE", "0.50")
+)
 # Auto-quarantine sources whose ECE crosses this threshold once they
 # have at least CALIBRATION_QUARANTINE_MIN_SAMPLES outcomes. Quarantined
 # sources are routed to shadow only until ECE recovers.
