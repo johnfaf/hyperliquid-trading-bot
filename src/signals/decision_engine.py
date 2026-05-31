@@ -65,6 +65,11 @@ class DecisionEngine:
             "ev_cost_r", getattr(_gcfg, "DECISION_EV_COST_R", 0.12)))
         self.min_ev_r = float(cfg.get(
             "min_ev_r", getattr(_gcfg, "DECISION_MIN_EV_R", 0.0)))
+        # Portfolio correlation / net-exposure cap (algo #7). Default OFF.
+        self.corr_cap_enabled = bool(cfg.get(
+            "corr_cap_enabled", getattr(_gcfg, "PORTFOLIO_NET_EXPOSURE_CAP_ENABLED", False)))
+        self.max_same_side_positions = int(cfg.get(
+            "max_same_side_positions", getattr(_gcfg, "PORTFOLIO_MAX_SAME_SIDE_POSITIONS", 3)))
 
         # Max trades to execute per cycle (independent of position slots)
         self.max_trades_per_cycle = cfg.get("max_trades_per_cycle", 3)
@@ -235,6 +240,9 @@ class DecisionEngine:
             scored.sort(key=lambda x: x["_composite_score"], reverse=True)
             qualified = [s for s in scored if s["_composite_score"] >= self.min_decision_score]
             disqualified = [s for s in scored if s["_composite_score"] < self.min_decision_score]
+
+        # ─── Portfolio correlation / net-exposure cap (algo #7) ─────
+        qualified = self._apply_correlation_cap(qualified, open_positions)
 
         # ─── Limit by cycle trade cap AND available slots ─
         max_this_cycle = min(self.max_prescreen_candidates, available_slots)
@@ -424,6 +432,41 @@ class DecisionEngine:
             "freshness": round(freshness, 3),
             "consensus": round(consensus, 3),
         }
+
+    def _apply_correlation_cap(self, qualified: List[Dict],
+                               open_positions: Optional[List]) -> List[Dict]:
+        """Cap concurrent same-direction positions (algo #7).
+
+        On a highly-correlated crypto book, N same-side positions are ~one big
+        beta bet. When enabled, limit existing-open + new same-side positions to
+        ``max_same_side_positions``, dropping the lowest-ranked new same-side
+        candidates (``qualified`` is already in rank order). OFF => unchanged.
+        """
+        if not self.corr_cap_enabled:
+            return qualified
+        counts = {"long": 0, "short": 0}
+        for p in (open_positions or []):
+            side = p.get("side") if isinstance(p, dict) else getattr(p, "side", None)
+            side = str(getattr(side, "value", side) or "").strip().lower()
+            if side in counts:
+                counts[side] += 1
+        kept: List[Dict] = []
+        dropped = 0
+        for s in qualified:
+            side = str(s.get("_decision_side", "")).strip().lower()
+            if side in counts:
+                if counts[side] >= self.max_same_side_positions:
+                    dropped += 1
+                    continue
+                counts[side] += 1
+            kept.append(s)
+        if dropped:
+            logger.info(
+                "Correlation cap: dropped %d same-side candidate(s) over max %d "
+                "concurrent (long=%d short=%d)",
+                dropped, self.max_same_side_positions, counts["long"], counts["short"],
+            )
+        return kept
 
     def _aggregate_directional_scores(self, scored: List[Dict]) -> Tuple[float, float]:
         """
