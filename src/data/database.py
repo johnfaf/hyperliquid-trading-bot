@@ -1325,6 +1325,23 @@ def _same_side_open_trade_limit() -> int:
         return 2
 
 
+def _trade_event_now_iso() -> str:
+    """Clock-aware UTC timestamp for paper-trade lifecycle events.
+
+    Routes through ``clock_provider`` so a sandboxed historical replay stamps
+    ``opened_at`` / ``closed_at`` with *market* time rather than the wall-clock
+    instant the row happens to be written.  In production the default
+    clock-provider backend returns real ``datetime.now`` so live behaviour is
+    byte-for-byte unchanged; the local import + fallback keep this safe even if
+    the provider is unavailable at import time.
+    """
+    try:
+        from src.core import clock_provider
+        return clock_provider.utc_now().isoformat()
+    except Exception:
+        return datetime.now(timezone.utc).isoformat()
+
+
 def open_paper_trade(strategy_id, coin, side, entry_price, size, leverage=1,
                      stop_loss=None, take_profit=None, metadata=None,
                      idempotency_key: Optional[str] = None):
@@ -1342,7 +1359,7 @@ def open_paper_trade(strategy_id, coin, side, entry_price, size, leverage=1,
     When ``idempotency_key`` is None, behavior is unchanged: every call
     inserts a new row (legacy caller contract preserved).
     """
-    now = datetime.now(timezone.utc).isoformat()
+    now = _trade_event_now_iso()
     _ensure_postgres_strategy_parent(strategy_id)
 
     key = None
@@ -1544,7 +1561,7 @@ def close_paper_trade(trade_id, exit_price, pnl) -> bool:
     eliminating the race window where a crash between close and credit would
     desync the account balance from the trades table.
     """
-    now = datetime.now(timezone.utc).isoformat()
+    now = _trade_event_now_iso()
     with get_connection() as conn:
         cursor = conn.execute("""
             UPDATE paper_trades SET closed_at = ?, exit_price = ?, pnl = ?, status = 'closed'
@@ -1576,7 +1593,7 @@ def close_paper_trade_and_credit_account(trade_id, exit_price, pnl) -> bool:
     a crash between the two calls could leave the account stale or, on retry
     of the caller, double-credit the PnL.
     """
-    now = datetime.now(timezone.utc).isoformat()
+    now = _trade_event_now_iso()
     with get_connection() as conn:
         try:
             cursor = conn.execute("""
