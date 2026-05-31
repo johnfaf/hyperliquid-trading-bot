@@ -16,7 +16,6 @@ Each regime maps to which strategy types should be active vs paused.
 import logging
 import time
 import copy
-from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 from collections import defaultdict
 from dataclasses import dataclass, asdict, field
@@ -189,8 +188,16 @@ class RegimeDetector:
 
         Returns RegimeState with classification and metrics.
         """
-        # Check cache
-        now = time.time()
+        # Check cache.  Use the injected clock (not raw time.time()) so the TTL
+        # is measured in *market* time during replay.  With wall-clock time the
+        # regime computed on the first tick stayed frozen for 2 real-minutes --
+        # i.e. for however many replay ticks happened to run in that window --
+        # making regime classification (and thus which strategies get paused)
+        # depend on how fast the replay ran.  In replay the step (>=hours) far
+        # exceeds CACHE_TTL so the cache expires every tick -> deterministic;
+        # in production clock_provider.unix_now() == time.time() so the 2-minute
+        # cache behaves exactly as before.
+        now = clock_provider.unix_now()
         if coin in self._cache and (now - self._cache_ts.get(coin, 0)) < self.CACHE_TTL:
             return self._cache[coin]
 
@@ -204,7 +211,7 @@ class RegimeDetector:
                 regime=Regime.UNKNOWN, confidence=0.0,
                 adx=0, atr_pct=0, volume_ratio=0,
                 trend_direction=0, momentum=0,
-                timestamp=datetime.now(timezone.utc).isoformat(),
+                timestamp=clock_provider.utc_now().isoformat(),
             )
 
         # Extract OHLCV arrays
@@ -236,7 +243,7 @@ class RegimeDetector:
             volume_ratio=round(volume_ratio, 2),
             trend_direction=round(trend_dir, 4),
             momentum=round(momentum, 4),
-            timestamp=datetime.now(timezone.utc).isoformat(),
+            timestamp=clock_provider.utc_now().isoformat(),
             lookback_mode=lookback_mode,
             lookback_periods=dict(lookbacks),
         )
@@ -622,7 +629,7 @@ class RegimeDetector:
             "per_coin": {coin: state.to_dict() for coin, state in per_coin.items()},
             "regime_votes": {r.value: round(w, 2) for r, w in regime_votes.items()},
             "strategy_guidance": guidance,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "timestamp": clock_provider.utc_now().isoformat(),
         }
 
         logger.info(f"Market regime: {overall_regime.value} (confidence={overall_confidence:.0%})")

@@ -103,7 +103,7 @@ def _scan_audited_trees() -> list[tuple[str, int, str]]:
 #      `clock_provider.iso_now()`.
 #   5. Decrement SNAPSHOT_TOTAL by the number of migrated occurrences
 #      and run pytest -q tests/test_clock_injection_ratchet.py to confirm.
-SNAPSHOT_TOTAL = 149
+SNAPSHOT_TOTAL = 140
 
 
 def test_no_new_raw_time_reads_on_decision_paths():
