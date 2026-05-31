@@ -1042,6 +1042,23 @@ CALIBRATION_HIERARCHICAL_SHRINKAGE = float(
 CALIBRATION_HIERARCHICAL_BLEND_N = float(
     os.environ.get("CALIBRATION_HIERARCHICAL_BLEND_N", "10.0")
 )
+# ── DecisionEngine EV-first ranking (algo #3, default OFF) ──
+# The engine ranks candidates on a heuristic composite (score 0.35, regime
+# 0.25, freshness/consensus/diversity 0.45 combined) -- so the thing that
+# predicts profit (expected value) is outweighed by regime/recency. When
+# enabled, composite-qualified candidates are ranked by a net-of-cost EV proxy
+#   EV_R = p_win*R_win - (1-p_win)*R_loss - cost_R
+# FIRST (composite becomes the tie-breaker), and must additionally clear
+# DECISION_MIN_EV_R. p_win uses the signal's (calibrated) confidence, so this
+# pairs with the hierarchical calibration in algo #2. Strictly more selective
+# than today (adds a positive-EV gate); OFF => current composite ranking.
+DECISION_EV_FIRST_ENABLED = os.environ.get(
+    "DECISION_EV_FIRST_ENABLED", "false"
+).lower() in ("true", "1", "yes")
+# Round-trip cost in R units (fees + slippage relative to the stop distance).
+DECISION_EV_COST_R = float(os.environ.get("DECISION_EV_COST_R", "0.12"))
+# Minimum EV (in R units) a candidate must clear when EV-first is enabled.
+DECISION_MIN_EV_R = float(os.environ.get("DECISION_MIN_EV_R", "0.0"))
 # Auto-quarantine sources whose ECE crosses this threshold once they
 # have at least CALIBRATION_QUARANTINE_MIN_SAMPLES outcomes. Quarantined
 # sources are routed to shadow only until ECE recovers.

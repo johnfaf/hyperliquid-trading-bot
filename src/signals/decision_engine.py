@@ -53,6 +53,19 @@ class DecisionEngine:
         # promising-but-young strategies through for paper validation.
         self.min_decision_score = cfg.get("min_decision_score", 0.20)
 
+        # EV-first ranking (algo #3). Reads global config with a cfg-dict
+        # override so tests/callers can set it directly. Default OFF.
+        try:
+            import config as _gcfg
+        except Exception:
+            _gcfg = None
+        self.ev_first_enabled = bool(cfg.get(
+            "ev_first_enabled", getattr(_gcfg, "DECISION_EV_FIRST_ENABLED", False)))
+        self.ev_cost_r = float(cfg.get(
+            "ev_cost_r", getattr(_gcfg, "DECISION_EV_COST_R", 0.12)))
+        self.min_ev_r = float(cfg.get(
+            "min_ev_r", getattr(_gcfg, "DECISION_MIN_EV_R", 0.0)))
+
         # Max trades to execute per cycle (independent of position slots)
         self.max_trades_per_cycle = cfg.get("max_trades_per_cycle", 3)
         self.max_prescreen_candidates = cfg.get("max_prescreen_candidates", 8)
@@ -200,15 +213,28 @@ class DecisionEngine:
             scored.append({
                 **s,
                 "_composite_score": composite["total"],
+                "_ev_proxy": composite.get("ev_proxy", 0.0),
                 "_score_breakdown": composite,
             })
 
-        # ─── Rank by composite score ─────────────────────
-        scored.sort(key=lambda x: x["_composite_score"], reverse=True)
+        # ─── Rank: EV-first (algo #3) or heuristic composite ─────────
+        if self.ev_first_enabled:
+            # Net-of-cost EV is the primary key; the composite only breaks
+            # ties. A candidate must clear BOTH the composite floor and the
+            # minimum EV, so EV-first is strictly MORE selective than the
+            # composite gate alone -- it never loosens, only re-prioritises
+            # toward expected profit.
+            scored.sort(key=lambda x: (x["_ev_proxy"], x["_composite_score"]), reverse=True)
 
-        # ─── Filter by minimum threshold ─────────────────
-        qualified = [s for s in scored if s["_composite_score"] >= self.min_decision_score]
-        disqualified = [s for s in scored if s["_composite_score"] < self.min_decision_score]
+            def _ev_ok(x):
+                return (x["_composite_score"] >= self.min_decision_score
+                        and x["_ev_proxy"] >= self.min_ev_r)
+            qualified = [s for s in scored if _ev_ok(s)]
+            disqualified = [s for s in scored if not _ev_ok(s)]
+        else:
+            scored.sort(key=lambda x: x["_composite_score"], reverse=True)
+            qualified = [s for s in scored if s["_composite_score"] >= self.min_decision_score]
+            disqualified = [s for s in scored if s["_composite_score"] < self.min_decision_score]
 
         # ─── Limit by cycle trade cap AND available slots ─
         max_this_cycle = min(self.max_prescreen_candidates, available_slots)
@@ -367,8 +393,31 @@ class DecisionEngine:
         if direction not in {"long", "short"}:
             total = -1.0
 
+        # EV proxy (algo #3): net-of-cost expected value in R units, driven by
+        # the signal's (calibrated) confidence. EV_R = p*R_win - (1-p)*R_loss
+        # - cost_R. R_win comes from the risk policy's reward_multiple when
+        # present, else a conservative default. Used as the primary ranking
+        # key only when ev_first_enabled.
+        conf_raw = strategy.get("confidence", strategy.get("current_score", base))
+        try:
+            p_win = max(0.0, min(float(conf_raw), 1.0))
+        except (TypeError, ValueError):
+            p_win = float(base)
+        r_win = 1.75
+        risk_policy = params.get("risk_policy") if isinstance(params, dict) else None
+        if isinstance(risk_policy, dict):
+            try:
+                r_win = float(risk_policy.get("reward_multiple", r_win) or r_win)
+            except (TypeError, ValueError):
+                pass
+        r_win = max(0.1, min(r_win, 10.0))
+        ev_proxy = p_win * r_win - (1.0 - p_win) * 1.0 - self.ev_cost_r
+        if direction not in {"long", "short"}:
+            ev_proxy = -999.0
+
         return {
             "total": round(total, 4),
+            "ev_proxy": round(ev_proxy, 4),
             "base_score": round(base, 3),
             "regime_alignment": round(regime_bonus, 3),
             "diversity": round(diversity_bonus, 3),
