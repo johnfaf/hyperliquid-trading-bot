@@ -575,6 +575,37 @@ class CopyTrader:
             "sizer_fallback_count": self._sizer_fallback_count,
         }
 
+    @staticmethod
+    def _shrunk_edge(win_rate, trade_count) -> float:
+        """Beta-binomial shrunk win-rate edge for trader ranking (algo #4).
+
+        Pulls a wallet's win rate toward 0.5 by its trade count, so a 3/3
+        wallet (raw 1.0) ranks below a 45/60 (raw 0.75) once shrunk -- robust
+        trader selection on thin samples. Returns a value in [0, 1]."""
+        k = float(getattr(config, "COPY_TRADER_EDGE_SHRINKAGE", 20.0))
+        wr = CopyTrader._normalise_win_rate(win_rate)
+        try:
+            n = max(0.0, float(trade_count or 0))
+        except (TypeError, ValueError):
+            n = 0.0
+        return (wr * n + k * 0.5) / (n + k)
+
+    def _rank_traders_by_edge(self, traders: List[Dict], top_n: int) -> List[Dict]:
+        """Re-rank copyable wallets by shrunk win-rate edge, drop those below
+        COPY_TRADER_MIN_SHRUNK_EDGE, then take the top N (algo #4)."""
+        min_edge = float(getattr(config, "COPY_TRADER_MIN_SHRUNK_EDGE", 0.50))
+        scored = []
+        for t in traders:
+            n = t.get("trade_count", t.get("count", t.get("total_trades", 0)))
+            scored.append((self._shrunk_edge(t.get("win_rate", 0), n), t))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        kept = [t for edge, t in scored if edge >= min_edge]
+        logger.info(
+            "Copy edge-rank: %d/%d wallets clear shrunk-edge >= %.2f (keeping top %d)",
+            len(kept), len(traders), min_edge, min(len(kept), top_n),
+        )
+        return kept[:top_n]
+
     def scan_top_traders(self, top_n: int = 10) -> List[Dict]:
         """
         Scan the top N traders by PnL, detect new/changed positions,
@@ -592,7 +623,12 @@ class CopyTrader:
         # track record.
         traders = db.get_copyable_traders(
             valid_only=True, quarantine_invalid=True
-        )[:top_n]
+        )
+        if getattr(config, "COPY_TRADER_EDGE_RANK_ENABLED", False):
+            # algo #4: re-rank by shrunk realized edge instead of raw PnL order.
+            traders = self._rank_traders_by_edge(traders, top_n)
+        else:
+            traders = traders[:top_n]
         if not traders:
             return []
 
