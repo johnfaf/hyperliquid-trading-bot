@@ -136,6 +136,7 @@ class ReplayHarness:
         self.health: Any = None
 
         self._prev_clock_backend = None
+        self._prev_readiness = None
         self._engaged = False
 
     # ---- lifecycle ----------------------------------------------------
@@ -153,6 +154,18 @@ class ReplayHarness:
 
         # 2. install clock as the process-wide time backend
         self._prev_clock_backend = clock_provider.install(self.clock)
+
+        # 2b. disable the live-feed data-readiness gate for this run. That gate
+        # validates LIVE feature-store / source-health freshness, which a
+        # sandboxed historical replay never populates; left on, it rejects every
+        # signal and the replay (and bg-auto-backtest) produce 0 trades. Saved
+        # here and restored in teardown() so production is never left with the
+        # gate off.
+        import config as _cfg
+        if getattr(_cfg, "DATA_READINESS_GATE_ENABLED", True):
+            self._prev_readiness = _cfg.DATA_READINESS_GATE_ENABLED
+            _cfg.DATA_READINESS_GATE_ENABLED = False
+            logger.info("ReplayHarness: data-readiness gate disabled for replay")
 
         # 3. candle oracle
         self.oracle = CandleOracle(self.cache_db, self.clock)
@@ -230,6 +243,10 @@ class ReplayHarness:
                         self.replay_db.uninstall()
                 finally:
                     clock_provider.restore(self._prev_clock_backend)
+                    if self._prev_readiness is not None:
+                        import config as _cfg
+                        _cfg.DATA_READINESS_GATE_ENABLED = self._prev_readiness
+                        self._prev_readiness = None
                     self._engaged = False
                     self.container = None
                     logger.info("ReplayHarness torn down")
