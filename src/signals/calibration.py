@@ -492,6 +492,17 @@ class CalibrationTracker:
     def get_sample_size(self, source_key: str = "global") -> float:
         return self._source_total(source_key)
 
+    def proven_evidence(self, source: str, side: Optional[str] = None,
+                        regime: Optional[str] = None) -> Tuple[float, float]:
+        """Public: ``(calibrated_edge, source+side_sample_size)`` for
+        "is this source proven enough to risk live capital" gates (algo #1).
+
+        Uses the empirical-Bayes ladder so the edge borrows strength from the
+        source's pooled parents and the sample size reflects pooled
+        source+side evidence rather than one thin regime cell. Independent of
+        the hierarchical *flag* -- it is always a direct aggregate query."""
+        return self._eb_rate(source, side, regime)
+
     # ── Hierarchical / empirical-Bayes helpers ───────────────────
     def _agg_over(self, *, exact: Optional[str] = None,
                   prefix: Optional[str] = None) -> Tuple[float, float]:
