@@ -1017,6 +1017,31 @@ CALIBRATION_COLDSTART_USES_GLOBAL_MIN = os.environ.get(
 CALIBRATION_ISOTONIC_MIN_OUTCOMES = int(
     os.environ.get("CALIBRATION_ISOTONIC_MIN_OUTCOMES", "100")
 )
+# Hierarchical / empirical-Bayes calibration (default OFF).
+# Problem it solves: outcomes fragment across (source|side|regime) cells, so on
+# a thin account every cell sits below CALIBRATION_MIN_OUTCOMES and confidence
+# collapses to the cold-start prior (the flat ~0.50 we observed). When enabled,
+# a thin fine cell BORROWS STRENGTH from its parents up the ladder
+#   global -> source|*|any -> source|side|any -> source|side|regime
+# via beta-binomial shrinkage, so a source with enough *total* evidence (spread
+# across regimes) gets a real calibrated confidence instead of the prior cap.
+# Falls back to the exact legacy cold-start cap when even the parents are thin,
+# so it never makes an evidence-free source more aggressive. OFF => byte-for-byte
+# identical to current behaviour.
+CALIBRATION_HIERARCHICAL_ENABLED = os.environ.get(
+    "CALIBRATION_HIERARCHICAL_ENABLED", "false"
+).lower() in ("true", "1", "yes")
+# Beta-binomial shrinkage strength K when blending a ladder level toward its
+# parent estimate: est = (wins + K*parent_est) / (n + K). Higher = more
+# shrinkage toward the parent (more conservative).
+CALIBRATION_HIERARCHICAL_SHRINKAGE = float(
+    os.environ.get("CALIBRATION_HIERARCHICAL_SHRINKAGE", "10.0")
+)
+# Blend strength between the empirical-Bayes rate and the raw predicted
+# confidence: w_emp = src_n / (src_n + N). Lower N = trust the EB rate sooner.
+CALIBRATION_HIERARCHICAL_BLEND_N = float(
+    os.environ.get("CALIBRATION_HIERARCHICAL_BLEND_N", "10.0")
+)
 # Auto-quarantine sources whose ECE crosses this threshold once they
 # have at least CALIBRATION_QUARANTINE_MIN_SAMPLES outcomes. Quarantined
 # sources are routed to shadow only until ECE recovers.

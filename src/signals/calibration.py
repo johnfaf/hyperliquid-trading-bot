@@ -154,6 +154,16 @@ class CalibrationTracker:
         self.coldstart_uses_global_min = bool(
             getattr(config, "CALIBRATION_COLDSTART_USES_GLOBAL_MIN", True)
         )
+        # Hierarchical / empirical-Bayes calibration (default OFF -> legacy path).
+        self._hierarchical_enabled = bool(
+            getattr(config, "CALIBRATION_HIERARCHICAL_ENABLED", False)
+        )
+        self._hier_shrinkage = float(
+            getattr(config, "CALIBRATION_HIERARCHICAL_SHRINKAGE", 10.0)
+        )
+        self._hier_blend_n = float(
+            getattr(config, "CALIBRATION_HIERARCHICAL_BLEND_N", 10.0)
+        )
         self.quarantine_ece = float(
             quarantine_ece
             if quarantine_ece is not None
@@ -482,6 +492,72 @@ class CalibrationTracker:
     def get_sample_size(self, source_key: str = "global") -> float:
         return self._source_total(source_key)
 
+    # ── Hierarchical / empirical-Bayes helpers ───────────────────
+    def _agg_over(self, *, exact: Optional[str] = None,
+                  prefix: Optional[str] = None) -> Tuple[float, float]:
+        """Aggregate ``(total, wins)`` over matching stored cells.
+
+        Records are only ever stored at the fine ``source|side|regime`` key
+        (plus ``global``) -- intermediate parents are never written -- so a
+        parent ladder level is the POOLED aggregate of its children, obtained
+        by prefix-summing every non-global key. ``exact`` matches one key;
+        ``prefix`` sums every non-global key starting with it."""
+        tot = 0.0
+        wins = 0.0
+        for key, bins in self._bins.items():
+            if exact is not None:
+                if key != exact:
+                    continue
+            elif prefix is not None:
+                if key == "global" or not key.startswith(prefix):
+                    continue
+            else:
+                continue
+            for b in bins.values():
+                tot += float(b.get("total", 0.0))
+                wins += float(b.get("wins", 0.0))
+        return tot, wins
+
+    def _eb_rate(self, source_key: str, side: Optional[str],
+                 regime: Optional[str]) -> Tuple[float, float]:
+        """Empirical-Bayes win-rate that lets a thin ``source|side|regime``
+        cell borrow strength from its (pooled) parents up the ladder::
+
+            global -> source|* -> source|side|* -> source|side|regime
+
+        Each level's pooled rate is shrunk toward its already-shrunk parent
+        estimate ``est = (wins + K*parent)/(n + K)``. Returns ``(rate, n_ss)``
+        where ``n_ss`` is the source+side pooled sample size -- the
+        source-specific evidence backing the estimate (global's huge N must
+        not make every source look well-sampled)."""
+        if _KEY_SEP in (source_key or ""):
+            src, s, r = decompose_calibration_key(source_key)
+        else:
+            src = source_key or "unknown"
+            s = side or _SIDE_ANY
+            r = bucket_regime(regime) if regime else _REGIME_ANY
+        if s in {"buy", "long"}:
+            s = "long"
+        elif s in {"sell", "short"}:
+            s = "short"
+        sep = _KEY_SEP
+        k = self._hier_shrinkage
+        est = float(self.coldstart_prior)
+
+        n_g, w_g = self._agg_over(exact="global")
+        if n_g > 0:
+            est = (w_g + k * est) / (n_g + k)
+        n_src, w_src = self._agg_over(prefix=f"{src}{sep}")
+        if n_src > 0:
+            est = (w_src + k * est) / (n_src + k)
+        n_ss, w_ss = self._agg_over(prefix=f"{src}{sep}{s}{sep}")
+        if n_ss > 0:
+            est = (w_ss + k * est) / (n_ss + k)
+        n_fine, w_fine = self._agg_over(exact=compose_calibration_key(src, s, r))
+        if n_fine > 0:
+            est = (w_fine + k * est) / (n_fine + k)
+        return float(est), float(n_ss)
+
     # ── Adjustment logic ──────────────────────────────────────────
     def get_adjustment_factor(self, source_key: str,
                               predicted_confidence: float, *,
@@ -505,6 +581,23 @@ class CalibrationTracker:
         if total <= 0 and key != "global":
             key = "global"
             total = self._source_total(key)
+
+        if self._hierarchical_enabled:
+            # Best case: the resolved cell already has enough for the isotonic
+            # curve -> use it unchanged.
+            if total >= self.isotonic_min_outcomes:
+                curve = self._fit_curve(key)
+                if curve is not None:
+                    return float(max(0.05, min(_interpolate_curve(curve, conf), 0.95)))
+            # Otherwise borrow strength up the ladder via empirical Bayes.
+            eb_rate, src_n = self._eb_rate(source_key, side=side, regime=regime)
+            if src_n < self.min_outcomes:
+                # Even the parents are thin -> stay conservative (legacy cap):
+                # an evidence-free source must not emit aggressive confidence.
+                return float(min(conf, self.coldstart_prior))
+            w_emp = src_n / (src_n + self._hier_blend_n)
+            adjusted = w_emp * eb_rate + (1.0 - w_emp) * conf
+            return float(max(0.05, min(adjusted, 0.95)))
 
         if total < self.min_outcomes:
             return float(min(conf, self.coldstart_prior))
