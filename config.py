@@ -1105,6 +1105,19 @@ COPY_TRADER_EDGE_SHRINKAGE = float(
 COPY_TRADER_MIN_SHRUNK_EDGE = float(
     os.environ.get("COPY_TRADER_MIN_SHRUNK_EDGE", "0.50")
 )
+# ── Portfolio correlation / net-exposure cap (algo #7, default OFF) ──
+# The DecisionEngine sizes signals independently (diversity is only a 0.05
+# tie-breaker), so on a highly-correlated crypto book it can stack many
+# same-direction positions -- effectively one big leveraged beta bet. When
+# enabled, cap concurrent same-side positions (existing open + new this cycle)
+# at PORTFOLIO_MAX_SAME_SIDE_POSITIONS, dropping the lowest-ranked new same-side
+# candidates. Limits directional (beta) concentration. OFF => no cap.
+PORTFOLIO_NET_EXPOSURE_CAP_ENABLED = os.environ.get(
+    "PORTFOLIO_NET_EXPOSURE_CAP_ENABLED", "false"
+).lower() in ("true", "1", "yes")
+PORTFOLIO_MAX_SAME_SIDE_POSITIONS = int(
+    os.environ.get("PORTFOLIO_MAX_SAME_SIDE_POSITIONS", "3")
+)
 # Auto-quarantine sources whose ECE crosses this threshold once they
 # have at least CALIBRATION_QUARANTINE_MIN_SAMPLES outcomes. Quarantined
 # sources are routed to shadow only until ECE recovers.
