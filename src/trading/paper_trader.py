@@ -1798,12 +1798,9 @@ class PaperTrader:
             )
             return None
 
-        # Determine leverage (capped by config)
-        leverage = min(
-            params.get("avg_leverage", 2),
-            config.PAPER_TRADING_MAX_LEVERAGE
-        )
-        leverage = max(1, leverage)
+        # Determine leverage: edge-proportional when enabled (algo #5),
+        # else the legacy followed-trader avg_leverage cap.
+        leverage = self._resolve_leverage(score, params.get("avg_leverage", 2))
 
         # Calculate position size
         account = db.get_paper_account()
@@ -1913,6 +1910,34 @@ class PaperTrader:
             return False
 
         return True
+
+    @staticmethod
+    def _resolve_leverage(score: float, avg_leverage: float) -> float:
+        """Resolve trade leverage (algo #5).
+
+        Legacy: inherit the followed trader's ``avg_leverage`` (capped at
+        PAPER_TRADING_MAX_LEVERAGE). When LEVERAGE_EDGE_PROPORTIONAL_ENABLED,
+        tie leverage to the signal's (calibrated) edge confidence instead: at
+        or below LEVERAGE_EDGE_MIN_CONF the source has no proven edge -> 1x;
+        leverage ramps linearly to the max as confidence reaches
+        LEVERAGE_EDGE_FULL_CONF. Stops the unproven bucket from being the
+        leveraged one."""
+        max_lev = float(getattr(config, "PAPER_TRADING_MAX_LEVERAGE", 5) or 5)
+        if getattr(config, "LEVERAGE_EDGE_PROPORTIONAL_ENABLED", False):
+            lo = float(getattr(config, "LEVERAGE_EDGE_MIN_CONF", 0.50))
+            hi = float(getattr(config, "LEVERAGE_EDGE_FULL_CONF", 0.65))
+            try:
+                conf = max(0.0, min(float(score), 1.0))
+            except (TypeError, ValueError):
+                conf = 0.0
+            frac = 0.0 if hi <= lo else max(0.0, min((conf - lo) / (hi - lo), 1.0))
+            lev = 1.0 + frac * (max_lev - 1.0)
+            return float(max(1.0, min(lev, max_lev)))
+        try:
+            lev = min(float(avg_leverage), max_lev)
+        except (TypeError, ValueError):
+            lev = 1.0
+        return float(max(1.0, lev))
 
     @staticmethod
     def _apply_slippage(price: float, side: str, is_entry: bool = True) -> float:

@@ -1059,6 +1059,20 @@ DECISION_EV_FIRST_ENABLED = os.environ.get(
 DECISION_EV_COST_R = float(os.environ.get("DECISION_EV_COST_R", "0.12"))
 # Minimum EV (in R units) a candidate must clear when EV-first is enabled.
 DECISION_MIN_EV_R = float(os.environ.get("DECISION_MIN_EV_R", "0.0"))
+# ── Edge-proportional leverage (algo #5, default OFF) ──
+# Today leverage = min(followed-trader's avg_leverage, MAX) -- so the bot
+# inherits the source trader's leverage habit, which is how the *unproven*
+# strategy/momentum bucket ended up the 5x-leveraged (and biggest-losing) one.
+# When enabled, leverage instead scales with the signal's (calibrated) edge
+# confidence: at/below LEVERAGE_EDGE_MIN_CONF a source has no proven edge and
+# trades at 1x; leverage ramps linearly to PAPER_TRADING_MAX_LEVERAGE only as
+# confidence reaches LEVERAGE_EDGE_FULL_CONF. Pairs with #2 (calibrated
+# confidence). OFF => legacy min(avg_leverage, MAX).
+LEVERAGE_EDGE_PROPORTIONAL_ENABLED = os.environ.get(
+    "LEVERAGE_EDGE_PROPORTIONAL_ENABLED", "false"
+).lower() in ("true", "1", "yes")
+LEVERAGE_EDGE_MIN_CONF = float(os.environ.get("LEVERAGE_EDGE_MIN_CONF", "0.50"))
+LEVERAGE_EDGE_FULL_CONF = float(os.environ.get("LEVERAGE_EDGE_FULL_CONF", "0.65"))
 # Auto-quarantine sources whose ECE crosses this threshold once they
 # have at least CALIBRATION_QUARANTINE_MIN_SAMPLES outcomes. Quarantined
 # sources are routed to shadow only until ECE recovers.
