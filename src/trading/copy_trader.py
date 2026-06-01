@@ -590,6 +590,22 @@ class CopyTrader:
             n = 0.0
         return (wr * n + k * 0.5) / (n + k)
 
+    @staticmethod
+    def _copy_lag_bps(our_price, source_entry, side) -> float:
+        """Replication-lag cost in bps: how much worse our copy entry is than the
+        source trader's entry, signed so positive = adverse (we chased the move).
+        Observe-only telemetry to measure copy-edge decay per wallet (signal #2).
+        """
+        try:
+            our_price = float(our_price)
+            source_entry = float(source_entry)
+        except (TypeError, ValueError):
+            return 0.0
+        if source_entry <= 0 or our_price <= 0:
+            return 0.0
+        raw = (our_price - source_entry) / source_entry * 10_000.0
+        return round(-raw if str(side).strip().lower() in ("short", "sell") else raw, 2)
+
     def _rank_traders_by_edge(self, traders: List[Dict], top_n: int) -> List[Dict]:
         """Re-rank copyable wallets by shrunk win-rate edge, drop those below
         COPY_TRADER_MIN_SHRUNK_EDGE, then take the top N (algo #4)."""
@@ -727,6 +743,8 @@ class CopyTrader:
                 "leverage": min(pos["leverage"], config.PAPER_TRADING_MAX_LEVERAGE),
                 "source_trader": normalized_address,
                 "source_pnl": trader.get("total_pnl", 0),
+                "source_entry_price": float(pos.get("entry_price", 0) or 0),
+                "copy_lag_bps": self._copy_lag_bps(price, pos.get("entry_price", 0), pos["side"]),
                 "confidence": self._calculate_signal_confidence("copy_open", win_rate),
                 "confidence_inputs": {**confidence_inputs, "signal_type": "copy_open"},
             })
