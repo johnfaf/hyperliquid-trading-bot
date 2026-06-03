@@ -450,6 +450,8 @@ class DecisionFirewall:
             "rejected_bucketed_confidence": 0,
             "rejected_data_readiness": 0,
             "rejected_ev_gate": 0,
+            # signal #3: confluence gate (min independent confirmations).
+            "rejected_confluence": 0,
             # ★ AUDIT FIX (2026-05-26): per-coin-side blocklist counter.
             "rejected_coin_side_blocklist": 0,
             # LOW-FIX LOW-1: count audit-log write failures so ops can detect
@@ -2240,6 +2242,21 @@ class DecisionFirewall:
         # 1. Schema validation
         if not signal.validate():
             return _reject("rejected_schema", f"Invalid signal schema: {signal.coin} {signal.side.value}")
+
+        # 1b. Confluence gate (signal #3, default OFF): a non-copy entry must
+        # have >= N independent confirmations (options flow / multi-exchange
+        # volume / regime / cross-venue). Lone low-quality signals don't trade;
+        # copy_trade is exempt (the proven edge). No-op when the threshold is 0.
+        try:
+            import config as _cfg
+            _min_conf = int(getattr(_cfg, "FIREWALL_CONFLUENCE_MIN_CONFIRMATIONS", 0) or 0)
+            if _min_conf > 0:
+                from src.signals.confluence import confluence_ok
+                _ok, _why = confluence_ok(signal, _min_conf)
+                if not _ok:
+                    return _reject("rejected_confluence", _why)
+        except Exception:
+            pass
 
         # 1a. ★ AUDIT FIX (2026-05-26): per-coin-side blocklist for
         # empirically lost-on combinations.  Production wallet history
