@@ -1105,6 +1105,19 @@ COPY_TRADER_EDGE_SHRINKAGE = float(
 COPY_TRADER_MIN_SHRUNK_EDGE = float(
     os.environ.get("COPY_TRADER_MIN_SHRUNK_EDGE", "0.50")
 )
+# ── Forward (recency-weighted) trader edge (signal #8 / PR-B, default OFF) ──
+# Rank copy wallets by a recency-weighted edge from their recent fills instead
+# of all-time win-rate -- survivorship-resistant, so a wallet must KEEP winning
+# to stay promoted. OFF => legacy all-time shrunk edge.
+COPY_FORWARD_EDGE_ENABLED = os.environ.get(
+    "COPY_FORWARD_EDGE_ENABLED", "false"
+).lower() in ("true", "1", "yes")
+COPY_FORWARD_EDGE_LOOKBACK_DAYS = float(
+    os.environ.get("COPY_FORWARD_EDGE_LOOKBACK_DAYS", "60")
+)
+COPY_FORWARD_EDGE_HALF_LIFE_DAYS = float(
+    os.environ.get("COPY_FORWARD_EDGE_HALF_LIFE_DAYS", "14")
+)
 # ── Portfolio correlation / net-exposure cap (algo #7, default OFF) ──
 # The DecisionEngine sizes signals independently (diversity is only a 0.05
 # tie-breaker), so on a highly-correlated crypto book it can stack many

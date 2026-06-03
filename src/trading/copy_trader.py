@@ -607,18 +607,52 @@ class CopyTrader:
         return round(-raw if str(side).strip().lower() in ("short", "sell") else raw, 2)
 
     def _rank_traders_by_edge(self, traders: List[Dict], top_n: int) -> List[Dict]:
-        """Re-rank copyable wallets by shrunk win-rate edge, drop those below
-        COPY_TRADER_MIN_SHRUNK_EDGE, then take the top N (algo #4)."""
+        """Re-rank copyable wallets by shrunk all-time win-rate edge (algo #4),
+        or by a recency-weighted FORWARD edge from recent fills when
+        COPY_FORWARD_EDGE_ENABLED (signal #8 PR-B) -- survivorship-resistant, a
+        wallet must keep winning to stay promoted. Drops wallets below
+        COPY_TRADER_MIN_SHRUNK_EDGE, then takes the top N."""
         min_edge = float(getattr(config, "COPY_TRADER_MIN_SHRUNK_EDGE", 0.50))
+        fwd = bool(getattr(config, "COPY_FORWARD_EDGE_ENABLED", False))
+        now_ms = None
+        if fwd:
+            try:
+                from src.core import clock_provider
+                now_ms = clock_provider.unix_ms()
+            except Exception:
+                fwd = False
         scored = []
         for t in traders:
-            n = t.get("trade_count", t.get("count", t.get("total_trades", 0)))
-            scored.append((self._shrunk_edge(t.get("win_rate", 0), n), t))
+            edge = None
+            if fwd:
+                # Forward (recency-weighted) edge from the wallet's own recent
+                # closed fills; falls back to the all-time shrunk edge when there
+                # isn't recent evidence. Defensive -- never breaks ranking.
+                try:
+                    from src.learning.forward_edge import (
+                        recency_weighted_edge, wallet_recent_outcomes,
+                    )
+                    outs = wallet_recent_outcomes(
+                        config.DB_PATH, t.get("address", ""), now_ms,
+                        lookback_days=float(getattr(config, "COPY_FORWARD_EDGE_LOOKBACK_DAYS", 60.0)),
+                    )
+                    if outs:
+                        edge, _ = recency_weighted_edge(
+                            outs,
+                            half_life_days=float(getattr(config, "COPY_FORWARD_EDGE_HALF_LIFE_DAYS", 14.0)),
+                        )
+                except Exception:
+                    edge = None
+            if edge is None:
+                n = t.get("trade_count", t.get("count", t.get("total_trades", 0)))
+                edge = self._shrunk_edge(t.get("win_rate", 0), n)
+            scored.append((edge, t))
         scored.sort(key=lambda x: x[0], reverse=True)
         kept = [t for edge, t in scored if edge >= min_edge]
         logger.info(
-            "Copy edge-rank: %d/%d wallets clear shrunk-edge >= %.2f (keeping top %d)",
-            len(kept), len(traders), min_edge, min(len(kept), top_n),
+            "Copy edge-rank (%s): %d/%d wallets clear edge >= %.2f (keeping top %d)",
+            "forward" if fwd else "shrunk", len(kept), len(traders), min_edge,
+            min(len(kept), top_n),
         )
         return kept[:top_n]
 
