@@ -1118,6 +1118,17 @@ COPY_FORWARD_EDGE_LOOKBACK_DAYS = float(
 COPY_FORWARD_EDGE_HALF_LIFE_DAYS = float(
     os.environ.get("COPY_FORWARD_EDGE_HALF_LIFE_DAYS", "14")
 )
+# ── ML deployment discipline: OOS-beats-baseline gate (signal #8 / PR-C, default OFF) ──
+# A model (XGBoost forecaster / alpha pipeline) is only trusted if it beats a
+# naive majority-class baseline out-of-sample under purged walk-forward. When
+# enabled, models that don't clear ML_OOS_MIN_MARGIN are disabled (the consumer
+# falls back to neutral). ML_OOS_EMBARGO purges bars between train and test to
+# prevent horizon-label leakage.
+ML_REQUIRE_OOS_BEATS_BASELINE = os.environ.get(
+    "ML_REQUIRE_OOS_BEATS_BASELINE", "false"
+).lower() in ("true", "1", "yes")
+ML_OOS_MIN_MARGIN = float(os.environ.get("ML_OOS_MIN_MARGIN", "0.0"))
+ML_OOS_EMBARGO = int(os.environ.get("ML_OOS_EMBARGO", "1"))
 # ── Portfolio correlation / net-exposure cap (algo #7, default OFF) ──
 # The DecisionEngine sizes signals independently (diversity is only a 0.05
 # tie-breaker), so on a highly-correlated crypto book it can stack many
