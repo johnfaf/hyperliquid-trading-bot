@@ -1129,6 +1129,12 @@ ML_REQUIRE_OOS_BEATS_BASELINE = os.environ.get(
 ).lower() in ("true", "1", "yes")
 ML_OOS_MIN_MARGIN = float(os.environ.get("ML_OOS_MIN_MARGIN", "0.0"))
 ML_OOS_EMBARGO = int(os.environ.get("ML_OOS_EMBARGO", "1"))
+# ── Confluence gate (signal #3, default OFF) ──
+# A non-copy entry must have >= N independent confirmations (options flow /
+# multi-exchange volume / regime / cross-venue) to trade. 0 disables the gate.
+FIREWALL_CONFLUENCE_MIN_CONFIRMATIONS = int(
+    os.environ.get("FIREWALL_CONFLUENCE_MIN_CONFIRMATIONS", "0")
+)
 # ── Portfolio correlation / net-exposure cap (algo #7, default OFF) ──
 # The DecisionEngine sizes signals independently (diversity is only a 0.05
 # tie-breaker), so on a highly-correlated crypto book it can stack many
