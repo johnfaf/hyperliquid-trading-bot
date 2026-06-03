@@ -1135,6 +1135,14 @@ ML_OOS_EMBARGO = int(os.environ.get("ML_OOS_EMBARGO", "1"))
 FIREWALL_CONFLUENCE_MIN_CONFIRMATIONS = int(
     os.environ.get("FIREWALL_CONFLUENCE_MIN_CONFIRMATIONS", "0")
 )
+# ── Regime routing (signal #4, default OFF) ──
+# When enabled, the regime filter DROPS strategies whose compatibility in the
+# current regime is below REGIME_ROUTING_MIN_COMPAT (emit-where-it-works),
+# rather than merely down-weighting misfits and trading them anyway.
+REGIME_ROUTING_ENABLED = os.environ.get(
+    "REGIME_ROUTING_ENABLED", "false"
+).lower() in ("true", "1", "yes")
+REGIME_ROUTING_MIN_COMPAT = float(os.environ.get("REGIME_ROUTING_MIN_COMPAT", "0.3"))
 # ── Portfolio correlation / net-exposure cap (algo #7, default OFF) ──
 # The DecisionEngine sizes signals independently (diversity is only a 0.05
 # tie-breaker), so on a highly-correlated crypto book it can stack many
