@@ -1193,6 +1193,34 @@ def run_trading_cycle(container, cycle_count: int) -> None:
             except Exception as exc:
                 logger.warning("  Alpha pipeline signal generation error: %s", exc)
 
+        # Cross-sectional market-neutral signal (signal #7, default OFF). Ranks
+        # the configured universe by trailing momentum and injects a beta-neutral
+        # basket (long top-K / short bottom-K). No-op unless CROSS_SECTIONAL_ENABLED.
+        if getattr(config, "CROSS_SECTIONAL_ENABLED", False):
+            try:
+                from src.signals.cross_sectional import generate_cross_sectional_signals
+                from src.data import hyperliquid_client as _hl
+                _universe = [c.strip().upper() for c in
+                             str(getattr(config, "CROSS_SECTIONAL_UNIVERSE", "") or "").split(",")
+                             if c.strip()]
+                _lookback = int(getattr(config, "CROSS_SECTIONAL_LOOKBACK", 24))
+                _topk = int(getattr(config, "CROSS_SECTIONAL_TOP_K", 3))
+                _closes = {}
+                for _coin in _universe:
+                    try:
+                        _candles = _hl.get_candles(_coin, "1h") or []
+                        _cs = [float(c["close"]) for c in _candles if "close" in c]
+                        if len(_cs) > _lookback:
+                            _closes[_coin] = _cs
+                    except Exception:
+                        continue
+                _xs = generate_cross_sectional_signals(_closes, top_k=_topk, lookback=_lookback)
+                if _xs:
+                    top_strategies.extend(_xs)
+                    logger.info("  Injected %d cross-sectional signals", len(_xs))
+            except Exception as exc:
+                logger.warning("  Cross-sectional signal generation error: %s", exc)
+
         # BUG-3 FIX (consumption): drain any whale signals queued by fast_cycle
         # into the trading pipeline so they actually influence decisions.
         whale_queue = getattr(container, "_whale_strategy_queue", None)
