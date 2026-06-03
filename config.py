@@ -1118,6 +1118,21 @@ PORTFOLIO_NET_EXPOSURE_CAP_ENABLED = os.environ.get(
 PORTFOLIO_MAX_SAME_SIDE_POSITIONS = int(
     os.environ.get("PORTFOLIO_MAX_SAME_SIDE_POSITIONS", "3")
 )
+# ── Cross-sectional market-neutral signal (signal #7, default OFF) ──
+# Per-coin directional bets leave the book implicitly long-beta. When enabled,
+# each cycle ranks CROSS_SECTIONAL_UNIVERSE by trailing momentum and emits a
+# market-neutral basket: long the top-K, short the bottom-K. Isolates relative
+# alpha. OFF => not injected (zero behaviour change).
+CROSS_SECTIONAL_ENABLED = os.environ.get(
+    "CROSS_SECTIONAL_ENABLED", "false"
+).lower() in ("true", "1", "yes")
+CROSS_SECTIONAL_TOP_K = int(os.environ.get("CROSS_SECTIONAL_TOP_K", "3"))
+CROSS_SECTIONAL_LOOKBACK = int(os.environ.get("CROSS_SECTIONAL_LOOKBACK", "24"))
+CROSS_SECTIONAL_UNIVERSE = os.environ.get(
+    "CROSS_SECTIONAL_UNIVERSE",
+    "BTC,ETH,SOL,BNB,XRP,DOGE,HYPE,TAO,ZEC,ALGO,HBAR,ZRO,FARTCOIN,"
+    "TRUMP,MOODENG,MORPHO,PENGU,IP,MET,MON,XPL",
+)
 # Auto-quarantine sources whose ECE crosses this threshold once they
 # have at least CALIBRATION_QUARANTINE_MIN_SAMPLES outcomes. Quarantined
 # sources are routed to shadow only until ECE recovers.
