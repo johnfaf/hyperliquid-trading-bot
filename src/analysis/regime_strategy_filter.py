@@ -230,6 +230,26 @@ class RegimeStrategyFilter:
 
             adjusted_strategies.append(adjusted)
 
+        # Regime routing (signal #4, default OFF): only EMIT strategies whose
+        # compatibility in the current regime clears the bar -- i.e. route each
+        # strategy to the regime where it works, instead of merely down-weighting
+        # misfits and trading them anyway. OFF => keep all (re-scored only).
+        try:
+            import config as _cfg
+            if getattr(_cfg, "REGIME_ROUTING_ENABLED", False) and adjusted_strategies:
+                _minc = float(getattr(_cfg, "REGIME_ROUTING_MIN_COMPAT", 0.3))
+                routed = [s for s in adjusted_strategies
+                          if s.get("regime_compatibility", 0.5) >= _minc]
+                dropped = len(adjusted_strategies) - len(routed)
+                if dropped:
+                    logger.info(
+                        "Regime routing: dropped %d strategies below compat %.2f in %s",
+                        dropped, _minc, regime_name,
+                    )
+                adjusted_strategies = routed
+        except Exception:
+            pass
+
         # Sort by adjusted score (highest first)
         adjusted_strategies.sort(
             key=lambda s: s.get("adjusted_score", 0),
