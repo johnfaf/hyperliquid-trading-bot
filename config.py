@@ -1133,6 +1133,15 @@ CROSS_SECTIONAL_UNIVERSE = os.environ.get(
     "BTC,ETH,SOL,BNB,XRP,DOGE,HYPE,TAO,ZEC,ALGO,HBAR,ZRO,FARTCOIN,"
     "TRUMP,MOODENG,MORPHO,PENGU,IP,MET,MON,XPL",
 )
+# ── Meta-labeling size scaling (signal #8 / PR-A, default OFF) ──
+# Scale position size by the calibrated win-probability of the specific trade
+# (edge above breakeven -> larger, below -> smaller), bounded by the clamps.
+# v1 uses the signal's calibrated confidence as the win-prob. OFF => no change.
+META_LABEL_ENABLED = os.environ.get(
+    "META_LABEL_ENABLED", "false"
+).lower() in ("true", "1", "yes")
+META_LABEL_MIN_MULT = float(os.environ.get("META_LABEL_MIN_MULT", "0.25"))
+META_LABEL_MAX_MULT = float(os.environ.get("META_LABEL_MAX_MULT", "1.5"))
 # Auto-quarantine sources whose ECE crosses this threshold once they
 # have at least CALIBRATION_QUARANTINE_MIN_SAMPLES outcomes. Quarantined
 # sources are routed to shadow only until ECE recovers.

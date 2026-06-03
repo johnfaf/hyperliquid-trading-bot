@@ -1808,6 +1808,20 @@ class PaperTrader:
             return None
         max_position = account["balance"] * config.PAPER_TRADING_MAX_POSITION_PCT
         size_usd = max_position * (score / 1.0)  # Scale by confidence
+        # Meta-labeling (signal #8, default OFF): scale size by the calibrated
+        # win-probability of THIS trade (edge above breakeven -> bigger, below ->
+        # smaller). v1 uses the signal's (calibrated-upstream) confidence as the
+        # win-prob; bounded by the multiplier clamps. No-op unless enabled.
+        if getattr(config, "META_LABEL_ENABLED", False):
+            try:
+                from src.signals.meta_label import meta_size_multiplier
+                size_usd *= meta_size_multiplier(
+                    score,
+                    min_mult=float(getattr(config, "META_LABEL_MIN_MULT", 0.25)),
+                    max_mult=float(getattr(config, "META_LABEL_MAX_MULT", 1.5)),
+                )
+            except Exception:
+                pass
         size = size_usd / target_price
 
         strategy_source = str(strategy.get("source", "strategy") or "strategy")
