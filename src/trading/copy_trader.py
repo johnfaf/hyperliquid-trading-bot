@@ -606,6 +606,38 @@ class CopyTrader:
         raw = (our_price - source_entry) / source_entry * 10_000.0
         return round(-raw if str(side).strip().lower() in ("short", "sell") else raw, 2)
 
+    @staticmethod
+    def _subbook_passes(address, coin, side) -> bool:
+        """Per-(wallet, side, coin) sub-book gate (signal #5, default OFF).
+
+        Returns False only when the sub-book has enough recent evidence AND a
+        sub-breakeven recency-weighted edge -- so proven-flat/negative sub-books
+        (e.g. a wallet's copy-shorts) are dropped while unmeasured sub-books pass
+        (bootstrap). Fail-open."""
+        if not getattr(config, "COPY_SUBBOOK_EDGE_ENABLED", False):
+            return True
+        try:
+            from src.core import clock_provider
+            from src.learning.forward_edge import (
+                recency_weighted_edge, wallet_subbook_outcomes,
+            )
+            outs = wallet_subbook_outcomes(
+                config.DB_PATH, address, coin, side, clock_provider.unix_ms(),
+                lookback_days=float(getattr(config, "COPY_SUBBOOK_LOOKBACK_DAYS", 90.0)),
+            )
+            min_n = float(getattr(config, "COPY_SUBBOOK_MIN_SAMPLES", 8))
+            min_edge = float(getattr(config, "COPY_SUBBOOK_MIN_EDGE", 0.50))
+            if len(outs) >= min_n:
+                edge, _ = recency_weighted_edge(
+                    outs,
+                    half_life_days=float(getattr(config, "COPY_FORWARD_EDGE_HALF_LIFE_DAYS", 14.0)),
+                )
+                if edge < min_edge:
+                    return False
+        except Exception:
+            return True  # fail-open
+        return True
+
     def _rank_traders_by_edge(self, traders: List[Dict], top_n: int) -> List[Dict]:
         """Re-rank copyable wallets by shrunk all-time win-rate edge (algo #4),
         or by a recency-weighted FORWARD edge from recent fills when
@@ -767,6 +799,11 @@ class CopyTrader:
             pos = new_positions[coin]
             price = float(mids.get(coin, pos["entry_price"]))
             if price <= 0:
+                continue
+            # Per-(wallet,side,coin) sub-book gate (signal #5, default OFF): only
+            # copy a wallet's coin+side if that sub-book is proven (or not yet
+            # measured). Drops proven-flat/negative sub-books (e.g. copy-short).
+            if not self._subbook_passes(normalized_address, coin, pos.get("side")):
                 continue
 
             signals.append({

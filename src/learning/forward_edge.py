@@ -75,3 +75,40 @@ def wallet_recent_outcomes(db_path: str, wallet_address: str, now_ms: float,
     except Exception:
         return []
     return out
+
+
+def wallet_subbook_outcomes(db_path: str, wallet_address: str, coin: str,
+                            side: str, now_ms: float, *,
+                            lookback_days: float = 90.0):
+    """``[(age_days, win)]`` for one wallet's (coin, side) SUB-BOOK from recent
+    closed fills -- a wallet may be great at ETH longs and bad at alt shorts, so
+    copy should be gated per sub-book, not per wallet. Read-only; [] on error."""
+    cutoff = float(now_ms) - float(lookback_days) * 86_400_000.0
+    side_n = str(side or "").strip().lower()
+    if side_n in ("buy",):
+        side_n = "long"
+    elif side_n in ("sell",):
+        side_n = "short"
+    out = []
+    try:
+        import sqlite3
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        try:
+            cur = conn.execute(
+                "SELECT time_ms, closed_pnl FROM wallet_fills "
+                "WHERE LOWER(wallet_address) = LOWER(?) AND UPPER(coin) = UPPER(?) "
+                "AND LOWER(side) = ? AND time_ms >= ? "
+                "AND closed_pnl IS NOT NULL AND closed_pnl != 0",
+                (str(wallet_address), str(coin), side_n, cutoff),
+            )
+            for t_ms, pnl in cur.fetchall():
+                try:
+                    age = max(0.0, (float(now_ms) - float(t_ms)) / 86_400_000.0)
+                    out.append((age, 1.0 if float(pnl) > 0 else 0.0))
+                except (TypeError, ValueError):
+                    continue
+        finally:
+            conn.close()
+    except Exception:
+        return []
+    return out
