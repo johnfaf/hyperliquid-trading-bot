@@ -288,12 +288,70 @@ def _summary_payload() -> Dict[str, Any]:
     )
 
 
+def _build_microstructure_payload() -> Dict[str, Any]:
+    """Read-only signal-quality telemetry for the Sources page (observe-first):
+    per-source Information Coefficient (which sources actually rank-predict) and
+    per-(wallet,coin,side) copy sub-book recency-weighted edges.
+
+    Pure DB reads, fail-soft -> ``{"available": False}`` on a cold/missing DB so
+    the page degrades gracefully. Mirrors the IC grading (#6) and sub-book gate
+    (#5) so the operator can WATCH forward data accrue before enabling either
+    flag -- the panel changes nothing about live behaviour.
+    """
+    import time
+    try:
+        import config
+        from src.analysis.signal_ic import load_records, compute_source_ic
+        from src.learning.forward_edge import subbook_edge_table
+
+        db_path = str(getattr(config, "DB_PATH", "data/bot.db"))
+        ic_min_n = int(getattr(config, "MICROSTRUCTURE_IC_MIN_N", 20) or 20)
+        ic_map = compute_source_ic(load_records(db_path), min_n=ic_min_n)
+        ic_rows = sorted(
+            ({"source": s, **d} for s, d in ic_map.items()),
+            key=lambda r: (r["ic"] is None, -(r["ic"] or 0.0)),
+        )
+        now_ms = time.time() * 1000.0
+        sub_min = int(getattr(config, "COPY_SUBBOOK_MIN_SAMPLES", 8) or 8)
+        subbook = subbook_edge_table(db_path, now_ms, min_samples=1, limit=60)
+        return {
+            "available": True,
+            "ic": ic_rows,
+            "ic_min_n": ic_min_n,
+            "ic_flag_on": bool(getattr(config, "MICROSTRUCTURE_IC_WEIGHT_ENABLED", False)),
+            "subbook": subbook,
+            "subbook_min_samples": sub_min,
+            "subbook_flag_on": bool(getattr(config, "COPY_SUBBOOK_EDGE_ENABLED", False)),
+        }
+    except Exception as exc:
+        logger.debug("microstructure payload failed: %s", exc)
+        return {"available": False, "ic": [], "subbook": []}
+
+
+def _microstructure_payload() -> Dict[str, Any]:
+    import config
+    db_path = str(getattr(config, "DB_PATH", "data/bot.db"))
+    return get_ttl(
+        ("sources_microstructure", db_path),
+        _cache_ttl("DASHBOARD_V2_MICROSTRUCTURE_CACHE_SECONDS", 30.0),
+        _build_microstructure_payload,
+    )
+
+
 @router.get("/api/sources", response_class=JSONResponse)
 async def sources_data(request: Request):
     redirect = require_auth(request)
     if redirect is not None:
         return JSONResponse({"error": "auth_required"}, status_code=401)
     return JSONResponse(_summary_payload())
+
+
+@router.get("/api/sources/microstructure", response_class=JSONResponse)
+async def sources_microstructure(request: Request):
+    redirect = require_auth(request)
+    if redirect is not None:
+        return JSONResponse({"error": "auth_required"}, status_code=401)
+    return JSONResponse(_microstructure_payload())
 
 
 @router.post("/api/sources/clear_quarantine")
@@ -359,5 +417,6 @@ async def sources_page(request: Request):
     return get_templates().TemplateResponse(
         request,
         "sources.html",
-        {"title": "Sources", "data": _summary_payload()},
+        {"title": "Sources", "data": _summary_payload(),
+         "micro": _microstructure_payload()},
     )
