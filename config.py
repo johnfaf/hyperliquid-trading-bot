@@ -1191,6 +1191,27 @@ META_LABEL_ENABLED = os.environ.get(
 ).lower() in ("true", "1", "yes")
 META_LABEL_MIN_MULT = float(os.environ.get("META_LABEL_MIN_MULT", "0.25"))
 META_LABEL_MAX_MULT = float(os.environ.get("META_LABEL_MAX_MULT", "1.5"))
+# ── Microstructure IC weighting (signal #6, default OFF) ──
+# The bot runs ~15 signal sources but never measured which actually *predict*.
+# The Information Coefficient (Spearman rank-corr of a source's pre-trade
+# confidence vs realized return) grades each source from its own
+# calibration_records. When enabled, the DecisionEngine scales a NON-copy
+# source's EV-proxy win-prob by source_ic_weight: lean on sources that
+# rank-predict (IC>0 -> weight up toward MAX), fade those that don't (IC<0 ->
+# down toward MIN). OBSERVE-FIRST: a source with fewer than MIN_N outcomes gets
+# a neutral 1.0, so this no-ops on cold sources. copy (the proven edge) is
+# always exempt. OFF => hard no-op (zero behaviour change).
+MICROSTRUCTURE_IC_WEIGHT_ENABLED = os.environ.get(
+    "MICROSTRUCTURE_IC_WEIGHT_ENABLED", "false"
+).lower() in ("true", "1", "yes")
+MICROSTRUCTURE_IC_MIN_N = int(os.environ.get("MICROSTRUCTURE_IC_MIN_N", "20"))
+MICROSTRUCTURE_IC_GAIN = float(os.environ.get("MICROSTRUCTURE_IC_GAIN", "2.5"))
+MICROSTRUCTURE_IC_MIN_WEIGHT = float(
+    os.environ.get("MICROSTRUCTURE_IC_MIN_WEIGHT", "0.25")
+)
+MICROSTRUCTURE_IC_MAX_WEIGHT = float(
+    os.environ.get("MICROSTRUCTURE_IC_MAX_WEIGHT", "1.5")
+)
 # Auto-quarantine sources whose ECE crosses this threshold once they
 # have at least CALIBRATION_QUARANTINE_MIN_SAMPLES outcomes. Quarantined
 # sources are routed to shadow only until ECE recovers.
