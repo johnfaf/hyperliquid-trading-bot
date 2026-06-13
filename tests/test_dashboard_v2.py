@@ -105,6 +105,47 @@ def test_dashboard_summary_fragments_render_without_full_layout(client):
         assert "<html" not in r.text
 
 
+def test_microstructure_endpoint_reports_ic_and_subbook(client, tmp_path, monkeypatch):
+    import sqlite3
+    import time
+    import config
+
+    db = str(tmp_path / "micro.db")
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE calibration_records (source_key TEXT, "
+                 "predicted_confidence REAL, pnl REAL)")
+    conn.executemany("INSERT INTO calibration_records VALUES (?,?,?)",
+                     [("funding_div", i / 12.0, float(i)) for i in range(12)])
+    conn.execute("CREATE TABLE wallet_fills (wallet_address TEXT, coin TEXT, "
+                 "side TEXT, time_ms REAL, closed_pnl REAL)")
+    now = time.time() * 1000
+    conn.executemany("INSERT INTO wallet_fills VALUES (?,?,?,?,?)",
+                     [("0xA", "ETH", "long", now - (i + 1) * 3_600_000, 5.0)
+                      for i in range(8)])
+    conn.commit()
+    conn.close()
+
+    monkeypatch.setattr(config, "DB_PATH", db, raising=False)
+    monkeypatch.setattr(config, "MICROSTRUCTURE_IC_MIN_N", 10, raising=False)
+
+    r = client.get("/api/sources/microstructure")
+    assert r.status_code == 200
+    data = r.json()
+    assert data["available"] is True
+    assert any(row["source"] == "funding_div" for row in data["ic"])
+    assert any(row["coin"] == "ETH" and row["side"] == "long"
+               for row in data["subbook"])
+
+
+def test_microstructure_endpoint_fail_soft_on_missing_db(client, tmp_path, monkeypatch):
+    import config
+    monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "nope.db"), raising=False)
+    r = client.get("/api/sources/microstructure")
+    assert r.status_code == 200
+    # No DB -> graceful empty payload, never a 500.
+    assert r.json().get("available") is False
+
+
 def test_dashboard_websocket_connects_without_auth_token(client):
     with client.websocket_connect("/ws") as ws:
         hello = ws.receive_json()

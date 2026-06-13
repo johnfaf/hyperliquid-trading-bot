@@ -5,7 +5,7 @@ import sqlite3
 import time
 
 import config
-from src.learning.forward_edge import wallet_subbook_outcomes
+from src.learning.forward_edge import subbook_edge_table, wallet_subbook_outcomes
 from src.trading.copy_trader import CopyTrader
 
 _DAY = 86_400_000.0
@@ -57,3 +57,29 @@ def test_subbook_unmeasured_bootstraps(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "DB_PATH", db, raising=False)
     monkeypatch.setattr(config, "COPY_SUBBOOK_MIN_SAMPLES", 8, raising=False)
     assert CopyTrader._subbook_passes("0xA", "ETH", "short") is True
+
+
+# ── subbook_edge_table (dashboard observability view) ──
+
+def test_subbook_edge_table_groups_and_ranks(tmp_path):
+    db = str(tmp_path / "wf.db")
+    now = time.time() * 1000
+    rows = [("0xA", "ETH", "long", now - (i + 1) * 3_600_000, 5.0) for i in range(8)]
+    rows += [("0xB", "SOL", "short", now - (i + 1) * 3_600_000, -3.0) for i in range(6)]
+    _mk(db, rows)
+    table = subbook_edge_table(db, now, lookback_days=90, min_samples=1)
+    assert len(table) == 2
+    top = table[0]
+    assert top["wallet"] == "0xa" and top["coin"] == "ETH" and top["side"] == "long"
+    assert top["n"] == 8 and top["edge"] > table[1]["edge"]   # winners rank first
+
+
+def test_subbook_edge_table_min_samples_filters(tmp_path):
+    db = str(tmp_path / "wf.db")
+    now = time.time() * 1000
+    _mk(db, [("0xA", "ETH", "long", now - 3_600_000, 5.0)])   # 1 outcome
+    assert subbook_edge_table(db, now, min_samples=5) == []
+
+
+def test_subbook_edge_table_missing_db_is_empty(tmp_path):
+    assert subbook_edge_table(str(tmp_path / "nope.db"), time.time() * 1000) == []

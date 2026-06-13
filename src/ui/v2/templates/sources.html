@@ -211,4 +211,96 @@
     </table>
   </div>
 </section>
+
+{% if micro and micro.available %}
+<section class="mt-6">
+  <div class="flex items-center justify-between mb-2">
+    <h2 class="text-sm font-semibold text-slate-300">Signal IC <span class="text-slate-500 font-normal">— does this source predict?</span></h2>
+    <div class="text-xs text-slate-500">
+      rank-corr of confidence vs realized pnl · min n {{ micro.ic_min_n }} ·
+      grading {% if micro.ic_flag_on %}<span class="text-emerald-300">ON</span>{% else %}<span class="text-slate-400">observe-only</span>{% endif %}
+    </div>
+  </div>
+  <div class="overflow-x-auto bg-slate-900 border border-slate-800 rounded">
+    <table class="w-full text-xs">
+      <thead class="bg-slate-950/60 text-slate-400">
+        <tr>
+          <th class="text-left py-2 px-3 font-medium">Source</th>
+          <th class="text-right py-2 px-3 font-medium">n</th>
+          <th class="text-right py-2 px-3 font-medium">IC</th>
+          <th class="text-right py-2 px-3 font-medium">Mean ret</th>
+          <th class="text-left py-2 px-3 font-medium">Verdict</th>
+        </tr>
+      </thead>
+      <tbody class="divide-y divide-slate-800">
+        {% for r in micro.ic %}
+        <tr class="hover:bg-slate-800/40">
+          <td class="py-1.5 px-3 text-slate-200 font-mono">{{ r.source }}</td>
+          <td class="py-1.5 px-3 text-right text-slate-400">{{ r.n }}</td>
+          <td class="py-1.5 px-3 text-right font-mono
+            {% if r.ic is none %}text-slate-500
+            {% elif r.ic >= 0.05 %}text-emerald-300
+            {% elif r.ic <= -0.05 %}text-rose-300
+            {% else %}text-slate-400{% endif %}">
+            {% if r.ic is none %}—{% else %}{{ '%+.3f'|format(r.ic) }}{% endif %}
+          </td>
+          <td class="py-1.5 px-3 text-right font-mono {% if r.mean_return > 0 %}text-emerald-300{% elif r.mean_return < 0 %}text-rose-300{% else %}text-slate-400{% endif %}">{{ '%+.3f'|format(r.mean_return) }}</td>
+          <td class="py-1.5 px-3">
+            <span class="inline-block px-2 py-0.5 rounded text-[10px]
+              {% if r.verdict == 'predictive' %}bg-emerald-900/60 text-emerald-200
+              {% elif r.verdict == 'negative' %}bg-rose-900/60 text-rose-200
+              {% elif r.verdict == 'noise' %}bg-slate-800 text-slate-300
+              {% elif r.verdict == 'flat' %}bg-amber-900/60 text-amber-200
+              {% else %}bg-slate-800/60 text-slate-500{% endif %}">{{ r.verdict|upper }}</span>
+          </td>
+        </tr>
+        {% else %}
+        <tr><td colspan="5" class="py-6 text-center text-slate-500">No graded sources yet — forward outcomes still accruing.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section class="mt-6">
+  <div class="flex items-center justify-between mb-2">
+    <h2 class="text-sm font-semibold text-slate-300">Copy sub-book edges <span class="text-slate-500 font-normal">— which (wallet, coin, side) actually wins</span></h2>
+    <div class="text-xs text-slate-500">
+      recency-weighted win-rate · gate floor n {{ micro.subbook_min_samples }} ·
+      gate {% if micro.subbook_flag_on %}<span class="text-emerald-300">ON</span>{% else %}<span class="text-slate-400">observe-only</span>{% endif %}
+    </div>
+  </div>
+  <div class="overflow-x-auto bg-slate-900 border border-slate-800 rounded">
+    <table class="w-full text-xs">
+      <thead class="bg-slate-950/60 text-slate-400">
+        <tr>
+          <th class="text-left py-2 px-3 font-medium">Wallet</th>
+          <th class="text-left py-2 px-3 font-medium">Coin</th>
+          <th class="text-left py-2 px-3 font-medium">Side</th>
+          <th class="text-right py-2 px-3 font-medium">n</th>
+          <th class="text-right py-2 px-3 font-medium">Edge</th>
+          <th class="text-right py-2 px-3 font-medium">Eff n</th>
+        </tr>
+      </thead>
+      <tbody class="divide-y divide-slate-800">
+        {% for r in micro.subbook %}
+        <tr class="hover:bg-slate-800/40 {% if r.n < micro.subbook_min_samples %}opacity-60{% endif %}">
+          <td class="py-1.5 px-3 text-slate-300 font-mono">{{ r.wallet[:10] }}…{{ r.wallet[-4:] }}</td>
+          <td class="py-1.5 px-3 text-slate-200">{{ r.coin }}</td>
+          <td class="py-1.5 px-3 {% if r.side == 'long' %}text-emerald-300{% else %}text-rose-300{% endif %}">{{ r.side }}</td>
+          <td class="py-1.5 px-3 text-right text-slate-400">{{ r.n }}{% if r.n < micro.subbook_min_samples %}<span class="text-slate-600 text-[10px]"> cold</span>{% endif %}</td>
+          <td class="py-1.5 px-3 text-right font-mono
+            {% if r.edge >= 0.55 %}text-emerald-300
+            {% elif r.edge <= 0.45 %}text-rose-300
+            {% else %}text-slate-400{% endif %}">{{ '%.3f'|format(r.edge) }}</td>
+          <td class="py-1.5 px-3 text-right text-slate-500">{{ '%.2f'|format(r.eff_n) }}</td>
+        </tr>
+        {% else %}
+        <tr><td colspan="6" class="py-6 text-center text-slate-500">No copy sub-book outcomes yet — wallet fills still accruing.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+{% endif %}
 {% endblock %}

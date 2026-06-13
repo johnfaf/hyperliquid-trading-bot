@@ -112,3 +112,53 @@ def wallet_subbook_outcomes(db_path: str, wallet_address: str, coin: str,
     except Exception:
         return []
     return out
+
+
+def subbook_edge_table(db_path: str, now_ms: float, *, lookback_days: float = 90.0,
+                       half_life_days: float = 14.0, shrinkage: float = 10.0,
+                       prior: float = 0.5, min_samples: int = 1, limit: int = 100):
+    """Every (wallet, coin, side) SUB-BOOK with its recency-weighted edge from
+    recent closed ``wallet_fills``, sorted by edge desc -- the observability view
+    behind the per-sub-book copy gate (signal #5).
+
+    Returns ``[{wallet, coin, side, n, edge, eff_n}]``; ``n`` is the raw outcome
+    count and ``eff_n`` the summed decay weight (recent evidence). Read-only;
+    ``[]`` on any error so the dashboard degrades gracefully.
+    """
+    cutoff = float(now_ms) - float(lookback_days) * 86_400_000.0
+    groups: dict = {}
+    try:
+        import sqlite3
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        try:
+            cur = conn.execute(
+                "SELECT LOWER(wallet_address), UPPER(coin), LOWER(side), time_ms, "
+                "closed_pnl FROM wallet_fills "
+                "WHERE time_ms >= ? AND closed_pnl IS NOT NULL AND closed_pnl != 0",
+                (cutoff,),
+            )
+            for wallet, coin, side, t_ms, pnl in cur.fetchall():
+                try:
+                    age = max(0.0, (float(now_ms) - float(t_ms)) / 86_400_000.0)
+                    win = 1.0 if float(pnl) > 0 else 0.0
+                except (TypeError, ValueError):
+                    continue
+                groups.setdefault((wallet, coin, side), []).append((age, win))
+        finally:
+            conn.close()
+    except Exception:
+        return []
+
+    out = []
+    for (wallet, coin, side), outcomes in groups.items():
+        if len(outcomes) < int(min_samples):
+            continue
+        edge, eff_n = recency_weighted_edge(
+            outcomes, half_life_days=half_life_days, shrinkage=shrinkage, prior=prior)
+        out.append({
+            "wallet": wallet, "coin": coin, "side": side,
+            "n": len(outcomes), "edge": round(float(edge), 4),
+            "eff_n": round(float(eff_n), 3),
+        })
+    out.sort(key=lambda r: (-r["edge"], -r["n"]))
+    return out[: max(1, int(limit or 100))]
