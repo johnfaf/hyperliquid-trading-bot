@@ -1118,6 +1118,17 @@ COPY_FORWARD_EDGE_LOOKBACK_DAYS = float(
 COPY_FORWARD_EDGE_HALF_LIFE_DAYS = float(
     os.environ.get("COPY_FORWARD_EDGE_HALF_LIFE_DAYS", "14")
 )
+# ── Per-(wallet,side,coin) copy sub-book gate (signal #5, default OFF) ──
+# Only copy a wallet's coin+side if that SUB-BOOK is proven (or not yet
+# measured) -- a wallet may be great at ETH longs and bad at alt shorts. Drops
+# proven-flat/negative sub-books (e.g. the flat copy-short bucket). Unmeasured
+# sub-books pass (bootstrap). OFF => copy every detected position change.
+COPY_SUBBOOK_EDGE_ENABLED = os.environ.get(
+    "COPY_SUBBOOK_EDGE_ENABLED", "false"
+).lower() in ("true", "1", "yes")
+COPY_SUBBOOK_MIN_SAMPLES = int(os.environ.get("COPY_SUBBOOK_MIN_SAMPLES", "8"))
+COPY_SUBBOOK_MIN_EDGE = float(os.environ.get("COPY_SUBBOOK_MIN_EDGE", "0.50"))
+COPY_SUBBOOK_LOOKBACK_DAYS = float(os.environ.get("COPY_SUBBOOK_LOOKBACK_DAYS", "90"))
 # ── ML deployment discipline: OOS-beats-baseline gate (signal #8 / PR-C, default OFF) ──
 # A model (XGBoost forecaster / alpha pipeline) is only trusted if it beats a
 # naive majority-class baseline out-of-sample under purged walk-forward. When
