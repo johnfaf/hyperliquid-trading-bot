@@ -70,6 +70,21 @@ class DecisionEngine:
             "corr_cap_enabled", getattr(_gcfg, "PORTFOLIO_NET_EXPOSURE_CAP_ENABLED", False)))
         self.max_same_side_positions = int(cfg.get(
             "max_same_side_positions", getattr(_gcfg, "PORTFOLIO_MAX_SAME_SIDE_POSITIONS", 3)))
+        # Microstructure IC weighting (signal #6). Default OFF + observe-first:
+        # scales a non-copy source's win-prob by its measured Information
+        # Coefficient (no-op until the source clears min_n outcomes).
+        self._ic_weight_enabled = bool(cfg.get(
+            "ic_weight_enabled", getattr(_gcfg, "MICROSTRUCTURE_IC_WEIGHT_ENABLED", False)))
+        self._ic_db_path = str(cfg.get(
+            "ic_db_path", getattr(_gcfg, "DB_PATH", "data/bot.db")))
+        self._ic_min_n = float(cfg.get(
+            "ic_min_n", getattr(_gcfg, "MICROSTRUCTURE_IC_MIN_N", 20)))
+        self._ic_gain = float(cfg.get(
+            "ic_gain", getattr(_gcfg, "MICROSTRUCTURE_IC_GAIN", 2.5)))
+        self._ic_min_w = float(cfg.get(
+            "ic_min_weight", getattr(_gcfg, "MICROSTRUCTURE_IC_MIN_WEIGHT", 0.25)))
+        self._ic_max_w = float(cfg.get(
+            "ic_max_weight", getattr(_gcfg, "MICROSTRUCTURE_IC_MAX_WEIGHT", 1.5)))
 
         # Max trades to execute per cycle (independent of position slots)
         self.max_trades_per_cycle = cfg.get("max_trades_per_cycle", 3)
@@ -411,6 +426,26 @@ class DecisionEngine:
             p_win = max(0.0, min(float(conf_raw), 1.0))
         except (TypeError, ValueError):
             p_win = float(base)
+        # Microstructure IC weighting (signal #6, default OFF). Scale a NON-copy
+        # source's win-prob by its measured Information Coefficient: lean on
+        # sources that demonstrably rank-predict realized returns, fade those
+        # that don't. Observe-first -- source_ic_weight returns a neutral 1.0
+        # until a source clears min_n outcomes, so this no-ops on cold sources
+        # and is a hard no-op when the flag is off. copy (the proven edge) is
+        # exempt; the weight only shapes the EV proxy used for ranking.
+        if self._ic_weight_enabled:
+            try:
+                _src = str(strategy.get("source", "") or "").lower()
+                if _src and not _src.startswith("copy"):
+                    from src.analysis.signal_ic import source_ic_weight
+                    _sk = str(strategy.get("source_key") or _src or strategy_type)
+                    _w = source_ic_weight(
+                        _sk, self._ic_db_path, min_n=self._ic_min_n,
+                        gain=self._ic_gain, min_weight=self._ic_min_w,
+                        max_weight=self._ic_max_w)
+                    p_win = max(0.0, min(p_win * _w, 1.0))
+            except Exception:
+                pass
         r_win = 1.75
         risk_policy = params.get("risk_policy") if isinstance(params, dict) else None
         if isinstance(risk_policy, dict):

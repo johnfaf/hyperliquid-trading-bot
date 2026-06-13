@@ -92,6 +92,39 @@ def compute_source_ic(rows: List[Tuple[str, float, float]],
     return out
 
 
+def ic_weight(ic, n, *, min_n: float = 20.0, gain: float = 2.5,
+              min_weight: float = 0.25, max_weight: float = 1.5) -> float:
+    """Map a source's measured IC + sample size to a confidence/size WEIGHT
+    (signal #6). Observe-first: insufficient evidence (``n < min_n`` or no IC)
+    -> neutral 1.0; positive IC scales up toward ``max_weight``, negative IC
+    down toward ``min_weight``. ``weight = clamp(1 + ic*gain, min, max)``."""
+    try:
+        if ic is None or n is None or float(n) < float(min_n):
+            return 1.0
+        ic_c = max(-1.0, min(float(ic), 1.0))
+    except (TypeError, ValueError):
+        return 1.0
+    return float(max(min_weight, min(1.0 + ic_c * gain, max_weight)))
+
+
+def source_ic_weight(source_key: str, db_path: str, *, min_n: float = 20.0,
+                     gain: float = 2.5, min_weight: float = 0.25,
+                     max_weight: float = 1.5) -> float:
+    """Confidence weight for one source from its measured IC over
+    calibration_records. Observe-first: neutral 1.0 when the source has < min_n
+    outcomes. Heavy callers should cache -- this reads the DB."""
+    try:
+        rows = [r for r in load_records(db_path) if r and r[0] == source_key]
+        ic_map = compute_source_ic(rows, min_n=int(min_n))
+        d = ic_map.get(source_key)
+        if not d:
+            return 1.0
+        return ic_weight(d.get("ic"), d.get("n"), min_n=min_n, gain=gain,
+                         min_weight=min_weight, max_weight=max_weight)
+    except Exception:
+        return 1.0
+
+
 def load_records(db_path: str) -> List[Tuple[str, float, float]]:
     """Load (source_key, predicted_confidence, pnl) from calibration_records."""
     import sqlite3
