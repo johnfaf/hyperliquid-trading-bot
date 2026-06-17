@@ -37,3 +37,39 @@ def test_passes_with_enough_confirmations():
 def test_copy_trade_is_exempt():
     # copy_trade is the proven edge -> never gated, even with 0 confirmations
     assert confluence_ok(_sig(source="copy_trade"), 3)[0] is True
+
+
+# ── regime alignment as a derivable confirmation (the wiring fix) ──
+
+def _sig2(side="long", strategy_type="momentum_long", source="strategy", ctx=None):
+    return SimpleNamespace(source=source, strategy_type=strategy_type,
+                           side=SimpleNamespace(value=side),
+                           options_flow_aligned=False, volume_confirmed=False,
+                           context=ctx or {})
+
+
+def test_regime_alignment_counts_when_data_passed():
+    sig = _sig2(side="long", strategy_type="momentum_long")
+    rd = {"overall_regime": "trending_up"}
+    assert count_confirmations(sig) == 0              # no regime_data -> unchanged (back-compat)
+    assert count_confirmations(sig, rd) == 1          # long in up-trend -> aligned
+    assert confluence_ok(sig, 1, regime_data=rd)[0] is True   # was unsatisfiable, now passes
+
+
+def test_regime_activate_list_aligns():
+    sig = _sig2(strategy_type="mean_reversion")
+    rd = {"strategy_guidance": {"activate": ["mean_reversion"]}}
+    assert count_confirmations(sig, rd) == 1
+
+
+def test_regime_pause_blocks_even_in_trend():
+    sig = _sig2(side="long", strategy_type="momentum_long")
+    rd = {"strategy_guidance": {"pause": ["momentum_long"]}, "overall_regime": "trending_up"}
+    assert count_confirmations(sig, rd) == 0
+    assert confluence_ok(sig, 1, regime_data=rd)[0] is False
+
+
+def test_regime_not_double_counted_with_context_key():
+    sig = _sig2(side="long", ctx={"regime_aligned": True})
+    rd = {"overall_regime": "trending_up"}     # both explicit + derivable
+    assert count_confirmations(sig, rd) == 1   # counted once, not twice
