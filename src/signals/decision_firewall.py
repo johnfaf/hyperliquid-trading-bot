@@ -2252,7 +2252,7 @@ class DecisionFirewall:
             _min_conf = int(getattr(_cfg, "FIREWALL_CONFLUENCE_MIN_CONFIRMATIONS", 0) or 0)
             if _min_conf > 0:
                 from src.signals.confluence import confluence_ok
-                _ok, _why = confluence_ok(signal, _min_conf)
+                _ok, _why = confluence_ok(signal, _min_conf, regime_data=regime_data)
                 if not _ok:
                     return _reject("rejected_confluence", _why)
         except Exception:
