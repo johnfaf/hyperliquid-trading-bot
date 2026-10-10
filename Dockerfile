@@ -14,12 +14,12 @@ COPY . .
 # volumes as root, so we run as root (container is already sandboxed).
 RUN mkdir -p /app/data /app/logs /app/reports /data \
     && adduser --disabled-password --gecos "" --uid 1000 bot \
-    && chown -R bot:bot /app
+    && chown -R bot:bot /app /data
 
 # Railway persistent volumes often mount /data as root. Keep root as the
 # default for Railway compatibility, but allow hardened runtimes to build with:
 #   docker build --build-arg RUN_AS_USER=bot .
-ARG RUN_AS_USER=root
+ARG RUN_AS_USER=bot
 USER ${RUN_AS_USER}
 
 # Health check — hits the /api/health endpoint
