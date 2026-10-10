@@ -21,7 +21,7 @@ from src.ui.v2.app import create_app
 
 @pytest.fixture
 def app(tmp_path, monkeypatch):
-    monkeypatch.delenv("DASHBOARD_AUTH_TOKEN", raising=False)
+    monkeypatch.setenv("DASHBOARD_AUTH_TOKEN", "test-dashboard-secret")
     monkeypatch.delenv("DASHBOARD_PUBLIC_READ", raising=False)
     v2_state.reset_components()
     cal = CalibrationTracker(db_path=str(tmp_path / "cal.db"))
@@ -35,7 +35,10 @@ def app(tmp_path, monkeypatch):
 
 @pytest.fixture
 def client(app):
-    return TestClient(app)
+    c = TestClient(app)
+    response = c.post("/api/auth/login", data={"token": "test-dashboard-secret"}, follow_redirects=False)
+    assert response.status_code == 303
+    return c
 
 
 def test_health_open_without_auth(client):
@@ -44,7 +47,7 @@ def test_health_open_without_auth(client):
     assert r.json()["status"] == "ok"
 
 
-def test_index_serves_dashboard_when_no_token_configured(client):
+def test_index_serves_dashboard_with_auth(client):
     r = client.get("/")
     assert r.status_code == 200
     assert "Calibration breakdown" in r.text
@@ -146,7 +149,7 @@ def test_microstructure_endpoint_fail_soft_on_missing_db(client, tmp_path, monke
     assert r.json().get("available") is False
 
 
-def test_dashboard_websocket_connects_without_auth_token(client):
+def test_dashboard_websocket_connects_with_valid_cookie(client):
     with client.websocket_connect("/ws") as ws:
         hello = ws.receive_json()
         assert hello["kind"] == "hello"
@@ -214,10 +217,11 @@ def test_login_round_trip_sets_session_cookie(monkeypatch, app):
 
 
 def test_calibration_unavailable_when_component_not_set(monkeypatch, tmp_path):
-    monkeypatch.delenv("DASHBOARD_AUTH_TOKEN", raising=False)
+    monkeypatch.setenv("DASHBOARD_AUTH_TOKEN", "test-dashboard-secret")
     v2_state.reset_components()
     app = create_app()
     client = TestClient(app)
+    assert client.post("/api/auth/login", data={"token": "test-dashboard-secret"}).status_code in (200, 303)
     r = client.get("/api/calibration")
     assert r.status_code == 503
     assert r.json()["error"] == "calibration_unavailable"
@@ -340,7 +344,7 @@ def test_sources_endpoint_aggregates_calibration(monkeypatch, tmp_path):
     single source row. Verify the rollup matches the underlying
     calibrator state.
     """
-    monkeypatch.delenv("DASHBOARD_AUTH_TOKEN", raising=False)
+    monkeypatch.setenv("DASHBOARD_AUTH_TOKEN", "test-dashboard-secret")
     v2_state.reset_components()
     cal = CalibrationTracker(db_path=str(tmp_path / "cal.db"))
     for _ in range(20):
@@ -362,6 +366,7 @@ def test_sources_endpoint_aggregates_calibration(monkeypatch, tmp_path):
     v2_state.set_components(agent_scorer=_Scorer(), calibration=cal)
     app = create_app()
     client = TestClient(app)
+    assert client.post("/api/auth/login", data={"token": "test-dashboard-secret"}).status_code in (200, 303)
     r = client.get("/api/sources")
     assert r.status_code == 200
     payload = r.json()
@@ -620,7 +625,7 @@ def test_clear_quarantine_requires_calibration(client):
 
 
 def test_clear_quarantine_drops_records(monkeypatch, tmp_path):
-    monkeypatch.delenv("DASHBOARD_AUTH_TOKEN", raising=False)
+    monkeypatch.setenv("DASHBOARD_AUTH_TOKEN", "test-dashboard-secret")
     v2_state.reset_components()
     cal = CalibrationTracker(
         db_path=str(tmp_path / "cal.db"),
@@ -632,6 +637,7 @@ def test_clear_quarantine_drops_records(monkeypatch, tmp_path):
     v2_state.set_components(calibration=cal)
     app = create_app()
     client = TestClient(app)
+    assert client.post("/api/auth/login", data={"token": "test-dashboard-secret"}).status_code in (200, 303)
     r = client.post(
         "/api/sources/clear_quarantine",
         data={"key": "strategy:m|long|trend", "audit_reason": "data quality fix"},

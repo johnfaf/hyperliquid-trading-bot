@@ -7,7 +7,7 @@ dashboard root. Logout clears the cookie.
 from __future__ import annotations
 
 from fastapi import APIRouter, Form, Request
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 
 from src.ui.v2 import auth as v2_auth
 
@@ -25,6 +25,8 @@ async def login_page(request: Request):
 @router.post("/api/auth/login")
 async def login_submit(request: Request, token: str = Form(...)):
     from src.ui.v2.app import get_templates
+    if not v2_auth.login_attempt_allowed(request.client.host if request.client else "unknown"):
+        return JSONResponse({"error": "login_rate_limited"}, status_code=429)
     if not v2_auth.login_with_token(token.strip()):
         return get_templates().TemplateResponse(
             request,
@@ -32,6 +34,7 @@ async def login_submit(request: Request, token: str = Form(...)):
             {"title": "Sign in", "error": "Invalid token."},
             status_code=401,
         )
+    v2_auth.login_attempt_succeeded(request.client.host if request.client else "unknown")
     response = RedirectResponse(url="/", status_code=303)
     secure = request.url.scheme == "https"
     v2_auth.issue_cookie(response, secure=secure)

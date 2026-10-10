@@ -13,6 +13,7 @@ import json
 import logging
 import os
 from typing import Optional
+from urllib.parse import urlsplit
 
 import requests
 
@@ -112,6 +113,9 @@ def _load_from_hashicorp_vault() -> str:
             "VAULT_ADDR, VAULT_TOKEN, and VAULT_SECRET_PATH are required for hashicorp provider"
         )
 
+    parsed = urlsplit(addr)
+    if parsed.scheme != "https" or not parsed.netloc or parsed.username or parsed.password:
+        raise SecretManagerError("Vault requires HTTPS without embedded credentials")
     url = f"{addr}/v1/{path}"
     headers = {"X-Vault-Token": token}
     try:

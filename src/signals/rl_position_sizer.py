@@ -205,7 +205,7 @@ class DQNetwork:
         if not os.path.exists(path):
             return False
         try:
-            ckpt = _torch.load(path, map_location=self.device, weights_only=False)
+            ckpt = _torch.load(path, map_location=self.device, weights_only=True)
             self.q_net.load_state_dict(ckpt["q_net"])
             self.target_net.load_state_dict(ckpt["target_net"])
             self.epsilon = ckpt.get("epsilon", self.epsilon_min)

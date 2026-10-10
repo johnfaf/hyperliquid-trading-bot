@@ -14,6 +14,7 @@ import hashlib
 import hmac
 import logging
 import os
+import threading
 import time
 from typing import Any, Optional
 
@@ -24,6 +25,30 @@ logger = logging.getLogger(__name__)
 
 COOKIE_NAME = "dashboard_v2_auth"
 DEFAULT_TTL_S = 86400
+_LOGIN_LOCK = threading.Lock()
+_LOGIN_ATTEMPTS: dict[str, tuple[int, float]] = {}
+
+
+def login_attempt_allowed(client_ip: str) -> bool:
+    """Allow at most ten login attempts per minute per peer."""
+    key = str(client_ip or "unknown")
+    now = time.monotonic()
+    with _LOGIN_LOCK:
+        count, start = _LOGIN_ATTEMPTS.get(key, (0, now))
+        if now - start >= 60:
+            count, start = 0, now
+        if len(_LOGIN_ATTEMPTS) > 4096:
+            _LOGIN_ATTEMPTS.clear()
+        if count >= 10:
+            return False
+        _LOGIN_ATTEMPTS[key] = (count + 1, start)
+        return True
+
+
+
+def login_attempt_succeeded(client_ip: str) -> None:
+    with _LOGIN_LOCK:
+        _LOGIN_ATTEMPTS.pop(str(client_ip or "unknown"), None)
 
 
 def _server_token() -> str:
@@ -76,7 +101,7 @@ def verify_cookie(request: Request) -> bool:
     token = _server_token()
     if not token:
         # No token configured -- the operator hasn't enabled auth.
-        return True
+        return False
     raw = request.cookies.get(COOKIE_NAME)
     if not raw:
         return False
@@ -115,7 +140,7 @@ def login_with_token(submitted_token: str) -> bool:
     """Constant-time compare submitted token against the server token."""
     expected = _server_token()
     if not expected:
-        return True
+        return False
     return hmac.compare_digest(submitted_token, expected)
 
 

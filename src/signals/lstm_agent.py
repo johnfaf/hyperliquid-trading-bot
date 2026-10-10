@@ -228,7 +228,7 @@ class DirectionLSTM:
         if not os.path.exists(path):
             return False
         try:
-            ckpt = _torch.load(path, map_location=self.device, weights_only=False)
+            ckpt = _torch.load(path, map_location=self.device, weights_only=True)
             self.model.load_state_dict(ckpt["state_dict"])
             self._trained = ckpt.get("trained", True)
             self.model.eval()
