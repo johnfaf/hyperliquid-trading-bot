@@ -46,6 +46,11 @@ def login_attempt_allowed(client_ip: str) -> bool:
 
 
 
+def login_attempt_succeeded(client_ip: str) -> None:
+    with _LOGIN_LOCK:
+        _LOGIN_ATTEMPTS.pop(str(client_ip or "unknown"), None)
+
+
 def _server_token() -> str:
     return os.environ.get("DASHBOARD_AUTH_TOKEN", "").strip()
 
