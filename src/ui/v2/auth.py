@@ -14,6 +14,7 @@ import hashlib
 import hmac
 import logging
 import os
+import threading
 import time
 from typing import Any, Optional
 
@@ -24,6 +25,25 @@ logger = logging.getLogger(__name__)
 
 COOKIE_NAME = "dashboard_v2_auth"
 DEFAULT_TTL_S = 86400
+_LOGIN_LOCK = threading.Lock()
+_LOGIN_ATTEMPTS: dict[str, tuple[int, float]] = {}
+
+
+def login_attempt_allowed(client_ip: str) -> bool:
+    """Allow at most ten login attempts per minute per peer."""
+    key = str(client_ip or "unknown")
+    now = time.monotonic()
+    with _LOGIN_LOCK:
+        count, start = _LOGIN_ATTEMPTS.get(key, (0, now))
+        if now - start >= 60:
+            count, start = 0, now
+        if len(_LOGIN_ATTEMPTS) > 4096:
+            _LOGIN_ATTEMPTS.clear()
+        if count >= 10:
+            return False
+        _LOGIN_ATTEMPTS[key] = (count + 1, start)
+        return True
+
 
 
 def _server_token() -> str:
