@@ -1764,6 +1764,14 @@ async function loadLiveChart(force=false){
   }
 }
 
+function escapeHtml(value) {
+  return String(value ?? '').replace(/[&<>"']/g, ch => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+  }[ch]));
+}
+
+// All text originating from third-party APIs, logs, model outputs, or the
+// database must be escaped before interpolating into innerHTML.
 function renderCards(d){
   const a = d.account;
   const cards = [
@@ -1779,7 +1787,7 @@ function renderCards(d){
   document.getElementById('stats-cards').innerHTML = cards.map(c=>`
     <div class="card"><div class="label">${c.label}</div>
     <div class="value ${c.cls||''}">${c.value}</div>
-    ${c.sub?`<div class="sub">${c.sub}</div>`:''}</div>`).join('');
+    ${c.sub?`<div class="sub">${escapeHtml(c.sub)}</div>`:''}</div>`).join('');
 }
 
 function renderOpenTrades(trades){
@@ -1792,14 +1800,14 @@ function renderOpenTrades(trades){
       unrealPnL = diff * t.size * t.leverage;
       pnlCls = unrealPnL > 0 ? 'green' : unrealPnL < 0 ? 'red' : '';
     }
-    return `<tr><td>${t.coin}</td>
-    <td><span class="badge badge-${t.side}">${t.side.toUpperCase()}</span></td>
+    return `<tr><td>${escapeHtml(t.coin)}</td>
+    <td><span class="badge badge-${escapeHtml(t.side)}">${t.side.toUpperCase()}</span></td>
     <td>${fmtUsd(t.entry_price)}</td><td>${currentPrice ? fmtUsd(currentPrice) : 'n/a'}</td>
     <td>${fmt(t.size,4)}</td><td>${t.leverage}x</td>
     <td class="${pnlCls}">${unrealPnL !== 'n/a' ? fmtUsd(unrealPnL) : 'n/a'}</td>
     <td>${fmtUsd(t.stop_loss)}</td><td>${fmtUsd(t.take_profit)}</td>
-    <td>${t.strategy_id||'n/a'}</td>
-    <td><button class="btn btn-close" onclick="closeTrade(${t.id},'${t.coin}')" id="close-btn-${t.id}" title="Close this position at market price">Close</button></td></tr>`;
+    <td>${escapeHtml(t.strategy_id||'n/a')}</td>
+    <td><button class="btn btn-close" onclick="closeTrade(${t.id},'${escapeHtml(t.coin)}')" id="close-btn-${t.id}" title="Close this position at market price">Close</button></td></tr>`;
   }).join('') : '<tr><td colspan="11" class="empty-row">No open positions</td></tr>';
   const closeAllBtn = document.getElementById('btn-close-all');
   if(closeAllBtn) closeAllBtn.style.display = trades.length ? '' : 'none';
@@ -1807,8 +1815,8 @@ function renderOpenTrades(trades){
 
 function renderStrategies(strats){
   document.getElementById('strategies-table').innerHTML = strats.slice(0,20).map((s,i)=>`
-    <tr><td>${i+1}</td><td>${s.name}</td>
-    <td><span class="badge badge-type">${s.strategy_type}</span></td>
+    <tr><td>${i+1}</td><td>${escapeHtml(s.name)}</td>
+    <td><span class="badge badge-type">${escapeHtml(s.strategy_type)}</span></td>
     <td>${fmt(s.current_score,4)}</td>
     <td class="${pnlClass(s.total_pnl)}">${fmtUsd(s.total_pnl)}</td>
     <td>${fmt(s.win_rate*100,1)}%</td><td>${s.trade_count}</td></tr>`).join('');
@@ -1824,8 +1832,8 @@ function renderTraders(traders){
 
 function renderClosedTrades(trades){
   document.getElementById('closed-trades').innerHTML = trades.length ? trades.slice(0,20).map(t=>`
-    <tr><td>${t.coin}</td>
-    <td><span class="badge badge-${t.side}">${t.side.toUpperCase()}</span></td>
+    <tr><td>${escapeHtml(t.coin)}</td>
+    <td><span class="badge badge-${escapeHtml(t.side)}">${t.side.toUpperCase()}</span></td>
     <td>${fmtUsd(t.entry_price)}</td><td>${fmtUsd(t.exit_price)}</td>
     <td class="${pnlClass(t.gross_pnl)}">${fmtUsd(t.gross_pnl)}</td>
     <td class="red">${fmtUsd(-(t.fees_paid||0))}</td>
@@ -1859,12 +1867,12 @@ function renderTradeAnalytics(analytics, runtime){
   summaryEl.innerHTML =
     `<div>Closed trades: <strong>${summary.count || 0}</strong> | Net PnL: <strong class="${pnlClass(summary.net_pnl || 0)}">${fmtUsd(summary.net_pnl || 0)}</strong> | Win rate: <strong>${((summary.win_rate || 0) * 100).toFixed(1)}%</strong></div>` +
     `<div>Short vs long: <strong class="${pnlClass(comp.short_net_pnl || 0)}">short ${fmtUsd(comp.short_net_pnl || 0)}</strong> vs <strong class="${pnlClass(comp.long_net_pnl || 0)}">long ${fmtUsd(comp.long_net_pnl || 0)}</strong></div>` +
-    `<div>Short guardrail: <strong>${policyStatus}</strong> — ${policyReason}</div>`;
+    `<div>Short guardrail: <strong>${policyStatus}</strong> — ${escapeHtml(policyReason)}</div>`;
 
   const sides = analytics.by_side || [];
   sidesEl.innerHTML = sides.length ? sides.map(row => `
     <tr>
-      <td><span class="badge badge-${row.label}">${row.label.toUpperCase()}</span></td>
+      <td><span class="badge badge-${escapeHtml(row.label)}">${row.label.toUpperCase()}</span></td>
       <td>${row.count}</td>
       <td>${((row.win_rate || 0) * 100).toFixed(1)}%</td>
       <td class="red">${fmtUsd(-(row.fees || 0))}</td>
@@ -1874,7 +1882,7 @@ function renderTradeAnalytics(analytics, runtime){
   const sources = analytics.by_source || [];
   sourcesEl.innerHTML = sources.length ? sources.map(row => `
     <tr>
-      <td><code class="agent-key">${row.label}</code></td>
+      <td><code class="agent-key">${escapeHtml(row.label)}</code></td>
       <td>${row.count}</td>
       <td>${((row.win_rate || 0) * 100).toFixed(1)}%</td>
       <td class="red">${fmtUsd(-(row.fees || 0))}</td>
@@ -1884,7 +1892,7 @@ function renderTradeAnalytics(analytics, runtime){
   const coinSides = analytics.by_coin_side || [];
   coinSidesEl.innerHTML = coinSides.length ? coinSides.map(row => `
     <tr>
-      <td><code class="agent-key">${row.coin} ${String(row.side || '').toUpperCase()}</code></td>
+      <td><code class="agent-key">${escapeHtml(row.coin)} ${String(row.side || '').toUpperCase()}</code></td>
       <td>${row.count}</td>
       <td>${((row.win_rate || 0) * 100).toFixed(1)}%</td>
       <td class="red">${fmtUsd(-(row.fees || 0))}</td>
@@ -1922,8 +1930,8 @@ function renderTradeAnalytics(analytics, runtime){
 
   liveEl.innerHTML = liveRows.map(([label, value]) => `
     <tr>
-      <td>${label}</td>
-      <td>${value}</td>
+      <td>${escapeHtml(label)}</td>
+      <td>${escapeHtml(value)}</td>
     </tr>`).join('');
 }
 
@@ -1945,25 +1953,25 @@ function renderDriftAnalytics(drift, runtime){
     `<div>Paper open: <strong>${summary.paper_open_positions || 0}</strong> | paper closed: <strong>${summary.paper_closed_trades || 0}</strong> | realized paper PnL: <strong class="${pnlClass(summary.paper_net_pnl || 0)}">${fmtUsd(summary.paper_net_pnl || 0)}</strong></div>` +
     `<div>Audit approvals: <strong>${summary.audit_approved || 0}</strong> | audit rejects: <strong>${summary.audit_rejected || 0}</strong> | live entries today: <strong>${summary.live_entries_today || 0}</strong> | approval gap: <strong>${summary.approval_gap || 0}</strong></div>` +
     `<div>Realized paper sources: <strong>${summary.paper_sources_realized || 0}</strong> | live-active sources: <strong>${summary.live_sources_active || 0}</strong></div>` +
-    `<div>Copy-trade guardrail: <strong>${String(copyGuardrail.status || 'unknown').toUpperCase()}</strong> | ${copyGuardrail.reason || 'No copy-trader guardrail data yet.'}</div>`;
+    `<div>Copy-trade guardrail: <strong>${String(copyGuardrail.status || 'unknown').toUpperCase()}</strong> | ${escapeHtml(copyGuardrail.reason || 'No copy-trader guardrail data yet.')}</div>`;
 
   const bySource = drift.by_source || [];
   sourceEl.innerHTML = bySource.length ? bySource.map(row => `
     <tr>
-      <td><code class="agent-key">${row.label}</code></td>
+      <td><code class="agent-key">${escapeHtml(row.label)}</code></td>
       <td>${row.paper_open}</td>
       <td>${row.paper_closed}</td>
       <td class="${pnlClass(row.paper_net_pnl || 0)}">${fmtUsd(row.paper_net_pnl || 0)}</td>
       <td>${row.audit_approved}</td>
       <td>${row.audit_rejected}</td>
       <td>${row.live_entries_today}</td>
-      <td>${row.top_reject_reason || 'n/a'}</td>
+      <td>${escapeHtml(row.top_reject_reason || 'n/a')}</td>
     </tr>`).join('') : '<tr><td colspan="8" class="empty-row">No source drift data yet</td></tr>';
 
   const bySide = drift.by_side || [];
   sideEl.innerHTML = bySide.length ? bySide.map(row => `
     <tr>
-      <td><span class="badge badge-${row.label}">${String(row.label || 'unknown').toUpperCase()}</span></td>
+      <td><span class="badge badge-${escapeHtml(row.label)}">${String(row.label || 'unknown').toUpperCase()}</span></td>
       <td>${row.paper_open}</td>
       <td>${row.paper_closed}</td>
       <td class="${pnlClass(row.paper_net_pnl || 0)}">${fmtUsd(row.paper_net_pnl || 0)}</td>
@@ -1989,8 +1997,8 @@ function renderTypeChart(dist){
 function renderLogs(logs){
   document.getElementById('logs-table').innerHTML = logs.map(l=>`
     <tr><td>${l.timestamp?l.timestamp.slice(0,16):''}</td>
-    <td><span class="badge badge-type">${l.cycle_type}</span></td>
-    <td>${l.summary}</td><td>${l.traders_analyzed||0}</td><td>${l.strategies_found||0}</td></tr>`).join('');
+    <td><span class="badge badge-type">${escapeHtml(l.cycle_type)}</span></td>
+    <td>${escapeHtml(l.summary)}</td><td>${l.traders_analyzed||0}</td><td>${l.strategies_found||0}</td></tr>`).join('');
 }
 
 function renderEvents(events){
@@ -2010,33 +2018,33 @@ function renderEvents(events){
     `<div>Sources healthy: <strong>${summary.sources_ok || 0}/${summary.sources_total || 0}</strong></div>` +
     `<div>High impact next 24h: <strong>${summary.high_impact_next_24h || 0}</strong></div>` +
     `<div>Active incidents: <strong>${summary.incident_count || 0}</strong></div>` +
-    `<div>Next event: <strong>${nextLabel}</strong></div>`;
+    `<div>Next event: <strong>${escapeHtml(nextLabel)}</strong></div>`;
 
   const upcoming = events.upcoming || [];
   document.getElementById('events-upcoming').innerHTML = upcoming.length ? upcoming.map(event=>`
     <tr>
       <td>${event.event_time ? event.event_time.slice(5,16).replace('T',' ') : 'n/a'}</td>
-      <td>${event.source}</td>
-      <td><span class="badge badge-type">${event.severity}</span></td>
-      <td>${event.title}</td>
+      <td>${escapeHtml(event.source)}</td>
+      <td><span class="badge badge-type">${escapeHtml(event.severity)}</span></td>
+      <td>${escapeHtml(event.title)}</td>
     </tr>`).join('') : '<tr><td colspan="4" class="empty-row">No upcoming core events</td></tr>';
 
   const recent = events.recent || [];
   document.getElementById('events-recent').innerHTML = recent.length ? recent.map(event=>`
     <tr>
       <td>${(event.published_time || event.event_time || '').slice(5,16).replace('T',' ') || 'n/a'}</td>
-      <td>${event.source}</td>
-      <td><span class="badge badge-type">${event.category}</span></td>
-      <td>${event.title}</td>
+      <td>${escapeHtml(event.source)}</td>
+      <td><span class="badge badge-type">${escapeHtml(event.category)}</span></td>
+      <td>${escapeHtml(event.title)}</td>
     </tr>`).join('') : '<tr><td colspan="4" class="empty-row">No recent official releases</td></tr>';
 
   const incidents = events.incidents || [];
   document.getElementById('events-incidents').innerHTML = incidents.length ? incidents.map(event=>`
     <tr>
-      <td>${event.source}</td>
-      <td><span class="badge badge-type">${event.severity}</span></td>
+      <td>${escapeHtml(event.source)}</td>
+      <td><span class="badge badge-type">${escapeHtml(event.severity)}</span></td>
       <td>${(event.assets || []).join(', ') || 'ALL'}</td>
-      <td>${event.title}</td>
+      <td>${escapeHtml(event.title)}</td>
     </tr>`).join('') : '<tr><td colspan="4" class="empty-row">No active crypto incidents</td></tr>';
 }
 
@@ -2046,14 +2054,14 @@ function renderCopyTrades(trades){
     try { meta = JSON.parse(t.metadata || '{}'); } catch(e) {}
     const isGolden = meta.is_golden || meta.golden_wallet;
     const traderLabel = meta.source_trader
-      ? `<code>${meta.source_trader}</code>${isGolden ? ' <span class="table-note" style="display:inline;margin-left:6px;color:#b9771f">gold</span>' : ''}`
+      ? `<code>${escapeHtml(meta.source_trader)}</code>${isGolden ? ' <span class="table-note" style="display:inline;margin-left:6px;color:#b9771f">gold</span>' : ''}`
       : 'n/a';
     const typeLabel = meta.type || 'copy_open';
-    return `<tr><td>${t.coin}</td>
-    <td><span class="badge badge-${t.side}">${t.side.toUpperCase()}</span></td>
+    return `<tr><td>${escapeHtml(t.coin)}</td>
+    <td><span class="badge badge-${escapeHtml(t.side)}">${t.side.toUpperCase()}</span></td>
     <td>${fmtUsd(t.entry_price)}</td><td>${fmt(t.size,4)}</td>
     <td>${traderLabel}</td>
-    <td><span class="badge badge-type">${t.status}</span> <span class="table-note" style="display:inline;margin-left:6px">${typeLabel}</span></td>
+    <td><span class="badge badge-type">${escapeHtml(t.status)}</span> <span class="table-note" style="display:inline;margin-left:6px">${escapeHtml(typeLabel)}</span></td>
     <td class="${pnlClass(t.pnl)}">${t.pnl?fmtUsd(t.pnl):'n/a'}</td></tr>`;
   }).join('') : '<tr><td colspan="7" class="empty-row">No copy trades yet. Position cache is still warming up.</td></tr>';
 }
@@ -2208,7 +2216,7 @@ function renderV2(v2) {
   document.getElementById('v2-cards').innerHTML = cards.map(c=>`
     <div class="card"><div class="label">${c.label}</div>
     <div class="value ${c.cls||''}">${c.value}</div>
-    ${c.sub?`<div class="sub">${c.sub}</div>`:''}</div>`).join('');
+    ${c.sub?`<div class="sub">${escapeHtml(c.sub)}</div>`:''}</div>`).join('');
 
   const reasons = ['confidence','risk','regime','conflict','cooldown','accuracy','drawdown','schema','source_policy','source_cap','event_risk','side_policy','exposure','funding']
     .filter(r => fw['rejected_'+r] > 0)
@@ -2339,15 +2347,15 @@ function renderArena(arena) {
   document.getElementById('arena-cards').innerHTML = cards.map(c=>`
     <div class="card"><div class="label">${c.label}</div>
     <div class="value ${c.cls||''}">${c.value}</div>
-    ${c.sub?`<div class="sub">${c.sub}</div>`:''}</div>`).join('');
+    ${c.sub?`<div class="sub">${escapeHtml(c.sub)}</div>`:''}</div>`).join('');
 
   const lb = arena.leaderboard || [];
   document.getElementById('arena-leaderboard').innerHTML = lb.length ? lb.map(a=>{
     const statusCls = a.status==='champion'?'green':a.status==='active'?'blue':a.status==='probation'?'yellow':'red';
     return `<tr>
       <td>${a.rank}</td>
-      <td><code>${a.name}</code></td>
-      <td><span class="badge badge-type">${a.strategy}</span></td>
+      <td><code>${escapeHtml(a.name)}</code></td>
+      <td><span class="badge badge-type">${escapeHtml(a.strategy)}</span></td>
       <td><span class="${statusCls}">${a.status.toUpperCase()}</span></td>
       <td>${a.elo}</td>
       <td>${a.fitness.toFixed(3)}</td>
@@ -2365,7 +2373,7 @@ function renderArena(arena) {
     const cls = v.approved ? 'green' : 'red';
     return `<div class="consensus-item">
       <span class="${cls}" style="font-weight:700">${v.approved?'APPROVED':'REJECTED'}</span>
-      <span style="margin-left:8px">${v.side.toUpperCase()} ${v.coin}</span>
+      <span style="margin-left:8px">${v.side.toUpperCase()} ${escapeHtml(v.coin)}</span>
       <span class="consensus-meta">${v.votes_for} for / ${v.votes_against} against | approval ${(v.approval_ratio*100).toFixed(0)}%</span>
     </div>`;
   }).join('') : '<div class="empty-row">No consensus votes yet</div>';
