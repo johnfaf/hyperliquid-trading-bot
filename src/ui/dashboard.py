@@ -1801,14 +1801,17 @@ function renderOpenTrades(trades){
       pnlCls = unrealPnL > 0 ? 'green' : unrealPnL < 0 ? 'red' : '';
     }
     return `<tr><td>${escapeHtml(t.coin)}</td>
-    <td><span class="badge badge-${escapeHtml(t.side)}">${t.side.toUpperCase()}</span></td>
+    <td><span class="badge badge-${escapeHtml(t.side)}">${escapeHtml(String(t.side).toUpperCase())}</span></td>
     <td>${fmtUsd(t.entry_price)}</td><td>${currentPrice ? fmtUsd(currentPrice) : 'n/a'}</td>
     <td>${fmt(t.size,4)}</td><td>${t.leverage}x</td>
     <td class="${pnlCls}">${unrealPnL !== 'n/a' ? fmtUsd(unrealPnL) : 'n/a'}</td>
     <td>${fmtUsd(t.stop_loss)}</td><td>${fmtUsd(t.take_profit)}</td>
     <td>${escapeHtml(t.strategy_id||'n/a')}</td>
-    <td><button class="btn btn-close" onclick="closeTrade(${t.id},'${escapeHtml(t.coin)}')" id="close-btn-${t.id}" title="Close this position at market price">Close</button></td></tr>`;
+    <td><button class="btn btn-close" data-close-trade-id="${Number(t.id)}" data-close-coin="${escapeHtml(t.coin)}" id="close-btn-${Number(t.id)}" title="Close this position at market price">Close</button></td></tr>`;
   }).join('') : '<tr><td colspan="11" class="empty-row">No open positions</td></tr>';
+  document.getElementById('open-trades').querySelectorAll('[data-close-trade-id]').forEach(btn => {
+    btn.addEventListener('click', () => closeTrade(Number(btn.dataset.closeTradeId), btn.dataset.closeCoin));
+  });
   const closeAllBtn = document.getElementById('btn-close-all');
   if(closeAllBtn) closeAllBtn.style.display = trades.length ? '' : 'none';
 }
@@ -1833,7 +1836,7 @@ function renderTraders(traders){
 function renderClosedTrades(trades){
   document.getElementById('closed-trades').innerHTML = trades.length ? trades.slice(0,20).map(t=>`
     <tr><td>${escapeHtml(t.coin)}</td>
-    <td><span class="badge badge-${escapeHtml(t.side)}">${t.side.toUpperCase()}</span></td>
+    <td><span class="badge badge-${escapeHtml(t.side)}">${escapeHtml(String(t.side).toUpperCase())}</span></td>
     <td>${fmtUsd(t.entry_price)}</td><td>${fmtUsd(t.exit_price)}</td>
     <td class="${pnlClass(t.gross_pnl)}">${fmtUsd(t.gross_pnl)}</td>
     <td class="red">${fmtUsd(-(t.fees_paid||0))}</td>
@@ -1867,7 +1870,7 @@ function renderTradeAnalytics(analytics, runtime){
   summaryEl.innerHTML =
     `<div>Closed trades: <strong>${summary.count || 0}</strong> | Net PnL: <strong class="${pnlClass(summary.net_pnl || 0)}">${fmtUsd(summary.net_pnl || 0)}</strong> | Win rate: <strong>${((summary.win_rate || 0) * 100).toFixed(1)}%</strong></div>` +
     `<div>Short vs long: <strong class="${pnlClass(comp.short_net_pnl || 0)}">short ${fmtUsd(comp.short_net_pnl || 0)}</strong> vs <strong class="${pnlClass(comp.long_net_pnl || 0)}">long ${fmtUsd(comp.long_net_pnl || 0)}</strong></div>` +
-    `<div>Short guardrail: <strong>${policyStatus}</strong> — ${escapeHtml(policyReason)}</div>`;
+    `<div>Short guardrail: <strong>${escapeHtml(policyStatus)}</strong> — ${escapeHtml(policyReason)}</div>`;
 
   const sides = analytics.by_side || [];
   sidesEl.innerHTML = sides.length ? sides.map(row => `
@@ -2043,7 +2046,7 @@ function renderEvents(events){
     <tr>
       <td>${escapeHtml(event.source)}</td>
       <td><span class="badge badge-type">${escapeHtml(event.severity)}</span></td>
-      <td>${(event.assets || []).join(', ') || 'ALL'}</td>
+      <td>${escapeHtml((event.assets || []).join(', ') || 'ALL')}</td>
       <td>${escapeHtml(event.title)}</td>
     </tr>`).join('') : '<tr><td colspan="4" class="empty-row">No active crypto incidents</td></tr>';
 }
@@ -2058,7 +2061,7 @@ function renderCopyTrades(trades){
       : 'n/a';
     const typeLabel = meta.type || 'copy_open';
     return `<tr><td>${escapeHtml(t.coin)}</td>
-    <td><span class="badge badge-${escapeHtml(t.side)}">${t.side.toUpperCase()}</span></td>
+    <td><span class="badge badge-${escapeHtml(t.side)}">${escapeHtml(String(t.side).toUpperCase())}</span></td>
     <td>${fmtUsd(t.entry_price)}</td><td>${fmt(t.size,4)}</td>
     <td>${traderLabel}</td>
     <td><span class="badge badge-type">${escapeHtml(t.status)}</span> <span class="table-note" style="display:inline;margin-left:6px">${escapeHtml(typeLabel)}</span></td>
@@ -2098,7 +2101,7 @@ function renderEquityChart(closed){
 }
 
 async function closeTrade(tradeId, coin){
-  if(!confirm(`Close ${coin} position at market price?`)) return;
+  if(!confirm(`Close ${escapeHtml(coin)} position at market price?`)) return;
   const btn = document.getElementById('close-btn-'+tradeId);
   if(btn){btn.disabled=true;btn.textContent='Closing...';}
   try {
@@ -2256,7 +2259,7 @@ function renderV2(v2) {
   document.getElementById('regime-grid').innerHTML = coins.length ? coins.map(([coin, r])=>{
     const cls = r.regime.includes('up') ? 'green' : r.regime.includes('down') ? 'red' : r.regime === 'volatile' ? 'yellow' : 'blue';
     return `<div class="card regime-card">
-      <div class="label">${coin}</div>
+      <div class="label">${escapeHtml(coin)}</div>
       <div class="value ${cls}">${r.regime.replace('_',' ').toUpperCase()}</div>
       <div class="sub">ADX: ${r.adx} | ATR: ${(r.atr_pct*100).toFixed(1)}% | Conf: ${(r.confidence*100).toFixed(0)}%</div>
     </div>`;
@@ -2328,7 +2331,7 @@ function renderRuntimeHealth(runtime) {
     `<div>Canary headroom: <strong>${live.canary_headroom_ratio != null ? live.canary_headroom_ratio + 'x' : 'n/a'}</strong> | crash-safe cap <strong>${live.crash_safe_canary_order_usd != null ? fmtUsd(live.crash_safe_canary_order_usd) : 'n/a'}</strong></div>` +
     `<div>Live sizing: <strong>${liveSizing.enabled ? fmtUsd(liveSizing.target_margin_usd || 0) + ' margin / ' + fmtUsd(liveSizing.target_notional_usd || 0) + ' notional' : (liveSizing.reason || 'n/a')}</strong> | stop <strong>${liveSizing.stop_roe_pct != null ? (Number(liveSizing.stop_roe_pct) * 100).toFixed(2) + '% ROE' : 'n/a'}</strong></div>` +
     `<div>Order hygiene: <strong>${String(hygieneAudit.status || 'n/a').toUpperCase()}</strong> | protected <strong>${hygieneAudit.protected || 0}</strong> | cancelled <strong>${hygieneAudit.stale_cancelled || 0}</strong> | failed <strong>${hygieneAudit.failed || 0}</strong></div>` +
-    `<div>Short guardrail: <strong>${String(shortPolicy.status || 'unknown').toUpperCase()}</strong> — ${shortPolicy.reason || 'n/a'}</div>` +
+    `<div>Short guardrail: <strong>${escapeHtml(String(shortPolicy.status || 'unknown').toUpperCase())}</strong> — ${shortPolicy.reason || 'n/a'}</div>` +
     copyGuardrailLine +
     `<div>Live source usage: <strong>${sourceUsageSummary}</strong></div>` +
     `<div>Source allocator: <strong>${sourcePolicySummary}</strong></div>`;
@@ -2356,7 +2359,7 @@ function renderArena(arena) {
       <td>${a.rank}</td>
       <td><code>${escapeHtml(a.name)}</code></td>
       <td><span class="badge badge-type">${escapeHtml(a.strategy)}</span></td>
-      <td><span class="${statusCls}">${a.status.toUpperCase()}</span></td>
+      <td><span class="${statusCls}">${escapeHtml(String(a.status).toUpperCase())}</span></td>
       <td>${a.elo}</td>
       <td>${a.fitness.toFixed(3)}</td>
       <td>${fmtUsd(a.capital)}</td>
@@ -2373,7 +2376,7 @@ function renderArena(arena) {
     const cls = v.approved ? 'green' : 'red';
     return `<div class="consensus-item">
       <span class="${cls}" style="font-weight:700">${v.approved?'APPROVED':'REJECTED'}</span>
-      <span style="margin-left:8px">${v.side.toUpperCase()} ${escapeHtml(v.coin)}</span>
+      <span style="margin-left:8px">${escapeHtml(String(v.side).toUpperCase())} ${escapeHtml(v.coin)}</span>
       <span class="consensus-meta">${v.votes_for} for / ${v.votes_against} against | approval ${(v.approval_ratio*100).toFixed(0)}%</span>
     </div>`;
   }).join('') : '<div class="empty-row">No consensus votes yet</div>';
