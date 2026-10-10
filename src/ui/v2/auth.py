@@ -76,7 +76,7 @@ def verify_cookie(request: Request) -> bool:
     token = _server_token()
     if not token:
         # No token configured -- the operator hasn't enabled auth.
-        return True
+        return False
     raw = request.cookies.get(COOKIE_NAME)
     if not raw:
         return False
@@ -115,7 +115,7 @@ def login_with_token(submitted_token: str) -> bool:
     """Constant-time compare submitted token against the server token."""
     expected = _server_token()
     if not expected:
-        return True
+        return False
     return hmac.compare_digest(submitted_token, expected)
 
 
