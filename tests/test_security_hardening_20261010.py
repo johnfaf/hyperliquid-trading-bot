@@ -1,7 +1,6 @@
 """Regression checks for previously identified security weaknesses."""
 from __future__ import annotations
 
-from io import BytesIO
 from types import SimpleNamespace
 
 from src.ui import dashboard
