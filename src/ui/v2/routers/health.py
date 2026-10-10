@@ -8,11 +8,12 @@ from __future__ import annotations
 import logging
 import os
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Request
 from starlette.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
 
 from src.ui.v2.cache import get_ttl
+from src.ui.v2.auth import verify_cookie
 
 logger = logging.getLogger(__name__)
 
@@ -42,13 +43,15 @@ async def health() -> JSONResponse:
 
 
 @router.get("/api/ready")
-async def ready() -> JSONResponse:
+async def ready(request: Request) -> JSONResponse:
     """Aggregated readiness check.
 
     Surfaces whatever ``evaluate_readiness`` reports today; the
     dashboard renders this in the header bar so operators see degraded
     state at a glance.
     """
+    if not verify_cookie(request):
+        return JSONResponse({"error": "auth_required"}, status_code=401)
     try:
         result = await run_in_threadpool(
             _cached_readiness,
@@ -62,21 +65,23 @@ async def ready() -> JSONResponse:
 
 
 @router.get("/api/live_ready")
-async def live_ready() -> JSONResponse:
+async def live_ready(request: Request) -> JSONResponse:
     """Same probe as ``/api/ready`` but expected to be hit by the
     exchange-facing health monitor. Kept separate so we can later
     diverge the strictness without breaking operator dashboards."""
-    return await ready()
+    return await ready(request)
 
 
 @router.get("/api/health/strip")
-async def health_strip() -> JSONResponse:
+async def health_strip(request: Request) -> JSONResponse:
     """Compact health snapshot for the dashboard header strip.
 
     Returns ``{tone, label, summary, reasons}`` where ``tone`` is one
     of ``green | amber | rose`` so the frontend can colour without
     interpreting the readiness payload.
     """
+    if not verify_cookie(request):
+        return JSONResponse({"error": "auth_required"}, status_code=401)
     payload: dict = {"tone": "amber", "label": "unknown", "summary": "no data", "reasons": []}
     try:
         result = await run_in_threadpool(
@@ -125,11 +130,13 @@ async def health_strip() -> JSONResponse:
 
 
 @router.get("/api/why_not_trading")
-async def why_not_trading(hours: float = 6.0) -> JSONResponse:
+async def why_not_trading(request: Request, hours: float = 6.0) -> JSONResponse:
     """Decision-funnel breakdown for a quiet bot: how many candidate
     decisions executed vs were rejected in the last ``hours``, and the top
     rejection reasons -- the "Decision summary" log line, made queryable so
     you can see *why* nothing is trading without grepping logs."""
+    if not verify_cookie(request):
+        return JSONResponse({"error": "auth_required"}, status_code=401)
     try:
         result = await run_in_threadpool(_cached_why_not_trading, float(hours))
     except Exception as exc:
