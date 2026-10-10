@@ -34,6 +34,7 @@ async def login_submit(request: Request, token: str = Form(...)):
             {"title": "Sign in", "error": "Invalid token."},
             status_code=401,
         )
+    v2_auth.login_attempt_succeeded(request.client.host if request.client else "unknown")
     response = RedirectResponse(url="/", status_code=303)
     secure = request.url.scheme == "https"
     v2_auth.issue_cookie(response, secure=secure)
