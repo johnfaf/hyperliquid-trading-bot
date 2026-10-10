@@ -173,6 +173,8 @@ def start_server(
     bind_host = host or os.environ.get("DASHBOARD_V2_HOST", "0.0.0.0")
     bind_port = int(port or os.environ.get("DASHBOARD_V2_PORT", "8081"))
 
+    if bind_host in ("0.0.0.0", "::") and not os.environ.get("DASHBOARD_AUTH_TOKEN", "").strip():
+        raise RuntimeError("DASHBOARD_AUTH_TOKEN required for public v2 dashboard")
     _configure_stdio_encoding()
     app = create_app()
     # Tell uvicorn to mute its WebSocket lifecycle "INFO: connection open"
