@@ -30,6 +30,12 @@ def _load_credentials() -> tuple:
     return token, chat_id, api
 
 
+def _safe_telegram_error(error: object) -> str:
+    message = str(error or "")
+    token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+    return (message.replace(token, "<redacted>") if token else message)[:500]
+
+
 def _report_health(success: bool, reason: str = "") -> None:
     """Report Telegram subsystem health to the shared registry (best effort)."""
     try:
@@ -107,7 +113,7 @@ def _send_message(text: str, parse_mode: str = "HTML", disable_preview: bool = T
                 _report_health(success=True)
                 return True
 
-            body_preview = (resp.text or "")[:120]
+            body_preview = _safe_telegram_error(resp.text or "")[:120]
             last_error = f"http_{resp.status_code}:{body_preview}"
             transient = resp.status_code == 429 or resp.status_code >= 500
             if transient and attempt < _MAX_SEND_RETRIES:
@@ -125,7 +131,7 @@ def _send_message(text: str, parse_mode: str = "HTML", disable_preview: bool = T
             logger.warning("Telegram send failed: %s", last_error)
             break
         except Exception as e:
-            last_error = str(e)
+            last_error = _safe_telegram_error(e)
             if attempt < _MAX_SEND_RETRIES:
                 wait = _RETRY_BASE_DELAY_S * (2 ** (attempt - 1))
                 logger.warning(
@@ -133,11 +139,11 @@ def _send_message(text: str, parse_mode: str = "HTML", disable_preview: bool = T
                     attempt,
                     _MAX_SEND_RETRIES,
                     wait,
-                    e,
+                    _safe_telegram_error(e),
                 )
                 time.sleep(wait)
                 continue
-            logger.warning("Telegram send error: %s", e)
+            logger.warning("Telegram send error: %s", _safe_telegram_error(e))
 
     # Cap streak and record timestamp for time-based decay
     now = time.time()
