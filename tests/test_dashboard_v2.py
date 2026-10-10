@@ -217,7 +217,7 @@ def test_login_round_trip_sets_session_cookie(monkeypatch, app):
 
 
 def test_calibration_unavailable_when_component_not_set(monkeypatch, tmp_path):
-    monkeypatch.delenv("DASHBOARD_AUTH_TOKEN", raising=False)
+    monkeypatch.setenv("DASHBOARD_AUTH_TOKEN", "test-dashboard-secret")
     v2_state.reset_components()
     app = create_app()
     client = TestClient(app)
@@ -344,7 +344,7 @@ def test_sources_endpoint_aggregates_calibration(monkeypatch, tmp_path):
     single source row. Verify the rollup matches the underlying
     calibrator state.
     """
-    monkeypatch.delenv("DASHBOARD_AUTH_TOKEN", raising=False)
+    monkeypatch.setenv("DASHBOARD_AUTH_TOKEN", "test-dashboard-secret")
     v2_state.reset_components()
     cal = CalibrationTracker(db_path=str(tmp_path / "cal.db"))
     for _ in range(20):
@@ -625,7 +625,7 @@ def test_clear_quarantine_requires_calibration(client):
 
 
 def test_clear_quarantine_drops_records(monkeypatch, tmp_path):
-    monkeypatch.delenv("DASHBOARD_AUTH_TOKEN", raising=False)
+    monkeypatch.setenv("DASHBOARD_AUTH_TOKEN", "test-dashboard-secret")
     v2_state.reset_components()
     cal = CalibrationTracker(
         db_path=str(tmp_path / "cal.db"),
