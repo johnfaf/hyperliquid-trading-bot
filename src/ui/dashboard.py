@@ -7,6 +7,7 @@ Serves a unified web dashboard on port 8080 with:
 Both dashboards served from the same port for Railway compatibility.
 """
 import errno
+import html
 import hashlib
 import hmac
 import json
@@ -105,6 +106,20 @@ def _rate_limit_allowed(key: str) -> bool:
         tokens, last_seen = _RATE_LIMIT_BUCKETS.get(key, (capacity, now))
         elapsed = max(0.0, now - last_seen)
         tokens = min(capacity, tokens + elapsed * refill_per_sec)
+        if tokens < 1.0:
+            _RATE_LIMIT_BUCKETS[key] = (tokens, now)
+            return False
+        _RATE_LIMIT_BUCKETS[key] = (tokens - 1.0, now)
+        return True
+
+
+def _login_rate_limit_allowed(client_host: str) -> bool:
+    """Limit unauthenticated login attempts to 10 requests per minute per peer."""
+    key = "login:" + client_host
+    now = time.monotonic()
+    with _RATE_LIMIT_LOCK:
+        tokens, last_seen = _RATE_LIMIT_BUCKETS.get(key, (10.0, now))
+        tokens = min(10.0, tokens + max(0.0, now - last_seen) / 6.0)
         if tokens < 1.0:
             _RATE_LIMIT_BUCKETS[key] = (tokens, now)
             return False
@@ -288,11 +303,20 @@ def _safe_json(obj):
     return str(obj)
 
 
+def _safe_dashboard_next(value: str) -> str:
+    """Allow only local absolute paths, not network-path or invalid redirects."""
+    path = str(value or "/").strip()
+    if (not path.startswith("/") or path.startswith("//") or "\\" in path
+            or any(ord(c) < 32 or ord(c) == 127 for c in path)):
+        return "/"
+    return path
+
+
 def _login_html(error_message: str = "", next_path: str = "/") -> str:
     """Render a small token login page that establishes the dashboard cookie."""
     error_block = (
         f'<p style="margin:0 0 16px;color:#b42318;background:#fef3f2;'
-        f'border:1px solid #fecdca;padding:12px 14px;border-radius:10px;">{error_message}</p>'
+        f'border:1px solid #fecdca;padding:12px 14px;border-radius:10px;">{html.escape(error_message, quote=True)}</p>'
         if error_message
         else ""
     )
@@ -399,7 +423,7 @@ def _login_html(error_message: str = "", next_path: str = "/") -> str:
     <p>Enter the dashboard auth token once. We will set a secure cookie for this browser and send you back to the dashboard.</p>
     {error_block}
     <form method="post" action="/api/auth/login">
-      <input type="hidden" name="next" value="{next_path}">
+      <input type="hidden" name="next" value="{html.escape(next_path, quote=True)}">
       <label for="token">Auth Token</label>
       <input id="token" name="token" type="password" autocomplete="current-password" required>
       <button type="submit">Open Dashboard</button>
@@ -2482,7 +2506,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def _serve_login(self):
         parsed = urlparse(self.path)
         params = parse_qs(parsed.query)
-        next_path = params.get("next", ["/"])[0] or "/"
+        next_path = _safe_dashboard_next(params.get("next", ["/"])[0])
         error_message = ""
         if params.get("error", [""])[0] == "invalid":
             error_message = "Token was not accepted. Double-check the Railway variable and try again."
@@ -2493,13 +2517,17 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.wfile.write(_login_html(error_message=error_message, next_path=next_path).encode())
 
     def _handle_login(self):
+        client_host = str((getattr(self, "client_address", None) or ["unknown"])[0])
+        if not _login_rate_limit_allowed(client_host):
+            self._json_response({"error": "login_rate_limited"}, code=429)
+            return
         auth_token = _dashboard_auth_token()
         raw_body = self._read_request_body()
         if raw_body is None:
             return
         form = parse_qs(raw_body.decode("utf-8", errors="ignore"))
         token = (form.get("token", [""])[0] or "").strip()
-        next_path = (form.get("next", ["/"])[0] or "/").strip()
+        next_path = _safe_dashboard_next(form.get("next", ["/"])[0])
         if not next_path.startswith("/"):
             next_path = "/"
         if not auth_token:
