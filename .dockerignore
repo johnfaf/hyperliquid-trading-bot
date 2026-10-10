@@ -28,7 +28,6 @@ __pycache__/
 node_modules/
 tests/
 docs/
-scripts/
 *.log
 *.zip
 *.tar
