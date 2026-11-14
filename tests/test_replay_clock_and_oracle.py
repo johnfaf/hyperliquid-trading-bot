@@ -10,7 +10,7 @@ import pytest
 
 from src.backtest.replay.clock import LiveClock, ReplayClock
 from src.backtest.replay.candle_oracle import (
-    CandleOracle, LookaheadError,
+    CandleOracle, LookaheadError, TIMEFRAME_MS,
 )
 
 
@@ -176,6 +176,19 @@ def test_oracle_latest_price_returns_most_recent_close(tmp_path):
     # Rewinding the clock returns the older close
     clk.set(opens[1] + 60_000)
     assert oracle.get_latest_price("BTC", "1m") == 200.0
+
+
+@pytest.mark.parametrize("timeframe", TIMEFRAME_MS)
+def test_oracle_range_never_reveals_an_unclosed_bar(tmp_path, timeframe):
+    start = 1_700_000_000_000
+    interval = TIMEFRAME_MS[timeframe]
+    db = _make_cache_db(tmp_path, _bar("BTC", timeframe, start, 100.0),
+                        _bar("BTC", timeframe, start + interval, 200.0))
+    clock = ReplayClock(start_ts_ms=start + interval * 2 - 1)
+    oracle = CandleOracle(db, clock)
+    assert [c.close for c in oracle.get_range("BTC", timeframe, start, clock.now_ms())] == [100.0]
+    clock.advance(1)
+    assert [c.close for c in oracle.get_range("BTC", timeframe, start, clock.now_ms())] == [100.0, 200.0]
 
 
 def test_oracle_latest_price_none_before_first_close(tmp_path):

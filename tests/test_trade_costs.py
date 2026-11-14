@@ -42,7 +42,7 @@ def test_taker_default_round_trip():
 
 def test_maker_role_lower_fees():
     costs = estimate_signal_costs_bps(_signal(), role="maker")
-    assert costs["fees_bps"] == pytest.approx(0.4, abs=1e-6)
+    assert costs["fees_bps"] == pytest.approx(2.7, abs=1e-6)  # maker entry, taker exit
 
 
 def test_short_funding_sign_flips():

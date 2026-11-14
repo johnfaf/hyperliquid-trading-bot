@@ -358,11 +358,18 @@ async def close_live_position(
     if live_trader is None:
         return JSONResponse({"error": "live_trader_unavailable"}, status_code=503)
 
-    operator = request.cookies.get("dashboard_v2_auth", "")[:16] or "dashboard"
+    operator = "dashboard"
     try:
-        pre_cancel = _safe_call(live_trader, "cancel_all_orders_detailed", coin=target_coin)
+        pre_cancel = live_trader.cancel_entry_orders_detailed(coin=target_coin)
+        if not pre_cancel.get("success"):
+            return JSONResponse({"error": "entry_cancel_unconfirmed"}, status_code=409)
         result = live_trader.close_position(target_coin)
-        post_cancel = _safe_call(live_trader, "cancel_all_orders_detailed", coin=target_coin)
+        positions = live_trader.get_positions(force_fresh=True)
+        flat_verified = (
+            isinstance(positions, list) and not any(
+                str(row.get("coin", "")).upper() == target_coin for row in positions
+            )
+        )
         logger.warning(
             "dashboard operator close_position coin=%s operator=%s reason=%s result=%s",
             target_coin,
@@ -387,12 +394,13 @@ async def close_live_position(
         invalidate("recent_fills")
         return JSONResponse(
             {
-                "ok": True,
+                "ok": flat_verified,
                 "coin": target_coin,
                 "result": result,
                 "pre_cancel": pre_cancel,
-                "post_cancel": post_cancel,
-            }
+                "flat_verified": flat_verified,
+            },
+            status_code=200 if flat_verified else 409,
         )
     except AttributeError:
         return JSONResponse({"error": "close_position_unsupported"}, status_code=501)

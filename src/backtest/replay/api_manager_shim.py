@@ -88,7 +88,7 @@ class ReplayAPIManager:
         self._oracle = oracle
         self._clock = clock
         self._position_oracle = position_oracle
-        self._funding_rate_8h = float(funding_rate_8h)
+        self._funding_rate_hourly = float(funding_rate_8h) / 8.0
         self._strict = bool(strict)
         self._lock = threading.Lock()
         self._call_counts: Counter[str] = Counter()
@@ -179,7 +179,7 @@ class ReplayAPIManager:
         for coin in self._known_coins:
             px = self._oracle.get_latest_price(coin, "1m") or self._oracle.get_latest_price(coin, "1h")
             ctxs.append({
-                "funding": str(self._funding_rate_8h),
+                "funding": str(self._funding_rate_hourly),
                 "openInterest": "0",
                 "prevDayPx": str(px) if px is not None else "0",
                 "dayNtlVlm": "0",

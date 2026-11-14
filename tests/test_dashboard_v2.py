@@ -306,13 +306,17 @@ def test_close_position_operator_override_calls_live_trader(client):
     calls = []
 
     class _Stub:
-        def cancel_all_orders_detailed(self, coin=None):
-            calls.append(("cancel", coin))
+        def cancel_entry_orders_detailed(self, coin=None):
+            calls.append(("cancel_entries", coin))
             return {"success": True, "cancelled_count": 0}
 
         def close_position(self, coin):
             calls.append(("close", coin))
             return {"status": "ok", "coin": coin}
+
+        def get_positions(self, *, force_fresh=False):
+            assert force_fresh
+            return []
 
     v2_state.set_components(live_trader=_Stub())
     r = client.post(
@@ -323,7 +327,24 @@ def test_close_position_operator_override_calls_live_trader(client):
     body = r.json()
     assert body["ok"] is True
     assert body["coin"] == "BTC"
-    assert calls == [("cancel", "BTC"), ("close", "BTC"), ("cancel", "BTC")]
+    assert calls == [("cancel_entries", "BTC"), ("close", "BTC")]
+
+
+def test_operator_close_reports_unconfirmed_when_position_snapshot_is_missing(client):
+    class _Stub:
+        def cancel_entry_orders_detailed(self, coin=None):
+            return {"success": True}
+
+        def close_position(self, coin):
+            return {"status": "ok", "coin": coin}
+
+        def get_positions(self, *, force_fresh=False):
+            return None
+
+    v2_state.set_components(live_trader=_Stub())
+    response = client.post("/api/operator/close_position", data={"coin": "BTC", "audit_reason": "verify closing"})
+    assert response.status_code == 409
+    assert response.json()["flat_verified"] is False
 
 
 def test_sources_endpoint_no_agent_scorer(client):

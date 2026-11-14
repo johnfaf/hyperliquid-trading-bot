@@ -101,7 +101,7 @@ def test_shim_meta_and_asset_ctxs_shape_matches_hl(tmp_path):
     meta, ctxs = out
     assert "universe" in meta
     assert meta["universe"][0]["name"] == "BTC"
-    assert ctxs[0]["funding"] == "0.0001"
+    assert float(ctxs[0]["funding"]) == pytest.approx(0.0001 / 8)
     assert ctxs[0]["midPx"] == "50000.0"
 
 

@@ -29,18 +29,6 @@ def _trade_metadata(trade: Dict) -> Dict:
         return {}
 
 
-def _notify_manual_close_detected(trade: Dict, exit_price: float) -> None:
-    try:
-        from src.notifications import telegram_bot as tg
-    except Exception:
-        return
-
-    try:
-        tg.notify_manual_close_detected(trade, exit_price=exit_price)
-    except Exception as exc:
-        logger.debug("Manual close notification failed for %s: %s", trade.get("coin", "?"), exc)
-
-
 def _is_insufficient_margin_rejection(result) -> bool:
     """Return True when a rejection payload indicates insufficient margin."""
     if not isinstance(result, dict):
@@ -245,25 +233,7 @@ def _paper_trade_id_from_live_mirror(execution, live_signal=None) -> Optional[in
     return None
 
 
-def _execution_entry_price(execution=None, live_signal=None) -> float:
-    """Best-effort entry price for closing an unmirrored shadow row flat."""
-    candidates = []
-    if isinstance(execution, dict):
-        candidates.extend(
-            execution.get(key)
-            for key in ("entry_price", "price", "fill_price")
-        )
-    for attr in ("entry_price", "price", "fill_price"):
-        candidates.append(getattr(live_signal, attr, None))
 
-    for value in candidates:
-        try:
-            price = float(value or 0.0)
-        except (TypeError, ValueError):
-            continue
-        if price > 0:
-            return price
-    return 0.0
 
 
 def is_confirmed_live_execution_result(live_result: Dict) -> bool:
@@ -292,80 +262,32 @@ def _is_confirmed_live_mirror_result(live_result: Dict) -> bool:
     return is_confirmed_live_execution_result(live_result)
 
 
-def _close_unmirrored_paper_trade(
-    trade_id: Optional[int],
-    live_signal=None,
-    reason: str = "live_mirror_not_opened",
-    live_result: Optional[Dict] = None,
-    entry_price: Optional[float] = None,
-) -> None:
-    """Close a paper trade flat when its live mirror never became real."""
-    if not trade_id:
-        return
-
-    flat_price = float(entry_price or 0.0)
-    if flat_price <= 0:
-        flat_price = _execution_entry_price(live_signal=live_signal)
-    if flat_price <= 0:
-        logger.warning(
-            "Could not close unmirrored paper trade %s flat: missing entry price",
-            trade_id,
-        )
-        return
-
-    now = datetime.now(timezone.utc).isoformat()
-    metadata = {
-        "live_mirror": False,
-        "live_mirror_attempted": True,
-        "live_mirror_failed_at": now,
-        "live_mirror_blocked_reason": reason,
-        "live_mirror_closed_flat": True,
-        "close_reason": reason,
-        "gross_pnl_before_fees": 0.0,
-        "net_pnl_after_fees": 0.0,
-    }
-    if live_signal is not None:
-        metadata.update({
-            "live_mirror_coin": getattr(live_signal, "coin", None),
-            "live_mirror_side": (
-                getattr(getattr(live_signal, "side", None), "value", None)
-                or str(getattr(live_signal, "side", "") or "")
-            ),
-        })
-    if isinstance(live_result, dict):
-        metadata["live_mirror_status"] = live_result.get("status")
-        for key in ("reason", "message", "entry_order_type"):
-            value = live_result.get(key)
-            if value not in (None, ""):
-                metadata[f"live_mirror_{key}"] = value
-        errors = live_result.get("errors")
-        if errors:
-            metadata["live_mirror_errors"] = errors
-    else:
-        metadata["live_mirror_status"] = "no_result"
-
+def _record_unconfirmed_live_mirror(trade_id, live_signal, venue: str, live_result) -> None:
+    """Keep execution exceptions out of the simulated ledger."""
+    result = live_result if isinstance(live_result, dict) else {}
     try:
-        db.update_paper_trade_metadata(int(trade_id), metadata)
-        if db.close_paper_trade(int(trade_id), flat_price, 0.0):
-            logger.info(
-                "Closed unmirrored paper trade %s flat (%s) so it cannot "
-                "be reconciled as live PnL later",
-                trade_id,
-                reason,
-            )
-    except Exception as exc:
-        logger.warning(
-            "Could not close unmirrored paper trade %s flat (%s): %s",
-            trade_id,
-            reason,
-            exc,
+        db.audit_log(
+            "live_mirror_unconfirmed",
+            coin=getattr(live_signal, "coin", None),
+            side=getattr(getattr(live_signal, "side", None), "value", None),
+            source="live_execution",
+            details={
+                "paper_trade_id": trade_id,
+                "venue": venue,
+                "status": result.get("status"),
+                "order_id": result.get("order_id") or result.get("oid"),
+                "client_order_id": result.get("client_order_id") or result.get("cloid"),
+            },
         )
+    except Exception:
+        logger.error("Unconfirmed live mirror could not be journaled: paper trade %s", trade_id)
 
 
 def _mark_paper_trade_live_mirrored(
     trade_id: Optional[int],
     live_signal,
     live_result: Dict,
+    venue: str,
 ) -> None:
     """Persist live-mirror metadata so live-mode history filters see the trade."""
     if not trade_id:
@@ -375,6 +297,7 @@ def _mark_paper_trade_live_mirrored(
 
     metadata = {
         "live_mirror": True,
+        "live_mirror_venue": venue,
         "live_mirror_attempted": True,
         "live_mirror_marked_at": datetime.now(timezone.utc).isoformat(),
         "live_mirror_status": live_result.get("status"),
@@ -395,28 +318,6 @@ def _mark_paper_trade_live_mirrored(
             trade_id,
             exc,
         )
-
-
-def _paper_trade_id_for_client_order_id(client_order_id: str) -> Optional[int]:
-    """Return an existing paper trade id for an idempotency key, if present."""
-    if not client_order_id:
-        return None
-    try:
-        with db.get_connection(for_read=True) as conn:
-            row = conn.execute(
-                "SELECT id FROM paper_trades WHERE client_order_id = ?",
-                (client_order_id,),
-            ).fetchone()
-    except Exception as exc:
-        logger.debug("paper trade idempotency lookup failed: %s", exc)
-        return None
-    if not row:
-        return None
-    try:
-        return int(row["id"] if hasattr(row, "keys") else row[0])
-    except Exception:
-        return None
-
 
 def get_live_trader(container):
     """Return the attached live trader, if any."""
@@ -471,272 +372,44 @@ def get_execution_account_balance(container) -> Optional[float]:
 
 
 def sync_shadow_book_to_live(container) -> List[Dict]:
-    """
-    Close shadow paper trades that no longer exist on the exchange.
-
-    In live mode, exchange state is the authority. This keeps the paper book as
-    a reporting shadow instead of letting it drive runtime decisions.
-
-    SAFETY: If the live account has $0 perps margin, skip reconciliation
-    entirely.  Otherwise we'd close every paper trade because the exchange
-    shows 0 positions (the money is in spot or hasn't been deposited).
-    """
-    if not is_live_trading_active(container) or not getattr(container, "paper_trader", None):
+    """Journal position discrepancies, never inferred fills or paper P&L."""
+    if not is_live_trading_active(container):
         return []
 
-    # Guard: don't reconcile paper trades against an unfunded exchange account.
-    # With $0 perps margin the exchange will always show 0 positions, which
-    # would cause this function to close EVERY paper trade immediately.
     trader = get_live_trader(container)
-    account_value = trader.get_account_value() if trader else None
-    if account_value is None or account_value <= 0:
+    venue = str(getattr(trader, "exchange", "hyperliquid"))
+    # This is intentionally observation-only. A coin/side match cannot
+    # establish a fill's identity or allocate it to a simulated trade.
+    positions = trader.get_positions(force_fresh=True)
+    if positions is None:
+        logger.warning("Live reconciliation deferred: position snapshot unavailable")
         return []
 
-    try:
-        fetched_positions = trader.get_positions(force_fresh=True) if trader else None
-    except TypeError:
-        fetched_positions = trader.get_positions() if trader else None
-    if fetched_positions is None:
-        logger.warning("Skipping shadow/live reconciliation: exchange positions unavailable")
-        return []
+    def position_key(row):
+        return (str(row.get("coin") or "").upper(), str(row.get("side") or "").lower())
 
-    live_positions = {
-        pos.get("coin", ""): pos
-        for pos in fetched_positions
-        if pos.get("coin") and abs(float(pos.get("szi", pos.get("size", 0)) or 0)) > 0
+    observed = {
+        position_key(row) for row in positions
+        if all(position_key(row)) and abs(float(row.get("size", row.get("szi", 0)) or 0)) > 0
     }
-    open_trades = db.get_open_paper_trades()
-    if not open_trades:
-        open_trades = []
+    mirrored = {}
+    for trade in db.get_open_paper_trades():
+        meta = _trade_metadata(trade)
+        if meta.get("live_mirror") and not meta.get("synthetic_reconciliation"):
+            mirror_venue = meta.get("live_mirror_venue", "hyperliquid")
+            if mirror_venue == venue:
+                mirrored.setdefault(position_key(trade), []).append(trade["id"])
 
-    mids = get_all_mids() or {}
-    closed = []
-    matched_live_keys = set()
-    for trade in open_trades:
-        existing_meta = _trade_metadata(trade)
-        # ★ RECONCILER FIX (origin/main 3d3e493): skip paper trades that
-        # were never attempted on live (e.g. promotion-gate-blocked
-        # sources, untagged sources, bootstrap-tier-deferred copies).
-        # For these the absence of a live position is expected by
-        # design, not an anomaly to close out.  Without this guard the
-        # reconciler force-closes ~89% of paper trades at adverse
-        # mid-prices ~3 minutes after open, poisoning the firewall's
-        # recent-loss windows and the agent_scorer's outcome history
-        # with -$735 of fake losses.
-        is_live_shadow = bool(
-            existing_meta.get("live_mirror") or existing_meta.get("orphan_found")
-        )
-        if not is_live_shadow:
-            logger.debug(
-                "Skipping shadow/live reconciliation for unmirrored paper "
-                "trade_id=%s coin=%s side=%s",
-                trade.get("id"),
-                trade.get("coin", "?"),
-                trade.get("side", "?"),
-            )
-            continue
-
-        live_pos = live_positions.get(trade.get("coin", ""))
-        if live_pos and live_pos.get("side") == trade.get("side"):
-            matched_live_keys.add(
-                (
-                    str(trade.get("coin", "") or "").upper(),
-                    str(trade.get("side", "") or "").lower(),
-                )
-            )
-            continue
-
-        current_price = float(
-            mids.get(trade.get("coin", ""), trade.get("entry_price", 0))
-            or trade.get("entry_price", 0)
-            or 0
-        )
-        if current_price <= 0:
-            continue
-
-        trade_id = trade.get("id")
-        if trade_id is None:
-            continue
-
-        # Compute reconciliation PnL FIRST so we can stamp the analytics
-        # fields into metadata in the same write as the reconciliation
-        # markers. Previously metadata was updated before reconciled_pnl
-        # was computed, so net_pnl_after_fees / close_reason were never
-        # written and any analytics reading metadata->>'net_pnl_after_fees'
-        # saw $0 for ~80% of copy_trade closes (the reconciliation path
-        # dominates copy_trade close volume).
-        entry_price = float(trade.get("entry_price", 0) or 0)
-        trade_size = float(trade.get("size", 0) or 0)
-        trade_leverage = float(trade.get("leverage", 1) or 1)
-        if trade.get("side") == "long":
-            gross_reconciled_pnl = (current_price - entry_price) * trade_size * trade_leverage
-        else:
-            gross_reconciled_pnl = (entry_price - current_price) * trade_size * trade_leverage
-        gross_reconciled_pnl = round(gross_reconciled_pnl, 2)
-
-        # Estimate the round-trip live fee so net_pnl_after_fees in
-        # metadata reflects actual fee drag, not just gross PnL at mid.
-        # Hyperliquid live closes are typically taker on the exit leg
-        # (forced reduce-only) so we use TAKER_FEE_BPS for both legs
-        # as a conservative upper bound.
-        try:
-            import config as _cfg
-            taker_bps = float(getattr(_cfg, "PAPER_TRADING_TAKER_FEE_BPS", 4.5))
-        except Exception:
-            taker_bps = 4.5
-        fee_rate = taker_bps / 10_000.0
-        entry_notional = entry_price * trade_size * trade_leverage
-        exit_notional = current_price * trade_size * trade_leverage
-        reconciled_fees = round(
-            (max(entry_notional, 0.0) + max(exit_notional, 0.0)) * fee_rate, 4,
-        )
-        net_reconciled_pnl = round(gross_reconciled_pnl - reconciled_fees, 2)
-        reconciled_pnl = net_reconciled_pnl  # legacy alias used below
-
-        existing_meta.update({
-            "synthetic_reconciliation": True,
-            "reconciliation_reason": "live_reconciled_closed",
-            "reconciliation_exit_price": current_price,
-            # Mirror the reconciled PnL into the analytics fields so any
-            # consumer reading metadata (dashboards, scorecards, the
-            # decision-replay diff tool, ad-hoc SQL like
-            # `details->>'net_pnl_after_fees'`) sees the same number that
-            # the `pnl` DB column already has. We estimate the live
-            # round-trip fee from PAPER_TRADING_TAKER_FEE_BPS so
-            # net_pnl_after_fees reflects real fee drag and gross/net
-            # differ correctly. Prior to this fix gross == net silently
-            # under-reported fee cost in analytics.
-            "close_reason": "live_reconciled_closed",
-            "net_pnl_after_fees": net_reconciled_pnl,
-            "gross_pnl_before_fees": gross_reconciled_pnl,
-            "reconciled_fees_estimated": reconciled_fees,
+    exceptions = []
+    for coin, side in sorted(set(mirrored) ^ observed):
+        exceptions.append({
+            "coin": coin, "side": side,
+            "kind": "missing_live_position" if (coin, side) in mirrored else "unmatched_live_position",
+            "paper_trade_ids": sorted(mirrored.get((coin, side), [])),
         })
-        db.update_paper_trade_metadata(trade_id, existing_meta)
-        if not db.close_paper_trade(trade_id, current_price, reconciled_pnl):
-            continue
-        _notify_manual_close_detected(
-            {
-                **trade,
-                "metadata": existing_meta,
-            },
-            exit_price=current_price,
-        )
 
-        # ★ H8 FIX: previously hardcoded "pnl": 0.0 in the returned dict
-        # despite computing reconciled_pnl correctly above and writing it to
-        # the DB. Callers consuming the returned dict (shadow tracker, kelly
-        # outcome feed, telegram notifier) saw zero PnL on every reconciled
-        # trade, poisoning their stats. Mirror the DB value into the dict.
-        closed_trade = {
-            "trade_id": trade_id,
-            "entry_price": trade.get("entry_price", 0),
-            "size": trade.get("size", 0),
-            "leverage": trade.get("leverage", 1),
-            "coin": trade.get("coin", ""),
-            "side": trade.get("side", ""),
-            "pnl": reconciled_pnl,
-            "gross_pnl": reconciled_pnl,
-            "fees_paid": 0.0,
-            "slippage_cost": 0.0,
-            "reason": "live_reconciled_closed",
-            "strategy_type": existing_meta.get("strategy_type", "unknown"),
-            "signal_id": existing_meta.get("signal_id", ""),
-            "exit_price": current_price,
-            "metadata": existing_meta,
-            "opened_at": trade.get("opened_at", ""),
-            "closed_at": trade.get("closed_at", ""),
-        }
-        closed.append(closed_trade)
-        logger.info(
-            "Shadow paper trade reconciled to exchange truth: %s %s",
-            trade.get("side", "?").upper(),
-            trade.get("coin", "?"),
-        )
-
-    for live_pos in live_positions.values():
-        coin = str(live_pos.get("coin", "") or "").upper()
-        side = str(live_pos.get("side", "") or "").lower()
-        if not coin or side not in {"long", "short"}:
-            continue
-        if (coin, side) in matched_live_keys:
-            continue
-
-        entry_price = float(
-            live_pos.get("entry_price", live_pos.get("entryPx", 0))
-            or 0
-        )
-        size = abs(float(live_pos.get("size", live_pos.get("szi", 0)) or 0))
-        leverage = float(live_pos.get("leverage", 1) or 1)
-        if entry_price <= 0 or size <= 0:
-            continue
-
-        metadata = {
-            "synthetic_reconciliation": True,
-            "reconciliation_reason": "orphan_found",
-            "orphan_found": True,
-            "orphan_found_at": datetime.now(timezone.utc).isoformat(),
-            "source": "live_orphan",
-            "source_key": "live_orphan",
-            "strategy_type": "orphan_found",
-            "live_snapshot": {
-                "coin": coin,
-                "side": side,
-                "entry_price": entry_price,
-                "size": size,
-                "leverage": leverage,
-            },
-        }
-        # H5 (audit): a crash mid-reconciliation must not spawn a second
-        # shadow record for the *same* orphan.  The exchange-level
-        # identity (coin + side + entry + size + leverage) is stable
-        # enough to serve as the idempotency key here — a repeated
-        # reconciliation run sees the existing shadow row instead of
-        # inserting a duplicate.
-        orphan_key = (
-            f"orphan:{coin}:{side}:{entry_price:.10g}:{size:.10g}:{leverage:.4g}"
-        )
-        existing_orphan_trade_id = _paper_trade_id_for_client_order_id(orphan_key)
-        trade_id = db.open_paper_trade(
-            None,
-            coin,
-            side,
-            entry_price,
-            size,
-            leverage=leverage,
-            metadata=metadata,
-            idempotency_key=orphan_key,
-        )
-        db.audit_log(
-            action="orphan_found",
-            coin=coin,
-            side=side,
-            price=entry_price,
-            size=size,
-            source="live_execution",
-            details={"trade_id": trade_id, "metadata": metadata},
-        )
-        if existing_orphan_trade_id is not None:
-            logger.info(
-                "Synthetic paper trade already tracks orphan live position: %s %s "
-                "trade_id=%s size=%.6f entry=%.6f",
-                side.upper(),
-                coin,
-                trade_id,
-                size,
-                entry_price,
-            )
-        else:
-            logger.warning(
-                "Created synthetic paper trade for orphan live position: %s %s "
-                "trade_id=%s size=%.6f entry=%.6f",
-                side.upper(),
-                coin,
-                trade_id,
-                size,
-                entry_price,
-            )
-
-    return closed
+    account = getattr(trader, "public_address", None) or getattr(trader, "account_index", None)
+    return db.record_live_reconciliation_snapshot(f"{venue}:{account}", exceptions)
 
 
 def _paper_open_margin_used() -> float:
@@ -1277,6 +950,7 @@ def mirror_executed_trades_to_live(
                         item.get("paper_trade_id"),
                         live_signal,
                         live_result,
+                        str(getattr(trader, "exchange", "hyperliquid")),
                     )
                     logger.info(
                         "%s: %s %s %s",
@@ -1286,11 +960,11 @@ def mirror_executed_trades_to_live(
                         live_signal.side.value,
                     )
                 else:
-                    _close_unmirrored_paper_trade(
+                    _record_unconfirmed_live_mirror(
                         item.get("paper_trade_id"),
-                        live_signal=live_signal,
-                        reason="live_mirror_not_opened",
-                        live_result=live_result if isinstance(live_result, dict) else None,
+                        live_signal,
+                        str(getattr(trader, "exchange", "hyperliquid")),
+                        live_result,
                     )
                     if live_result is None:
                         logger.info(

@@ -13,6 +13,7 @@ import time
 
 from src.core.live_execution import (
     get_execution_open_positions,
+    get_live_trader,
     is_live_trading_active,
     mirror_executed_trades_to_live,
     sync_shadow_book_to_live,
@@ -147,44 +148,35 @@ def _mark_kill_switch_state(container, reason: str) -> bool:
         return True
 
 
-def cancel_live_orders_once(container, reason: str, *, force: bool = False) -> bool:
-    """Cancel all live orders exactly once, serialised across threads.
+def cancel_live_orders_once(container, reason: str) -> bool:
+    """Cancel live entry orders while retaining protective exits.
 
     Used both by the fast-cycle file-kill-switch path and by the main-thread
     shutdown signal handler.  After the first call the container's
     ``_shutdown_orders_cancelled`` flag is set and subsequent calls are
     no-ops.
 
-    Parameters
-    ----------
-    force : bool
-        When True the dry-run guard is bypassed — used by the KILL_SWITCH
-        emergency path where we want to cancel regardless of the live_trader's
-        configured dry-run state.
-
-    Returns True if this call performed the cancellation, False if it was
-    skipped because another thread had already done it or the trader is
-    dry-run and force is False.
+    Returns True only when the entry cancellation sweep is confirmed.
     """
     with _order_cancel_lock:
         if getattr(container, "_shutdown_orders_cancelled", False):
             return False
-        live_trader = getattr(container, "live_trader", None)
+        live_trader = get_live_trader(container)
         if not live_trader:
             setattr(container, "_shutdown_orders_cancelled", True)
             return False
-        if not force and getattr(live_trader, "dry_run", True):
+        if getattr(live_trader, "dry_run", True):
             setattr(container, "_shutdown_orders_cancelled", True)
             return False
         # P0-2 (audit): do NOT flip _shutdown_orders_cancelled pre-emptively.
-        # Only mark cancellation done when cancel_all_orders_detailed()
+        # Only mark cancellation done when cancel_entry_orders_detailed()
         # confirms that open-order fetch succeeded AND every cancel attempt
         # returned success.  Otherwise we could log "Cancelled 0 live orders"
         # on a fetch failure and block any further retries while resting
         # orders stay live.  An un-cancelled order during a kill-switch
         # event is a much worse outcome than a duplicate cancel call.
         try:
-            detail_fn = getattr(live_trader, "cancel_all_orders_detailed", None)
+            detail_fn = getattr(live_trader, "cancel_entry_orders_detailed", None)
             if callable(detail_fn):
                 result = detail_fn()
                 cancelled = int(result.get("cancelled_count", 0))
@@ -208,17 +200,12 @@ def cancel_live_orders_once(container, reason: str, *, force: bool = False) -> b
                 # the SIGINT handler / watchdog / next loop iteration can
                 # retry.  The caller decides whether to escalate.
                 return False
-            # Fallback for older live_trader shims that only expose the
-            # legacy int-returning cancel_all_orders(): we still have no
-            # structured signal, so we leave the pre-P0-2 behaviour
-            # (set-then-attempt) rather than leaking half-cancelled state.
-            setattr(container, "_shutdown_orders_cancelled", True)
-            cancelled = live_trader.cancel_all_orders()
             logger.critical(
-                "Cancelled %d live orders during shutdown (%s) [legacy path]",
-                cancelled, reason,
+                "Cannot distinguish entries from exits during %s; orders left untouched. "
+                "Verify resting entries and protection at the venue.",
+                reason,
             )
-            return True
+            return False
         except Exception as exc:
             logger.error(
                 "Failed to cancel live orders during shutdown (%s): %s -- "
@@ -232,7 +219,7 @@ def cancel_live_orders_once(container, reason: str, *, force: bool = False) -> b
 def check_file_kill_switch(container) -> bool:
     """Emergency stop via file presence.
 
-    If the configured kill-switch file exists, cancel all live orders, mark the
+    If the configured kill-switch file exists, cancel known entries, mark the
     live trader as killed, and request the bot loop to stop.  The check is
     idempotent and thread-safe — the kill-switch flag is set atomically and
     order cancellation is serialised with any concurrent shutdown signal.
@@ -248,7 +235,7 @@ def check_file_kill_switch(container) -> bool:
 
     logger.critical("[fast] KILL_SWITCH file detected at %s", path)
 
-    live_trader = getattr(container, "live_trader", None)
+    live_trader = get_live_trader(container)
     if live_trader:
         try:
             reason = f"file:{path}"
@@ -268,14 +255,7 @@ def check_file_kill_switch(container) -> bool:
                 "continuing to cancel orders regardless",
                 exc,
             )
-        # Serialised single-shot cancellation — if the SIGINT handler also
-        # fires, only one of the two will actually hit the exchange.  KILL
-        # SWITCH is an emergency path, so we force-cancel regardless of the
-        # live_trader's dry-run flag (the file being present is the operator's
-        # explicit signal to purge).
-        cancel_live_orders_once(
-            container, reason=f"kill_switch_file:{path}", force=True,
-        )
+        cancel_live_orders_once(container, reason=f"kill_switch_file:{path}")
 
     return True
 
@@ -374,9 +354,9 @@ def run_fast_cycle(container, cycle_count: int) -> None:
                         backoff,
                     )
             container.live_trader.update_daily_pnl_from_fills()
-            reconciled = sync_shadow_book_to_live(container)
-            if reconciled:
-                logger.info("[fast] Reconciled %d shadow trades to exchange", len(reconciled))
+            discrepancies = sync_shadow_book_to_live(container)
+            if discrepancies:
+                logger.warning("[fast] Observed %d live position discrepancies", len(discrepancies))
             manage_summary = container.live_trader.manage_open_positions()
             if manage_summary.get("updated") or manage_summary.get("closed") or manage_summary.get("failed"):
                 logger.info("[fast] Live risk management summary: %s", manage_summary)

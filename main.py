@@ -598,12 +598,9 @@ class HyperliquidResearchBot:
         )
 
     def _cancel_live_orders_for_shutdown(self, reason: str) -> None:
-        # CRIT-FIX C5: delegate to the shared, lock-guarded single-shot helper
-        # in fast_cycle so the signal-handler path and the file-kill-switch
-        # path cannot both issue cancel_all_orders() concurrently.  The helper
-        # is idempotent — subsequent calls are no-ops.
+        # Use the same entry-only sweep as the file kill switch.
         cancel_live_orders_once(self.container, reason=reason)
-        self._shutdown_orders_cancelled = True
+        self._shutdown_orders_cancelled = getattr(self.container, "_shutdown_orders_cancelled", False)
 
     def _run_with_timeout(self, name: str, func, timeout_s: float) -> bool:
         """Run shutdown work with a hard wait bound so SIGTERM cannot hang forever."""

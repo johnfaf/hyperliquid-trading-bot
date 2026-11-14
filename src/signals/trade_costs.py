@@ -24,8 +24,8 @@ logger = logging.getLogger(__name__)
 def _fee_bps(role: str) -> float:
     role = str(role or "taker").lower()
     if role == "maker":
-        return float(getattr(config, "PAPER_TRADING_MAKER_FEE_BPS", 0.2) or 0.0)
-    return float(getattr(config, "PAPER_TRADING_TAKER_FEE_BPS", 2.5) or 0.0)
+        return float(getattr(config, "PAPER_TRADING_MAKER_FEE_BPS", 1.5) or 0.0)
+    return float(getattr(config, "PAPER_TRADING_TAKER_FEE_BPS", 4.5) or 0.0)
 
 
 def _slippage_bps_estimate() -> float:
@@ -117,7 +117,7 @@ def estimate_signal_costs_bps(
 
     fee_bps_one_leg = _fee_bps(role)
     slip_bps_one_leg = _slippage_bps_estimate()
-    fees_bps = 2.0 * fee_bps_one_leg
+    fees_bps = fee_bps_one_leg + _fee_bps("taker")
     slippage_bps = 2.0 * slip_bps_one_leg
     funding_bps = _funding_bps_for_coin(coin, side=side, holding_hours=holding_hours)
     total_bps = fees_bps + slippage_bps + funding_bps

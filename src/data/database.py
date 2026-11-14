@@ -1750,7 +1750,7 @@ def reset_paper_trades(initial_balance: float = None):
     Returns summary of what was deleted.
     """
     if initial_balance is None:
-        initial_balance = 10_000.0
+        initial_balance = config.PAPER_TRADING_INITIAL_BALANCE
 
     with get_connection() as conn:
         open_count = conn.execute(
@@ -1819,6 +1819,36 @@ def audit_log(action: str, coin: str = None, side: str = None,
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (now, action, coin, side, price, size, pnl, source,
               json.dumps(details or {})))
+
+
+def record_live_reconciliation_snapshot(account_key: str, exceptions: list) -> list:
+    """Append changed observations atomically without touching paper P&L."""
+    key = f"live_reconciliation:{account_key}"
+    payload = json.dumps(exceptions, sort_keys=True)
+    with get_connection() as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO bot_state (key, value) VALUES (?, ?)
+            ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+            WHERE bot_state.value IS DISTINCT FROM EXCLUDED.value
+            """,
+            (key, payload),
+        )
+        if cursor.rowcount == 0:
+            return []
+        conn.execute(
+            """
+            INSERT INTO audit_trail (timestamp, action, source, details)
+            VALUES (?, ?, ?, ?)
+            """,
+            (
+                datetime.now(timezone.utc).isoformat(),
+                "live_reconciliation_snapshot",
+                "live_execution",
+                json.dumps({"account": account_key, "exceptions": exceptions}),
+            ),
+        )
+    return exceptions
 
 
 def get_audit_trail(limit: int = 200, action_filter: str = None,

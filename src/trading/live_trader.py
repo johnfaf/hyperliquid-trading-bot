@@ -460,15 +460,10 @@ class LiveTrader:
         self._default_leverage_is_cross = os.environ.get(
             "LIVE_LEVERAGE_IS_CROSS", "true"
         ).strip().lower() in {"1", "true", "yes"}
-        self.schedule_cancel_enabled = bool(
-            getattr(config, "LIVE_SCHEDULE_CANCEL_ENABLED", False)
-        )
-        self.schedule_cancel_entry_timeout_s = float(
-            getattr(config, "LIVE_SCHEDULE_CANCEL_ENTRY_TIMEOUT_S", 60.0)
-        )
-        self.schedule_cancel_working_timeout_s = float(
-            getattr(config, "LIVE_SCHEDULE_CANCEL_WORKING_TIMEOUT_S", 300.0)
-        )
+        if getattr(config, "LIVE_SCHEDULE_CANCEL_ENABLED", False):
+            logger.warning(
+                "LIVE_SCHEDULE_CANCEL_ENABLED is ignored: a venue-wide cancel timer removes protection"
+            )
         self._last_schedule_cancel_deadline_ms = 0
 
         # Price sanity state (instance-level; class-level cache leaks across traders).
@@ -636,6 +631,10 @@ class LiveTrader:
         self._equity_samples: Deque[Tuple[float, float]] = deque()  # (ts, equity)
         self._equity_samples_lock = threading.Lock()
         self._peak_equity_since_start: float = 0.0
+        if self.public_address and self._max_drawdown_usd > 0:
+            persisted_peak = db.get_bot_state(self._equity_peak_key())
+            if isinstance(persisted_peak, (float, int)) and math.isfinite(persisted_peak) and persisted_peak > 0:
+                self._peak_equity_since_start = float(persisted_peak)
 
         self._load_persisted_kill_switch_state()
         # H5: restore the per-source canary counter from the DB so a restart
@@ -1300,6 +1299,9 @@ class LiveTrader:
         )
 
     # ── S3: rolling drawdown tracking ──────────────────────────
+    def _equity_peak_key(self) -> str:
+        return f"live_equity_peak:hyperliquid:{self.public_address.lower()}"
+
     def _record_equity_sample(self, equity: Optional[float]) -> None:
         """Append an equity reading to the rolling window and update peak.
 
@@ -1313,16 +1315,21 @@ class LiveTrader:
             equity_f = float(equity)
         except (TypeError, ValueError):
             return
-        if equity_f <= 0:
+        if not math.isfinite(equity_f) or equity_f < 0:
             return
         now = time.time()
         cutoff = now - self._drawdown_window_s
+        persistence_failed = False
         with self._equity_samples_lock:
             while self._equity_samples and self._equity_samples[0][0] < cutoff:
                 self._equity_samples.popleft()
             self._equity_samples.append((now, equity_f))
             if equity_f > self._peak_equity_since_start:
                 self._peak_equity_since_start = equity_f
+                if self.public_address and not self.dry_run:
+                    persistence_failed = not db.set_bot_state(self._equity_peak_key(), equity_f)
+        if persistence_failed:
+            self.activate_kill_switch("equity_peak_persistence_failed", status_reason="equity_peak_unavailable")
 
     def _current_drawdown_usd(self) -> Tuple[float, float, float]:
         """Return (drawdown_usd, rolling_peak, current_equity).
@@ -1788,7 +1795,8 @@ class LiveTrader:
                 )
                 if isinstance(data, dict):
                     margin_summary = data.get("marginSummary", {}) or {}
-                    perps = float(margin_summary.get("accountValue", 0) or 0)
+                    value = margin_summary.get("accountValue")
+                    perps = float(value) if value is not None else None
                     free_margin = self._extract_free_margin_from_state(data)
         except Exception as e:
             logger.debug("snapshot_balance: perps fetch error: %s", e)
@@ -1822,12 +1830,14 @@ class LiveTrader:
         # spot) — an operator who drains perps to cover a loss should still
         # see the aggregate drop reflected in the drawdown calc.  Guarded by
         # the env var so dry-run/test setups without it configured are no-ops.
-        if total is not None and self._max_drawdown_usd > 0:
+        if perps is not None and spot is not None and self._max_drawdown_usd > 0:
             try:
                 self._record_equity_sample(total)
                 self.check_drawdown()
             except Exception as dd_exc:
-                logger.debug("drawdown bookkeeping failed: %s", dd_exc)
+                logger.error("Drawdown bookkeeping failed: %s", dd_exc)
+                if not self.dry_run:
+                    self.activate_kill_switch("equity_tracking_failed", status_reason="equity_peak_unavailable")
 
         if log and (now - self._last_balance_log_ts) >= self._balance_log_interval_s:
             self._last_balance_log_ts = now
@@ -4255,16 +4265,12 @@ class LiveTrader:
 
             # Include current unrealized PnL so daily loss controls react to
             # open-position drawdowns, not only realized closes.
-            unrealized = self.daily_unrealized_pnl
             try:
                 positions = self.get_positions(force_fresh=True)
             except TypeError:
                 positions = self.get_positions()
             if positions is None:
-                logger.warning(
-                    "Could not refresh positions for unrealized PnL - keeping prior estimate %+.2f",
-                    unrealized,
-                )
+                raise RuntimeError("Position snapshot unavailable for loss check")
             else:
                 unrealized = 0.0
                 for pos in positions:
@@ -4787,43 +4793,9 @@ class LiveTrader:
             "raw_result": result,
         }
 
-    def schedule_dead_man_cancel(
-        self,
-        timeout_s: Optional[float] = None,
-        *,
-        reason: str = "order",
-    ) -> Dict[str, Any]:
-        """Schedule Hyperliquid's server-side cancel-all dead-man switch.
-
-        Hyperliquid's ``scheduleCancel`` action cancels all open orders at a
-        future millisecond timestamp.  The exchange requires the deadline to be
-        at least five seconds ahead; we clamp locally so operator-provided
-        timeouts fail closed less often.
-        """
-        raw_timeout = self.schedule_cancel_entry_timeout_s if timeout_s is None else float(timeout_s)
-        timeout = max(5.0, raw_timeout)
-        # Use the canonical clock provider so the dead-man deadline tracks the
-        # replay clock under the OOS harness while keeping wall-clock behaviour
-        # in production (LiveClock backend).
-        from src.core import clock_provider
-        deadline_ms = int((clock_provider.unix_now() + timeout) * 1000)
-        action = {"type": "scheduleCancel", "time": deadline_ms}
-        result = self._post_order(action)
-        if self._is_order_result_success(result):
-            self._last_schedule_cancel_deadline_ms = deadline_ms
-            logger.info(
-                "Hyperliquid scheduleCancel registered for %s: deadline_ms=%d timeout=%.1fs",
-                reason,
-                deadline_ms,
-                timeout,
-            )
-        else:
-            logger.error(
-                "Hyperliquid scheduleCancel failed before %s order: %s",
-                reason,
-                result,
-            )
-        return result
+    def schedule_dead_man_cancel(self, timeout_s: Optional[float] = None, *, reason: str = "order") -> Dict[str, Any]:
+        """Reject account-wide cancellation: an entry timeout must not remove exit orders."""
+        return {"status": "rejected", "reason": "account_wide_cancel_would_remove_protection"}
 
     def clear_dead_man_cancel(self) -> Dict[str, Any]:
         """Remove a pending Hyperliquid scheduleCancel deadline."""
@@ -4831,23 +4803,6 @@ class LiveTrader:
         if self._is_order_result_success(result):
             self._last_schedule_cancel_deadline_ms = 0
         return result
-
-    def _schedule_dead_man_for_order(self, order_kind: str) -> Optional[Dict[str, Any]]:
-        if not self.schedule_cancel_enabled:
-            return None
-        timeout = (
-            self.schedule_cancel_entry_timeout_s
-            if order_kind == "entry"
-            else self.schedule_cancel_working_timeout_s
-        )
-        result = self.schedule_dead_man_cancel(timeout, reason=order_kind)
-        if self._is_order_result_success(result):
-            return None
-        return {
-            "status": "rejected",
-            "reason": "schedule_cancel_failed",
-            "schedule_cancel_result": result,
-        }
 
     def place_market_order(self, coin: str, side: str, size: float,
                            leverage: float = 1, reduce_only: bool = False) -> Dict:
@@ -5048,9 +5003,6 @@ class LiveTrader:
             notional,
             cloid[:10],
         )
-        dead_man_rejection = self._schedule_dead_man_for_order("entry")
-        if dead_man_rejection:
-            return dead_man_rejection
         result = self._post_order(action)
         if isinstance(result, dict):
             result = dict(result)
@@ -5321,9 +5273,6 @@ class LiveTrader:
             "post-only" if post_only else "GTC",
             coin, side, size, price, notional, cloid[:10],
         )
-        dead_man_rejection = self._schedule_dead_man_for_order("working")
-        if dead_man_rejection:
-            return dead_man_rejection
         result = self._post_order(action)
         if isinstance(result, dict):
             result = dict(result)
@@ -5449,9 +5398,6 @@ class LiveTrader:
             tp_or_sl, coin, side, wire_size, wire_trigger_px, wire_limit_px,
             cloid[:10] + "…",
         )
-        dead_man_rejection = self._schedule_dead_man_for_order("working")
-        if dead_man_rejection:
-            return dead_man_rejection
         result = self._post_order(action)
 
         return result
@@ -5597,7 +5543,13 @@ class LiveTrader:
         result = self.cancel_all_orders_detailed(coin=coin)
         return int(result.get("cancelled_count", 0))
 
-    def cancel_all_orders_detailed(self, coin: Optional[str] = None) -> Dict[str, Any]:
+    def cancel_entry_orders_detailed(self, coin: Optional[str] = None) -> Dict[str, Any]:
+        """Cancel identifiable entries without touching protection."""
+        return self.cancel_all_orders_detailed(coin=coin, entries_only=True)
+
+    def cancel_all_orders_detailed(
+        self, coin: Optional[str] = None, *, entries_only: bool = False,
+    ) -> Dict[str, Any]:
         """Cancel all open orders and return a structured result.
 
         P0-2 (audit): the legacy ``cancel_all_orders()`` returns ``0`` on BOTH
@@ -5657,7 +5609,20 @@ class LiveTrader:
 
             cancelled = 0
             failed = 0
+            preserved = 0
             for order in orders:
+                if entries_only:
+                    if self._is_protective_order(order) or (
+                        isinstance(order.get("t"), dict) and "trigger" in order["t"]
+                    ):
+                        preserved += 1
+                        continue
+                    if order.get("reduceOnly", order.get("reduce_only")) is not False or (
+                        order.get("isTrigger", order.get("is_trigger")) is not False
+                    ):
+                        # The fallback openOrders view may omit protection fields.
+                        failed += 1
+                        continue
                 order_id = order.get("oid") or order.get("order_id") or order.get("id")
                 if order_id is None:
                     logger.warning("cancel_all_orders: open order missing oid/order_id/id: %s", order)
@@ -5668,11 +5633,11 @@ class LiveTrader:
                 else:
                     failed += 1
 
-            if cancelled < len(orders):
+            if failed:
                 logger.warning(
                     "cancel_all_orders: confirmed %d/%d cancellations%s",
                     cancelled,
-                    len(orders),
+                    len(orders) - preserved,
                     f" for {coin}" if coin else "",
                 )
             return {
@@ -5681,6 +5646,7 @@ class LiveTrader:
                 "open_orders_seen": len(orders),
                 "cancelled_count": cancelled,
                 "failed_count": failed,
+                "preserved_count": preserved,
                 "reason": "ok" if failed == 0 else "partial_cancel",
             }
         except Exception as e:
@@ -5791,7 +5757,7 @@ class LiveTrader:
 
     def emergency_close_all(self) -> List[Dict]:
         """
-        KILL SWITCH: Close all positions immediately and cancel all orders.
+        Stop entries and request reduce-only closes without removing protection.
 
         Returns:
             List of close results
@@ -5802,9 +5768,9 @@ class LiveTrader:
         results = []
 
         try:
-            # Cancel all orders first
-            cancelled = self.cancel_all_orders()
-            logger.warning(f"Cancelled {cancelled} open orders")
+            sweep = self.cancel_entry_orders_detailed()
+            if not sweep["success"]:
+                logger.critical("Entry cancellation incomplete: %s; operator verification required", sweep)
 
             # Close all positions.
             # P0-3: emergency close MUST see the exchange-truth position
@@ -5823,7 +5789,7 @@ class LiveTrader:
                     result = self.close_position(coin)
                     if self._is_order_result_success(result):
                         logger.warning(
-                            "Closed position on %s (attempt %d/%d)",
+                            "Close acknowledged for %s (attempt %d/%d); checking venue position",
                             coin,
                             attempt,
                             self._emergency_close_retries,
@@ -5848,6 +5814,11 @@ class LiveTrader:
                             coin,
                             self._emergency_close_retries,
                         )
+
+            if positions:
+                remaining = self.get_positions(force_fresh=True)
+                if remaining is None or remaining:
+                    logger.critical("Emergency close not confirmed flat; operator verification required")
 
         except Exception as e:
             logger.error(f"Error in emergency close all: {e}")
@@ -5875,9 +5846,20 @@ class LiveTrader:
                 return None
 
             data = self.get_account_state(force_fresh=force_fresh)
-            positions = data.get("assetPositions", []) if isinstance(data, dict) else []
-            normalized = [self._normalize_position(pos) for pos in positions]
-            return [pos for pos in normalized if pos.get("coin")]
+            positions = data.get("assetPositions") if isinstance(data, dict) else None
+            if not isinstance(positions, list):
+                return None
+            normalized = []
+            for row in positions:
+                pos = row.get("position", row) if isinstance(row, dict) else None
+                if not isinstance(pos, dict) or not isinstance(pos.get("coin"), str) or not pos["coin"].strip():
+                    return None
+                size = self._coerce_float(pos.get("szi", pos.get("size")), default=math.nan)
+                if not math.isfinite(size):
+                    return None
+                if size:
+                    normalized.append(self._normalize_position(row))
+            return normalized
 
         except Exception as e:
             logger.error(f"Error getting positions: {e}")

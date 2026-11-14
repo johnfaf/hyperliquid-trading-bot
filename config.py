@@ -440,7 +440,9 @@ SCORING_WEIGHTS = {
 }
 
 # ─── Paper Trading ─────────────────────────────────────────────
-PAPER_TRADING_INITIAL_BALANCE = 10_000  # USD
+PAPER_TRADING_INITIAL_BALANCE = float(os.environ.get("PAPER_TRADING_INITIAL_BALANCE", "10000"))
+if not math.isfinite(PAPER_TRADING_INITIAL_BALANCE) or PAPER_TRADING_INITIAL_BALANCE <= 0:
+    raise ValueError("PAPER_TRADING_INITIAL_BALANCE must be a finite positive amount")
 PAPER_TRADING_MAX_POSITION_PCT = 0.08   # 8% of balance per trade (smaller = more concurrent trades)
 PAPER_TRADING_MAX_LEVERAGE = float(os.environ.get("PAPER_TRADING_MAX_LEVERAGE", 5))
 # Max number of coins to pre-compute candle features for per strategy
@@ -473,7 +475,7 @@ PAPER_TRADING_STOP_LOSS_PCT = float(os.environ.get("PAPER_TRADING_STOP_LOSS_PCT"
 # the time (-$12.59 net across 35 trades) -- the bot was getting
 # noise-stopped before its edge could materialise.  Positions held
 # >24h won 71% of the time (+$11.27 net).  The 10-min default below
-# suppresses SL fires during the first 600s of a position's life so
+# suppresses tightened SL fires during the first 600s of a position's life so
 # the natural noise around entry doesn't trigger a fee-leaking exit.
 # Take-profit, time-limit, and break-even/trailing-update logic are
 # unaffected -- this guard ONLY suppresses the SL CLOSE check.
@@ -492,15 +494,15 @@ PAPER_TRADING_TAKE_PROFIT_MULTIPLE = float(
     os.environ.get("PAPER_TRADING_TAKE_PROFIT_MULTIPLE", 2.5)
 )
 PAPER_TRADING_TAKE_PROFIT_PCT = PAPER_TRADING_STOP_LOSS_PCT * PAPER_TRADING_TAKE_PROFIT_MULTIPLE
-PAPER_TRADING_MAKER_FEE_BPS = float(os.environ.get("PAPER_TRADING_MAKER_FEE_BPS", 0.2))
-PAPER_TRADING_TAKER_FEE_BPS = float(os.environ.get("PAPER_TRADING_TAKER_FEE_BPS", 2.5))
+PAPER_TRADING_MAKER_FEE_BPS = float(os.environ.get("PAPER_TRADING_MAKER_FEE_BPS", 1.5))
+PAPER_TRADING_TAKER_FEE_BPS = float(os.environ.get("PAPER_TRADING_TAKER_FEE_BPS", 4.5))
 PAPER_TRADING_DEFAULT_EXECUTION_ROLE = os.environ.get(
     "PAPER_TRADING_DEFAULT_EXECUTION_ROLE", "taker"
 ).lower()
 # Simulated slippage range applied to paper market orders (basis points).
 PAPER_TRADING_SLIPPAGE_MIN_BPS = float(os.environ.get("PAPER_TRADING_SLIPPAGE_MIN_BPS", 1.0))
 PAPER_TRADING_SLIPPAGE_MAX_BPS = float(os.environ.get("PAPER_TRADING_SLIPPAGE_MAX_BPS", 5.0))
-# Accrue Hyperliquid 8h funding payments on open paper positions.
+# Estimate hourly Hyperliquid funding on open paper positions.
 PAPER_TRADING_FUNDING_ENABLED = os.environ.get(
     "PAPER_TRADING_FUNDING_ENABLED", "true"
 ).lower() in ("true", "1", "yes")

@@ -81,6 +81,16 @@ def _get_lstm_block_class():
     return _LSTMBlockClass
 
 
+def _validation_boundaries(n: int, val_split: float, label_horizon: int) -> Tuple[int, int]:
+    if not 0 < val_split < 1 or label_horizon < 0:
+        raise ValueError("Invalid LSTM validation split or label horizon")
+    val_start = n - max(1, int(n * val_split))
+    train_end = val_start - label_horizon
+    if train_end <= 0 or not 0 < val_start < n:
+        raise ValueError("Not enough samples for purged LSTM validation")
+    return train_end, val_start
+
+
 class DirectionLSTM:
     """Lightweight LSTM for 3-class direction prediction."""
 
@@ -111,7 +121,7 @@ class DirectionLSTM:
 
     def train_model(self, X: np.ndarray, y: np.ndarray,
                     epochs: int = 50, batch_size: int = 32,
-                    val_split: float = 0.15) -> Dict:
+                    val_split: float = 0.15, *, label_horizon: int) -> Dict:
         """
         Train the LSTM on labeled sequences.
 
@@ -126,10 +136,9 @@ class DirectionLSTM:
             Training metrics dict
         """
         n = len(X)
-        val_n = max(1, int(n * val_split))
-        # Walk-forward: validation is the most recent data
-        X_train, y_train = X[:-val_n], y[:-val_n]
-        X_val, y_val = X[-val_n:], y[-val_n:]
+        train_end, val_start = _validation_boundaries(n, val_split, label_horizon)
+        X_train, y_train = X[:train_end], y[:train_end]
+        X_val, y_val = X[val_start:], y[val_start:]
 
         X_t = _torch.FloatTensor(X_train).to(self.device)
         y_t = _torch.LongTensor(y_train).to(self.device)
@@ -217,6 +226,7 @@ class DirectionLSTM:
     def save(self, path: str):
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         _torch.save({
+            "training_schema": 2,
             "state_dict": self.model.state_dict(),
             "n_features": self.n_features,
             "hidden_size": self.hidden_size,
@@ -228,7 +238,10 @@ class DirectionLSTM:
         if not os.path.exists(path):
             return False
         try:
-            ckpt = _torch.load(path, map_location=self.device, weights_only=False)
+            ckpt = _torch.load(path, map_location=self.device, weights_only=True)
+            if ckpt.get("training_schema") != 2:
+                logger.warning("Ignoring legacy LSTM artifact: training causality is not verified")
+                return False
             self.model.load_state_dict(ckpt["state_dict"])
             self._trained = ckpt.get("trained", True)
             self.model.eval()
@@ -334,7 +347,7 @@ def create_sequences(features: np.ndarray, labels: np.ndarray,
     X, y = [], []
     for i in range(seq_len, len(features)):
         seq = features[i - seq_len:i]
-        if not np.isnan(seq).any():
+        if labels[i] >= 0 and np.isfinite(seq).all():
             X.append(seq)
             y.append(labels[i])
     return np.array(X, dtype=np.float32), np.array(y, dtype=np.int64)
@@ -351,19 +364,25 @@ def label_direction(candles: List[Dict], lookahead: int = 6,
         threshold: Minimum return to count as up/down (0.3% default)
 
     Returns:
-        (n,) array — 0=down, 1=flat, 2=up. Last `lookahead` bars are 1 (flat).
+        (n,) array: 0=down, 1=flat, 2=up, -1=outcome not yet known.
     """
     closes = np.array([c["close"] for c in candles], dtype=np.float64)
     n = len(closes)
-    labels = np.ones(n, dtype=np.int64)  # default flat
+    if lookahead < 1:
+        raise ValueError("lookahead must be positive")
+    labels = np.full(n, -1, dtype=np.int64)
 
     for i in range(n - lookahead):
-        future_return = (closes[i + lookahead] - closes[i]) / (closes[i] + 1e-10)
+        start, end = closes[i], closes[i + lookahead]
+        if not (np.isfinite(start) and np.isfinite(end) and start > 0 and end > 0):
+            continue
+        future_return = (end - start) / start
         if future_return > threshold:
             labels[i] = 2  # up
         elif future_return < -threshold:
             labels[i] = 0  # down
-        # else stays 1 (flat)
+        else:
+            labels[i] = 1
 
     return labels
 
@@ -467,13 +486,19 @@ class LSTMAgent:
                 logger.info("LSTMAgent: not enough valid sequences (%d)", len(X))
                 return
 
-            metrics = self._model.train_model(X, y)
+            candidate = DirectionLSTM(
+                n_features=N_FEATURES,
+                hidden_size=self.hidden_size,
+                sequence_length=self.sequence_length,
+            )
+            metrics = candidate.train_model(X, y, label_horizon=self.lookahead)
+            model_path = os.path.join(self.model_dir, "lstm_direction.pt")
+            candidate_path = model_path + ".candidate"
+            candidate.save(candidate_path)
+            os.replace(candidate_path, model_path)
+            self._model = candidate
             self._train_metrics = metrics
             self._initialized = True
-
-            # Save model
-            model_path = os.path.join(self.model_dir, "lstm_direction.pt")
-            self._model.save(model_path)
             logger.info("LSTMAgent: model saved to %s", model_path)
         except Exception as exc:  # noqa: BLE001 — background thread must never escape
             logger.warning("LSTMAgent background training failed: %s", exc)

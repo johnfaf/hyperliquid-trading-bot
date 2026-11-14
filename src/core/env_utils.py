@@ -14,6 +14,7 @@ so it can be imported from anywhere in the codebase.
 from __future__ import annotations
 
 import logging
+import math
 import os
 from typing import Optional
 
@@ -33,6 +34,8 @@ def safe_env_float(
         return float(default)
     try:
         value = float(raw)
+        if not math.isfinite(value):
+            raise ValueError("not finite")
     except (TypeError, ValueError):
         logger.warning(
             "Env var %s=%r is not numeric; falling back to default %s",
@@ -67,7 +70,7 @@ def safe_env_int(
         return int(default)
     try:
         value = int(float(raw))  # tolerate "10.0" style inputs
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         logger.warning(
             "Env var %s=%r is not integer; falling back to default %s",
             name, raw, default,

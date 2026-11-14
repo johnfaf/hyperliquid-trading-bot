@@ -18,7 +18,6 @@ from src.core.live_execution import (
     get_execution_open_positions,
     is_live_trading_active,
     mirror_executed_trades_to_live,
-    sync_shadow_book_to_live,
 )
 
 logger = logging.getLogger(__name__)
@@ -1229,11 +1228,8 @@ def run_trading_cycle(container, cycle_count: int) -> None:
             logger.info("  Injected %d whale trade signals from fast cycle", len(whale_queue))
             container._whale_strategy_queue = []
 
-        # Keep the shadow ledger synced to exchange truth when live mode is active.
-        if is_live_trading_active(container):
-            closed = sync_shadow_book_to_live(container)
-        else:
-            closed = container.paper_trader.check_open_positions() if container.paper_trader else []
+        # Paper outcomes are independent of live acknowledgments and positions.
+        closed = container.paper_trader.check_open_positions() if container.paper_trader else []
         if closed:
             logger.info("  Closed %d positions", len(closed))
 

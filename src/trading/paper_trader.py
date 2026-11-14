@@ -12,6 +12,7 @@ V2 integration:
 """
 import logging
 import json
+import math
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
@@ -2033,6 +2034,7 @@ class PaperTrader:
                     "maker_fee_bps": config.PAPER_TRADING_MAKER_FEE_BPS,
                     "taker_fee_bps": config.PAPER_TRADING_TAKER_FEE_BPS,
                     "intended_entry_price": signal["price"],
+                    "initial_stop_loss": signal["stop_loss"],
                     "entry_slipped_price": slipped_price,
                     "features": signal.get("features", {}),
                     "risk_policy": signal.get("risk_policy", {}),
@@ -2099,6 +2101,7 @@ class PaperTrader:
                     "maker_fee_bps": config.PAPER_TRADING_MAKER_FEE_BPS,
                     "taker_fee_bps": config.PAPER_TRADING_TAKER_FEE_BPS,
                     "intended_entry_price": signal["price"],
+                    "initial_stop_loss": signal["stop_loss"],
                     "entry_slipped_price": slipped_price,
                     "features": signal.get("features", {}),
                     "risk_policy": signal.get("risk_policy", {}),
@@ -2130,11 +2133,13 @@ class PaperTrader:
         slipped_exit = self._apply_slippage(current_price, trade["side"], is_entry=False)
         gross_pnl = self._calculate_pnl(trade, slipped_exit)
         execution_role = trade_meta.get("execution_role", config.PAPER_TRADING_DEFAULT_EXECUTION_ROLE)
-        fee_rate = self._fee_rate_for_role(execution_role)
+        fee_key = "maker_fee_bps" if execution_role == "maker" else "taker_fee_bps"
+        entry_rate = float(trade_meta.get(fee_key, self._fee_rate_for_role(execution_role) * 10_000)) / 10_000
+        exit_rate = self._fee_rate_for_role("taker")
         entry_notional = max(float(trade.get("entry_price", 0)), 0.0) * max(float(trade.get("size", 0)), 0.0) * max(float(trade.get("leverage", 1)), 1.0)
         exit_notional = max(float(slipped_exit), 0.0) * max(float(trade.get("size", 0)), 0.0) * max(float(trade.get("leverage", 1)), 1.0)
-        entry_fee = entry_notional * fee_rate
-        exit_fee = exit_notional * fee_rate
+        entry_fee = entry_notional * entry_rate
+        exit_fee = exit_notional * exit_rate
         total_fees = entry_fee + exit_fee
         # Include accumulated funding payments (positive = cost to holder).
         funding_accrued = float(trade_meta.get("funding_accrued", 0.0))
@@ -2495,8 +2500,7 @@ class PaperTrader:
         Also implements trailing stop: if price moves 3%+ in our favor,
         ratchet the stop-loss to lock in at least breakeven.
 
-        When PAPER_TRADING_FUNDING_ENABLED is True, accrues Hyperliquid 8h
-        funding on every open position proportional to elapsed time.
+        Estimates funding on hourly boundaries for open positions.
         """
         open_trades = db.get_open_paper_trades()
         if not open_trades:
@@ -2505,14 +2509,13 @@ class PaperTrader:
         mids = hl.get_all_mids() or {}
 
         # Fetch live funding rates for accrual (best-effort; empty on failure).
-        funding_rates: Dict[str, float] = {}
+        funding_contexts: Dict[str, Dict] = {}
         if config.PAPER_TRADING_FUNDING_ENABLED:
             try:
                 ctxs = hl.get_asset_contexts() or {}
                 for coin, ctx in ctxs.items():
-                    rate = float(ctx.get("funding", 0) if isinstance(ctx, dict) else 0)
-                    if rate:
-                        funding_rates[coin.upper()] = rate
+                    if isinstance(ctx, dict) and ctx.get("funding") is not None:
+                        funding_contexts[coin.upper()] = ctx
             except Exception as exc:
                 logger.debug("Funding rate fetch for paper accrual failed: %s", exc)
 
@@ -2520,21 +2523,13 @@ class PaperTrader:
         closed = []
 
         for trade in open_trades:
-            current_price = float(mids.get(trade["coin"], 0))
-            if current_price <= 0:
-                # MED-FIX MED-9: no market price for this coin (possibly delisted
-                # or feed gap).  Use entry_price as a fallback so that time-exit
-                # logic (24h close) can still fire.  SL/TP checks won't trigger
-                # at entry price (no P&L), which is correct — we just can't compute
-                # a real exit price.  Log a warning so operators can investigate.
-                fallback_price = float(trade.get("entry_price", 0) or 0)
-                if fallback_price <= 0:
-                    continue  # No price at all — skip entirely
-                logger.warning(
-                    "No market price for %s (trade %s) -- using entry price $%.4f as fallback",
-                    trade["coin"], trade.get("id"), fallback_price,
-                )
-                current_price = fallback_price
+            try:
+                current_price = float(mids.get(trade["coin"]) or 0)
+            except (TypeError, ValueError):
+                current_price = 0.0
+            if not math.isfinite(current_price) or current_price <= 0:
+                logger.warning("Paper exit deferred: no valid quote for %s (trade %s)", trade["coin"], trade["id"])
+                continue
 
             should_close = False
             close_reason = ""
@@ -2625,12 +2620,10 @@ class PaperTrader:
                         sl = trail_sl
 
             # --- Funding rate accrual ---
-            # Hyperliquid settles funding every 8h.  We prorate the current
-            # rate across the time elapsed since our last accrual so paper
-            # positions reflect the real cost of carry.
+            # Estimate hourly settlements from the current context, not confirmed payments.
             coin_upper = trade["coin"].upper() if trade.get("coin") else ""
-            fr = funding_rates.get(coin_upper, 0.0)
-            if fr and config.PAPER_TRADING_FUNDING_ENABLED:
+            context = funding_contexts.get(coin_upper)
+            if context is not None:
                 try:
                     meta_raw = trade.get("metadata", "{}")
                     t_meta = json.loads(meta_raw) if isinstance(meta_raw, str) else dict(meta_raw or {})
@@ -2646,22 +2639,23 @@ class PaperTrader:
                         if last_dt.tzinfo is None:
                             last_dt = last_dt.replace(tzinfo=timezone.utc)
 
-                    elapsed_h = max((now_utc - last_dt).total_seconds() / 3600, 0.0)
-                    if elapsed_h > 0.01:  # skip trivially small intervals
-                        notional = current_price * float(trade.get("size", 0) or 0) * float(trade.get("leverage", 1) or 1)
-                        # funding_rate is per 8h period; prorate to elapsed time.
-                        # Longs pay when rate > 0, shorts pay when rate < 0.
-                        if trade["side"] == "long":
-                            payment = notional * fr * (elapsed_h / 8.0)
-                        else:
-                            payment = notional * (-fr) * (elapsed_h / 8.0)
+                    hour = now_utc.replace(minute=0, second=0, microsecond=0)
+                    ticks = int(hour.timestamp() // 3600 - last_dt.timestamp() // 3600)
+                    fr = float(context["funding"])
+                    oracle = float(context.get("oracle_price") or current_price)
+                    if ticks > 0 and math.isfinite(fr) and math.isfinite(oracle) and oracle > 0:
+                        notional = oracle * float(trade["size"]) * float(trade.get("leverage", 1) or 1)
+                        payment = notional * fr * ticks * (1 if trade["side"] == "long" else -1)
                         prev_accrued = float(t_meta.get("funding_accrued", 0.0))
                         new_accrued = round(prev_accrued + payment, 6)
-                        db.update_paper_trade_metadata(trade["id"], {
+                        updates = {
                             "funding_accrued": new_accrued,
-                            "last_funding_ts": now_utc.isoformat(),
+                            "last_funding_ts": hour.isoformat(),
                             "last_funding_rate": fr,
-                        })
+                            "funding_estimated": True,
+                        }
+                        db.update_paper_trade_metadata(trade["id"], updates)
+                        trade["metadata"] = {**t_meta, **updates}
                 except Exception as exc:
                     logger.debug("Funding accrual failed for trade %s: %s", trade.get("id"), exc)
 
@@ -2671,14 +2665,8 @@ class PaperTrader:
             # WR (+$11.27 net).  The bot was closing positions on
             # noise-stop hits before they had a chance to work.
             #
-            # New behaviour: during the first
-            # ``SL_MIN_HOLD_SECONDS`` seconds (default 600 = 10 min)
-            # the stop-loss is INACTIVE.  Trailing-stop / break-even
-            # updates above are still allowed to compute the new SL,
-            # but it cannot CLOSE the position during the grace
-            # window.  Take-profit and time-limit exits are
-            # unaffected.  Set ``SL_MIN_HOLD_SECONDS=0`` to restore the
-            # legacy fire-immediately behaviour.
+            # The optional grace window applies to tightened stops only.
+            # The original stop remains effective throughout the trade.
             sl_min_hold_s = max(
                 0, int(getattr(config, "SL_MIN_HOLD_SECONDS", 600) or 0)
             )
@@ -2697,7 +2685,14 @@ class PaperTrader:
             sl_armed = position_age_s >= sl_min_hold_s if sl_min_hold_s > 0 else True
 
             # Check stop loss (using potentially updated SL)
-            if sl and sl_armed:
+            hard_stop = float(self._trade_metadata(trade).get("initial_stop_loss") or trade.get("stop_loss") or 0)
+            hard_stop_hit = hard_stop > 0 and (
+                current_price <= hard_stop if trade["side"] == "long" else current_price >= hard_stop
+            )
+            if hard_stop_hit:
+                should_close = True
+                close_reason = "stop_loss"
+            elif sl and sl_armed:
                 if trade["side"] == "long" and current_price <= sl:
                     should_close = True
                     close_reason = "trailing_stop" if sl > trade["stop_loss"] else "stop_loss"

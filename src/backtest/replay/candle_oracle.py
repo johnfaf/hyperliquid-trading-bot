@@ -24,6 +24,7 @@ from __future__ import annotations
 import logging
 import os
 import sqlite3
+from contextlib import closing
 from dataclasses import dataclass
 from typing import List, Optional
 
@@ -87,9 +88,9 @@ class CandleOracle:
             if not row or row[0] == 0:
                 raise RuntimeError(f"CandleOracle: cache at {db_path} is empty")
 
-    def _connect(self) -> sqlite3.Connection:
+    def _connect(self) -> closing:
         # `uri=` with `mode=ro` makes it impossible to accidentally write.
-        return sqlite3.connect(f"file:{self._db_path}?mode=ro", uri=True)
+        return closing(sqlite3.connect(f"file:{self._db_path}?mode=ro", uri=True))
 
     # ---- core read API -------------------------------------------------
 
@@ -173,9 +174,10 @@ class CandleOracle:
                 FROM candles
                 WHERE coin = ? AND timeframe = ?
                   AND timestamp_ms >= ? AND timestamp_ms < ?
+                  AND timestamp_ms <= ?
                 ORDER BY timestamp_ms
                 """,
-                (coin.upper(), timeframe, start_ts_ms, end_ts_ms),
+                (coin.upper(), timeframe, start_ts_ms, end_ts_ms, horizon - TIMEFRAME_MS[timeframe]),
             ).fetchall()
         return [
             OracleCandle(
