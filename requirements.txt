@@ -8,7 +8,7 @@ numpy>=1.26.4,<3.0
 pyarrow>=24.0.0,<25.0
 websocket-client>=1.7.0,<2.0
 eth_account>=0.10.0,<1.0
-msgpack>=1.0.0
+msgpack>=1.2.3
 boto3>=1.34.0
 psycopg[binary]>=3.1.0
 psycopg_pool>=3.1.0
@@ -27,6 +27,13 @@ jinja2>=3.1.0
 # to the patched line (pip-compile reconciles the fastapi/starlette pair).
 python-multipart>=0.0.31
 starlette>=1.3.1
+
+# Patched transitive dependency floors reported by the locked dependency scan.
+anyio>=4.14.2
+certifi>=2026.10.18
+urllib3>=2.8.0
+filelock>=4.2.1
+fsspec>=2026.6.0
 
 # ─── XGBoost Regime Forecaster ────────────────────────────────
 # ML-powered regime prediction (walk-forward trained on bot history).
