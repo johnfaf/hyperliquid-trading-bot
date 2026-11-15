@@ -1,5 +1,5 @@
 param(
-    [string]$StateDir = "$env:LOCALAPPDATA\HyperliquidStudy",
+    [string]$StateDir = "$env:USERPROFILE\HyperliquidStudy",
     [string]$Archive
 )
 

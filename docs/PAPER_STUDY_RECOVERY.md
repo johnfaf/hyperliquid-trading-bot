@@ -19,7 +19,9 @@ run while the PC sleeps or is signed out. Focus Assist can suppress a
 visible notification. The log is the durable record.
 
 On the configured Windows PC, run `Verify-PaperStudyBackup.ps1` from
-the installed release to verify the latest downloaded archive. For
+the release in `%USERPROFILE%\HyperliquidStudy` to verify the latest
+downloaded archive. The scheduled check must use a normal profile folder
+visible outside sandboxed applications. For
 manual recovery on another host:
 
 1. Work with a previously downloaded encrypted archive and the
