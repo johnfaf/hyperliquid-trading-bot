@@ -1,0 +1,9 @@
+[Unit]
+Description=Create a daily encrypted paper research backup
+
+[Timer]
+OnCalendar=*-*-* 00:40:00 UTC
+Persistent=true
+
+[Install]
+WantedBy=timers.target

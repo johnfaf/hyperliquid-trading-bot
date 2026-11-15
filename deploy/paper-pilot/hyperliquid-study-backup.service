@@ -1,0 +1,19 @@
+[Unit]
+Description=Write an encrypted off-host-ready paper study backup
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+UMask=0077
+EnvironmentFile=/srv/hyperliquid-audit-pilot/exit-study/recovery/backup-public.env
+ExecStart=/usr/bin/python3 -I -B /srv/hyperliquid-audit-pilot/exit-study/recovery/release/scripts/paper_study_recovery.py backup --keyring /srv/hyperliquid-audit-pilot/exit-study/recovery/keyring --recipient ${BACKUP_RECIPIENT} --revision ${RECOVERY_REVISION}
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+PrivateNetwork=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/srv/hyperliquid-audit-pilot/data /srv/hyperliquid-audit-pilot/exit-study/market /srv/hyperliquid-audit-pilot/exit-study/recovery/keyring /srv/hyperliquid-audit-pilot/exit-study/recovery/encrypted
+TimeoutStartSec=8min
+MemoryMax=768M
