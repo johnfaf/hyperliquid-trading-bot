@@ -199,6 +199,19 @@ def test_market_database_round_trip_and_one_sample_per_bucket(tmp_path):
     assert cli.load_samples(path, 0, 11_000) == [ready, gap]
 
 
+def test_recorder_status_requires_recent_ready_quote_and_rejects_future_tail(tmp_path):
+    path = tmp_path / cli.DB_NAME
+    with closing(sqlite3.connect(path)) as conn:
+        cli._init_market(conn)
+        cli._record(conn, sample(5))
+        cli._record(conn, MarketSample(10_000, "mark_stale"))
+        result = cli.capture_status(path, 10_001)
+        assert result["healthy"]
+        assert result["recent_samples"] == {"ready": 1, "mark_stale": 1}
+        assert not cli.capture_status(path, 38_000)["healthy"]
+        assert not cli.capture_status(path, 8_000)["healthy"]
+
+
 def test_research_subscriptions_and_state_reset_on_every_connection(monkeypatch):
     from src.core import api_manager
 

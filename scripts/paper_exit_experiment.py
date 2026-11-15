@@ -5,8 +5,10 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import signal
 import sqlite3
 import sys
+import threading
 import time
 from collections import Counter
 from contextlib import closing
@@ -25,13 +27,15 @@ from src.backtest.paper_exit_study import (
     ARM_AFTER_R, ATR_PERIOD, FEE_RATE, HEALTHY_CHECKS, HEALTHY_SPREAD_BPS, MAX_GAP_MS,
     MINUTE_MS, POLICIES, SLIPPAGE, TRAIL_ATR_MULTIPLE, TRAIL_FLOOR_PCT, Entry, build_frames, compare,
 )
-from src.data.paper_exit_feed import MarketSample, PaperExitFeed, SAMPLE_MS
+from src.data.paper_exit_feed import MarketSample, PaperExitFeed, SAMPLE_MS, epoch_ms
 
 
 DB_NAME = "btc-paper-exit-market.sqlite3"
 SCHEMA_VERSION = 2
+HEALTH_MAX_AGE_SECONDS = 30
 _FIELDS = [f.name for f in fields(MarketSample)]
 _COLUMN_LIST = ", ".join(_FIELDS)
+logger = logging.getLogger(__name__)
 
 
 def _market_path(path: Path) -> Path:
@@ -62,23 +66,26 @@ def _record(conn: sqlite3.Connection, sample: MarketSample):
         conn.execute(f"INSERT INTO market_samples ({_COLUMN_LIST}) VALUES ({', '.join('?' for _ in values)})", values)
 
 
-def capture(path: Path, duration_seconds: int) -> dict:
-    if duration_seconds < SAMPLE_MS // 1000:
+def capture(path: Path, duration_seconds: int | None, *, stop: threading.Event | None = None) -> dict:
+    if duration_seconds is not None and duration_seconds < SAMPLE_MS // 1000:
         raise ValueError("capture duration must be at least 5 seconds")
+    stop = stop if stop is not None else threading.Event()
     market_path = _market_path(path)
     counts = Counter()
     with closing(sqlite3.connect(market_path, timeout=5)) as conn:
         _init_market(conn)
+        conn.execute("PRAGMA journal_mode=WAL")
         feed = PaperExitFeed(COIN)
         stream = feed.make_stream()
         stream.start()
         try:
-            deadline = time.monotonic() + duration_seconds
-            next_sample = (int(time.time() * 1000) // SAMPLE_MS + 1) * SAMPLE_MS
-            while time.monotonic() < deadline:
-                wait = max(0.0, (next_sample - time.time() * 1000) / 1000)
+            deadline = float("inf") if duration_seconds is None else time.monotonic() + duration_seconds
+            next_sample = (epoch_ms() // SAMPLE_MS + 1) * SAMPLE_MS
+            samples_written = 0
+            while not stop.is_set():
+                wait = max(0.0, (next_sample - epoch_ms()) / 1000)
                 remaining = deadline - time.monotonic()
-                if wait >= remaining:
+                if wait >= remaining or stop.wait(wait):
                     break
                 time.sleep(wait)
                 sample = feed.snapshot(connected=stream.is_connected())
@@ -86,6 +93,9 @@ def capture(path: Path, duration_seconds: int) -> dict:
                     continue
                 _record(conn, sample)
                 counts[sample.status] += 1
+                samples_written += 1
+                if duration_seconds is None and samples_written % 60 == 0:
+                    logger.info("Market samples since start: %s", dict(counts))
                 next_sample = (sample.at_ms // SAMPLE_MS + 1) * SAMPLE_MS
         finally:
             stream.stop()
@@ -105,6 +115,27 @@ def _utc(ms: int) -> str:
 
 def _readonly(path: Path) -> sqlite3.Connection:
     return sqlite3.connect(f"{path.resolve(strict=True).as_uri()}?mode=ro", uri=True, timeout=5)
+
+
+def capture_status(path: Path, now_ms: int, *, max_age_s: int = HEALTH_MAX_AGE_SECONDS) -> dict:
+    """Give a bounded, read-only view suitable for container health checks."""
+    with closing(_readonly(_market_path(path))) as conn:
+        if conn.execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION:
+            raise ValueError("unrecognized market recording version")
+        latest = conn.execute("SELECT at_ms FROM market_samples ORDER BY at_ms DESC LIMIT 1").fetchone()
+        rows = conn.execute(
+            "SELECT status, count(*), max(at_ms) FROM market_samples WHERE at_ms >= ? AND at_ms <= ? GROUP BY status",
+            (now_ms - max_age_s * 1000, now_ms),
+        ).fetchall()
+    fresh_ms = next((row[2] for row in rows if row[0] == "ready"), None)
+    latest_ms = latest[0] if latest else None
+    return {
+        "healthy": fresh_ms is not None and latest_ms is not None and latest_ms <= now_ms,
+        "latest_sample_utc": _utc(latest_ms) if latest_ms is not None else None,
+        "latest_ready_sample_utc": _utc(fresh_ms) if fresh_ms is not None else None,
+        "recent_samples": {status: count for status, count, _ in rows},
+        "max_age_seconds": max_age_s,
+    }
 
 
 def load_entries(path: Path, start: int, end: int) -> list[Entry]:
@@ -206,7 +237,11 @@ def main() -> int:
     commands = parser.add_subparsers(dest="command", required=True)
     collect = commands.add_parser("capture", help="Collect timestamped public data; no orders or account credentials")
     collect.add_argument("--market-db", type=Path, required=True)
-    collect.add_argument("--seconds", type=int, default=60)
+    duration = collect.add_mutually_exclusive_group()
+    duration.add_argument("--seconds", type=int, default=60)
+    duration.add_argument("--continuous", action="store_true", help="Run until interrupted or stopped")
+    status = commands.add_parser("status", help="Report whether the recorder has recently stored a ready quote")
+    status.add_argument("--market-db", type=Path, required=True)
     replay = commands.add_parser("compare", help="Read the pilot and market databases and print a paired JSON report")
     replay.add_argument("--market-db", type=Path, required=True)
     replay.add_argument("--pilot-db", type=Path, required=True)
@@ -216,9 +251,20 @@ def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     try:
         if args.command == "capture":
-            counts = capture(args.market_db, args.seconds)
+            stop = threading.Event()
+            if args.continuous:
+                def request_stop(_signum, _frame):
+                    stop.set()
+
+                signal.signal(signal.SIGTERM, request_stop)
+                signal.signal(signal.SIGINT, request_stop)
+            counts = capture(args.market_db, None if args.continuous else args.seconds, stop=stop)
             print(json.dumps({"capture_samples": counts}, sort_keys=True))
             return 0 if counts.get("ready", 0) else 1
+        if args.command == "status":
+            result = capture_status(args.market_db, epoch_ms())
+            print(json.dumps(result, sort_keys=True))
+            return 0 if result["healthy"] else 1
         if args.start >= args.end:
             raise ValueError("--from must be before --until")
         entries = load_entries(args.pilot_db, args.start, args.end)

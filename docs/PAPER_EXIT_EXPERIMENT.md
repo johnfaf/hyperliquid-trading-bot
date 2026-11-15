@@ -21,6 +21,15 @@ it to another machine. Comparison opens both inputs read-only and writes JSON
 to stdout. No account address, secret, Telegram integration, or order endpoint
 is needed.
 
+For a sustained recording, use `capture --continuous` and the `status`
+subcommand against its market database. The VPS companion image in
+`deploy/paper-pilot/exit-collector.Dockerfile` layers these research files
+onto the pinned paper-pilot image. Mount only a new writable directory
+at `/capture`; don't mount the pilot database or publish network ports.
+`status` exits nonzero if no usable quote was recorded in the last 30
+seconds. Container restart policy should be configured at launch; an
+unhealthy Docker status alone does not restart a running container.
+
 The collector samples [public Hyperliquid streams](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/websocket/subscriptions)
 every five seconds: mark, best bid/ask and top bid size, five-level book imbalance,
 signed trade notional over the last minute, funding rate, oracle price and open
