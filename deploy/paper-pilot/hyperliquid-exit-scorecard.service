@@ -1,0 +1,19 @@
+[Unit]
+Description=Build the private BTC paper exit comparison scorecard
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+UMask=0077
+ExecStart=/usr/bin/python3 -B /srv/hyperliquid-audit-pilot/exit-study/scorecard/scripts/paper_exit_scorecard.py --market-db /srv/hyperliquid-audit-pilot/exit-study/market/btc-paper-exit-market.sqlite3 --pilot-db /srv/hyperliquid-audit-pilot/data/audit-paper-1000.db --output-dir /srv/hyperliquid-audit-pilot/exit-study/reports
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+PrivateNetwork=true
+ProtectHome=true
+ProtectSystem=strict
+# SQLite may create shared-memory sidecars even with read-only database handles.
+ReadWritePaths=/srv/hyperliquid-audit-pilot/data /srv/hyperliquid-audit-pilot/exit-study/market /srv/hyperliquid-audit-pilot/exit-study/reports
+TimeoutStartSec=5min
+MemoryMax=768M
