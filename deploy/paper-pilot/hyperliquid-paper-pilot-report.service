@@ -1,0 +1,17 @@
+[Unit]
+Description=Publish the previous UTC day's isolated Hyperliquid paper report
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+UMask=0077
+ExecStart=/usr/bin/python3 -B /srv/hyperliquid-audit-pilot/tools/daily_paper_report.py --db /srv/hyperliquid-audit-pilot/data/audit-paper-1000.db --output /srv/hyperliquid-audit-pilot/reports/paper-{day}.md
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+PrivateNetwork=true
+ProtectHome=true
+ProtectSystem=strict
+# SQLite may need to create shared-memory sidecars even with a read-only data connection.
+ReadWritePaths=/srv/hyperliquid-audit-pilot/data /srv/hyperliquid-audit-pilot/reports

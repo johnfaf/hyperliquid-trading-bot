@@ -1992,11 +1992,13 @@ class PaperTrader:
         return max(config.PAPER_TRADING_TAKER_FEE_BPS, 0.0) / 10_000
 
     @staticmethod
-    def _slippage_cost(side: str, intended_price: float, filled_price: float, size: float, leverage: float) -> float:
+    def _slippage_cost(
+        side: str, intended_price: float, filled_price: float, size: float, leverage: float, *, is_entry: bool = True,
+    ) -> float:
         """Positive number = adverse slippage cost in USD notional PnL terms."""
         if intended_price <= 0 or filled_price <= 0 or size <= 0 or leverage <= 0:
             return 0.0
-        direction = 1.0 if side == "long" else -1.0
+        direction = 1.0 if (side == "long") == is_entry else -1.0
         return max((filled_price - intended_price) * direction * size * leverage, 0.0)
 
     def _execute_paper_trade(self, account: Dict, strategy: Dict, signal: Dict) -> Optional[Dict]:
@@ -2159,6 +2161,7 @@ class PaperTrader:
             slipped_exit,
             float(trade.get("size", 0) or 0),
             float(trade.get("leverage", 1) or 1),
+            is_entry=False,
         )
         total_slippage_cost = round(entry_slippage_cost + exit_slippage_cost, 4)
         risk_policy = self._resolve_trade_risk_policy(
@@ -2493,7 +2496,7 @@ class PaperTrader:
         self._closed_events.clear()
         return events
 
-    def check_open_positions(self) -> List[Dict]:
+    def check_open_positions(self, *, mids: Optional[Dict] = None) -> List[Dict]:
         """
         Check all open paper positions against current prices.
         Close any that hit stop-loss, take-profit, or trailing stop.
@@ -2506,7 +2509,8 @@ class PaperTrader:
         if not open_trades:
             return []
 
-        mids = hl.get_all_mids() or {}
+        if mids is None:
+            mids = hl.get_all_mids() or {}
 
         # Fetch live funding rates for accrual (best-effort; empty on failure).
         funding_contexts: Dict[str, Dict] = {}
