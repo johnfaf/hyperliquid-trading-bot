@@ -1,0 +1,9 @@
+[Unit]
+Description=Score the observed BTC/ETH absorption study once per UTC day
+
+[Timer]
+OnCalendar=*-*-* 00:20:00 UTC
+Persistent=true
+
+[Install]
+WantedBy=timers.target

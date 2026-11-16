@@ -1,0 +1,16 @@
+[Unit]
+Description=Publish the private order-flow absorption research scorecard
+After=docker.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/hyperliquid-absorption/current
+ExecStart=/usr/bin/python3 -B -m scripts.score_hyperliquid_absorption --db /var/lib/hyperliquid-absorption/data/flow.sqlite3 --out /var/lib/hyperliquid-absorption/reports/latest.md
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateNetwork=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/hyperliquid-absorption
+TimeoutStartSec=90
