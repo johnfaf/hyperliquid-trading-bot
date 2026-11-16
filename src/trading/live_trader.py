@@ -30,6 +30,7 @@ import math
 import random
 import threading
 from collections import defaultdict, deque
+from contextvars import ContextVar
 from datetime import datetime, timezone, timedelta
 from typing import Any, Deque, Dict, List, Optional, Tuple, Union
 
@@ -115,6 +116,7 @@ from src.trading.scaling_tiers import (
 from src.trading.regime_reversal_manager import RegimeReversalDecision, RegimeReversalManager
 
 logger = logging.getLogger(__name__)
+_ENTRY_ORDER_DECISION = ContextVar("entry_order_decision", default="")
 
 
 class LiveTrader:
@@ -2404,6 +2406,15 @@ class LiveTrader:
         un-placed).
         """
         logger.info("Reconciling positions with exchange...")
+        if not self.dry_run and self.public_address:
+            try:
+                journal = self._durable_order_journal()
+                self._recover_durable_orders(journal)
+                count = len(journal.unresolved())
+                if count:
+                    logger.critical("New entries blocked: %d durable order submission(s) unresolved", count)
+            except Exception:
+                logger.exception("Could not verify durable order submissions; continuing exit reconciliation")
         try:
             exchange_positions = self.get_positions()
             if exchange_positions is None:
@@ -4496,6 +4507,37 @@ class LiveTrader:
     def _is_insufficient_margin_rejection(cls, result: Optional[Dict]) -> bool:
         return _ord_is_insufficient_margin(result)
 
+    def _durable_order_journal(self):
+        from pathlib import Path
+        from src.trading.order_journal import OrderJournal
+
+        address = getattr(self, "public_address", None)
+        if not address:
+            return None
+        return OrderJournal(
+            Path(config.DB_PATH).with_suffix(".orders.sqlite3"),
+            f"hyperliquid:{self.info_url}:{address.lower()}",
+        )
+
+    def _recover_durable_orders(self, journal) -> None:
+        from src.trading.hyperliquid_order_recovery import recover_submissions
+
+        def lookup(cid):
+            return self.api_manager.post(
+                {"type": "orderStatus", "user": self.public_address, "oid": cid},
+                priority=Priority.CRITICAL, retries=1, endpoint_url=self.info_url,
+                cache_response=False, req_type="orderStatus", timeout=8,
+            )
+
+        def fetch_fills():
+            return self.api_manager.post(
+                {"type": "userFills", "user": self.public_address, "aggregateByTime": False},
+                priority=Priority.CRITICAL, retries=1, endpoint_url=self.info_url,
+                cache_response=False, req_type="userFills", timeout=8,
+            )
+
+        recover_submissions(journal, lookup, fetch_fills)
+
     def _post_order(self, action: Dict, dry_run_override: Optional[bool] = None) -> Dict:
         """
         Post an order to Hyperliquid exchange.
@@ -4556,6 +4598,8 @@ class LiveTrader:
         # doesn't re-ship an order that may have executed.
         self._persist_order_dedup_cache()
 
+        journal = None
+        cid = None
         # ``request_dispatched`` starts False and flips True just before we
         # hand the payload off to api_manager.post().  If a generic exception
         # fires after dispatch we MUST keep the dedup slot to block retries
@@ -4613,6 +4657,20 @@ class LiveTrader:
             if vault_address:
                 payload["vaultAddress"] = vault_address
 
+            if action.get("type") == "order" and getattr(self, "public_address", None):
+                orders = action.get("orders") or []
+                if len(orders) != 1 or not orders[0].get("c"):
+                    raise ValueError("durable submission requires exactly one order with a client ID")
+                journal = self._durable_order_journal()
+                cid = orders[0]["c"]
+                entry = orders[0].get("r") is not True
+                if entry:
+                    self._recover_durable_orders(journal)
+                if not journal.reserve(cid, action, entry=entry):
+                    with self._order_dedup_lock:
+                        self._recent_order_hashes.pop(action_hash, None)
+                    return {"status": "rejected", "reason": "durable_order_blocked"}
+
             logger.debug(f"Posting order to {self.exchange_url}: action_hash={action_hash}")
 
             # Flag that the HTTP request is being dispatched — from this
@@ -4630,12 +4688,10 @@ class LiveTrader:
             )
             if result is None:
                 logger.error("Exchange request failed for action_hash=%s", action_hash[:16])
-                # Release the in-flight slot — the request never reached the exchange,
-                # so future retries with the same hash must be allowed.
                 with self._order_dedup_lock:
-                    self._recent_order_hashes.pop(action_hash, None)
+                    self._recent_order_hashes[action_hash] = (now, {"status": "timeout"})
                 self._persist_order_dedup_cache()
-                return {"status": "error", "message": "exchange request failed"}
+                return {"status": "error", "reason": "submission_unknown", "message": "exchange request failed"}
 
             logger.info(f"Order posted: {json.dumps(result)}")
 
@@ -4644,6 +4700,21 @@ class LiveTrader:
             # clear rejection so downstream callers stop waiting on
             # verify_fill for a fill that will never come.
             inner_statuses = self._extract_inner_order_statuses(result)
+            if journal is not None:
+                if inner_statuses and all("error" in status for status in inner_statuses):
+                    journal.observe(cid, "rejected")
+                elif len(inner_statuses) == 1:
+                    details = inner_statuses[0].get("resting") or inner_statuses[0].get("filled")
+                    if isinstance(details, dict) and details.get("oid") is not None:
+                        journal.observe(cid, "accepted", str(details["oid"]))
+                    else:
+                        result = {"status": "error", "reason": "submission_unknown"}
+                        journal.observe(cid, "unknown")
+                elif result.get("status") == "err":
+                    journal.observe(cid, "rejected")
+                else:
+                    result = {"status": "error", "reason": "submission_unknown"}
+                    journal.observe(cid, "unknown")
             if inner_statuses and any("error" in s for s in inner_statuses):
                 errors = [s["error"] for s in inner_statuses if "error" in s]
                 rejection_payload = {
@@ -4973,7 +5044,8 @@ class LiveTrader:
         # cloid if the caller intentionally re-submits the exact same
         # order ~seconds apart.
         time_bucket = int(time.time())
-        cloid = self._make_cloid(
+        decision_id = _ENTRY_ORDER_DECISION.get()
+        cloid = self._make_cloid("entry", decision_id) if decision_id and not reduce_only else self._make_cloid(
             "market", coin, side.lower(), wire_size, wire_price,
             bool(reduce_only), time_bucket,
         )
@@ -5185,7 +5257,7 @@ class LiveTrader:
 
         asset_idx = self._get_asset_index(coin)
         if asset_idx is None:
-            return {"status": "error", "message": f"Unknown coin: {coin}"}
+            return {"status": "error", "reason": "maker_asset_not_resolved", "message": f"Unknown coin: {coin}"}
 
         # Position size check only for new positions
         notional = size * price
@@ -5248,7 +5320,8 @@ class LiveTrader:
         # H1: exchange-level cloid for retry idempotency.
         tif = OrderType.LIMIT_ALO.value if post_only else OrderType.LIMIT_GTC.value
         time_bucket = int(time.time())
-        cloid = self._make_cloid(
+        decision_id = _ENTRY_ORDER_DECISION.get()
+        cloid = self._make_cloid("entry", decision_id) if decision_id and not reduce_only else self._make_cloid(
             "limit", coin, side.lower(), wire_size, wire_price,
             bool(reduce_only), tif, time_bucket,
         )
@@ -6233,7 +6306,7 @@ class LiveTrader:
         mode = self.entry_execution_mode
         if mode == "market":
             result = self.place_market_order(
-                coin, side, size, leverage=leverage, reduce_only=False
+                coin, side, size, leverage=leverage, reduce_only=False,
             )
             if isinstance(result, dict):
                 result = dict(result)
@@ -6250,7 +6323,7 @@ class LiveTrader:
             )
             if mode == "maker_then_market" and self.maker_entry_fallback_to_market:
                 fallback = self.place_market_order(
-                    coin, side, size, leverage=leverage, reduce_only=False
+                    coin, side, size, leverage=leverage, reduce_only=False,
                 )
                 if isinstance(fallback, dict):
                     fallback = dict(fallback)
@@ -6270,19 +6343,16 @@ class LiveTrader:
         )
         if not self._is_order_result_success(maker_result):
             self._incr_entry_metric("maker_entry_rejected")
-            if mode == "maker_then_market" and self.maker_entry_fallback_to_market:
-                logger.warning(
-                    "Maker entry rejected for %s %s; falling back to market: %s",
-                    coin, side, maker_result,
-                )
-                fallback = self.place_market_order(
-                    coin, side, size, leverage=leverage, reduce_only=False
-                )
+            if (
+                mode == "maker_then_market" and self.maker_entry_fallback_to_market
+                and (maker_result or {}).get("reason") == "maker_asset_not_resolved"
+            ):
+                # No maker order could have been submitted on this local validation path.
+                fallback = self.place_market_order(coin, side, size, leverage=leverage, reduce_only=False)
                 if isinstance(fallback, dict):
-                    fallback = dict(fallback)
-                    fallback["maker_entry_result"] = maker_result
-                    fallback["entry_order_type"] = "maker_fallback_market"
+                    return {**fallback, "entry_order_type": "maker_fallback_market"}
                 return fallback
+            # A second entry is unsafe after a submission, even if its response was lost.
             return maker_result
 
         if self.dry_run:
@@ -6326,35 +6396,27 @@ class LiveTrader:
                     maker_result["exchange_reported_fill_price"] = fill_check.get("entry_price")
                 return maker_result
 
-        # If the maker order is still only resting, cancel it before any
-        # fallback so we do not leave a stale entry order behind.
+        # Record uncertainty before requesting a cancellation.
+        decision_id = _ENTRY_ORDER_DECISION.get()
+        if resting_oids and decision_id and self.public_address:
+            journal = self._durable_order_journal()
+            journal.observe(self._make_cloid("entry", decision_id), "cancel_pending")
         for oid in resting_oids:
             try:
                 self.cancel_order(coin, oid)
             except Exception as exc:
                 logger.warning("Failed to cancel resting maker entry %s %s oid=%s: %s", coin, side, oid, exc)
 
-        if mode == "maker_only" or not self.maker_entry_fallback_to_market:
-            self._incr_entry_metric("maker_entry_unfilled")
-            return {
-                "status": "resting_cancelled",
-                "reason": "maker_entry_unfilled",
-                "coin": coin,
-                "side": side,
-                "maker_entry_result": maker_result,
-                "entry_order_type": "post_only_limit",
-            }
-
-        self._incr_entry_metric("maker_entry_fallback_market")
-        logger.info("Maker entry unfilled for %s %s; falling back to market", coin, side)
-        fallback = self.place_market_order(
-            coin, side, size, leverage=leverage, reduce_only=False
-        )
-        if isinstance(fallback, dict):
-            fallback = dict(fallback)
-            fallback["maker_entry_result"] = maker_result
-            fallback["entry_order_type"] = "maker_fallback_market"
-        return fallback
+        # Cancel intent is not proof the order did not fill while being canceled.
+        self._incr_entry_metric("maker_entry_unfilled")
+        return {
+            "status": "cancel_requested",
+            "reason": "maker_entry_unfilled_or_unconfirmed",
+            "coin": coin,
+            "side": side,
+            "maker_entry_result": maker_result,
+            "entry_order_type": "post_only_limit",
+        }
 
     def execute_signal(
         self,
@@ -6689,13 +6751,14 @@ class LiveTrader:
             # 1. Place entry order.  Non-urgent entries use maker-first
             # execution by default to reduce fee drag; emergency exits still
             # use market/reduce-only paths elsewhere.
-            entry_result = self._place_entry_order(
-                coin,
-                entry_side,
-                size,
-                leverage=signal.leverage,
-                baseline_position_size=baseline_position_size,
-            )
+            token = _ENTRY_ORDER_DECISION.set(str((signal.context or {}).get("decision_id") or signal.signal_id or ""))
+            try:
+                entry_result = self._place_entry_order(
+                    coin, entry_side, size, leverage=signal.leverage,
+                    baseline_position_size=baseline_position_size,
+                )
+            finally:
+                _ENTRY_ORDER_DECISION.reset(token)
 
             if not self._is_order_result_success(entry_result):
                 if self._is_insufficient_margin_rejection(entry_result):

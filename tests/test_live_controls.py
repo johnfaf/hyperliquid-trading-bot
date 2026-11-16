@@ -634,6 +634,8 @@ def test_post_order_routes_exchange_requests_through_api_manager(monkeypatch):
 
         def post(self, payload, **kwargs):
             self.calls.append((payload, kwargs))
+            if kwargs.get("req_type") == "exchange":
+                return {"status": "ok", "response": {"type": "order", "data": {"statuses": [{"resting": {"oid": 1}}]}}}
             return {"status": "ok"}
 
     class FakeSigner:
@@ -659,7 +661,7 @@ def test_post_order_routes_exchange_requests_through_api_manager(monkeypatch):
     monkeypatch.setattr(LiveTrader, "_load_asset_index_map", lambda self: None)
 
     trader = LiveTrader(firewall=FakeFirewall(), dry_run=False)
-    result = trader._post_order({"type": "order", "orders": []})
+    result = trader._post_order({"type": "order", "orders": [{"c": "0x" + "1" * 32}]})
 
     assert result["status"] == "ok"
     exchange_call = next(
@@ -3925,7 +3927,7 @@ def test_post_order_promotes_inner_error_to_rejection(monkeypatch):
     trader.signer = FakeSigner()
     trader.dry_run = False
 
-    result = trader._post_order({"type": "order", "orders": [], "grouping": "na"})
+    result = trader._post_order({"type": "order", "orders": [{"c": "0x" + "2" * 32}], "grouping": "na"})
     assert result.get("status") == "rejected"
     assert result.get("reason") == "exchange_inner_error"
     assert "Order has invalid price." in result.get("errors", [])
@@ -4761,7 +4763,9 @@ def test_post_order_does_not_cache_inner_error_rejections(monkeypatch):
     trader.signer = FakeSigner()
     trader.dry_run = False
 
-    action = {"type": "order", "orders": [{"a": 0, "b": True, "p": "0", "s": "1", "r": False, "t": {"limit": {"tif": "Ioc"}}}], "grouping": "na"}
+    first_cid = "0x" + "3" * 32
+    action = {"type": "order", "orders": [{"c": first_cid, "a": 0, "b": True, "p": "0", "s": "1", "r": False,
+                                           "t": {"limit": {"tif": "Ioc"}}}], "grouping": "na"}
 
     # First call: hits the exchange, gets inner error
     r1 = trader._post_order(action)
@@ -4769,9 +4773,9 @@ def test_post_order_does_not_cache_inner_error_rejections(monkeypatch):
     assert r1["reason"] == "exchange_inner_error"
     assert call_count["n"] == 1
 
-    # Second call with the SAME action: must reach the exchange again
-    # (not be silently blocked by the dedup cache)
-    r2 = trader._post_order(action)
+    # Allow a fresh attempt after a definitive rejection, never reuse the old client ID.
+    assert trader._post_order(action)["reason"] == "durable_order_blocked"
+    r2 = trader._post_order({**action, "orders": [{**action["orders"][0], "c": "0x" + "4" * 32}]})
     assert r2["status"] == "rejected"
     assert r2["reason"] == "exchange_inner_error"
     assert call_count["n"] == 2, (
