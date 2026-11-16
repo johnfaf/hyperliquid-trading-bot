@@ -118,3 +118,19 @@ After reviewing a fresh open-session shadow cycle, keep
 The dashboard publisher uses the existing bot Telegram configuration for
 stock incidents. Normal closed sessions and no-signal cycles are quiet;
 repeated quote/mismatch incidents and failed cycles are rate-limited.
+
+## Crypto trade review
+
+The private Trades tab groups simulated results by source, asset and
+direction. Copy overlap counts require simultaneous same-asset, same-side
+positions during the selected window, not merely repeated symbols. Tainted
+and synthetic reconciliations are visible as records but excluded from
+totals. Fees and stop gaps show only recorded measurements. A stop is
+classified as original or tightened only when both a trigger and initial
+stop were recorded.
+
+New main-bot paper entries carry the recorded rationale, selection time,
+signal time and available decision inputs. New bot exits store the reason,
+actual trigger when applicable, exit price input and simulated fill with the
+ledger close. Trade details show the exact linked journal events when
+available. Missing historical context is not inferred or backfilled.

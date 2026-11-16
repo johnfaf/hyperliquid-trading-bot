@@ -1,0 +1,76 @@
+{% extends "base.html" %}
+{% from "partials/desk_macros.html" import icon, badge, money %}
+{% block content %}
+{% set s = report.summary %}
+<div class="desk-content">
+  <header class="desk-pagehead">
+    <div><div class="desk-kicker">{{ icon("file", 15) }} Hyperliquid</div><h1>Trade review</h1><p class="desk-muted">Crypto · Paper only</p></div>
+    <div class="desk-actions"><a href="/trades?days={{ report.days }}&amp;group={{ report.group }}&amp;scope={{ report.scope }}"
+      class="desk-icon-btn" aria-label="Refresh trade review" title="Refresh trade review">{{ icon("refresh") }}</a></div>
+  </header>
+  <div class="desk-review-controls">
+    <div class="desk-segments" aria-label="Trade scope">
+      {% for scope,label in [("copy","Copy trades"),("all","All paper trades")] %}
+      <a href="/trades?scope={{ scope }}&amp;days={{ report.days }}&amp;group={{ report.group }}"{% if report.scope == scope %} aria-current="true"{% endif %}>{{ label }}</a>
+      {% endfor %}
+    </div>
+    <div class="desk-segments" aria-label="Review window">
+      {% for days,label in [(1,"24h"),(7,"7d"),(30,"30d")] %}
+      <a href="/trades?scope={{ report.scope }}&amp;days={{ days }}&amp;group={{ report.group }}"{% if report.days == days %} aria-current="true"{% endif %}>{{ label }}</a>
+      {% endfor %}
+    </div>
+  </div>
+  {% if s %}
+  <section class="desk-kpis" aria-label="Trade review totals">
+    <div><span>Net realized P&amp;L</span><strong class="{{ 'tone-text-bad' if s.pnl is not none and s.pnl < 0 else 'tone-text-good' if s.pnl else '' }}">{{ money(s.pnl,true) }}</strong><small>{{ s.priced }} of {{ s.closed }} closes with P&amp;L</small></div>
+    <div><span>Fees recorded</span><strong>{{ money(s.fees) }}</strong><small>{{ s.fee_count }} of {{ s.closed }} closes</small></div>
+    <div><span>Copy trades that overlapped</span><strong>{{ s.overlap }}</strong><small>Same asset and direction · {{ report.peak or 0 }} peak in one group</small></div>
+    <div><span>Largest adverse stop gap</span><strong>{{ "{:.1f} bps".format(s.max_gap) if s.max_gap is not none else "Unmeasured" }}</strong><small>{{ s.gap_count }} exits with trigger and fill recorded</small></div>
+  </section>
+  {% endif %}
+  <section class="desk-panel">
+    <div class="desk-panel-heading">
+      <div><h2>Attribution</h2><p>Paper results · sorted by net P&amp;L</p></div>
+      <div class="desk-segments" aria-label="Group trades">
+        {% for group,label in [("source","Source"),("asset","Asset + side"),("side","Side")] %}
+        <a href="/trades?scope={{ report.scope }}&amp;days={{ report.days }}&amp;group={{ group }}"{% if report.group == group %} aria-current="true"{% endif %}>{{ label }}</a>
+        {% endfor %}
+      </div>
+    </div>
+    {% if report.groups %}
+    <div class="desk-table-scroll" tabindex="0" aria-label="Scrollable trade attribution">
+      <table class="desk-table review-table">
+        <thead><tr><th scope="col">Group</th><th scope="col">Closed</th><th scope="col">Wins / priced</th><th scope="col">Open</th>
+          <th scope="col">Overlapping copies</th><th scope="col">Known fees</th><th scope="col">Net P&amp;L</th></tr></thead>
+        <tbody>{% for row in report.groups %}
+          <tr><th scope="row">{{ row.label }}</th><td>{{ row.closed }}</td><td>{{ row.wins }} / {{ row.priced }}</td><td>{{ row.open }}</td><td>{{ row.overlap }}</td>
+            <td>{{ money(row.fees) }} <small class="desk-muted">({{ row.fee_count }}/{{ row.closed }})</small></td>
+            <td class="{{ 'tone-text-bad' if row.pnl is not none and row.pnl < 0 else 'tone-text-good' if row.pnl else '' }}">{{ money(row.pnl,true) }}</td></tr>
+        {% endfor %}</tbody>
+      </table>
+    </div>
+    <div class="desk-decision-empty">Original stops: {{ s.original }} · Tightened stops: {{ s.tightened }} · Unverified stops: {{ s.unverified_stops }} · Excluded from totals: {{ report.excluded }}</div>
+    {% else %}
+    <div class="desk-empty compact"><p>{{ "Results exceed the review limit. Select a shorter window." if report.limited else "No eligible trades in this view." if report.available else "Paper trade history is unavailable." }}</p></div>
+    {% endif %}
+  </section>
+  <section class="desk-panel desk-trades">
+    <div class="desk-panel-heading"><div><h2>Trade records</h2><p>Newest first · up to 50 records</p></div></div>
+    {% if report.recent %}
+    <div class="desk-table-scroll" tabindex="0" aria-label="Scrollable trade records">
+      <table class="desk-table review-table">
+        <thead><tr><th scope="col">Asset</th><th scope="col">Side</th><th scope="col">Source</th><th scope="col">Opened (UTC)</th>
+          <th scope="col">Exit</th><th scope="col">Stop gap</th><th scope="col">Net P&amp;L</th></tr></thead>
+        <tbody>{% for t in report.recent %}
+          <tr><th scope="row"><a class="desk-table-link" href="/trades/{{ t.id }}">{{ t.symbol }} #{{ t.id }}</a></th>
+            <td>{{ t.side|capitalize }}</td><td>{{ t.source|replace("_"," ") }}</td><td>{{ (t.opened_at or "")[:16]|replace("T"," ") or "Unrecorded" }}</td>
+            <td>{{ "Excluded" if t.excluded else t.stop_type or (t.reason|replace("_"," ")) if t.reason else "Open" if t.status == "open" else "Unrecorded" }}{% if t.overlap %}<small class="desk-overlap">Overlap</small>{% endif %}</td>
+            <td>{{ "{:.1f} bps".format(t.stop_gap_bps) if t.stop_gap_bps is not none else "—" }}</td>
+            <td class="{{ 'tone-text-bad' if t.pnl is not none and t.pnl < 0 else 'tone-text-good' if t.pnl else '' }}">{{ money(t.pnl,true) if t.status == "closed" else "—" }}</td></tr>
+        {% endfor %}</tbody>
+      </table>
+    </div>
+    {% else %}<div class="desk-empty compact"><p>No trade records in this view.</p></div>{% endif %}
+  </section>
+</div>
+{% endblock %}

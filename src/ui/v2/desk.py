@@ -75,7 +75,7 @@ def paper_book(path: Path, start: datetime) -> dict:
                 result.update(cash=account["balance"], lifetime_pnl=account["total_pnl"])
             result["open"] = conn.execute("SELECT count(*) FROM paper_trades WHERE status = 'open'").fetchone()[0]
             rows = conn.execute("""
-                SELECT coin, side, pnl, closed_at, metadata FROM paper_trades
+                SELECT id, coin, side, pnl, closed_at, metadata FROM paper_trades
                 WHERE status = 'closed' AND closed_at >= ? ORDER BY closed_at DESC, id DESC LIMIT 1001
                 """, (start.isoformat(),)).fetchall()
             result["complete_window"] = len(rows) <= 1000
@@ -92,7 +92,7 @@ def paper_book(path: Path, start: datetime) -> dict:
                     continue
                 if row["pnl"] is not None:
                     result["closes"].append({
-                        "coin": row["coin"], "side": row["side"], "pnl": row["pnl"], "timestamp": row["closed_at"],
+                        "id": row["id"], "coin": row["coin"], "side": row["side"], "pnl": row["pnl"], "timestamp": row["closed_at"],
                         "source": meta.get("strategy_type") or meta.get("source") or "Unattributed",
                         "reason": meta.get("close_reason") or "Unrecorded",
                     })

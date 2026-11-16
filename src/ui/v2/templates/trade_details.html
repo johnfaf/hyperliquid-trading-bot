@@ -1,0 +1,78 @@
+{% extends "base.html" %}
+{% from "partials/desk_macros.html" import icon, badge, money %}
+{% macro evidence_row(label, value) -%}
+<div><dt>{{ label }}</dt><dd>{{ value if value is not none and value != "" else "Not recorded" }}</dd></div>
+{%- endmacro %}
+{% macro display_time(raw) -%}
+{% if raw %}<time datetime="{{ raw }}">{{ raw[:19]|replace("T"," ") }}</time>{% else %}Not recorded{% endif %}
+{%- endmacro %}
+{% block content %}
+{% set copy = trade.entry.get("copy") or {} %}
+<div class="desk-content">
+  <header class="desk-pagehead">
+    <div><a href="/trades" class="desk-text-link">Trade review</a><h1>{{ trade.symbol }} #{{ trade.id }}</h1>
+      <p class="desk-muted">{{ trade.side|capitalize }} · {{ trade.source|replace("_"," ") }} · Crypto paper</p></div>
+    <div class="desk-actions">{{ badge("Excluded", "warn") if trade.excluded else badge(trade.status|capitalize, "good" if trade.status == "open" else "neutral") }}</div>
+  </header>
+  <section class="desk-kpis" aria-label="Trade execution">
+    <div><span>Net realized P&amp;L</span><strong>{{ money(trade.pnl,true) if trade.status == "closed" else "Open" }}</strong><small>Paper ledger</small></div>
+    <div><span>Entry fill</span><strong>{{ trade.entry_price if trade.entry_price is not none else "Unrecorded" }}</strong><small>USD per unit</small></div>
+    <div><span>Exit fill</span><strong>{{ trade.exit_price if trade.exit_price is not none else "Unrecorded" }}</strong><small>USD per unit</small></div>
+    <div><span>Fees recorded</span><strong>{{ money(trade.fees) }}</strong><small>Simulated costs</small></div>
+  </section>
+  <div class="desk-grid desk-settings-grid">
+    <section class="desk-panel">
+      <div class="desk-panel-heading"><div><h2>Entry decision</h2><p>Signal and risk context · UTC</p></div>
+        {{ badge("Saved at entry", "good") if trade.entry.get("version") else badge("Linked journal" if trade.linked else "Limited history") }}</div>
+      <dl class="desk-settings-list evidence-list">
+        {{ evidence_row("Why", trade.entry_reason) }}
+        <div><dt>Signal time</dt><dd>{{ display_time(trade.signal_at) }}</dd></div>
+        <div><dt>Selected for entry</dt><dd>{{ display_time(trade.selected_at) }}</dd></div>
+        {% if trade.journal_at %}<div><dt>First journal record</dt><dd>{{ display_time(trade.journal_at) }}</dd></div>{% endif %}
+        <div><dt>Paper position opened</dt><dd>{{ display_time(trade.opened_at) }}</dd></div>
+        {{ evidence_row("Confidence", "{:.1%}".format(trade.confidence) if trade.confidence is not none else none) }}
+        {{ evidence_row("Regime", trade.regime|replace("_"," ") if trade.regime else none) }}
+        {{ evidence_row("Firewall", trade.firewall) }}
+        {% if trade.entry.get("rotation") %}{{ evidence_row("Portfolio decision", trade.entry.rotation) }}{% endif %}
+        {% if trade.entry.get("edge_bps") is not none %}{{ evidence_row("Estimated edge at entry", "{:.1f} bps".format(trade.entry.edge_bps)) }}{% endif %}
+        {% if trade.entry.get("estimated_cost_bps") is not none %}{{ evidence_row("Estimated entry cost", "{:.1f} bps".format(trade.entry.estimated_cost_bps)) }}{% endif %}
+        {% if trade.entry.get("volume_confirmed") is not none %}{{ evidence_row("Volume confirmation", "Yes" if trade.entry.volume_confirmed else "No") }}{% endif %}
+        {% if trade.entry.get("options_flow_aligned") is not none %}{{ evidence_row("Options flow aligned", "Yes" if trade.entry.options_flow_aligned else "No") }}{% endif %}
+        {{ evidence_row("Initial stop", trade.initial_stop) }}
+        {{ evidence_row("Initial target", trade.entry.get("initial_target")) }}
+        {% if copy %}
+          {{ evidence_row("Followed source entry price", copy.get("source_entry_price")) }}
+          {{ evidence_row("Copy entry lag", "{:.1f} bps".format(copy.lag_bps) if copy.get("lag_bps") is not none else none) }}
+        {% endif %}
+      </dl>
+    </section>
+    <section class="desk-panel">
+      <div class="desk-panel-heading"><div><h2>Exit decision</h2><p>Reason and observed prices · UTC</p></div>{{ badge(trade.stop_type) if trade.stop_type else "" }}</div>
+      <dl class="desk-settings-list evidence-list">
+        {{ evidence_row("Why", trade.reason|replace("_"," ") if trade.reason else none) }}
+        <div><dt>Paper position closed</dt><dd>{{ display_time(trade.closed_at) }}</dd></div>
+        {{ evidence_row("Stop trigger used", trade.trigger) }}
+        {{ evidence_row("Exit price input", trade.exit.get("observed_price", trade.meta.get("intended_exit_price"))) }}
+        {% if trade.exit.get("price_source") %}{{ evidence_row("Pricing basis", trade.exit.price_source|replace("_"," ")|capitalize) }}{% endif %}
+        {{ evidence_row("Adverse gap from trigger", "{:.1f} bps".format(trade.stop_gap_bps) if trade.stop_gap_bps is not none else none) }}
+        {{ evidence_row("Quantity", trade.size) }}
+        {{ evidence_row("Leverage", "{}x".format(trade.leverage) if trade.leverage is not none else none) }}
+      </dl>
+    </section>
+  </div>
+  <section class="desk-panel desk-trades">
+    <div class="desk-panel-heading"><div><h2>Decision timeline</h2><p>{{ "Decision ID: " ~ trade.decision_id if trade.decision_id else "No matching decision ID recorded" }}</p></div></div>
+    {% if trade.events %}
+    <div class="desk-table-scroll" tabindex="0" aria-label="Scrollable decision events">
+      <table class="desk-table timeline-table">
+        <thead><tr><th scope="col">Time (UTC)</th><th scope="col">Stage</th><th scope="col">Result</th><th scope="col">Reason</th></tr></thead>
+        <tbody>{% for event in trade.events %}
+        <tr><td>{{ display_time(event.created_at) }}</td><td>{{ event.stage|replace("_"," ") }}</td>
+          <td>{{ event.status|replace("_"," ") }}</td><td>{{ event.reason|replace("_"," ") if event.reason else "Not recorded" }}</td></tr>
+        {% endfor %}</tbody>
+      </table>
+    </div>
+    {% else %}<div class="desk-empty compact"><p>No linked stage history recorded for this trade.</p></div>{% endif %}
+  </section>
+</div>
+{% endblock %}

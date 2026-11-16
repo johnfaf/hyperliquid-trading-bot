@@ -95,7 +95,7 @@
   <section class="desk-panel desk-trades">
     <div class="desk-panel-heading">
       <div><h2>Recent paper closes</h2><p>Hyperliquid · sorted newest first</p></div>
-      <a href="/positions" class="desk-text-link">Positions {{ icon("arrow", 15) }}</a>
+      <a href="/trades?scope=all" class="desk-text-link">Trade review {{ icon("arrow", 15) }}</a>
     </div>
     {% if paper.recent %}
       <div class="desk-table-scroll" tabindex="0" aria-label="Scrollable paper trades">
@@ -104,7 +104,7 @@
           <tbody>
           {% for trade in paper.recent %}
             <tr>
-              <th scope="row">{{ trade.coin }}</th><td>{{ trade.side|capitalize }}</td>
+              <th scope="row"><a href="/trades/{{ trade.id }}" class="desk-table-link">{{ trade.coin }}</a></th><td>{{ trade.side|capitalize }}</td>
               <td>{{ trade.source|string|replace("_", " ") }}</td><td>{{ trade.reason|string|replace("_", " ") }}</td>
               <td>{{ trade.timestamp[:16]|replace("T", " ") }}</td>
               <td class="{{ 'tone-text-bad' if trade.pnl < 0 else 'tone-text-good' if trade.pnl > 0 else '' }}">{{ money(trade.pnl, true) }}</td>

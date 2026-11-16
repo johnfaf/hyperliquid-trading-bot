@@ -1360,6 +1360,13 @@ def open_paper_trade(strategy_id, coin, side, entry_price, size, leverage=1,
     inserts a new row (legacy caller contract preserved).
     """
     now = _trade_event_now_iso()
+    metadata = dict(metadata or {})
+    captured = metadata.get("entry_decision")
+    captured = dict(captured) if isinstance(captured, dict) else {}
+    captured["recorded_at"] = now
+    captured["initial_stop"] = stop_loss
+    captured["initial_target"] = take_profit
+    metadata["entry_decision"] = captured
     _ensure_postgres_strategy_parent(strategy_id)
 
     key = None
@@ -1577,7 +1584,7 @@ def close_paper_trade(trade_id, exit_price, pnl) -> bool:
     return True
 
 
-def close_paper_trade_and_credit_account(trade_id, exit_price, pnl) -> bool:
+def close_paper_trade_and_credit_account(trade_id, exit_price, pnl, *, metadata_updates=None) -> bool:
     """Atomically close a paper trade AND credit the paper_account balance.
 
     Runs both UPDATEs inside a single transaction.  If the trade is already
@@ -1611,6 +1618,26 @@ def close_paper_trade_and_credit_account(trade_id, exit_price, pnl) -> bool:
                     trade_id,
                 )
                 return False
+
+            if metadata_updates is not None:
+                row = conn.execute("SELECT metadata FROM paper_trades WHERE id = ?", (trade_id,)).fetchone()
+                raw = row["metadata"]
+                try:
+                    metadata = raw if isinstance(raw, dict) else json.loads(raw or "{}")
+                    metadata = dict(metadata) if isinstance(metadata, dict) else {}
+                except (TypeError, ValueError):
+                    metadata = {}
+                metadata.update(metadata_updates)
+                metadata["exit_decision"] = {
+                    "version": 1,
+                    "recorded_at": now,
+                    "reason": metadata_updates.get("close_reason"),
+                    "trigger": metadata_updates.get("stop_trigger_price"),
+                    "observed_price": metadata_updates.get("intended_exit_price"),
+                    "price_source": metadata_updates.get("exit_price_source"),
+                    "fill_price": exit_price,
+                }
+                conn.execute("UPDATE paper_trades SET metadata = ? WHERE id = ?", (json.dumps(metadata), trade_id))
 
             # D10: Use a single relative UPDATE instead of SELECT-then-UPDATE.
             # Even inside a transaction the prior pattern left a read/modify/

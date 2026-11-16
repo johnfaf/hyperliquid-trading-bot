@@ -13,6 +13,8 @@ import copy
 import config
 from src.core import clock_provider
 from src.data import database as db
+from src.data import decision_journal
+from src.trading.trade_decision_memory import entry_memory
 from src.core.live_execution import (
     get_execution_account_balance,
     get_execution_open_positions,
@@ -1666,11 +1668,18 @@ def _execute_lcrs_signals(container, lcrs_signals, regime_data):
                     stop_loss=sig["stop_loss"], take_profit=sig["take_profit"],
                     metadata={
                         "source": "liquidation_strategy",
+                        "decision_id": decision_journal.resolve_decision_id(trade_signal),
+                        "entry_decision": entry_memory(
+                            trade_signal, route="liquidation_strategy", firewall="approved" if container.firewall else None,
+                        ),
                         "strategy_type": "liquidation_reversal",
                         "confidence": trade_signal.confidence,
                         "setup_type": sig["features"].get("setup_type", ""),
                         "features": sig["features"],
                     },
+                )
+                decision_journal.record_paper_opened(
+                    decision_journal.resolve_decision_id(trade_signal), trade_id, confidence=trade_signal.confidence,
                 )
                 lcrs_executed.append({"id": trade_id, "coin": sig["coin"], "side": sig["side"]})
                 logger.info(
@@ -1844,11 +1853,18 @@ def _execute_options_flow_trades(container, regime_data):
                     stop_loss=sl, take_profit=tp,
                     metadata={
                         "source": "options_flow",
+                        "decision_id": decision_journal.resolve_decision_id(flow_signal),
+                        "entry_decision": entry_memory(
+                            flow_signal, route="options_flow", firewall="approved" if container.firewall else None,
+                        ),
                         "conviction": conv["conviction_pct"],
                         "net_flow": conv["net_flow"],
                         "prints": conv["total_prints"],
                         "risk_policy": dict((flow_signal.context or {}).get("risk_policy", {}) or {}),
                     },
+                )
+                decision_journal.record_paper_opened(
+                    decision_journal.resolve_decision_id(flow_signal), trade_id, confidence=flow_signal.confidence,
                 )
                 logger.info(
                     "  Options flow trade: %s %s @ $%s (conviction: %d%%)",
@@ -2207,12 +2223,14 @@ def _run_alpha_arena(container, regime_data):
                                 size = size_usd / price
                                 # SILENT-4 FIX: use risk-policy-adjusted leverage
                                 # instead of hardcoded 2x.
-                                db.open_paper_trade(
+                                trade_id = db.open_paper_trade(
                                     strategy_id=None, coin=sig["coin"], side=side,
                                     entry_price=price, size=size, leverage=live_signal.leverage,
                                     stop_loss=sl, take_profit=tp,
                                     metadata={
                                         "source": "arena_champion",
+                                        "decision_id": decision_journal.resolve_decision_id(live_signal),
+                                        "entry_decision": entry_memory(live_signal, route="arena_champion"),
                                         "agent_id": sig["agent_id"],
                                         "agent_name": sig["agent_name"],
                                         "strategy_type": sig["strategy_type"],
@@ -2225,6 +2243,9 @@ def _run_alpha_arena(container, regime_data):
                                         "arena_validation_passed": bool(sig.get("validation_passed", False)),
                                         "risk_policy": dict((live_signal.context or {}).get("risk_policy", {}) or {}),
                                     },
+                                )
+                                decision_journal.record_paper_opened(
+                                    decision_journal.resolve_decision_id(live_signal), trade_id, confidence=conf,
                                 )
                                 logger.info(
                                     "  Champion trade: %s %s @ $%s | agent=%s",

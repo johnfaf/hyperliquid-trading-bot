@@ -49,13 +49,13 @@
       <a href="/" class="desk-brand"><span>{{ icon("activity", 18) }}</span><b>HL Trading</b></a>
       <nav class="desk-nav" aria-label="Main navigation">
         {% for path, label, glyph in [
-          ("/", "Overview", "layout"), ("/stock-pilot", "Stock Pilot", "chart"),
+          ("/", "Overview", "layout"), ("/trades", "Trades", "file"), ("/stock-pilot", "Stock Pilot", "chart"),
           ("/positions", "Positions", "layers"), ("/settings", "Settings", "sliders"),
           ("/sources", "Sources", "activity"),
           ("/calibration", "Calibration", "chart"), ("/traders", "Traders", "users"), ("/audit", "Audit", "shield"),
           ("/backtest", "Backtest", "file")
         ] %}
-        <a href="{{ path }}"{% if request.url.path == path %} aria-current="page"{% endif %}>
+        <a href="{{ path }}"{% if request.url.path == path or (path == "/trades" and request.url.path.startswith("/trades/")) %} aria-current="page"{% endif %}>
           {{ icon(glyph, 15) }}<span>{{ label }}</span>
         </a>
         {% endfor %}

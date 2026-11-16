@@ -32,6 +32,7 @@ from src.signals.kelly_sizing import KellySizer
 from src.trading.trade_memory import TradeMemory
 from src.trading.portfolio_rotation import PortfolioRotationManager
 from src.trading.paper_risk import size_for_planned_stop
+from src.trading.trade_decision_memory import entry_memory
 from src.signals.calibration import (
     CalibrationTracker,
     bucket_regime as _bucket_regime,
@@ -1603,17 +1604,22 @@ class PaperTrader:
                 )
             sig["decision_id"] = sig.get("decision_id") or trade_signal.signal_id
             sig["signal_id"] = signal_id or sig["decision_id"]
+            sig["entry_decision"] = entry_memory(
+                trade_signal, route="strategy", firewall="approved" if self.firewall else None,
+                rotation=decision_reason,
+            )
 
             # CRIT-FIX CRIT-6: close victim BEFORE opening replacement.
             # Original order (open → close) left both positions alive simultaneously
             # during the window between calls, allowing a double-exposure window and
             # making the rollback guard dead code (DB close never raises).
             if victim:
+                victim_mid = mids.get(victim["coin"])
                 victim_price = float(
-                    mids.get(victim["coin"], victim.get("entry_price", 0)) or victim.get("entry_price", 0)
+                    victim_mid or victim.get("entry_price", 0)
                 )
                 closed_victim = self._close_trade(
-                    victim,
+                    {**victim, "_exit_price_source": "market_mid" if victim_mid else "entry_price_fallback"},
                     current_price=victim_price,
                     close_reason=f"rotation_out:{sig['coin']}",
                 )
@@ -2040,6 +2046,7 @@ class PaperTrader:
                     "confidence": signal.get("confidence", 0),
                     "signal_id": signal.get("signal_id", ""),
                     "decision_id": decision_id,
+                    "entry_decision": signal.get("entry_decision"),
                     "execution_role": role,
                     **sizing,
                     "maker_fee_bps": config.PAPER_TRADING_MAKER_FEE_BPS,
@@ -2097,6 +2104,7 @@ class PaperTrader:
                     "confidence": signal.get("confidence", 0),
                     "signal_id": signal.get("signal_id", ""),
                     "decision_id": decision_id,
+                    "entry_decision": signal.get("entry_decision"),
                     "execution_role": role,
                     **sizing,
                     "maker_fee_bps": config.PAPER_TRADING_MAKER_FEE_BPS,
@@ -2204,56 +2212,38 @@ class PaperTrader:
             "stop_trigger_price": trade.get("stop_trigger_price"),
         }
 
-        db.update_paper_trade_metadata(
-            trade["id"],
-            {
-                "execution_role": execution_role,
-                "maker_fee_bps": config.PAPER_TRADING_MAKER_FEE_BPS,
-                "taker_fee_bps": config.PAPER_TRADING_TAKER_FEE_BPS,
-                "entry_fee_paid": round(entry_fee, 4),
-                "exit_fee_paid": round(exit_fee, 4),
-                "total_fees_paid": round(total_fees, 4),
-                "entry_slippage_cost": round(entry_slippage_cost, 4),
-                "exit_slippage_cost": round(exit_slippage_cost, 4),
-                "total_slippage_cost": total_slippage_cost,
-                "gross_pnl_before_fees": round(gross_pnl, 4),
-                "funding_accrued": round(funding_accrued, 4),
-                "net_pnl_after_fees": pnl,
-                "intended_exit_price": float(current_price or 0),
-                "exit_slipped_price": slipped_exit,
-                **path_metrics,
-            },
-        )
-        trade_meta.update(
-            {
-                "execution_role": execution_role,
-                "maker_fee_bps": config.PAPER_TRADING_MAKER_FEE_BPS,
-                "taker_fee_bps": config.PAPER_TRADING_TAKER_FEE_BPS,
-                "entry_fee_paid": round(entry_fee, 4),
-                "exit_fee_paid": round(exit_fee, 4),
-                "total_fees_paid": round(total_fees, 4),
-                "funding_accrued": round(funding_accrued, 4),
-                "entry_slippage_cost": round(entry_slippage_cost, 4),
-                "exit_slippage_cost": round(exit_slippage_cost, 4),
-                "total_slippage_cost": total_slippage_cost,
-                "gross_pnl_before_fees": round(gross_pnl, 4),
-                "net_pnl_after_fees": pnl,
-                "intended_exit_price": float(current_price or 0),
-                "exit_slipped_price": slipped_exit,
-                **path_metrics,
-            }
-        )
+        close_metadata = {
+            "execution_role": execution_role,
+            "maker_fee_bps": config.PAPER_TRADING_MAKER_FEE_BPS,
+            "taker_fee_bps": config.PAPER_TRADING_TAKER_FEE_BPS,
+            "entry_fee_paid": round(entry_fee, 4),
+            "exit_fee_paid": round(exit_fee, 4),
+            "total_fees_paid": round(total_fees, 4),
+            "entry_slippage_cost": round(entry_slippage_cost, 4),
+            "exit_slippage_cost": round(exit_slippage_cost, 4),
+            "total_slippage_cost": total_slippage_cost,
+            "gross_pnl_before_fees": round(gross_pnl, 4),
+            "funding_accrued": round(funding_accrued, 4),
+            "net_pnl_after_fees": pnl,
+            "intended_exit_price": float(current_price or 0),
+            "exit_price_source": trade.get("_exit_price_source", "market_mid"),
+            "exit_slipped_price": slipped_exit,
+            **path_metrics,
+        }
         # CRIT-FIX C2: atomic close + account credit in one transaction
         # (see src/data/database.py::close_paper_trade_and_credit_account).
         # A crash between the close and the credit previously could desync
         # the paper_account balance or, on retry, double-credit the PnL.
-        if not db.close_paper_trade_and_credit_account(trade["id"], slipped_exit, pnl):
+        if not db.close_paper_trade_and_credit_account(
+            trade["id"], slipped_exit, pnl, metadata_updates=close_metadata,
+        ):
             logger.error(
                 "_close_trade: DB close failed for trade %s (%s %s) -- "
                 "no account PnL credited (already closed or account missing).",
                 trade["id"], trade.get("side", "?"), trade.get("coin", "?"),
             )
             return None
+        trade_meta.update(close_metadata)
 
         logger.info(
             "Paper trade closed (%s): %s %s entry=$%s exit=$%s gross=$%s fees=$%s funding=$%s net=$%s",

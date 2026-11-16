@@ -29,6 +29,7 @@ from src.signals.kelly_sizing import KellySizer
 from src.trading.trade_memory import TradeMemory
 from src.trading.portfolio_rotation import PortfolioRotationManager
 from src.trading.paper_risk import size_for_planned_stop
+from src.trading.trade_decision_memory import COPY_REASONS, entry_memory
 from src.signals.calibration import (
     CalibrationTracker,
     bucket_regime as _calibration_bucket_regime,
@@ -1434,11 +1435,12 @@ class CopyTrader:
 
             closed_trade = None
             if victim:
+                victim_mid = mids.get(victim["coin"])
                 current_price = float(
-                    mids.get(victim["coin"], victim.get("entry_price", 0)) or victim.get("entry_price", 0)
+                    victim_mid or victim.get("entry_price", 0)
                 )
                 closed_trade = self._close_trade(
-                    victim,
+                    {**victim, "_exit_price_source": "market_mid" if victim_mid else "entry_price_fallback"},
                     exit_price=current_price,
                     close_reason=f"rotation_out:{signal['coin']}",
                 )
@@ -1461,6 +1463,10 @@ class CopyTrader:
                 ]
 
             account = db.get_paper_account() or account
+            signal["entry_decision"] = entry_memory(
+                trade_signal, route="copy_trade", reason=COPY_REASONS.get(signal["type"]),
+                firewall=firewall_status, rotation=decision.reason, copy=signal,
+            )
             trade = self._open_copy_trade(account, signal, candidate_paper_positions)
             if trade:
                 executed.append(trade)
@@ -1513,6 +1519,7 @@ class CopyTrader:
             "confidence": signal.get("confidence", 0),
             "signal_id": signal.get("_signal_id", ""),
             "decision_id": signal.get("decision_id", ""),
+            "entry_decision": signal.get("entry_decision"),
             "source_key": signal.get("_source_key", ""),
             "source_accuracy": signal.get("source_accuracy", 0),
             "copy_source_size_multiplier": signal.get("copy_source_size_multiplier", 1.0),
@@ -1733,53 +1740,36 @@ class CopyTrader:
         total_fees = round(entry_fee + exit_fee, 4)
         pnl = round(gross_pnl - total_fees, 2)
 
-        db.update_paper_trade_metadata(
-            trade["id"],
-            {
-                "execution_role": execution_role,
-                "maker_fee_bps": config.PAPER_TRADING_MAKER_FEE_BPS,
-                "taker_fee_bps": config.PAPER_TRADING_TAKER_FEE_BPS,
-                "entry_fee_paid": round(entry_fee, 4),
-                "exit_fee_paid": round(exit_fee, 4),
-                "total_fees_paid": total_fees,
-                "entry_slippage_cost": 0.0,
-                "exit_slippage_cost": 0.0,
-                "total_slippage_cost": 0.0,
-                "gross_pnl_before_fees": round(gross_pnl, 4),
-                "net_pnl_after_fees": pnl,
-                "intended_exit_price": float(exit_price),
-                "exit_slipped_price": float(exit_price),
-                "close_reason": close_reason,
-            },
-        )
-        meta.update(
-            {
-                "execution_role": execution_role,
-                "maker_fee_bps": config.PAPER_TRADING_MAKER_FEE_BPS,
-                "taker_fee_bps": config.PAPER_TRADING_TAKER_FEE_BPS,
-                "entry_fee_paid": round(entry_fee, 4),
-                "exit_fee_paid": round(exit_fee, 4),
-                "total_fees_paid": total_fees,
-                "entry_slippage_cost": 0.0,
-                "exit_slippage_cost": 0.0,
-                "total_slippage_cost": 0.0,
-                "gross_pnl_before_fees": round(gross_pnl, 4),
-                "net_pnl_after_fees": pnl,
-                "intended_exit_price": float(exit_price),
-                "exit_slipped_price": float(exit_price),
-                "close_reason": close_reason,
-            }
-        )
+        close_metadata = {
+            "execution_role": execution_role,
+            "maker_fee_bps": config.PAPER_TRADING_MAKER_FEE_BPS,
+            "taker_fee_bps": config.PAPER_TRADING_TAKER_FEE_BPS,
+            "entry_fee_paid": round(entry_fee, 4),
+            "exit_fee_paid": round(exit_fee, 4),
+            "total_fees_paid": total_fees,
+            "entry_slippage_cost": 0.0,
+            "exit_slippage_cost": 0.0,
+            "total_slippage_cost": 0.0,
+            "gross_pnl_before_fees": round(gross_pnl, 4),
+            "net_pnl_after_fees": pnl,
+            "intended_exit_price": float(exit_price),
+            "exit_price_source": trade.get("_exit_price_source", "market_mid"),
+            "exit_slipped_price": float(exit_price),
+            "close_reason": close_reason,
+        }
 
         # CRIT-FIX C2: atomic close + account credit in one transaction
         # (see src/data/database.py::close_paper_trade_and_credit_account).
-        if not db.close_paper_trade_and_credit_account(trade["id"], exit_price, pnl):
+        if not db.close_paper_trade_and_credit_account(
+            trade["id"], exit_price, pnl, metadata_updates=close_metadata,
+        ):
             logger.error(
                 "Copy trade close failed for trade %s (%s %s) -- "
                 "already closed or account row missing; no credit applied.",
                 trade["id"], trade.get("side", "?"), trade.get("coin", "?"),
             )
             return None
+        meta.update(close_metadata)
 
         logger.info(
             "Copy trade closed (%s): %s %s entry=$%s exit=$%s gross=$%s fees=$%s net=$%s",
