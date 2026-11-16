@@ -45,18 +45,24 @@ sudo -n grep -Fx 'BOT_RUN_MODE=paper' "$env_file" >/dev/null
 install -m 0644 "$previous/.dockerignore" "$release/.dockerignore"
 install -D -m 0644 "$previous/deploy/vps/launch.py" "$release/deploy/vps/launch.py"
 install -m 0644 "$previous/src/notifications/telegram_bot.py" "$release/src/notifications/telegram_bot.py"
-sudo -n docker build --build-arg RUN_AS_USER=bot --label "org.opencontainers.image.revision=$rev" -t "$tag" "$release"
+sudo -n docker build --build-arg RUN_AS_USER=bot --build-arg "BOT_BUILD_REVISION=$rev" \
+    --label "org.opencontainers.image.revision=$rev" -t "$tag" "$release"
 sudo -n docker run --rm --network=none --entrypoint python "$tag" -B -c \
     'from src.trading.order_journal import OrderJournal; from src.trading.live_trader import LiveTrader; from scripts.run_stock_paper import AlpacaPaper; from src.ui.v2.app import create_app; create_app()'
 
 sudo -n install -d -m 0700 /srv/hyperliquid-bot/rollbacks
-sudo -n python3 - "$paper_data/bot.db" "/srv/hyperliquid-bot/rollbacks/bot-pre-$rev.db" <<'PY'
+sudo -n python3 - "$paper_data" "/srv/hyperliquid-bot/rollbacks" "$rev" <<'PY'
 from contextlib import closing
 from pathlib import Path
 import sqlite3, sys
 
-source, dest = map(Path, sys.argv[1:])
-if not dest.exists():
+data, rollbacks = map(Path, sys.argv[1:3])
+revision = sys.argv[3]
+for kind, filename in (("bot", "bot.db"), ("decisions", "bot.decisions.sqlite3"), ("orders", "bot.orders.sqlite3")):
+    source = data / filename
+    dest = rollbacks / f"{kind}-pre-{revision}.db"
+    if dest.exists() or (kind != "bot" and not source.exists()):
+        continue
     temporary = dest.with_suffix(".tmp")
     if temporary.exists():
         raise SystemExit("previous incomplete backup must be inspected first")
@@ -88,7 +94,7 @@ ready=false
 deadline=$((SECONDS + 180))
 while (( SECONDS < deadline )); do
     if [[ $(sudo -n docker inspect --format '{{.State.Health.Status}}' hyperliquid-bot) == healthy ]]; then
-        if verify_paper && curl -s --max-time 4 -D - -o /dev/null http://127.0.0.1:8080/settings |
+        if verify_paper && curl -s --max-time 4 -D - -o /dev/null http://127.0.0.1:8080/decision-coverage |
             grep -qi '^location: /login'; then
             ready=true
             break

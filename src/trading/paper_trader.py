@@ -23,6 +23,7 @@ import config
 from src.core import clock_provider
 from src.data import database as db
 from src.data import decision_journal
+from src.data import decision_coverage
 from src.data import hyperliquid_client as hl
 from src.signals.signal_schema import TradeSignal, SignalSide, SignalSource, RiskParams
 from src.signals.decision_firewall import DecisionFirewall
@@ -726,8 +727,15 @@ class PaperTrader:
         7. Route through DecisionFirewall
         8. Execute approved signals
         """
+        tickets = [s.get("_coverage_ticket") if decision_coverage.owns(s.get("_coverage_ticket")) else None
+                   for s in strategies]
+        unregistered = [s for s, ref in zip(strategies, tickets) if not ref]
+        new_refs = iter(decision_coverage.expect("strategy", unregistered)) if unregistered else iter(())
+        evaluations = [(s, ref or next(new_refs)) for s, ref in zip(strategies, tickets)]
         account = db.get_paper_account()
         if not account:
+            for _, ref in evaluations:
+                decision_coverage.resolve(ref, "blocked", reason="paper_account_unavailable")
             return []
 
         open_trades = (
@@ -829,19 +837,23 @@ class PaperTrader:
                         "llm_filter": 0, "ev_gate": 0, "execution_cap": 0,
                         "calibration_quarantine": 0,
                         "missing_asset": 0, "other_error": 0}
-        for strategy in strategies:
+        for strategy, ref in evaluations:
             try:
                 existing = [t for t in open_trades if t["strategy_id"] == strategy.get("id")]
 
                 # Generate signal from strategy
                 signal = self._generate_signal(strategy, mids, regime_data=regime_data)
                 if not signal:
+                    reason = strategy.get("_decision_skip_reason") or "no_signal_generated"
+                    decision_coverage.resolve(ref, "blocked" if reason == "missing_asset" else "no_signal", reason=reason)
                     if strategy.get("_decision_skip_reason") == "missing_asset":
                         _drop_counts["missing_asset"] += 1
                     else:
                         _drop_counts["no_signal"] += 1
                     logger.info(f"No signal generated for {strategy.get('name', '?')}")
                     continue
+
+                signal["evaluation_ref"] = ref
 
                 if existing:
                     matching_trade = next(
@@ -853,6 +865,7 @@ class PaperTrader:
                         None,
                     )
                     if matching_trade:
+                        decision_coverage.resolve(ref, "blocked", reason="matching_strategy_position_exists")
                         _drop_counts["existing_position"] += 1
                         logger.info(
                             "Skipping %s -- already have matching open position",
@@ -913,6 +926,7 @@ class PaperTrader:
                             signal["coin"], signal["side"]
                         )
                         if not confirmed:
+                            decision_coverage.resolve(ref, "blocked", reason="no_volume_confirmation")
                             _drop_counts["volume_reject"] += 1
                             logger.info(f"Volume rejects {signal['side']} {signal['coin']} "
                                         f"(confidence={vol_confidence:.2f})")
@@ -956,6 +970,7 @@ class PaperTrader:
                 raw_signals.append(signal)
 
             except Exception as e:
+                decision_coverage.resolve(ref, "error", reason=type(e).__name__)
                 logger.error(f"Error generating signal for {strategy.get('name', '?')}: {e}")
 
         # Convert to TradeSignal objects and apply agent scoring
@@ -1005,6 +1020,7 @@ class PaperTrader:
                     firewall_decision="pending",
                     metadata={"stage": "paper_trader_candidate"},
                 )
+                decision_coverage.bind_signal(sig.get("evaluation_ref"), trade_signal)
                 self._journal_signal_stage(
                     trade_signal,
                     sig,
@@ -1014,6 +1030,7 @@ class PaperTrader:
                 )
                 trade_signals.append((trade_signal, sig))
             except Exception as e:
+                decision_coverage.resolve(sig.get("evaluation_ref"), "error", reason="signal_schema_error")
                 _drop_counts["schema_error"] += 1
                 logger.info(f"Error creating TradeSignal: {e}")
 
@@ -1608,6 +1625,8 @@ class PaperTrader:
                 trade_signal, route="strategy", firewall="approved" if self.firewall else None,
                 rotation=decision_reason,
             )
+            if not decision_coverage.entry_allowed():
+                continue
 
             # CRIT-FIX CRIT-6: close victim BEFORE opening replacement.
             # Original order (open → close) left both positions alive simultaneously
@@ -2047,6 +2066,7 @@ class PaperTrader:
                     "signal_id": signal.get("signal_id", ""),
                     "decision_id": decision_id,
                     "entry_decision": signal.get("entry_decision"),
+                    "evaluation_ref": signal.get("evaluation_ref"),
                     "execution_role": role,
                     **sizing,
                     "maker_fee_bps": config.PAPER_TRADING_MAKER_FEE_BPS,

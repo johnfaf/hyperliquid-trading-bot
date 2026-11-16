@@ -3,5 +3,6 @@ services:
     environment:
       DASHBOARD_V2_PRIMARY: "true"
       DASHBOARD_LEGACY_PORT: "8082"
+      DECISION_COVERAGE_ENABLED: "true"
     ports:
       - "127.0.0.1:8082:8082"

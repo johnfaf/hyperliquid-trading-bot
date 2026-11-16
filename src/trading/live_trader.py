@@ -4665,6 +4665,12 @@ class LiveTrader:
                 cid = orders[0]["c"]
                 entry = orders[0].get("r") is not True
                 if entry:
+                    from src.data.decision_coverage import entry_allowed
+
+                    if not entry_allowed():
+                        with self._order_dedup_lock:
+                            self._recent_order_hashes.pop(action_hash, None)
+                        return {"status": "rejected", "reason": "decision_coverage_unavailable"}
                     self._recover_durable_orders(journal)
                 if not journal.reserve(cid, action, entry=entry):
                     with self._order_dedup_lock:

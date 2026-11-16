@@ -20,6 +20,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import config
 from src.data import database as db
 from src.data import decision_journal
+from src.data import decision_coverage
 from src.data import hyperliquid_client as hl
 from src.analysis.trade_analytics import evaluate_source_policy, evaluate_side_source_policy
 from src.signals.signal_schema import RiskParams, SignalSide, SignalSource, TradeSignal, signal_from_copy_trade
@@ -1080,8 +1081,11 @@ class CopyTrader:
         if not signals:
             return []
 
+        refs = decision_coverage.expect("copy", signals)
         account = db.get_paper_account()
         if not account:
+            for ref in refs:
+                decision_coverage.resolve(ref, "blocked", reason="paper_account_unavailable")
             return []
 
         open_trades = db.get_open_paper_trades()
@@ -1112,7 +1116,7 @@ class CopyTrader:
             # the cycle, but candidate collection is still bounded.
             candidate_cap = max(10, self.max_new_trades_per_cycle * 10)
 
-        for signal in signals:
+        for signal, ref in zip(signals, refs):
             trade_signal = None
             try:
                 if signal["type"] in ("copy_close", "copy_scale_out"):
@@ -1123,10 +1127,13 @@ class CopyTrader:
                     risk_open_positions = [
                         trade for trade in risk_open_positions if trade.get("id") not in closed_ids
                     ]
+                    decision_coverage.resolve(ref, "exit_applied" if closed else "blocked",
+                                              reason=reason if closed else "source_exit_not_executed")
                     continue
 
                 if signal["type"] in ("copy_open", "copy_scale_in", "copy_flip", "golden_copy"):
                     signal = dict(signal)
+                    signal["evaluation_ref"] = ref
                     trade_signal = signal_from_copy_trade(
                         trader_address=str(signal.get("source_trader") or ""),
                         coin=signal["coin"], side=signal["side"], entry_price=signal["price"],
@@ -1140,6 +1147,7 @@ class CopyTrader:
                         trade_signal, regime_data=regime_data, account_balance=account.get("balance"),
                         metadata={"copy_signal_type": signal["type"]},
                     )
+                    decision_coverage.bind_signal(ref, trade_signal)
 
                     def reject(reason):
                         self._journal_entry_result(trade_signal, "copy_prescreen", "copy_prescreen_rejected", reason)
@@ -1248,8 +1256,11 @@ class CopyTrader:
                         "signal": signal,
                         "trade_signal": trade_signal,
                     })
+                else:
+                    decision_coverage.resolve(ref, "blocked", reason="unsupported_copy_signal")
 
             except Exception as e:
+                decision_coverage.resolve(ref, "error", reason=type(e).__name__)
                 logger.error(f"Error executing copy signal: {e}")
                 if trade_signal is not None:
                     self._journal_entry_result(trade_signal, "copy_prescreen", "copy_prescreen_rejected", "entry_error")
@@ -1434,6 +1445,8 @@ class CopyTrader:
                 signal["_signal_id"] = signal_id
 
             closed_trade = None
+            if not decision_coverage.entry_allowed():
+                continue
             if victim:
                 victim_mid = mids.get(victim["coin"])
                 current_price = float(
@@ -1520,6 +1533,7 @@ class CopyTrader:
             "signal_id": signal.get("_signal_id", ""),
             "decision_id": signal.get("decision_id", ""),
             "entry_decision": signal.get("entry_decision"),
+            "evaluation_ref": signal.get("evaluation_ref"),
             "source_key": signal.get("_source_key", ""),
             "source_accuracy": signal.get("source_accuracy", 0),
             "copy_source_size_multiplier": signal.get("copy_source_size_multiplier", 1.0),

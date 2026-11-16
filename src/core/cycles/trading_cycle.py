@@ -14,6 +14,7 @@ import config
 from src.core import clock_provider
 from src.data import database as db
 from src.data import decision_journal
+from src.data import decision_coverage
 from src.trading.trade_decision_memory import entry_memory
 from src.core.live_execution import (
     get_execution_account_balance,
@@ -887,6 +888,11 @@ def _execute_signal_live(container, trade_signal, source_label: str, bypass_fire
 # ---------------------------------------------------------------------------
 
 def run_trading_cycle(container, cycle_count: int) -> None:
+    with decision_coverage.track_cycle(cycle_count):
+        _run_trading_cycle(container, cycle_count)
+
+
+def _run_trading_cycle(container, cycle_count: int) -> None:
     """
     Execute one trading cycle using the subsystems in *container*.
     """
@@ -1275,6 +1281,8 @@ def run_trading_cycle(container, cycle_count: int) -> None:
             if tg.is_configured():
                 for t in executed:
                     tg.notify_trade_opened(t, source="strategy")
+        elif not top_strategies:
+            decision_coverage.expect("strategy", [])
 
         # Phase 4a: LCRS execution
         if lcrs_signals:
@@ -1325,6 +1333,7 @@ def run_trading_cycle(container, cycle_count: int) -> None:
             pass
 
     except Exception as exc:
+        decision_coverage.mark_failed()
         logger.error("Error in cycle #%d: %s", cycle_count, exc, exc_info=True)
 
 
@@ -1575,6 +1584,7 @@ def _execute_lcrs_signals(container, lcrs_signals, regime_data):
     """Phase 4a: execute liquidation reversal signals."""
     from src.notifications import telegram_bot as tg
     logger.info("Phase 4a: Liquidation Strategy Execution")
+    refs = decision_coverage.expect("liquidation", lcrs_signals)
     try:
         from src.signals.signal_schema import TradeSignal, SignalSide, SignalSource, RiskParams
         lcrs_executed = []
@@ -1587,7 +1597,7 @@ def _execute_lcrs_signals(container, lcrs_signals, regime_data):
         except Exception:
             account = None
 
-        for sig in lcrs_signals:
+        for sig, ref in zip(lcrs_signals, refs):
             try:
                 trade_signal = TradeSignal(
                     coin=sig["coin"], side=SignalSide(sig["side"]),
@@ -1605,6 +1615,7 @@ def _execute_lcrs_signals(container, lcrs_signals, regime_data):
                     regime=regime_data.get("overall_regime", "") if regime_data else "",
                 )
                 trade_signal = _apply_dynamic_risk_policy(container, trade_signal, regime_data=regime_data)
+                decision_coverage.bind_signal(ref, trade_signal)
 
                 if container.firewall:
                     passed, reason = container.firewall.validate(
@@ -1612,6 +1623,7 @@ def _execute_lcrs_signals(container, lcrs_signals, regime_data):
                     )
                     if not passed:
                         logger.info("  LCRS firewall rejected %s: %s", sig["coin"], reason)
+                        decision_coverage.resolve(ref, "blocked", reason=f"firewall: {reason}")
                         continue
 
                 if container.kelly_sizer or getattr(container, "rl_sizer", None):
@@ -1635,6 +1647,7 @@ def _execute_lcrs_signals(container, lcrs_signals, regime_data):
                     )
                     if mem.recommendation == "avoid":
                         logger.info("  LCRS memory blocked %s: %s", sig["coin"], mem.reason)
+                        decision_coverage.resolve(ref, "blocked", reason=f"trade_memory: {mem.reason}")
                         continue
 
                 if container.llm_filter:
@@ -1642,6 +1655,7 @@ def _execute_lcrs_signals(container, lcrs_signals, regime_data):
                     approved, adj_conf, reason = container.llm_filter.filter(sig, ctx)
                     if not approved:
                         logger.info("  LCRS LLM filter blocked %s: %s", sig["coin"], reason)
+                        decision_coverage.resolve(ref, "blocked", reason=f"llm_filter: {reason}")
                         continue
                     trade_signal.confidence = adj_conf
 
@@ -1659,6 +1673,7 @@ def _execute_lcrs_signals(container, lcrs_signals, regime_data):
                 if account is None:
                     account = db.get_paper_account()
                 if not account:
+                    decision_coverage.resolve(ref, "blocked", reason="paper_account_unavailable")
                     continue
                 size_usd = account["balance"] * trade_signal.effective_size
                 size = size_usd / sig["price"]
@@ -1668,6 +1683,7 @@ def _execute_lcrs_signals(container, lcrs_signals, regime_data):
                     stop_loss=sig["stop_loss"], take_profit=sig["take_profit"],
                     metadata={
                         "source": "liquidation_strategy",
+                        "evaluation_ref": ref,
                         "decision_id": decision_journal.resolve_decision_id(trade_signal),
                         "entry_decision": entry_memory(
                             trade_signal, route="liquidation_strategy", firewall="approved" if container.firewall else None,
@@ -1693,11 +1709,13 @@ def _execute_lcrs_signals(container, lcrs_signals, regime_data):
                         source="liquidation_strategy",
                     )
             except Exception as exc:
+                decision_coverage.resolve(ref, "error", reason=type(exc).__name__)
                 logger.debug("  LCRS execution error %s: %s", sig.get("coin"), exc)
 
         if lcrs_executed:
             logger.info("  Executed %d LCRS trades", len(lcrs_executed))
     except Exception as exc:
+        decision_coverage.mark_failed()
         logger.warning("  LCRS execution phase error: %s", exc)
 
 
@@ -1708,6 +1726,8 @@ def _execute_options_flow_trades(container, regime_data):
     try:
         from src.signals.signal_schema import signal_from_options_flow
         from src.data import hyperliquid_client as hl_client
+        convictions = getattr(container.options_scanner, "top_convictions", None) or []
+        refs = decision_coverage.expect("options_flow", convictions)
         mids = hl_client.get_all_mids() or {}
         options_executed = []
         live_active = is_live_trading_active(container)
@@ -1721,9 +1741,9 @@ def _execute_options_flow_trades(container, regime_data):
                 except Exception as exc:
                     logger.debug("  Options flow live account check failed: %s", exc)
 
-        convictions = getattr(container.options_scanner, "top_convictions", None) or []
-        for conv in convictions:
+        for conv, ref in zip(convictions, refs):
             if conv.get("conviction_pct", 0) < _OPTIONS_FLOW_MIN_CONVICTION_PCT:
+                decision_coverage.resolve(ref, "blocked", reason="below_minimum_conviction")
                 continue
             flow_signal = signal_from_options_flow(
                 ticker=conv["ticker"], direction=conv["direction"],
@@ -1734,6 +1754,7 @@ def _execute_options_flow_trades(container, regime_data):
             flow_signal.leverage = 2.0
             price = float(mids.get(conv["ticker"], 0))
             if price <= 0:
+                decision_coverage.resolve(ref, "blocked", reason="quote_unavailable")
                 continue
             flow_signal.entry_price = price
             flow_signal.context = {
@@ -1742,6 +1763,7 @@ def _execute_options_flow_trades(container, regime_data):
                 "volatility": None,
             }
             flow_signal = _apply_dynamic_risk_policy(container, flow_signal, regime_data=regime_data)
+            decision_coverage.bind_signal(ref, flow_signal)
 
             if live_active and live_account_value is not None and live_account_value <= 0:
                 logger.warning(
@@ -1749,6 +1771,7 @@ def _execute_options_flow_trades(container, regime_data):
                     conv["ticker"],
                     live_account_value,
                 )
+                decision_coverage.resolve(ref, "blocked", reason="live_margin_unavailable")
                 continue
 
             if live_active and live_trader and (not flow_signal.size or flow_signal.size <= 0):
@@ -1810,6 +1833,7 @@ def _execute_options_flow_trades(container, regime_data):
                 )
                 if not passed:
                     logger.info("  Firewall rejected options flow %s: %s", conv["ticker"], reason)
+                    decision_coverage.resolve(ref, "blocked", reason=f"firewall: {reason}")
                     continue
 
             if container.agent_scorer:
@@ -1853,6 +1877,7 @@ def _execute_options_flow_trades(container, regime_data):
                     stop_loss=sl, take_profit=tp,
                     metadata={
                         "source": "options_flow",
+                        "evaluation_ref": ref,
                         "decision_id": decision_journal.resolve_decision_id(flow_signal),
                         "entry_decision": entry_memory(
                             flow_signal, route="options_flow", firewall="approved" if container.firewall else None,
@@ -1876,9 +1901,12 @@ def _execute_options_flow_trades(container, regime_data):
                         {"coin": conv["ticker"], "side": side, "entry_price": price},
                         source="options_flow",
                     )
+            else:
+                decision_coverage.resolve(ref, "blocked", reason="paper_account_unavailable")
         if options_executed:
             logger.info("  Executed %d options flow trades", len(options_executed))
     except Exception as exc:
+        decision_coverage.mark_failed()
         logger.warning("  Options flow trading error: %s", exc)
 
 
@@ -1922,6 +1950,8 @@ def _run_copy_trading(container, regime_data):
             success_label="  LIVE COPY",
             skip_label="  Live trader requested but not deployable; skipping copy mirroring",
         )
+    elif not copy_signals:
+        decision_coverage.expect("copy", [])
 
 
 def _collect_closed_trade_events(container, initial_closed):
@@ -2100,13 +2130,15 @@ def _run_alpha_arena(container, regime_data):
                     min_trades=_ARENA_CHAMPION_MIN_TRADES,
                     min_win_rate=_ARENA_CHAMPION_MIN_WIN_RATE,
                 )
+                refs = decision_coverage.expect("arena", champion_signals or [])
                 if champion_signals:
                     logger.info("  Arena champions: %d signals", len(champion_signals))
                     account = None
-                    for sig in champion_signals:
+                    for sig, ref in zip(champion_signals, refs):
                         try:
                             price = sig.get("price", 0)
                             if price <= 0:
+                                decision_coverage.resolve(ref, "blocked", reason="quote_unavailable")
                                 continue
                             side = sig["side"]
                             conf = sig["confidence"]
@@ -2134,6 +2166,7 @@ def _run_alpha_arena(container, regime_data):
                                 regime=regime_data.get("overall_regime", "") if regime_data else "",
                             )
                             live_signal = _apply_dynamic_risk_policy(container, live_signal, regime_data=regime_data)
+                            decision_coverage.bind_signal(ref, live_signal)
                             # A1: pass atr_pct so the ATR floor widens
                             # tight live-arena stops.
                             sl, tp = live_signal.risk.resolve_trigger_prices(
@@ -2198,6 +2231,7 @@ def _run_alpha_arena(container, regime_data):
                                             "  Arena firewall rejected %s %s: %s",
                                             sig["coin"], side, reason,
                                         )
+                                        decision_coverage.resolve(ref, "blocked", reason=f"firewall: {reason}")
                                         continue
                                 _execute_signal_live(container, live_signal, "ARENA")
                                 continue
@@ -2229,6 +2263,7 @@ def _run_alpha_arena(container, regime_data):
                                     stop_loss=sl, take_profit=tp,
                                     metadata={
                                         "source": "arena_champion",
+                                        "evaluation_ref": ref,
                                         "decision_id": decision_journal.resolve_decision_id(live_signal),
                                         "entry_decision": entry_memory(live_signal, route="arena_champion"),
                                         "agent_id": sig["agent_id"],
@@ -2251,9 +2286,16 @@ def _run_alpha_arena(container, regime_data):
                                     "  Champion trade: %s %s @ $%s | agent=%s",
                                     side.upper(), sig["coin"], f"{price:,.2f}", sig["agent_name"],
                                 )
+                            else:
+                                decision_coverage.resolve(ref, "blocked", reason="paper_account_unavailable")
                         except Exception as exc:
+                            decision_coverage.resolve(ref, "error", reason=type(exc).__name__)
                             logger.debug("  Champion trade exec error: %s", exc)
             except Exception as exc:
+                decision_coverage.mark_failed()
                 logger.debug("  Champion signals error: %s", exc)
+        else:
+            decision_coverage.expect("arena", [])
     except Exception as exc:
+        decision_coverage.mark_failed()
         logger.warning("  Arena error: %s", exc)

@@ -13,6 +13,7 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from starlette.concurrency import run_in_threadpool
 
+from src.data.decision_coverage import read_report as decision_coverage_report
 from src.ui.v2.auth import require_auth, verify_cookie
 from src.ui.v2.cache import get_ttl
 from src.ui.v2.desk import STOCK_LABELS, snapshot
@@ -81,6 +82,15 @@ async def trade_details(request: Request, trade_id: int):
     if not trade:
         raise HTTPException(404, "Paper trade not found")
     return get_templates().TemplateResponse(request, "trade_details.html", {"title": f"Trade {trade_id}", "trade": trade})
+
+
+@router.get("/decision-coverage", response_class=HTMLResponse)
+async def decision_coverage(request: Request):
+    if not verify_cookie(request):
+        return RedirectResponse("/login", status_code=303)
+    from src.ui.v2.app import get_templates
+    report = await run_in_threadpool(get_ttl, "decision-coverage", 10, decision_coverage_report)
+    return get_templates().TemplateResponse(request, "coverage.html", {"title": "Decision Coverage", "report": report})
 
 
 @router.get("/api/events/recent", response_class=JSONResponse)

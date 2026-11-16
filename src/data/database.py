@@ -1439,6 +1439,9 @@ def open_paper_trade(strategy_id, coin, side, entry_price, size, leverage=1,
             if measured:
                 captured["copy_concentration_study"] = {"policy": COPY_CONCENTRATION_STUDY, "peers": copy_peers}
 
+        from src.data.decision_coverage import prepare_entry
+
+        prepare_entry(metadata, symbol=coin, side=normalized_side, price=entry_price)
         try:
             return _insert_and_get_id(conn, """
                 INSERT INTO paper_trades

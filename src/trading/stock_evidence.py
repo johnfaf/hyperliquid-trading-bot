@@ -14,7 +14,7 @@ NEW_YORK = ZoneInfo("America/New_York")
 MODELED_FEE_RATE = Decimal("0.0002")
 INCIDENTS = {
     "broker_position_mismatch", "unmanaged_or_unconfirmed_fill", "unmanaged_open_order",
-    "submission_unknown", "cycle_failed", "stale_broker_clock", "order_rejected",
+    "submission_unknown", "submitting", "cycle_failed", "stale_broker_clock", "order_rejected",
 }
 NEUTRAL = {"outside_entry_or_exit_window", "no_order"}
 
@@ -48,10 +48,20 @@ class StockEvidence:
                 );
                 CREATE INDEX IF NOT EXISTS idx_stock_cycles_account_time ON stock_cycles(account, observed_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_stock_cycles_session ON stock_cycles(account, session, observed_at);
+                CREATE TABLE IF NOT EXISTS stock_cycle_attempts (
+                    id TEXT PRIMARY KEY, started_at TEXT NOT NULL, finished_at TEXT, purpose TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_stock_cycle_attempts_time ON stock_cycle_attempts(started_at);
             """)
 
+    def start(self, cycle_id: str, purpose: str, *, observed_at: datetime | None = None):
+        now = (observed_at or datetime.now(timezone.utc)).astimezone(timezone.utc)
+        with closing(sqlite3.connect(self.path, timeout=8)) as conn, conn:
+            conn.execute("PRAGMA synchronous=FULL")
+            conn.execute("INSERT INTO stock_cycle_attempts VALUES (?, ?, NULL, ?)", (cycle_id, now.isoformat(), purpose))
+
     def record(self, cycle_id: str, result: dict, *, symbol: str, mode: str, purpose: str,
-               observed_at: datetime | None = None):
+               observed_at: datetime | None = None, finished: bool = False):
         now = observed_at or datetime.now(timezone.utc)
         intent = result.get("intent") or {}
         side = result.get("decision") or intent.get("side")
@@ -62,14 +72,20 @@ class StockEvidence:
             for key in ("mark", "account_cash", "account_equity", "quantity")
         ]
         with closing(sqlite3.connect(self.path, timeout=8)) as conn, conn:
+            conn.execute("PRAGMA synchronous=FULL")
             conn.execute("""
                 INSERT INTO stock_cycles VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(id) DO UPDATE SET state=excluded.state
+                ON CONFLICT(id) DO UPDATE SET state=CASE
+                    WHEN excluded.state='cycle_failed' AND stock_cycles.state='submitting' THEN stock_cycles.state
+                    ELSE excluded.state END
                 """, (cycle_id, self.account, now.astimezone(timezone.utc).isoformat(), symbol, mode, purpose,
                       result.get("session") or now.astimezone(NEW_YORK).date().isoformat(),
                       decision, state, intent.get("client_order_id"), result.get("quote_at"),
                       result.get("quote_age"), bool(result.get("quote_valid")), *quantities,
                       str(number(intent.get("qty"))) if number(intent.get("qty")) is not None else None))
+            if finished:
+                conn.execute("UPDATE stock_cycle_attempts SET finished_at=? WHERE id=?",
+                             (now.astimezone(timezone.utc).isoformat(), cycle_id))
 
     def ready_shadow(self, session: str, at: datetime) -> bool:
         at = at.astimezone(timezone.utc)
@@ -225,5 +241,13 @@ def read_summary(path: Path, *, session: str | None = None) -> dict:
             d["ref"] = cid[:8] if cid else None
             cycles.append(d)
         fills = _paper_fills(conn, scope)
+        coverage = None
+        if conn.execute("SELECT 1 FROM sqlite_master WHERE name='stock_cycle_attempts'").fetchone():
+            now = datetime.now(timezone.utc)
+            row = conn.execute("""
+                SELECT count(*), count(finished_at), count(CASE WHEN finished_at IS NULL AND started_at<? THEN 1 END)
+                FROM stock_cycle_attempts WHERE purpose='strategy' AND started_at>=?
+                """, ((now - timedelta(minutes=10)).isoformat(), (now - timedelta(hours=24)).isoformat())).fetchone()
+            coverage = dict(zip(("started", "finished", "overdue"), row))
         return {"decisions": cycles, "fills": fills[-12:][::-1], "scorecard": scorecard(conn, scope, session),
-                "drill": drill_status(conn, scope, fills)}
+                "drill": drill_status(conn, scope, fills), "coverage": coverage}

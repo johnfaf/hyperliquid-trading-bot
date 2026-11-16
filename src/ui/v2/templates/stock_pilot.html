@@ -49,7 +49,10 @@
   </div>
 
   <section class="desk-panel desk-trades">
-    <div class="desk-panel-heading"><div><h2>Decision journal</h2><p>Most recent stock cycles</p></div></div>
+    <div class="desk-panel-heading"><div><h2>Decision journal</h2>
+      {% set coverage = pilot.get("coverage") %}
+      <p>{% if coverage %}{{ coverage.finished }} / {{ coverage.started }} stock cycles finished &middot; {{ coverage.overdue }} overdue &middot; Last 24 hours{% else %}Most recent stock cycles &middot; Start coverage unmeasured{% endif %}</p>
+    </div></div>
     {% if rows %}
     <div class="desk-table-scroll" tabindex="0" aria-label="Scrollable stock decisions">
       <table class="desk-table stock-table">

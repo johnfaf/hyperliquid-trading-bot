@@ -44,6 +44,25 @@ def test_health_open_without_auth(client):
     assert r.json()["status"] == "ok"
 
 
+def test_decision_coverage_private_even_when_overview_is_public(monkeypatch, client):
+    from src.ui.v2.cache import invalidate
+    from src.ui.v2.routers import pages
+
+    monkeypatch.setenv("DASHBOARD_AUTH_TOKEN", "coverage-test-auth")
+    monkeypatch.setenv("DASHBOARD_PUBLIC_READ", "true")
+    monkeypatch.setattr(pages, "decision_coverage_report", lambda: {"available": False, "issue": "unavailable"})
+    invalidate("decision-coverage")
+    try:
+        assert client.get("/decision-coverage", follow_redirects=False).status_code == 303
+        assert client.post("/api/auth/login", data={"token": "coverage-test-auth"}, follow_redirects=False).status_code == 303
+        response = client.get("/decision-coverage")
+        assert response.status_code == 200
+        assert "Decision Coverage" in response.text
+        assert "Historical candidates were not counted" in response.text
+    finally:
+        invalidate("decision-coverage")
+
+
 def test_index_serves_dashboard_when_no_token_configured(client):
     r = client.get("/")
     assert r.status_code == 200

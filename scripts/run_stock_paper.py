@@ -223,15 +223,16 @@ def main():
     purpose = "drill" if drill else "operator" if args.action != "cycle" else "strategy"
     evidence = None
 
-    def remember(result):
-        evidence.record(cycle_id, result, symbol=args.symbol, mode=mode, purpose=purpose)
+    def remember(result, *, finished=False):
+        evidence.record(cycle_id, result, symbol=args.symbol, mode=mode, purpose=purpose, finished=finished)
 
     try:
+        evidence = StockEvidence(args.db, account)
+        evidence.start(cycle_id, purpose)
         if not key or not secret:
             OrderJournal(args.db, account)
-            evidence = StockEvidence(args.db, account)
             result = {"mode": "paper_only", "state": "waiting_for_paper_credentials"}
-            remember(result)
+            remember(result, finished=True)
             print(json.dumps(result))
             return
         broker = AlpacaPaper(key, secret)
@@ -247,7 +248,7 @@ def main():
                 broker, journal, symbol=args.symbol, orders_enabled=orders_enabled,
                 flatten=args.action == "flatten", evidence=evidence, remember=remember, drill=drill,
             )
-        remember(result)
+        remember(result, finished=True)
         print(json.dumps({"mode": mode, **result}))
     except Exception as exc:
         # Exception messages from HTTP clients can contain deployment-sensitive details.
@@ -256,7 +257,7 @@ def main():
             if evidence is None:
                 OrderJournal(args.db, account)
                 evidence = StockEvidence(args.db, account)
-            remember({"state": "cycle_failed"})
+            remember({"state": "cycle_failed"}, finished=True)
         except Exception:
             pass
         raise SystemExit(1) from None

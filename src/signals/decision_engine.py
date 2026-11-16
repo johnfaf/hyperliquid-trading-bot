@@ -179,7 +179,12 @@ class DecisionEngine:
         # are shadow-only; assigning a random liquid coin makes the bot trade a
         # market the strategy never actually identified.
         valid_strategies = []
-        for s in strategies:
+        from src.data import decision_coverage
+
+        refs = decision_coverage.expect("strategy", strategies)
+        for s, ref in zip(strategies, refs):
+            if ref:
+                s["_coverage_ticket"] = ref
             params = self._normalise_params(s.get("parameters", {}))
             # Persist parsed version so downstream doesn't re-parse
             s["parameters"] = params
@@ -204,6 +209,7 @@ class DecisionEngine:
             if not coins or (coins and coins[0].lower() == "unknown"):
                 strategy_type = s.get("strategy_type", s.get("type", ""))
                 s["_decision_skip_reason"] = "missing_asset"
+                decision_coverage.resolve(ref, "blocked", reason="missing_asset")
                 self.stats["total_missing_asset"] += 1
                 logger.info(
                     "Skipping non-executable strategy %s (%s): no asset in parameters/metrics",
@@ -257,12 +263,21 @@ class DecisionEngine:
             disqualified = [s for s in scored if s["_composite_score"] < self.min_decision_score]
 
         # ─── Portfolio correlation / net-exposure cap (algo #7) ─────
+        ranked_refs = {s.get("_coverage_ticket") for s in qualified}
         qualified = self._apply_correlation_cap(qualified, open_positions)
 
         # ─── Limit by cycle trade cap AND available slots ─
         max_this_cycle = min(self.max_prescreen_candidates, available_slots)
         executions = qualified[:max_this_cycle]
         overflow = qualified[max_this_cycle:]
+        qualified_refs = {s.get("_coverage_ticket") for s in qualified}
+        execution_refs = {s.get("_coverage_ticket") for s in executions}
+        for s in scored:
+            ref = s.get("_coverage_ticket")
+            if ref:
+                reason = ("ranked" if ref in execution_refs else "execution_capacity" if ref in qualified_refs
+                          else "portfolio_correlation_cap" if ref in ranked_refs else "below_ranking_threshold")
+                decision_coverage.resolve(ref, "ranked" if ref in execution_refs else "blocked", reason=reason)
 
         # ─── Aggregate directional analysis (ChatGPT's insight) ───
         long_score, short_score = self._aggregate_directional_scores(scored)

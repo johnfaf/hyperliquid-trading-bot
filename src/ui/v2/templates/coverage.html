@@ -1,0 +1,47 @@
+{% extends "base.html" %}
+{% from "partials/desk_macros.html" import icon %}
+{% block content %}
+<div class="desk-content">
+  <header class="desk-pagehead">
+    <div><div class="desk-kicker">{{ icon("file", 15) }} Hyperliquid</div><h1>Decision Coverage</h1><p class="desk-muted">Crypto execution candidates &middot; Last 24 hours</p></div>
+    <div class="desk-actions"><a class="text-sm text-sky-300 underline" href="/audit">Audit</a>
+      <a href="/decision-coverage" class="desk-icon-btn" aria-label="Refresh coverage" title="Refresh coverage">{{ icon("refresh") }}</a></div>
+  </header>
+  {% if not report.available %}
+  <section class="desk-empty compact"><p>{{ "The 24-hour row limit was reached. Coverage is unmeasured." if report.issue == "limit" else "Coverage is unavailable. Historical candidates were not counted before capture." }}</p></section>
+  {% else %}
+  <section class="desk-kpis" aria-label="Decision coverage totals">
+    <div><span>Cycles finished</span><strong>{{ report.finished }} / {{ report.cycles }}</strong><small>{{ report.unresolved_cycles }} unfinished or failed</small></div>
+    <div><span>Evaluations recorded</span><strong>{{ report.registered }} / {{ report.expected }}</strong><small>{{ report.terminal }} final &middot; {{ report.errors }} errors</small></div>
+    <div><span>Paper intents unresolved</span><strong>{{ report.unresolved_intents }}</strong><small>Of {{ report.intents }} durable intents</small></div>
+    <div><span>Venue submissions unresolved</span><strong>{{ report.unresolved_orders if report.unresolved_orders is not none else "Unmeasured" }}</strong><small>Durable live-order journal &middot; All time</small></div>
+  </section>
+  <section class="desk-panel">
+    <div class="desk-panel-heading"><div><h2>Evaluation roster</h2>
+      <p>{% if report.late %}<strong class="tone-text-bad">Trading cycle overdue.</strong> {% endif %}
+      {% if report.latest_cycle %}Last cycle started {{ report.gap_minutes }} min ago.{% else %}No cycle starts in this window.{% endif %}</p></div></div>
+    {% if report.routes %}
+    <div class="desk-table-scroll" tabindex="0" aria-label="Scrollable candidate counts">
+      <table class="desk-table"><thead><tr><th scope="col">Route</th><th scope="col">Expected</th><th scope="col">Recorded</th><th scope="col">Final</th><th scope="col">Unresolved</th></tr></thead>
+        <tbody>{% for row in report.routes %}
+          <tr><th scope="row">{{ row.route | replace("_", " ") | title }}</th><td>{{ row.expected }}</td><td>{{ row.registered }}</td><td>{{ row.terminal }}</td><td>{{ row.expected - row.terminal }}</td></tr>
+        {% endfor %}</tbody></table>
+    </div>
+    {% endif %}
+    <div class="desk-decision-empty">Capture began {{ report.capture_started or "not yet recorded" }} &middot; Scanner prefilters and <a class="underline" href="/stock-pilot">Stock Pilot</a> are counted separately or outside this roster.</div>
+  </section>
+  {% if report.pending %}
+  <section class="desk-panel">
+    <div class="desk-panel-heading"><div><h2>Unresolved evaluations</h2><p>{{ report.unresolved_evaluations }} total &middot; Latest {{ report.pending | length }}</p></div></div>
+    <div class="desk-table-scroll" tabindex="0" aria-label="Scrollable unresolved evaluations">
+      <table class="desk-table"><thead><tr><th scope="col">UTC time</th><th scope="col">Route</th><th scope="col">Asset</th><th scope="col">Last checkpoint</th><th scope="col">Reference</th></tr></thead>
+        <tbody>{% for row in report.pending %}
+        <tr><td>{{ row.observed_at[:19] | replace("T", " ") }}</td><td>{{ row.route | replace("_", " ") | title }}</td><td>{{ row.symbol or "Unknown" }}</td>
+          <td>{{ row.state | replace("_", " ") }}</td><td>{% if row.decision_id %}<a class="underline" href="/audit?decision_id={{ row.decision_id | urlencode }}">{{ row.reference[:8] }}</a>{% else %}{{ row.reference[:8] }}{% endif %}</td></tr>
+        {% endfor %}</tbody></table>
+    </div>
+  </section>
+  {% endif %}
+  {% endif %}
+</div>
+{% endblock %}

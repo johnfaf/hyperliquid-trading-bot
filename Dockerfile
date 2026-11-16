@@ -21,6 +21,8 @@ RUN mkdir -p /app/data /app/logs /app/reports /data \
 #   docker build --build-arg RUN_AS_USER=bot .
 ARG RUN_AS_USER=root
 USER ${RUN_AS_USER}
+ARG BOT_BUILD_REVISION=unknown
+ENV BOT_BUILD_REVISION=${BOT_BUILD_REVISION}
 
 # Health check — hits the /api/health endpoint
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
