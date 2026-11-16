@@ -18,15 +18,17 @@ verify_paper() {
         grep -Fx 'BOT_RUN_MODE=paper' >/dev/null || return 1
     python3 - <<'PY'
 import json
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 from urllib.request import urlopen
 
 try:
-    response = urlopen("http://127.0.0.1:8080/api/live_ready", timeout=3)
+    response = urlopen("http://127.0.0.1:8080/api/live_ready", timeout=10)
 except HTTPError as exc:
     if exc.code != 503:
         raise
     response = exc
+except (URLError, TimeoutError):
+    raise SystemExit("live-readiness endpoint still warming up")
 with response as body:
     readiness = json.load(body)
 checks = readiness.get("checks", {})
@@ -77,12 +79,13 @@ if ! "${compose[@]}" up -d --no-build --no-deps --force-recreate bot; then
     exit 1
 fi
 ready=false
-for _ in {1..40}; do
+deadline=$((SECONDS + 180))
+while (( SECONDS < deadline )); do
     if [[ $(sudo -n docker inspect --format '{{.State.Health.Status}}' hyperliquid-bot) == healthy ]]; then
         if verify_paper; then
             ready=true
+            break
         fi
-        break
     fi
     sleep 3
 done
@@ -101,6 +104,7 @@ sudo -n systemctl start hyperliquid-paper-pilot-report.service hyperliquid-exit-
 
 # Separate immutable release and ledger. No broker credentials are provisioned here.
 stock=/opt/hyperliquid-stock-paper
+sudo -n install -d -m 0700 /etc/hyperliquid-stock-paper
 sudo -n install -d -m 0755 "$stock/$rev"
 for file in scripts/run_stock_paper.py src/trading/alpaca_paper.py src/trading/order_journal.py; do
     sudo -n install -D -m 0644 "$release/$file" "$stock/$rev/$file"
