@@ -8,6 +8,34 @@
     <div class="desk-actions"><a class="text-sm text-sky-300 underline" href="/decision-coverage">Decision Coverage</a><a href="/trades?days={{ report.days }}&amp;group={{ report.group }}&amp;scope={{ report.scope }}"
       class="desk-icon-btn" aria-label="Refresh trade review" title="Refresh trade review">{{ icon("refresh") }}</a></div>
   </header>
+  {% if report.scope == "copy" %}
+  {% for alert in report.copy_alerts %}
+  <p class="desk-muted tone-text-bad">{{ icon("alert", 14) }} {{ alert }}</p>
+  {% endfor %}
+  {% set daily = report.copy_daily %}
+  {% if daily %}
+  <section class="desk-panel">
+    <div class="desk-panel-heading"><div><h2>Daily copy comparison</h2><p>{{ daily.date }} UTC &middot; Realized paper closes</p></div>{{ badge("Shadow only") }}</div>
+    {% if daily.baseline %}
+    <div class="desk-table-scroll" tabindex="0" aria-label="Scrollable daily comparison">
+      <table class="desk-table">
+        <thead><tr><th scope="col">Book</th><th scope="col">Closes</th><th scope="col">Net P&amp;L</th><th scope="col">Realized drawdown</th><th scope="col">+{{ daily.extra_cost_bps }} bps net</th></tr></thead>
+        <tbody>{% for label, row, stress in [("Recorded paper",daily.baseline,daily.stress_baseline),("Skip overlapping entries",daily.shadow,daily.stress_shadow)] %}
+          <tr><th scope="row">{{ label }}</th><td>{{ row.n }}</td><td>{{ money(row.net,true) }}</td><td>{{ money(row.drawdown) }}</td><td>{{ money(stress.net,true) if stress else "Unmeasured" }}</td></tr>
+        {% endfor %}</tbody>
+      </table>
+    </div>
+    {% else %}
+    <div class="desk-empty compact"><p>No matched, priced closes. Comparison unmeasured.</p></div>
+    {% endif %}
+    <div class="desk-decision-empty">{% if daily.all_copy %}All clean copy closes {{ money(daily.all_copy.net,true) }} / {{ daily.all_copy.n }} &middot; {% endif %}
+      Skipped {{ daily.skipped }} &middot; Missed {{ daily.missed_winners }} winners &middot;
+      Unmatched {{ daily.untagged + daily.excluded + daily.unpriced }} &middot;
+      {% if daily.coverage %}Coverage {{ daily.coverage.terminal }}/{{ daily.coverage.expected }} final{% else %}Decision coverage unmeasured{% endif %}
+    </div>
+  </section>
+  {% endif %}
+  {% endif %}
   <div class="desk-review-controls">
     <div class="desk-segments" aria-label="Trade scope">
       {% for scope,label in [("copy","Copy trades"),("all","All paper trades")] %}

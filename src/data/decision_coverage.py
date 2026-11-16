@@ -11,8 +11,6 @@ from pathlib import Path
 import sqlite3
 from uuid import uuid4
 
-import config
-from src.core import clock_provider
 from src.trading.trade_decision_memory import COPY_CONCENTRATION_STUDY
 
 log = logging.getLogger(__name__)
@@ -20,7 +18,11 @@ CURRENT = ContextVar("decision_coverage_cycle", default=None)
 
 
 def path_for(path=None):
-    return Path(path or config.DB_PATH).with_suffix(".decisions.sqlite3")
+    if path is None:
+        import config
+
+        path = config.DB_PATH
+    return Path(path).with_suffix(".decisions.sqlite3")
 
 
 def json_value(values):
@@ -29,6 +31,8 @@ def json_value(values):
 
 class Cycle:
     def __init__(self, path, number):
+        import config
+
         self.path = path
         self.cycle_id = uuid4().hex
         self.number = number
@@ -59,6 +63,8 @@ class Cycle:
     def write(self, rows):
         if not self.usable:
             return False
+        from src.core import clock_provider
+
         try:
             stamp = clock_provider.utc_now().isoformat()
             with closing(sqlite3.connect(self.path, timeout=2)) as db, db:
@@ -183,22 +189,27 @@ def prepare_entry(metadata, *, symbol, side, price):
 def read_report(*, paper_path=None, order_path=None, now=None, window_start=None):
     """Read a bounded 24-hour report. Historic absence is explicitly unmeasured."""
     now = now or datetime.now(timezone.utc)
-    ledger = Path(paper_path or config.DB_PATH)
+    if paper_path is None:
+        import config
+
+        paper_path = config.DB_PATH
+    ledger = Path(paper_path)
     result = {"available": False, "cycles": 0, "finished": 0, "unresolved_cycles": 0,
               "expected": 0, "registered": 0, "terminal": 0, "unresolved_evaluations": 0,
               "intents": 0, "unresolved_intents": 0, "unresolved_orders": None, "routes": [],
               "latest_cycle": None, "capture_started": None, "gap_minutes": None, "late": False,
               "issue": "unavailable", "pending": [], "errors": 0, "revisions": [], "protocols": [],
-              "schedule_contiguous": False}
+              "schedule_contiguous": False, "failed_cycles": 0, "overdue_cycles": 0,
+              "overdue_evaluations": 0, "overdue_intents": 0}
     try:
-        with closing(_readonly(Path(order_path or ledger.with_suffix(".orders.sqlite3")))) as db:
+        with closing(open_readonly(Path(order_path or ledger.with_suffix(".orders.sqlite3")))) as db:
             result["unresolved_orders"] = db.execute(
                 "SELECT count(*) FROM orders WHERE status IN ('submitting','unknown','cancel_pending')"
             ).fetchone()[0]
     except (sqlite3.Error, OSError):
         pass
     try:
-        with closing(_readonly(path_for(ledger))) as db:
+        with closing(open_readonly(path_for(ledger))) as db:
             start_at = window_start or now - timedelta(hours=24)
             start = start_at.isoformat()
             limit = 150_000 if window_start is not None else 25_000
@@ -208,7 +219,8 @@ def read_report(*, paper_path=None, order_path=None, now=None, window_start=None
             if len(rows) > limit:
                 result["issue"] = "limit"
                 return result
-        with closing(_readonly(ledger)) as db:
+        with closing(open_readonly(ledger)) as db:
+            db.execute("BEGIN")
             actual, actual_evaluations, actual_trades = set(), set(), {}
             snapshots = {}
             closed = db.execute("""
@@ -224,14 +236,17 @@ def read_report(*, paper_path=None, order_path=None, now=None, window_start=None
                     actual_trades[row[0]] = value["decision_id"]
             has_snapshots = db.execute("SELECT 1 FROM sqlite_master WHERE name='decision_snapshots'").fetchone()
             if has_snapshots:
+                columns = {r[1] for r in db.execute("PRAGMA table_info(decision_snapshots)")}
+                seen_at = "updated_at" if "updated_at" in columns else "created_at"
                 snapshots = {r[0]: (r[1], r[2]) for r in db.execute(
-                    "SELECT decision_id,final_status,paper_trade_id FROM decision_snapshots WHERE created_at>=?",
-                    (start,),
+                    "SELECT decision_id,final_status,paper_trade_id FROM decision_snapshots "
+                    f"WHERE created_at>=? AND created_at<? AND {seen_at}<?",
+                    (start, now.isoformat(), now.isoformat()),
                 )}
     except (sqlite3.Error, OSError):
         return result
     groups = {}
-    states, scheduled, finished, intents = {}, {}, set(), set()
+    states, scheduled, finished, failed, intents = {}, {}, set(), set(), {}
     terminal = {"no_signal", "blocked", "error", "exit_applied"}
     candidates = {}
     revisions, protocols = set(), set()
@@ -244,6 +259,8 @@ def read_report(*, paper_path=None, order_path=None, now=None, window_start=None
             protocols.add(payload.get("shadow_protocol") or "unknown")
         elif event == "cycle_finished":
             finished.add(row["cycle_id"])
+        elif event == "cycle_failed":
+            failed.add(row["cycle_id"])
         elif event == "roster":
             counts = groups.setdefault(route, {"route": route, "expected": 0, "registered": 0, "terminal": 0})
             counts["expected"] += _dict(row["payload"]).get("expected", 0)
@@ -252,7 +269,7 @@ def read_report(*, paper_path=None, order_path=None, now=None, window_start=None
             candidates[ref] = {"observed_at": row["observed_at"], "route": route,
                                "symbol": _dict(row["payload"]).get("symbol"), "reference": ref}
         elif event == "paper_entry_intent":
-            intents.add(ref)
+            intents[ref] = row["observed_at"]
         elif ref in states:
             states[ref] = (states[ref][0], event, row["decision_id"] or states[ref][2])
     for ref, (route, event, decision_id) in states.items():
@@ -271,10 +288,15 @@ def read_report(*, paper_path=None, order_path=None, now=None, window_start=None
             result["errors"] += int(event == "error" or status in {"rotation_victim_close_failed", "paper_open_failed"})
         else:
             result["pending"].append({**candidates[ref], "decision_id": decision_id, "state": status or event})
+    overdue = (now - timedelta(minutes=20)).isoformat()
     result.update(available=True, issue=None, cycles=len(scheduled), finished=len(scheduled.keys() & finished),
                   unresolved_cycles=len(scheduled.keys() - finished), intents=len(intents),
-                  unresolved_intents=len(intents - actual), routes=list(groups.values()),
-                  revisions=sorted(revisions), protocols=sorted(protocols))
+                  unresolved_intents=len(intents.keys() - actual), routes=list(groups.values()),
+                  revisions=sorted(revisions), protocols=sorted(protocols),
+                  failed_cycles=len(scheduled.keys() & failed),
+                  overdue_cycles=sum(scheduled[k][0] <= overdue for k in scheduled.keys() - finished - failed),
+                  overdue_evaluations=sum(row["observed_at"] <= overdue for row in result["pending"]),
+                  overdue_intents=sum(intents[k] <= overdue for k in intents.keys() - actual))
     if scheduled:
         latest, cadence = max(scheduled.values(), key=lambda row: row[0])
         result["latest_cycle"] = latest
@@ -297,7 +319,7 @@ def read_report(*, paper_path=None, order_path=None, now=None, window_start=None
     return result
 
 
-def _readonly(path):
+def open_readonly(path):
     db = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=2)
     db.row_factory = sqlite3.Row
     return db

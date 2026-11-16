@@ -9,7 +9,7 @@ import sqlite3
 
 import config
 from src.trading.trade_decision_memory import COPY_CONCENTRATION_STUDY, is_copy_metadata, number
-from src.ui.v2.desk import read_sqlite
+from src.ui.v2.desk import host_status, read_sqlite
 
 COLUMNS = "id, coin, side, status, opened_at, closed_at, entry_price, exit_price, size, leverage, pnl, stop_loss, take_profit, metadata"
 STOP_REASONS = {"stop_loss", "trailing_stop"}
@@ -157,10 +157,14 @@ def shadow_comparison(trades, start):
 def review(days=7, group="source", scope="copy", *, path=None, now=None):
     now = now or datetime.now(timezone.utc)
     start = now - timedelta(days=days)
+    path = Path(path or config.DB_PATH)
     base = {"days": days, "group": group, "scope": scope, "available": False, "limited": False,
             "summary": {}, "groups": [], "recent": [], "excluded": 0, "peak": None}
+    if scope == "copy":
+        status = host_status(path.with_name("dashboard_ops.json"), now)
+        base.update(copy_daily=status.get("copy_daily"), copy_alerts=status.get("copy_alerts") or [])
     try:
-        with closing(read_sqlite(Path(path or config.DB_PATH))) as conn:
+        with closing(read_sqlite(path)) as conn:
             rows = conn.execute(f"""
                 SELECT {COLUMNS} FROM paper_trades
                 WHERE status='open' OR (status='closed' AND closed_at>=? AND closed_at<=?)

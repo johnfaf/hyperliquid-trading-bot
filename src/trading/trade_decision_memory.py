@@ -2,8 +2,6 @@
 from datetime import datetime, timezone
 import math
 
-from src.core import clock_provider
-
 
 def number(value):
     try:
@@ -40,6 +38,8 @@ def is_copy_metadata(data):
 
 def entry_memory(signal, *, route, reason=None, firewall=None, rotation=None, copy=None):
     """Build a small, versioned record. Do not persist arbitrary provider context."""
+    from src.core import clock_provider
+
     context = getattr(signal, "context", None)
     context = context if isinstance(context, dict) else {}
     attribution = context.get("decision_attribution")

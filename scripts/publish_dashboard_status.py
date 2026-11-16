@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Publish a small allowlisted host status snapshot to the dashboard bind mount."""
 import argparse
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 import json
 from pathlib import Path
 import re
@@ -39,6 +39,17 @@ ALERTS = {
     "stale_worker": "The worker has not reported a cycle for more than 15 minutes.",
     "order_rejected": "Alpaca reported a rejected paper order.",
     "quote_not_usable": "Three open-session cycles could not verify a usable quote.",
+}
+
+COPY_ALERTS = {
+    "coverage_unavailable": "Decision coverage is unavailable.",
+    "coverage_late": "No new trading cycle within two scheduled intervals.",
+    "cycle_incomplete": "A trading cycle failed or did not finish within 20 minutes.",
+    "evaluation_incomplete": "At least one evaluation is unresolved after 20 minutes.",
+    "evaluation_error": "The decision journal recorded an execution or evaluation error.",
+    "paper_intent": "A paper entry remains unmatched to the ledger after 20 minutes.",
+    "venue_order": "The venue order journal contains an unresolved submission.",
+    "report_unavailable": "The daily copy comparison could not be generated.",
 }
 
 
@@ -95,16 +106,91 @@ def build_snapshot(study: Path) -> dict:
             "exit_report": exit_report.name if exit_report else None, "pilot_report": pilot.name if pilot else None}
 
 
-def publish(path: Path, payload: dict, *, mode=0o644) -> None:
+def publish_text(path: Path, text: str, *, mode=0o644) -> None:
     with NamedTemporaryFile(dir=path.parent, mode="w", encoding="utf-8", delete=False) as output:
         temporary = Path(output.name)
-        json.dump(payload, output, allow_nan=False)
+        output.write(text)
     try:
         # The parent is the private Docker bind mount, not a public web directory.
         temporary.chmod(mode)
         temporary.replace(path)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def publish(path: Path, payload: dict, *, mode=0o644) -> None:
+    publish_text(path, json.dumps(payload, allow_nan=False), mode=mode)
+
+
+def load_object(path: Path) -> dict:
+    try:
+        with path.open(encoding="utf-8") as stream:
+            value = json.loads(stream.read(65536))
+        return value if isinstance(value, dict) else {}
+    except (ValueError, OSError):
+        return {}
+
+
+def daily_copy_report(path, directory, now):
+    from src.trading.copy_shadow_report import build_daily, markdown
+
+    # Let the completed UTC day's asynchronous ledger writes settle before archiving.
+    day = (now - timedelta(minutes=10)).date() - timedelta(days=1)
+    basename = directory / f"copy-shadow-{day.isoformat()}"
+    archive = basename.with_suffix(".json")
+    result = load_object(archive)
+    if result.get("date") == day.isoformat() and "baseline" in result:
+        return result
+    report = build_daily(path, day)
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    publish_text(basename.with_suffix(".md"), markdown(report), mode=0o600)
+    publish(archive, report, mode=0o600)
+    return report
+
+
+def copy_incidents(coverage, *, report_available=True):
+    reasons = []
+    if not coverage["available"] or ("capture_started" in coverage and coverage["capture_started"] is None):
+        reasons.append("coverage_unavailable")
+    else:
+        if coverage["late"]:
+            reasons.append("coverage_late")
+        if coverage["failed_cycles"] or coverage["overdue_cycles"]:
+            reasons.append("cycle_incomplete")
+        if coverage["overdue_evaluations"]:
+            reasons.append("evaluation_incomplete")
+        if coverage["errors"]:
+            reasons.append("evaluation_error")
+        if coverage["overdue_intents"]:
+            reasons.append("paper_intent")
+    if coverage["unresolved_orders"]:
+        reasons.append("venue_order")
+    if not report_available:
+        reasons.append("report_unavailable")
+    return reasons
+
+
+def notify_copy(report, incidents, config, state_path, *, now):
+    from src.trading.copy_shadow_report import digest
+
+    history = load_object(state_path)
+    alerts = {key: history[key] for key in COPY_ALERTS if isinstance(history.get(key), (float, int))}
+    due = [key for key in incidents if key not in alerts or not 0 <= now.timestamp() - alerts[key] < 6 * 3600]
+    report_due = report is not None and history.get("date") != report["date"]
+    messages = [digest(report)] if report_due else []
+    if due:
+        messages.append("Crypto decision alerts:\n" + "\n".join("- " + COPY_ALERTS[key] for key in due))
+    if not messages:
+        return "quiet"
+    try:
+        if send_telegram(config, "\n\n".join(messages)):
+            alerts.update({key: now.timestamp() for key in due})
+            publish(state_path, {**alerts, "date": report["date"] if report_due else history.get("date")}, mode=0o600)
+            return "sent"
+    except Exception:
+        # Transport errors can contain the secret-bearing URL.
+        pass
+    return "delivery_unavailable"
 
 
 def stock_alert(snapshot: dict, now: datetime) -> str | None:
@@ -150,12 +236,7 @@ def maybe_alert(snapshot: dict, config: Path, state_path: Path, *, now: datetime
     reason = stock_alert(snapshot, now)
     if reason is None:
         return "quiet"
-    try:
-        history = json.loads(state_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        history = {}
-    if not isinstance(history, dict):
-        history = {}
+    history = load_object(state_path)
     previous = history.get(reason, 0)
     if isinstance(previous, (int, float)) and 0 <= now.timestamp() - previous < 3600:
         return "suppressed"
@@ -177,20 +258,38 @@ def main() -> None:
     parser.add_argument("--stock-db", type=Path)
     parser.add_argument("--telegram-env", type=Path)
     parser.add_argument("--alert-state", type=Path)
+    parser.add_argument("--paper-db", type=Path)
+    parser.add_argument("--copy-report-dir", type=Path)
     args = parser.parse_args()
+    if bool(args.paper_db) != bool(args.copy_report_dir):
+        parser.error("--paper-db and --copy-report-dir must be used together")
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
     snapshot = build_snapshot(args.study)
     if args.stock_db:
-        sys.path.insert(0, str(Path(__file__).resolve().parent))
         from src.trading.stock_evidence import read_summary
         try:
             snapshot["stock_pilot"] = read_summary(args.stock_db)
         except (sqlite3.Error, ValueError, OSError):
             snapshot["stock_pilot"] = None
+    now = datetime.now(UTC)
+    if args.paper_db:
+        from src.data.decision_coverage import read_report
+
+        try:
+            report = daily_copy_report(args.paper_db, args.copy_report_dir, now)
+        except (sqlite3.Error, ValueError, OSError):
+            report = None
+        incidents = copy_incidents(read_report(paper_path=args.paper_db, now=now), report_available=report is not None)
+        snapshot.update(copy_daily=report, copy_alerts=[COPY_ALERTS[key] for key in incidents])
     publish(args.output, snapshot)
     if args.telegram_env and args.alert_state:
-        delivery = maybe_alert(snapshot, args.telegram_env, args.alert_state, now=datetime.now(UTC))
+        delivery = maybe_alert(snapshot, args.telegram_env, args.alert_state, now=now)
         if delivery in {"sent", "delivery_unavailable"}:
             print("Stock Pilot alert:", delivery)
+        if args.paper_db:
+            delivery = notify_copy(report, incidents, args.telegram_env, args.alert_state.with_name("copy-alerts.json"), now=now)
+            if delivery in {"sent", "delivery_unavailable"}:
+                print("Copy comparison/alert:", delivery)
 
 
 if __name__ == "__main__":

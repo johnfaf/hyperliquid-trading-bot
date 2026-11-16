@@ -22,3 +22,21 @@ python -m scripts.run_decision_evidence_backtest --db /path/to/bot.db \
 Actual paper fills, matched copy exclusions, and hypothetical future paths are separate. The matched diagnostic skips a position when same-asset, same-direction copy exposure already existed in the observed book; it does not roll forward the hypothetical book or reinvest freed capital. Forward prices begin at the next 15-minute candle, use no fill or exit assumptions, and are not trade-level P&L. A chronological split of already-observed history is not independent prospective evidence.
 
 The copy shadow protocol is registered with the build revision when each cycle starts. Once a **new** period has at least 14 elapsed days on one known revision, rerun the command with that period and `--prospective`. This read-only screen requires at least 30 matched clean closes, 95% terminal coverage, no unfinished cycles or unmatched paper intents, and positive improvement without worse realized drawdown after an additional 16 bps cost on the recorded entry notional. Missing or mixed-revision data blocks the screen. A passing screen only requests operator review of a paper change; it does not modify the active policy or authorize any live order. Do not pick a different threshold or date range after viewing the result and call that a holdout.
+
+## Daily report and alerts
+
+The existing `hyperliquid-dashboard-status.timer` publishes the latest comparison to **Trade review > Copy trades**. Around 00:10 UTC it archives the previous completed UTC day and sends one Telegram digest through the configured bot. The VPS keeps private Markdown and JSON in `/var/lib/hyperliquid-dashboard/copy-reports`. The total for all clean copy closes is separate from the matched comparison, which requires entry-time tags. A day with no tagged closes is unmeasured, not break-even. The report excludes tainted or synthetic closes and displays a separate additional 16 bps cost scenario when entry notional is available for every matched close.
+
+The same job alerts on missing or late decision coverage, failed cycles, unresolved evaluations and paper intents older than 20 minutes, unresolved venue submissions, and daily report failure. It retries unsuccessful deliveries and limits repeat alerts for the same reason to once every six hours. It does not pause or modify trading. Use [Decision Coverage](/decision-coverage) to inspect pending candidates. An absent live order journal remains unmeasured, not a confirmed zero. Today's P&L is not reported as a completed daily result.
+
+## Faster historical iteration
+
+Use historical replay to reject weak ideas quickly, without lowering the prospective review standard. The offline selector below fits one choice only: keep the recorded policy or skip same-direction overlaps. Freeze dates and thresholds before examining results. It reconstructs older overlap from the observed book, delivering close events no earlier than their timestamp; actual entry tags take precedence when available. It does not use future prices, final trade outcomes, or mutable decision scores as entry features.
+
+```shell
+python -m scripts.run_copy_walk_forward --db /path/to/bot.db \
+  --start 2026-11-14T00:00:00Z --test-start 2026-11-15T00:00:00Z \
+  --test-start 2026-11-16T00:00:00Z --end 2026-11-16T12:30:00Z
+```
+
+Each fold learns only from earlier trades that closed before its start, with an extra one-hour embargo. The selected rule stays frozen throughout that test fold. Later P&L is used only to score the frozen selection; trades whose outcomes cross the scoring cutoff are counted as unscored. Never randomize time order or use a later exchange price to populate an entry-time feature. Legacy reconstructed trades are historical diagnostics, not a full execution backtest or independent prospective evidence. Resolve missing data and retain the next unseen period for confirmation. This tool writes no model to the running bot.
