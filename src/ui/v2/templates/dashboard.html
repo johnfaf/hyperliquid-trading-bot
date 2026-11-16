@@ -1,107 +1,121 @@
 {% extends "base.html" %}
+{% from "partials/desk_macros.html" import icon, badge, money, job %}
 {% block content %}
-<section class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
-  <div class="bg-slate-900 border border-slate-800 rounded-lg p-4">
-    <h2 class="text-sm uppercase tracking-wide text-slate-400">Overview</h2>
-    <p class="mt-2 text-slate-300 text-sm">
-      Welcome to the v2 dashboard. The Calibration tab is the first concrete page;
-      Positions, Traders, and Audit pages will land next.
-    </p>
-  </div>
-  <div class="bg-slate-900 border border-slate-800 rounded-lg p-4">
-    <h2 class="text-sm uppercase tracking-wide text-slate-400">Live link</h2>
-    <p class="mt-2 text-slate-300 text-sm">
-      WebSocket status appears in the header. Sections marked
-      <code class="text-emerald-300">data-ws-refresh-on</code> auto-refresh on
-      cycle events without polling.
-    </p>
-  </div>
-  <div class="bg-slate-900 border border-slate-800 rounded-lg p-4">
-    <h2 class="text-sm uppercase tracking-wide text-slate-400">Pages</h2>
-    <ul class="mt-2 space-y-1 text-sm">
-      <li><a href="/positions" class="text-emerald-400 hover:underline">→ Positions &amp; kill-switch</a></li>
-      <li><a href="/sources" class="text-emerald-400 hover:underline">→ Source scoreboard</a></li>
-      <li><a href="/calibration" class="text-emerald-400 hover:underline">→ Calibration breakdown</a></li>
-      <li><a href="/traders" class="text-emerald-400 hover:underline">→ Traders directory</a></li>
-      <li><a href="/audit" class="text-emerald-400 hover:underline">→ Audit trail</a></li>
-      <li><a href="/backtest" class="text-emerald-400 hover:underline">→ Backtest runner</a></li>
-    </ul>
-  </div>
-</section>
-
-<section class="bg-slate-900 border border-slate-800 rounded-lg p-4">
-  <div class="flex items-center justify-between mb-3">
+{% set paper = desk.paper %}
+{% set jobs = desk.host.get("jobs", {}) %}
+<div class="desk-content">
+  <header class="desk-pagehead">
     <div>
-      <h2 class="text-sm uppercase tracking-wide text-slate-400">WS event log</h2>
-      <p class="mt-1 text-xs text-slate-500">Live tail of dashboard bus events plus the recent replay buffer.</p>
+      <div class="desk-kicker">{{ icon("activity", 15) }} Trading desk</div>
+      <h1>Overview</h1>
+      <p class="desk-muted">Crypto and US equities</p>
     </div>
-    <span id="event-log-count" class="text-[10px] text-slate-500">loading...</span>
+    <div class="desk-actions">
+      <time datetime="{{ desk.updated.isoformat() }}">As of {{ desk.updated.strftime("%H:%M UTC") }}</time>
+      <a class="desk-icon-btn" href="/?hours={{ desk.hours }}" aria-label="Refresh overview" title="Refresh overview">{{ icon("refresh") }}</a>
+    </div>
+  </header>
+
+  <section class="desk-venue-strip" aria-label="Trading environments">
+    <div class="desk-venue">
+      <span class="desk-venue-icon crypto-icon">{{ icon("layers", 21) }}</span>
+      <div><b>Hyperliquid</b><span>Crypto</span></div>
+      {{ badge("Paper mode" if desk.crypto.paper_only else "Review live configuration", "good" if desk.crypto.paper_only else "warn") }}
+    </div>
+    <div class="desk-venue">
+      <span class="desk-venue-icon stock-icon">{{ icon("chart", 21) }}</span>
+      <div><b>Alpaca</b><span>US equities · Paper only</span></div>
+      {{ badge(*desk.stock_status) }}
+    </div>
+  </section>
+
+  <section class="desk-kpis" aria-label="Crypto paper performance">
+    <div><span>Paper cash</span><strong>{{ money(paper.cash) }}</strong><small>Hyperliquid simulator</small></div>
+    <div><span>Realized net P&amp;L</span><strong class="{{ 'tone-text-bad' if paper.net is not none and paper.net < 0 else 'tone-text-good' if paper.net else '' }}">{{ money(paper.net, true) }}</strong><small>{{ desk.hours // 24 }}-day window · eligible closes</small></div>
+    <div><span>Open positions</span><strong>{{ paper.open if paper.open is not none else "Unavailable" }}</strong><small>Simulated positions</small></div>
+    <div><span>Win rate</span><strong>{{ "{:.1f}%".format(paper.win_rate) if paper.win_rate is not none else "Unavailable" }}</strong><small>{{ paper.closed_count if paper.closed_count is not none else "No verified count for" }} closed trades</small></div>
+  </section>
+
+  <div class="desk-grid">
+    <section class="desk-panel performance">
+      <div class="desk-panel-heading">
+        <div><h2>Paper performance</h2><p>Cumulative realized P&amp;L by close</p></div>
+        <div class="desk-segments" aria-label="Performance time window">
+          <a href="/?hours=24"{% if desk.hours == 24 %} aria-current="true"{% endif %}>24h</a>
+          <a href="/?hours=168"{% if desk.hours == 168 %} aria-current="true"{% endif %}>7d</a>
+        </div>
+      </div>
+      {% if paper.chart %}
+        <div class="desk-chart {{ 'chart-loss' if paper.net < 0 else 'chart-win' }}">
+          <svg viewBox="-6 0 612 170" preserveAspectRatio="none" role="img" aria-label="Cumulative simulated P and L by close">
+            <path class="chart-grid" d="M0 18H600M0 52H600M0 86H600M0 120H600M0 154H600"/>
+            <polygon class="chart-fill" points="{{ paper.chart.fill }}"/>
+            <line class="chart-zero" x1="0" x2="600" y1="{{ paper.chart.zero }}" y2="{{ paper.chart.zero }}"/>
+            <polyline class="chart-line" points="{{ paper.chart.points }}" vector-effect="non-scaling-stroke"/>
+            <circle class="chart-dot" cx="600" cy="{{ paper.chart.last_y }}" r="4"/>
+          </svg>
+          <div class="desk-chart-axis"><span>Window start</span><span><i></i> Zero P&amp;L</span><span>Latest close</span></div>
+        </div>
+      {% else %}
+        <div class="desk-empty">{{ icon("chart", 24) }}
+          <p>{{ "No eligible paper closes in this window." if paper.complete_window else "Performance unavailable for this window." }}</p>
+        </div>
+      {% endif %}
+      {% if paper.decisions and paper.decisions.total %}
+      <div class="desk-decision-strip">
+        <div><span>Decisions recorded</span><b>{{ paper.decisions.total }}</b></div>
+        <div><span>Filtered</span><b>{{ paper.decisions.rejected }}</b></div>
+        <div><span>Linked to a paper trade</span><b>{{ paper.decisions.linked }}</b></div>
+      </div>
+      {% else %}
+      <div class="desk-decision-empty">Decision counts unmeasured in this window</div>
+      {% endif %}
+    </section>
+
+    <section class="desk-panel operations">
+      <div class="desk-panel-heading"><div><h2>Operations</h2><p>Execution and scheduled jobs</p></div>
+        <a href="/settings" class="desk-icon-btn" title="View settings" aria-label="View settings">{{ icon("sliders") }}</a>
+      </div>
+      <ul class="desk-jobs">
+        <li class="desk-job"><div><strong>Live execution</strong><span>{{ "No live signer" if not desk.crypto.signer else "Signer available" }}</span></div>
+          {{ badge("Off", "good") if desk.crypto.paper_only else badge("Review", "warn") }}
+        </li>
+        <li class="desk-job"><div><strong>Order recovery</strong><span>Unconfirmed submissions</span></div>
+          {% if desk.crypto.unresolved is not none %}{{ badge(desk.crypto.unresolved|string, "bad" if desk.crypto.unresolved else "good") }}
+          {% else %}{{ badge("Standby" if desk.crypto.paper_only else "Unverified") }}{% endif %}
+        </li>
+        {{ job("Daily pilot report", jobs.get("pilot_report"), desk.host.get("pilot_report") or "") }}
+        {% set coverage = desk.host.get("coverage") %}
+        {{ job("BTC exit scorecard", jobs.get("exit_scorecard"), "{:.2f}% usable since capture".format(coverage.percent) if coverage else "") }}
+        {{ job("Encrypted study backup", jobs.get("study_backup")) }}
+      </ul>
+    </section>
   </div>
-  <div id="event-log" class="space-y-1 max-h-96 overflow-y-auto text-xs font-mono"></div>
-</section>
 
-<script>
-  (function () {
-    const list = document.getElementById('event-log');
-    const count = document.getElementById('event-log-count');
-    const maxRows = 120;
-    const rows = [];
-
-    function fmtTs(ts) {
-      if (!ts) return '--:--:--';
-      try { return new Date(ts * 1000).toISOString().slice(11, 19); }
-      catch { return '--:--:--'; }
-    }
-    function esc(value) {
-      return String(value ?? '').replace(/[&<>"']/g, (ch) => ({
-        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
-      }[ch]));
-    }
-
-    function render() {
-      if (!list) return;
-      const html = rows.slice(-maxRows).reverse().map((ev) => {
-        const payload = Object.assign({}, ev);
-        delete payload.kind;
-        delete payload.ts;
-        const rendered = JSON.stringify(payload);
-        const safeRendered = esc(rendered);
-        const tone = ev.kind === 'kill_switch' ? 'text-rose-300'
-          : ev.kind === 'calibration' ? 'text-amber-300'
-          : ev.kind === 'cycle' ? 'text-emerald-300'
-          : 'text-slate-300';
-        return `
-          <div class="grid grid-cols-[4rem_8rem_1fr] gap-2 py-1 border-b border-slate-800/60">
-            <span class="text-slate-500">${fmtTs(ev.ts)}</span>
-            <span class="${tone}">${esc(ev.kind || 'unknown')}</span>
-            <span class="text-slate-400 truncate" title="${safeRendered}">${safeRendered}</span>
-          </div>`;
-      }).join('');
-      list.innerHTML = html || '<div class="py-6 text-center text-slate-500">No events yet.</div>';
-      if (count) count.textContent = `${rows.length} buffered`;
-    }
-
-    function addEvent(ev) {
-      if (!ev || !ev.kind || ev.kind === 'heartbeat' || ev.kind === 'hello') return;
-      rows.push(ev);
-      while (rows.length > maxRows) rows.shift();
-      render();
-    }
-
-    async function loadRecent() {
-      try {
-        const resp = await fetch('/api/events/recent?limit=120');
-        if (!resp.ok) return;
-        const data = await resp.json();
-        rows.splice(0, rows.length, ...(data.events || []));
-        render();
-      } catch (e) {
-        if (count) count.textContent = 'event replay unavailable';
-      }
-    }
-
-    window.addEventListener('ws-event', (ev) => addEvent(ev.detail));
-    loadRecent();
-  })();
-</script>
+  <section class="desk-panel desk-trades">
+    <div class="desk-panel-heading">
+      <div><h2>Recent paper closes</h2><p>Hyperliquid · sorted newest first</p></div>
+      <a href="/positions" class="desk-text-link">Positions {{ icon("arrow", 15) }}</a>
+    </div>
+    {% if paper.recent %}
+      <div class="desk-table-scroll" tabindex="0" aria-label="Scrollable paper trades">
+        <table class="desk-table">
+          <thead><tr><th scope="col">Asset</th><th scope="col">Side</th><th scope="col">Strategy</th><th scope="col">Exit reason</th><th scope="col">Closed (UTC)</th><th scope="col">Net P&amp;L</th></tr></thead>
+          <tbody>
+          {% for trade in paper.recent %}
+            <tr>
+              <th scope="row">{{ trade.coin }}</th><td>{{ trade.side|capitalize }}</td>
+              <td>{{ trade.source|string|replace("_", " ") }}</td><td>{{ trade.reason|string|replace("_", " ") }}</td>
+              <td>{{ trade.timestamp[:16]|replace("T", " ") }}</td>
+              <td class="{{ 'tone-text-bad' if trade.pnl < 0 else 'tone-text-good' if trade.pnl > 0 else '' }}">{{ money(trade.pnl, true) }}</td>
+            </tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    {% else %}
+      <div class="desk-empty compact">{{ icon("file", 22) }}<p>No recorded paper closes.</p></div>
+    {% endif %}
+  </section>
+</div>
 {% endblock %}

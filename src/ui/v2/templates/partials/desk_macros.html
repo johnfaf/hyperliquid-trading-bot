@@ -1,0 +1,38 @@
+{% macro icon(name, size=17) -%}
+<svg width="{{ size }}" height="{{ size }}" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+     stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+{% if name == "layout" %}<rect width="7" height="9" x="3" y="3" rx="1"/><rect width="7" height="5" x="14" y="3" rx="1"/><rect width="7" height="9" x="14" y="12" rx="1"/><rect width="7" height="5" x="3" y="16" rx="1"/>
+{% elif name == "layers" %}<path d="M12 2 2 7l10 5 10-5-10-5Z"/><path d="m2 12 10 5 10-5M2 17l10 5 10-5"/>
+{% elif name == "sliders" %}<path d="M4 21v-7m0-4V3m8 18v-9m0-4V3m8 18v-5m0-4V3M2 14h4m4-6h4m4 8h4"/>
+{% elif name == "chart" %}<path d="M3 3v18h18M7 14l4-4 4 4 6-7"/>
+{% elif name == "shield" %}<path d="M12 22s7-3.5 7-9V5l-7-3-7 3v8c0 5.5 7 9 7 9Z"/><path d="m9 12 2 2 4-4"/>
+{% elif name == "activity" %}<path d="M3 12h4l3-8 4 16 3-8h4"/>
+{% elif name == "users" %}<path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2m20 0v-2a4 4 0 0 0-3-4"/><circle cx="9" cy="7" r="4"/><path d="M17 3a4 4 0 0 1 0 8"/>
+{% elif name == "file" %}<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8Z"/><path d="M14 2v6h6M8 13h8m-8 4h8"/>
+{% elif name == "arrow" %}<path d="M5 12h14m-7-7 7 7-7 7"/>
+{% elif name == "refresh" %}<path d="M20 7v5h-5M4 17v-5h5"/><path d="M6 8a7 7 0 0 1 11-2l3 6M4 12l3 6a7 7 0 0 0 11-2"/>
+{% elif name == "exit" %}<path d="M10 17l5-5-5-5m5 5H3m9-9h7a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-7"/>
+{% elif name == "sun" %}<circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.93 4.93l1.42 1.42m11.3 11.3 1.42 1.42M2 12h2m16 0h2M4.93 19.07l1.42-1.42m11.3-11.3 1.42-1.42"/>
+{% elif name == "lock" %}<rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/>
+{% endif %}
+</svg>
+{%- endmacro %}
+
+{% macro badge(label, tone="neutral") -%}
+<span class="desk-badge tone-{{ tone }}"><i></i>{{ label }}</span>
+{%- endmacro %}
+
+{% macro money(amount, signed=false) -%}
+{% if amount is none %}<span class="desk-muted">Unavailable</span>{% else %}{% if amount < 0 %}-{% elif signed and amount > 0 %}+{% endif %}${{ "{:,.2f}".format(amount|abs) }}{% endif %}
+{%- endmacro %}
+
+{% macro job(name, row, detail="") -%}
+<li class="desk-job">
+  <div><strong>{{ name }}</strong>{% if detail %}<span>{{ detail }}</span>{% endif %}</div>
+  {% if not row %}{{ badge("Unverified") }}
+  {% elif row.result not in [none, "success"] %}{{ badge("Failed", "bad") }}
+  {% elif not row.timer_active %}{{ badge("Schedule off", "warn") }}
+  {% elif row.last_run and row.result == "success" %}{{ badge("Passed", "good") }}
+  {% else %}{{ badge("Scheduled") }}{% endif %}
+</li>
+{%- endmacro %}

@@ -10,8 +10,9 @@ env_file=/etc/hyperliquid-bot/paper/compose.env
 paper_data=/srv/hyperliquid-bot/paper
 tag="hyperliquid-bot:paper-$rev"
 runtime="hyperliquid-bot:vps"
-compose=(sudo -n docker compose --project-directory "$previous" --env-file "$env_file"
+base_compose=(sudo -n docker compose --project-directory "$previous" --env-file "$env_file"
     -f "$previous/compose.vps.yaml" -f "$previous/compose.vps.postgres.yaml")
+compose=("${base_compose[@]}" -f "$release/deploy/dashboard/hyperliquid-dashboard.compose.yml")
 
 verify_paper() {
     sudo -n docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' hyperliquid-bot |
@@ -46,7 +47,7 @@ install -D -m 0644 "$previous/deploy/vps/launch.py" "$release/deploy/vps/launch.
 install -m 0644 "$previous/src/notifications/telegram_bot.py" "$release/src/notifications/telegram_bot.py"
 sudo -n docker build --build-arg RUN_AS_USER=bot --label "org.opencontainers.image.revision=$rev" -t "$tag" "$release"
 sudo -n docker run --rm --network=none --entrypoint python "$tag" -B -c \
-    'from src.trading.order_journal import OrderJournal; from src.trading.live_trader import LiveTrader; from scripts.run_stock_paper import AlpacaPaper'
+    'from src.trading.order_journal import OrderJournal; from src.trading.live_trader import LiveTrader; from scripts.run_stock_paper import AlpacaPaper; from src.ui.v2.app import create_app; create_app()'
 
 sudo -n install -d -m 0700 /srv/hyperliquid-bot/rollbacks
 sudo -n python3 - "$paper_data/bot.db" "/srv/hyperliquid-bot/rollbacks/bot-pre-$rev.db" <<'PY'
@@ -67,11 +68,16 @@ if not dest.exists():
     temporary.replace(dest)
 PY
 old_id=$(sudo -n docker inspect --format '{{.Image}}' hyperliquid-bot)
+rollback_compose=("${base_compose[@]}")
+if sudo -n docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' hyperliquid-bot |
+    grep -Fx 'DASHBOARD_V2_PRIMARY=true' >/dev/null; then
+    rollback_compose=("${compose[@]}")
+fi
 sudo -n docker tag "$old_id" "hyperliquid-bot:pre-$rev"
 rollback() {
     printf '%s\n' "Rollout failed; restoring previous image (no database restore attempted)." >&2
     sudo -n docker tag "$old_id" "$runtime"
-    "${compose[@]}" up -d --no-build --no-deps --force-recreate bot
+    "${rollback_compose[@]}" up -d --no-build --no-deps --force-recreate bot
 }
 sudo -n docker tag "$tag" "$runtime"
 if ! "${compose[@]}" up -d --no-build --no-deps --force-recreate bot; then
@@ -82,7 +88,8 @@ ready=false
 deadline=$((SECONDS + 180))
 while (( SECONDS < deadline )); do
     if [[ $(sudo -n docker inspect --format '{{.State.Health.Status}}' hyperliquid-bot) == healthy ]]; then
-        if verify_paper; then
+        if verify_paper && curl -s --max-time 4 -D - -o /dev/null http://127.0.0.1:8080/settings |
+            grep -qi '^location: /login'; then
             ready=true
             break
         fi
@@ -116,4 +123,12 @@ done
 sudo -n systemctl daemon-reload
 sudo -n systemctl enable --now hyperliquid-stock-paper.timer
 sudo -n systemctl start hyperliquid-stock-paper.service
+
+sudo -n install -D -m 0644 "$release/scripts/publish_dashboard_status.py" /opt/hyperliquid-dashboard/publish_dashboard_status.py
+for unit in hyperliquid-dashboard-status.service hyperliquid-dashboard-status.timer; do
+    sudo -n install -m 0644 "$release/deploy/dashboard/$unit" "/etc/systemd/system/$unit"
+done
+sudo -n systemctl daemon-reload
+sudo -n systemctl enable --now hyperliquid-dashboard-status.timer
+sudo -n systemctl start hyperliquid-dashboard-status.service
 printf '%s\n' "Verified VPS paper release $rev"

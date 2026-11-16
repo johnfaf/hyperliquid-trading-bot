@@ -1,0 +1,12 @@
+[Unit]
+Description=Publish read-only dashboard operations status
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -I -B /opt/hyperliquid-dashboard/publish_dashboard_status.py --study /srv/hyperliquid-audit-pilot --output /srv/hyperliquid-bot/paper/dashboard_ops.json
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/srv/hyperliquid-bot/paper
+TimeoutStartSec=55

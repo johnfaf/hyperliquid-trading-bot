@@ -7,6 +7,14 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from src.trading.order_journal import Fill
 
+DEFAULT_SYMBOL = "SPY"
+STRATEGY_ID = "equity_daily_sma20_v1"
+REFERENCE_BALANCE_USD = 1000
+MAX_ENTRY_USD = Decimal(75)
+DAILY_LOSS_USD = Decimal(10)
+MAX_QUOTE_AGE_SECONDS = 30
+MAX_QUOTE_SPREAD_FRACTION = Decimal("0.005")
+
 
 class NoRedirects(HTTPRedirectHandler):
     def redirect_request(self, *args, **kwargs):

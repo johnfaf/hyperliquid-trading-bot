@@ -1025,6 +1025,7 @@ def build_subsystems(
         logger.warning("  FAIL websocket_feed - %s (REST fallback active)", exc)
 
     # ─── Dashboard ────────────────────────────────────────────
+    dashboard_v2_primary = os.environ.get("DASHBOARD_V2_PRIMARY", "").strip().lower() in ("1", "true", "yes", "on")
     if "dashboard" in profile:
         try:
             from src.ui.dashboard import start_dashboard, set_v2_components, set_live_trader
@@ -1054,7 +1055,10 @@ def build_subsystems(
             )
             if execution_trader:
                 set_live_trader(execution_trader)
-            c.dashboard = start_dashboard(options_scanner=c.options_scanner)
+            c.dashboard = start_dashboard(
+                port=int(os.environ.get("DASHBOARD_LEGACY_PORT", "8082")) if dashboard_v2_primary else None,
+                options_scanner=c.options_scanner,
+            )
             logger.info("  OK dashboard")
         except Exception as exc:
             logger.warning("  FAIL dashboard - %s", exc)
@@ -1063,7 +1067,7 @@ def build_subsystems(
     # Opt-in. Coexists with v1 on a separate port so operators can
     # try it without losing the existing UI. Failures here never
     # affect trading.
-    if os.environ.get("DASHBOARD_V2_ENABLED", "").strip().lower() in ("1", "true", "yes", "on"):
+    if dashboard_v2_primary or os.environ.get("DASHBOARD_V2_ENABLED", "").strip().lower() in ("1", "true", "yes", "on"):
         try:
             from src.ui.v2 import set_components as _set_v2_components
             from src.ui.v2 import start_server as _start_v2_server
@@ -1088,7 +1092,12 @@ def build_subsystems(
                 live_trader=c.live_trader,
                 health_registry=health,
             )
-            c.dashboard_v2 = _start_v2_server()
+            if dashboard_v2_primary:
+                c.dashboard_v2 = _start_v2_server(
+                    port=int(os.environ.get("PORT", "8080")), host=os.environ.get("DASHBOARD_HOST", "127.0.0.1"),
+                )
+            else:
+                c.dashboard_v2 = _start_v2_server()
             logger.info("  OK dashboard_v2")
         except Exception as exc:
             logger.warning("  FAIL dashboard_v2 - %s", exc)

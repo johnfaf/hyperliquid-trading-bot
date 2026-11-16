@@ -79,3 +79,10 @@ takes a checked SQLite backup, verifies paper-only health and rolls back the
 image on a failed startup. It then refreshes the paper report jobs and stock
 timer without provisioning keys. Do not use this procedure to arm live
 trading.
+
+The private dashboard tunnel still targets VPS port `8080`. The refreshed
+Overview shows paper performance, decisions and service status; Settings
+shows effective risk settings and stock-paper readiness. Settings are
+read-only and never display signing keys. The legacy dashboard, including its
+options and stress views, is retained on VPS loopback port `8082` for a
+separate administrative SSH tunnel. Neither dashboard port is public.

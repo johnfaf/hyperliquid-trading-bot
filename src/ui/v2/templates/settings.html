@@ -1,0 +1,56 @@
+{% extends "base.html" %}
+{% from "partials/desk_macros.html" import icon, badge, money, job %}
+{% block content %}
+{% set s = desk.settings %}
+{% set jobs = desk.host.get("jobs", {}) %}
+<div class="desk-content">
+  <header class="desk-pagehead">
+    <div><div class="desk-kicker">{{ icon("sliders", 15) }} Trading desk</div><h1>Settings</h1><p class="desk-muted">Venue configuration and safeguards</p></div>
+    <div class="desk-actions">{{ badge("Read only") }}
+      <a href="/settings" class="desk-icon-btn" title="Refresh settings" aria-label="Refresh settings">{{ icon("refresh") }}</a>
+    </div>
+  </header>
+  <div class="desk-grid desk-settings-grid">
+    <section class="desk-panel">
+      <div class="desk-panel-heading"><div><h2>Hyperliquid</h2><p>Crypto execution</p></div>
+        {{ badge("Paper mode", "good") if desk.crypto.paper_only else badge("Review live configuration", "warn") }}</div>
+      <dl class="desk-settings-list">
+        <div><dt>Starting paper balance</dt><dd>{{ money(s.paper_start_usd) }}</dd></div>
+        <div><dt>Planned loss cap per paper trade</dt><dd>{{ "{:.2f}%".format(s.paper_risk_pct) if s.paper_risk_pct else "Off" }}</dd></div>
+        <div><dt>Live trading requested</dt><dd>{{ "Yes" if desk.crypto.requested else "No" }}</dd></div>
+        <div><dt>Live signer</dt><dd>{{ "Available" if desk.crypto.signer else "Not loaded" }}</dd></div>
+        <div><dt>Live kill switch</dt><dd>{{ "Standby" if desk.crypto.paper_only else "Paused" if desk.crypto.paused else "Not active" }}</dd></div>
+        <div><dt>Unconfirmed submissions</dt><dd>{{ desk.crypto.unresolved if desk.crypto.unresolved is not none else "Not measured" }}</dd></div>
+        <div><dt>Live maximum order</dt><dd>{{ money(s.live_max_order_usd) }}</dd></div>
+        <div><dt>Live daily loss limit</dt><dd>{{ money(s.live_daily_limit_usd) }}</dd></div>
+      </dl>
+    </section>
+
+    <section class="desk-panel">
+      <div class="desk-panel-heading"><div><h2>Alpaca</h2><p>US equities · Paper only</p></div>{{ badge(*desk.stock_status) }}</div>
+      <dl class="desk-settings-list">
+        <div><dt>Submission mode</dt><dd>{{ {"paper": "Paper orders", "shadow": "Shadow", "paper_only": "Waiting for setup"}.get(desk.stock_mode, "Unverified") }}</dd></div>
+        <div><dt>Strategy</dt><dd>Daily SMA20 crossover</dd></div>
+        <div><dt>Pilot symbol</dt><dd>{{ s.stock_symbol }}</dd></div>
+        <div><dt>Reference paper balance</dt><dd>{{ money(s.stock_reference_usd) }}</dd></div>
+        <div><dt>Maximum entry</dt><dd>{{ money(s.stock_max_order_usd) }}</dd></div>
+        <div><dt>Daily drawdown trigger</dt><dd>{{ money(s.stock_daily_limit_usd) }}</dd></div>
+        <div><dt>Order scope</dt><dd>Long only · regular session</dd></div>
+        <div><dt>Concurrent positions</dt><dd>1 per pilot</dd></div>
+        <div><dt>Maximum quote age</dt><dd>{{ s.stock_max_quote_age }} seconds</dd></div>
+        <div><dt>Maximum quote spread</dt><dd>{{ "{:.2f}%".format(s.stock_max_quote_spread_pct) }}</dd></div>
+        <div><dt>Cycle schedule</dt><dd>{{ "Every 5 minutes" if jobs.get("stock", {}).get("timer_active") else "Unverified" }}</dd></div>
+        <div><dt>Last observed cycle</dt><dd>{% if desk.stock_last_run %}<time datetime="{{ desk.stock_last_run.isoformat() }}">{{ desk.stock_last_run.strftime("%d %b, %H:%M UTC") }}</time>{% else %}Unavailable{% endif %}</dd></div>
+      </dl>
+    </section>
+  </div>
+  <section class="desk-panel settings-jobs">
+    <div class="desk-panel-heading"><div><h2>Scheduled jobs</h2><p>UTC</p></div></div>
+    <ul class="desk-jobs">
+      {{ job("Daily pilot report", jobs.get("pilot_report"), "00:10 daily") }}
+      {{ job("BTC exit scorecard", jobs.get("exit_scorecard"), "00:20 daily") }}
+      {{ job("Encrypted study backup", jobs.get("study_backup"), "00:40 daily") }}
+    </ul>
+  </section>
+</div>
+{% endblock %}

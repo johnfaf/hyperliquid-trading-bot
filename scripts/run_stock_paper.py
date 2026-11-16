@@ -14,11 +14,13 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.trading.alpaca_paper import AlpacaPaper
+from src.trading.alpaca_paper import (
+    AlpacaPaper, DAILY_LOSS_USD, DEFAULT_SYMBOL, MAX_ENTRY_USD,
+    MAX_QUOTE_AGE_SECONDS, MAX_QUOTE_SPREAD_FRACTION, STRATEGY_ID,
+)
 from src.trading.order_journal import OrderJournal, client_id
 
 NY = ZoneInfo("America/New_York")
-STRATEGY = "equity_daily_sma20_v1"
 ACTIVE = {"submitting", "unknown", "accepted", "partial"}
 
 
@@ -138,24 +140,26 @@ def tick(broker, journal, *, symbol, orders_enabled=False, flatten=False):
         return {"state": "not_enough_completed_bars"}
     equity = positive(account["equity"])
     delta = equity - positive(account["last_equity"])
+    entry_paused = bool(journal.pause_reason())
     if qty:
-        side = "sell" if flatten or (signals and signals[1]) or delta <= -10 else None
+        side = "sell" if flatten or (signals and signals[1]) or delta <= -DAILY_LOSS_USD else None
     else:
-        side = "buy" if not flatten and not journal.pause_reason() and signals and signals[0] and delta > -10 else None
-    report = {"state": "no_order", "session": today, "symbol": symbol, "quantity": str(qty),
+        side = "buy" if not flatten and not entry_paused and signals and signals[0] and delta > -DAILY_LOSS_USD else None
+    status = "entries_paused" if entry_paused else "daily_limit_reached" if delta <= -DAILY_LOSS_USD else "no_order"
+    report = {"state": status, "session": today, "symbol": symbol, "quantity": str(qty),
               "account_equity": str(equity), "account_daily_change": str(delta), "mode": "paper" if orders_enabled else "shadow"}
     if not side:
         return report
     row = broker.request(f"/v2/stocks/{symbol}/quotes/latest", market_data=True, query={"feed": "iex"})["quote"]
     bid, ask = positive(row["bp"]), positive(row["ap"])
     quote_age = (now - timestamp(row["t"])).total_seconds()
-    if not -10 <= quote_age <= 30 or ask < bid or (ask - bid) / bid > Decimal("0.005"):
+    if not -10 <= quote_age <= MAX_QUOTE_AGE_SECONDS or ask < bid or (ask - bid) / bid > MAX_QUOTE_SPREAD_FRACTION:
         return {**report, "state": "quote_not_usable"}
     price = (ask if side == "buy" else bid).quantize(Decimal("0.01"), rounding=ROUND_UP if side == "buy" else ROUND_DOWN)
     if price <= 0:
         return {**report, "state": "invalid_limit_price"}
     if side == "buy":
-        cash = min(Decimal(account["cash"]), Decimal(account["buying_power"]), Decimal(75))
+        cash = min(Decimal(account["cash"]), Decimal(account["buying_power"]), MAX_ENTRY_USD)
         if not cash.is_finite() or cash < 1:
             return {**report, "state": "insufficient_cash"}
         qty = (cash / price).quantize(Decimal("0.000001"), rounding=ROUND_DOWN)
@@ -163,7 +167,7 @@ def tick(broker, journal, *, symbol, orders_enabled=False, flatten=False):
             return {**report, "state": "order_below_minimum"}
     intent = {"symbol": symbol, "side": side, "qty": str(qty), "limit_price": str(price),
               "type": "limit", "time_in_force": "day", "extended_hours": False,
-              "client_order_id": client_id(STRATEGY, today, symbol, side, "flatten" if flatten else "routine")}
+              "client_order_id": client_id(STRATEGY_ID, today, symbol, side, "flatten" if flatten else "routine")}
     if not orders_enabled:
         return {**report, "state": "shadow_intent", "intent": intent}
     if any(order["client_id"] == intent["client_order_id"] for order in journal.orders()):
@@ -174,7 +178,7 @@ def tick(broker, journal, *, symbol, orders_enabled=False, flatten=False):
 def main():
     parser = ArgumentParser(description=__doc__)
     parser.add_argument("--db", type=Path, required=True)
-    parser.add_argument("--symbol", default="SPY")
+    parser.add_argument("--symbol", default=DEFAULT_SYMBOL)
     parser.add_argument("--action", choices=["cycle", "pause", "resume", "flatten"], default="cycle")
     args = parser.parse_args()
     if not re.fullmatch(r"[A-Z]{1,5}", args.symbol):
@@ -195,7 +199,7 @@ def main():
                 broker, journal, symbol=args.symbol, orders_enabled=os.getenv("STOCK_PAPER_SEND_ORDERS") == "true",
                 flatten=args.action == "flatten",
             )
-        print(json.dumps(result))
+        print(json.dumps({"mode": "paper" if os.getenv("STOCK_PAPER_SEND_ORDERS") == "true" else "shadow", **result}))
     except Exception as exc:
         # Exception messages from HTTP clients can contain deployment-sensitive details.
         print(json.dumps({"state": "cycle_failed", "error_type": type(exc).__name__}), file=sys.stderr)

@@ -47,11 +47,11 @@ def test_health_open_without_auth(client):
 def test_index_serves_dashboard_when_no_token_configured(client):
     r = client.get("/")
     assert r.status_code == 200
-    assert "Calibration breakdown" in r.text
+    assert "Paper performance" in r.text
     assert "/static/dashboard.css" in r.text
     assert "cdn.tailwindcss.com" not in r.text
     assert 'id="page-main"' in r.text
-    assert "hx-boost" in r.text
+    assert 'href="/settings"' in r.text
 
 
 def test_dashboard_responses_include_timing_header(client):
