@@ -6,7 +6,9 @@ from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+import sqlite3
 
+from src.backtest.history_archive import archived_ledger
 from src.data.decision_coverage import open_readonly
 from src.trading.copy_shadow_report import (
     EXTRA_COST_BPS, as_dict, clean_close, money, realized, stress_cost, study_peers,
@@ -41,13 +43,15 @@ def stamp(value):
     return dt.astimezone(timezone.utc)
 
 
-def load(path, start, end):
+def load(path, start, end, *, session=None):
     with closing(open_readonly(path)) as db:
-        rows = db.execute("""
-            SELECT id,opened_at,closed_at,coin,side,status,pnl,entry_price,size,metadata FROM paper_trades
-            WHERE opened_at<? AND (closed_at IS NULL OR closed_at>=?)
+        db.execute("BEGIN")
+        table, scope, params = archived_ledger(db, session)
+        rows = db.execute(f"""
+            SELECT id,opened_at,closed_at,coin,side,status,pnl,entry_price,size,metadata FROM {table}
+            WHERE {scope}opened_at<? AND (closed_at IS NULL OR closed_at>=?)
             ORDER BY opened_at,id LIMIT ?
-        """, (end.isoformat(), start.isoformat(), MAX_ROWS + 1)).fetchall()
+        """, (*params, end.isoformat(), start.isoformat(), MAX_ROWS + 1)).fetchall()
     if len(rows) > MAX_ROWS:
         raise ValueError("ledger exceeds bounded replay size; choose a shorter date range")
     return rows
@@ -162,6 +166,7 @@ def render(folds, start):
 def main():
     parser = ArgumentParser(description=__doc__)
     parser.add_argument("--db", type=Path, required=True)
+    parser.add_argument("--session", help="Named paper session when reading a historical archive")
     parser.add_argument("--start", type=stamp, required=True)
     parser.add_argument("--test-start", type=stamp, required=True, action="append", help="A chronological fold start; repeat at least twice")
     parser.add_argument("--end", type=stamp, required=True)
@@ -170,7 +175,12 @@ def main():
     if (len(args.test_start) < 2 or any(a >= b for a, b in zip(bounds, bounds[1:]))
             or args.end > datetime.now(timezone.utc) or args.end - args.start > timedelta(days=90)):
         parser.error("use at least two strictly increasing fold starts in a past window of at most 90 days")
-    entries, labels = point_in_time(load(args.db, args.start, args.end))
+    try:
+        entries, labels = point_in_time(load(args.db, args.start, args.end, session=args.session))
+    except (OSError, ValueError, sqlite3.Error) as exc:
+        parser.exit(2, f"Replay stopped: {exc}\n")
+    if args.session is not None:
+        print(f"Paper session: `{args.session}`\n")
     print(render(evaluate(entries, labels, args.start, args.test_start, args.end), args.start), end="")
 
 

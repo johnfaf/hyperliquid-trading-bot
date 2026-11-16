@@ -40,3 +40,24 @@ python -m scripts.run_copy_walk_forward --db /path/to/bot.db \
 ```
 
 Each fold learns only from earlier trades that closed before its start, with an extra one-hour embargo. The selected rule stays frozen throughout that test fold. Later P&L is used only to score the frozen selection; trades whose outcomes cross the scoring cutoff are counted as unscored. Never randomize time order or use a later exchange price to populate an entry-time feature. Legacy reconstructed trades are historical diagnostics, not a full execution backtest or independent prospective evidence. Resolve missing data and retain the next unseen period for confirmation. This tool writes no model to the running bot.
+
+## Import previous sessions
+
+Create a fresh research archive outside the repo. Use the input ledger's verified name or date as its session label. Backups of the same account often overlap; pick the newest complete snapshot for that account rather than adding results from its successive backups. Use a SQLite backup rather than copying a database file out from under a writer.
+
+```shell
+python -m scripts.import_trading_history --csv-dir /path/to/exports \
+  --ledger november=/path/to/backup/bot.db --out /private/history.sqlite3 --report /private/history-quality.md
+```
+
+The CSV adapter recognizes the eight-field Hyperliquid trade history export. It groups normalized row signatures, keeps every occurrence with its source row, and reports overlap rather than claiming exact duplicate signatures are proved duplicate fills. The timestamp in that export has no offset: omit `--csv-timezone` until the export timezone is confirmed. Even with a timezone, CSV fills cannot become copy decisions. Ambiguous daylight-saving timestamps retain their original time but no UTC mapping.
+
+An imported paper session uses offset-aware timestamps and a small, allowlisted subset of ledger fields. Invalid rows block replay because the missing position could affect exposure; tainted or unpriced closes are never scored, but their observed positions can still affect overlap before they close. The decision journal is counted for inventory only, not used as retroactively known features. No candidate, copied wallet, or trade explanation is invented from a fill. Archive and report paths must be new; keep the originals and resulting SQLite database private.
+
+```shell
+python -m scripts.run_copy_walk_forward --db /private/history.sqlite3 --session november \
+  --start 2026-11-14T00:00:00Z --test-start 2026-11-15T00:00:00Z \
+  --test-start 2026-11-16T00:00:00Z --end 2026-11-16T12:30:00Z
+```
+
+The runner requires an explicit session on an archive so a CSV-only import or the wrong account cannot silently become training data. Its date and embargo requirements still apply. On the VPS, the offline tooling can be run from `/opt/hyperliquid-history/current`; it does not need API keys or a service restart.
