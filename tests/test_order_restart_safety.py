@@ -192,3 +192,14 @@ def test_stock_shadow_caps_fractional_order_and_refuses_stale_quotes(tmp_path, m
     quote["t"] = (now - timedelta(minutes=5)).isoformat()
     assert stocks.tick(broker, journal, symbol="SPY", orders_enabled=True)["state"] == "quote_not_usable"
     assert not broker.posts
+
+    quote["t"] = now.isoformat()
+    evidence = SimpleNamespace(ready_shadow=lambda *_: False, drill_position=lambda _: Decimal(0))
+    assert stocks.tick(broker, journal, symbol="SPY", evidence=evidence, drill="buy")["state"] == "drill_entry_not_ready"
+    assert not broker.posts
+    evidence.ready_shadow = lambda *_: True
+    result = stocks.tick(broker, journal, symbol="SPY", evidence=evidence, drill="buy")
+    assert result["intent"]["qty"] == "0.100000"
+    assert result["state"] == "submission_unknown"
+    assert journal.orders()[0]["intent"]["_purpose"] == "drill"
+    assert broker.posts == 1

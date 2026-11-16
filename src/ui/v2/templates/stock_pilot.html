@@ -1,0 +1,92 @@
+{% extends "base.html" %}
+{% from "partials/desk_macros.html" import icon, badge, money, job %}
+{% block content %}
+{% set pilot = desk.host.get("stock_pilot") or {} %}
+{% set rows = pilot.get("decisions", []) %}
+{% set score = pilot.get("scorecard", {}) %}
+{% set drill = pilot.get("drill", {}) %}
+{% set jobs = desk.host.get("jobs", {}) %}
+<div class="desk-content">
+  <header class="desk-pagehead">
+    <div><div class="desk-kicker">{{ icon("chart", 15) }} US equities</div><h1>Stock Pilot</h1><p class="desk-muted">Alpaca · Paper only</p></div>
+    <div class="desk-actions">
+      {{ badge(*desk.stock_status) }}
+      <a href="/stock-pilot" class="desk-icon-btn" title="Refresh stock pilot" aria-label="Refresh stock pilot">{{ icon("refresh") }}</a>
+    </div>
+  </header>
+
+  <div class="desk-grid">
+    <section class="desk-panel">
+      <div class="desk-panel-heading">
+        <div><h2>Session scorecard</h2><p>{{ score.get("session") or "No recorded session" }} · Simulated USD per {{ money(score.get("basis_usd", 1000)) }}</p></div>
+        {{ badge("Measured" if score.get("strategy_move") is not none else "Unmeasured", "good" if score.get("strategy_move") is not none else "neutral") }}
+      </div>
+      <dl class="desk-settings-list">
+        <div><dt>Strategy change</dt><dd>{{ money(score.get("strategy_move"), true) }}</dd></div>
+        <div><dt>Cash change</dt><dd>{{ money(score.get("cash_move"), true) }}</dd></div>
+        <div><dt>Buy and hold (price only)</dt><dd>{{ money(score.get("hold_move"), true) }}</dd></div>
+        <div><dt>Fresh / checked quotes</dt><dd>{{ score.get("fresh_quotes", "—") }} / {{ score.get("quote_checks", "—") }}</dd></div>
+        <div><dt>Recorded cycles</dt><dd>{{ score.get("cycles", "—") }}</dd></div>
+        {% if score.get("first_mark") %}
+        <div><dt>Observed window (UTC)</dt><dd>{{ score.first_mark[11:16] }} to {{ score.last_mark[11:16] }}</dd></div>
+        {% endif %}
+      </dl>
+      <div class="desk-decision-empty">{{ score.get("state", "Waiting for stock evidence") }}</div>
+    </section>
+    <section class="desk-panel">
+      <div class="desk-panel-heading"><div><h2>Verification</h2><p>Orders and scheduled checks</p></div></div>
+      <ul class="desk-jobs">
+        <li class="desk-job"><div><strong>Stock worker</strong><span>{{ "Shadow mode" if desk.stock_mode == "shadow" else "Paper mode" if desk.stock_mode == "paper" else "Mode unverified" }}</span></div>{{ badge(*desk.stock_status) }}</li>
+        <li class="desk-job"><div><strong>Supervised round trip</strong><span>{{ drill.get("fills", 0) }} recorded fills · excluded from strategy P&amp;L</span></div>
+          {{ badge(drill.get("state", "Not run"), "good" if drill.get("state") == "Reconciled" else "warn" if drill.get("fills") else "neutral") }}
+        </li>
+        {% if drill.get("observed_cash_move") is not none %}
+        <li class="desk-job"><div><strong>Observed cash change</strong><span>Fill-based change {{ money(drill.fill_cash_move, true) }}</span></div>{{ money(drill.observed_cash_move, true) }}</li>
+        {% endif %}
+        {{ job("Daily stock scorecard", jobs.get("stock_report")) }}
+      </ul>
+    </section>
+  </div>
+
+  <section class="desk-panel desk-trades">
+    <div class="desk-panel-heading"><div><h2>Decision journal</h2><p>Most recent stock cycles</p></div></div>
+    {% if rows %}
+    <div class="desk-table-scroll" tabindex="0" aria-label="Scrollable stock decisions">
+      <table class="desk-table stock-table">
+        <thead><tr><th scope="col">UTC</th><th scope="col">Symbol</th><th scope="col">Decision</th><th scope="col">Result</th><th scope="col">Quote age</th><th scope="col">Order / proposal</th></tr></thead>
+        <tbody>
+          {% for row in rows %}
+          <tr>
+            <td>{{ row.observed_at[:16]|replace("T", " ") }}</td>
+            <th scope="row">{{ row.symbol }}</th>
+            <td>{{ {"buy":"Buy", "sell":"Sell", "no_signal":"No signal", "closed":"Session closed", "blocked":"Blocked"}.get(row.decision, row.decision) }}</td>
+            <td>{{ "No signal" if row.state == "no_order" else labels.get(row.state, (row.state|replace("_", " ")|capitalize, "neutral"))[0] }}</td>
+            <td>{% if row.quote_age is not none %}{{ "{:.0f}s".format(row.quote_age) }}{% else %}—{% endif %}</td>
+            <td>{% if row.status %}{{ row.status|replace("_", " ")|capitalize }} · {{ row.ref }}{% elif row.ref %}{{ "Shadow proposal" if row.mode == "shadow" and row.purpose == "strategy" else "No broker order recorded" }}{% else %}—{% endif %}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% else %}<div class="desk-empty compact">{{ icon("file", 22) }}<p>No stock decisions recorded yet.</p></div>{% endif %}
+  </section>
+
+  <section class="desk-panel desk-trades">
+    <div class="desk-panel-heading"><div><h2>Confirmed paper fills</h2><p>Alpaca execution records</p></div></div>
+    {% if pilot.get("fills") %}
+    <div class="desk-table-scroll" tabindex="0" aria-label="Scrollable stock fills">
+      <table class="desk-table stock-table">
+        <thead><tr><th scope="col">UTC</th><th scope="col">Symbol</th><th scope="col">Side</th><th scope="col">Shares</th><th scope="col">Fill price</th><th scope="col">Purpose / order</th></tr></thead>
+        <tbody>
+        {% for fill in pilot.fills %}
+          <tr><td>{{ fill.occurred_at[:16]|replace("T", " ") if fill.occurred_at else "Unverified" }}</td><th scope="row">{{ fill.symbol }}</th>
+            <td>{{ fill.side|capitalize }}</td><td>{{ fill.qty }}</td><td>${{ fill.price }}</td>
+            <td>{{ "Supervised test" if fill.purpose == "drill" else fill.purpose|capitalize }} · {{ fill.ref }}</td></tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% else %}<div class="desk-empty compact">{{ icon("layers", 22) }}<p>No confirmed stock paper fills.</p></div>{% endif %}
+  </section>
+</div>
+{% endblock %}

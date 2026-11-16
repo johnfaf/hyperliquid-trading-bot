@@ -16,6 +16,7 @@ class Fill:
     side: str
     quantity: Decimal
     price: Decimal
+    occurred_at: str | None = None
 
 
 def client_id(*parts: str) -> str:
@@ -42,6 +43,9 @@ class OrderJournal:
                     account TEXT PRIMARY KEY, reason TEXT NOT NULL
                 );
             """)
+            db.execute("BEGIN IMMEDIATE")
+            if "occurred_at" not in {r[1] for r in db.execute("PRAGMA table_info(fills)")}:
+                db.execute("ALTER TABLE fills ADD COLUMN occurred_at TEXT")
 
     @contextmanager
     def _connection(self):
@@ -50,9 +54,10 @@ class OrderJournal:
             db.execute("PRAGMA synchronous=FULL")
             yield db
 
-    def reserve(self, cid: str, intent: dict, *, entry: bool) -> bool:
+    def reserve(self, cid: str, intent: dict, *, entry: bool, purpose: str | None = None) -> bool:
         """Claim before network I/O. A previous claim is never permission to resend."""
-        encoded = json.dumps(intent, sort_keys=True, separators=(",", ":"))
+        stored = {**intent, "_purpose": purpose} if purpose else intent
+        encoded = json.dumps(stored, sort_keys=True, separators=(",", ":"))
         with self._connection() as db:
             db.execute("BEGIN IMMEDIATE")
             previous = db.execute(
@@ -130,14 +135,18 @@ class OrderJournal:
                     raise ValueError("invalid broker fill")
                 values = (fill.order_id, fill.symbol, fill.side, str(fill.quantity.normalize()), str(fill.price.normalize()))
                 prior = db.execute(
-                    "SELECT order_id,symbol,side,quantity,price FROM fills WHERE account=? AND fill_id=?",
+                    "SELECT order_id,symbol,side,quantity,price,occurred_at FROM fills WHERE account=? AND fill_id=?",
                     (self.account, fill.fill_id),
                 ).fetchone()
                 if prior:
-                    if tuple(prior) != values:
+                    if tuple(prior)[:5] != values:
                         raise ValueError("conflicting duplicate broker fill")
+                    if prior["occurred_at"] is None and fill.occurred_at:
+                        db.execute("UPDATE fills SET occurred_at=? WHERE account=? AND fill_id=?",
+                                   (fill.occurred_at, self.account, fill.fill_id))
                 else:
-                    db.execute("INSERT INTO fills VALUES (?, ?, ?, ?, ?, ?, ?)", (self.account, fill.fill_id, *values))
+                    db.execute("INSERT INTO fills VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                               (self.account, fill.fill_id, *values, fill.occurred_at))
                     added += 1
         return added
 

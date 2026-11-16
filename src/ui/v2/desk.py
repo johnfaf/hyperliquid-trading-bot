@@ -33,6 +33,10 @@ STOCK_LABELS = {
     "broker_trading_blocked": ("Broker paused", "bad"),
     "entries_paused": ("Entries paused", "warn"),
     "daily_limit_reached": ("Daily loss limit reached", "bad"),
+    "order_rejected": ("Paper order rejected", "bad"),
+    "drill_entry_not_ready": ("Waiting for fresh shadow evidence", "warn"),
+    "drill_position_unverified": ("Test position not verified", "warn"),
+    "drill_position_open": ("Supervised paper test open", "warn"),
 }
 
 
@@ -53,7 +57,7 @@ def _datestamp(raw):
 def host_status(path: Path, now: datetime) -> dict:
     try:
         with path.open(encoding="utf-8") as source:
-            data = json.loads(source.read(16384))
+            data = json.loads(source.read(65536))
         observed = _datestamp(data.get("observed_at"))
         if observed is None or not 0 <= (now - observed).total_seconds() <= 180:
             return {}

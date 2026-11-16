@@ -1,0 +1,15 @@
+[Unit]
+Description=Build the daily paper stock scorecard from the local ledger
+
+[Service]
+Type=oneshot
+StateDirectory=hyperliquid-stock-reports
+StateDirectoryMode=0700
+ExecStart=/usr/bin/python3 -I -B /opt/hyperliquid-stock-paper/current/scripts/stock_pilot_report.py --db /var/lib/hyperliquid-stock-paper/orders.sqlite3 --reports /var/lib/hyperliquid-stock-reports
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateNetwork=yes
+TimeoutStartSec=40
+UMask=0077

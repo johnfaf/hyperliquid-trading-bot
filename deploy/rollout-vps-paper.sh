@@ -113,18 +113,25 @@ sudo -n systemctl start hyperliquid-paper-pilot-report.service hyperliquid-exit-
 stock=/opt/hyperliquid-stock-paper
 sudo -n install -d -m 0700 /etc/hyperliquid-stock-paper
 sudo -n install -d -m 0755 "$stock/$rev"
-for file in scripts/run_stock_paper.py src/trading/alpaca_paper.py src/trading/order_journal.py; do
+for file in scripts/run_stock_paper.py scripts/stock_pilot_report.py src/trading/alpaca_paper.py \
+    src/trading/order_journal.py src/trading/stock_evidence.py; do
     sudo -n install -D -m 0644 "$release/$file" "$stock/$rev/$file"
 done
 sudo -n ln -sfn "$stock/$rev" "$stock/current"
-for unit in hyperliquid-stock-paper.service hyperliquid-stock-paper.timer; do
+for unit in hyperliquid-stock-paper.service hyperliquid-stock-paper.timer hyperliquid-stock-paper-drill@.service \
+    hyperliquid-stock-paper-report.service hyperliquid-stock-paper-report.timer; do
     sudo -n install -m 0644 "$release/deploy/stock-paper/$unit" "/etc/systemd/system/$unit"
 done
 sudo -n systemctl daemon-reload
 sudo -n systemctl enable --now hyperliquid-stock-paper.timer
 sudo -n systemctl start hyperliquid-stock-paper.service
+sudo -n systemctl enable --now hyperliquid-stock-paper-report.timer
+sudo -n systemctl start hyperliquid-stock-paper-report.service
 
 sudo -n install -D -m 0644 "$release/scripts/publish_dashboard_status.py" /opt/hyperliquid-dashboard/publish_dashboard_status.py
+for file in src/trading/alpaca_paper.py src/trading/order_journal.py src/trading/stock_evidence.py; do
+    sudo -n install -D -m 0644 "$release/$file" "/opt/hyperliquid-dashboard/$file"
+done
 for unit in hyperliquid-dashboard-status.service hyperliquid-dashboard-status.timer; do
     sudo -n install -m 0644 "$release/deploy/dashboard/$unit" "/etc/systemd/system/$unit"
 done

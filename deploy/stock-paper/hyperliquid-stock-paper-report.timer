@@ -1,0 +1,9 @@
+[Unit]
+Description=Score the completed US stock paper session each day
+
+[Timer]
+OnCalendar=*-*-* 00:25:00 UTC
+Persistent=true
+
+[Install]
+WantedBy=timers.target

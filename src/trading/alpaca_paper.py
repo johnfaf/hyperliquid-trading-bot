@@ -1,5 +1,6 @@
 """Paper-only US equity broker transport. No production trading host is accepted."""
 from decimal import Decimal
+from datetime import datetime, timezone
 import json
 from urllib.error import HTTPError
 from urllib.parse import urlencode
@@ -58,6 +59,7 @@ class AlpacaPaper:
             fills.extend(Fill(
                 row["id"], row["order_id"], row["symbol"], row["side"],
                 Decimal(row["qty"]), Decimal(row["price"]),
+                datetime.fromisoformat(row["transaction_time"].replace("Z", "+00:00")).astimezone(timezone.utc).isoformat(),
             ) for row in rows)
             if len(rows) < 100:
                 return fills

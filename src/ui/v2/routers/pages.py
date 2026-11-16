@@ -14,7 +14,7 @@ from starlette.concurrency import run_in_threadpool
 
 from src.ui.v2.auth import require_auth, verify_cookie
 from src.ui.v2.cache import get_ttl
-from src.ui.v2.desk import snapshot
+from src.ui.v2.desk import STOCK_LABELS, snapshot
 from src.ui.v2.events import get_recent_events
 
 logger = logging.getLogger(__name__)
@@ -42,6 +42,17 @@ async def settings(request: Request):
     from src.ui.v2.app import get_templates
     desk = await run_in_threadpool(get_ttl, ("desk", 24), 15, snapshot)
     return get_templates().TemplateResponse(request, "settings.html", {"title": "Settings", "desk": desk})
+
+
+@router.get("/stock-pilot", response_class=HTMLResponse)
+async def stock_pilot(request: Request):
+    if not verify_cookie(request):
+        return RedirectResponse("/login", status_code=303)
+    from src.ui.v2.app import get_templates
+    desk = await run_in_threadpool(get_ttl, ("desk", 24), 15, snapshot)
+    return get_templates().TemplateResponse(
+        request, "stock_pilot.html", {"title": "Stock Pilot", "desk": desk, "labels": STOCK_LABELS},
+    )
 
 
 @router.get("/api/events/recent", response_class=JSONResponse)

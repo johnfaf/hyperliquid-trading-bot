@@ -143,6 +143,8 @@ body.desk-body, html.theme-light body.desk-body {
 .desk-table :is(td,th):last-child { text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; }
 .desk-table td:nth-child(5) { white-space: nowrap; }
 .desk-table tbody tr:hover { background: var(--desk-raised); }
+.stock-table td:first-child { white-space: nowrap; font-variant-numeric: tabular-nums; }
+.stock-table td:nth-child(5) { text-align: right; }
 .desk-settings-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 .desk-settings-list { margin: 0; }
 .desk-settings-list > div { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, max-content); gap: 10px; align-items: baseline; border-top: 1px solid var(--desk-line); padding: 9px 16px; }

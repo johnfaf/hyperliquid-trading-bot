@@ -86,3 +86,35 @@ shows effective risk settings and stock-paper readiness. Settings are
 read-only and never display signing keys. The legacy dashboard, including its
 options and stress views, is retained on VPS loopback port `8082` for a
 separate administrative SSH tunnel. Neither dashboard port is public.
+
+## Stock decision evidence and supervised drill
+
+The Stock Pilot tab records fresh quotes even when the strategy has no
+signal, separates shadow proposals from confirmed paper broker fills, and
+shows the state of a supervised test round trip. The daily stock scorecard
+runs at 00:25 UTC and writes private reports to
+`/var/lib/hyperliquid-stock-reports`. It compares the observed session
+window on a $1,000 basis to cash and a price-only passive reference. Strategy
+P&L is unmeasured in shadow. In paper mode it uses verified strategy fills,
+marked inventory, and an estimated two basis points per fill. It does not
+claim full-session coverage, fees charged by the broker, or live returns.
+Drill fills do not enter strategy accounting.
+
+After reviewing a fresh open-session shadow cycle, keep
+`STOCK_PAPER_SEND_ORDERS=false` and explicitly supervise the paper test:
+
+1. `sudo systemctl start hyperliquid-stock-paper-drill@buy.service` sends
+   at most a $10 limit order to paper, with 15 minutes required before
+   session close. It requires an empty, reconciled position and a fresh
+   shadow quote. Do not treat an acknowledgement as a fill.
+2. Check the order and confirmed fill on the Stock Pilot tab and in Alpaca.
+   If the order is still open or ambiguous, wait or cancel it in Alpaca
+   Paper before proceeding.
+3. After a fill, `sudo systemctl start hyperliquid-stock-paper-drill@sell.service`
+   sends a separate sell for the verified paper drill position. Monitor it
+   until the position is flat and the verified fills and broker cash match.
+   A limit order may not fill. The timer never runs the drill automatically.
+
+The dashboard publisher uses the existing bot Telegram configuration for
+stock incidents. Normal closed sessions and no-signal cycles are quiet;
+repeated quote/mismatch incidents and failed cycles are rate-limited.

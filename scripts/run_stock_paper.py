@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import re
 import sys
+from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -19,6 +20,7 @@ from src.trading.alpaca_paper import (
     MAX_QUOTE_AGE_SECONDS, MAX_QUOTE_SPREAD_FRACTION, STRATEGY_ID,
 )
 from src.trading.order_journal import OrderJournal, client_id
+from src.trading.stock_evidence import StockEvidence
 
 NY = ZoneInfo("America/New_York")
 ACTIVE = {"submitting", "unknown", "accepted", "partial"}
@@ -45,19 +47,20 @@ def observe(journal, cid, remote):
         "pending_cancel": "accepted", "done_for_day": "accepted",
     }.get(remote["status"], "unknown")
     journal.observe(cid, status, remote["id"])
+    return status
 
 
-def submit_once(broker, journal, intent):
+def submit_once(broker, journal, intent, *, purpose=None):
     cid = intent["client_order_id"]
-    if not journal.reserve(cid, intent, entry=intent["side"] == "buy"):
+    if not journal.reserve(cid, intent, entry=intent["side"] == "buy", purpose=purpose):
         return "intent_already_recorded_or_paused"
     try:
-        observe(journal, cid, broker.submit(intent))
+        status = observe(journal, cid, broker.submit(intent))
     except Exception:
         # Even a transport exception after POST can mean the broker accepted the order.
         journal.observe(cid, "unknown")
         return "submission_unknown"
-    return "intent_sent"
+    return "order_rejected" if status == "rejected" else "intent_sent"
 
 
 def reconcile(broker, journal):
@@ -104,7 +107,8 @@ def trend(bars, sessions, today):
     return prices[-2] * 20 <= sum(prices[:-1]) and prices[-1] * 20 > sum(prices[1:]), prices[-1] * 20 < sum(prices[1:])
 
 
-def tick(broker, journal, *, symbol, orders_enabled=False, flatten=False):
+def tick(broker, journal, *, symbol, orders_enabled=False, flatten=False,
+         evidence=None, remember=None, drill=None):
     if flatten:
         journal.set_pause("operator_flatten")
     positions, problem = reconcile(broker, journal)
@@ -136,30 +140,52 @@ def tick(broker, journal, *, symbol, orders_enabled=False, flatten=False):
     })
     signals = None if bars.get("next_page_token") else trend(bars["bars"], sessions, today)
     qty = positions.get(symbol, Decimal(0))
-    if signals is None and not (flatten and qty):
+    if signals is None and not ((flatten or drill == "sell") and qty):
         return {"state": "not_enough_completed_bars"}
     equity = positive(account["equity"])
     delta = equity - positive(account["last_equity"])
     entry_paused = bool(journal.pause_reason())
+    drill_qty = evidence.drill_position(symbol) if evidence and qty else Decimal(0)
+    paper_guard = qty and drill_qty and not (drill or flatten)
     if qty:
         side = "sell" if flatten or (signals and signals[1]) or delta <= -DAILY_LOSS_USD else None
     else:
         side = "buy" if not flatten and not entry_paused and signals and signals[0] and delta > -DAILY_LOSS_USD else None
+    if drill:
+        side = drill
+        if drill == "buy" and (
+            not evidence or not evidence.ready_shadow(today, now) or qty or entry_paused
+            or delta <= -DAILY_LOSS_USD or timestamp(clock["next_close"]) - now < timedelta(minutes=15)
+            or any(row["entry"] and row["intent"].get("_purpose") == "drill" for row in journal.orders())
+        ):
+            return {"state": "drill_entry_not_ready", "session": today}
+        if drill == "sell" and (qty <= 0 or drill_qty != qty):
+            return {"state": "drill_position_unverified", "session": today}
+    elif paper_guard:
+        return {"state": "drill_position_open", "session": today}
     status = "entries_paused" if entry_paused else "daily_limit_reached" if delta <= -DAILY_LOSS_USD else "no_order"
     report = {"state": status, "session": today, "symbol": symbol, "quantity": str(qty),
-              "account_equity": str(equity), "account_daily_change": str(delta), "mode": "paper" if orders_enabled else "shadow"}
+              "account_equity": str(equity), "account_cash": str(account["cash"]) if account.get("cash") is not None else None,
+              "account_daily_change": str(delta), "mode": "paper" if orders_enabled else "shadow",
+              "decision": side}
+    row = broker.request(f"/v2/stocks/{symbol}/quotes/latest", market_data=True, query={"feed": "iex"})["quote"]
+    try:
+        quote_at = timestamp(row["t"]).astimezone(UTC)
+        bid, ask = positive(row["bp"]), positive(row["ap"])
+    except (ValueError, ArithmeticError, TypeError, KeyError):
+        return {**report, "state": "quote_not_usable", "decision": None}
+    quote_age = (datetime.now(UTC) - quote_at).total_seconds()
+    report.update(quote_at=quote_at.isoformat(), quote_age=quote_age)
+    if not -10 <= quote_age <= MAX_QUOTE_AGE_SECONDS or ask < bid or (ask - bid) / bid > MAX_QUOTE_SPREAD_FRACTION:
+        return {**report, "state": "quote_not_usable", "decision": None}
+    report.update(quote_valid=True, mark=str((bid + ask) / 2))
     if not side:
         return report
-    row = broker.request(f"/v2/stocks/{symbol}/quotes/latest", market_data=True, query={"feed": "iex"})["quote"]
-    bid, ask = positive(row["bp"]), positive(row["ap"])
-    quote_age = (now - timestamp(row["t"])).total_seconds()
-    if not -10 <= quote_age <= MAX_QUOTE_AGE_SECONDS or ask < bid or (ask - bid) / bid > MAX_QUOTE_SPREAD_FRACTION:
-        return {**report, "state": "quote_not_usable"}
     price = (ask if side == "buy" else bid).quantize(Decimal("0.01"), rounding=ROUND_UP if side == "buy" else ROUND_DOWN)
     if price <= 0:
         return {**report, "state": "invalid_limit_price"}
     if side == "buy":
-        cash = min(Decimal(account["cash"]), Decimal(account["buying_power"]), MAX_ENTRY_USD)
+        cash = min(Decimal(account["cash"]), Decimal(account["buying_power"]), Decimal(10) if drill else MAX_ENTRY_USD)
         if not cash.is_finite() or cash < 1:
             return {**report, "state": "insufficient_cash"}
         qty = (cash / price).quantize(Decimal("0.000001"), rounding=ROUND_DOWN)
@@ -167,42 +193,72 @@ def tick(broker, journal, *, symbol, orders_enabled=False, flatten=False):
             return {**report, "state": "order_below_minimum"}
     intent = {"symbol": symbol, "side": side, "qty": str(qty), "limit_price": str(price),
               "type": "limit", "time_in_force": "day", "extended_hours": False,
-              "client_order_id": client_id(STRATEGY_ID, today, symbol, side, "flatten" if flatten else "routine")}
-    if not orders_enabled:
+              "client_order_id": client_id(STRATEGY_ID, today, symbol, side, "drill" if drill else "flatten" if flatten else "routine")}
+    if not orders_enabled and not drill:
         return {**report, "state": "shadow_intent", "intent": intent}
     if any(order["client_id"] == intent["client_order_id"] for order in journal.orders()):
         return {**report, "state": "session_intent_already_recorded"}
-    return {**report, "state": submit_once(broker, journal, intent), "intent": intent}
+    if remember:
+        remember({**report, "state": "submitting", "intent": intent})
+    purpose = "drill" if drill or (flatten and drill_qty) else "strategy"
+    return {**report, "state": submit_once(broker, journal, intent, purpose=purpose), "intent": intent}
 
 
 def main():
     parser = ArgumentParser(description=__doc__)
     parser.add_argument("--db", type=Path, required=True)
     parser.add_argument("--symbol", default=DEFAULT_SYMBOL)
-    parser.add_argument("--action", choices=["cycle", "pause", "resume", "flatten"], default="cycle")
+    parser.add_argument("--action", choices=["cycle", "pause", "resume", "flatten", "drill-buy", "drill-sell"], default="cycle")
+    parser.add_argument("--confirm-paper-drill", action="store_true")
     args = parser.parse_args()
     if not re.fullmatch(r"[A-Z]{1,5}", args.symbol):
         parser.error("symbol must be a simple US equity ticker")
     key, secret = os.getenv("STOCK_PAPER_KEY"), os.getenv("STOCK_PAPER_SECRET")
-    if not key or not secret:
-        print(json.dumps({"mode": "paper_only", "state": "waiting_for_paper_credentials"}))
-        return
-    broker = AlpacaPaper(key, secret)
+    orders_enabled = os.getenv("STOCK_PAPER_SEND_ORDERS") == "true"
+    drill = args.action.removeprefix("drill-") if args.action.startswith("drill-") else None
+    if drill and (not args.confirm_paper_drill or orders_enabled):
+        parser.error("the supervised drill requires --confirm-paper-drill and shadow mode")
+    account, cycle_id = "unbound", uuid4().hex
+    mode = "paper" if orders_enabled else "shadow"
+    purpose = "drill" if drill else "operator" if args.action != "cycle" else "strategy"
+    evidence = None
+
+    def remember(result):
+        evidence.record(cycle_id, result, symbol=args.symbol, mode=mode, purpose=purpose)
+
     try:
+        if not key or not secret:
+            OrderJournal(args.db, account)
+            evidence = StockEvidence(args.db, account)
+            result = {"mode": "paper_only", "state": "waiting_for_paper_credentials"}
+            remember(result)
+            print(json.dumps(result))
+            return
+        broker = AlpacaPaper(key, secret)
         account_id = broker.request("/v2/account")["id"]
-        journal = OrderJournal(args.db, f"alpaca-paper:{account_id}")
+        account = f"alpaca-paper:{account_id}"
+        journal = OrderJournal(args.db, account)
+        evidence = StockEvidence(args.db, account)
         if args.action in {"pause", "resume"}:
             journal.set_pause("operator_pause" if args.action == "pause" else None)
             result = {"state": args.action}
         else:
             result = tick(
-                broker, journal, symbol=args.symbol, orders_enabled=os.getenv("STOCK_PAPER_SEND_ORDERS") == "true",
-                flatten=args.action == "flatten",
+                broker, journal, symbol=args.symbol, orders_enabled=orders_enabled,
+                flatten=args.action == "flatten", evidence=evidence, remember=remember, drill=drill,
             )
-        print(json.dumps({"mode": "paper" if os.getenv("STOCK_PAPER_SEND_ORDERS") == "true" else "shadow", **result}))
+        remember(result)
+        print(json.dumps({"mode": mode, **result}))
     except Exception as exc:
         # Exception messages from HTTP clients can contain deployment-sensitive details.
         print(json.dumps({"state": "cycle_failed", "error_type": type(exc).__name__}), file=sys.stderr)
+        try:
+            if evidence is None:
+                OrderJournal(args.db, account)
+                evidence = StockEvidence(args.db, account)
+            remember({"state": "cycle_failed"})
+        except Exception:
+            pass
         raise SystemExit(1) from None
 
 

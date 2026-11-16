@@ -6,6 +6,7 @@ After=network-online.target
 [Service]
 Type=oneshot
 DynamicUser=yes
+User=hyperliquid-stock-paper
 StateDirectory=hyperliquid-stock-paper
 StateDirectoryMode=0700
 EnvironmentFile=-/etc/hyperliquid-stock-paper/paper.env
