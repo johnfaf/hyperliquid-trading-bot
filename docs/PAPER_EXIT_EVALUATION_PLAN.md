@@ -44,7 +44,11 @@ evidence. Keep the same criteria through the end of this window.
 ## Operations and historical checks
 
 The daily scorecard uses the previous seven calendar days as of UTC midnight.
-It is descriptive and distinguishes zero matched exits from zero P&L. On the
+It distinguishes zero matched exits from zero P&L and shows both the full
+requested window and coverage since the first persisted observation. Missing
+slots after recording starts still count against coverage. The holdout gate
+uses the full scheduled period. The pilot's daily report labels signal counts
+as unmeasured when no decision snapshots were recorded. On the
 VPS, `hyperliquid-exit-scorecard.timer` runs at 00:20 UTC and writes private
 Markdown reports. At the holdout deadline, run the script with `--holdout`
 to evaluate the frozen gate; it refuses an early verdict.
@@ -56,3 +60,10 @@ has time-stamped books and asset contexts, can be incomplete, and charges
 the requester for transfer. Do not reconstruct five-second fills from
 minute candles. Synthetic regression scenarios are separate from performance
 evidence.
+
+The main bot's new strategy and copy paper entries have a separate
+`PAPER_MAX_PLANNED_STOP_LOSS_PCT` sizing ceiling (default `0.0025`, or 0.25%
+of current paper balance; `0` disables the size cap). The estimate includes
+entry and exit fees and configured modeled stop slippage, but not funding
+or gaps beyond the stop. The ceiling does not change the stop or take-profit
+levels, and it is not used for the frozen pilot's fixed-size entries.

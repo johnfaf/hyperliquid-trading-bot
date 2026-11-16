@@ -89,14 +89,15 @@ def build_report(path: Path, day: date | None, label: str) -> str:
                 "AND (action LIKE 'paper_pilot_%' OR action IN ('live_mirror_unconfirmed', 'live_reconciliation_snapshot')) "
                 "GROUP BY action", (lo, hi),
             )))
-        decision_rejects = None
+        decision_total, decision_rejects, decision_links = 0, 0, 0
         if "decision_snapshots" in tables:
-            decision_rejects = conn.execute(
-                "SELECT count(*) FROM decision_snapshots WHERE created_at >= ? AND created_at < ? "
-                "AND (LOWER(COALESCE(firewall_decision, '')) = 'rejected' "
-                "OR LOWER(COALESCE(final_status, '')) IN ('rejected', 'blocked', 'paper_rejected'))",
+            decision_total, decision_rejects, decision_links = conn.execute(
+                "SELECT count(*), count(CASE WHEN LOWER(COALESCE(firewall_decision, '')) = 'rejected' "
+                "OR LOWER(COALESCE(final_status, '')) LIKE '%rejected' "
+                "OR LOWER(COALESCE(final_status, '')) = 'blocked' THEN 1 END), count(paper_trade_id) "
+                "FROM decision_snapshots WHERE created_at >= ? AND created_at < ?",
                 (lo, hi),
-            ).fetchone()[0]
+            ).fetchone()
         marks = []
         if "paper_pilot_marks" in tables:
             marks = conn.execute(
@@ -109,6 +110,8 @@ def build_report(path: Path, day: date | None, label: str) -> str:
             spec = metadata(saved[0]) if saved else None
 
     amounts: dict[str, list[float]] = {}
+    groups: dict[str, Counter] = {}
+    stop_gaps = []
     reasons, counts = Counter(), Counter()
     for row in rows:
         meta = metadata(row["metadata"])
@@ -117,7 +120,23 @@ def build_report(path: Path, day: date | None, label: str) -> str:
             counts["excluded"] += 1
             continue
         counts["included"] += 1
-        reasons[str(meta.get("close_reason") or "unknown")] += 1
+        reason = str(meta.get("close_reason") or "unknown")
+        reasons[reason] += 1
+        group = str(meta.get("strategy_type") or meta.get("source") or "unknown")
+        summary = groups.setdefault(group, Counter())
+        summary["closed"] += 1
+        net = number(row["pnl"])
+        if net is not None:
+            summary["priced"] += 1
+            summary["wins"] += net > 0
+            summary["pnl"] += net
+        stop = number(meta.get("stop_trigger_price"))
+        if reason in {"stop_loss", "trailing_stop"}:
+            summary["stops"] += 1
+            fill = number(row["exit_price"])
+            if stop and stop > 0 and fill and fill > 0 and row["side"] in {"long", "short"}:
+                direction = 1 if row["side"] == "long" else -1
+                stop_gaps.append(max(0, direction * (stop - fill) / stop * 10_000))
         for key, value in trade_costs(row, meta).items():
             amounts.setdefault(key, [])
             if value is not None:
@@ -151,12 +170,31 @@ def build_report(path: Path, day: date | None, label: str) -> str:
             lines.append(f"- Flat cash reference: {_money(spec['starting_cash'])}.")
     if reasons:
         lines.append("- Close reasons: " + ", ".join(f"{key}: {value}" for key, value in sorted(reasons.items())) + ".")
-    if decision_rejects is not None:
-        lines.append(f"- Rejected or blocked signal decisions: {decision_rejects} (not exchange rejections).")
+    if decision_total:
+        lines.append(f"- Signal decisions recorded: {decision_total}; rejected or blocked: {decision_rejects} "
+                     f"(not exchange rejections); linked to a paper trade: {decision_links}.")
+    else:
+        lines.append("- Signal decisions and rejection rate: unmeasured (no decision snapshots recorded for this period).")
     if events:
         lines.extend(f"- `{key}`: {value}" for key, value in sorted(events.items()))
     else:
         lines.append("- No tracked pilot or live execution exceptions recorded for this period.")
+    if groups:
+        lines += [
+            "", "## Closed Trades by Strategy",
+            "| Strategy or source | Closed | Wins / priced | Stop exits | Net P&L |",
+            "| --- | ---: | ---: | ---: | ---: |",
+        ]
+        for group, summary in sorted(groups.items()):
+            label = group.replace("|", "\\|").replace("\n", " ").replace("\r", " ")
+            pnl = _money(summary["pnl"]) if summary["priced"] else "n/a"
+            lines.append(f"| {label} | {summary['closed']} | {summary['wins']}/{summary['priced']} | "
+                         f"{summary['stops']} | {pnl} |")
+        stops = reasons["stop_loss"] + reasons["trailing_stop"]
+        if stops:
+            overshoot = f"{max(stop_gaps):.1f} bps" if stop_gaps else "unmeasured"
+            lines.append(f"- Largest adverse move from stop trigger to simulated fill: {overshoot} "
+                         f"({len(stop_gaps)}/{stops} stop exits with trigger and fill recorded).")
     return "\n".join(lines) + "\n"
 
 

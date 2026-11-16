@@ -96,7 +96,11 @@ def _write_reference(work: Path) -> tuple[int, int]:
     start = max(first // SAMPLE_MS * SAMPLE_MS, cutoff - 7 * DAY_MS)
     if cutoff <= start:
         raise ValueError("snapshots have no common market/pilot time window")
-    text = render(score_window(market, paper, start, cutoff, cutoff), start, cutoff, cutoff)
+    # Existing encrypted backups pin the exact bytes of the original report format.
+    text = render(
+        score_window(market, paper, start, cutoff, cutoff), start, cutoff, cutoff,
+        include_capture_breakdown=False,
+    )
     (work / REPORT).write_text(text, encoding="utf-8", newline="\n")
     return start, cutoff
 

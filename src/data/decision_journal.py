@@ -708,8 +708,9 @@ def link_paper_trade(
     paper_trade_id: Any,
     *,
     metadata: Optional[Dict[str, Any]] = None,
+    close_reason: Optional[str] = None,
 ) -> bool:
-    """Attach the opened paper trade id to an existing decision snapshot."""
+    """Attach a paper trade and persist the corresponding execution status."""
     if not _enabled() or not decision_id or paper_trade_id is None:
         return False
     if not _schema_or_skip():
@@ -720,20 +721,29 @@ def link_paper_trade(
         now = _now()
         with db.get_connection() as conn:
             row = conn.execute(
-                "SELECT metadata FROM decision_snapshots WHERE decision_id = ?",
+                "SELECT metadata, paper_trade_id, final_status FROM decision_snapshots WHERE decision_id = ?",
                 (decision_id,),
             ).fetchone()
+            trade_id = int(paper_trade_id)
+            final_status = "paper_closed" if close_reason is not None else "paper_opened"
+            if row and (
+                row["paper_trade_id"] not in (None, trade_id)
+                or (row["final_status"] == "paper_closed" and final_status == "paper_opened")
+            ):
+                return False
             merged_meta = _loads(row["metadata"] if row else None)
             if metadata:
                 merged_meta.update(metadata)
+            if close_reason is not None:
+                merged_meta.update(paper_trade_closed=True, close_reason=close_reason)
             if row:
                 conn.execute(
                     """
                     UPDATE decision_snapshots
-                    SET updated_at = ?, paper_trade_id = ?, final_status = ?, metadata = ?
+                    SET updated_at = ?, paper_trade_id = ?, final_status = ?, metadata = ?, rejection_reason = NULL
                     WHERE decision_id = ?
                     """,
-                    (now, int(paper_trade_id), "paper_opened", _json(merged_meta), decision_id),
+                    (now, trade_id, final_status, _json(merged_meta), decision_id),
                 )
             else:
                 conn.execute(
@@ -742,12 +752,50 @@ def link_paper_trade(
                     (decision_id, created_at, updated_at, final_status, paper_trade_id, metadata)
                     VALUES (?, ?, ?, ?, ?, ?)
                     """,
-                    (decision_id, now, now, "paper_opened", int(paper_trade_id), _json(merged_meta)),
+                    (decision_id, now, now, final_status, trade_id, _json(merged_meta)),
                 )
         return True
     except Exception as exc:
         _record_write_failure("paper_trade_link", exc)
         return False
+
+
+def record_paper_opened(decision_id: str, trade_id: int, *, confidence=None, metadata=None) -> None:
+    """Record the actual execution separately from firewall approval."""
+    snapshot_metadata = {"paper_trade_opened": True}
+    if metadata and "paper_trade_signal_id" in metadata:
+        snapshot_metadata["paper_trade_signal_id"] = metadata["paper_trade_signal_id"]
+    if not link_paper_trade(decision_id, trade_id, metadata=snapshot_metadata):
+        return
+    record_stage_event(
+        decision_id, stage="paper_execution", status="paper_opened",
+        reason="paper_trade_opened", confidence=confidence,
+        metadata={**(metadata or {}), "paper_trade_id": trade_id},
+    )
+    record_decision_outcome(decision_id)
+
+
+def record_paper_closed(decision_id: str, trade_id: int, *, confidence=None, outcome: Dict[str, Any]) -> None:
+    """Complete the same decision for market stops, source exits and rotations."""
+    if not _enabled() or not decision_id:
+        return
+    reason = outcome["exit_reason"]
+    # Recover the link from durable trade metadata if the open-time write failed.
+    if not link_paper_trade(
+        decision_id, trade_id, metadata={"paper_trade_opened": True}, close_reason=reason,
+    ):
+        return
+    record_stage_event(
+        decision_id, stage="paper_close", status="paper_closed", reason=reason,
+        confidence=confidence, metadata={
+            "paper_trade_id": trade_id,
+            "pnl": outcome.get("outcome_pnl"),
+            "return_pct": outcome.get("outcome_return_pct"),
+            "exit_price": outcome.get("exit_price"),
+            **((outcome.get("metadata") or {}).get("path_metrics") or {}),
+        },
+    )
+    record_decision_outcome(decision_id, outcome=outcome)
 
 
 def record_stage_event(
@@ -1209,7 +1257,7 @@ def record_decision_outcome(
                     paper = None
             paper_dict = dict(paper) if paper else {}
             pnl = outcome.get("outcome_pnl")
-            if pnl is None:
+            if pnl is None and paper_dict.get("status") == "closed":
                 pnl = paper_dict.get("pnl")
             pnl_float = _float(pnl, None)
             action_taken = bool(paper_trade_id is not None)
@@ -1226,7 +1274,7 @@ def record_decision_outcome(
             label_win = outcome.get("label_win")
             if label_win is None and pnl_float is not None:
                 label_win = 1 if pnl_float > 0 else 0
-            if label_win is None and forward.get("would_have_won") is not None:
+            if label_win is None and not action_taken and forward.get("would_have_won") is not None:
                 label_win = int(forward.get("would_have_won"))
             entry = _float(paper_dict.get("entry_price") or decision.get("entry_price"), None)
             size = _float(paper_dict.get("size"), None)

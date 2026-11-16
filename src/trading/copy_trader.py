@@ -8,6 +8,7 @@ V2: Signals routed through DecisionFirewall and tracked by AgentScorer.
 """
 import logging
 import json
+import math
 import re
 import time
 from datetime import datetime, timezone
@@ -18,6 +19,7 @@ import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import config
 from src.data import database as db
+from src.data import decision_journal
 from src.data import hyperliquid_client as hl
 from src.analysis.trade_analytics import evaluate_source_policy, evaluate_side_source_policy
 from src.signals.signal_schema import RiskParams, SignalSide, SignalSource, TradeSignal, signal_from_copy_trade
@@ -26,6 +28,7 @@ from src.signals.agent_scoring import AgentScorer
 from src.signals.kelly_sizing import KellySizer
 from src.trading.trade_memory import TradeMemory
 from src.trading.portfolio_rotation import PortfolioRotationManager
+from src.trading.paper_risk import size_for_planned_stop
 from src.signals.calibration import (
     CalibrationTracker,
     bucket_regime as _calibration_bucket_regime,
@@ -340,7 +343,7 @@ class CopyTrader:
             original_confidence = float(signal.get("confidence", 0.5) or 0.5)
             signal["confidence"] = original_confidence * self.source_side_confidence_multiplier
             signal["copy_source_size_multiplier"] = min(
-                float(signal.get("copy_source_size_multiplier", 1.0) or 1.0),
+                float(signal.get("copy_source_size_multiplier", 1.0)),
                 self.source_side_size_multiplier,
             )
             signal["copy_source_side_policy"] = dict(policy)
@@ -978,7 +981,7 @@ class CopyTrader:
                 signal["regime_block_reason"] = f"forecaster_crash_blocks_long:{regime_conf:.2f}"
                 return signal
             if signal_side == "short":
-                existing_mod = float(signal.get("regime_size_modifier", 1.0) or 1.0)
+                existing_mod = float(signal.get("regime_size_modifier", 1.0))
                 signal["regime_size_modifier"] = max(
                     0.0, min(existing_mod * _BEARISH_COPY_CONFIDENCE_MULTIPLIER, 2.0)
                 )
@@ -1005,7 +1008,7 @@ class CopyTrader:
                 signal["regime_block_reason"] = f"forecaster_bullish_blocks_short:{regime_conf:.2f}"
                 return signal
             if signal_side == "long":
-                existing_mod = float(signal.get("regime_size_modifier", 1.0) or 1.0)
+                existing_mod = float(signal.get("regime_size_modifier", 1.0))
                 new_mod = max(0.0, min(existing_mod * _BULLISH_COPY_CONFIDENCE_MULTIPLIER, 2.0))
                 signal["regime_size_modifier"] = new_mod
                 logger.info(
@@ -1031,7 +1034,7 @@ class CopyTrader:
                 signal["regime_block_reason"] = f"forecaster_bearish_blocks_long:{regime_conf:.2f}"
                 return signal
             if signal_side == "short":
-                existing_mod = float(signal.get("regime_size_modifier", 1.0) or 1.0)
+                existing_mod = float(signal.get("regime_size_modifier", 1.0))
                 new_mod = max(0.0, min(existing_mod * _BEARISH_COPY_CONFIDENCE_MULTIPLIER, 2.0))
                 signal["regime_size_modifier"] = new_mod
                 logger.info(
@@ -1054,6 +1057,16 @@ class CopyTrader:
                 signal["confidence"] = adjusted_confidence
 
         return signal
+
+    @staticmethod
+    def _journal_entry_result(signal: TradeSignal, stage: str, status: str, reason: str,
+                              firewall_decision: Optional[str] = None) -> None:
+        decision_id = decision_journal.resolve_decision_id(signal)
+        if decision_journal.finalize_decision(
+            decision_id, final_status=status, stage=stage, reason=reason,
+            confidence=signal.confidence, firewall_decision=firewall_decision,
+        ):
+            decision_journal.record_decision_outcome(decision_id)
 
     def execute_copy_signals(self, signals: List[Dict],
                               regime_data: Optional[Dict] = None,
@@ -1099,6 +1112,7 @@ class CopyTrader:
             candidate_cap = max(10, self.max_new_trades_per_cycle * 10)
 
         for signal in signals:
+            trade_signal = None
             try:
                 if signal["type"] in ("copy_close", "copy_scale_out"):
                     reason = "source_reduce" if signal["type"] == "copy_scale_out" else "source_exit"
@@ -1111,7 +1125,26 @@ class CopyTrader:
                     continue
 
                 if signal["type"] in ("copy_open", "copy_scale_in", "copy_flip", "golden_copy"):
+                    signal = dict(signal)
+                    trade_signal = signal_from_copy_trade(
+                        trader_address=str(signal.get("source_trader") or ""),
+                        coin=signal["coin"], side=signal["side"], entry_price=signal["price"],
+                        confidence=signal.get("confidence", 0.5),
+                    )
+                    trade_signal.leverage = signal.get("leverage", 2)
+                    trade_signal.regime = (regime_data or {}).get("overall_regime", "")
+                    trade_signal.context["confidence_inputs"] = signal.get("confidence_inputs") or {}
+                    signal["decision_id"] = decision_journal.resolve_decision_id(trade_signal)
+                    decision_journal.record_decision_snapshot(
+                        trade_signal, regime_data=regime_data, account_balance=account.get("balance"),
+                        metadata={"copy_signal_type": signal["type"]},
+                    )
+
+                    def reject(reason):
+                        self._journal_entry_result(trade_signal, "copy_prescreen", "copy_prescreen_rejected", reason)
+
                     if not allow_new_entries:
+                        reject(str(guardrail.get("reason") or "copy_guardrail_blocked"))
                         continue
                     source_issue = self._entry_source_issue(signal)
                     if source_issue:
@@ -1122,6 +1155,7 @@ class CopyTrader:
                             signal.get("source_trader", ""),
                             source_issue,
                         )
+                        reject(source_issue)
                         continue
                     blocklisted, blocklist_reason = self._is_source_blocklisted(signal)
                     if blocklisted:
@@ -1132,6 +1166,7 @@ class CopyTrader:
                         summary["count"] = int(summary["count"]) + 1
                         summary["coins"].add(str(signal.get("coin", "?")).upper())
                         summary["sides"].add(str(signal.get("side", "?")).lower())
+                        reject(blocklist_reason)
                         continue
                     cutoff, cutoff_reason = self._is_source_hard_cutoff(signal)
                     if cutoff:
@@ -1141,6 +1176,7 @@ class CopyTrader:
                             signal["coin"],
                             cutoff_reason,
                         )
+                        reject(cutoff_reason)
                         continue
                     if (
                         candidate_cap > 0
@@ -1153,6 +1189,7 @@ class CopyTrader:
                             signal["side"],
                             signal["coin"],
                         )
+                        reject("copy_candidate_cap")
                         continue
                     signal = self._apply_regime_weight(signal, signal["coin"], regime_data=regime_data)
                     if signal.get("regime_block_reason"):
@@ -1162,6 +1199,7 @@ class CopyTrader:
                             signal["coin"],
                             signal["regime_block_reason"],
                         )
+                        reject(signal["regime_block_reason"])
                         continue
                     source_side_ok, source_side_reason = self._apply_source_side_guard(signal)
                     if not source_side_ok:
@@ -1171,20 +1209,14 @@ class CopyTrader:
                             signal["coin"],
                             source_side_reason,
                         )
+                        reject(source_side_reason)
                         continue
-                    trade_signal = None
+                    trade_signal.confidence = signal.get("confidence", 0.5)
+                    if not math.isfinite(float(signal["price"])) or float(signal["price"]) <= 0:
+                        reject("invalid_entry_price")
+                        continue
 
-                    if self.firewall and signal.get("price", 0) > 0:
-                        trade_signal = signal_from_copy_trade(
-                            trader_address=signal.get("source_trader", ""),
-                            coin=signal["coin"],
-                            side=signal["side"],
-                            entry_price=signal["price"],
-                            confidence=signal.get("confidence", 0.5),
-                        )
-                        trade_signal.leverage = signal.get("leverage", 2)
-                        trade_signal.regime = regime_data.get("overall_regime", "") if regime_data else ""
-
+                    if self.firewall:
                         if self.agent_scorer:
                             source_key = self._source_key(signal)
                             weight = self.agent_scorer.get_weight(source_key)
@@ -1203,18 +1235,10 @@ class CopyTrader:
                         )
                         if not passed:
                             logger.info(f"  Firewall rejected copy {signal['side']} {signal['coin']}: {reason}")
+                            self._journal_entry_result(
+                                trade_signal, "firewall_prescreen", "firewall_prescreen_rejected", reason, "rejected",
+                            )
                             continue
-
-                    if trade_signal is None:
-                        trade_signal = signal_from_copy_trade(
-                            trader_address=signal.get("source_trader", ""),
-                            coin=signal["coin"],
-                            side=signal["side"],
-                            entry_price=signal["price"],
-                            confidence=signal.get("confidence", 0.5),
-                        )
-                        trade_signal.leverage = signal.get("leverage", 2)
-                        trade_signal.regime = regime_data.get("overall_regime", "") if regime_data else ""
 
                     signal["confidence"] = trade_signal.confidence
                     signal["source_accuracy"] = trade_signal.source_accuracy
@@ -1226,6 +1250,8 @@ class CopyTrader:
 
             except Exception as e:
                 logger.error(f"Error executing copy signal: {e}")
+                if trade_signal is not None:
+                    self._journal_entry_result(trade_signal, "copy_prescreen", "copy_prescreen_rejected", "entry_error")
 
         for reason, summary in blocklisted_summary.items():
             coins = ",".join(sorted(summary["coins"]))
@@ -1249,19 +1275,17 @@ class CopyTrader:
             ),
             reverse=True,
         ):
+            signal = candidate["signal"]
+            trade_signal = candidate["trade_signal"]
             if (
                 self.max_new_trades_per_cycle > 0
                 and len(executed) >= self.max_new_trades_per_cycle
             ):
-                logger.info(
-                    "  Copy-trader execution cap reached (%d/%d); skipping remaining candidates",
-                    len(executed),
-                    self.max_new_trades_per_cycle,
+                self._journal_entry_result(
+                    trade_signal, "paper_execution", "copy_entry_rejected", "copy_execution_cap",
                 )
-                break
+                continue
 
-            signal = candidate["signal"]
-            trade_signal = candidate["trade_signal"]
             decision = self.rotation_manager.decide(
                 trade_signal,
                 open_trades,
@@ -1286,6 +1310,7 @@ class CopyTrader:
                     signal["coin"],
                     decision.reason,
                 )
+                self._journal_entry_result(trade_signal, "rotation", "rotation_rejected", decision.reason)
                 continue
             if shadow_bypass_open:
                 logger.info(
@@ -1312,6 +1337,7 @@ class CopyTrader:
                         signal["side"],
                         signal["coin"],
                     )
+                    self._journal_entry_result(trade_signal, "rotation", "rotation_rejected", "rotation_disabled")
                     continue
                 if rotation_dry_run:
                     self.rotation_manager.record_dry_run_replacement_skip(
@@ -1323,6 +1349,7 @@ class CopyTrader:
                         signal["coin"],
                         decision.reason,
                     )
+                    self._journal_entry_result(trade_signal, "rotation", "rotation_rejected", "rotation_dry_run")
                     continue
 
             if decision.action == "replace":
@@ -1332,6 +1359,7 @@ class CopyTrader:
                 )
                 if not victim:
                     logger.info("  Rotation skipped copy %s: incumbent not found", signal["coin"])
+                    self._journal_entry_result(trade_signal, "rotation", "rotation_rejected", "incumbent_not_found")
                     continue
 
                 candidate_paper_positions = [
@@ -1351,6 +1379,9 @@ class CopyTrader:
                         signal["side"],
                         signal["coin"],
                     )
+                    self._journal_entry_result(
+                        trade_signal, "paper_execution", "copy_entry_rejected", "copy_position_cap",
+                    )
                     continue
 
             if self.firewall:
@@ -1366,30 +1397,40 @@ class CopyTrader:
                         signal["coin"],
                         reason,
                     )
+                    self._journal_entry_result(
+                        trade_signal, "firewall_execution", "firewall_execution_rejected", reason, "rejected",
+                    )
                     continue
 
-            # CRIT-FIX C4: propagate the firewall's regime_size_modifier onto
-            # the dict-shaped signal so _open_copy_trade can scale final size.
-            # Without this the crash/neutral-regime size reduction set on
-            # `trade_signal.regime_size_modifier` was silently dropped at
-            # execution time, letting full-size copies through in crash
-            # regimes despite the firewall correctly computing the modifier.
+            # Retain local reductions as well as any tighter firewall sizing.
             try:
-                signal["regime_size_modifier"] = float(
-                    getattr(trade_signal, "regime_size_modifier", 1.0) or 1.0
+                local_modifier = float(signal.get("regime_size_modifier", 1.0))
+                firewall_modifier = float(trade_signal.regime_size_modifier)
+                modifier = min(local_modifier, firewall_modifier) if local_modifier < 1 else firewall_modifier
+                signal["regime_size_modifier"] = modifier if self.firewall else local_modifier
+                source_modifier = float(signal.get("copy_source_size_multiplier", 1.0))
+                valid_size = all(
+                    math.isfinite(value) and value > 0
+                    for value in (local_modifier, signal["regime_size_modifier"], source_modifier)
                 )
             except (TypeError, ValueError):
-                signal["regime_size_modifier"] = 1.0
+                valid_size = False
+            firewall_status = "approved" if self.firewall else None
+            if not valid_size:
+                self._journal_entry_result(
+                    trade_signal, "paper_execution", "copy_entry_rejected", "copy_size_modifier_zero", firewall_status,
+                )
+                continue
 
+            source_key = self._source_key(signal)
+            signal["_source_key"] = source_key
             if self.agent_scorer:
-                source_key = self._source_key(signal)
                 signal_id = self.agent_scorer.record_signal(source_key, {
                     "coin": signal["coin"],
                     "side": signal["side"],
                     "confidence": trade_signal.confidence,
                 })
                 signal["_signal_id"] = signal_id
-                signal["_source_key"] = source_key
 
             closed_trade = None
             if victim:
@@ -1406,6 +1447,9 @@ class CopyTrader:
                         "  Rotation victim close failed for %s -- skipping copy replacement with %s",
                         victim.get("coin"),
                         signal["coin"],
+                    )
+                    self._journal_entry_result(
+                        trade_signal, "rotation", "rotation_victim_close_failed", "victim_close_failed", firewall_status,
                     )
                     continue
                 open_trades = [t for t in open_trades if t.get("id") != victim.get("id")]
@@ -1441,6 +1485,11 @@ class CopyTrader:
                         signal["coin"],
                         decision.reason,
                     )
+            else:
+                self._journal_entry_result(
+                    trade_signal, "paper_execution", "paper_open_failed",
+                    signal.get("_open_failure_reason", "open_paper_trade_failed"), firewall_status,
+                )
 
         if executed:
             self._copy_count += len(executed)
@@ -1463,6 +1512,7 @@ class CopyTrader:
             "source_trader": str(signal.get("source_trader", "") or "").strip().lower(),
             "confidence": signal.get("confidence", 0),
             "signal_id": signal.get("_signal_id", ""),
+            "decision_id": signal.get("decision_id", ""),
             "source_key": signal.get("_source_key", ""),
             "source_accuracy": signal.get("source_accuracy", 0),
             "copy_source_size_multiplier": signal.get("copy_source_size_multiplier", 1.0),
@@ -1507,7 +1557,7 @@ class CopyTrader:
         # this multiplication the firewall's regime protection was effectively
         # bypassed at execution time.  Clamp to [0, 2] to guard against a
         # malformed upstream modifier inflating size uncontrollably.
-        regime_mod = float(signal.get("regime_size_modifier", 1.0) or 1.0)
+        regime_mod = float(signal.get("regime_size_modifier", 1.0))
         if regime_mod < 0.0:
             regime_mod = 0.0
         elif regime_mod > 2.0:
@@ -1518,7 +1568,7 @@ class CopyTrader:
                 signal.get("side", "?"), signal.get("coin", "?"), regime_mod, size_usd,
             )
         size_usd = size_usd * regime_mod
-        source_side_mod = float(signal.get("copy_source_size_multiplier", 1.0) or 1.0)
+        source_side_mod = float(signal.get("copy_source_size_multiplier", 1.0))
         if source_side_mod < 0.0:
             source_side_mod = 0.0
         elif source_side_mod > 1.0:
@@ -1531,16 +1581,18 @@ class CopyTrader:
         size_usd = size_usd * source_side_mod
 
         price = signal["price"]
-        if price <= 0:
+        if not math.isfinite(price) or price <= 0:
+            signal["_open_failure_reason"] = "invalid_entry_price"
             return None
 
-        if size_usd <= 0:
+        if not math.isfinite(size_usd) or size_usd <= 0:
             # Regime modifier can legitimately zero out sizing (e.g. extreme
             # crash regime).  Skip silently rather than opening a $0 position.
             logger.info(
                 "Copy trade %s %s skipped: regime modifier zeroed size",
                 signal.get("side", "?"), signal.get("coin", "?"),
             )
+            signal["_open_failure_reason"] = "invalid_position_size"
             return None
 
         size = size_usd / price
@@ -1566,6 +1618,7 @@ class CopyTrader:
                 signal["coin"],
                 signal.get("source_trader", ""),
             )
+            signal["_open_failure_reason"] = "copy_already_open_from_source"
             return None
 
         # CRITICAL: No conflicting sides on same asset
@@ -1578,23 +1631,28 @@ class CopyTrader:
             ).strip().lower()
             if t_side_norm and t_side_norm != side_norm:
                 logger.debug(f"Copy skip: conflicting side for {signal['coin']}")
+                signal["_open_failure_reason"] = "conflicting_position_side"
                 return None
 
         # Check basic risk: max 5 copy trades per coin (same direction only)
         coin_copies = sum(1 for t in open_trades if t.get("coin") == signal["coin"])
         if coin_copies >= 5:
+            signal["_open_failure_reason"] = "copy_coin_position_cap"
             return None
 
-        stop_loss, take_profit, risk_policy = self._resolve_copy_trade_risk(
-            signal,
-            leverage,
-            regime_data=signal.get("regime_data"),
-        )
-
         try:
+            stop_loss, take_profit, risk_policy = self._resolve_copy_trade_risk(
+                signal, leverage, regime_data=signal.get("regime_data"),
+            )
             execution_role = signal.get("execution_role", config.PAPER_TRADING_DEFAULT_EXECUTION_ROLE)
+            size, sizing = size_for_planned_stop(
+                balance=account["balance"], side=side_norm, entry=price, stop=stop_loss,
+                size=size, leverage=leverage, execution_role=execution_role,
+            )
             # Build metadata once, reuse for both the DB record and the return value
             metadata = self._build_trade_metadata(signal, risk_policy, execution_role)
+            metadata.update(initial_stop_loss=stop_loss, **sizing)
+            decision_id = metadata["decision_id"]
 
             trade_id = db.open_paper_trade(
                 strategy_id=None,
@@ -1606,7 +1664,16 @@ class CopyTrader:
                 stop_loss=stop_loss,
                 take_profit=take_profit,
                 metadata=metadata,
+                **({"idempotency_key": f"paper:{decision_id}"} if decision_id else {}),
             )
+            if decision_id:
+                decision_journal.record_paper_opened(
+                    decision_id, trade_id, confidence=signal.get("confidence"),
+                    metadata={
+                        "entry_price": price, "size": size, "leverage": leverage,
+                        "paper_trade_signal_id": metadata["signal_id"], **sizing,
+                    },
+                )
             logger.info(
                 f"Copy trade: {side.upper()} {signal['coin']} @ ${price:,.2f} "
                 f"(from trader {signal.get('source_trader', '?')})"
@@ -1625,6 +1692,8 @@ class CopyTrader:
                 "confidence": signal.get("confidence", 0),
                 "trader_address": signal.get("source_trader", ""),
                 "source": "copy_trade",
+                "decision_id": decision_id,
+                "signal_id": metadata["signal_id"],
                 "opened_at": datetime.now(timezone.utc).isoformat(),
                 "metadata": metadata,
             }
@@ -1680,6 +1749,7 @@ class CopyTrader:
                 "net_pnl_after_fees": pnl,
                 "intended_exit_price": float(exit_price),
                 "exit_slipped_price": float(exit_price),
+                "close_reason": close_reason,
             },
         )
         meta.update(
@@ -1697,6 +1767,7 @@ class CopyTrader:
                 "net_pnl_after_fees": pnl,
                 "intended_exit_price": float(exit_price),
                 "exit_slipped_price": float(exit_price),
+                "close_reason": close_reason,
             }
         )
 
@@ -1817,6 +1888,26 @@ class CopyTrader:
             except Exception as hook_exc:
                 logger.warning("copy_trader post-close hook 'shadow_tracker' failed: %s", hook_exc)
 
+        closed_at = datetime.now(timezone.utc)
+        decision_id = str(meta.get("decision_id") or trade.get("decision_id") or "").strip()
+        if decision_id:
+            hold_minutes = None
+            try:
+                opened_at = datetime.fromisoformat(str(trade.get("opened_at") or "").replace("Z", "+00:00"))
+                if opened_at.tzinfo is None:
+                    opened_at = opened_at.replace(tzinfo=timezone.utc)
+                hold_minutes = max((closed_at - opened_at).total_seconds() / 60, 0.0)
+            except ValueError:
+                pass
+            decision_journal.record_paper_closed(
+                decision_id, trade["id"], confidence=meta.get("confidence"),
+                outcome={
+                    "exit_reason": close_reason, "outcome_pnl": pnl, "outcome_return_pct": return_pct,
+                    "exit_price": exit_price, "hold_minutes": hold_minutes,
+                    "metadata": {"close_reason": close_reason, "fees_paid": total_fees},
+                },
+            )
+
         closed_event = {
             "trade_id": trade["id"],
             "coin": trade["coin"],
@@ -1834,7 +1925,7 @@ class CopyTrader:
             "strategy_type": "copy_trade",
             "trader_address": meta.get("source_trader", ""),
             "opened_at": trade.get("opened_at", ""),
-            "closed_at": datetime.now(timezone.utc).isoformat(),
+            "closed_at": closed_at.isoformat(),
         }
         try:
             if self.rotation_manager:

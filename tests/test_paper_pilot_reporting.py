@@ -90,7 +90,8 @@ def test_report_costs_drawdown_and_tainted_and_other_day_filters(tmp_path):
                    "metadata, status, opened_at, closed_at)")
         details = {
             "gross_pnl_before_fees": 6, "intended_entry_price": 100, "intended_exit_price": 105,
-            "total_fees_paid": 0.4, "funding_accrued": 0.1, "close_reason": "stop_loss",
+            "total_fees_paid": 0.4, "funding_accrued": 0.1, "close_reason": "trailing_stop",
+            "stop_trigger_price": 105, "source": "copy_trade",
         }
         for i, when, meta in [(1, "2026-01-02", details), (2, "2026-01-02", {"synthetic_reconciliation": True}),
                              (3, "2026-01-03", details)]:
@@ -102,6 +103,7 @@ def test_report_costs_drawdown_and_tainted_and_other_day_filters(tmp_path):
         db.executemany("INSERT INTO paper_pilot_marks VALUES (?, ?, ?)", [
             ("2026-01-02T01:00:00", 1002, 1000), ("2026-01-02T02:00:00", 999, 1001)
         ])
+        db.execute("CREATE TABLE decision_snapshots (created_at, firewall_decision, final_status, paper_trade_id)")
         db.commit()
     original = path.read_bytes()
     body = report.build_report(path, date(2026, 1, 2), "fixture")
@@ -111,7 +113,20 @@ def test_report_costs_drawdown_and_tainted_and_other_day_filters(tmp_path):
     assert "| Modeled slippage (included in simulated fills) | $4.00 | 1/1 |" in body
     assert "| Net realized P&L | $5.50 | 1/1 |" in body
     assert "drawdown: $3.00" in body
+    assert "rejection rate: unmeasured" in body
+    assert "| copy_trade | 1 | 1/1 | 1 | $5.50 |" in body
+    assert "95.2 bps (1/1 stop exits" in body
     assert path.read_bytes() == original
+
+    with closing(sqlite3.connect(path)) as db:
+        db.executemany("INSERT INTO decision_snapshots VALUES ('2026-01-02T00:01:00', ?, ?, ?)", [
+            (None, "copy_prescreen_rejected", None), ("approved", "paper_closed", 1),
+            ("approved", "paper_open_failed", None),
+        ])
+        db.commit()
+    body = report.build_report(path, date(2026, 1, 2), "fixture")
+    assert "Signal decisions recorded: 3; rejected or blocked: 1" in body
+    assert "linked to a paper trade: 1" in body
 
 
 def test_costs_never_infer_missing_slippage_or_funding():

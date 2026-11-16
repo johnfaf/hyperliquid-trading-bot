@@ -166,6 +166,13 @@ def load_entries(path: Path, start: int, end: int) -> list[Entry]:
     return entries
 
 
+def first_sample_at(path: Path) -> int | None:
+    with closing(_readonly(_market_path(path))) as conn:
+        if conn.execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION:
+            raise ValueError("unrecognized market recording version")
+        return conn.execute("SELECT MIN(at_ms) FROM market_samples").fetchone()[0]
+
+
 def load_samples(path: Path, start: int, end: int) -> list[MarketSample]:
     with closing(_readonly(_market_path(path))) as conn:
         if conn.execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION:

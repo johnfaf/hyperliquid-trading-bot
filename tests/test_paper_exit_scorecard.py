@@ -56,6 +56,23 @@ def test_coverage_counts_invalid_mark_missing_sample_and_window_gap():
     assert "Not enough evidence" in body
 
 
+def test_report_splits_precapture_time_and_preserves_later_outage_in_denominator():
+    score = scorecard._market_coverage([quote(15_500), MarketSample(20_500, "disconnected")], 0, 25_000)
+    assert score.expected == 5 and score.capture_expected == 2
+    assert score.max_capture_gap_ms == 9_500
+    following = scorecard._market_coverage([], 25_000, 35_000, capture_start=15_500)
+    assert following.capture_expected == 2
+    score.merge(following)
+    body = scorecard.render(score, 0, 35_000, 35_000)
+    assert "Full requested window: 1/7 usable slots" in body
+    assert "Scheduled slots before first capture: 3" in body
+    assert "Since capture began: 1/4 usable slots (25.00%)" in body
+    assert "no recorded sample after capture began: 2" in body
+    reference = scorecard.render(score, 0, 35_000, 35_000, include_capture_breakdown=False)
+    assert "Usable quote slots: 1/7" in reference
+    assert "Scheduled slots before first capture" not in reference
+
+
 def test_scorecard_excludes_cohort_closed_only_at_base_costs(monkeypatch):
     samples = [quote(i, 105 if i == 60_000 else 100) for i in range(0, 65_000, 5_000)]
     # All base arms trigger and fill at 60s; the adverse delay cannot be fabricated.

@@ -569,6 +569,12 @@ from src.core.env_utils import (  # noqa: E402 -- must follow sys.path setup abo
 
 LIVE_MIN_ORDER_USD = _safe_env_float("LIVE_MIN_ORDER_USD", 11.0, lo=1.0, hi=10_000.0)
 
+# Cap estimated loss at the initial stop for new strategy/copy paper trades.
+# This is a sizing ceiling, not a bound on losses if the quote gaps.
+PAPER_MAX_PLANNED_STOP_LOSS_PCT = _safe_env_float(
+    "PAPER_MAX_PLANNED_STOP_LOSS_PCT", 0.0025, lo=0.0, hi=0.25,
+)
+
 # Hard ceiling on the notional ($ USDC) of any single live order.  This is a
 # safety net while the bot is ramping on a small live balance — even if paper
 # sizing, rescaling, or the firewall suggest a larger trade, nothing above

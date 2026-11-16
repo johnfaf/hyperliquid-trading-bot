@@ -31,6 +31,7 @@ from src.analysis.features import FeatureEngine
 from src.signals.kelly_sizing import KellySizer
 from src.trading.trade_memory import TradeMemory
 from src.trading.portfolio_rotation import PortfolioRotationManager
+from src.trading.paper_risk import size_for_planned_stop
 from src.signals.calibration import (
     CalibrationTracker,
     bucket_regime as _bucket_regime,
@@ -285,7 +286,7 @@ class PaperTrader:
         risk_policy = meta.get("risk_policy", {})
         if isinstance(risk_policy, dict) and risk_policy.get("stop_roe_pct"):
             return dict(risk_policy)
-        return self._fallback_risk_policy(trade)
+        return self._fallback_risk_policy({**trade, "stop_loss": meta.get("initial_stop_loss") or trade.get("stop_loss")})
 
     def _update_trade_risk_levels(
         self,
@@ -1635,6 +1636,7 @@ class PaperTrader:
                 # Remove closed victim from working position list immediately so
                 # subsequent firewall checks in this batch don't double-count it.
                 open_trades = [t for t in open_trades if t.get("id") != victim.get("id")]
+                account = db.get_paper_account() or account
 
             trade = self._execute_paper_trade(account, sig["strategy"], sig)
             if trade:
@@ -2016,12 +2018,18 @@ class PaperTrader:
             signal_id = str(signal.get("signal_id") or signal.get("decision_id") or "").strip()
             decision_id = str(signal.get("decision_id") or signal_id or "").strip()
             idem_key = f"paper:{signal_id}" if signal_id else None
+            role = signal.get("execution_role", config.PAPER_TRADING_DEFAULT_EXECUTION_ROLE)
+            size, sizing = size_for_planned_stop(
+                balance=account["balance"], side=signal["side"], entry=slipped_price,
+                stop=signal["stop_loss"], size=signal["size"], leverage=signal["leverage"],
+                execution_role=role,
+            )
             trade_id = db.open_paper_trade(
                 strategy_id=strategy.get("id"),
                 coin=signal["coin"],
                 side=signal["side"],
                 entry_price=slipped_price,
-                size=signal["size"],
+                size=size,
                 leverage=signal["leverage"],
                 stop_loss=signal["stop_loss"],
                 take_profit=signal["take_profit"],
@@ -2032,7 +2040,8 @@ class PaperTrader:
                     "confidence": signal.get("confidence", 0),
                     "signal_id": signal.get("signal_id", ""),
                     "decision_id": decision_id,
-                    "execution_role": signal.get("execution_role", config.PAPER_TRADING_DEFAULT_EXECUTION_ROLE),
+                    "execution_role": role,
+                    **sizing,
                     "maker_fee_bps": config.PAPER_TRADING_MAKER_FEE_BPS,
                     "taker_fee_bps": config.PAPER_TRADING_TAKER_FEE_BPS,
                     "intended_entry_price": signal["price"],
@@ -2048,32 +2057,21 @@ class PaperTrader:
                 idempotency_key=idem_key,
             )
             if decision_id:
-                decision_journal.link_paper_trade(
-                    decision_id,
-                    trade_id,
-                    metadata={
-                        "paper_trade_opened": True,
-                        "paper_trade_signal_id": signal_id,
-                    },
-                )
-                decision_journal.record_stage_event(
-                    decision_id,
-                    stage="paper_execution",
-                    status="paper_opened",
-                    reason="paper_trade_opened",
+                decision_journal.record_paper_opened(
+                    decision_id, trade_id,
                     confidence=signal.get("confidence", 0),
                     metadata={
-                        "paper_trade_id": trade_id,
+                        "paper_trade_signal_id": signal_id,
                         "entry_price": slipped_price,
-                        "size": signal["size"],
+                        "size": size,
                         "leverage": signal["leverage"],
+                        **sizing,
                     },
                 )
-                decision_journal.record_decision_outcome(decision_id)
 
             logger.info(
                 f"Paper trade opened: {signal['side'].upper()} {signal['coin']} "
-                f"@ ${signal['price']:,.2f} | size={signal['size']:.4f} | "
+                f"@ ${signal['price']:,.2f} | size={size:.4f} | "
                 f"leverage={signal['leverage']}x | SL=${signal['stop_loss']:,.2f} | "
                 f"TP=${signal['take_profit']:,.2f}"
             )
@@ -2083,7 +2081,7 @@ class PaperTrader:
                 "coin": signal["coin"],
                 "side": signal["side"],
                 "entry_price": slipped_price,
-                "size": signal["size"],
+                "size": size,
                 "leverage": signal["leverage"],
                 "stop_loss": signal["stop_loss"],
                 "take_profit": signal["take_profit"],
@@ -2099,7 +2097,8 @@ class PaperTrader:
                     "confidence": signal.get("confidence", 0),
                     "signal_id": signal.get("signal_id", ""),
                     "decision_id": decision_id,
-                    "execution_role": signal.get("execution_role", config.PAPER_TRADING_DEFAULT_EXECUTION_ROLE),
+                    "execution_role": role,
+                    **sizing,
                     "maker_fee_bps": config.PAPER_TRADING_MAKER_FEE_BPS,
                     "taker_fee_bps": config.PAPER_TRADING_TAKER_FEE_BPS,
                     "intended_entry_price": signal["price"],
@@ -2202,6 +2201,7 @@ class PaperTrader:
             "path_capture_ratio": round(path_capture_ratio, 6),
             "r_multiple_valid": exit_r_multiple is not None,
             "close_reason": close_reason,
+            "stop_trigger_price": trade.get("stop_trigger_price"),
         }
 
         db.update_paper_trade_metadata(
@@ -2438,31 +2438,12 @@ class PaperTrader:
             except Exception:
                 hold_minutes = None
             try:
-                decision_journal.record_stage_event(
-                    decision_id,
-                    stage="paper_close",
-                    status="paper_closed",
-                    reason=close_reason,
-                    confidence=trade_meta.get("confidence"),
-                    metadata={
-                        "paper_trade_id": trade.get("id"),
-                        "pnl": pnl,
-                        "return_pct": return_pct,
-                        "exit_price": slipped_exit,
-                        **path_metrics,
-                    },
-                )
-                decision_journal.update_decision_status(
-                    decision_id,
-                    final_status="paper_closed",
-                    firewall_decision="approved",
-                    metadata={"paper_trade_closed": True, "close_reason": close_reason},
-                )
-                decision_journal.record_decision_outcome(
-                    decision_id,
+                decision_journal.record_paper_closed(
+                    decision_id, trade["id"], confidence=trade_meta.get("confidence"),
                     outcome={
                         "outcome_pnl": pnl,
                         "outcome_return_pct": return_pct,
+                        "exit_price": slipped_exit,
                         "label_win": 1 if pnl > 0 else 0,
                         "exit_reason": close_reason,
                         "hold_minutes": hold_minutes,
@@ -2537,6 +2518,7 @@ class PaperTrader:
 
             should_close = False
             close_reason = ""
+            trigger_stop = None
 
             # --- Trailing stop logic ---
             entry = trade["entry_price"]
@@ -2690,19 +2672,16 @@ class PaperTrader:
 
             # Check stop loss (using potentially updated SL)
             hard_stop = float(self._trade_metadata(trade).get("initial_stop_loss") or trade.get("stop_loss") or 0)
-            hard_stop_hit = hard_stop > 0 and (
-                current_price <= hard_stop if trade["side"] == "long" else current_price >= hard_stop
-            )
-            if hard_stop_hit:
+            is_long = trade["side"] == "long"
+            tightened = sl and hard_stop > 0 and (sl > hard_stop if is_long else sl < hard_stop)
+            if tightened and sl_armed and (current_price <= sl if is_long else current_price >= sl):
+                should_close = True
+                close_reason = "trailing_stop"
+                trigger_stop = sl
+            elif hard_stop > 0 and (current_price <= hard_stop if is_long else current_price >= hard_stop):
                 should_close = True
                 close_reason = "stop_loss"
-            elif sl and sl_armed:
-                if trade["side"] == "long" and current_price <= sl:
-                    should_close = True
-                    close_reason = "trailing_stop" if sl > trade["stop_loss"] else "stop_loss"
-                elif trade["side"] == "short" and current_price >= sl:
-                    should_close = True
-                    close_reason = "trailing_stop" if sl < trade["stop_loss"] else "stop_loss"
+                trigger_stop = hard_stop
             elif sl and not sl_armed and sl_min_hold_s > 0:
                 # Log the first time we suppress a would-be stop-out so
                 # the operator can see how often this guard fires.
@@ -2763,7 +2742,7 @@ class PaperTrader:
 
             if should_close:
                 closed_trade = self._close_trade(
-                    trade,
+                    {**trade, "stop_trigger_price": trigger_stop},
                     current_price=current_price,
                     close_reason=close_reason,
                 )

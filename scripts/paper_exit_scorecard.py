@@ -18,7 +18,7 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from scripts.paper_exit_experiment import _ms, _utc, load_entries, load_samples
+from scripts.paper_exit_experiment import _ms, _utc, first_sample_at, load_entries, load_samples
 from src.backtest.paper_exit_study import (
     ADVERSE_COSTS, BASE_COSTS, HOUR_MS, MAX_GAP_MS, MINUTE_MS, POLICIES, RISK_WINDOW, ExitResult, build_frames, compare,
 )
@@ -51,6 +51,8 @@ class Score:
     expected: int = 0
     samples: Counter = field(default_factory=Counter)
     max_ready_gap_ms: int = 0
+    capture_expected: int = 0
+    max_capture_gap_ms: int = 0
     entries: int = 0
     excluded: int = 0
     reasons: Counter = field(default_factory=Counter)
@@ -60,17 +62,28 @@ class Score:
         self.expected += other.expected
         self.samples.update(other.samples)
         self.max_ready_gap_ms = max(self.max_ready_gap_ms, other.max_ready_gap_ms)
+        self.capture_expected += other.capture_expected
+        self.max_capture_gap_ms = max(self.max_capture_gap_ms, other.max_capture_gap_ms)
         self.entries += other.entries
         self.excluded += other.excluded
         self.reasons.update(other.reasons)
         self.pairs.extend(other.pairs)
 
 
-def _market_coverage(samples: list[MarketSample], start: int, end: int) -> Score:
+def _market_coverage(samples: list[MarketSample], start: int, end: int,
+                     capture_start: int | None = None) -> Score:
     if start >= end:
         raise ValueError("scorecard window must have positive duration")
-    expected = (end + SAMPLE_MS - 1) // SAMPLE_MS - (start + SAMPLE_MS - 1) // SAMPLE_MS
+    first_slot = (start + SAMPLE_MS - 1) // SAMPLE_MS
+    end_slot = (end + SAMPLE_MS - 1) // SAMPLE_MS
+    expected = end_slot - first_slot
     result = Score(expected=expected)
+    if capture_start is None:
+        capture_start = min((sample.at_ms for sample in samples), default=end)
+    capture_slot = max(first_slot, capture_start // SAMPLE_MS)
+    if capture_start < end:
+        result.capture_expected = max(0, end_slot - capture_slot)
+    capture_prev = max(start, capture_slot * SAMPLE_MS)
     prev = start
     for sample in samples:
         # Use the same bucket alignment as the collector's uniqueness index.
@@ -80,19 +93,24 @@ def _market_coverage(samples: list[MarketSample], start: int, end: int) -> Score
         result.samples[status] += 1
         if sample.ready:
             result.max_ready_gap_ms = max(result.max_ready_gap_ms, sample.at_ms - prev)
+            result.max_capture_gap_ms = max(result.max_capture_gap_ms, sample.at_ms - capture_prev)
             prev = sample.at_ms
+            capture_prev = sample.at_ms
     if result.samples.total() > expected:
         raise ValueError("recorded observations exceed the scheduled buckets")
     result.max_ready_gap_ms = max(result.max_ready_gap_ms, end - prev)
+    if result.capture_expected:
+        result.max_capture_gap_ms = max(result.max_capture_gap_ms, end - capture_prev)
     return result
 
 
-def score_window(market: Path, pilot: Path, start: int, entry_end: int, sample_end: int) -> Score:
+def score_window(market: Path, pilot: Path, start: int, entry_end: int, sample_end: int, *,
+                 capture_start: int | None = None) -> Score:
     if not start < entry_end <= sample_end:
         raise ValueError("entry window must fall within the requested sample window")
     samples = load_samples(market, start, sample_end)
     entries = load_entries(pilot, start, entry_end)
-    score = _market_coverage(samples, start, entry_end)
+    score = _market_coverage(samples, start, entry_end, capture_start)
     score.entries = len(entries)
     if not entries:
         return score
@@ -200,14 +218,30 @@ def _arm_lines(pairs: list[Pair], scenario: str) -> list[str]:
     return lines
 
 
-def render(score: Score, start: int, end: int, through: int, *, holdout: bool = False) -> str:
+def render(score: Score, start: int, end: int, through: int, *, holdout: bool = False,
+           include_capture_breakdown: bool = True) -> str:
     verdict, details = decision(score) if holdout else (
         "Not enough evidence for a strategy decision",
         ["This is a descriptive check. The prospective gate runs only after its fixed window and follow-up."],
     )
     missing = score.expected - score.samples.total()
-    regimes = Counter(pair.regime for pair in score.pairs)
+    usable = score.samples["ready"]
     gap_scope = "within any one UTC day" if holdout else "within the requested window"
+    capture = [
+        f"- Since capture began: {usable:,}/{score.capture_expected:,} usable slots "
+        f"({usable / score.capture_expected:.2%}); no recorded sample after capture began: "
+        f"{score.capture_expected - score.samples.total():,}.",
+        f"- Largest span between usable quotes or boundaries since capture began {gap_scope}: "
+        f"{score.max_capture_gap_ms / 1000:,.1f}s.",
+    ] if score.capture_expected else ["- Capture not yet recorded within this window."]
+    coverage = [
+        f"- Full requested window: {usable:,}/{score.expected:,} usable slots; no recorded sample: {missing:,}.",
+        f"- Scheduled slots before first capture: {score.expected - score.capture_expected:,}.",
+        *capture,
+    ] if include_capture_breakdown else [
+        f"- Usable quote slots: {usable:,}/{score.expected:,}; no recorded sample: {missing:,}.",
+    ]
+    regimes = Counter(pair.regime for pair in score.pairs)
     lines = [
         "# BTC paper exit scorecard", "", f"**{verdict}.**", "",
         f"Entry window: `{_utc(start)}` to `{_utc(end)}` (end exclusive).",
@@ -216,7 +250,7 @@ def render(score: Score, start: int, end: int, through: int, *, holdout: bool = 
         *[f"- {detail}" for detail in details],
         "",
         "## Coverage",
-        f"- Usable quote slots: {score.samples['ready']:,}/{score.expected:,}; no recorded sample: {missing:,}.",
+        *coverage,
         f"- Other recorded statuses: {', '.join(f'{k}: {v:,}' for k, v in sorted(score.samples.items()) if k != 'ready') or 'none'}.",
         f"- Largest span between usable quotes or boundaries {gap_scope}: {score.max_ready_gap_ms / 1000:,.1f}s.",
         "- The denominator includes periods before capture. No recorded sample does not by itself prove an outage.",
@@ -254,8 +288,12 @@ def main(argv: list[str] | None = None) -> None:
         if as_of < through:
             parser.error(f"prospective gate opens after {_utc(through)}; no interim verdict")
         score = Score()
+        capture_start = first_sample_at(args.market_db)
         for day in range(start, end, DAY_MS):
-            score.merge(score_window(args.market_db, args.pilot_db, day, day + DAY_MS, day + DAY_MS + FOLLOWUP_MS))
+            score.merge(score_window(
+                args.market_db, args.pilot_db, day, day + DAY_MS, day + DAY_MS + FOLLOWUP_MS,
+                capture_start=capture_start,
+            ))
         filename = "holdout-scorecard.md"
     else:
         if args.start is None:
@@ -269,7 +307,9 @@ def main(argv: list[str] | None = None) -> None:
                 parser.error("choose a past time range of up to seven days")
             filename = "historical-check.md"
         through = end
-        score = score_window(args.market_db, args.pilot_db, start, end, through)
+        score = score_window(
+            args.market_db, args.pilot_db, start, end, through, capture_start=first_sample_at(args.market_db),
+        )
 
     body = render(score, start, end, through, holdout=args.holdout)
     if args.output_dir:
