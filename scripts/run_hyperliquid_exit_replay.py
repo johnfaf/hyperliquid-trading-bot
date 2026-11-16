@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Evaluate the bot's candle-only Arena signal with fixed versus ATR stops offline."""
 from argparse import ArgumentParser
-from contextlib import closing, ExitStack
+from contextlib import closing, contextmanager
 from functools import partial
 import hashlib
 import json
@@ -18,6 +18,25 @@ from src.backtest.replay import network_sandbox
 
 CORE = ("BTC", "ETH")
 CAPITAL = 1000.
+
+
+@contextmanager
+def offline_runtime():
+    if network_sandbox.is_engaged():
+        raise RuntimeError("start each replay in its own process")
+    with TemporaryDirectory(prefix="hl-market-replay-") as scratch:
+        saved = {key: os.environ.get(key) for key in ("HL_BOT_DB", "DB_BACKEND")}
+        os.environ.update(HL_BOT_DB=str(Path(scratch) / "offline.db"), DB_BACKEND="sqlite")
+        try:
+            network_sandbox.engage(allow_loopback=False)
+            yield
+        finally:
+            network_sandbox.disengage()
+            for key, prior in saved.items():
+                if prior is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = prior
 
 
 def load_market(path):
@@ -170,12 +189,7 @@ def main():
         sha = hashlib.file_digest(raw, "sha256").hexdigest()
     created = []
     try:
-        with TemporaryDirectory(prefix="hl-exit-replay-") as sandbox, ExitStack() as stack:
-            os.environ["HL_BOT_DB"] = str(Path(sandbox) / "offline.db")
-            os.environ["DB_BACKEND"] = "sqlite"
-            network_sandbox.engage(allow_loopback=False)
-            stack.callback(network_sandbox.disengage)
-            output = stack.enter_context(trace_path.open("x", encoding="utf-8"))
+        with offline_runtime(), trace_path.open("x", encoding="utf-8") as output:
             created.append(trace_path)
 
             def trace(fold, scope, coin, policy, event):

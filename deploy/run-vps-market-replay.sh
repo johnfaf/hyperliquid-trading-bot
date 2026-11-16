@@ -2,9 +2,20 @@
 # Run from a private Git release archive, with only public market data mounted as input.
 set -euo pipefail
 
-input=$(realpath -e -- "${1:?usage: run-vps-market-replay.sh MARKET_SQLITE NEW_REPORT_DIR}")
-output=$(realpath -m -- "${2:?usage: run-vps-market-replay.sh MARKET_SQLITE NEW_REPORT_DIR}")
+input=$(realpath -e -- "${1:?usage: run-vps-market-replay.sh MARKET_SQLITE NEW_REPORT_DIR [exit|entry]}")
+output=$(realpath -m -- "${2:?usage: run-vps-market-replay.sh MARKET_SQLITE NEW_REPORT_DIR [exit|entry]}")
 release=$(cd -- "$(dirname -- "$0")/.." && pwd)
+case "${3:-exit}" in
+    exit) module=scripts.run_hyperliquid_exit_replay; artifact=exit-test ;;
+    entry) module=scripts.run_hyperliquid_entry_replay; artifact=entry-test ;;
+    *) printf 'Unknown replay type (use exit or entry).\n' >&2; exit 2 ;;
+esac
+shift 2
+if (( $# )); then shift; fi
+if (( $# )) && [[ "$artifact" != entry-test || $# != 2 || "$1" != --forward-from ]]; then
+    printf 'The only optional argument is entry --forward-from UTC_CUTOFF.\n' >&2
+    exit 2
+fi
 [[ -f "$input" ]]
 for dir in "$input" "$output" "$release"; do
     [[ "$dir" != *,* && "$dir" != /srv/hyperliquid-bot && "$dir" != /srv/hyperliquid-bot/* ]]
@@ -16,5 +27,5 @@ sudo -n docker run --rm --network none --read-only --cap-drop ALL --security-opt
     --mount "type=bind,src=$release,dst=/replay,readonly" \
     --mount "type=bind,src=$input,dst=/market.sqlite3,readonly" \
     --mount "type=bind,src=$output,dst=/reports" --workdir /replay --entrypoint python "$image" \
-    -B -m scripts.run_hyperliquid_exit_replay --market /market.sqlite3 \
-    --report /reports/exit-test.md --trace /reports/exit-test.jsonl
+    -B -m "$module" --market /market.sqlite3 \
+    --report "/reports/$artifact.md" --trace "/reports/$artifact.jsonl" "$@"
