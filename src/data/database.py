@@ -1413,6 +1413,32 @@ def open_paper_trade(strategy_id, coin, side, entry_price, size, leverage=1,
                 f"{same_side_count} open positions already exist (limit={same_side_limit})"
             )
 
+        # Observe the real pre-entry book without changing admission or sizing.
+        from src.trading.trade_decision_memory import COPY_CONCENTRATION_STUDY, is_copy_metadata
+
+        if is_copy_metadata(metadata) and normalized_side in {"long", "short"}:
+            copy_peers, measured = 0, True
+            if same_side_count:
+                peers = conn.execute("""
+                    SELECT metadata FROM paper_trades
+                    WHERE LOWER(COALESCE(status, '')) = 'open'
+                      AND UPPER(COALESCE(coin, '')) = ?
+                      AND LOWER(COALESCE(side, '')) = ?
+                """, (normalized_coin, normalized_side)).fetchall()
+                for peer in peers:
+                    raw = peer["metadata"]
+                    try:
+                        fields = raw if isinstance(raw, dict) else json.loads(raw or "{}")
+                    except (TypeError, ValueError):
+                        measured = False
+                        break
+                    if not isinstance(fields, dict):
+                        measured = False
+                        break
+                    copy_peers += is_copy_metadata(fields)
+            if measured:
+                captured["copy_concentration_study"] = {"policy": COPY_CONCENTRATION_STUDY, "peers": copy_peers}
+
         try:
             return _insert_and_get_id(conn, """
                 INSERT INTO paper_trades

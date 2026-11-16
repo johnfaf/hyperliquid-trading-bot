@@ -134,3 +134,10 @@ signal time and available decision inputs. New bot exits store the reason,
 actual trigger when applicable, exit price input and simulated fill with the
 ledger close. Trade details show the exact linked journal events when
 available. Missing historical context is not inferred or backfilled.
+
+The copy concentration study records how many same-asset, same-side copy
+positions were open before each new copy entry. It does not filter trades.
+The comparison drops those overlapping entries from a matched cohort of
+recorded closes and reports net P&L, realized drawdown and omitted winners.
+It does not simulate capital reuse, later opportunities, or a separate
+portfolio path; use it to decide whether a proper replay is warranted.

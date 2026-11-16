@@ -54,6 +54,27 @@
     <div class="desk-empty compact"><p>{{ "Results exceed the review limit. Select a shorter window." if report.limited else "No eligible trades in this view." if report.available else "Paper trade history is unavailable." }}</p></div>
     {% endif %}
   </section>
+  {% if report.scope == "copy" and report.shadow %}
+  {% set shadow = report.shadow %}
+  <section class="desk-panel desk-trades">
+    <div class="desk-panel-heading"><div><h2>Copy concentration study</h2><p>One copy position per asset and side · shadow only</p></div>{{ badge("Observation only") }}</div>
+    {% if shadow.actual %}
+    <div class="desk-table-scroll" tabindex="0" aria-label="Scrollable copy rule comparison">
+      <table class="desk-table review-table">
+        <thead><tr><th scope="col">Observed cohort</th><th scope="col">Closed</th><th scope="col">Realized drawdown</th><th scope="col">Net P&amp;L</th></tr></thead>
+        <tbody>
+          <tr><th scope="row">Current copy entries</th><td>{{ shadow.actual.closed }}</td><td>{{ money(shadow.actual.drawdown) }}</td><td>{{ money(shadow.actual.pnl,true) }}</td></tr>
+          <tr><th scope="row">Omit entries with an existing copy</th><td>{{ shadow.exclusion.closed }}</td><td>{{ money(shadow.exclusion.drawdown) }}</td><td>{{ money(shadow.exclusion.pnl,true) }}</td></tr>
+        </tbody>
+      </table>
+    </div>
+    {% else %}
+    <div class="desk-empty compact"><p>No closed copy trades with a recorded pre-entry check.</p></div>
+    {% endif %}
+    <div class="desk-decision-empty">Tracked: {{ shadow.tracked }} · Without a priced close: {{ shadow.pending }} · Unmeasured entries: {{ shadow.unmeasured }} · Skipped closes: {{ shadow.skipped }} · Missed winners: {{ shadow.missed_winners }}</div>
+    <div class="desk-decision-empty">Same recorded trades and exits. No reallocation or alternate portfolio simulation. Drawdown uses realized closes only.</div>
+  </section>
+  {% endif %}
   <section class="desk-panel desk-trades">
     <div class="desk-panel-heading"><div><h2>Trade records</h2><p>Newest first · up to 50 records</p></div></div>
     {% if report.recent %}

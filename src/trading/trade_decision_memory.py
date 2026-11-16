@@ -30,6 +30,13 @@ COPY_REASONS = {
     "golden_copy": "A tracked golden-wallet signal was selected.",
 }
 
+COPY_CONCENTRATION_STUDY = "copy_one_same_asset_side_v1"
+
+
+def is_copy_metadata(data):
+    return bool(data.get("is_copy_trade") or data.get("source") == "copy_trade"
+                or str(data.get("source_key") or "").startswith("copy_trade:") or data.get("source_trader"))
+
 
 def entry_memory(signal, *, route, reason=None, firewall=None, rotation=None, copy=None):
     """Build a small, versioned record. Do not persist arbitrary provider context."""

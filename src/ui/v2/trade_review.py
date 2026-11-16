@@ -8,7 +8,7 @@ from pathlib import Path
 import sqlite3
 
 import config
-from src.trading.trade_decision_memory import number
+from src.trading.trade_decision_memory import COPY_CONCENTRATION_STUDY, is_copy_metadata, number
 from src.ui.v2.desk import read_sqlite
 
 COLUMNS = "id, coin, side, status, opened_at, closed_at, entry_price, exit_price, size, leverage, pnl, stop_loss, take_profit, metadata"
@@ -50,8 +50,7 @@ def normalize(row):
     entry = as_dict(meta.get("entry_decision"))
     exit = as_dict(meta.get("exit_decision"))
     key = str(meta.get("source_key") or "")
-    is_copy = bool(meta.get("is_copy_trade") or meta.get("source") == "copy_trade"
-                   or key.startswith("copy_trade:") or meta.get("source_trader"))
+    is_copy = is_copy_metadata(meta)
     wallet = str(meta.get("source_trader") or (key.split(":", 1)[1] if key.startswith("copy_trade:") else ""))
     reason = str(exit.get("reason") or meta.get("close_reason") or (
         "manual_dashboard_close" if meta.get("manual_close") is True and meta.get("close_source") == "dashboard" else ""
@@ -71,6 +70,8 @@ def normalize(row):
                     stop_type = "Original stop"
                 elif (side == "long" and trigger > initial_stop) or (side == "short" and trigger < initial_stop):
                     stop_type = "Tightened stop"
+    study = as_dict(entry.get("copy_concentration_study"))
+    peers = study.get("peers")
     trade.update(
         symbol=str(trade["coin"] or "Unknown").strip().upper(), side=side, meta=meta, entry=entry, exit=exit,
         copy=is_copy, wallet=wallet.lower(), reason=reason, stop_type=stop_type, stop_gap_bps=gap,
@@ -80,6 +81,7 @@ def normalize(row):
         excluded=bool(meta.get("tainted") or meta.get("synthetic_reconciliation") or
                       "live_reconciled_closed" in (reason, meta.get("reconciliation_reason"))),
         opened_at=utc_text(trade["opened_at"]), closed_at=utc_text(trade["closed_at"]),
+        study_peers=peers if study.get("policy") == COPY_CONCENTRATION_STUDY and type(peers) is int and peers >= 0 else None,
     )
     return trade
 
@@ -127,6 +129,31 @@ def summary(trades, overlap):
     }
 
 
+def shadow_comparison(trades, start):
+    """Matched exclusions only; no new orders or reallocation in the comparison."""
+    entered = [t for t in trades if t["opened_at"] and stamp(t["opened_at"]) >= start]
+    tracked = [t for t in entered if t["study_peers"] is not None]
+    priced = [t for t in tracked if t["status"] == "closed" and t["pnl"] is not None and t["closed_at"]]
+    retained = [t for t in priced if not t["study_peers"]]
+    skipped = [t for t in priced if t["study_peers"]]
+
+    def metrics(rows):
+        pnl, peak, drawdown = 0., 0., 0.
+        for trade in sorted(rows, key=lambda t: (t["closed_at"], t["id"])):
+            pnl += trade["pnl"]
+            peak = max(peak, pnl)
+            drawdown = max(drawdown, peak - pnl)
+        return {"pnl": pnl, "drawdown": drawdown, "closed": len(rows)}
+
+    return {
+        "tracked": len(tracked), "unmeasured": len(entered) - len(tracked),
+        "pending": len(tracked) - len(priced), "skipped": len(skipped),
+        "missed_winners": sum(t["pnl"] > 0 for t in skipped),
+        "actual": metrics(priced) if priced else None,
+        "exclusion": metrics(retained) if priced else None,
+    }
+
+
 def review(days=7, group="source", scope="copy", *, path=None, now=None):
     now = now or datetime.now(timezone.utc)
     start = now - timedelta(days=days)
@@ -163,7 +190,8 @@ def review(days=7, group="source", scope="copy", *, path=None, now=None):
                  if group == "side" else members[0]["source"].replace("_", " "))
         output.append({"label": label, **summary(members, overlap)})
     output.sort(key=lambda row: (row["pnl"] is None, row["pnl"] or 0, row["label"]))
-    base.update(summary=summary(eligible, overlap), groups=output[:100], peak=max(peaks.values(), default=None))
+    base.update(summary=summary(eligible, overlap), groups=output[:100], peak=max(peaks.values(), default=None),
+                shadow=shadow_comparison(copy, start))
     return base
 
 

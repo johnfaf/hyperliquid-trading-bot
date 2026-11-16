@@ -44,6 +44,10 @@
           {{ evidence_row("Followed source entry price", copy.get("source_entry_price")) }}
           {{ evidence_row("Copy entry lag", "{:.1f} bps".format(copy.lag_bps) if copy.get("lag_bps") is not none else none) }}
         {% endif %}
+        {% if trade.copy %}
+          {{ evidence_row("Matching copies already open", trade.study_peers) }}
+          {% if trade.study_peers is not none %}{{ evidence_row("Shadow concentration rule", "Would omit" if trade.study_peers else "Would keep") }}{% endif %}
+        {% endif %}
       </dl>
     </section>
     <section class="desk-panel">

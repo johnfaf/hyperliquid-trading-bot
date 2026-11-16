@@ -9,7 +9,7 @@ import pytest
 
 import config
 from src.data import database as db
-from src.trading.trade_decision_memory import entry_memory
+from src.trading.trade_decision_memory import COPY_CONCENTRATION_STUDY, entry_memory
 from src.ui.v2.app import create_app
 from src.ui.v2.trade_review import detail, review
 
@@ -86,6 +86,31 @@ def test_detail_only_links_an_exact_record_and_never_guesses(ledger):
     assert detail(3, path=path)["stop_type"] == "Unverified stop"
 
 
+def test_copy_snapshot_uses_open_paper_book_and_does_not_block(monkeypatch):
+    db.init_db()
+    monkeypatch.setattr(db, "_same_side_open_trade_limit", lambda: 4)
+    db.open_paper_trade(None, "BTC", "long", 100, 1, metadata={"source": "strategy"})
+    first = db.open_paper_trade(None, "BTC", "long", 100, 1, metadata={"source": "copy_trade"})
+    second = db.open_paper_trade(None, "BTC", "long", 100, 1, metadata={"source": "copy_trade"})
+    assert detail(first)["study_peers"] == 0
+    assert detail(second)["study_peers"] == 1
+    assert detail(second)["status"] == "open"
+
+
+def test_shadow_comparison_uses_only_measured_closes_and_counts_missed_winners(ledger):
+    path, now = ledger
+    with closing(sqlite3.connect(path)) as conn, conn:
+        for tid, peers in [(1, 0), (2, 1)]:
+            meta = json.loads(conn.execute("SELECT metadata FROM paper_trades WHERE id=?", (tid,)).fetchone()[0])
+            meta["entry_decision"] = {"copy_concentration_study": {"policy": COPY_CONCENTRATION_STUDY, "peers": peers}}
+            conn.execute("UPDATE paper_trades SET metadata=? WHERE id=?", (json.dumps(meta), tid))
+    shadow = review(path=path, now=now)["shadow"]
+    assert shadow["tracked"] == 2 and shadow["unmeasured"] == 2
+    assert shadow["skipped"] == shadow["missed_winners"] == 1
+    assert shadow["actual"] == {"closed": 2, "pnl": -1, "drawdown": 4}
+    assert shadow["exclusion"] == {"closed": 1, "pnl": -4, "drawdown": 4}
+
+
 def test_trade_memory_is_written_at_open_and_not_overwritten_by_duplicate_close():
     db.init_db()
     saved = db.get_paper_account()
@@ -131,6 +156,7 @@ def test_review_requires_sign_in_and_exposes_trade_details(ledger, monkeypatch):
     response = client.get("/trades?days=1&group=asset")
     assert response.status_code == 200
     assert "BTC Long" in response.text and 'href="/trades/1"' in response.text
+    assert "Copy concentration study" in response.text and "No closed copy trades with a recorded pre-entry check." in response.text
     response = client.get("/trades/1")
     assert response.status_code == 200
     assert "Followed wallet increased BTC long exposure" in response.text
