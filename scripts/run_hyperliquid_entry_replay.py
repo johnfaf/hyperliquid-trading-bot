@@ -13,6 +13,8 @@ from src.backtest.candle_entry_replay import (
     FILTERS, HORIZONS, LOOKBACK_MS, block_intervals, fit_filter, match_entries, materialize, summarize,
 )
 from src.backtest.candle_exit_replay import BASE_SLIPPAGE_BPS, STRESS_SLIPPAGE_BPS, arena_decisions
+from src.backtest.range_rejection_replay import range_rejection_decisions
+from src.signals.range_rejection import VOLUME_SPIKE_RATIO
 
 WEEK = 7 * DAY
 
@@ -42,8 +44,18 @@ def windows(meta, forward_from=None):
     return [(end - n * WEEK, end - (n - 1) * WEEK) for n in (3, 2, 1)]
 
 
-def evaluate(markets, ranges, trace=None):
-    prepared = {coin: (bars, arena_decisions(coin, bars), funding) for coin, (bars, funding) in markets.items()}
+def evaluate(markets, ranges, trace=None, *, signal="arena"):
+    if signal not in {"arena", "failed-breakout"}:
+        raise ValueError("unrecognized replay signal")
+    prepared, volume_ratios, strata = {}, {}, {}
+    for coin, (bars, funding) in markets.items():
+        if signal == "failed-breakout":
+            decisions, ratios = range_rejection_decisions(bars)
+            volume_ratios[coin] = ratios
+            strata[coin] = [ratio >= VOLUME_SPIKE_RATIO if ratio is not None else None for ratio in ratios]
+        else:
+            decisions = arena_decisions(coin, bars)
+        prepared[coin] = (bars, decisions, funding)
     other = tuple(coin for coin in prepared if coin not in CORE)
     results = {}
     for name, holding in HORIZONS.items():
@@ -58,17 +70,24 @@ def evaluate(markets, ranges, trace=None):
                 rows, coverage = [], Counter()
                 for coin in coins:
                     bars, decisions, funding = prepared[coin]
-                    matches, counts = match_entries(bars, decisions, start, end, holding, used[coin])
+                    matches, counts = match_entries(bars, decisions, start, end, holding, used[coin], strata=strata.get(coin))
                     coverage.update(counts)
                     scored = materialize(coin, bars, decisions, funding, matches, holding, BASE_SLIPPAGE_BPS, STRESS_SLIPPAGE_BPS)
                     if trace:
-                        for row in scored:
-                            trace({"study": "unfiltered", "week": index, "scope": scope, "horizon": name, **row})
+                        for match, row in zip(matches, scored):
+                            event = {"study": "unfiltered", "week": index, "scope": scope, "horizon": name, **row}
+                            if coin in volume_ratios:
+                                ratios = volume_ratios[coin]
+                                event.update(study=signal, signal_volume_ratio=ratios[match.signal],
+                                             control_volume_ratio=ratios[match.control] if match.control is not None else None)
+                            trace(event)
                     rows.extend(scored)
                 scopes[scope] = {"rows": rows, "summary": summarize(rows), "coverage": coverage}
                 total[scope].extend(rows)
             weeks.append(scopes)
         results[name] = {"weeks": weeks, "total": total}
+    if signal == "failed-breakout":
+        return results
     used = {coin: set() for coin in CORE}
     core = [prepared[coin] for coin in CORE]
     training = []
@@ -98,7 +117,7 @@ def row_metrics(result):
             f"{bps(stress['signal'])} / {bps(stress['control'])} | {bps(stress['lift'])} | {bps(stress['all'])}")
 
 
-def render(meta, markets, ranges, results, captured_sha, forward_from):
+def render(meta, markets, ranges, results, captured_sha, forward_from, *, signal="arena"):
     primary = results["4h"]["total"]["BTC+ETH"]
     summary = summarize(primary)
     intervals = block_intervals(primary)
@@ -111,17 +130,25 @@ def render(meta, markets, ranges, results, captured_sha, forward_from):
         result = "Positive under the declared post-cutoff screen; review dataset provenance and shadow-test. Not approved for trading."
     else:
         result = "Did not meet the post-cutoff screen. Do not change trading rules on this result."
+    if signal == "failed-breakout":
+        rule = ("Frozen failed-breakout rule: a closed 15m candle crosses one edge of the prior 8h range by at least "
+                "0.10 prior ATR and closes at least 0.25 prior ATR back inside that edge. Volume must be at least "
+                "1.5x the prior 24h median. Fade that rejected side; abstain when both edges break. No parameter search. "
+                "Stops, take profit, and position sizing are deliberately removed. ")
+        extra_control = "Both signal and control must have volume at least 1.5x their own prior 24h median. Match prior-bar ATR. "
+    else:
+        rule = "The Arena trend-following entry rule is frozen; stops, take profit, and position sizing are deliberately removed. "
+        extra_control = ""
     lines = ["# Hyperliquid entry-edge screen", "", f"**{result}**", "",
              f"Source capture: {iso(meta['captured_ms'])}, SHA-256 `{captured_sha}`. Markets: {', '.join(markets)}.",
              "Primary test: BTC/ETH at a four-hour hold. One hour and the other ranked coins are diagnostics, not extra chances to pass.",
-             "The Arena trend-following entry rule is frozen; stops, take profit, and position sizing are deliberately removed. "
-             "Returns are per initial traded dollar. Enter at the next open and exit at the scheduled open, with actual historical "
+             rule + "Returns are per initial traded dollar. Enter at the next open and exit at the scheduled open, with actual historical "
              "hourly funding (open price notional proxy), 4.5 bps taker fee per side, and 5/12 bps adverse fill slippage per side.",
              "", "Each control is an earlier neutral (no-signal) bar on the same asset, assigned the same direction as the signal. "
              "Match the same 8-hour UTC session and trailing 24h regime, with ATR within a factor of 1.5. Choose the closest ATR "
              "relative to the signal within 14 days; tie-break by recency. The control must finish a full bar before the signal. "
              "Skip overlapping signal horizons and never reuse a control holding window within a coin/horizon across scored weeks. "
-             "Choose both entries before evaluating any return.", "",
+             + extra_control + "Choose both entries before evaluating any return.", "",
              "The net return and matched lift both matter: beating a losing control is not an edge. A later positive screen needs "
              "at least two complete weeks with 50 matched core pairs and 14 matched UTC days, positive net on all eligible core "
              "signals, and a positive lower band on both matched net and lift. The bootstrap uses 95% exploratory bands "
@@ -157,7 +184,16 @@ def render(meta, markets, ranges, results, captured_sha, forward_from):
             label = {1: "Long", -1: "Short"}[value] if field == "side" else value
             lines.append(f"| {label} | {part['pairs']} / {part['signals']} | {bps(part['adverse']['signal'])} / "
                          f"{bps(part['adverse']['control'])} | {bps(part['adverse']['lift'])} |")
-    lines += ["", "### Repeated entry-filter fitting (BTC/ETH, 4h only)", "",
+    if "training" in results:
+        lines.extend(render_filter_training(results["training"]))
+    lines.extend(["", "This is a diagnostic of one candle-only signal, with simulated fills. It is not the full bot, a copy trade "
+                        "replay, a portfolio return, or authorization to trade. Matching on observed features does not remove "
+                        "unmeasured differences between older control bars and signal bars. No trading settings were changed.", ""])
+    return "\n".join(lines)
+
+
+def render_filter_training(training):
+    lines = ["", "### Repeated entry-filter fitting (BTC/ETH, 4h only)", "",
               "Eight predeclared trade filters: all, three confidence thresholds, trend alignment, trend alignment plus confidence, "
               "choppy plus confidence, and low ATR plus confidence. Fit them on two completed seven-day training blocks ending "
               "one bar before each test. Require at least 30 training trades overall, ten in each block, and positive stressed net "
@@ -165,19 +201,16 @@ def render(meta, markets, ranges, results, captured_sha, forward_from):
               "Only the frozen winner is scored again on the following window; no retry after seeing it.", "",
               "| Week | Chosen before test | Matched / eligible | Base signal / control | Stress signal / control | Stress lift | All eligible signals, stress |",
               "| --- | --- | ---: | ---: | ---: | ---: | ---: |"]
-    for index, item in enumerate(results["training"], 1):
+    for index, item in enumerate(training, 1):
         choice = item["selected"]
         lines.append(f"| {index} | {choice} | {row_metrics(item['test'])} |")
     lines += ["", "| Test week | Candidate | Earlier week stress bps / n | Later week stress bps / n | Qualified on training |",
               "| --- | --- | ---: | ---: | --- |"]
-    for index, item in enumerate(results["training"], 1):
+    for index, item in enumerate(training, 1):
         for candidate in item["comparisons"]:
             cells = " | ".join(f"{bps(x['net'])} / {x['n']}" for x in candidate["segments"])
             lines.append(f"| {index} | {candidate['name']} | {cells} | {'yes' if candidate['qualifies'] else 'no'} |")
-    lines.extend(["", "This is a diagnostic of one candle-only signal, with simulated fills. It is not the full bot, a copy trade "
-                        "replay, a portfolio return, or authorization to trade. Matching on observed features does not remove "
-                        "unmeasured differences between older control bars and signal bars. No trading settings were changed.", ""])
-    return "\n".join(lines)
+    return lines
 
 
 def main():
@@ -185,6 +218,7 @@ def main():
     parser.add_argument("--market", required=True, type=Path)
     parser.add_argument("--report", required=True, type=Path)
     parser.add_argument("--trace", required=True, type=Path)
+    parser.add_argument("--signal", choices=("arena", "failed-breakout"), default="arena")
     parser.add_argument("--forward-from", type=date_ms, help="Predeclared cutoff; score only complete weeks after it")
     args = parser.parse_args()
     market, report, trace_path = (p.resolve() for p in (args.market, args.report, args.trace))
@@ -201,10 +235,11 @@ def main():
     try:
         with offline_runtime(), trace_path.open("x", encoding="utf-8") as output:
             created.append(trace_path)
-            results = evaluate(markets, ranges, lambda event: print(json.dumps(event, allow_nan=False), file=output))
+            results = evaluate(markets, ranges, lambda event: print(json.dumps(event, allow_nan=False), file=output),
+                               signal=args.signal)
         with report.open("x", encoding="utf-8") as target:
             created.append(report)
-            target.write(render(meta, markets, ranges, results, sha, args.forward_from))
+            target.write(render(meta, markets, ranges, results, sha, args.forward_from, signal=args.signal))
     except BaseException:
         for path in created:
             path.unlink(missing_ok=True)

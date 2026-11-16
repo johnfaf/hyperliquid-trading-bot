@@ -51,13 +51,20 @@ def eligible_entries(bars, decisions, start, end, horizon, accept=None):
     return entries, counts
 
 
-def match_entries(bars, decisions, start, end, horizon, used_controls, accept=None):
+def match_entries(bars, decisions, start, end, horizon, used_controls, accept=None, *, strata=None):
     """Choose pairs using past entry covariates only. Outcomes are not an input."""
     entries, counts = eligible_entries(bars, decisions, start, end, horizon, accept)
+    if strata is not None and len(strata) != len(bars):
+        raise ValueError("control strata must align to the market bars")
+
+    def group(i):
+        key = _stratum(bars[i], decisions[i])
+        return key if strata is None else (*key, strata[i])
+
     neutral = defaultdict(list)
-    for i, (bar, d) in enumerate(zip(bars, decisions)):
+    for i, d in enumerate(decisions):
         if d.side == 0 and d.atr_pct and math.isfinite(d.atr_pct) and d.atr_pct > 0:
-            neutral[_stratum(bar, d)].append(i)
+            neutral[group(i)].append(i)
     result = []
     earliest = bars[0].t
     max_age_bars = LOOKBACK_MS // BAR_MS
@@ -65,7 +72,7 @@ def match_entries(bars, decisions, start, end, horizon, used_controls, accept=No
         bar, d = bars[i], decisions[i]
         control = None
         if d.atr_pct and math.isfinite(d.atr_pct) and d.atr_pct > 0 and bar.t - LOOKBACK_MS >= earliest:
-            available = neutral[_stratum(bar, d)]
+            available = neutral[group(i)]
             lo = bisect_left(available, i - max_age_bars)
             # The historical control exit must be at least one bar before this decision.
             hi = bisect_right(available, i - 1 - horizon)

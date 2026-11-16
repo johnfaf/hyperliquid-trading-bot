@@ -35,18 +35,31 @@ class Decision:
     regime: str
 
 
+def candle_atr(bars):
+    import numpy as np
+
+    from src.backtest.candle_backtester import _atr
+
+    return _atr(*(np.array([getattr(b, name) for b in bars], dtype=float) for name in ("high", "low", "close")), ATR_PERIOD)
+
+
+def trailing_regime(bars, index):
+    reference = bars[max(0, index - 96)].close
+    change = bars[index].close / reference - 1
+    return "rising" if change >= .02 else "falling" if change <= -.02 else "choppy"
+
+
 def arena_decisions(coin, bars):
     """Run the bot's champion entry generator on bounded completed-bar prefixes."""
     import numpy as np
 
-    from src.backtest.candle_backtester import _atr
     from src.signals.alpha_arena import ArenaAgent, Backtester
 
     backtester = Backtester()
     agent = ArenaAgent("offline-trend", "Frozen trend following", "trend_following", params={"confidence_threshold": 0.5})
     historical = [{"timestamp": b.t, "open": b.open, "high": b.high, "low": b.low, "close": b.close, "volume": b.volume}
                   for b in bars]
-    atr = _atr(*(np.array([getattr(b, name) for b in bars], dtype=float) for name in ("high", "low", "close")), ATR_PERIOD)
+    atr = candle_atr(bars)
     decisions = []
     with np.errstate(divide="ignore"):
         for i, bar in enumerate(bars):
@@ -55,12 +68,9 @@ def arena_decisions(coin, bars):
                 continue
             visible = historical[max(0, i - 99):i + 1]
             signal = backtester._agent_generate_signal(agent, visible, visible[-1], coin=coin)
-            past = bars[max(0, i - 96)].close
-            change = bar.close / past - 1
-            regime = "rising" if change >= .02 else "falling" if change <= -.02 else "choppy"
             decisions.append(Decision({"long": 1, "short": -1}[signal["side"]] if signal else 0,
                                       float(signal["confidence"]) if signal else 0.0,
-                                      float(atr[i] / bar.close), regime))
+                                      float(atr[i] / bar.close), trailing_regime(bars, i)))
     return decisions
 
 
