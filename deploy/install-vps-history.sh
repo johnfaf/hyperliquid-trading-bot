@@ -8,7 +8,8 @@ release=$(cd -- "$(dirname -- "$0")/.." && pwd)
 base=/opt/hyperliquid-history
 destination="$base/$revision"
 
-sudo -n install -d -m 0755 "$base" "$destination"
+sudo -n install -d -m 0755 "$base" "$destination" "$destination/scripts" "$destination/src" \
+    "$destination/src/backtest" "$destination/src/data" "$destination/src/trading"
 for file in scripts/import_trading_history.py scripts/run_copy_walk_forward.py src/backtest/history_archive.py \
     src/data/decision_coverage.py src/trading/copy_shadow_report.py src/trading/trade_decision_memory.py; do
     sudo -n install -D -m 0644 "$release/$file" "$destination/$file"
