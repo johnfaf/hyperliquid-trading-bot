@@ -117,8 +117,8 @@ def test_funding_health_distinguishes_not_due_pending_and_overdue(tmp_path):
     path = tmp_path / "bot.db"
     hour = NOW.replace(minute=0)
     with closing(sqlite3.connect(path)) as conn, conn:
-        conn.execute("CREATE TABLE paper_trades(coin,side,size,leverage,opened_at,closed_at,metadata,status)")
-        conn.execute("INSERT INTO paper_trades VALUES ('BTC','long',1,2,?,NULL,?,'open')",
+        conn.execute("CREATE TABLE paper_trades(coin,side,size,leverage,opened_at,closed_at,metadata,status,pnl)")
+        conn.execute("INSERT INTO paper_trades VALUES ('BTC','long',1,2,?,NULL,?,'open',NULL)",
                      ((hour-timedelta(minutes=15)).isoformat(), json.dumps({"paper_funding_model": MODEL})))
     assert funding_health(path, hour-timedelta(seconds=1))["open_due"] == 0
     assert funding_health(path, hour+timedelta(minutes=1))["pending_hours"] == 1
@@ -127,6 +127,28 @@ def test_funding_health_distinguishes_not_due_pending_and_overdue(tmp_path):
     settlement(FundingLedger(ledger_path(path)), millis(hour), 0, 100)
     report = funding_health(path, NOW)
     assert report["state"] == "Open settlements measured" and report["overdue_hours"] == 0
+
+
+def test_funding_health_groups_missing_and_bad_arithmetic_by_exit(tmp_path):
+    path = tmp_path/"bot.db"
+    opened, closed = NOW-timedelta(minutes=30), NOW-timedelta(seconds=1)
+    ledger = FundingLedger(ledger_path(path))
+    trade = {"coin": "BTC", "side": "long", "size": 1, "leverage": 1, "opened_at": opened.isoformat()}
+    missing = ledger.position(trade, now=closed)
+    settlement(ledger, millis(NOW)//HOUR*HOUR, .001, 100)
+    measured = ledger.position(trade, now=closed)
+    with closing(sqlite3.connect(path)) as conn, conn:
+        conn.execute("CREATE TABLE paper_trades(coin,side,size,leverage,opened_at,closed_at,metadata,status,pnl)")
+        for reason, coverage, pnl in (("stop_loss", missing, 10), ("time_limit", measured, 10), ("take_profit", measured, 9.9)):
+            meta = {"paper_funding_model": MODEL, "close_reason": reason, "funding_coverage": coverage,
+                    "funding_accrued": .1, "total_fees_paid": 0, "gross_pnl_before_fees": 10}
+            conn.execute("INSERT INTO paper_trades VALUES ('BTC','long',1,1,?,?,?,'closed',?)",
+                         (opened.isoformat(), closed.isoformat(), json.dumps(meta), pnl))
+    result = funding_health(path, NOW)
+    assert result["verified_closes"] == 1 and result["unverified_closes"] == 2
+    assert result["by_exit"]["stop_loss"]["missing_receipt"] == 1
+    assert result["by_exit"]["time_limit"]["cost_mismatch"] == 1
+    assert result["by_exit"]["take_profit"]["verified"] == 1
 
 
 def test_rule_identity_ignores_deploy_commit_but_not_config_or_strategy_params(monkeypatch):

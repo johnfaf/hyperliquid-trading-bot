@@ -6,6 +6,12 @@
     <div><div class="desk-kicker">{{ icon("activity",15) }} Hyperliquid</div><h1>Research</h1><p class="desk-muted">Separate ledgers &middot; No live approval</p></div>
     <div class="desk-actions"><a class="text-sm text-sky-300 underline" href="/trades?scope=all">Trade review</a><a class="desk-icon-btn" href="/research" title="Refresh research" aria-label="Refresh research">{{ icon("refresh") }}</a></div>
   </header>
+  <section class="desk-panel" id="release-review">
+    <div class="desk-panel-heading"><div><h2>Release review</h2><p>Paper and shadow evidence</p></div>{{ badge("Live entries locked", "warn") }}</div>
+    <dl class="desk-settings-list evidence-list">
+      {% for row in promotion_review %}<div><dt>{{ row.check }}</dt><dd>{{ row.result }}</dd></div>{% endfor %}
+    </dl>
+  </section>
   <section class="desk-panel" id="strategy-evidence">
     <div class="desk-panel-heading"><div><h2>Strategy evidence</h2><p>Last 30 days &middot; Verified paper outcomes</p></div>{{ badge("Live entries locked", "warn") }}</div>
     {% if not evidence.available %}
@@ -42,6 +48,12 @@
       <div><span>Open modeled positions</span><strong>{{ funding_health.active }}</strong><small>{{ funding_health.open_due }} crossed a settlement hour{% if funding_health.invalid_open %} &middot; {{ funding_health.invalid_open }} invalid{% endif %}</small></div>
       <div><span>Missing position-hours</span><strong>{{ funding_health.overdue_hours }}</strong><small>{{ funding_health.pending_hours }} awaiting publication</small></div>
     </div>
+    {% if funding_health.get("by_exit") %}
+    <div class="desk-table-scroll" tabindex="0" aria-label="Cross-hour close evidence by exit reason">
+      <table class="desk-table"><thead><tr><th>Exit reason</th><th>Verified</th><th>Missing receipt</th><th>Invalid receipt</th><th>Cost mismatch</th></tr></thead>
+      <tbody>{% for reason, row in funding_health.by_exit|dictsort %}<tr><th scope="row">{{ reason|replace("_", " ") }}</th><td>{{ row.verified }}</td><td>{{ row.missing_receipt }}</td><td>{{ row.invalid_receipt }}</td><td>{{ row.cost_mismatch }}</td></tr>{% endfor %}</tbody></table>
+    </div>
+    {% endif %}
   </section>
   {% endif %}
   <section class="desk-panel">

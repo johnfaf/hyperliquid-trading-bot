@@ -183,43 +183,44 @@ def ensure_paper_entry_risk(conn, *, coin, side, entry, size, leverage, stop, me
     """Called while the authoritative paper admission transaction is locked."""
     import config
     from src.trading.paper_reporting import fields
+    from src.trading.paper_risk import PaperEntryBlocked
     if not config.PAPER_PORTFOLIO_GUARD_ENABLED:
         return
     if fields(metadata.get("entry_decision")).get("firewall") != "approved":
-        raise ValueError("paper entry has no recorded firewall approval")
+        raise PaperEntryBlocked("approval_missing", "paper entry has no recorded firewall approval")
     state = paper_status(now=utc(now))
     if state["blocked"]:
-        raise ValueError("paper portfolio risk: "+state["reason"])
+        raise PaperEntryBlocked("portfolio_equity_risk", "paper portfolio risk: "+state["reason"])
     account = conn.execute("SELECT balance FROM paper_account WHERE id=1").fetchone()
     if not account or amount(account["balance"]) is None:
-        raise ValueError("paper balance unavailable")
+        raise PaperEntryBlocked("paper_balance_unavailable", "paper balance unavailable")
     basis = min(float(account["balance"]), state["equity"])
     marks_row = conn.execute("SELECT value FROM bot_state WHERE key='paper_mark_prices'").fetchone()
     marks = fields(marks_row["value"]) if marks_row else {}
     seen = marks.get("observed_at")
     positions = conn.execute("SELECT coin,side,entry_price,size,leverage,stop_loss FROM paper_trades WHERE status='open'").fetchall()
     if positions and (not seen or not 0 <= (utc(now)-utc(seen)).total_seconds() <= 900):
-        raise ValueError("paper portfolio marks unavailable or stale")
+        raise PaperEntryBlocked("portfolio_marks_unavailable", "paper portfolio marks unavailable or stale")
     slip = max(config.PAPER_TRADING_SLIPPAGE_MIN_BPS, config.PAPER_TRADING_SLIPPAGE_MAX_BPS, 0.)/10000
     fee = max(config.PAPER_TRADING_TAKER_FEE_BPS, config.PAPER_TRADING_MAKER_FEE_BPS, 0.)/10000
 
     def risk(direction, mark, fill_entry, quantity, lev, trigger):
         values = tuple(amount(v) for v in (mark, fill_entry, quantity, lev, trigger))
         if None in values or min(values) <= 0 or direction not in {"long", "short"}:
-            raise ValueError("paper position protection or marks are unmeasured")
+            raise PaperEntryBlocked("position_risk_unmeasured", "paper position protection or marks are unmeasured")
         mark, fill_entry, quantity, lev, trigger = values
         fill = trigger*(1-slip if direction == "long" else 1+slip)
         distance = max(0., mark-fill if direction == "long" else fill-mark)
         return quantity*lev*(distance+(fill_entry+fill)*fee)
 
     if not ((side == "long" and stop is not None and stop < entry) or (side == "short" and stop is not None and stop > entry)):
-        raise ValueError("paper initial stop is invalid")
+        raise PaperEntryBlocked("initial_stop_invalid", "paper initial stop is invalid")
     candidate = risk(side, entry, entry, size, leverage, stop)
     if config.PAPER_MAX_PLANNED_STOP_LOSS_PCT > 0 and candidate > basis*config.PAPER_MAX_PLANNED_STOP_LOSS_PCT+1e-8:
-        raise ValueError("paper per-entry stop risk exceeded")
+        raise PaperEntryBlocked("per_entry_stop_budget", "paper per-entry stop risk exceeded")
     total = candidate
     for trade in positions:
         total += risk(trade["side"], fields(marks.get("mids")).get(trade["coin"]), trade["entry_price"],
                       trade["size"], trade["leverage"], trade["stop_loss"])
     if total > basis*config.PAPER_MAX_OPEN_STOP_RISK_PCT+1e-8:
-        raise ValueError("paper portfolio stop-risk budget exceeded")
+        raise PaperEntryBlocked("portfolio_stop_budget", "paper portfolio stop-risk budget exceeded")

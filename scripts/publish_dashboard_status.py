@@ -183,6 +183,28 @@ def forward_shadow_status(path, now):
     return {"state": state, **stamps, "results": results if len(results) == 2 else None, "stale": age > 7200}
 
 
+def offhost_restore_status(path, now):
+    data = load_object(path, max_bytes=4096)
+    revision = data.get("revision")
+    digest = data.get("encrypted_sha256")
+    names = data.get("files")
+    if (data.get("verified") is not True or not isinstance(revision, str) or not re.fullmatch("[a-f0-9]{40}", revision)
+            or not isinstance(digest, str) or not re.fullmatch("[a-f0-9]{64}", digest) or not isinstance(names, list)
+            or not all(isinstance(n, str) for n in names)
+            or not {"bot.db", "decisions.db", "risk.db", "funding.db", "stock.db"} <= set(names)):
+        return None
+    try:
+        verified = datetime.fromisoformat(data["verified_at"])
+        snapshot = datetime.fromisoformat(data["snapshot_at"])
+        if not (snapshot.tzinfo and verified.tzinfo and snapshot <= verified <= now):
+            return None
+        age = now - snapshot
+    except (KeyError, ValueError, TypeError):
+        return None
+    return {"snapshot_at": snapshot.isoformat(), "verified_at": verified.isoformat(), "revision": revision,
+            "stale": age > timedelta(days=7)}
+
+
 def daily_copy_report(path, directory, now):
     from src.trading.copy_shadow_report import build_daily, markdown
 
@@ -345,6 +367,7 @@ def main() -> None:
     parser.add_argument("--copy-report-dir", type=Path)
     parser.add_argument("--absorption-report", type=Path, default=Path("/var/lib/hyperliquid-absorption/reports/latest.json"))
     parser.add_argument("--forward-report", type=Path, default=Path("/var/lib/hyperliquid-forward-shadow/latest.json"))
+    parser.add_argument("--offhost-restore", type=Path, default=Path("/var/lib/hyperliquid-dashboard/offhost-restore.json"))
     args = parser.parse_args()
     if bool(args.paper_db) != bool(args.copy_report_dir):
         parser.error("--paper-db and --copy-report-dir must be used together")
@@ -359,6 +382,7 @@ def main() -> None:
     now = datetime.now(UTC)
     snapshot["absorption"] = absorption_status(args.absorption_report, now)
     snapshot["forward_shadow"] = forward_shadow_status(args.forward_report, now)
+    snapshot["offhost_restore"] = offhost_restore_status(args.offhost_restore, now)
     if args.paper_db:
         from src.data.decision_coverage import read_report
         from src.trading.paper_funding_health import funding_health

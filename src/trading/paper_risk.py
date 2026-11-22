@@ -4,15 +4,23 @@ import math
 import config
 
 
+class PaperEntryBlocked(ValueError):
+    """An intentional admission denial, not a failed execution."""
+
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+
+
 def size_for_planned_stop(
     *, balance: float, side: str, entry: float, stop: float, size: float,
     leverage: float, execution_role: str,
 ) -> tuple[float, dict[str, float]]:
     """Cap size using planned stop distance, modeled exit slippage and fees."""
     if not all(math.isfinite(v) and v > 0 for v in (balance, entry, stop, size, leverage)):
-        raise ValueError("invalid paper position or stop")
+        raise PaperEntryBlocked("invalid_position_or_stop", "invalid paper position or stop")
     if not ((side == "long" and stop < entry) or (side == "short" and stop > entry)):
-        raise ValueError("initial stop is on the wrong side of the paper fill")
+        raise PaperEntryBlocked("wrong_side_stop", "initial stop is on the wrong side of the paper fill")
 
     slippage = max(config.PAPER_TRADING_SLIPPAGE_MIN_BPS, config.PAPER_TRADING_SLIPPAGE_MAX_BPS, 0.0) / 10_000
     stop_fill = stop * (1 - slippage if side == "long" else 1 + slippage)

@@ -190,6 +190,7 @@ sudo -n systemctl enable --now hyperliquid-stock-paper-report.timer
 sudo -n systemctl start hyperliquid-stock-paper-report.service
 
 sudo -n install -D -m 0644 "$release/scripts/publish_dashboard_status.py" /opt/hyperliquid-dashboard/publish_dashboard_status.py
+sudo -n install -D -m 0644 "$release/scripts/recovery_bundle.py" /opt/hyperliquid-recovery/recovery_bundle.py
 for file in src/trading/alpaca_paper.py src/trading/order_journal.py src/trading/stock_evidence.py \
     src/core/clock_provider.py src/backtest/replay/clock.py src/trading/trade_decision_memory.py src/trading/equity_risk.py \
     src/trading/copy_shadow_report.py src/trading/paper_reporting.py src/trading/paper_funding.py \

@@ -95,6 +95,7 @@ async def research(request: Request):
         return RedirectResponse("/login", status_code=303)
     from src.ui.v2.app import get_templates
     from src.learning.strategy_evidence import scorecard
+    from src.learning.promotion_review import review
     host = await run_in_threadpool(host_status, Path(config.DB_PATH).with_name("dashboard_ops.json"), datetime.now(timezone.utc))
     evidence = await run_in_threadpool(get_ttl, "strategy-evidence", 30,
                                        lambda: scorecard(config.DB_PATH, now=datetime.now(timezone.utc)))
@@ -102,6 +103,7 @@ async def research(request: Request):
         "title": "Research", "study": host.get("absorption"), "weekly": host.get("weekly"), "evidence": evidence,
         "forward_shadow": host.get("forward_shadow"), "funding_health": host.get("paper_funding"),
         "funding_worker": (host.get("jobs") or {}).get("paper_funding") or {},
+        "promotion_review": review(evidence, host),
     })
 
 

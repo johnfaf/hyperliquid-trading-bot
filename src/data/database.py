@@ -1401,12 +1401,13 @@ def open_paper_trade(strategy_id, coin, side, entry_price, size, leverage=1,
                 return int(existing["id"])
 
         from src.trading.equity_risk import ensure_paper_entry_risk
+        from src.trading.paper_risk import PaperEntryBlocked
         ensure_paper_entry_risk(conn, coin=coin, side=_normalize_trade_side_value(side), entry=entry_price,
                                 size=size, leverage=leverage, stop=stop_loss, metadata=metadata, now=now)
         normalized_coin = _normalize_coin_value(coin)
         normalized_side = _normalize_trade_side_value(side)
         if not normalized_coin or normalized_side not in {"long", "short"}:
-            raise ValueError("Paper entry requires an asset and long/short side")
+            raise PaperEntryBlocked("invalid_asset_or_side", "Paper entry requires an asset and long/short side")
         opposing = conn.execute("""
             SELECT id FROM paper_trades
             WHERE LOWER(COALESCE(status, '')) = 'open'
@@ -1414,7 +1415,7 @@ def open_paper_trade(strategy_id, coin, side, entry_price, size, leverage=1,
               AND LOWER(TRIM(COALESCE(side, ''))) != ? LIMIT 1
         """, (normalized_coin, normalized_side)).fetchone()
         if opposing is not None:
-            raise ValueError(f"Opposing position blocked for {normalized_coin} {normalized_side}")
+            raise PaperEntryBlocked("opposing_position", f"Opposing position blocked for {normalized_coin} {normalized_side}")
         same_side_limit = _same_side_open_trade_limit()
         same_side_count_row = conn.execute(
             """
@@ -1431,7 +1432,8 @@ def open_paper_trade(strategy_id, coin, side, entry_price, size, leverage=1,
             or 0
         )
         if same_side_count >= same_side_limit:
-            raise ValueError(
+            raise PaperEntryBlocked(
+                "same_side_limit",
                 f"Pyramiding blocked for {normalized_coin} {normalized_side}: "
                 f"{same_side_count} open positions already exist (limit={same_side_limit})"
             )

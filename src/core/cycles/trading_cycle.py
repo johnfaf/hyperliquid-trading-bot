@@ -16,6 +16,7 @@ from src.core import clock_provider
 from src.data import database as db
 from src.data import decision_journal
 from src.data import decision_coverage
+from src.trading.paper_risk import PaperEntryBlocked
 from src.trading.trade_decision_memory import entry_memory
 from src.core.live_execution import (
     get_live_trader,
@@ -1641,25 +1642,33 @@ def _open_direct_paper_trade(container, signal, balance, ref, route, metadata):
     proposed_size = balance * signal.effective_size / price
     if signal.size > 0:
         proposed_size = min(proposed_size, signal.size)
-    size, budget = size_for_planned_stop(
-        balance=balance, side=side, entry=price, stop=sl,
-        size=proposed_size, leverage=signal.leverage, execution_role="taker",
-    )
+    try:
+        size, budget = size_for_planned_stop(
+            balance=balance, side=side, entry=price, stop=sl,
+            size=proposed_size, leverage=signal.leverage, execution_role="taker",
+        )
+    except PaperEntryBlocked as exc:
+        decision_coverage.resolve(ref, "blocked", reason=exc.code, context={"stage": "planned_stop"})
+        return None
     source_key = DecisionFirewall._source_key(signal)
     scorer = getattr(container, "agent_scorer", None)
     signal_id = scorer.record_signal(source_key, {
         "coin": signal.coin, "side": side, "confidence": signal.confidence,
     }) if scorer else None
-    return db.open_paper_trade(
-        strategy_id=None, coin=signal.coin, side=side, entry_price=price,
-        size=size, leverage=signal.leverage, stop_loss=sl, take_profit=tp,
-        metadata={**metadata, "source": route, "strategy_type": signal.strategy_type,
-                  "source_key": source_key, "signal_id": signal_id, "evaluation_ref": ref,
-                  "decision_id": decision_journal.resolve_decision_id(signal),
-                  "entry_decision": entry_memory(signal, route=route, firewall="approved"),
-                  "planned_stop": budget, "confidence": signal.confidence,
-                  "risk_policy": dict((signal.context or {}).get("risk_policy", {}) or {})},
-    )
+    try:
+        return db.open_paper_trade(
+            strategy_id=None, coin=signal.coin, side=side, entry_price=price,
+            size=size, leverage=signal.leverage, stop_loss=sl, take_profit=tp,
+            metadata={**metadata, "source": route, "strategy_type": signal.strategy_type,
+                      "source_key": source_key, "signal_id": signal_id, "evaluation_ref": ref,
+                      "decision_id": decision_journal.resolve_decision_id(signal),
+                      "entry_decision": entry_memory(signal, route=route, firewall="approved"),
+                      "planned_stop": budget, "confidence": signal.confidence,
+                      "risk_policy": dict((signal.context or {}).get("risk_policy", {}) or {})},
+        )
+    except PaperEntryBlocked as exc:
+        decision_coverage.resolve(ref, "blocked", reason=exc.code, context={"stage": "paper_admission"})
+        return None
 
 
 def _execute_lcrs_signals(container, lcrs_signals, regime_data):
@@ -1752,6 +1761,8 @@ def _execute_lcrs_signals(container, lcrs_signals, regime_data):
                         "features": sig["features"],
                     },
                 )
+                if trade_id is None:
+                    continue
                 decision_journal.record_paper_opened(
                     decision_journal.resolve_decision_id(trade_signal), trade_id, confidence=trade_signal.confidence,
                 )
@@ -1898,6 +1909,8 @@ def _execute_options_flow_trades(container, regime_data):
                         "prints": conv["total_prints"],
                     },
                 )
+                if trade_id is None:
+                    continue
                 decision_journal.record_paper_opened(
                     decision_journal.resolve_decision_id(flow_signal), trade_id, confidence=flow_signal.confidence,
                 )
@@ -2144,6 +2157,7 @@ def _run_alpha_arena(container, regime_data):
                 if champion_signals:
                     logger.info("  Arena champions: %d signals", len(champion_signals))
                     for sig, ref in zip(champion_signals, refs):
+                        stage = "candidate"
                         try:
                             price = float(sig.get("price", 0))
                             if not math.isfinite(price) or price <= 0:
@@ -2199,13 +2213,16 @@ def _run_alpha_arena(container, regime_data):
                                 except Exception as exc:
                                     logger.debug("  Arena champion sizing failed: %s", exc)
                             live_signal.position_pct = position_pct
+                            stage = "firewall"
                             account_balance = _admit_direct_entry(container, live_signal, regime_data, ref)
                             if account_balance is None:
                                 continue
                             if live_active:
+                                stage = "live_route"
                                 _execute_signal_live(container, live_signal, "ARENA")
                                 continue
                             if account_balance:
+                                stage = "paper_admission"
                                 trade_id = _open_direct_paper_trade(
                                     container, live_signal, account_balance, ref, "arena_champion", {
                                         "agent_id": sig["agent_id"],
@@ -2222,6 +2239,9 @@ def _run_alpha_arena(container, regime_data):
                                         "risk_policy": dict((live_signal.context or {}).get("risk_policy", {}) or {}),
                                     },
                                 )
+                                if trade_id is None:
+                                    continue
+                                stage = "paper_journal"
                                 decision_journal.record_paper_opened(
                                     decision_journal.resolve_decision_id(live_signal), trade_id, confidence=conf,
                                 )
@@ -2232,8 +2252,10 @@ def _run_alpha_arena(container, regime_data):
                             else:
                                 decision_coverage.resolve(ref, "blocked", reason="paper_account_unavailable")
                         except Exception as exc:
-                            decision_coverage.resolve(ref, "error", reason=type(exc).__name__)
-                            logger.warning("  Champion trade exec error (%s): %s", type(exc).__name__, exc)
+                            decision_coverage.resolve(
+                                ref, "error", reason=type(exc).__name__, context={"stage": stage},
+                            )
+                            logger.warning("  Champion trade failed at %s (%s)", stage, type(exc).__name__)
             except Exception as exc:
                 decision_coverage.mark_failed()
                 logger.debug("  Champion signals error: %s", exc)

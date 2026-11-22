@@ -2,6 +2,7 @@
 from contextlib import closing
 from datetime import timedelta
 from pathlib import Path
+import re
 import sqlite3
 
 from src.trading.paper_funding import FundingLedger, HOUR, MODEL, hours_between, ledger_path, millis, verified_cost
@@ -10,6 +11,20 @@ from src.trading.trade_decision_memory import number
 
 LIMIT = 2000
 GRACE_MS = 5 * 60_000
+
+
+def close_result(row, meta):
+    coverage = fields(meta.get("funding_coverage"))
+    signed = verified_cost(row, coverage)
+    if signed is None:
+        return "missing_receipt" if coverage.get("state") == "incomplete" else "invalid_receipt"
+    pnl, gross, fees, charged = (number(v) for v in (
+        row["pnl"], meta.get("gross_pnl_before_fees"), meta.get("total_fees_paid"), meta.get("funding_accrued"),
+    ))
+    if (None in (pnl, gross, fees, charged) or fees < 0 or abs(signed-charged) > .000051
+            or abs(pnl-(gross-fees-signed)) > .011):
+        return "cost_mismatch"
+    return "verified"
 
 
 def _open(path):
@@ -23,6 +38,7 @@ def funding_health(path, now):
         "state": "Ledger unavailable", "observed_at": now.isoformat(), "last_oracle_hour": None,
         "active": 0, "open_due": 0, "pending_hours": 0, "overdue_hours": 0, "invalid_open": 0,
         "cross_hour_closes": 0, "verified_closes": 0, "unverified_closes": 0,
+        "by_exit": {},
     }
     cutoff = now - timedelta(days=1)
     instant = millis(now)
@@ -35,7 +51,7 @@ def funding_health(path, now):
                 f"SELECT {columns} FROM paper_trades WHERE status='open' LIMIT ?", (LIMIT + 1,)
             ).fetchall()
             closed = conn.execute(
-                f"SELECT {columns} FROM paper_trades WHERE status='closed' AND closed_at>=? AND closed_at<? "
+                f"SELECT {columns}, pnl FROM paper_trades WHERE status='closed' AND closed_at>=? AND closed_at<? "
                 "ORDER BY closed_at DESC LIMIT ?", (cutoff.isoformat(), now.isoformat(), LIMIT + 1)
             ).fetchall()
     except (OSError, sqlite3.Error):
@@ -77,10 +93,14 @@ def funding_health(path, now):
         if hours == []:
             continue
         result["cross_hour_closes"] += 1
-        coverage = fields(meta.get("funding_coverage"))
-        signed = verified_cost(row, coverage)
-        charged = number(meta.get("funding_accrued"))
-        key = "verified_closes" if signed is not None and charged is not None and abs(signed-charged) <= .000051 else "unverified_closes"
+        reason = meta.get("close_reason") or fields(meta.get("exit_decision")).get("reason")
+        reason = reason if isinstance(reason, str) and re.fullmatch("[a-z0-9_]{1,48}", reason) else "unrecorded_or_other"
+        if len(result["by_exit"]) >= 20 and reason not in result["by_exit"]:
+            reason = "unrecorded_or_other"
+        group = result["by_exit"].setdefault(reason, {"verified": 0, "missing_receipt": 0, "invalid_receipt": 0, "cost_mismatch": 0})
+        outcome = close_result(row, meta)
+        group[outcome] += 1
+        key = "verified_closes" if outcome == "verified" else "unverified_closes"
         result[key] += 1
 
     if result["overdue_hours"] or result["unverified_closes"] or result["invalid_open"]:

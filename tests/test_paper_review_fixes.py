@@ -85,7 +85,8 @@ def test_untracked_source_is_warmup_not_unlimited():
     assert policy["max_signals_per_day"] > 0
 
 
-@pytest.mark.parametrize("mode", ["missing", "rejected", "approved", "sizing", "live_no_balance", "invalid_quote"])
+@pytest.mark.parametrize("mode", ["missing", "rejected", "approved", "sizing", "live_no_balance", "invalid_quote",
+                                  "ledger_block", "unexpected_error"])
 def test_arena_firewall_and_final_size(monkeypatch, mode):
     signal = {"coin": "BTC", "side": "long", "confidence": .8, "price": 100., "agent_id": "a",
               "agent_name": "alpha", "strategy_type": "scalping", "agent_fitness": 1., "agent_elo": 1100}
@@ -112,14 +113,26 @@ def test_arena_firewall_and_final_size(monkeypatch, mode):
     monkeypatch.setattr(cycle, "is_live_trading_active", lambda _: mode == "live_no_balance")
     monkeypatch.setattr(cycle, "get_execution_open_positions", lambda _: [])
     monkeypatch.setattr(db, "get_paper_account", lambda: {"balance": 1000.})
-    monkeypatch.setattr(db, "open_paper_trade", lambda **k: opened.append(k) or 1)
-    monkeypatch.setattr(cycle.decision_journal, "record_paper_opened", lambda *a, **k: None)
+    def open_trade(**kwargs):
+        if mode == "ledger_block":
+            from src.trading.paper_risk import PaperEntryBlocked
+            raise PaperEntryBlocked("same_side_limit", "Pyramiding blocked")
+        if mode == "unexpected_error":
+            raise ValueError("unstructured backend fault")
+        opened.append(kwargs)
+        return 1
+    recorded = []
+    monkeypatch.setattr(db, "open_paper_trade", open_trade)
+    monkeypatch.setattr(cycle.decision_journal, "record_paper_opened", lambda *a, **k: recorded.append(a))
     monkeypatch.setattr(decision_coverage, "expect", lambda *a: ["ref"])
     monkeypatch.setattr(decision_coverage, "bind_signal", lambda *a: None)
     monkeypatch.setattr(decision_coverage, "resolve", lambda *a, **k: resolutions.append((a, k)))
     cycle._run_alpha_arena(container, {})
-    if mode in {"missing", "rejected", "live_no_balance", "invalid_quote"}:
-        assert not opened and resolutions
+    if mode in {"missing", "rejected", "live_no_balance", "invalid_quote", "ledger_block", "unexpected_error"}:
+        assert not opened and not recorded and resolutions
+        if mode in {"ledger_block", "unexpected_error"}:
+            expected_state, expected_reason = ("blocked", "same_side_limit") if mode == "ledger_block" else ("error", "ValueError")
+            assert resolutions[-1] == (("ref", expected_state), {"reason": expected_reason, "context": {"stage": "paper_admission"}})
     else:
         trade, = opened
         assert calls[0][0] == SignalSource.ARENA_CHAMPION

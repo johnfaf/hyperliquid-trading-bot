@@ -198,7 +198,8 @@ def read_report(*, paper_path=None, order_path=None, now=None, window_start=None
               "expected": 0, "registered": 0, "terminal": 0, "unresolved_evaluations": 0,
               "intents": 0, "unresolved_intents": 0, "unresolved_orders": None, "routes": [],
               "latest_cycle": None, "capture_started": None, "gap_minutes": None, "late": False,
-              "issue": "unavailable", "pending": [], "failures": [], "errors": 0, "non_error_final": 0, "revisions": [], "protocols": [],
+              "issue": "unavailable", "pending": [], "failures": [], "admission_blocks": [],
+              "errors": 0, "non_error_final": 0, "revisions": [], "protocols": [],
               "schedule_contiguous": False, "failed_cycles": 0, "overdue_cycles": 0,
               "overdue_evaluations": 0, "overdue_intents": 0}
     try:
@@ -286,11 +287,16 @@ def read_report(*, paper_path=None, order_path=None, now=None, window_start=None
         )
         if known:
             counts["terminal"] += 1
+            checkpoint = checkpoints.get(ref, {})
             is_error = event == "error" or status in {"rotation_victim_close_failed", "paper_open_failed"}
             result["errors"] += int(is_error)
             if is_error:
                 result["failures"].append({**candidates[ref], "decision_id": decision_id,
-                                          "reason": str(checkpoints.get(ref, {}).get("reason") or status or event)[:250]})
+                                          "stage": checkpoint.get("stage"),
+                                          "reason": str(checkpoint.get("reason") or status or event)[:250]})
+            elif event == "blocked" and checkpoint.get("stage") in ("planned_stop", "paper_admission"):
+                result["admission_blocks"].append({**candidates[ref], "decision_id": decision_id,
+                                                   "stage": checkpoint["stage"], "reason": checkpoint.get("reason")})
         else:
             result["pending"].append({**candidates[ref], "decision_id": decision_id, "state": status or event})
     overdue = (now - timedelta(minutes=20)).isoformat()
@@ -322,6 +328,7 @@ def read_report(*, paper_path=None, order_path=None, now=None, window_start=None
     result["unresolved_evaluations"] = result["expected"] - result["terminal"]
     result["non_error_final"] = result["terminal"] - result["errors"]
     result["failures"] = result["failures"][-20:][::-1]
+    result["admission_blocks"] = result["admission_blocks"][-20:][::-1]
     result["pending"] = result["pending"][-20:][::-1]
     return result
 

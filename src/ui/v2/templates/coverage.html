@@ -30,12 +30,21 @@
     {% endif %}
     <div class="desk-decision-empty">Capture began {{ report.capture_started or "not yet recorded" }} &middot; Scanner prefilters and <a class="underline" href="/stock-pilot">Stock Pilot</a> are counted separately or outside this roster.</div>
   </section>
+  {% if report.admission_blocks %}
+  <section class="desk-panel">
+    <div class="desk-panel-heading"><div><h2>Paper entries blocked</h2><p>Risk controls &middot; Latest {{ report.admission_blocks | length }}</p></div></div>
+    <div class="desk-table-scroll" tabindex="0" aria-label="Paper admission blocks">
+      <table class="desk-table"><thead><tr><th>Observed (UTC)</th><th>Route</th><th>Asset</th><th>Reason</th></tr></thead>
+      <tbody>{% for row in report.admission_blocks %}<tr><td>{{ row.observed_at[:19]|replace("T", " ") }}</td><td>{{ row.route }}</td><td>{{ row.symbol or "Unknown" }}</td><td>{{ row.reason|replace("_", " ") }}</td></tr>{% endfor %}</tbody></table>
+    </div>
+  </section>
+  {% endif %}
   {% if report.failures %}
   <section class="desk-panel">
     <div class="desk-panel-heading"><div><h2>Evaluation errors</h2><p>{{ report.errors }} errors &middot; Latest {{ report.failures | length }} &middot; Final does not mean executed</p></div></div>
     <div class="desk-table-scroll" tabindex="0" aria-label="Evaluation errors">
       <table class="desk-table"><thead><tr><th>Observed (UTC)</th><th>Route</th><th>Asset</th><th>Reason</th><th>Reference</th></tr></thead>
-      <tbody>{% for row in report.failures %}<tr><td>{{ row.observed_at[:19] | replace("T", " ") }}</td><td>{{ row.route }}</td><td>{{ row.symbol or "Unknown" }}</td><td>{{ row.reason }}</td>
+      <tbody>{% for row in report.failures %}<tr><td>{{ row.observed_at[:19] | replace("T", " ") }}</td><td>{{ row.route }}</td><td>{{ row.symbol or "Unknown" }}</td><td>{{ row.reason }}{% if row.stage %}<br><small>{{ row.stage | replace("_", " ") }}</small>{% endif %}</td>
       <td>{% if row.decision_id %}<a class="underline" href="/audit?decision_id={{ row.decision_id | urlencode }}">{{ row.reference[:8] }}</a>{% else %}{{ row.reference[:8] }}{% endif %}</td></tr>{% endfor %}</tbody></table>
     </div>
   </section>
