@@ -1,0 +1,9 @@
+[Unit]
+Description=Record public paper funding evidence each minute
+
+[Timer]
+OnCalendar=*-*-* *:*:20 UTC
+AccuracySec=1s
+
+[Install]
+WantedBy=timers.target

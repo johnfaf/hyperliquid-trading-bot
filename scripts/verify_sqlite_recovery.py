@@ -10,7 +10,7 @@ import sqlite3
 from tempfile import TemporaryDirectory
 
 CRITICAL = {"paper_account", "paper_trades", "orders", "fills", "pauses", "account_equity_samples", "evidence",
-            "stock_cycles", "stock_cycle_attempts"}
+            "stock_cycles", "stock_cycle_attempts", "paper_oracle_samples", "paper_funding_rates"}
 
 
 def fingerprint(conn, table):
@@ -59,7 +59,7 @@ def main():
         parser.error("insufficient free space for isolated restore and reserve")
     results = {}
     with TemporaryDirectory(prefix="sqlite-recovery-", dir=root) as scratch:
-        for kind in ("bot", "decisions", "orders", "risk", "stock"):
+        for kind in ("bot", "decisions", "orders", "risk", "funding", "stock"):
             source = root / f"{kind}-pre-{args.revision}.db"
             if source.exists():
                 results[kind] = verify_backup(source, Path(scratch) / f"{kind}.db")

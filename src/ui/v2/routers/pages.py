@@ -100,6 +100,7 @@ async def research(request: Request):
                                        lambda: scorecard(config.DB_PATH, now=datetime.now(timezone.utc)))
     return get_templates().TemplateResponse(request, "research.html", {
         "title": "Research", "study": host.get("absorption"), "weekly": host.get("weekly"), "evidence": evidence,
+        "forward_shadow": host.get("forward_shadow"),
     })
 
 

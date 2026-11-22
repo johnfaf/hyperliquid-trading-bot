@@ -137,6 +137,40 @@ def load_object(path: Path, *, max_bytes=65536) -> dict:
         return {}
 
 
+def forward_shadow_status(path, now):
+    import math
+
+    data = load_object(path, max_bytes=8192)
+    if data.get("rule") != "btc_long_24h_channel_v1" or data.get("capital") != 1000 or data.get("live_approval") is not False:
+        return None
+    stamps = {}
+    try:
+        for key in ("start", "end", "evaluated_at", "published_at"):
+            value = datetime.fromisoformat(data[key])
+            if value.utcoffset() is None:
+                return None
+            stamps[key] = value.astimezone(UTC).isoformat()
+        age = (now-datetime.fromisoformat(stamps["published_at"])).total_seconds()
+        if age < 0:
+            return None
+    except (KeyError, ValueError, TypeError):
+        return None
+    state = data.get("state")
+    if state not in ("Observing", "Window complete", "Waiting for forward candles", "Incomplete market data"):
+        return None
+    results = {}
+    scenarios = data.get("results")
+    scenarios = scenarios if isinstance(scenarios, dict) else {}
+    for name in ("base", "stress"):
+        row = scenarios.get(name, {})
+        if not isinstance(row, dict):
+            continue
+        values = {k: row.get(k) for k in ("net", "cash", "passive", "drawdown_pct", "net_without_largest", "closed")}
+        if all(type(v) in (float, int) and abs(v) <= 1e12 and math.isfinite(v) for v in values.values()):
+            results[name] = values
+    return {"state": state, **stamps, "results": results if len(results) == 2 else None, "stale": age > 7200}
+
+
 def daily_copy_report(path, directory, now):
     from src.trading.copy_shadow_report import build_daily, markdown
 
@@ -298,6 +332,7 @@ def main() -> None:
     parser.add_argument("--paper-db", type=Path)
     parser.add_argument("--copy-report-dir", type=Path)
     parser.add_argument("--absorption-report", type=Path, default=Path("/var/lib/hyperliquid-absorption/reports/latest.json"))
+    parser.add_argument("--forward-report", type=Path, default=Path("/var/lib/hyperliquid-forward-shadow/latest.json"))
     args = parser.parse_args()
     if bool(args.paper_db) != bool(args.copy_report_dir):
         parser.error("--paper-db and --copy-report-dir must be used together")
@@ -311,6 +346,7 @@ def main() -> None:
             snapshot["stock_pilot"] = None
     now = datetime.now(UTC)
     snapshot["absorption"] = absorption_status(args.absorption_report, now)
+    snapshot["forward_shadow"] = forward_shadow_status(args.forward_report, now)
     if args.paper_db:
         from src.data.decision_coverage import read_report
 

@@ -98,7 +98,8 @@ def trigger(bar, side, stop, take):
     return None
 
 
-def simulate(bars, decisions, funding, start, end, *, policy, slip_bps, capital, trace=None, fee_rate=TAKER_FEE):
+def simulate(bars, decisions, funding, start, end, *, policy, slip_bps, capital, trace=None, fee_rate=TAKER_FEE,
+             liquidate_at_end=True):
     stamps = [bar.t for bar in bars]
     lo, hi = bisect_left(stamps, start), bisect_left(stamps, end)
     if (hi <= lo or bars[lo].t != start or bars[hi - 1].t + BAR_MS != end
@@ -161,7 +162,7 @@ def simulate(bars, decisions, funding, start, end, *, policy, slip_bps, capital,
             if hit:
                 reason, price, ambiguous = hit
                 close_position(price, reason, bar.t, ambiguous)
-        if index == hi - 1 and position:
+        if index == hi - 1 and position and liquidate_at_end:
             close_position(bar.close, "window_end", bar.t)
 
         if position and policy == "atr_2x_tighten":
@@ -195,7 +196,7 @@ def simulate(bars, decisions, funding, start, end, *, policy, slip_bps, capital,
             equity.append(balance + unrealized - mark * position["units"] * fee_rate)
         else:
             equity.append(balance)
-    return {"equity": equity, "trades": trades, "counts": counts}
+    return {"equity": equity, "trades": trades, "counts": counts, "open": position}
 
 
 def aggregate(sleeves, capital):

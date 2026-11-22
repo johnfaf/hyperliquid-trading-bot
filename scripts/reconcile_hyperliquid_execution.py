@@ -2,7 +2,9 @@
 from argparse import ArgumentParser
 from collections import Counter, defaultdict
 from contextlib import closing
+import csv
 from decimal import Decimal, InvalidOperation
+from hashlib import sha256
 import json
 from pathlib import Path
 import re
@@ -36,6 +38,34 @@ def summarize_csv(paths):
     return {**result, "exports": exports, "exact_links_possible": False, "funding_included": "unverified"}
 
 
+def compare_fee_encoding(path, fill_path, account):
+    """Audit field semantics only. Matching by economics never attributes a bot trade."""
+    def signature(row):
+        return (row["coin"].strip(), row["dir"].strip(), *(Decimal(row[k]) for k in ("px", "sz", "fee")))
+
+    left, right = defaultdict(list), defaultdict(list)
+    with path.open(encoding="utf-8-sig", newline="") as stream:
+        for row in csv.DictReader(stream, strict=True):
+            left[signature(row)].append(Decimal(row["closedPnl"]))
+    for row in read_rows(fill_path, "SELECT payload FROM hyperliquid_fills WHERE account=?", (account.lower(),)):
+        fill = fields(row["payload"])
+        right[signature(fill)].append(Decimal(fill["closedPnl"]))
+    unique = agreed = opening = closing = 0
+    for key in left.keys() & right.keys():
+        csv_rows, venue_rows = left[key], right[key]
+        if len(csv_rows) != 1 or len(venue_rows) != 1 or not key[-1]:
+            continue
+        unique += 1
+        if abs(csv_rows[0] - (venue_rows[0]-key[-1])) <= Decimal(".000001"):
+            agreed += 1
+            opening += key[1] in ("Open Long", "Open Short")
+            closing += key[1] in ("Close Long", "Close Short")
+    return {"unique_nonzero_fee_signatures": unique, "agreed_raw_minus_fee": agreed,
+            "opening_agreements": opening, "closing_agreements": closing,
+            "fee_exclusive_raw_supported": unique == agreed and opening >= 10 and closing >= 10,
+            "attribution": False}
+
+
 def read_rows(path, query, args=()):
     with closing(open_readonly(Path(path))) as db:
         rows = db.execute(query + " LIMIT ?", (*args, LIMIT+1)).fetchall()
@@ -56,7 +86,33 @@ def _decision_index(path, last, wanted):
     return index
 
 
-def match_execution(fill_path, account, *, order_path=None, decision_path=None):
+def venue_order_index(rows):
+    by_oid = defaultdict(list)
+    for envelope in rows:
+        order = fields(envelope.get("order"))
+        order = {key: order.get(key) for key in ("oid", "cloid", "coin", "side", "origSz", "reduceOnly", "timestamp")}
+        oid, cid = order.get("oid"), order.get("cloid")
+        if type(oid) is int and oid > 0:
+            if order not in by_oid[str(oid)]:
+                by_oid[str(oid)].append(order)
+        if cid and not isinstance(cid, str):
+            raise ValueError("malformed venue client ID")
+    return by_oid
+
+
+def actual_funding(rows):
+    events = {}
+    for row in rows:
+        delta = fields(row.get("delta"))
+        key = (row["time"], delta["coin"], row["hash"])
+        value = Decimal(delta["usdc"].strip())
+        if not value.is_finite() or delta.get("type") != "funding" or (key in events and events[key] != value):
+            raise ValueError("invalid or conflicting venue funding receipt")
+        events[key] = value
+    return {"receipt_rows": len(events), "venue_net_cash_usdc": str(sum(events.values(), Decimal(0)))}
+
+
+def match_execution(fill_path, account, *, order_path=None, decision_path=None, venue_orders=()):
     if not re.fullmatch("0x[0-9a-fA-F]{40}", account or ""):
         raise ValueError("a verified public account address is required for the raw fill ledger")
     account = account.lower()
@@ -68,7 +124,10 @@ def match_execution(fill_path, account, *, order_path=None, decision_path=None):
             by_oid[str(order["venue_id"])].append(order)
     for fill in fills:
         chunks[str(fill["oid"])].append(fill)
-    index = _decision_index(decision_path, fills[-1]["time_ms"], {row["client_id"] for row in orders}) if fills else {}
+    venue_index = venue_order_index(venue_orders)
+    wanted = {row["client_id"] for row in orders}
+    wanted.update(order["cloid"] for rows in venue_index.values() for order in rows if order.get("cloid"))
+    index = _decision_index(decision_path, fills[-1]["time_ms"], wanted) if fills else {}
     states, fees, details = Counter(), defaultdict(Decimal), []
     venue_closed_pnl = Decimal(0)
     seen_tids = Counter((row["coin"], row["tid"]) for row in fills)
@@ -77,8 +136,10 @@ def match_execution(fill_path, account, *, order_path=None, decision_path=None):
         order_rows = by_oid.get(oid, [])
         if any(seen_tids[(row["coin"], row["tid"])] != 1 for row in batch):
             state, decision_id = "batch_has_conflicting_fill_identity", None
-        else:
+        elif order_rows:
             state, decision_id = _match_batch(oid, batch, payloads, order_rows, index)
+        else:
+            state, decision_id = _match_venue_order(oid, batch, payloads, venue_index.get(oid, []), index)
         for row, payload in zip(batch, payloads, strict=True):
             if seen_tids[(row["coin"], row["tid"])] != 1:
                 states["conflicting_fill_identity"] += 1
@@ -89,10 +150,30 @@ def match_execution(fill_path, account, *, order_path=None, decision_path=None):
             venue_closed_pnl += Decimal(payload["closedPnl"])
             details.append({"oid": oid, "tid": row["tid"], "decision_id": decision_id, "state": state})
     return {"fills": len(fills), "venue_orders": len(chunks), "journal_orders": len(orders),
+            "venue_order_records": len(venue_index),
             "journal_orders_without_fills_in_input": sum(not o["venue_id"] or str(o["venue_id"]) not in chunks for o in orders),
             "first_time_ms": fills[0]["time_ms"] if fills else None, "last_time_ms": fills[-1]["time_ms"] if fills else None,
             "coverage": "unknown", "venue_reported_closed_pnl": str(venue_closed_pnl) if fills else None,
             "fees_by_token": {k: str(v) for k, v in fees.items()}, "states": dict(states), "records": details}
+
+
+def _match_venue_order(oid, batch, payloads, orders, index):
+    if not orders:
+        return "no_journal_order", None
+    if len(orders) != 1:
+        return "ambiguous_venue_order", None
+    order = orders[0]
+    if order.get("reduceOnly") is True:
+        return "non_entry_order", None
+    cid, side, qty, submitted = (order.get(k) for k in ("cloid", "side", "origSz", "timestamp"))
+    if not cid:
+        return "venue_order_missing_client_id", None
+    if (type(submitted) is not int or order.get("reduceOnly") is not False or side not in {"B", "A"}
+            or any(row["time_ms"] < submitted or row["coin"] != order.get("coin") for row in batch)):
+        return "venue_order_fill_conflict", None
+    return _match_batch(oid, batch, payloads, [{"entry": 1, "client_id": cid, "intent": {"orders": [
+        {"c": cid, "s": qty, "r": False, "b": side == "B"},
+    ]}}], index)
 
 
 def _match_batch(oid, batch, payloads, order_rows, index):
@@ -132,21 +213,44 @@ def main():
     parser = ArgumentParser(description=__doc__)
     parser.add_argument("--csv", nargs="+", type=Path)
     parser.add_argument("--fills", type=Path, help="Dedicated raw fill ledger from import_hyperliquid_fills")
+    parser.add_argument("--capture", type=Path, help="Account-scoped capture from capture_hyperliquid_account_history")
     parser.add_argument("--account", help="Public address used for the raw import")
     parser.add_argument("--orders", type=Path, help="Local order journal snapshot")
     parser.add_argument("--decisions", type=Path, help="Bot ledger snapshot containing decision_snapshots")
     parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args()
-    if not (args.csv or args.fills) or (not args.fills and (args.account or args.orders or args.decisions)):
+    if args.fills and args.capture:
+        parser.error("choose a standalone fill ledger or an account capture")
+    if not (args.csv or args.fills or args.capture) or (not (args.fills or args.capture) and (args.account or args.orders or args.decisions)):
         parser.error("supply CSV exports or a scoped raw venue ledger")
     try:
+        venue_orders, funding, manifest = [], None, None
+        if args.capture:
+            manifest = json.loads((args.capture/"manifest.json").read_text(encoding="utf-8"))
+            if manifest.get("account_sha256") != sha256((args.account or "").lower().encode()).hexdigest():
+                raise ValueError("account does not match capture manifest")
+            venue_orders = json.loads((args.capture/"orders.json").read_text(encoding="utf-8"))
+            funding = actual_funding(json.loads((args.capture/"funding.json").read_text(encoding="utf-8")))
+            args.fills = args.capture/"fills.sqlite3"
         report = {"csv": summarize_csv(args.csv) if args.csv else None,
                   "raw": match_execution(args.fills, args.account, order_path=args.orders,
-                                         decision_path=args.decisions) if args.fills else None,
+                                         decision_path=args.decisions, venue_orders=venue_orders) if args.fills else None,
+                  "actual_funding": funding,
                   "execution_attribution": "exact_ID_only", "statement_reconciled": False}
+        if args.csv and args.fills and report["raw"]["fills"]:
+            encoding = compare_fee_encoding(args.csv[0], args.fills, args.account)
+            report["fee_encoding_comparison"] = encoding
+            raw = report["raw"]
+            if (encoding["fee_exclusive_raw_supported"] and set(raw["fees_by_token"]) == {"USDC"}
+                    and not raw["states"].get("conflicting_fill_identity")):
+                reported = Decimal(raw["venue_reported_closed_pnl"])
+                fees = Decimal(raw["fees_by_token"]["USDC"])
+                report["observed_fill_net_usdc"] = str(reported-fees)
+                if funding:
+                    report["observed_fill_net_plus_funding_usdc"] = str(reported-fees+Decimal(funding["venue_net_cash_usdc"]))
         with args.out.open("x", encoding="utf-8") as f:
             json.dump(report, f, indent=2, allow_nan=False)
-    except (OSError, sqlite3.Error, ValueError, InvalidOperation) as exc:
+    except (OSError, sqlite3.Error, ValueError, TypeError, KeyError, InvalidOperation) as exc:
         parser.exit(1, f"Reconciliation failed: {exc}\n")
 
 

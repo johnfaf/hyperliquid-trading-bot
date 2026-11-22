@@ -1,0 +1,19 @@
+[Unit]
+Description=Evaluate the isolated BTC forward shadow book
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+DynamicUser=yes
+StateDirectory=hyperliquid-forward-shadow
+StateDirectoryMode=0700
+WorkingDirectory=/opt/hyperliquid-forward-shadow/current
+ExecStart=/usr/bin/python3 -B -m scripts.run_forward_shadow --state-dir /var/lib/hyperliquid-forward-shadow
+TimeoutStartSec=120
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+InaccessiblePaths=-/srv/hyperliquid-bot -/etc/hyperliquid-bot -/etc/hyperliquid-stock-paper

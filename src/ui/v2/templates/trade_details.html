@@ -14,8 +14,9 @@
       <p class="desk-muted">{{ trade.side|capitalize }} · {{ trade.source|replace("_"," ") }} · Crypto paper</p></div>
     <div class="desk-actions">{{ badge("Excluded", "warn") if trade.excluded else badge(trade.status|capitalize, "good" if trade.status == "open" else "neutral") }}</div>
   </header>
+  {% set funding = trade.funding if trade.funding is mapping else {} %}
   <section class="desk-kpis" aria-label="Trade execution">
-    <div><span>Net realized P&amp;L</span><strong>{{ money(trade.pnl,true) if trade.status == "closed" else "Open" }}</strong><small>Paper ledger</small></div>
+    <div><span>Net realized P&amp;L</span><strong>{{ money(trade.pnl,true) if trade.status == "closed" else "Open" }}</strong><small>{{ "Known costs only; funding incomplete" if funding.get("state") == "incomplete" else "Paper ledger" }}</small></div>
     <div><span>Entry fill</span><strong>{{ trade.entry_price if trade.entry_price is not none else "Unrecorded" }}</strong><small>USD per unit</small></div>
     <div><span>Exit fill</span><strong>{{ trade.exit_price if trade.exit_price is not none else "Unrecorded" }}</strong><small>USD per unit</small></div>
     <div><span>Fees recorded</span><strong>{{ money(trade.fees) }}</strong><small>Simulated costs</small></div>
@@ -61,6 +62,12 @@
         {{ evidence_row("Adverse gap from trigger", "{:.1f} bps".format(trade.stop_gap_bps) if trade.stop_gap_bps is not none else none) }}
         {{ evidence_row("Quantity", trade.size) }}
         {{ evidence_row("Leverage", "{}x".format(trade.leverage) if trade.leverage is not none else none) }}
+        {% if funding %}
+          {{ evidence_row("Funding evidence", "Complete model" if funding.get("state") == "modeled_complete" else "Incomplete") }}
+          {{ evidence_row("Modeled funding paid", money(funding.get("known_cost"), true)) }}
+          {{ evidence_row("Funded hours recorded", funding.get("receipts", [])|length) }}
+          {{ evidence_row("Funding hours missing", funding.get("missing_hours", [])|length) }}
+        {% endif %}
       </dl>
     </section>
   </div>

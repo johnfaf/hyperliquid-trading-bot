@@ -68,11 +68,13 @@ import shutil, sqlite3, sys
 data, rollbacks = map(Path, sys.argv[1:3])
 revision = sys.argv[3]
 required = sum(path.stat().st_size for path in (data / "bot.db", data / "bot.decisions.sqlite3",
-               data / "bot.orders.sqlite3", data / "bot.risk.sqlite3", Path("/var/lib/hyperliquid-stock-paper/orders.sqlite3")) if path.exists())
+               data / "bot.orders.sqlite3", data / "bot.risk.sqlite3", data / "bot.funding.sqlite3",
+               Path("/var/lib/hyperliquid-stock-paper/orders.sqlite3")) if path.exists())
 if shutil.disk_usage(rollbacks).free < required*2 + 2*1024**3:
     raise SystemExit("not enough space for backups, isolated recovery verification, and reserve")
 for kind, filename in (("bot", "bot.db"), ("decisions", "bot.decisions.sqlite3"), ("orders", "bot.orders.sqlite3"),
-                       ("risk", "bot.risk.sqlite3"), ("stock", "/var/lib/hyperliquid-stock-paper/orders.sqlite3")):
+                       ("risk", "bot.risk.sqlite3"), ("funding", "bot.funding.sqlite3"),
+                       ("stock", "/var/lib/hyperliquid-stock-paper/orders.sqlite3")):
     source = data / filename
     dest = rollbacks / f"{kind}-pre-{revision}.db"
     if dest.exists() or (kind != "bot" and not source.exists()):
@@ -81,7 +83,11 @@ for kind, filename in (("bot", "bot.db"), ("decisions", "bot.decisions.sqlite3")
     if temporary.exists():
         raise SystemExit("previous incomplete backup must be inspected first")
     with closing(sqlite3.connect(source.as_uri() + "?mode=ro", uri=True)) as src, closing(sqlite3.connect(temporary)) as out:
+        # Pin one WAL snapshot so new bot writes cannot restart the large backup.
+        src.execute("BEGIN")
+        src.execute("SELECT count(*) FROM sqlite_master").fetchone()
         src.backup(out, pages=1024, sleep=0.05)
+        src.rollback()
         if out.execute("PRAGMA quick_check").fetchone() != ("ok",):
             raise SystemExit("pre-rollout SQLite backup failed quick_check")
     temporary.chmod(0o600)
@@ -120,6 +126,22 @@ if [[ "$ready" != true ]]; then
     rollback
     exit 1
 fi
+
+# Install independent funding capture and a credential-free forward book.
+shadow=/opt/hyperliquid-forward-shadow
+for file in scripts/run_forward_shadow.py scripts/fetch_hyperliquid_replay_market.py src/backtest/candle_exit_replay.py; do
+    sudo -n install -D -m 0644 "$release/$file" "$shadow/$rev/$file"
+done
+if ! sudo -n test -e "$shadow/current"; then
+    sudo -n ln -s "$shadow/$rev" "$shadow/current"
+fi
+for unit in hyperliquid-paper-funding.service hyperliquid-paper-funding.timer \
+    hyperliquid-forward-shadow.service hyperliquid-forward-shadow.timer; do
+    sudo -n install -m 0644 "$release/deploy/research/$unit" "/etc/systemd/system/$unit"
+done
+sudo -n systemctl daemon-reload
+sudo -n systemctl start hyperliquid-paper-funding.service hyperliquid-forward-shadow.service
+sudo -n systemctl enable --now hyperliquid-paper-funding.timer hyperliquid-forward-shadow.timer
 
 # Update the reporters, leaving the frozen pilot, collector and backup jobs running.
 if sudo -n test -f /var/lib/hyperliquid-absorption/data/flow.sqlite3; then

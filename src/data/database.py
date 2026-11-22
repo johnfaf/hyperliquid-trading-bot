@@ -1369,6 +1369,9 @@ def open_paper_trade(strategy_id, coin, side, entry_price, size, leverage=1,
     metadata["entry_decision"] = captured
     from src.learning.strategy_evidence import stamp_paper_entry
     stamp_paper_entry(metadata, strategy_id)
+    if config.PAPER_FUNDING_LEDGER_ENABLED and config.PAPER_TRADING_FUNDING_ENABLED:
+        from src.trading.paper_funding import MODEL
+        metadata["paper_funding_model"] = MODEL
     _ensure_postgres_strategy_parent(strategy_id)
 
     key = None
@@ -1633,7 +1636,7 @@ def close_paper_trade(trade_id, exit_price, pnl) -> bool:
     return True
 
 
-def close_paper_trade_and_credit_account(trade_id, exit_price, pnl, *, metadata_updates=None) -> bool:
+def close_paper_trade_and_credit_account(trade_id, exit_price, pnl, *, metadata_updates=None, event_at=None) -> bool:
     """Atomically close a paper trade AND credit the paper_account balance.
 
     Runs both UPDATEs inside a single transaction.  If the trade is already
@@ -1649,7 +1652,7 @@ def close_paper_trade_and_credit_account(trade_id, exit_price, pnl, *, metadata_
     a crash between the two calls could leave the account stale or, on retry
     of the caller, double-credit the PnL.
     """
-    now = _trade_event_now_iso()
+    now = event_at.isoformat() if event_at is not None else _trade_event_now_iso()
     with get_connection() as conn:
         try:
             cursor = conn.execute("""

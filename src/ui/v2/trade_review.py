@@ -75,6 +75,7 @@ def normalize(row):
     peers = study.get("peers")
     trade.update(
         symbol=str(trade["coin"] or "Unknown").strip().upper(), side=side, meta=meta, entry=entry, exit=exit,
+        funding=as_dict(meta.get("funding_coverage")),
         copy=is_copy, wallet=wallet.lower(), reason=reason, stop_type=stop_type, stop_gap_bps=gap,
         source=source_label(wallet.lower()) if is_copy else str(meta.get("strategy_type") or meta.get("source") or "Unattributed"),
         route=str(entry.get("route") or meta.get("source") or "Unrecorded"),
@@ -214,6 +215,8 @@ def review(days=7, group="source", scope="copy", *, path=None, now=None, period=
         output.append({"label": label, **summary(members, overlap)})
     output.sort(key=lambda row: (row["pnl"] is None, row["pnl"] or 0, row["label"]))
     base.update(summary=summary(eligible, overlap), groups=output[:100], peak=max(peaks.values(), default=None),
+                funding_incomplete=sum(t["status"] == "closed" and
+                    t["funding"].get("state") == "incomplete" for t in eligible),
                 shadow=shadow_comparison(copy, start) if period == "rolling" else None)
     return base
 

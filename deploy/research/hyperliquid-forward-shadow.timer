@@ -1,0 +1,10 @@
+[Unit]
+Description=Observe the frozen BTC shadow book hourly
+
+[Timer]
+OnCalendar=*-*-* *:03:00 UTC
+AccuracySec=1s
+Persistent=true
+
+[Install]
+WantedBy=timers.target

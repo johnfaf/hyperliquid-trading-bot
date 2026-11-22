@@ -58,7 +58,7 @@
   </div>
   {% if s %}
   <section class="desk-kpis" aria-label="Trade review totals">
-    <div><span>Net realized P&amp;L</span><strong class="{{ 'tone-text-bad' if s.pnl is not none and s.pnl < 0 else 'tone-text-good' if s.pnl else '' }}">{{ money(s.pnl,true) }}</strong><small>{{ s.priced }} of {{ s.closed }} closes with P&amp;L</small></div>
+    <div><span>Net realized P&amp;L</span><strong class="{{ 'tone-text-bad' if s.pnl is not none and s.pnl < 0 else 'tone-text-good' if s.pnl else '' }}">{{ money(s.pnl,true) }}</strong><small>{{ s.priced }} of {{ s.closed }} closes with P&amp;L{% if report.get("funding_incomplete") %} &middot; {{ report.funding_incomplete }} with incomplete funding{% endif %}</small></div>
     <div><span>Fees recorded</span><strong>{{ money(s.fees) }}</strong><small>Already included in net · {{ s.fee_count }} of {{ s.closed }} closes</small></div>
     <div><span>Copy trades that overlapped</span><strong>{{ s.overlap }}</strong><small>Same asset and direction · {{ report.peak or 0 }} peak in one group</small></div>
     <div><span>Largest adverse stop gap</span><strong>{{ "{:.1f} bps".format(s.max_gap) if s.max_gap is not none else "Unmeasured" }}</strong><small>{{ s.gap_count }} exits with trigger and fill recorded</small></div>

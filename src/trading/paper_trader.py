@@ -2172,7 +2172,10 @@ class PaperTrader:
         exit_fee = exit_notional * exit_rate
         total_fees = entry_fee + exit_fee
         # Include accumulated funding payments (positive = cost to holder).
-        funding_accrued = float(trade_meta.get("funding_accrued", 0.0))
+        from src.trading.paper_funding import funding_for_close
+        event_at = clock_provider.utc_now()
+        funding = funding_for_close(trade, now=event_at)
+        funding_accrued = (funding["known_cost"] or 0.) if funding is not None else float(trade_meta.get("funding_accrued", 0.0))
         pnl = round(gross_pnl - total_fees - funding_accrued, 2)
 
         intended_entry = float(trade_meta.get("intended_entry_price", trade.get("entry_price", 0)) or trade.get("entry_price", 0) or 0)
@@ -2251,12 +2254,15 @@ class PaperTrader:
             "exit_slipped_price": slipped_exit,
             **path_metrics,
         }
+        if funding is not None:
+            close_metadata["funding_coverage"] = funding
         # CRIT-FIX C2: atomic close + account credit in one transaction
         # (see src/data/database.py::close_paper_trade_and_credit_account).
         # A crash between the close and the credit previously could desync
         # the paper_account balance or, on retry, double-credit the PnL.
         if not db.close_paper_trade_and_credit_account(
             trade["id"], slipped_exit, pnl, metadata_updates=close_metadata,
+            **({"event_at": event_at} if funding is not None else {}),
         ):
             logger.error(
                 "_close_trade: DB close failed for trade %s (%s %s) -- "
@@ -2522,9 +2528,13 @@ class PaperTrader:
         except Exception as exc:
             logger.warning("Paper valuation marks could not be recorded: %s", type(exc).__name__)
 
-        # Fetch live funding rates for accrual (best-effort; empty on failure).
+        # Preserve legacy accrual for positions opened before the settlement ledger.
+        from src.trading.paper_funding import MODEL
+        from src.trading.paper_reporting import fields
         funding_contexts: Dict[str, Dict] = {}
-        if config.PAPER_TRADING_FUNDING_ENABLED:
+        if config.PAPER_TRADING_FUNDING_ENABLED and any(
+            fields(t.get("metadata")).get("paper_funding_model") != MODEL for t in open_trades
+        ):
             try:
                 ctxs = hl.get_asset_contexts() or {}
                 for coin, ctx in ctxs.items():
@@ -2638,7 +2648,7 @@ class PaperTrader:
             # Estimate hourly settlements from the current context, not confirmed payments.
             coin_upper = trade["coin"].upper() if trade.get("coin") else ""
             context = funding_contexts.get(coin_upper)
-            if context is not None:
+            if context is not None and fields(trade.get("metadata")).get("paper_funding_model") != MODEL:
                 try:
                     meta_raw = trade.get("metadata", "{}")
                     t_meta = json.loads(meta_raw) if isinstance(meta_raw, str) else dict(meta_raw or {})

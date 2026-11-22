@@ -2,6 +2,7 @@
 from collections import Counter, defaultdict
 from contextlib import closing
 from datetime import timedelta
+from functools import lru_cache
 from hashlib import sha256
 import json
 import math
@@ -14,6 +15,7 @@ from src.data.decision_coverage import open_readonly
 from src.signals.source_key import is_canonical_source_key
 from src.trading.copy_shadow_report import clean_close
 from src.trading.paper_reporting import fields, timestamp
+from src.trading.paper_funding import verified_cost
 from src.trading.trade_decision_memory import number
 
 MIN_CLOSES = 30
@@ -21,14 +23,42 @@ MIN_DAYS = 7
 STRESS_BPS = 16
 MAX_ROWS = 12_000
 UNVERIFIED_REASONS = {"unknown", "reconciliation", "live_reconciled_closed", "unverified"}
+VERSION_RE = re.compile(r"(?:[0-9a-f]{40}:[0-9a-f]{16}|rules-v2:[0-9a-f]{24})")
+CORE_RULE_FILES = (
+    "src/core/cycles/trading_cycle.py", "src/trading/paper_trader.py", "src/trading/paper_risk.py",
+    "src/trading/equity_risk.py", "src/trading/paper_funding.py", "src/signals/decision_firewall.py",
+    "src/signals/ev_gate.py", "src/signals/risk_policy.py", "src/signals/signal_schema.py",
+)
+ROUTE_RULE_FILES = {
+    "arena_champion": ("src/signals/alpha_arena.py",),
+    "copy_trade": ("src/trading/copy_trader.py",),
+}
+RULE_PREFIXES = ("PAPER_", "RISK_POLICY_", "ATR_STOP_", "SL_MIN_HOLD_", "FIREWALL_", "EV_GATE_",
+                 "ARENA_", "COPY_", "LCRS_", "OPTIONS_FLOW_", "KELLY_", "RL_SIZER_", "DATA_READINESS_",
+                 "REGIME_REVERSAL_", "META_LABEL_", "PORTFOLIO_ROTATION_")
+
+
+@lru_cache(maxsize=16)
+def code_version(route):
+    root = Path(__file__).resolve().parents[2]
+    digest = sha256()
+    for relative in (*CORE_RULE_FILES, *ROUTE_RULE_FILES.get(route, ())):
+        digest.update(relative.encode()+b"\0")
+        digest.update((root/relative).read_text(encoding="utf-8").encode()+b"\0")
+    return digest.hexdigest()
+
+
+def effective_controls(config):
+    # Store only the resulting rule digest, not the environment values.
+    return {k: v for k, v in vars(config).items() if k.startswith(RULE_PREFIXES)
+            and type(v) in (str, bool, int, float)
+            and not any(word in k for word in ("TOKEN", "SECRET", "PASSWORD", "PRIVATE_KEY", "URL", "DB_PATH"))
+            and (not isinstance(v, float) or math.isfinite(v))}
 
 
 def rule_version(profile):
-    rev = os.getenv("BOT_BUILD_REVISION", "")
-    if not re.fullmatch("[0-9a-f]{40}", rev):
-        return None
-    encoded = json.dumps(profile, sort_keys=True, default=str, separators=(",", ":"))
-    return f"{rev}:{sha256(encoded.encode()).hexdigest()[:16]}"
+    encoded = json.dumps(profile, sort_keys=True, allow_nan=False, separators=(",", ":"))
+    return "rules-v2:" + sha256(encoded.encode()).hexdigest()[:24]
 
 
 def stamp_paper_entry(meta, strategy_id):
@@ -45,15 +75,19 @@ def stamp_paper_entry(meta, strategy_id):
     if ":" not in key or not is_canonical_source_key(key) or key.split(":")[-1] in {"unknown", "untagged"} or not route:
         return
     import config
-    controls = {k: getattr(config, k) for k in (
-        "PAPER_MAX_PLANNED_STOP_LOSS_PCT", "PAPER_MAX_OPEN_STOP_RISK_PCT",
-        "PAPER_TRADING_MAKER_FEE_BPS", "PAPER_TRADING_TAKER_FEE_BPS",
-        "PAPER_TRADING_SLIPPAGE_MIN_BPS", "PAPER_TRADING_SLIPPAGE_MAX_BPS",
-    )}
+    build = os.getenv("BOT_BUILD_REVISION", "")
+    if not re.fullmatch("[0-9a-f]{40}", build):
+        return
     instance = str(strategy_id or meta.get("agent_id") or key)
-    version = rule_version({"instance": instance, "rules": rules, "controls": controls})
-    if version:
-        meta["strategy_evidence"] = {"source_key": key, "route": route, "instance": instance, "version": version}
+    try:
+        if isinstance(rules, str):
+            rules = json.loads(rules)
+        version = rule_version({"instance": instance, "rules": rules, "controls": effective_controls(config),
+                                "code": code_version(route)})
+    except (OSError, ValueError, TypeError):
+        return
+    meta["strategy_evidence"] = {"source_key": key, "route": route, "instance": instance,
+                                 "version": version, "build_revision": build}
 
 
 def _outcome(row, meta):
@@ -66,13 +100,13 @@ def _outcome(row, meta):
     pnl, entry, exit_px, size, lev = (number(row[k]) for k in ("pnl", "entry_price", "exit_price", "size", "leverage"))
     gross, fees, slip = (number(meta.get(k)) for k in
                          ("gross_pnl_before_fees", "total_fees_paid", "total_slippage_cost"))
-    # The runtime's best-effort funding aggregate does not prove every hour was
-    # observed. Only same-hour outcomes are verifiable without a funding ledger.
-    if entry_time.replace(minute=0, second=0, microsecond=0) != close_time.replace(minute=0, second=0, microsecond=0):
+    modeled_funding = verified_cost(row, fields(meta.get("funding_coverage")))
+    if modeled_funding is None:
         return None, "funding_coverage_unverified"
     funding = number(meta.get("funding_accrued", 0))
     if (None in (pnl, entry, exit_px, size, lev, gross, fees, slip, funding)
-            or min(entry, exit_px, size, lev) <= 0 or fees < 0 or slip < 0 or funding != 0
+            or min(entry, exit_px, size, lev) <= 0 or fees < 0 or slip < 0
+            or abs(funding-modeled_funding) > .000051
             or row["side"] not in {"long", "short"}):
         return None, "cost_evidence_missing"
     notional = number((entry + exit_px)*size*lev)
@@ -109,7 +143,8 @@ def scorecard(path, *, now):
         return {**report, "reason": "window_limit"}
     parsed = [(row, fields(row["metadata"])) for row in rows]
     decisions = Counter(meta.get("decision_id") for _, meta in parsed if isinstance(meta.get("decision_id"), str) and meta["decision_id"])
-    cohorts = defaultdict(lambda: {"closed": 0, "open": 0, "excluded": Counter(), "outcomes": []})
+    cohorts = defaultdict(lambda: {"closed": 0, "open": 0, "excluded": Counter(), "funding": Counter(),
+                                   "builds": set(), "outcomes": []})
     for row, meta in parsed:
         identity = fields(meta.get("strategy_evidence"))
         source = str(identity.get("source_key") or meta.get("source_key") or meta.get("strategy_type") or meta.get("source") or "unknown")
@@ -118,14 +153,20 @@ def scorecard(path, *, now):
         route = str(identity.get("route") or fields(meta.get("entry_decision")).get("route") or meta.get("source") or "unknown")
         instance = str(identity.get("instance") or row["strategy_id"] or meta.get("agent_id") or "")
         version = identity.get("version")
-        version = version if isinstance(version, str) and re.fullmatch("[0-9a-f]{40}:[0-9a-f]{16}", version) else None
+        version = version if isinstance(version, str) and VERSION_RE.fullmatch(version) else None
         # Keep the unredacted identity in the internal key, not the UI.
         key = (source, route, instance, version, str(identity.get("source_key") or meta.get("source_key") or ""))
         group = cohorts[key]
+        if version:
+            build = identity.get("build_revision") or (version[:40] if not version.startswith("rules-v2:") else None)
+            if isinstance(build, str) and re.fullmatch("[0-9a-f]{40}", build):
+                group["builds"].add(build)
         if row["status"] == "open":
             group["open"] += 1
             continue
         group["closed"] += 1
+        coverage = fields(meta.get("funding_coverage")).get("state")
+        group["funding"][coverage if coverage in ("modeled_complete", "incomplete") else "unrecorded"] += 1
         decision = meta.get("decision_id")
         if not version or identity.get("source_key") != meta.get("source_key"):
             group["excluded"]["unversioned"] += 1
@@ -141,6 +182,7 @@ def scorecard(path, *, now):
                 group["outcomes"].append(outcome)
     for (source, route, instance, version, raw_source), group in cohorts.items():
         outcomes = group.pop("outcomes")
+        builds = sorted(group.pop("builds"))
         net = math.fsum(o[0] for o in outcomes) if outcomes else None
         stressed = math.fsum(o[1] for o in outcomes) if outcomes else None
         days = len({o[2] for o in outcomes})
@@ -157,7 +199,7 @@ def scorecard(path, *, now):
             state = "Ready for human review"
         report["rows"].append({**group, "source": source[:100], "route": route[:55],
                                "instance": instance[:24] if instance != raw_source else "",
-                               "version": version, "verified": len(outcomes), "days": days, "net": net,
+                               "version": version, "builds": builds, "verified": len(outcomes), "days": days, "net": net,
                                "stressed": stressed, "without_best": without_best, "state": state})
     report["rows"].sort(key=lambda r: (-r["closed"], r["source"], r["version"] or ""))
     return {**report, "available": True, "reason": None, "total_cohorts": len(report["rows"]), "rows": report["rows"][:150]}

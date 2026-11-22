@@ -1,0 +1,11 @@
+[Unit]
+Description=Capture public Oracle prices and hourly rates for the paper book
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/docker exec hyperliquid-bot python -B -m scripts.capture_paper_funding --paper-db /data/bot.db
+TimeoutStartSec=55
+NoNewPrivileges=yes
+PrivateTmp=yes

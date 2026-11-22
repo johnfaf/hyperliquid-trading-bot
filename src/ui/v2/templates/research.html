@@ -17,13 +17,26 @@
       <table class="desk-table"><thead><tr><th scope="col">Source / route</th><th scope="col">Review state</th><th scope="col">Verified / closed</th><th scope="col">Days</th><th scope="col">Rule version</th><th scope="col">Net</th><th scope="col">Stressed net</th></tr></thead>
       <tbody>{% for row in evidence.rows %}<tr>
         <th scope="row">{{ row.source }}<br><small>{{ row.route }}{% if row.instance %} &middot; {{ row.instance }}{% endif %}</small></th>
-        <td>{{ row.state }}{% for reason, n in row.excluded|dictsort %}<br><small>{{ n }} {{ reason|replace("_", " ") }}</small>{% endfor %}</td>
+        <td>{{ row.state }}{% for reason, n in row.excluded|dictsort %}<br><small>{{ n }} {{ reason|replace("_", " ") }}</small>{% endfor %}{% if row.funding.get("modeled_complete") %}<br><small>{{ row.funding.modeled_complete }} with complete funding model</small>{% endif %}</td>
         <td>{{ row.verified }} / {{ row.closed }}{% if row.open %}<br><small>{{ row.open }} open</small>{% endif %}</td>
-        <td>{{ row.days }}</td><td title="{{ row.version or '' }}">{{ row.version[:8] ~ ":" ~ row.version[41:49] if row.version else "Unrecorded" }}</td>
+        <td>{{ row.days }}</td><td title="{{ row.version or '' }}">{{ (row.version[9:21] if row.version.startswith("rules-v2:") else row.version[:8] ~ ":" ~ row.version[41:49]) if row.version else "Unrecorded" }}{% if row.builds %}<br><small>{{ row.builds|length }} build{{ "s" if row.builds|length != 1 else "" }}</small>{% endif %}</td>
         <td>{{ money(row.net, true) }}</td><td>{{ money(row.stressed, true) }}</td>
       </tr>{% endfor %}</tbody></table>
     </div>
     <div class="desk-decision-empty">{{ evidence.min_closes }} verified closes &middot; {{ evidence.min_days }} UTC days &middot; +{{ evidence.stress_bps }} bps round trip{% if evidence.total_cohorts > evidence.rows|length %} &middot; Showing {{ evidence.rows|length }} of {{ evidence.total_cohorts }} cohorts{% endif %}</div>
+    {% endif %}
+  </section>
+  <section class="desk-panel">
+    <div class="desk-panel-heading"><div><h2>BTC forward shadow</h2><p>24-hour channel breakout &middot; Separate $1,000 book</p></div>{{ badge("Simulation only") }}</div>
+    {% if not forward_shadow %}<div class="desk-empty compact"><p>Forward scorecard unavailable.</p></div>
+    {% else %}
+    <p class="desk-muted desk-research-status">{{ forward_shadow.state }}{% if forward_shadow.stale %} &middot; Stale report{% endif %}<br>{{ forward_shadow.start[:16]|replace("T", " ") }} to {{ forward_shadow.end[:16]|replace("T", " ") }} UTC</p>
+    {% if forward_shadow.results %}
+    <div class="desk-table-scroll" tabindex="0" aria-label="Forward simulated cash and passive benchmarks">
+      <table class="desk-table"><thead><tr><th>Costs</th><th>Strategy</th><th>Cash</th><th>Passive BTC</th><th>Drawdown</th><th>Closes</th><th>Without largest winner</th></tr></thead>
+      <tbody>{% for scenario, row in forward_shadow.results.items() %}<tr><th scope="row">{{ scenario|capitalize }}</th><td>{{ money(row.net,true) }}</td><td>{{ money(row.cash,true) }}</td><td>{{ money(row.passive,true) }}</td><td>{{ "{:.2f}%".format(row.drawdown_pct) }}</td><td>{{ row.closed }}</td><td>{{ money(row.net_without_largest,true) }}</td></tr>{% endfor %}</tbody></table>
+    </div>
+    {% endif %}
     {% endif %}
   </section>
   <section class="desk-panel">

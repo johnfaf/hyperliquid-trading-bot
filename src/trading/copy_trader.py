@@ -1752,7 +1752,12 @@ class CopyTrader:
         entry_fee = entry_notional * fee_rate
         exit_fee = exit_notional * fee_rate
         total_fees = round(entry_fee + exit_fee, 4)
-        pnl = round(gross_pnl - total_fees, 2)
+        from src.core import clock_provider
+        from src.trading.paper_funding import funding_for_close
+        event_at = clock_provider.utc_now()
+        funding = funding_for_close(trade, now=event_at)
+        funding_cost = (funding["known_cost"] or 0.) if funding is not None else 0.
+        pnl = round(gross_pnl - total_fees - funding_cost, 2)
 
         close_metadata = {
             "execution_role": execution_role,
@@ -1771,11 +1776,14 @@ class CopyTrader:
             "exit_slipped_price": float(exit_price),
             "close_reason": close_reason,
         }
+        if funding is not None:
+            close_metadata.update(funding_accrued=round(funding_cost, 4), funding_coverage=funding)
 
         # CRIT-FIX C2: atomic close + account credit in one transaction
         # (see src/data/database.py::close_paper_trade_and_credit_account).
         if not db.close_paper_trade_and_credit_account(
             trade["id"], exit_price, pnl, metadata_updates=close_metadata,
+            **({"event_at": event_at} if funding is not None else {}),
         ):
             logger.error(
                 "Copy trade close failed for trade %s (%s %s) -- "
