@@ -94,9 +94,12 @@ async def research(request: Request):
     if not verify_cookie(request):
         return RedirectResponse("/login", status_code=303)
     from src.ui.v2.app import get_templates
+    from src.learning.strategy_evidence import scorecard
     host = await run_in_threadpool(host_status, Path(config.DB_PATH).with_name("dashboard_ops.json"), datetime.now(timezone.utc))
+    evidence = await run_in_threadpool(get_ttl, "strategy-evidence", 30,
+                                       lambda: scorecard(config.DB_PATH, now=datetime.now(timezone.utc)))
     return get_templates().TemplateResponse(request, "research.html", {
-        "title": "Research", "study": host.get("absorption"), "weekly": host.get("weekly"),
+        "title": "Research", "study": host.get("absorption"), "weekly": host.get("weekly"), "evidence": evidence,
     })
 
 

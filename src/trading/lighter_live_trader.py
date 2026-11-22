@@ -461,6 +461,11 @@ class LighterLiveTrader:
         return self._sdk_constant("ORDER_TYPE_MARKET", default=1)
 
     def execute_signal(self, signal: TradeSignal | Dict[str, Any], bypass_firewall: bool = False) -> Optional[Dict[str, Any]]:
+        if not self.dry_run:
+            from src.learning.strategy_evidence import live_entry_hold
+            if reason := live_entry_hold():
+                logger.warning("Live entry blocked: %s", reason)
+                return None
         trade_signal = signal if isinstance(signal, TradeSignal) else signal_from_execution_dict(signal)
         side = _side_value(trade_signal.side)
         size = abs(float(getattr(trade_signal, "size", 0.0) or 0.0))

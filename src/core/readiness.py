@@ -308,8 +308,13 @@ def evaluate_readiness(
     checks["kill_switch_active"] = kill_switch_active
     checks["live_status_reason"] = live_status_reason or None
     checks["free_margin"] = free_margin
+    from src.learning.strategy_evidence import live_entry_hold
+    entry_hold = live_entry_hold()
+    checks["live_entry_hold"] = entry_hold
 
     if live_requested:
+        if entry_hold:
+            reasons.append(entry_hold)
         if not deployable:
             reasons.append(f"live_not_deployable:{live_status_reason or 'unknown'}")
         if not signer_available:
@@ -326,6 +331,7 @@ def evaluate_readiness(
         and live_requested
         and deployable
         and signer_available
+        and not entry_hold
         and not kill_switch_active
         and not (free_margin is not None and free_margin <= 0)
     )

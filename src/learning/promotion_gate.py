@@ -1,25 +1,10 @@
-"""Walk-forward promotion gate for live trades.
+"""Legacy promotion diagnostics for historical comparisons.
 
-Before a paper trade is mirrored to live, this gate checks that its
-underlying strategy/source has accumulated enough out-of-sample
-evidence to justify real money. Trades whose source hasn't earned
-live status stay paper-only.
+The execution adapters no longer use these scores to permit orders.
+See strategy_evidence for the current review-only evidence.
 
-This is a *defense-in-depth* layer on top of the existing strategy
-quarantine (``is_strategy_live_eligible`` / ``strategy_quarantine_reason``
-in ``src.data.database``). Quarantine catches *broken* or *synthetic*
-strategies; this gate catches strategies that are well-formed but
-simply haven't proven themselves yet.
-
-Design notes:
-  - Fails CLOSED for live by default. If we can't resolve the source's
-    track record, the trade stays paper. The "if it can't be measured
-    it can't be sized" principle.
-  - Two source paths supported in MVP: strategy-id-backed (look up the
-    DB strategy row) and copy-trade (look up the agent_scorer entry).
-  - Thresholds are all env-configurable. Disable the whole gate with
-    ``LIVE_PROMOTION_GATE_ENABLED=false`` if you need to bypass during
-    bootstrap.
+Preserved for historical analysis of the former thresholds. Signal counts are
+not completed-trade evidence.
 """
 from __future__ import annotations
 

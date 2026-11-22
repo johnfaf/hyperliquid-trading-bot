@@ -2064,6 +2064,7 @@ class AlphaArena:
                     "source": "arena_champion",
                     "strategy_type": agent.strategy_type,
                     "agent_id": agent.agent_id,
+                    "evidence_rule_inputs": dict(agent.params),
                     "agent_name": agent.name,
                     "agent_fitness": round(agent.fitness_score, 4),
                     "agent_elo": round(agent.elo_rating, 0),

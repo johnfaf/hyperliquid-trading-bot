@@ -45,14 +45,16 @@ async def health() -> JSONResponse:
 async def execution_mode() -> JSONResponse:
     """Fast mode attestation, deliberately independent of full DB readiness."""
     import config
+    from src.learning.strategy_evidence import live_entry_hold
     from src.ui.v2.state import get_components
     trader = get_components().live_trader
-    requested = bool(config.LIVE_TRADING_ENABLED or getattr(trader, "live_requested", False))
+    requested = bool(config.LIVE_TRADING_ENABLED or config.LIGHTER_LIVE_TRADING_ENABLED or getattr(trader, "live_requested", False))
     signer = bool(getattr(trader, "signer", None))
     bound = trader is not None
     paper = bound and os.getenv("BOT_RUN_MODE") == "paper" and not requested and not signer
     return JSONResponse({"runtime_bound": bound, "paper_only": paper,
-                         "live_requested": requested, "signer_available": signer}, status_code=200 if bound else 503)
+                         "live_requested": requested, "signer_available": signer,
+                         "live_entry_hold": live_entry_hold()}, status_code=200 if bound else 503)
 
 
 @router.get("/api/ready")

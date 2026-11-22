@@ -6452,6 +6452,11 @@ class LiveTrader:
         Returns:
             Execution result dict or None if rejected
         """
+        if not self.dry_run:
+            from src.learning.strategy_evidence import live_entry_hold
+            if reason := live_entry_hold():
+                logger.warning("Live entry blocked: %s", reason)
+                return None
         signal = self._coerce_signal(signal)
         source_key = self._signal_source_key(signal)
         self._incr_entry_metric("attempted_entry_signals")

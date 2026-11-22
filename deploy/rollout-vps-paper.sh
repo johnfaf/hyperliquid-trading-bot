@@ -18,7 +18,8 @@ verify_paper() {
     sudo -n docker exec -i hyperliquid-bot python - <<'PY'
 import os
 import config
-if os.getenv("BOT_RUN_MODE") != "paper" or config.LIVE_TRADING_ENABLED or bool(os.getenv("HL_AGENT_PRIVATE_KEY")):
+if (os.getenv("BOT_RUN_MODE") != "paper" or config.LIVE_TRADING_ENABLED
+        or config.LIGHTER_LIVE_TRADING_ENABLED or bool(os.getenv("HL_AGENT_PRIVATE_KEY"))):
     raise SystemExit("paper-only configuration or signer absence not confirmed")
 PY
     if [[ "${1:-runtime}" == configuration ]]; then
@@ -41,6 +42,8 @@ with response as body:
     readiness = json.load(body)
 if readiness.get("paper_only") is not True or readiness.get("live_requested") is not False or readiness.get("signer_available") is not False:
     raise SystemExit("bot is not confirmed paper-only")
+if readiness.get("live_entry_hold") != "strategy_evidence_human_approval_required":
+    raise SystemExit("crypto live entry hold not confirmed")
 PY
 }
 

@@ -2062,6 +2062,7 @@ class PaperTrader:
                     "strategy_type": signal.get("strategy_type", ""),
                     "source": signal.get("source", "strategy"),
                     "source_key": signal.get("source_key", ""),
+                    "evidence_rule_inputs": strategy.get("parameters"),
                     "confidence": signal.get("confidence", 0),
                     "signal_id": signal.get("signal_id", ""),
                     "decision_id": decision_id,

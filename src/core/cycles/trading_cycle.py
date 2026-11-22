@@ -767,9 +767,8 @@ def _execute_signal_live(container, trade_signal, source_label: str, bypass_fire
     every gate added for the paper->live mirror path. The funding-
     divergence and unknown-source gates are applied here too because
     they're cheap, asymmetric (only block), and the same risks apply
-    regardless of which path the signal came in on. Promotion gate is
-    *not* applied here because LCRS/options/arena don't have the same
-    strategy_id/agent_score tracking model as paper-mirror trades.
+    regardless of which path the signal came in on. The execution adapter
+    applies the same evidence hold to direct, mirror, and reversal entries.
     """
     trader = get_live_trader(container)
     if not trader or not is_live_trading_active(container):
@@ -2210,6 +2209,7 @@ def _run_alpha_arena(container, regime_data):
                                 trade_id = _open_direct_paper_trade(
                                     container, live_signal, account_balance, ref, "arena_champion", {
                                         "agent_id": sig["agent_id"],
+                                        "evidence_rule_inputs": sig.get("evidence_rule_inputs"),
                                         "agent_name": sig["agent_name"],
                                         "strategy_type": sig["strategy_type"],
                                         "agent_fitness": sig["agent_fitness"],

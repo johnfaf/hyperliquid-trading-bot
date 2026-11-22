@@ -6,6 +6,26 @@
     <div><div class="desk-kicker">{{ icon("activity",15) }} Hyperliquid</div><h1>Research</h1><p class="desk-muted">Separate ledgers &middot; No live approval</p></div>
     <div class="desk-actions"><a class="text-sm text-sky-300 underline" href="/trades?scope=all">Trade review</a><a class="desk-icon-btn" href="/research" title="Refresh research" aria-label="Refresh research">{{ icon("refresh") }}</a></div>
   </header>
+  <section class="desk-panel" id="strategy-evidence">
+    <div class="desk-panel-heading"><div><h2>Strategy evidence</h2><p>Last 30 days &middot; Verified paper outcomes</p></div>{{ badge("Live entries locked", "warn") }}</div>
+    {% if not evidence.available %}
+    <div class="desk-empty compact"><p>{{ "Evidence window exceeds report limit" if evidence.reason == "window_limit" else "Paper ledger unavailable" }}.</p></div>
+    {% elif not evidence.rows %}
+    <div class="desk-empty compact"><p>No paper observations in this window.</p></div>
+    {% else %}
+    <div class="desk-table-scroll" tabindex="0" aria-label="Strategy evidence by exact cohort">
+      <table class="desk-table"><thead><tr><th scope="col">Source / route</th><th scope="col">Review state</th><th scope="col">Verified / closed</th><th scope="col">Days</th><th scope="col">Rule version</th><th scope="col">Net</th><th scope="col">Stressed net</th></tr></thead>
+      <tbody>{% for row in evidence.rows %}<tr>
+        <th scope="row">{{ row.source }}<br><small>{{ row.route }}{% if row.instance %} &middot; {{ row.instance }}{% endif %}</small></th>
+        <td>{{ row.state }}{% for reason, n in row.excluded|dictsort %}<br><small>{{ n }} {{ reason|replace("_", " ") }}</small>{% endfor %}</td>
+        <td>{{ row.verified }} / {{ row.closed }}{% if row.open %}<br><small>{{ row.open }} open</small>{% endif %}</td>
+        <td>{{ row.days }}</td><td title="{{ row.version or '' }}">{{ row.version[:8] ~ ":" ~ row.version[41:49] if row.version else "Unrecorded" }}</td>
+        <td>{{ money(row.net, true) }}</td><td>{{ money(row.stressed, true) }}</td>
+      </tr>{% endfor %}</tbody></table>
+    </div>
+    <div class="desk-decision-empty">{{ evidence.min_closes }} verified closes &middot; {{ evidence.min_days }} UTC days &middot; +{{ evidence.stress_bps }} bps round trip{% if evidence.total_cohorts > evidence.rows|length %} &middot; Showing {{ evidence.rows|length }} of {{ evidence.total_cohorts }} cohorts{% endif %}</div>
+    {% endif %}
+  </section>
   <section class="desk-panel">
     <div class="desk-panel-heading"><div><h2>BTC / ETH absorption</h2><p>Public order flow &middot; {{ study.rule if study else "Unmeasured" }}</p></div>{{ badge("Observation only") }}</div>
     {% if not study %}<div class="desk-empty compact"><p>Structured research scorecard unavailable. Performance is unmeasured.</p></div>

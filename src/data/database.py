@@ -1367,6 +1367,8 @@ def open_paper_trade(strategy_id, coin, side, entry_price, size, leverage=1,
     captured["initial_stop"] = stop_loss
     captured["initial_target"] = take_profit
     metadata["entry_decision"] = captured
+    from src.learning.strategy_evidence import stamp_paper_entry
+    stamp_paper_entry(metadata, strategy_id)
     _ensure_postgres_strategy_parent(strategy_id)
 
     key = None

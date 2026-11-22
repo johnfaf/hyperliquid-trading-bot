@@ -52,16 +52,9 @@ from src.trading.live_trader import (
 
 
 @pytest.fixture(autouse=True)
-def _bypass_promotion_gate(monkeypatch):
-    """Pre-existing live-control tests use minimal trade dicts that the
-    walk-forward promotion gate would (correctly) reject as untagged.
-    Bypass the gate so these tests keep exercising the rescale/firewall
-    math they were written for. The promotion gate itself is covered by
-    ``tests/test_promotion_gate.py``."""
-    monkeypatch.setattr(
-        "src.learning.promotion_gate.is_live_promotable",
-        lambda trade: (True, "test_bypass"),
-    )
+def _simulate_operator_review(monkeypatch):
+    """Exercise downstream controls with mocked venues; adapter hold tested separately."""
+    monkeypatch.setattr("src.learning.strategy_evidence.live_entry_hold", lambda: None)
     # Same rationale for the data-readiness + EV gates -- the legacy
     # test fixtures don't carry populated feature vectors or stubbed
     # market data. Each gate has its own dedicated test module.

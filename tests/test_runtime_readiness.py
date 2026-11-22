@@ -128,6 +128,19 @@ def test_evaluate_readiness_flags_stale_trading_heartbeat(monkeypatch):
     assert "decision_firewall" in snapshot["checks"]["stale_trading_subsystems"]
 
 
+def test_evidence_hold_is_reported_even_with_funded_live_credentials(monkeypatch):
+    monkeypatch.setattr(readiness, "_probe_db_readable", lambda: (True, ""))
+    monkeypatch.setattr(readiness, "_probe_db_writable", lambda: (True, ""))
+    snapshot = readiness.evaluate_readiness(
+        container=_FakeContainer({"live_enabled": True, "deployable": True, "signer_available": True,
+                                  "wallet_balance": {"free_margin": 500.}}),
+        health_registry=_healthy_registry(), include_db_audit=False,
+    )
+    assert snapshot["ready"] is True
+    assert snapshot["live_ready"] is False
+    assert "strategy_evidence_human_approval_required" in snapshot["reasons"]
+
+
 def test_evaluate_readiness_blocks_on_db_audit_findings(monkeypatch):
     monkeypatch.setattr(readiness, "_probe_db_readable", lambda: (True, ""))
     monkeypatch.setattr(readiness, "_probe_db_writable", lambda ttl_s=None: (True, ""))

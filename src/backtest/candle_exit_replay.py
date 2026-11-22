@@ -98,7 +98,7 @@ def trigger(bar, side, stop, take):
     return None
 
 
-def simulate(bars, decisions, funding, start, end, *, policy, slip_bps, capital, trace=None):
+def simulate(bars, decisions, funding, start, end, *, policy, slip_bps, capital, trace=None, fee_rate=TAKER_FEE):
     stamps = [bar.t for bar in bars]
     lo, hi = bisect_left(stamps, start), bisect_left(stamps, end)
     if (hi <= lo or bars[lo].t != start or bars[hi - 1].t + BAR_MS != end
@@ -119,7 +119,7 @@ def simulate(bars, decisions, funding, start, end, *, policy, slip_bps, capital,
         nonlocal balance, position
         s, units = position["side"], position["units"]
         fill = price * (1 - s * slip)
-        fee = fill * units * TAKER_FEE
+        fee = fill * units * fee_rate
         gross = (fill - position["entry_price"]) * units * s
         pnl = gross - position["entry_fee"] - fee - position["funding"]
         balance += gross - fee
@@ -148,7 +148,7 @@ def simulate(bars, decisions, funding, start, end, *, policy, slip_bps, capital,
             else:
                 fill = bar.open * (1 + side * slip)
                 units = balance * POSITION_FRACTION / fill
-                fee = fill * units * TAKER_FEE
+                fee = fill * units * fee_rate
                 balance -= fee
                 position = {"side": side, "entry_bar": bar.t, "signal_bar": previous, "entry_price": fill,
                             "units": units, "stop": fill * (1 - side * distance),
@@ -192,7 +192,7 @@ def simulate(bars, decisions, funding, start, end, *, policy, slip_bps, capital,
         if position:
             mark = bar.close * (1 - position["side"] * slip)
             unrealized = (mark - position["entry_price"]) * position["units"] * position["side"]
-            equity.append(balance + unrealized - mark * position["units"] * TAKER_FEE)
+            equity.append(balance + unrealized - mark * position["units"] * fee_rate)
         else:
             equity.append(balance)
     return {"equity": equity, "trades": trades, "counts": counts}

@@ -52,6 +52,7 @@ def test_lighter_live_trader_fail_closed_without_enable(monkeypatch):
 def test_lighter_execute_signal_places_entry_and_protective_orders(monkeypatch):
     calls = []
     _install_fake_lighter_sdk(monkeypatch, calls)
+    monkeypatch.setattr("src.learning.strategy_evidence.live_entry_hold", lambda: None)
     monkeypatch.setattr(config, "LIGHTER_LIVE_TRADING_ENABLED", True, raising=False)
     monkeypatch.setattr(config, "LIGHTER_LIVE_TRADING_DUAL_CONTROL_CONFIRM", True, raising=False)
 

@@ -462,72 +462,7 @@ def _rescale_size_for_live(trade: Dict, trader) -> Optional[Dict]:
     After rescaling, the final notional is clamped to trader.max_order_usd
     (if set) so nothing above the bootstrap cap ever hits the exchange.
     """
-    # Walk-forward promotion gate: block live mirror if the strategy /
-    # source hasn't earned live status yet (insufficient trade history,
-    # poor win rate, or no resolvable track record). Paper continues
-    # so the source keeps accumulating outcomes; only the live mirror
-    # is gated. Bypass via ``LIVE_PROMOTION_GATE_ENABLED=false`` if you
-    # need to bootstrap a new source.
-    promotion_scale = 1.0  # bootstrap-tier size modifier; 1.0 = full
-    # ★ AUDIT FIX (live-mirror fail-closed): the previous behaviour
-    # caught ANY exception from ``is_live_promotable`` and forced
-    # ``promotable=True`` with reason ``gate_error_fail_open``, silently
-    # bypassing the entire live-promotion safety system on transient DB
-    # errors, import failures, or any other gate-internal exception.
-    # ``is_live_promotable`` is *itself* fail-closed (returns False on
-    # exceptions); the wrapper here was overriding that into a
-    # fail-OPEN-to-live default, which is exactly the failure mode the
-    # gate exists to prevent.
-    #
-    # New default: fail-CLOSED for live.  An exception while evaluating
-    # the gate skips the live mirror; the paper trade continues so the
-    # source keeps accumulating outcomes and can promote on the next
-    # cycle.  Operators can opt back into the legacy fail-open behaviour
-    # via ``LIVE_PROMOTION_GATE_FAIL_OPEN=1`` (e.g. for a one-off
-    # bootstrap of a fresh source while the gate's underlying DB schema
-    # is being migrated).
-    try:
-        from src.learning.promotion_gate import is_live_promotable, get_bootstrap_scale
-        promotable, reason = is_live_promotable(trade)
-        promotion_scale = get_bootstrap_scale(reason)
-    except Exception as exc:
-        fail_open = str(
-            os.environ.get("LIVE_PROMOTION_GATE_FAIL_OPEN", "0")
-        ).strip().lower() in {"1", "true", "yes"}
-        if fail_open:
-            logger.warning(
-                "Promotion gate check failed for %s but LIVE_PROMOTION_GATE_FAIL_OPEN=1 "
-                "is set -- proceeding to live mirror at full size (legacy "
-                "fail-open behaviour, %s)",
-                trade.get("coin", "?"),
-                exc,
-            )
-            promotable, reason = True, "gate_error_fail_open"
-        else:
-            logger.error(
-                "Promotion gate check failed for %s -- skipping live mirror "
-                "(fail-closed for live safety; set LIVE_PROMOTION_GATE_FAIL_OPEN=1 "
-                "to override): %s",
-                trade.get("coin", "?"),
-                exc,
-            )
-            return None
-    if not promotable:
-        logger.info(
-            "Skipping live mirror for %s: promotion gate blocked (%s). "
-            "Paper trade continues; live stays gated until source meets "
-            "promotion thresholds.",
-            trade.get("coin", "?"),
-            reason,
-        )
-        return None
-    if promotion_scale < 1.0:
-        logger.info(
-            "Bootstrap-tier promotion for %s: applying %.2fx size scale (%s). "
-            "Full-size promotion unlocks once the source meets the standard "
-            "30-trade / 45%% win-rate bar.",
-            trade.get("coin", "?"), promotion_scale, reason,
-        )
+    # Execution adapters separately enforce the strategy evidence hold.
 
     paper_account = db.get_paper_account()
     paper_balance = float((paper_account or {}).get("balance", 0) or 0)
@@ -591,13 +526,6 @@ def _rescale_size_for_live(trade: Dict, trader) -> Optional[Dict]:
 
     # H6: scale on symmetric "new-trade capacity" on both sides.
     scale = live_free_margin / paper_free_balance
-    # Bootstrap-tier promotion: multiply the rescale by the bootstrap scale
-    # so the live mirror size becomes (paper_scale * bootstrap_fraction).
-    # Floor-up below may still raise this back to min_order_usd if the
-    # result lands under the exchange minimum -- by design, since refusing
-    # every bootstrap mirror on a small wallet would defeat the tier.
-    if promotion_scale < 1.0:
-        scale *= promotion_scale
     # H7: Clamp scale to 1.0 when live free margin exceeds the paper
     # reference unless the operator explicitly opts in via
     # LIVE_ALLOW_SCALE_ABOVE_PAPER=1.  The paper book is the source of our
