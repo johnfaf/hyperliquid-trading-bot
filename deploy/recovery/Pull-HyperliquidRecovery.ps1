@@ -2,7 +2,8 @@ param(
     [Parameter(Mandatory)][string]$Server,
     [Parameter(Mandatory)][string]$SshKey,
     [string]$Directory = "$env:LOCALAPPDATA\HyperliquidRecovery",
-    [string]$Python = "python"
+    [string]$Python = "python",
+    [switch]$VerifyAgain
 )
 
 $ErrorActionPreference = 'Stop'
@@ -15,13 +16,16 @@ $revision = $state.revision
 if ($revision -notmatch '^[a-f0-9]{40}$') { throw 'Unexpected recovery revision.' }
 $archive = Join-Path $Directory "paper-recovery-$revision.tar.gz.age"
 $receipt = Join-Path $Directory "verified-$revision.json"
-if (Test-Path -LiteralPath $receipt) {
+if ((Test-Path -LiteralPath $receipt) -and !$VerifyAgain) {
     $proof = Get-Content -Raw -LiteralPath $receipt | ConvertFrom-Json
     if ($proof.verified -ne $true -or $proof.revision -ne $revision) { throw 'Invalid existing recovery receipt.' }
     if ($proof.PSObject.Properties.Name -contains 'snapshot_at' -and $proof.snapshot_at) {
         return
     }
 } else {
+    if ($PSVersionTable.PSEdition -eq 'Desktop') {
+        Add-Type -AssemblyName System.Security
+    }
     $locked = [IO.File]::ReadAllBytes((Join-Path $Directory 'restore-identity.dpapi'))
     $plain = [Security.Cryptography.ProtectedData]::Unprotect(
         $locked, $null, [Security.Cryptography.DataProtectionScope]::CurrentUser
