@@ -2503,6 +2503,17 @@ class PaperTrader:
         if mids is None:
             mids = hl.get_all_mids() or {}
 
+        # Persist only observed marks; an unavailable quote must never become entry price.
+        try:
+            marks = {}
+            for trade in open_trades:
+                value = float(mids.get(trade["coin"]) or 0)
+                if math.isfinite(value) and value > 0:
+                    marks[trade["coin"]] = value
+            db.set_bot_state("paper_mark_prices", {"observed_at": clock_provider.utc_now().isoformat(), "mids": marks})
+        except Exception as exc:
+            logger.warning("Paper valuation marks could not be recorded: %s", type(exc).__name__)
+
         # Fetch live funding rates for accrual (best-effort; empty on failure).
         funding_contexts: Dict[str, Dict] = {}
         if config.PAPER_TRADING_FUNDING_ENABLED:

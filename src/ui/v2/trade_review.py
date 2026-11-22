@@ -10,6 +10,7 @@ import sqlite3
 import config
 from src.trading.trade_decision_memory import COPY_CONCENTRATION_STUDY, is_copy_metadata, number
 from src.ui.v2.desk import host_status, read_sqlite
+from src.trading.paper_reporting import completed_week, metrics, valuation
 
 COLUMNS = "id, coin, side, status, opened_at, closed_at, entry_price, exit_price, size, leverage, pnl, stop_loss, take_profit, metadata"
 STOP_REASONS = {"stop_loss", "trailing_stop"}
@@ -76,6 +77,7 @@ def normalize(row):
         symbol=str(trade["coin"] or "Unknown").strip().upper(), side=side, meta=meta, entry=entry, exit=exit,
         copy=is_copy, wallet=wallet.lower(), reason=reason, stop_type=stop_type, stop_gap_bps=gap,
         source=source_label(wallet.lower()) if is_copy else str(meta.get("strategy_type") or meta.get("source") or "Unattributed"),
+        route=str(entry.get("route") or meta.get("source") or "Unrecorded"),
         trigger=trigger, initial_stop=initial_stop, pnl=number(trade["pnl"]),
         fees=number(meta.get("total_fees_paid", meta.get("fees_paid"))),
         excluded=bool(meta.get("tainted") or meta.get("synthetic_reconciliation") or
@@ -118,6 +120,7 @@ def summary(trades, overlap):
     fees = [t["fees"] for t in closed if t["fees"] is not None]
     stop_gaps = [t["stop_gap_bps"] for t in closed if t["stop_gap_bps"] is not None]
     return {
+        **metrics(trades),
         "closed": len(closed), "open": sum(t["status"] == "open" for t in trades),
         "priced": len(priced), "wins": sum(pnl > 0 for pnl in priced),
         "pnl": math.fsum(priced) if priced else None, "fees": math.fsum(fees) if fees else None,
@@ -154,48 +157,58 @@ def shadow_comparison(trades, start):
     }
 
 
-def review(days=7, group="source", scope="copy", *, path=None, now=None):
+def review(days=7, group="source", scope="copy", *, path=None, now=None, period="rolling"):
     now = now or datetime.now(timezone.utc)
-    start = now - timedelta(days=days)
+    start, end = completed_week(now) if period == "week" else (now - timedelta(days=days), now)
     path = Path(path or config.DB_PATH)
     base = {"days": days, "group": group, "scope": scope, "available": False, "limited": False,
-            "summary": {}, "groups": [], "recent": [], "excluded": 0, "peak": None}
+            "summary": {}, "groups": [], "recent": [], "excluded": 0, "peak": None,
+            "period": period, "start": start.isoformat(), "end": end.isoformat(), "valuation": valuation(path, now)}
     if scope == "copy":
         status = host_status(path.with_name("dashboard_ops.json"), now)
         base.update(copy_daily=status.get("copy_daily"), copy_alerts=status.get("copy_alerts") or [])
     try:
         with closing(read_sqlite(path)) as conn:
+            conn.execute("BEGIN")
             rows = conn.execute(f"""
                 SELECT {COLUMNS} FROM paper_trades
-                WHERE status='open' OR (status='closed' AND closed_at>=? AND closed_at<=?)
+                WHERE (status='open' AND ?='rolling') OR (status='closed' AND julianday(closed_at)>=julianday(?) AND julianday(closed_at)<julianday(?))
                 ORDER BY COALESCE(closed_at, opened_at) DESC, id DESC LIMIT ?
-                """, (start.isoformat(), now.isoformat(), MAX_ROWS + 1)).fetchall()
+                """, (period, start.isoformat(), end.isoformat(), MAX_ROWS + 1)).fetchall()
+            peers = conn.execute(f"""
+                SELECT {COLUMNS} FROM paper_trades
+                WHERE julianday(opened_at)<julianday(?)
+                  AND (status='open' OR (status='closed' AND julianday(closed_at)>julianday(?)))
+                ORDER BY id LIMIT ?
+                """, (end.isoformat(), start.isoformat(), MAX_ROWS + 1)).fetchall()
     except sqlite3.Error:
         return base
     trades = [normalize(row) for row in rows[:MAX_ROWS]]
     selection = [t for t in trades if scope == "all" or t["copy"]]
-    base.update(available=True, limited=len(rows) > MAX_ROWS, recent=selection[:50],
+    base.update(available=True, limited=len(rows) > MAX_ROWS or len(peers) > MAX_ROWS, recent=selection[:50],
                 excluded=sum(t["excluded"] for t in selection))
     if base["limited"]:
         return base  # Never report truncated totals as whole-window results.
     eligible = [t for t in selection if not t["excluded"]]
     copy = [t for t in trades if t["copy"] and not t["excluded"]]
-    overlap, peaks = concentration(copy, start, now)
+    # A position closing after the window can still overlap a close inside it.
+    cohort = [normalize(row) for row in peers]
+    overlap, peaks = concentration([t for t in cohort if t["copy"] and not t["excluded"]], start, end)
     groups = defaultdict(list)
     for trade in eligible:
-        key = (trade["symbol"], trade["side"]) if group == "asset" else trade["side"] if group == "side" else (
+        key = trade["route"] if group == "route" else (trade["symbol"], trade["side"]) if group == "asset" else trade["side"] if group == "side" else (
             ("copy", trade["wallet"]) if trade["copy"] else ("strategy", trade["source"])
         )
         trade["overlap"] = trade["id"] in overlap
         groups[key].append(trade)
     output = []
     for key, members in groups.items():
-        label = (f"{key[0]} {key[1].capitalize()}" if group == "asset" else key.capitalize() or "Unknown"
+        label = (key.replace("_", " ") if group == "route" else f"{key[0]} {key[1].capitalize()}" if group == "asset" else key.capitalize() or "Unknown"
                  if group == "side" else members[0]["source"].replace("_", " "))
         output.append({"label": label, **summary(members, overlap)})
     output.sort(key=lambda row: (row["pnl"] is None, row["pnl"] or 0, row["label"]))
     base.update(summary=summary(eligible, overlap), groups=output[:100], peak=max(peaks.values(), default=None),
-                shadow=shadow_comparison(copy, start))
+                shadow=shadow_comparison(copy, start) if period == "rolling" else None)
     return base
 
 

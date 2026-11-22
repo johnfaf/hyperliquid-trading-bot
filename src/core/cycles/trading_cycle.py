@@ -9,6 +9,7 @@ Extracted from ``HyperliquidResearchBot._run_trading_cycle``.
 """
 import logging
 import copy
+import math
 
 import config
 from src.core import clock_provider
@@ -2133,11 +2134,10 @@ def _run_alpha_arena(container, regime_data):
                 refs = decision_coverage.expect("arena", champion_signals or [])
                 if champion_signals:
                     logger.info("  Arena champions: %d signals", len(champion_signals))
-                    account = None
                     for sig, ref in zip(champion_signals, refs):
                         try:
-                            price = sig.get("price", 0)
-                            if price <= 0:
+                            price = float(sig.get("price", 0))
+                            if not math.isfinite(price) or price <= 0:
                                 decision_coverage.resolve(ref, "blocked", reason="quote_unavailable")
                                 continue
                             side = sig["side"]
@@ -2147,7 +2147,7 @@ def _run_alpha_arena(container, regime_data):
                                 coin=sig["coin"],
                                 side=SignalSide(side),
                                 confidence=conf,
-                                source=SignalSource.STRATEGY,
+                                source=SignalSource.ARENA_CHAMPION,
                                 reason=f"Arena champion: {sig['agent_name']}",
                                 strategy_type=sig["strategy_type"],
                                 entry_price=price,
@@ -2167,37 +2167,24 @@ def _run_alpha_arena(container, regime_data):
                             )
                             live_signal = _apply_dynamic_risk_policy(container, live_signal, regime_data=regime_data)
                             decision_coverage.bind_signal(ref, live_signal)
-                            # A1: pass atr_pct so the ATR floor widens
-                            # tight live-arena stops.
-                            sl, tp = live_signal.risk.resolve_trigger_prices(
-                                price, side, live_signal.leverage,
-                                atr_pct=(live_signal.context or {}).get("atr_pct"),
-                            )
-                            position_pct = 0.05 * conf
-                            # ★ M17 FIX: for live trading, size against real account value
-                            # not PAPER_TRADING_INITIAL_BALANCE constant. For paper mode,
-                            # fall back to the constant as before.
+                            position_pct = live_signal.position_pct
                             live_active = is_live_trading_active(container)
+                            account = None if live_active else db.get_paper_account()
+                            account_balance = None
+                            if live_active and container.live_trader is not None:
+                                trader = container.live_trader
+                                if hasattr(trader, "get_free_margin"):
+                                    account_balance = trader.get_free_margin()
+                                if account_balance is None and hasattr(trader, "get_account_value"):
+                                    account_balance = trader.get_account_value()
+                            elif account:
+                                account_balance = account.get("balance")
+                            if account_balance is None or not math.isfinite(float(account_balance)) or float(account_balance) <= 0:
+                                decision_coverage.resolve(ref, "blocked", reason="account_balance_unavailable")
+                                continue
+                            account_balance = float(account_balance)
                             if getattr(container, "kelly_sizer", None) or getattr(container, "rl_sizer", None):
                                 try:
-                                    if live_active and container.live_trader is not None:
-                                        try:
-                                            fm = None
-                                            if hasattr(container.live_trader, "get_free_margin"):
-                                                fm = container.live_trader.get_free_margin()
-                                            if fm is None and hasattr(container.live_trader, "get_account_value"):
-                                                fm = container.live_trader.get_account_value()
-                                            account_balance = float(fm) if fm is not None else float(
-                                                getattr(config, "PAPER_TRADING_INITIAL_BALANCE", 10_000.0)
-                                            )
-                                        except Exception:
-                                            account_balance = float(
-                                                getattr(config, "PAPER_TRADING_INITIAL_BALANCE", 10_000.0)
-                                            )
-                                    else:
-                                        account_balance = float(
-                                            getattr(config, "PAPER_TRADING_INITIAL_BALANCE", 10_000.0)
-                                        )
                                     sizing = _get_dynamic_sizing(
                                         container,
                                         sig["strategy_type"],
@@ -2208,55 +2195,43 @@ def _run_alpha_arena(container, regime_data):
                                         volatility=sig.get("atr_pct", 0.02),
                                     )
                                     if sizing:
-                                        position_pct = sizing.position_pct
+                                        position_pct = min(position_pct, sizing.position_pct)
                                 except Exception as exc:
                                     logger.debug("  Arena champion sizing failed: %s", exc)
+                            live_signal.position_pct = position_pct
+                            arena_firewall = getattr(container, "firewall", None)
+                            if arena_firewall is None:
+                                decision_coverage.resolve(ref, "blocked", reason="firewall_unavailable")
+                                continue
+                            passed, reason = arena_firewall.validate(
+                                live_signal, regime_data=regime_data,
+                                open_positions=get_execution_open_positions(container),
+                                account_balance=account_balance, require_live_balance=live_active,
+                            )
+                            if not passed:
+                                logger.info("  Arena firewall rejected %s %s: %s", sig["coin"], side, reason)
+                                decision_coverage.resolve(ref, "blocked", reason=f"firewall: {reason}")
+                                continue
                             if live_active:
-                                live_signal.position_pct = position_pct
-                                # ★ H18 FIX: Arena signals previously bypassed the
-                                # firewall entirely on the live path. Run the same
-                                # validation LCRS does (line ~1063) so cooldowns,
-                                # per-coin limits, source caps, side policies, and
-                                # event risk gates all apply to Arena signals.
-                                arena_firewall = getattr(container, "firewall", None)
-                                if arena_firewall:
-                                    open_trades = get_execution_open_positions(container)
-                                    passed, reason = arena_firewall.validate(
-                                        live_signal,
-                                        regime_data=regime_data,
-                                        open_positions=open_trades,
-                                    )
-                                    if not passed:
-                                        logger.info(
-                                            "  Arena firewall rejected %s %s: %s",
-                                            sig["coin"], side, reason,
-                                        )
-                                        decision_coverage.resolve(ref, "blocked", reason=f"firewall: {reason}")
-                                        continue
                                 _execute_signal_live(container, live_signal, "ARENA")
                                 continue
-                            if account is None:
-                                account = db.get_paper_account()
+                            # Use the approved, possibly reduced size and leverage.
+                            sl, tp = live_signal.risk.resolve_trigger_prices(
+                                price, side, live_signal.leverage,
+                                atr_pct=(live_signal.context or {}).get("atr_pct"),
+                            )
                             if account:
-                                if getattr(container, "kelly_sizer", None) or getattr(container, "rl_sizer", None):
-                                    try:
-                                        sizing = _get_dynamic_sizing(
-                                            container,
-                                            sig["strategy_type"],
-                                            account["balance"],
-                                            conf,
-                                            regime_data=regime_data,
-                                            coin=sig["coin"],
-                                            volatility=sig.get("atr_pct", 0.02),
-                                        )
-                                        if sizing:
-                                            position_pct = sizing.position_pct
-                                    except Exception as exc:
-                                        logger.debug("  Arena paper sizing failed: %s", exc)
-                                size_usd = account["balance"] * position_pct
-                                size = size_usd / price
-                                # SILENT-4 FIX: use risk-policy-adjusted leverage
-                                # instead of hardcoded 2x.
+                                from src.trading.paper_risk import size_for_planned_stop
+                                size, stop_budget = size_for_planned_stop(
+                                    balance=account_balance, side=side, entry=price, stop=sl,
+                                    size=account_balance * live_signal.position_pct / price,
+                                    leverage=live_signal.leverage, execution_role="taker",
+                                )
+                                source_key = arena_firewall._source_key(live_signal)
+                                scorer = getattr(container, "agent_scorer", None)
+                                signal_id = scorer.record_signal(source_key, {
+                                    "coin": sig["coin"], "side": side, "confidence": conf,
+                                }) if scorer else None
                                 trade_id = db.open_paper_trade(
                                     strategy_id=None, coin=sig["coin"], side=side,
                                     entry_price=price, size=size, leverage=live_signal.leverage,
@@ -2265,7 +2240,10 @@ def _run_alpha_arena(container, regime_data):
                                         "source": "arena_champion",
                                         "evaluation_ref": ref,
                                         "decision_id": decision_journal.resolve_decision_id(live_signal),
-                                        "entry_decision": entry_memory(live_signal, route="arena_champion"),
+                                        "entry_decision": entry_memory(live_signal, route="arena_champion", firewall="approved"),
+                                        "source_key": source_key,
+                                        "signal_id": signal_id,
+                                        "planned_stop": stop_budget,
                                         "agent_id": sig["agent_id"],
                                         "agent_name": sig["agent_name"],
                                         "strategy_type": sig["strategy_type"],
@@ -2290,7 +2268,7 @@ def _run_alpha_arena(container, regime_data):
                                 decision_coverage.resolve(ref, "blocked", reason="paper_account_unavailable")
                         except Exception as exc:
                             decision_coverage.resolve(ref, "error", reason=type(exc).__name__)
-                            logger.debug("  Champion trade exec error: %s", exc)
+                            logger.warning("  Champion trade exec error (%s): %s", type(exc).__name__, exc)
             except Exception as exc:
                 decision_coverage.mark_failed()
                 logger.debug("  Champion signals error: %s", exc)

@@ -816,7 +816,11 @@ class AgentScorer:
 
         row = next((item for item in self.get_scorecard() if item["source_key"] == source_key), None)
         if not row:
-            return default_policy
+            return {**default_policy, "status": "warmup",
+                    "max_signals_per_day": self.policy_warmup_max_signals_per_day,
+                    "size_multiplier": self.policy_warmup_size_multiplier,
+                    "min_confidence": self.policy_warmup_min_confidence,
+                    "dynamic_cap_reason": "untracked_source_warmup"}
 
         policy = {
             **default_policy,

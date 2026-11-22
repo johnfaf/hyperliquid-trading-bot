@@ -72,6 +72,7 @@ def test_breakdown_excludes_reconciliation_and_counts_true_overlap(ledger):
     assert s["max_gap"] == pytest.approx(50.7614213)
     assert {row["label"] for row in out["groups"]} == {"BTC Long", "BTC Short"}
     assert review(path=path, scope="all", now=now)["summary"]["open"] == 1
+    assert {row["label"] for row in review(path=path, scope="all", group="route", now=now)["groups"]} == {"strategy", "copy trade"}
 
 
 def test_detail_only_links_an_exact_record_and_never_guesses(ledger):
@@ -84,6 +85,21 @@ def test_detail_only_links_an_exact_record_and_never_guesses(ledger):
     old = detail(2, path=path)
     assert old["entry_reason"] is None and not old["linked"] and not old["events"]
     assert detail(3, path=path)["stop_type"] == "Unverified stop"
+
+
+def test_completed_week_overlap_includes_peer_closing_later_without_future_pnl(ledger):
+    path, _ = ledger
+    with closing(sqlite3.connect(path)) as conn, conn:
+        for tid, closed, pnl in [(10, "2026-11-11T00:00:00Z", 1), (11, "2026-11-20T00:00:00Z", 999)]:
+            conn.execute("INSERT INTO paper_trades VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (
+                tid, "ETH", "long", "closed", "2026-11-10T00:00:00Z", closed,
+                100, 101, .1, 2, pnl, 98, 110, '{"source":"copy_trade"}',
+            ))
+    now = datetime(2026, 11, 22, tzinfo=timezone.utc)
+    report = review(path=path, now=now, period="week")
+    assert report["summary"]["closed"] == 1 and report["summary"]["pnl"] == 1
+    assert report["summary"]["overlap"] == 1 and report["peak"] == 2
+    assert report["shadow"] is None
 
 
 def test_copy_snapshot_uses_open_paper_book_and_does_not_block(monkeypatch):

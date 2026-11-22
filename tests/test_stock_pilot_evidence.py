@@ -11,9 +11,27 @@ from scripts.stock_pilot_report import render
 from src.trading.order_journal import Fill, OrderJournal
 from src.trading.stock_evidence import StockEvidence, read_summary
 from src.ui.v2.app import create_app
+from src.core import clock_provider
+from src.backtest.replay.clock import ReplayClock
 
 START = datetime(2026, 11, 16, 15, tzinfo=timezone.utc)
 SESSION = "2026-11-16"
+
+
+def test_default_evidence_timestamps_follow_injected_clock(tmp_path):
+    path = tmp_path / "replay.db"
+    journal = OrderJournal(path, "paper-test")
+    evidence = StockEvidence(path, journal.account)
+    previous = clock_provider.install(ReplayClock(int(START.timestamp() * 1000)))
+    try:
+        evidence.start("cycle", "strategy")
+        evidence.record("cycle", {"state": "no_order", "session": SESSION},
+                        symbol="SPY", mode="shadow", purpose="strategy", finished=True)
+        summary = read_summary(path)
+        assert summary["decisions"][0]["observed_at"] == START.isoformat()
+        assert summary["coverage"] == {"started": 1, "finished": 1, "overdue": 0}
+    finally:
+        clock_provider.restore(previous)
 
 
 def mark(evidence, key, minutes, price, *, mode="shadow", state="no_order", purpose="strategy", **extras):

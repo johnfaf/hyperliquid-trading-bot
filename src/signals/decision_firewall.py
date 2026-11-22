@@ -15,6 +15,7 @@ It enforces:
 Flow: Signal Source → TradeSignal → DecisionFirewall → Execution
 """
 import logging
+import math
 import threading
 from src.core import clock_provider
 from typing import List, Dict, Optional, Tuple
@@ -1914,17 +1915,25 @@ class DecisionFirewall:
             policy = self.agent_scorer.get_source_policy(source_key)
         except Exception as exc:
             logger.debug("Source policy lookup failed for %s: %s", source_key, exc)
-            return True, "", {
+            return False, f"Source policy unavailable for {source_key}", {
                 "source_key": source_key,
                 "status": "policy_error",
                 "max_signals_per_day": int(self.max_signals_per_source_per_day or 0),
             }
 
+        if not isinstance(policy, dict):
+            return False, f"Invalid source policy for {source_key}", {"status": "policy_error"}
         status = str(policy.get("status", "unknown") or "unknown")
         if policy.get("blocked"):
             return False, f"Source allocator paused {source_key} ({status})", policy
 
-        min_conf = float(policy.get("min_confidence", 0.0) or 0.0)
+        try:
+            min_conf = float(policy.get("min_confidence", 0.0))
+            size_mult = float(policy.get("size_multiplier", 1.0))
+            if not math.isfinite(min_conf) or not 0 <= min_conf <= 1 or not math.isfinite(size_mult) or not 0 < size_mult <= 1:
+                raise ValueError("invalid source policy bounds")
+        except (ValueError, TypeError):
+            return False, f"Invalid or zero allocation for {source_key}", policy
         # #1/#2 synthetic-capped copy handling. copy_trader's synthetic-
         # regime cap flattens EVERY copy signal's confidence to one value,
         # which then blends to a constant ~0.43 sitting deterministically
@@ -1989,7 +1998,6 @@ class DecisionFirewall:
                 policy,
             )
 
-        size_mult = float(policy.get("size_multiplier", 1.0) or 1.0)
         if size_mult < 1.0:
             signal.position_pct *= size_mult
             if signal.size > 0:
@@ -2536,7 +2544,7 @@ class DecisionFirewall:
                           f"Max positions reached ({len(positions)}/{self.max_positions})")
 
         # 5. Per-coin limit
-        coin_positions = [p for p in positions if p.get("coin") == signal.coin]
+        coin_positions = [p for p in positions if str(p.get("coin") or "").strip().upper() == str(signal.coin).strip().upper()]
         if len(coin_positions) >= self.max_per_coin:
             return _reject("rejected_risk",
                           f"Max positions for {signal.coin} ({len(coin_positions)}/{self.max_per_coin})")

@@ -8,6 +8,10 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+from datetime import datetime, timezone
+from pathlib import Path
+
+import config
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
@@ -16,7 +20,7 @@ from starlette.concurrency import run_in_threadpool
 from src.data.decision_coverage import read_report as decision_coverage_report
 from src.ui.v2.auth import require_auth, verify_cookie
 from src.ui.v2.cache import get_ttl
-from src.ui.v2.desk import STOCK_LABELS, snapshot
+from src.ui.v2.desk import STOCK_LABELS, host_status, snapshot
 from src.ui.v2.events import get_recent_events
 from src.ui.v2.trade_review import detail, review
 
@@ -59,14 +63,15 @@ async def stock_pilot(request: Request):
 
 
 @router.get("/trades", response_class=HTMLResponse)
-async def trades(request: Request, days: int = 7, group: str = "source", scope: str = "copy"):
+async def trades(request: Request, days: int = 7, group: str = "source", scope: str = "copy", period: str = "rolling"):
     if not verify_cookie(request):
         return RedirectResponse("/login", status_code=303)
     from src.ui.v2.app import get_templates
     days = days if days in (1, 7, 30) else 7
-    group = group if group in ("source", "asset", "side") else "source"
+    group = group if group in ("source", "asset", "side", "route") else "source"
     scope = "all" if scope == "all" else "copy"
-    report = await run_in_threadpool(get_ttl, ("trade-review", days, group, scope), 20, lambda: review(days, group, scope))
+    period = "week" if period == "week" else "rolling"
+    report = await run_in_threadpool(get_ttl, ("trade-review", days, group, scope, period), 20, lambda: review(days, group, scope, period=period))
     return get_templates().TemplateResponse(request, "trade_review.html", {"title": "Trade review", "report": report})
 
 
@@ -82,6 +87,17 @@ async def trade_details(request: Request, trade_id: int):
     if not trade:
         raise HTTPException(404, "Paper trade not found")
     return get_templates().TemplateResponse(request, "trade_details.html", {"title": f"Trade {trade_id}", "trade": trade})
+
+
+@router.get("/research", response_class=HTMLResponse)
+async def research(request: Request):
+    if not verify_cookie(request):
+        return RedirectResponse("/login", status_code=303)
+    from src.ui.v2.app import get_templates
+    host = await run_in_threadpool(host_status, Path(config.DB_PATH).with_name("dashboard_ops.json"), datetime.now(timezone.utc))
+    return get_templates().TemplateResponse(request, "research.html", {
+        "title": "Research", "study": host.get("absorption"), "weekly": host.get("weekly"),
+    })
 
 
 @router.get("/decision-coverage", response_class=HTMLResponse)

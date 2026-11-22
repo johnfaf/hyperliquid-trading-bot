@@ -3,9 +3,9 @@
 {% block content %}
 {% set s = report.summary %}
 <div class="desk-content">
-  <header class="desk-pagehead">
-    <div><div class="desk-kicker">{{ icon("file", 15) }} Hyperliquid</div><h1>Trade review</h1><p class="desk-muted">Crypto · Paper only</p></div>
-    <div class="desk-actions"><a class="text-sm text-sky-300 underline" href="/decision-coverage">Decision Coverage</a><a href="/trades?days={{ report.days }}&amp;group={{ report.group }}&amp;scope={{ report.scope }}"
+  <header class="desk-pagehead review-pagehead">
+    <div><div class="desk-kicker">{{ icon("file", 15) }} Hyperliquid</div><h1>Trade review</h1><p class="desk-muted">Crypto · Paper only · {{ report.start[:16]|replace("T"," ") }} to {{ report.end[:16]|replace("T"," ") }} UTC (end exclusive)</p></div>
+    <div class="desk-actions"><a class="text-sm text-sky-300 underline" href="/research">Research</a><a class="text-sm text-sky-300 underline" href="/decision-coverage">Decision Coverage</a><a href="/trades?days={{ report.days }}&amp;group={{ report.group }}&amp;scope={{ report.scope }}&amp;period={{ report.period }}"
       class="desk-icon-btn" aria-label="Refresh trade review" title="Refresh trade review">{{ icon("refresh") }}</a></div>
   </header>
   {% if report.scope == "copy" %}
@@ -39,29 +39,43 @@
   <div class="desk-review-controls">
     <div class="desk-segments" aria-label="Trade scope">
       {% for scope,label in [("copy","Copy trades"),("all","All paper trades")] %}
-      <a href="/trades?scope={{ scope }}&amp;days={{ report.days }}&amp;group={{ report.group }}"{% if report.scope == scope %} aria-current="true"{% endif %}>{{ label }}</a>
+      <a href="/trades?scope={{ scope }}&amp;days={{ report.days }}&amp;group={{ report.group }}&amp;period={{ report.period }}"{% if report.scope == scope %} aria-current="true"{% endif %}>{{ label }}</a>
       {% endfor %}
     </div>
     <div class="desk-segments" aria-label="Review window">
       {% for days,label in [(1,"24h"),(7,"7d"),(30,"30d")] %}
-      <a href="/trades?scope={{ report.scope }}&amp;days={{ days }}&amp;group={{ report.group }}"{% if report.days == days %} aria-current="true"{% endif %}>{{ label }}</a>
+      <a href="/trades?scope={{ report.scope }}&amp;days={{ days }}&amp;group={{ report.group }}"{% if report.period == "rolling" and report.days == days %} aria-current="true"{% endif %}>{{ label }}</a>
       {% endfor %}
+      <a href="/trades?scope={{ report.scope }}&amp;group={{ report.group }}&amp;period=week"{% if report.period == "week" %} aria-current="true"{% endif %}>Completed week</a>
     </div>
   </div>
   {% if s %}
   <section class="desk-kpis" aria-label="Trade review totals">
     <div><span>Net realized P&amp;L</span><strong class="{{ 'tone-text-bad' if s.pnl is not none and s.pnl < 0 else 'tone-text-good' if s.pnl else '' }}">{{ money(s.pnl,true) }}</strong><small>{{ s.priced }} of {{ s.closed }} closes with P&amp;L</small></div>
-    <div><span>Fees recorded</span><strong>{{ money(s.fees) }}</strong><small>{{ s.fee_count }} of {{ s.closed }} closes</small></div>
+    <div><span>Fees recorded</span><strong>{{ money(s.fees) }}</strong><small>Already included in net · {{ s.fee_count }} of {{ s.closed }} closes</small></div>
     <div><span>Copy trades that overlapped</span><strong>{{ s.overlap }}</strong><small>Same asset and direction · {{ report.peak or 0 }} peak in one group</small></div>
     <div><span>Largest adverse stop gap</span><strong>{{ "{:.1f} bps".format(s.max_gap) if s.max_gap is not none else "Unmeasured" }}</strong><small>{{ s.gap_count }} exits with trigger and fill recorded</small></div>
   </section>
+  <section class="desk-kpis" aria-label="Outcome statistics">
+    <div><span>Win rate</span><strong>{{ "{:.1f}%".format(s.win_rate) if s.win_rate is not none else "Unmeasured" }}</strong><small>{{ s.wins }} / {{ s.priced }} priced closes</small></div>
+    <div><span>Average net / trade</span><strong>{{ money(s.average,true) }}</strong><small>Profit factor {{ "{:.2f}".format(s.profit_factor) if s.profit_factor is not none else "No losing closes" if s.no_losing_closes else "Unmeasured" }}</small></div>
+    <div><span>Realized drawdown</span><strong>{{ money(s.realized_drawdown) }}</strong><small>Closed trades only · Not equity drawdown</small></div>
+    <div><span>Net without largest winner</span><strong>{{ money(s.net_without_largest,true) }}</strong><small>{{ s.evidence }} · No live approval</small></div>
+  </section>
   {% endif %}
+  {% set v = report.valuation %}
+  <section class="desk-kpis" aria-label="Current whole paper book valuation">
+    <div><span>Current paper balance</span><strong>{{ money(v.cash) }}</strong><small>Whole book · Not period return</small></div>
+    <div><span>Current unrealized P&amp;L</span><strong>{{ money(v.unrealized,true) }}</strong><small>Mid-price marks · Before exit costs</small></div>
+    <div><span>Current marked equity</span><strong>{{ money(v.equity) }}</strong><small>{{ v.open if v.open is not none else "Unmeasured" }} open positions</small></div>
+    <div><span>Valuation observed (UTC)</span><strong class="desk-stamp">{{ (v.observed_at or "")[:10] or "Unavailable" }}{% if v.observed_at %}<br>{{ v.observed_at[11:19] }}{% endif %}</strong><small>Marks expire after 15 minutes</small></div>
+  </section>
   <section class="desk-panel">
-    <div class="desk-panel-heading">
+    <div class="desk-panel-heading review-attribution-heading">
       <div><h2>Attribution</h2><p>Paper results · sorted by net P&amp;L</p></div>
       <div class="desk-segments" aria-label="Group trades">
-        {% for group,label in [("source","Source"),("asset","Asset + side"),("side","Side")] %}
-        <a href="/trades?scope={{ report.scope }}&amp;days={{ report.days }}&amp;group={{ group }}"{% if report.group == group %} aria-current="true"{% endif %}>{{ label }}</a>
+        {% for group,label in [("source","Source"),("route","Entry route"),("asset","Asset + side"),("side","Side")] %}
+        <a href="/trades?scope={{ report.scope }}&amp;days={{ report.days }}&amp;group={{ group }}&amp;period={{ report.period }}"{% if report.group == group %} aria-current="true"{% endif %}>{{ label }}</a>
         {% endfor %}
       </div>
     </div>
@@ -69,11 +83,11 @@
     <div class="desk-table-scroll" tabindex="0" aria-label="Scrollable trade attribution">
       <table class="desk-table review-table">
         <thead><tr><th scope="col">Group</th><th scope="col">Closed</th><th scope="col">Wins / priced</th><th scope="col">Open</th>
-          <th scope="col">Overlapping copies</th><th scope="col">Known fees</th><th scope="col">Net P&amp;L</th></tr></thead>
+          <th scope="col">Overlapping copies</th><th scope="col">Known fees</th><th scope="col">Net P&amp;L</th><th scope="col">Evidence</th></tr></thead>
         <tbody>{% for row in report.groups %}
           <tr><th scope="row">{{ row.label }}</th><td>{{ row.closed }}</td><td>{{ row.wins }} / {{ row.priced }}</td><td>{{ row.open }}</td><td>{{ row.overlap }}</td>
             <td>{{ money(row.fees) }} <small class="desk-muted">({{ row.fee_count }}/{{ row.closed }})</small></td>
-            <td class="{{ 'tone-text-bad' if row.pnl is not none and row.pnl < 0 else 'tone-text-good' if row.pnl else '' }}">{{ money(row.pnl,true) }}</td></tr>
+            <td class="{{ 'tone-text-bad' if row.pnl is not none and row.pnl < 0 else 'tone-text-good' if row.pnl else '' }}">{{ money(row.pnl,true) }}</td><td>{{ row.evidence }}</td></tr>
         {% endfor %}</tbody>
       </table>
     </div>

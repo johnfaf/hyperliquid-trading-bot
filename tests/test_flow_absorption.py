@@ -99,3 +99,6 @@ def test_new_archive_reports_unmeasured_not_zero(tmp_path):
     storage(path).close()
     report = build(path)
     assert "Insufficient forward evidence" in report and "Unmeasured" in report and "no signals yet" in report
+    structured = build(path, structured=True)
+    assert not structured["live_approved"] and structured["horizons"][0]["pairs"] == 0
+    assert structured["horizons"][0]["adverse"]["all"] is None

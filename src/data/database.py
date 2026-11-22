@@ -1356,8 +1356,8 @@ def open_paper_trade(strategy_id, coin, side, entry_price, size, leverage=1,
     translate that into a re-lookup so the caller never sees a phantom
     duplicate.
 
-    When ``idempotency_key`` is None, behavior is unchanged: every call
-    inserts a new row (legacy caller contract preserved).
+    New rows must pass the serialized position-admission checks. An existing
+    idempotency key is returned before admission, without creating a new row.
     """
     now = _trade_event_now_iso()
     metadata = dict(metadata or {})
@@ -1378,6 +1378,11 @@ def open_paper_trade(strategy_id, coin, side, entry_price, size, leverage=1,
         key = str(idempotency_key).strip() or None
 
     with get_connection() as conn:
+        # Serialize admission checks with insertion across processes, not just threads.
+        if conn.backend == "postgres":
+            conn.execute("SELECT pg_advisory_xact_lock(742198351)")
+        else:
+            conn.execute("BEGIN IMMEDIATE")
         if key is not None:
             existing = conn.execute(
                 "SELECT id FROM paper_trades WHERE client_order_id = ?",
@@ -1392,14 +1397,24 @@ def open_paper_trade(strategy_id, coin, side, entry_price, size, leverage=1,
 
         normalized_coin = _normalize_coin_value(coin)
         normalized_side = _normalize_trade_side_value(side)
+        if not normalized_coin or normalized_side not in {"long", "short"}:
+            raise ValueError("Paper entry requires an asset and long/short side")
+        opposing = conn.execute("""
+            SELECT id FROM paper_trades
+            WHERE LOWER(COALESCE(status, '')) = 'open'
+              AND UPPER(TRIM(COALESCE(coin, ''))) = ?
+              AND LOWER(TRIM(COALESCE(side, ''))) != ? LIMIT 1
+        """, (normalized_coin, normalized_side)).fetchone()
+        if opposing is not None:
+            raise ValueError(f"Opposing position blocked for {normalized_coin} {normalized_side}")
         same_side_limit = _same_side_open_trade_limit()
         same_side_count_row = conn.execute(
             """
             SELECT COUNT(*) AS c
             FROM paper_trades
             WHERE LOWER(COALESCE(status, '')) = 'open'
-              AND UPPER(COALESCE(coin, '')) = ?
-              AND LOWER(COALESCE(side, '')) = ?
+              AND UPPER(TRIM(COALESCE(coin, ''))) = ?
+              AND LOWER(TRIM(COALESCE(side, ''))) = ?
             """,
             (normalized_coin, normalized_side),
         ).fetchone()
@@ -1422,8 +1437,8 @@ def open_paper_trade(strategy_id, coin, side, entry_price, size, leverage=1,
                 peers = conn.execute("""
                     SELECT metadata FROM paper_trades
                     WHERE LOWER(COALESCE(status, '')) = 'open'
-                      AND UPPER(COALESCE(coin, '')) = ?
-                      AND LOWER(COALESCE(side, '')) = ?
+                      AND UPPER(TRIM(COALESCE(coin, ''))) = ?
+                      AND LOWER(TRIM(COALESCE(side, ''))) = ?
                 """, (normalized_coin, normalized_side)).fetchall()
                 for peer in peers:
                     raw = peer["metadata"]
@@ -1448,7 +1463,7 @@ def open_paper_trade(strategy_id, coin, side, entry_price, size, leverage=1,
                 (strategy_id, opened_at, coin, side, entry_price, size, leverage,
                  stop_loss, take_profit, status, client_order_id, metadata)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?)
-            """, (strategy_id, now, coin, side, entry_price, size, leverage,
+            """, (strategy_id, now, normalized_coin, normalized_side, entry_price, size, leverage,
                   stop_loss, take_profit, key, json.dumps(metadata or {})))
         except Exception:
             if key is None:

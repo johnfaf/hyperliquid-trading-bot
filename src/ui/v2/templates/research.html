@@ -1,0 +1,42 @@
+{% extends "base.html" %}
+{% from "partials/desk_macros.html" import icon, badge, money %}
+{% block content %}
+<div class="desk-content">
+  <header class="desk-pagehead">
+    <div><div class="desk-kicker">{{ icon("activity",15) }} Hyperliquid</div><h1>Research</h1><p class="desk-muted">Separate ledgers &middot; No live approval</p></div>
+    <div class="desk-actions"><a class="text-sm text-sky-300 underline" href="/trades?scope=all">Trade review</a><a class="desk-icon-btn" href="/research" title="Refresh research" aria-label="Refresh research">{{ icon("refresh") }}</a></div>
+  </header>
+  <section class="desk-panel">
+    <div class="desk-panel-heading"><div><h2>BTC / ETH absorption</h2><p>Public order flow &middot; {{ study.rule if study else "Unmeasured" }}</p></div>{{ badge("Observation only") }}</div>
+    {% if not study %}<div class="desk-empty compact"><p>Structured research scorecard unavailable. Performance is unmeasured.</p></div>
+    {% else %}
+    <p class="desk-muted desk-research-status">{{ study.state }}{% if study.stale %} &middot; Stale scorecard{% endif %}</p>
+    <div class="desk-kpis">
+      <div><span>Ready frames</span><strong>{{ study.ready }} / {{ study.expected }}</strong><small>{{ study.frames }} observed</small></div>
+      <div><span>Feed at scoring</span><strong>{{ "Passed" if study.healthy_at_scoring else "Incomplete" }}</strong><small>Not current feed status</small></div>
+      <div><span>Scorecard (UTC)</span><strong class="desk-stamp">{{ (study.observed_at or "")[:10] }}<br>{{ (study.observed_at or "")[11:19] }}</strong><small>{{ "Stale" if study.stale else "Published within 26h" }}</small></div>
+      <div><span>Last frame (UTC)</span><strong class="desk-stamp">{{ (study.last_frame or "")[:10] }}<br>{{ (study.last_frame or "")[11:19] }}</strong><small>Trade-side check {{ "supported" if study.side_supported else "insufficient" }}</small></div>
+    </div>
+    <div class="desk-table-scroll" tabindex="0" aria-label="Absorption research outcomes">
+      <table class="desk-table"><thead><tr><th>Horizon</th><th>Pairs / scored</th><th>Matched UTC days</th><th>Stress signal</th><th>Stress control</th><th>Stress lift</th><th>All scored stress</th></tr></thead>
+      <tbody>{% for row in study.horizons %}<tr><th>{{ row.minutes }}m</th><td>{{ row.pairs }} / {{ row.signals }}</td><td>{{ row.days }}</td>
+      {% for value in [row.adverse.signal,row.adverse.control,row.adverse.lift,row.adverse.all] %}<td>{{ "{:+.1f} bps".format(value) if value is not none else "Unmeasured" }}</td>{% endfor %}</tr>{% endfor %}</tbody></table>
+    </div>
+    <div class="desk-decision-empty">5m primary &middot; 15m diagnostic &middot; Spread, fees and extra cost included &middot; No exchange orders</div>
+    {% endif %}
+  </section>
+  <section class="desk-panel">
+    <div class="desk-panel-heading"><div><h2>Archived paper week</h2><p>Fixed UTC Monday-to-Monday &middot; Realized closes</p></div>{{ badge("Paper only") }}</div>
+    {% if weekly %}
+    <p class="desk-muted desk-research-status">{{ weekly.start[:10] }} to {{ weekly.end_exclusive[:10] }} (end exclusive) &middot; Captured {{ weekly.generated_at[:19]|replace("T"," ") }} UTC</p>
+    <div class="desk-kpis">
+      <div><span>Net realized</span><strong>{{ money(weekly.summary.net,true) }}</strong><small>{{ weekly.summary.priced }} / {{ weekly.summary.closed }} priced closes</small></div>
+      <div><span>Realized drawdown</span><strong>{{ money(weekly.summary.realized_drawdown) }}</strong><small>Equity drawdown unmeasured</small></div>
+      <div><span>Fees included in net</span><strong>{{ money(weekly.summary.fees) }}</strong><small>{{ weekly.summary.fee_count }} closes with recorded fees</small></div>
+      <div><span>Net without largest winner</span><strong>{{ money(weekly.summary.net_without_largest,true) }}</strong><small>{{ weekly.summary.evidence }}</small></div>
+    </div>
+    <div class="desk-decision-empty">{{ weekly.excluded }} reconciliation or tainted records excluded &middot; No live approval</div>
+    {% else %}<div class="desk-empty compact"><p>Weekly archive unavailable. No zero-return assumption.</p></div>{% endif %}
+  </section>
+</div>
+{% endblock %}

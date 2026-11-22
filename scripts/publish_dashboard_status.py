@@ -18,6 +18,7 @@ UNITS = {
     "exit_scorecard": "hyperliquid-exit-scorecard",
     "study_backup": "hyperliquid-study-backup",
     "stock_report": "hyperliquid-stock-paper-report",
+    "absorption_report": "hyperliquid-absorption-report",
 }
 STOCK_STATES = {
     "waiting_for_paper_credentials", "no_order", "outside_entry_or_exit_window", "shadow_intent",
@@ -122,10 +123,13 @@ def publish(path: Path, payload: dict, *, mode=0o644) -> None:
     publish_text(path, json.dumps(payload, allow_nan=False), mode=mode)
 
 
-def load_object(path: Path) -> dict:
+def load_object(path: Path, *, max_bytes=65536) -> dict:
     try:
         with path.open(encoding="utf-8") as stream:
-            value = json.loads(stream.read(65536))
+            body = stream.read(max_bytes + 1)
+        if len(body) > max_bytes:
+            return {}
+        value = json.loads(body)
         return value if isinstance(value, dict) else {}
     except (ValueError, OSError):
         return {}
@@ -146,6 +150,37 @@ def daily_copy_report(path, directory, now):
     publish_text(basename.with_suffix(".md"), markdown(report), mode=0o600)
     publish(archive, report, mode=0o600)
     return report
+
+
+def fixed_weekly_report(path, directory, now):
+    from src.trading.paper_reporting import completed_week, weekly_report
+
+    cutoff = now - timedelta(minutes=10)
+    start, end = completed_week(cutoff)
+    archive = directory / f"paper-week-{start.date()}-to-{end.date()}.json"
+    if archive.exists():
+        existing = load_object(archive, max_bytes=32 * 1024 * 1024)
+        if existing.get("start") != start.isoformat() or existing.get("end_exclusive") != end.isoformat():
+            raise ValueError("Existing weekly archive must be inspected, not overwritten")
+        return existing
+    report = weekly_report(path, cutoff)
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    publish(archive, report, mode=0o600)
+    return report
+
+
+def absorption_status(path, now):
+    from src.trading.paper_reporting import timestamp
+
+    report = load_object(path)
+    observed = timestamp(report.get("observed_at"))
+    if report.get("version") != 1 or observed is None:
+        return None
+    # Research data only; never relay arbitrary provider context or file contents.
+    keys = ("observed_at", "start", "rule", "state", "healthy_at_scoring", "frames", "ready", "expected",
+            "first_frame", "last_frame", "side_supported", "coverage", "horizons", "primary_intervals")
+    return {**{key: report.get(key) for key in keys}, "live_approved": False,
+            "stale": not 0 <= (now - observed).total_seconds() <= 26 * 3600}
 
 
 def copy_incidents(coverage, *, report_available=True):
@@ -260,6 +295,7 @@ def main() -> None:
     parser.add_argument("--alert-state", type=Path)
     parser.add_argument("--paper-db", type=Path)
     parser.add_argument("--copy-report-dir", type=Path)
+    parser.add_argument("--absorption-report", type=Path, default=Path("/var/lib/hyperliquid-absorption/reports/latest.json"))
     args = parser.parse_args()
     if bool(args.paper_db) != bool(args.copy_report_dir):
         parser.error("--paper-db and --copy-report-dir must be used together")
@@ -272,6 +308,7 @@ def main() -> None:
         except (sqlite3.Error, ValueError, OSError):
             snapshot["stock_pilot"] = None
     now = datetime.now(UTC)
+    snapshot["absorption"] = absorption_status(args.absorption_report, now)
     if args.paper_db:
         from src.data.decision_coverage import read_report
 
@@ -281,6 +318,11 @@ def main() -> None:
             report = None
         incidents = copy_incidents(read_report(paper_path=args.paper_db, now=now), report_available=report is not None)
         snapshot.update(copy_daily=report, copy_alerts=[COPY_ALERTS[key] for key in incidents])
+        try:
+            weekly = fixed_weekly_report(args.paper_db, args.copy_report_dir / "weekly", now)
+            snapshot["weekly"] = {key: value for key, value in weekly.items() if key != "trades"}
+        except (sqlite3.Error, ValueError, OSError):
+            snapshot["weekly"] = None
     publish(args.output, snapshot)
     if args.telegram_env and args.alert_state:
         delivery = maybe_alert(snapshot, args.telegram_env, args.alert_state, now=now)

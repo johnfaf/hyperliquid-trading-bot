@@ -50,6 +50,16 @@ KNOWN_SQLITE_ONLY_TABLES: set[str] = {
     "fetch_log",
 }
 
+# These modules use direct sqlite3 connections to separate durable files, never
+# the dualwrite router. Exempt the module/table pair, not these generic names in
+# every module: a new router-backed "orders" table still needs a PG migration.
+SQLITE_ONLY_MODULE_TABLES = {
+    "data/decision_coverage.py": {"evidence"},  # sibling .decisions.sqlite3
+    "data/absorption_feed.py": {"frames", "decisions"},  # independent public-feed ledger
+    "trading/order_journal.py": {"orders", "fills", "pauses"},  # per-account execution journal
+    "trading/stock_evidence.py": {"stock_cycles", "stock_cycle_attempts"},  # stock-only journal
+}
+
 # Tables created by the schema_migrations machinery itself or by the
 # dualwrite probes — these are bookkeeping concerns, not bot data.
 INTERNAL_TABLES: set[str] = {
@@ -68,20 +78,23 @@ _CREATE_RE = re.compile(
 )
 
 
-def _collect_create_table_names(root: Path, suffix: str) -> set[str]:
+def _collect_create_table_names(root: Path, suffix: str, *, local_only=False) -> set[str]:
     names: set[str] = set()
     for path in root.rglob(f"*{suffix}"):
         try:
             text = path.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError):
             continue
+        exemptions = SQLITE_ONLY_MODULE_TABLES.get(path.relative_to(root).as_posix(), set()) if local_only else set()
         for match in _CREATE_RE.finditer(text):
-            names.add(match.group(1).lower())
+            name = match.group(1).lower()
+            if name not in exemptions:
+                names.add(name)
     return names
 
 
 def test_every_runtime_create_table_has_a_postgres_migration():
-    src_tables = _collect_create_table_names(SRC, ".py")
+    src_tables = _collect_create_table_names(SRC, ".py", local_only=True)
     migration_tables = _collect_create_table_names(MIGRATIONS, ".sql")
 
     # Strip internal/whitelisted entries from both sides.
@@ -97,3 +110,8 @@ def test_every_runtime_create_table_has_a_postgres_migration():
         "SQLite-only, add it to KNOWN_SQLITE_ONLY_TABLES with a reason).\n"
         f"  Missing: {missing}"
     )
+
+
+def test_local_journal_exemptions_do_not_hide_new_router_tables(tmp_path):
+    (tmp_path / "new_runtime.py").write_text("CREATE TABLE IF NOT EXISTS orders (id TEXT)")
+    assert _collect_create_table_names(tmp_path, ".py", local_only=True) == {"orders"}

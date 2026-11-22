@@ -198,7 +198,7 @@ def read_report(*, paper_path=None, order_path=None, now=None, window_start=None
               "expected": 0, "registered": 0, "terminal": 0, "unresolved_evaluations": 0,
               "intents": 0, "unresolved_intents": 0, "unresolved_orders": None, "routes": [],
               "latest_cycle": None, "capture_started": None, "gap_minutes": None, "late": False,
-              "issue": "unavailable", "pending": [], "errors": 0, "revisions": [], "protocols": [],
+              "issue": "unavailable", "pending": [], "failures": [], "errors": 0, "non_error_final": 0, "revisions": [], "protocols": [],
               "schedule_contiguous": False, "failed_cycles": 0, "overdue_cycles": 0,
               "overdue_evaluations": 0, "overdue_intents": 0}
     try:
@@ -248,7 +248,7 @@ def read_report(*, paper_path=None, order_path=None, now=None, window_start=None
     groups = {}
     states, scheduled, finished, failed, intents = {}, {}, set(), set(), {}
     terminal = {"no_signal", "blocked", "error", "exit_applied"}
-    candidates = {}
+    candidates, checkpoints = {}, {}
     revisions, protocols = set(), set()
     for row in rows:
         event, route, ref = row["event"], row["route"], row["reference"]
@@ -272,6 +272,7 @@ def read_report(*, paper_path=None, order_path=None, now=None, window_start=None
             intents[ref] = row["observed_at"]
         elif ref in states:
             states[ref] = (states[ref][0], event, row["decision_id"] or states[ref][2])
+            checkpoints[ref] = _dict(row["payload"])
     for ref, (route, event, decision_id) in states.items():
         counts = groups[route]
         if event != "evaluation_expected" or ref in actual_evaluations:
@@ -285,7 +286,11 @@ def read_report(*, paper_path=None, order_path=None, now=None, window_start=None
         )
         if known:
             counts["terminal"] += 1
-            result["errors"] += int(event == "error" or status in {"rotation_victim_close_failed", "paper_open_failed"})
+            is_error = event == "error" or status in {"rotation_victim_close_failed", "paper_open_failed"}
+            result["errors"] += int(is_error)
+            if is_error:
+                result["failures"].append({**candidates[ref], "decision_id": decision_id,
+                                          "reason": str(checkpoints.get(ref, {}).get("reason") or status or event)[:250]})
         else:
             result["pending"].append({**candidates[ref], "decision_id": decision_id, "state": status or event})
     overdue = (now - timedelta(minutes=20)).isoformat()
@@ -315,6 +320,8 @@ def read_report(*, paper_path=None, order_path=None, now=None, window_start=None
     for field in ("expected", "registered", "terminal"):
         result[field] = sum(row[field] for row in groups.values())
     result["unresolved_evaluations"] = result["expected"] - result["terminal"]
+    result["non_error_final"] = result["terminal"] - result["errors"]
+    result["failures"] = result["failures"][-20:][::-1]
     result["pending"] = result["pending"][-20:][::-1]
     return result
 

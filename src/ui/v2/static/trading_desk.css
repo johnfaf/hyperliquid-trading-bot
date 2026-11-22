@@ -146,6 +146,11 @@ body.desk-body, html.theme-light body.desk-body {
 .stock-table td:first-child { white-space: nowrap; font-variant-numeric: tabular-nums; }
 .stock-table td:nth-child(5) { text-align: right; }
 .desk-review-controls { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 0 0 16px; }
+.review-attribution-heading { flex-wrap: wrap; }
+.review-attribution-heading > div:first-child { flex: 1 1 180px; }
+.review-attribution-heading .desk-segments { max-width: 100%; overflow-x: auto; }
+.desk-kpis strong.desk-stamp { font-size: 14px; }
+.desk-research-status { padding: 0 16px 12px; }
 .desk-review-controls .desk-segments a, .desk-panel-heading .desk-segments a { padding-inline: 7px; }
 .desk-table-link { color: var(--desk-good); text-decoration: none; }
 .desk-table-link:hover { text-decoration: underline; }
@@ -183,6 +188,8 @@ body.desk-body, html.theme-light body.desk-body {
   .desk-shell-inner { padding-inline: 12px; }
   .desk-shell-actions #ws-status { display: none; }
   .desk-pagehead h1 { font-size: 27px; }
+  .review-pagehead { flex-direction: column; align-items: flex-start; }
+  .review-pagehead .desk-actions { align-self: flex-end; }
   .desk-actions { gap: 5px; }
   .desk-actions time { font-size: 11px; }
   .desk-nav { gap: 3px; }

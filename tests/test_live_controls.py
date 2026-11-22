@@ -1874,6 +1874,9 @@ def test_run_alpha_arena_live_path_executes_signal(monkeypatch):
             ]
 
     class FakeLiveTrader:
+        def get_free_margin(self):
+            return 1000.
+
         def execute_signal(self, signal, bypass_firewall=False):
             executed.append((signal.coin, signal.side.value, bypass_firewall, signal.position_pct))
             return {"status": "success", "coin": signal.coin}
@@ -1910,6 +1913,8 @@ def test_run_alpha_arena_live_path_executes_signal(monkeypatch):
     )()
 
     monkeypatch.setattr("src.core.cycles.trading_cycle.is_live_trading_active", lambda container: True)
+    container.firewall = types.SimpleNamespace(validate=lambda *a, **k: (True, ""))
+    monkeypatch.setattr("src.core.cycles.trading_cycle.get_execution_open_positions", lambda _: [])
 
     # Mock the API manager to return candle data (arena now uses get_manager().post)
     fake_candles = [
@@ -1973,6 +1978,8 @@ def test_run_alpha_arena_paper_trade_preserves_precise_stops(monkeypatch):
     )()
 
     monkeypatch.setattr("src.core.cycles.trading_cycle.is_live_trading_active", lambda container: False)
+    container.firewall = types.SimpleNamespace(validate=lambda *a, **k: (True, ""), _source_key=lambda _: "arena_champion:arena_breakout")
+    monkeypatch.setattr("src.core.cycles.trading_cycle.get_execution_open_positions", lambda _: [])
     monkeypatch.setattr("src.core.cycles.trading_cycle.db.get_paper_account", lambda: {"balance": 10000.0})
     monkeypatch.setattr(
         "src.core.cycles.trading_cycle.db.open_paper_trade",

@@ -108,6 +108,17 @@ if [[ "$ready" != true ]]; then
 fi
 
 # Update the reporters, leaving the frozen pilot, collector and backup jobs running.
+if sudo -n test -f /var/lib/hyperliquid-absorption/data/flow.sqlite3; then
+    reporter=/opt/hyperliquid-absorption-report
+    for file in scripts/score_hyperliquid_absorption.py src/backtest/absorption_study.py \
+        src/backtest/candle_entry_replay.py src/backtest/candle_exit_replay.py src/signals/flow_absorption.py; do
+        sudo -n install -D -m 0644 "$release/$file" "$reporter/$rev/$file"
+    done
+    sudo -n ln -sfn "$reporter/$rev" "$reporter/current"
+    sudo -n install -m 0644 "$release/deploy/absorption/hyperliquid-absorption-report.service" /etc/systemd/system/
+    sudo -n systemctl daemon-reload
+    sudo -n systemctl start hyperliquid-absorption-report.service
+fi
 study=/srv/hyperliquid-audit-pilot
 sudo -n install -m 0644 "$release/scripts/daily_paper_report.py" "$study/tools/daily_paper_report.py"
 for script in paper_exit_experiment paper_exit_scorecard; do
@@ -120,7 +131,7 @@ stock=/opt/hyperliquid-stock-paper
 sudo -n install -d -m 0700 /etc/hyperliquid-stock-paper
 sudo -n install -d -m 0755 "$stock/$rev"
 for file in scripts/run_stock_paper.py scripts/stock_pilot_report.py src/trading/alpaca_paper.py \
-    src/trading/order_journal.py src/trading/stock_evidence.py; do
+    src/trading/order_journal.py src/trading/stock_evidence.py src/core/clock_provider.py src/backtest/replay/clock.py; do
     sudo -n install -D -m 0644 "$release/$file" "$stock/$rev/$file"
 done
 sudo -n ln -sfn "$stock/$rev" "$stock/current"
@@ -136,7 +147,8 @@ sudo -n systemctl start hyperliquid-stock-paper-report.service
 
 sudo -n install -D -m 0644 "$release/scripts/publish_dashboard_status.py" /opt/hyperliquid-dashboard/publish_dashboard_status.py
 for file in src/trading/alpaca_paper.py src/trading/order_journal.py src/trading/stock_evidence.py \
-    src/trading/trade_decision_memory.py src/trading/copy_shadow_report.py src/data/decision_coverage.py; do
+    src/core/clock_provider.py src/backtest/replay/clock.py src/trading/trade_decision_memory.py \
+    src/trading/copy_shadow_report.py src/trading/paper_reporting.py src/data/decision_coverage.py; do
     sudo -n install -D -m 0644 "$release/$file" "/opt/hyperliquid-dashboard/$file"
 done
 for unit in hyperliquid-dashboard-status.service hyperliquid-dashboard-status.timer; do

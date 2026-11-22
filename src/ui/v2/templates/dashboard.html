@@ -87,8 +87,10 @@
         {{ job("Daily pilot report", jobs.get("pilot_report"), desk.host.get("pilot_report") or "") }}
         {% set coverage = desk.host.get("coverage") %}
         {{ job("BTC exit scorecard", jobs.get("exit_scorecard"), "{:.2f}% usable since capture".format(coverage.percent) if coverage else "") }}
+        {{ job("Absorption scorecard", jobs.get("absorption_report")) }}
         {{ job("Encrypted study backup", jobs.get("study_backup")) }}
       </ul>
+      <a class="text-sm text-sky-300 underline" href="/research">Research and archived paper week</a>
     </section>
   </div>
 

@@ -36,7 +36,7 @@ def test_coverage_matches_exact_evidence_only(tmp_path, monkeypatch):
         coverage.resolve(done, "decision_linked", decision="done")
         coverage.resolve(ghost, "decision_linked", decision="ghost")
         coverage.resolve(rejected, "decision_linked", decision="rejected")
-        coverage.resolve(errored, "error")
+        coverage.resolve(errored, "error", reason="QuoteUnavailable")
         data = {"evaluation_ref": done}
         coverage.prepare_entry(data, symbol="BTC", side="long", price=100)
         coverage.prepare_entry({}, symbol="BTC", side="long", price=101)
@@ -54,6 +54,9 @@ def test_coverage_matches_exact_evidence_only(tmp_path, monkeypatch):
     assert {r["state"] for r in report["pending"]} == {"paper_opened", "evaluation_expected"}
     assert (report["cycles"], report["finished"], report["unresolved_cycles"]) == (2, 1, 1)
     assert (report["intents"], report["unresolved_intents"], report["unresolved_orders"]) == (2, 1, None)
+    assert report["non_error_final"] == 3
+    assert report["failures"][0]["reason"] == "QuoteUnavailable"
+    assert report["failures"][0]["reference"] == errored
 
 
 def test_missing_storage_blocks_new_entries_only_in_active_capture(tmp_path, monkeypatch):

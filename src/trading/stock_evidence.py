@@ -8,6 +8,7 @@ import sqlite3
 from zoneinfo import ZoneInfo
 
 from src.trading.alpaca_paper import REFERENCE_BALANCE_USD
+from src.core import clock_provider
 
 BASE_CASH = Decimal(REFERENCE_BALANCE_USD)
 NEW_YORK = ZoneInfo("America/New_York")
@@ -55,14 +56,14 @@ class StockEvidence:
             """)
 
     def start(self, cycle_id: str, purpose: str, *, observed_at: datetime | None = None):
-        now = (observed_at or datetime.now(timezone.utc)).astimezone(timezone.utc)
+        now = (observed_at or clock_provider.utc_now()).astimezone(timezone.utc)
         with closing(sqlite3.connect(self.path, timeout=8)) as conn, conn:
             conn.execute("PRAGMA synchronous=FULL")
             conn.execute("INSERT INTO stock_cycle_attempts VALUES (?, ?, NULL, ?)", (cycle_id, now.isoformat(), purpose))
 
     def record(self, cycle_id: str, result: dict, *, symbol: str, mode: str, purpose: str,
                observed_at: datetime | None = None, finished: bool = False):
-        now = observed_at or datetime.now(timezone.utc)
+        now = observed_at or clock_provider.utc_now()
         intent = result.get("intent") or {}
         side = result.get("decision") or intent.get("side")
         state = result["state"]
@@ -243,7 +244,7 @@ def read_summary(path: Path, *, session: str | None = None) -> dict:
         fills = _paper_fills(conn, scope)
         coverage = None
         if conn.execute("SELECT 1 FROM sqlite_master WHERE name='stock_cycle_attempts'").fetchone():
-            now = datetime.now(timezone.utc)
+            now = clock_provider.utc_now()
             row = conn.execute("""
                 SELECT count(*), count(finished_at), count(CASE WHEN finished_at IS NULL AND started_at<? THEN 1 END)
                 FROM stock_cycle_attempts WHERE purpose='strategy' AND started_at>=?

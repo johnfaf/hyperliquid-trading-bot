@@ -5,6 +5,7 @@ from collections import Counter
 from contextlib import closing
 from datetime import datetime, timezone
 import os
+import json
 from pathlib import Path
 import sqlite3
 from tempfile import NamedTemporaryFile
@@ -23,7 +24,7 @@ def bps(value):
     return "Unmeasured" if value is None else f"{value:+.1f} bps"
 
 
-def build(path, days=21, at=None):
+def build(path, days=21, at=None, *, structured=False):
     at = at if at is not None else time.time_ns() // 1_000_000
     start = at - days * DAY
     with closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=3)) as db:
@@ -48,6 +49,13 @@ def build(path, days=21, at=None):
               and result["adverse"]["all"] > 0 and all(bounds[0] > 0 for bounds in bands.values()))
     state = ("Eligible for research review only" if passes else "Insufficient forward evidence"
              if not healthy or result["pairs"] < 50 or result["days"] < 14 or not side_supported else "Failed the forward screen")
+    report = {"version": 1, "observed_at": instant(at), "start": instant(start), "rule": RULE_ID,
+                "state": state, "healthy_at_scoring": healthy, "live_approved": False,
+                "frames": frames[0], "ready": frames[1], "expected": possible,
+                "first_frame": instant(frames[2]), "last_frame": instant(frames[3]),
+                "side_supported": side_supported, "coverage": dict(coverage),
+                "horizons": [{"minutes": horizon, **summarize(rows)} for horizon, (rows, _, _) in studies.items()],
+                "primary_intervals": bands}
     lines = ["# BTC/ETH order-flow absorption", "", f"**{state}. No orders or trading changes.**", "",
              f"Rule: {RULE_ID}. Lookback: {days} days ending {instant(at)}. Five minutes is the primary horizon; 15 minutes is diagnostic.",
              f"- Observed {frames[0]:,} five-second frames ({frames[1]:,} ready) and {frames[5]:,} public trades from "
@@ -79,7 +87,8 @@ def build(path, days=21, at=None):
               "never causes rematching. Confidence bands use two-day blocks across both markets.",
               "Review needs 95% ready slots and a fresh feed, 50 matched primary pairs on 14 distinct UTC days, positive stressed net on all scored signals, "
               "and positive lower bands for matched net and lift. Data or quote failures are not zero returns. A pass only requests research review.", ""]
-    return "\n".join(lines)
+    body = "\n".join(lines)
+    return {**report, "markdown": body} if structured else body
 
 
 def main():
@@ -87,20 +96,30 @@ def main():
     parser.add_argument("--db", required=True, type=Path)
     parser.add_argument("--out", type=Path, help="Atomically refresh the private research scorecard")
     parser.add_argument("--days", type=int, default=21)
+    parser.add_argument("--json-out", type=Path, help="Separate structured dashboard scorecard")
     args = parser.parse_args()
     if not 1 <= args.days <= 30:
         parser.error("use 1-30 days")
-    body = build(args.db, args.days)
+    if args.json_out and (args.json_out.suffix != ".json" or args.json_out.resolve() == args.db.resolve()):
+        parser.error("use a separate .json report path")
+    if args.out and (args.out.resolve().suffix != ".md" or args.out.resolve() == args.db.resolve()):
+        parser.error("use a separate .md report path")
+    report = build(args.db, args.days, structured=True)
+    body = report.pop("markdown")
+    if args.json_out:
+        atomic_write(args.json_out, json.dumps(report, allow_nan=False))
     if args.out is None:
         print(body, end="")
         return
-    if args.out.resolve().suffix != ".md" or args.out.resolve() == args.db.resolve():
-        parser.error("use a separate .md report path")
-    with NamedTemporaryFile(dir=args.out.parent, mode="w", encoding="utf-8", delete=False) as out:
+    atomic_write(args.out, body)
+
+
+def atomic_write(path, body):
+    with NamedTemporaryFile(dir=path.parent, mode="w", encoding="utf-8", delete=False) as out:
         stage = Path(out.name)
         out.write(body)
     try:
-        os.replace(stage, args.out)
+        os.replace(stage, path)
     finally:
         stage.unlink(missing_ok=True)
 
