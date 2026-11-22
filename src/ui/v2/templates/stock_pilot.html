@@ -32,6 +32,12 @@
         {% endif %}
       </dl>
       <div class="desk-decision-empty">{{ score.get("state", "Waiting for stock evidence") }}</div>
+      {% set risk = pilot.get("equity_risk") or {} %}
+      <dl class="desk-settings-list">
+        <div><dt>Equity-risk state</dt><dd>{{ risk.get("reason", "Unmeasured")|replace("_"," ") }}</dd></div>
+        <div><dt>Observed peak drawdown</dt><dd>{{ money(risk.get("max_drawdown")) }}</dd></div>
+        <div><dt>Daily equity loss / budget</dt><dd>{{ money(risk.get("daily_loss")) }} / {{ money(risk.get("daily_budget")) }}</dd></div>
+      </dl>
     </section>
     <section class="desk-panel">
       <div class="desk-panel-heading"><div><h2>Verification</h2><p>Orders and scheduled checks</p></div></div>

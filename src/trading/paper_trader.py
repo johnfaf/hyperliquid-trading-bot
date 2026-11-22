@@ -2498,6 +2498,11 @@ class PaperTrader:
         """
         open_trades = db.get_open_paper_trades()
         if not open_trades:
+            try:
+                from src.trading.equity_risk import observe_paper
+                observe_paper({}, now=clock_provider.utc_now())
+            except Exception as exc:
+                logger.warning("Paper equity capture unavailable: %s", type(exc).__name__)
             return []
 
         if mids is None:
@@ -2511,6 +2516,8 @@ class PaperTrader:
                 if math.isfinite(value) and value > 0:
                     marks[trade["coin"]] = value
             db.set_bot_state("paper_mark_prices", {"observed_at": clock_provider.utc_now().isoformat(), "mids": marks})
+            from src.trading.equity_risk import observe_paper
+            observe_paper(marks, now=clock_provider.utc_now())
         except Exception as exc:
             logger.warning("Paper valuation marks could not be recorded: %s", type(exc).__name__)
 

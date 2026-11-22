@@ -29,6 +29,7 @@ STOCK_STATES = {
     "intent_already_recorded_or_paused", "session_intent_already_recorded", "invalid_limit_price",
     "entries_paused", "daily_limit_reached",
     "order_rejected", "drill_entry_not_ready", "drill_position_unverified", "drill_position_open",
+    "equity_risk_blocked",
 }
 
 ALERTS = {
@@ -39,6 +40,7 @@ ALERTS = {
     "cycle_failed": "The stock paper worker failed.",
     "stale_worker": "The worker has not reported a cycle for more than 15 minutes.",
     "order_rejected": "Alpaca reported a rejected paper order.",
+    "equity_risk_blocked": "The stock paper equity-risk budget is blocking new entries.",
     "quote_not_usable": "Three open-session cycles could not verify a usable quote.",
 }
 

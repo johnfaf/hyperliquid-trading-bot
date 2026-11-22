@@ -17,6 +17,10 @@
       <dl class="desk-settings-list">
         <div><dt>Starting paper balance</dt><dd>{{ money(s.paper_start_usd) }}</dd></div>
         <div><dt>Planned loss cap per paper trade</dt><dd>{{ "{:.2f}%".format(s.paper_risk_pct) if s.paper_risk_pct else "Off" }}</dd></div>
+        <div><dt>Portfolio admission guard</dt><dd>{{ "Enabled" if s.paper_guard_enabled else "Observation only" }}</dd></div>
+        <div><dt>Combined open stop-risk cap</dt><dd>{{ "{:.2f}%".format(s.paper_open_stop_risk_pct) }}</dd></div>
+        <div><dt>Daily equity-loss cap</dt><dd>{{ "{:.2f}%".format(s.paper_daily_equity_loss_pct) }}</dd></div>
+        <div><dt>Peak equity-drawdown cap</dt><dd>{{ "{:.2f}%".format(s.paper_max_equity_drawdown_pct) }}</dd></div>
         <div><dt>Live trading requested</dt><dd>{{ "Yes" if desk.crypto.requested else "No" }}</dd></div>
         <div><dt>Live signer</dt><dd>{{ "Available" if desk.crypto.signer else "Not loaded" }}</dd></div>
         <div><dt>Live kill switch</dt><dd>{{ "Standby" if desk.crypto.paper_only else "Paused" if desk.crypto.paused else "Not active" }}</dd></div>

@@ -16,6 +16,7 @@ sudo -n install -d -m 0755 "$base" "$target" "$target/scripts" "$target/src" \
     "$target/src/backtest" "$target/src/data" "$target/src/signals"
 sudo -n install -d -m 0700 "$state" "$state/reports"
 sudo -n install -d -m 0700 -o "$(id -u)" -g "$(id -g)" "$state/data"
+sudo -n install -D -m 0644 "$release/scripts/check_absorption_health.py" "$base/health/check.py"
 for file in scripts/capture_hyperliquid_absorption.py scripts/score_hyperliquid_absorption.py \
     src/data/absorption_feed.py src/signals/flow_absorption.py src/backtest/absorption_study.py \
     src/backtest/candle_entry_replay.py src/backtest/candle_exit_replay.py; do
@@ -29,6 +30,9 @@ if [[ -z "${existing:-}" ]]; then
         --security-opt no-new-privileges --memory 128m --cpus .50 --tmpfs /tmp:rw,nosuid,nodev,mode=1777 \
         --user "$(id -u):$(id -g)" --env HOME=/tmp --mount "type=bind,src=$target,dst=/research,readonly" \
         --mount "type=bind,src=$state/data,dst=/capture" --workdir /research \
+        --mount "type=bind,src=$base/health/check.py,dst=/healthcheck.py,readonly" \
+        --health-cmd 'python -B /healthcheck.py --db /capture/flow.sqlite3' \
+        --health-interval 30s --health-timeout 5s --health-retries 3 --health-start-period 90s \
         --label "org.opencontainers.image.revision=$rev" --entrypoint python "$runtime" \
         -B -m scripts.capture_hyperliquid_absorption --db /capture/flow.sqlite3 >/dev/null
 fi

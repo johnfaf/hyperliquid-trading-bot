@@ -15,30 +15,36 @@ base_compose=(sudo -n docker compose --project-directory "$previous" --env-file 
 compose=("${base_compose[@]}" -f "$release/deploy/dashboard/hyperliquid-dashboard.compose.yml")
 
 verify_paper() {
-    sudo -n docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' hyperliquid-bot |
-        grep -Fx 'BOT_RUN_MODE=paper' >/dev/null || return 1
+    sudo -n docker exec -i hyperliquid-bot python - <<'PY'
+import os
+import config
+if os.getenv("BOT_RUN_MODE") != "paper" or config.LIVE_TRADING_ENABLED or bool(os.getenv("HL_AGENT_PRIVATE_KEY")):
+    raise SystemExit("paper-only configuration or signer absence not confirmed")
+PY
+    if [[ "${1:-runtime}" == configuration ]]; then
+        return
+    fi
     python3 - <<'PY'
 import json
 from urllib.error import HTTPError, URLError
 from urllib.request import urlopen
 
 try:
-    response = urlopen("http://127.0.0.1:8080/api/live_ready", timeout=10)
+    response = urlopen("http://127.0.0.1:8080/api/execution-mode", timeout=5)
 except HTTPError as exc:
     if exc.code != 503:
         raise
     response = exc
 except (URLError, TimeoutError):
-    raise SystemExit("live-readiness endpoint still warming up")
+    raise SystemExit("execution-mode endpoint still warming up")
 with response as body:
     readiness = json.load(body)
-checks = readiness.get("checks", {})
-if checks.get("live_requested") is not False or checks.get("signer_available") is not False:
+if readiness.get("paper_only") is not True or readiness.get("live_requested") is not False or readiness.get("signer_available") is not False:
     raise SystemExit("bot is not confirmed paper-only")
 PY
 }
 
-verify_paper
+verify_paper configuration
 sudo -n grep -Fx 'BOT_RUN_MODE=paper' "$env_file" >/dev/null
 
 # These files are local infrastructure and notification settings, not part of the stock rollout.
@@ -54,11 +60,16 @@ sudo -n install -d -m 0700 /srv/hyperliquid-bot/rollbacks
 sudo -n python3 - "$paper_data" "/srv/hyperliquid-bot/rollbacks" "$rev" <<'PY'
 from contextlib import closing
 from pathlib import Path
-import sqlite3, sys
+import shutil, sqlite3, sys
 
 data, rollbacks = map(Path, sys.argv[1:3])
 revision = sys.argv[3]
-for kind, filename in (("bot", "bot.db"), ("decisions", "bot.decisions.sqlite3"), ("orders", "bot.orders.sqlite3")):
+required = sum(path.stat().st_size for path in (data / "bot.db", data / "bot.decisions.sqlite3",
+               data / "bot.orders.sqlite3", data / "bot.risk.sqlite3", Path("/var/lib/hyperliquid-stock-paper/orders.sqlite3")) if path.exists())
+if shutil.disk_usage(rollbacks).free < required*2 + 2*1024**3:
+    raise SystemExit("not enough space for backups, isolated recovery verification, and reserve")
+for kind, filename in (("bot", "bot.db"), ("decisions", "bot.decisions.sqlite3"), ("orders", "bot.orders.sqlite3"),
+                       ("risk", "bot.risk.sqlite3"), ("stock", "/var/lib/hyperliquid-stock-paper/orders.sqlite3")):
     source = data / filename
     dest = rollbacks / f"{kind}-pre-{revision}.db"
     if dest.exists() or (kind != "bot" and not source.exists()):
@@ -131,7 +142,7 @@ stock=/opt/hyperliquid-stock-paper
 sudo -n install -d -m 0700 /etc/hyperliquid-stock-paper
 sudo -n install -d -m 0755 "$stock/$rev"
 for file in scripts/run_stock_paper.py scripts/stock_pilot_report.py src/trading/alpaca_paper.py \
-    src/trading/order_journal.py src/trading/stock_evidence.py src/core/clock_provider.py src/backtest/replay/clock.py; do
+    src/trading/order_journal.py src/trading/equity_risk.py src/trading/stock_evidence.py src/core/clock_provider.py src/backtest/replay/clock.py; do
     sudo -n install -D -m 0644 "$release/$file" "$stock/$rev/$file"
 done
 sudo -n ln -sfn "$stock/$rev" "$stock/current"
@@ -147,7 +158,7 @@ sudo -n systemctl start hyperliquid-stock-paper-report.service
 
 sudo -n install -D -m 0644 "$release/scripts/publish_dashboard_status.py" /opt/hyperliquid-dashboard/publish_dashboard_status.py
 for file in src/trading/alpaca_paper.py src/trading/order_journal.py src/trading/stock_evidence.py \
-    src/core/clock_provider.py src/backtest/replay/clock.py src/trading/trade_decision_memory.py \
+    src/core/clock_provider.py src/backtest/replay/clock.py src/trading/trade_decision_memory.py src/trading/equity_risk.py \
     src/trading/copy_shadow_report.py src/trading/paper_reporting.py src/data/decision_coverage.py; do
     sudo -n install -D -m 0644 "$release/$file" "/opt/hyperliquid-dashboard/$file"
 done

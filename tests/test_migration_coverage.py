@@ -58,6 +58,7 @@ SQLITE_ONLY_MODULE_TABLES = {
     "data/absorption_feed.py": {"frames", "decisions"},  # independent public-feed ledger
     "trading/order_journal.py": {"orders", "fills", "pauses"},  # per-account execution journal
     "trading/stock_evidence.py": {"stock_cycles", "stock_cycle_attempts"},  # stock-only journal
+    "trading/equity_risk.py": {"account_equity_samples"},  # account-scoped SQLite risk sidecar
 }
 
 # Tables created by the schema_migrations machinery itself or by the

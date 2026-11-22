@@ -1395,6 +1395,9 @@ def open_paper_trade(strategy_id, coin, side, entry_price, size, leverage=1,
                 )
                 return int(existing["id"])
 
+        from src.trading.equity_risk import ensure_paper_entry_risk
+        ensure_paper_entry_risk(conn, coin=coin, side=_normalize_trade_side_value(side), entry=entry_price,
+                                size=size, leverage=leverage, stop=stop_loss, metadata=metadata, now=now)
         normalized_coin = _normalize_coin_value(coin)
         normalized_side = _normalize_trade_side_value(side)
         if not normalized_coin or normalized_side not in {"long", "short"}:

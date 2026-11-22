@@ -2755,6 +2755,13 @@ class DecisionFirewall:
                               f"{self.min_source_accuracy:.0%}")
 
         # 10. Daily drawdown circuit breaker
+        if not require_live_balance:
+            import config as runtime_config
+            if runtime_config.PAPER_PORTFOLIO_GUARD_ENABLED:
+                from src.trading.equity_risk import paper_status
+                equity_risk = paper_status(now=clock_provider.utc_now())
+                if equity_risk["blocked"]:
+                    return _reject("rejected_drawdown", "Paper equity risk: "+equity_risk["reason"])
         self._check_daily_reset()
         drawdown_balance = account_balance
         if drawdown_balance is None:
@@ -2767,20 +2774,19 @@ class DecisionFirewall:
                               f"{self.daily_loss_limit_pct:.0%})")
 
         # 11. Funding rate risk check
-        #     Block new longs when funding is deeply negative (longs pay shorts heavily)
-        #     Block new shorts when funding is extremely positive (shorts pay longs)
+        # Positive funding is paid by longs; negative funding is paid by shorts.
         if self.funding_risk_enabled:
             try:
                 funding = self._get_funding_rate(signal.coin)
                 side_val = signal.side.value if hasattr(signal.side, 'value') else str(signal.side)
-                if side_val == "long" and funding < self.funding_negative_threshold:
+                if not math.isfinite(funding):
+                    return _reject("rejected_funding", "Funding rate is not finite")
+                if side_val == "long" and funding > self.funding_positive_threshold:
                     return _reject("rejected_funding",
-                                  f"Funding deeply negative ({funding:.4%}/8h) — "
-                                  f"longs pay {abs(funding)*3*365:.0f}% annualized, blocking long")
-                elif side_val == "short" and funding > self.funding_positive_threshold:
+                                  f"Positive funding cost ({funding:.4%}/8h), blocking long")
+                elif side_val == "short" and funding < self.funding_negative_threshold:
                     return _reject("rejected_funding",
-                                  f"Funding extremely positive ({funding:.4%}/8h) — "
-                                  f"shorts pay {funding*3*365:.0f}% annualized, blocking short")
+                                  f"Negative funding cost ({funding:.4%}/8h), blocking short")
             except Exception as e:
                 logger.debug(f"Funding rate check failed: {e}")
 
@@ -2971,8 +2977,11 @@ class DecisionFirewall:
                 for i, asset in enumerate(meta.get("universe", [])):
                     if i < len(asset_ctxs):
                         name = asset.get("name", "").upper()
-                        rate = float(asset_ctxs[i].get("funding", 0))
-                        self._funding_cache[name] = rate
+                        # Asset contexts report hourly funding; policy thresholds
+                        # and this method's contract are eight-hour fractions.
+                        rate = float(asset_ctxs[i].get("funding", 0)) * 8
+                        if math.isfinite(rate):
+                            self._funding_cache[name] = rate
                 self._funding_cache_ts = now
         except Exception as e:
             logger.debug(f"Funding rate fetch failed: {e}")

@@ -240,7 +240,8 @@ def quality_report(fills, sessions):
     if not sessions:
         lines += ["No paper ledger supplied. Copy replay unavailable."]
     for name, row in sessions.items():
-        count = lambda key: row.get(key, 0)
+        def count(key):
+            return row.get(key, 0)
         lines += [f"### {name}", f"- {count('valid_rows'):,} valid paper rows of {count('source_rows'):,}; "
                   f"{count('copy_entries'):,} identified copy entries and {count('copy_open'):,} still open in the snapshot."]
         if row["start"]:

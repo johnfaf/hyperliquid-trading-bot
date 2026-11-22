@@ -1244,6 +1244,9 @@ def test_execute_lcrs_signals_live_path_executes_signal(monkeypatch):
     executed = []
 
     class FakeLiveTrader:
+        def get_account_value(self):
+            return 1000.
+
         def execute_signal(self, signal, bypass_firewall=False):
             executed.append((signal.coin, signal.side.value, bypass_firewall))
             return {"status": "success", "coin": signal.coin}
@@ -1355,13 +1358,16 @@ def test_execute_lcrs_live_sizing_uses_live_account_balance(monkeypatch):
     assert seen["strategy_key"] == "liquidation_reversal"
     assert seen["account_balance"] == 42.0
     assert seen["signal_confidence"] == 0.7
-    assert executed == [("ETH", 0.123)]
+    assert executed == [("ETH", 0.06)]  # sizing cannot enlarge the risk-policy allocation
 
 
 def test_execute_options_flow_live_path_executes_signal(monkeypatch):
     executed = []
 
     class FakeLiveTrader:
+        def get_account_value(self):
+            return 1000.
+
         def execute_signal(self, signal, bypass_firewall=False):
             executed.append((signal.coin, signal.side.value, bypass_firewall))
             return {"status": "success", "coin": signal.coin}
@@ -1406,7 +1412,7 @@ def test_execute_options_flow_live_path_executes_signal(monkeypatch):
 
     _execute_options_flow_trades(container, {"overall_regime": "neutral"})
 
-    assert executed == [("ETH", "long", False)]
+    assert executed == [("ETH", "long", True)]  # final firewall validation already ran
 
 
 def test_execute_options_flow_live_path_skips_unfunded_perps(monkeypatch):
@@ -1515,7 +1521,7 @@ def test_execute_options_flow_live_precomputes_size_for_firewall(monkeypatch):
 
     assert executed == []
     assert seen["account_balance"] == 20.0
-    assert abs(seen["size"] - 0.02) < 1e-12
+    assert abs(seen["size"] - 0.0004) < 1e-12  # 4% of the $20 wallet, not a $1000 ceiling
 
 
 def test_execute_signal_live_logs_warning_for_insufficient_margin(monkeypatch, caplog):

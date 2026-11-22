@@ -41,6 +41,20 @@ async def health() -> JSONResponse:
     return JSONResponse({"status": "ok", "version": version})
 
 
+@router.get("/api/execution-mode")
+async def execution_mode() -> JSONResponse:
+    """Fast mode attestation, deliberately independent of full DB readiness."""
+    import config
+    from src.ui.v2.state import get_components
+    trader = get_components().live_trader
+    requested = bool(config.LIVE_TRADING_ENABLED or getattr(trader, "live_requested", False))
+    signer = bool(getattr(trader, "signer", None))
+    bound = trader is not None
+    paper = bound and os.getenv("BOT_RUN_MODE") == "paper" and not requested and not signer
+    return JSONResponse({"runtime_bound": bound, "paper_only": paper,
+                         "live_requested": requested, "signer_available": signer}, status_code=200 if bound else 503)
+
+
 @router.get("/api/ready")
 async def ready() -> JSONResponse:
     """Aggregated readiness check.

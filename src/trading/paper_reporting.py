@@ -128,7 +128,10 @@ def weekly_report(path, now):
                 "net": math.fsum(values) if values else None,
                 "fees": math.fsum(fees) if fees else None, "fee_count": len(fees)}
 
+    from src.trading.equity_risk import EquityRiskLedger, PAPER_ACCOUNT
+    equity = EquityRiskLedger(Path(path).with_suffix(".risk.sqlite3")).window(PAPER_ACCOUNT, start=start, end=end)
     return {"version": 1, "start": start.isoformat(), "end_exclusive": end.isoformat(),
             "generated_at": now.isoformat(), "mode": "paper", "excluded": excluded,
             "summary": total(clean), "routes": {key: total(rows) for key, rows in sorted(groups.items())},
-            "trades": clean, "equity_drawdown": None}
+            "trades": clean, "equity_drawdown": equity["drawdown"] if equity["complete"] else None,
+            "equity_coverage": equity}

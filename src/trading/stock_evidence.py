@@ -7,7 +7,7 @@ from pathlib import Path
 import sqlite3
 from zoneinfo import ZoneInfo
 
-from src.trading.alpaca_paper import REFERENCE_BALANCE_USD
+from src.trading.alpaca_paper import DAILY_LOSS_USD, REFERENCE_BALANCE_USD
 from src.core import clock_provider
 
 BASE_CASH = Decimal(REFERENCE_BALANCE_USD)
@@ -251,4 +251,10 @@ def read_summary(path: Path, *, session: str | None = None) -> dict:
                 """, ((now - timedelta(minutes=10)).isoformat(), (now - timedelta(hours=24)).isoformat())).fetchone()
             coverage = dict(zip(("started", "finished", "overdue"), row))
         return {"decisions": cycles, "fills": fills[-12:][::-1], "scorecard": scorecard(conn, scope, session),
-                "drill": drill_status(conn, scope, fills), "coverage": coverage}
+                "drill": drill_status(conn, scope, fills), "coverage": coverage,
+                "equity_risk": _equity_risk(path, scope)}
+
+
+def _equity_risk(path, account):
+    from src.trading.equity_risk import EquityRiskLedger
+    return EquityRiskLedger(path).status(account, now=clock_provider.utc_now(), daily_loss_usd=float(DAILY_LOSS_USD))

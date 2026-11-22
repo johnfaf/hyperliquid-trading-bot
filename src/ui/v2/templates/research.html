@@ -31,7 +31,7 @@
     <p class="desk-muted desk-research-status">{{ weekly.start[:10] }} to {{ weekly.end_exclusive[:10] }} (end exclusive) &middot; Captured {{ weekly.generated_at[:19]|replace("T"," ") }} UTC</p>
     <div class="desk-kpis">
       <div><span>Net realized</span><strong>{{ money(weekly.summary.net,true) }}</strong><small>{{ weekly.summary.priced }} / {{ weekly.summary.closed }} priced closes</small></div>
-      <div><span>Realized drawdown</span><strong>{{ money(weekly.summary.realized_drawdown) }}</strong><small>Equity drawdown unmeasured</small></div>
+      <div><span>Realized drawdown</span><strong>{{ money(weekly.summary.realized_drawdown) }}</strong><small>Equity drawdown {% if weekly.get("equity_drawdown") is not none %}{{ money(weekly.equity_drawdown) }}{% else %}unmeasured{% endif %}</small></div>
       <div><span>Fees included in net</span><strong>{{ money(weekly.summary.fees) }}</strong><small>{{ weekly.summary.fee_count }} closes with recorded fees</small></div>
       <div><span>Net without largest winner</span><strong>{{ money(weekly.summary.net_without_largest,true) }}</strong><small>{{ weekly.summary.evidence }}</small></div>
     </div>

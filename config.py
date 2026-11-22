@@ -574,6 +574,10 @@ LIVE_MIN_ORDER_USD = _safe_env_float("LIVE_MIN_ORDER_USD", 11.0, lo=1.0, hi=10_0
 PAPER_MAX_PLANNED_STOP_LOSS_PCT = _safe_env_float(
     "PAPER_MAX_PLANNED_STOP_LOSS_PCT", 0.0025, lo=0.0, hi=0.25,
 )
+PAPER_PORTFOLIO_GUARD_ENABLED = _safe_env_bool("PAPER_PORTFOLIO_GUARD_ENABLED", False)
+PAPER_DAILY_EQUITY_LOSS_PCT = _safe_env_float("PAPER_DAILY_EQUITY_LOSS_PCT", .03, lo=.001, hi=.25)
+PAPER_MAX_EQUITY_DRAWDOWN_PCT = _safe_env_float("PAPER_MAX_EQUITY_DRAWDOWN_PCT", .10, lo=.001, hi=.50)
+PAPER_MAX_OPEN_STOP_RISK_PCT = _safe_env_float("PAPER_MAX_OPEN_STOP_RISK_PCT", .02, lo=.001, hi=.25)
 
 # Hard ceiling on the notional ($ USDC) of any single live order.  This is a
 # safety net while the bot is ramping on a small live balance — even if paper

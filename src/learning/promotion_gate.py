@@ -29,6 +29,7 @@ from typing import Any, Dict, Tuple
 
 import config
 from src.data import database as db
+from src.signals.source_key import copy_trade_source_key, is_canonical_source_key
 
 logger = logging.getLogger(__name__)
 
@@ -344,11 +345,10 @@ def is_live_promotable(trade: Dict[str, Any]) -> Tuple[bool, str]:
 
     Resolution order:
       1. Direct ``strategy_id`` on the trade — most reliable.
-      2. Copy-trade ``source_trader`` in metadata — agent_scorer lookup.
-      3. ``strategy_type`` in metadata — best-effort agent_scorer lookup
-         under ``strategy:<type>`` key.
+      2. Exact recorded source identity, validated against route/type/wallet.
+      3. Canonical source identity derived from route/type/wallet metadata.
 
-    Returns ``(False, "gate_disabled")`` and lets the caller through when
+    Returns ``(True, "gate_disabled")`` and lets the caller through when
     ``config.LIVE_PROMOTION_GATE_ENABLED`` is false.
     """
     if not bool(getattr(config, "LIVE_PROMOTION_GATE_ENABLED", True)):
@@ -359,16 +359,42 @@ def is_live_promotable(trade: Dict[str, Any]) -> Tuple[bool, str]:
     min_score = float(getattr(config, "LIVE_PROMOTION_MIN_SCORE", 0.20))
 
     metadata = _parse_metadata(trade.get("metadata", {}))
+    source = str(metadata.get("source") or trade.get("source") or "").strip().lower()
+    strategy_type = str(metadata.get("strategy_type") or trade.get("strategy_type") or "").strip().lower()
+    recorded = metadata.get("source_key", trade.get("source_key"))
+    if recorded is not None and (not isinstance(recorded, str) or not is_canonical_source_key(recorded)):
+        return False, "invalid_source_key"
+    namespace = "strategy" if source == "liquidation_strategy" else source
+    if not namespace and recorded:
+        namespace = recorded.split(":", 1)[0]
+    source_trader = metadata.get("source_trader") or trade.get("source_trader")
+    if namespace == "copy_trade":
+        try:
+            expected = str(copy_trade_source_key(str(source_trader), strict=True)) if source_trader else None
+        except ValueError:
+            return False, "invalid_copy_source"
+    elif strategy_type and strategy_type not in {"unknown", "untagged"}:
+        expected = f"{namespace or 'strategy'}:{strategy_type}"
+    else:
+        expected = recorded if recorded and recorded.split(":", 1)[0] == namespace else namespace or None
+    if recorded and expected and recorded != expected and not (namespace == "copy_trade" and not source_trader):
+        return False, "source_key_mismatch"
+    source_key = recorded or expected
+    if source_key in {"unknown", "strategy:unknown", "strategy:untagged", "copy_trade"}:
+        return False, "no_promotion_data"
 
     # Path 1: strategy_id on trade
     strategy_id = trade.get("strategy_id") or metadata.get("strategy_id")
-    if strategy_id:
+    if strategy_id and (source_key is None or source_key.startswith("strategy:")):
         try:
             strategy = db.get_strategy(strategy_id)
         except Exception as exc:
             logger.debug("get_strategy(%s) failed: %s", strategy_id, exc)
             strategy = None
         if strategy:
+            stored_type = str(strategy.get("strategy_type") or "").strip().lower()
+            if source_key and stored_type and source_key != f"strategy:{stored_type}":
+                return False, "strategy_source_key_mismatch"
             ok, reason = _strategy_promotion_ok(
                 strategy,
                 min_trades=min_trades,
@@ -398,30 +424,9 @@ def is_live_promotable(trade: Dict[str, Any]) -> Tuple[bool, str]:
                     return False, drift_reason
             return ok, reason
 
-    # Path 2: copy-trade source_trader (agent_scorer)
-    source_trader = (
-        metadata.get("source_trader")
-        or trade.get("source_trader")
-        or ""
-    )
-    source = str(metadata.get("source") or trade.get("source") or "").strip().lower()
-    if source == "copy_trade" and source_trader:
-        source_key = f"copy_trade:{str(source_trader).strip().lower()}"
-        ok, reason = _agent_score_promotion_ok(
-            source_key,
-            min_trades=min_trades,
-            min_win_rate=min_win_rate,
-        )
-        if not ok:
-            ok, reason = _maybe_bootstrap_tier(source_key, base_reason=reason)
-        return ok, reason
-
-    # Path 3: strategy_type tag (agent_scorer under strategy:<type>)
-    strategy_type = str(
-        metadata.get("strategy_type") or trade.get("strategy_type") or ""
-    ).strip().lower()
-    if strategy_type and strategy_type not in {"unknown", "untagged"}:
-        source_key = f"strategy:{strategy_type}"
+    # A missing exact cohort is a rejection, never permission to borrow another
+    # route's strategy statistics (including Arena/options-flow cohorts).
+    if source_key:
         ok, reason = _agent_score_promotion_ok(
             source_key,
             min_trades=min_trades,

@@ -18,7 +18,7 @@ from src.data import decision_journal
 from src.data import decision_coverage
 from src.trading.trade_decision_memory import entry_memory
 from src.core.live_execution import (
-    get_execution_account_balance,
+    get_live_trader,
     get_execution_open_positions,
     is_live_trading_active,
     mirror_executed_trades_to_live,
@@ -771,7 +771,7 @@ def _execute_signal_live(container, trade_signal, source_label: str, bypass_fire
     *not* applied here because LCRS/options/arena don't have the same
     strategy_id/agent_score tracking model as paper-mirror trades.
     """
-    trader = getattr(container, "live_trader", None)
+    trader = get_live_trader(container)
     if not trader or not is_live_trading_active(container):
         return None
 
@@ -1581,6 +1581,88 @@ def _apply_agent_scorer_weights(container, top_strategies):
         logger.debug("  AgentScorer weight apply error: %s", exc)
 
 
+def _direct_account_balance(container):
+    """Never substitute a paper balance for a missing live wallet snapshot."""
+    try:
+        if is_live_trading_active(container):
+            trader = get_live_trader(container)
+            balance = trader.get_free_margin() if callable(getattr(trader, "get_free_margin", None)) else None
+            if balance is None and callable(getattr(trader, "get_account_value", None)):
+                balance = trader.get_account_value()
+        else:
+            balance = (db.get_paper_account() or {}).get("balance")
+        value = float(balance) if balance is not None else 0.
+        return value if math.isfinite(value) and value > 0 else None
+    except Exception:
+        return None
+
+
+def _admit_direct_entry(container, signal, regime_data, ref):
+    """Validate the final candidate against a fresh book and the correct wallet."""
+    firewall = getattr(container, "firewall", None)
+    reason = None
+    balance = None
+    live = is_live_trading_active(container)
+    if firewall is None:
+        reason = "firewall_unavailable"
+    else:
+        try:
+            balance = _direct_account_balance(container)
+            if balance is None:
+                reason = "account_balance_unavailable"
+            else:
+                if not math.isfinite(signal.entry_price) or signal.entry_price <= 0:
+                    raise ValueError("invalid entry price")
+                signal.size = balance * signal.effective_size / signal.entry_price
+                passed, why = firewall.validate(
+                    signal, regime_data=regime_data,
+                    open_positions=get_execution_open_positions(container),
+                    account_balance=balance, require_live_balance=live,
+                )
+                if not passed:
+                    reason = f"firewall: {why}"
+        except Exception as exc:
+            logger.warning("Direct entry validation unavailable (%s)", type(exc).__name__)
+            reason = "entry_validation_unavailable"
+    if reason:
+        decision_coverage.resolve(ref, "blocked", reason=reason)
+        return None
+    return balance
+
+
+def _open_direct_paper_trade(container, signal, balance, ref, route, metadata):
+    """All direct routes execute the approved size, leverage and stop budget."""
+    from src.signals.decision_firewall import DecisionFirewall
+    from src.trading.paper_risk import size_for_planned_stop
+
+    price, side = signal.entry_price, signal.side.value
+    sl, tp = signal.risk.resolve_trigger_prices(
+        price, side, signal.leverage, atr_pct=(signal.context or {}).get("atr_pct"),
+    )
+    proposed_size = balance * signal.effective_size / price
+    if signal.size > 0:
+        proposed_size = min(proposed_size, signal.size)
+    size, budget = size_for_planned_stop(
+        balance=balance, side=side, entry=price, stop=sl,
+        size=proposed_size, leverage=signal.leverage, execution_role="taker",
+    )
+    source_key = DecisionFirewall._source_key(signal)
+    scorer = getattr(container, "agent_scorer", None)
+    signal_id = scorer.record_signal(source_key, {
+        "coin": signal.coin, "side": side, "confidence": signal.confidence,
+    }) if scorer else None
+    return db.open_paper_trade(
+        strategy_id=None, coin=signal.coin, side=side, entry_price=price,
+        size=size, leverage=signal.leverage, stop_loss=sl, take_profit=tp,
+        metadata={**metadata, "source": route, "strategy_type": signal.strategy_type,
+                  "source_key": source_key, "signal_id": signal_id, "evaluation_ref": ref,
+                  "decision_id": decision_journal.resolve_decision_id(signal),
+                  "entry_decision": entry_memory(signal, route=route, firewall="approved"),
+                  "planned_stop": budget, "confidence": signal.confidence,
+                  "risk_policy": dict((signal.context or {}).get("risk_policy", {}) or {})},
+    )
+
+
 def _execute_lcrs_signals(container, lcrs_signals, regime_data):
     """Phase 4a: execute liquidation reversal signals."""
     from src.notifications import telegram_bot as tg
@@ -1589,17 +1671,16 @@ def _execute_lcrs_signals(container, lcrs_signals, regime_data):
     try:
         from src.signals.signal_schema import TradeSignal, SignalSide, SignalSource, RiskParams
         lcrs_executed = []
-        open_trades = get_execution_open_positions(container)
-        # BUG-2 FIX: load account BEFORE the loop so dynamic sizing
-        # (Kelly/RL) is actually applied to LCRS trades.  Previously
-        # `account` was None at the sizing check, making it dead code.
-        try:
-            account = db.get_paper_account()
-        except Exception:
-            account = None
-
         for sig, ref in zip(lcrs_signals, refs):
             try:
+                price = float(sig["price"])
+                stop, target = float(sig["stop_loss"]), float(sig["take_profit"])
+                side = sig["side"]
+                if not all(math.isfinite(x) and x > 0 for x in (price, stop, target)) or not (
+                    stop < price < target if side == "long" else target < price < stop if side == "short" else False
+                ):
+                    decision_coverage.resolve(ref, "blocked", reason="invalid_entry_or_protection")
+                    continue
                 trade_signal = TradeSignal(
                     coin=sig["coin"], side=SignalSide(sig["side"]),
                     confidence=sig["confidence"], source=SignalSource.STRATEGY,
@@ -1607,7 +1688,8 @@ def _execute_lcrs_signals(container, lcrs_signals, regime_data):
                     strategy_type="liquidation_reversal",
                     entry_price=sig["price"], leverage=sig["leverage"],
                     position_pct=sig.get("position_pct", 0.06),
-                    risk=RiskParams(stop_loss_pct=0.025, take_profit_pct=0.125),
+                    risk=RiskParams(stop_loss_pct=abs(price-stop)/price, take_profit_pct=abs(target-price)/price,
+                                    risk_basis="price", enforce_reward_to_risk=False),
                     context={
                         "features": sig.get("features", {}) or {},
                         "volatility": (sig.get("features", {}) or {}).get("volatility"),
@@ -1618,17 +1700,8 @@ def _execute_lcrs_signals(container, lcrs_signals, regime_data):
                 trade_signal = _apply_dynamic_risk_policy(container, trade_signal, regime_data=regime_data)
                 decision_coverage.bind_signal(ref, trade_signal)
 
-                if container.firewall:
-                    passed, reason = container.firewall.validate(
-                        trade_signal, regime_data=regime_data, open_positions=open_trades
-                    )
-                    if not passed:
-                        logger.info("  LCRS firewall rejected %s: %s", sig["coin"], reason)
-                        decision_coverage.resolve(ref, "blocked", reason=f"firewall: {reason}")
-                        continue
-
-                if container.kelly_sizer or getattr(container, "rl_sizer", None):
-                    sizing_balance = get_execution_account_balance(container)
+                if getattr(container, "kelly_sizer", None) or getattr(container, "rl_sizer", None):
+                    sizing_balance = _direct_account_balance(container)
                     if sizing_balance is not None:
                         sizing = _get_dynamic_sizing(
                             container,
@@ -1640,7 +1713,7 @@ def _execute_lcrs_signals(container, lcrs_signals, regime_data):
                             volatility=sig.get("features", {}).get("volatility", 0.02),
                         )
                         if sizing:
-                            trade_signal.position_pct = sizing.position_pct
+                            trade_signal.position_pct = min(trade_signal.position_pct, sizing.position_pct)
 
                 if container.trade_memory:
                     mem = container.trade_memory.find_similar(
@@ -1652,7 +1725,7 @@ def _execute_lcrs_signals(container, lcrs_signals, regime_data):
                         continue
 
                 if container.llm_filter:
-                    ctx = {"regime_data": regime_data, "open_positions": open_trades}
+                    ctx = {"regime_data": regime_data, "open_positions": get_execution_open_positions(container)}
                     approved, adj_conf, reason = container.llm_filter.filter(sig, ctx)
                     if not approved:
                         logger.info("  LCRS LLM filter blocked %s: %s", sig["coin"], reason)
@@ -1660,6 +1733,9 @@ def _execute_lcrs_signals(container, lcrs_signals, regime_data):
                         continue
                     trade_signal.confidence = adj_conf
 
+                balance = _admit_direct_entry(container, trade_signal, regime_data, ref)
+                if balance is None:
+                    continue
                 if is_live_trading_active(container):
                     live_result = _execute_signal_live(container, trade_signal, "LCRS")
                     if live_result:
@@ -1671,26 +1747,8 @@ def _execute_lcrs_signals(container, lcrs_signals, regime_data):
                             )
                     continue
 
-                if account is None:
-                    account = db.get_paper_account()
-                if not account:
-                    decision_coverage.resolve(ref, "blocked", reason="paper_account_unavailable")
-                    continue
-                size_usd = account["balance"] * trade_signal.effective_size
-                size = size_usd / sig["price"]
-                trade_id = db.open_paper_trade(
-                    strategy_id=None, coin=sig["coin"], side=sig["side"],
-                    entry_price=sig["price"], size=size, leverage=sig["leverage"],
-                    stop_loss=sig["stop_loss"], take_profit=sig["take_profit"],
-                    metadata={
-                        "source": "liquidation_strategy",
-                        "evaluation_ref": ref,
-                        "decision_id": decision_journal.resolve_decision_id(trade_signal),
-                        "entry_decision": entry_memory(
-                            trade_signal, route="liquidation_strategy", firewall="approved" if container.firewall else None,
-                        ),
-                        "strategy_type": "liquidation_reversal",
-                        "confidence": trade_signal.confidence,
+                trade_id = _open_direct_paper_trade(
+                    container, trade_signal, balance, ref, "liquidation_strategy", {
                         "setup_type": sig["features"].get("setup_type", ""),
                         "features": sig["features"],
                     },
@@ -1732,7 +1790,7 @@ def _execute_options_flow_trades(container, regime_data):
         mids = hl_client.get_all_mids() or {}
         options_executed = []
         live_active = is_live_trading_active(container)
-        live_trader = getattr(container, "live_trader", None) if live_active else None
+        live_trader = get_live_trader(container) if live_active else None
         live_account_value = None
         if live_active and live_trader:
             get_account_value = getattr(live_trader, "get_account_value", None)
@@ -1754,7 +1812,7 @@ def _execute_options_flow_trades(container, regime_data):
             flow_signal.position_pct = 0.04
             flow_signal.leverage = 2.0
             price = float(mids.get(conv["ticker"], 0))
-            if price <= 0:
+            if not math.isfinite(price) or price <= 0:
                 decision_coverage.resolve(ref, "blocked", reason="quote_unavailable")
                 continue
             flow_signal.entry_price = price
@@ -1775,16 +1833,6 @@ def _execute_options_flow_trades(container, regime_data):
                 decision_coverage.resolve(ref, "blocked", reason="live_margin_unavailable")
                 continue
 
-            if live_active and live_trader and (not flow_signal.size or flow_signal.size <= 0):
-                try:
-                    max_position_size = float(getattr(live_trader, "max_position_size", 0.0) or 0.0)
-                except (TypeError, ValueError):
-                    max_position_size = 0.0
-                if max_position_size > 0:
-                    estimated_notional = max_position_size * flow_signal.position_pct
-                    if estimated_notional > 0:
-                        flow_signal.size = estimated_notional / price
-
             try:
                 paper_account = db.get_paper_account()
                 _paper_balance = (
@@ -1804,7 +1852,7 @@ def _execute_options_flow_trades(container, regime_data):
                 live_value=live_account_value,
                 paper_value=_paper_balance,
             )
-            sizing_balance = _basis.usd if _basis.source != "unknown" else None
+            sizing_balance = _basis.usd if _basis.source == ("live" if live_active else "paper") else None
             if sizing_balance and (getattr(container, "kelly_sizer", None) or getattr(container, "rl_sizer", None)):
                 try:
                     sizing = _get_dynamic_sizing(
@@ -1817,40 +1865,21 @@ def _execute_options_flow_trades(container, regime_data):
                         volatility=0.02,
                     )
                     if sizing:
-                        flow_signal.position_pct = sizing.position_pct
+                        flow_signal.position_pct = min(flow_signal.position_pct, sizing.position_pct)
                 except Exception as exc:
                     logger.debug("  Options flow dynamic sizing failed: %s", exc)
 
-            if container.firewall:
-                passed, reason = container.firewall.validate(
-                    flow_signal, regime_data=regime_data,
-                    open_positions=get_execution_open_positions(container),
-                    account_balance=live_account_value if live_active else None,
-                    # Live options-flow is a direct live entry: force the
-                    # exposure/margin caps onto the real live wallet and
-                    # refuse (rather than fall back to the ~$10k paper
-                    # balance) if the live balance is unavailable.
-                    require_live_balance=live_active,
-                )
-                if not passed:
-                    logger.info("  Firewall rejected options flow %s: %s", conv["ticker"], reason)
-                    decision_coverage.resolve(ref, "blocked", reason=f"firewall: {reason}")
-                    continue
-
-            if container.agent_scorer:
-                container.agent_scorer.record_signal("options_flow", {
-                    "coin": conv["ticker"], "side": flow_signal.side.value,
-                    "confidence": flow_signal.confidence,
-                })
+            balance = _admit_direct_entry(container, flow_signal, regime_data, ref)
+            if balance is None:
+                continue
 
             if live_active:
-                # Run full live-trader firewall validation so account-based checks
-                # use live balance context instead of paper defaults.
+                # Final admission above already checked the real wallet and book.
                 live_result = _execute_signal_live(
                     container,
                     flow_signal,
                     "OPTIONS FLOW",
-                    bypass_firewall=False,
+                    bypass_firewall=True,
                 )
                 if live_result:
                     options_executed.append(live_result)
@@ -1861,32 +1890,13 @@ def _execute_options_flow_trades(container, regime_data):
                         )
                 continue
 
-            account = db.get_paper_account()
-            if account:
-                size_usd = account["balance"] * flow_signal.effective_size
-                size = size_usd / price
+            if balance:
                 side = flow_signal.side.value
-                # A1: pass atr_pct so the ATR floor (if enabled) widens
-                # tight options-flow stops.
-                sl, tp = flow_signal.risk.resolve_trigger_prices(
-                    price, side, flow_signal.leverage,
-                    atr_pct=(flow_signal.context or {}).get("atr_pct"),
-                )
-                trade_id = db.open_paper_trade(
-                    strategy_id=None, coin=conv["ticker"], side=side,
-                    entry_price=price, size=size, leverage=flow_signal.leverage,
-                    stop_loss=sl, take_profit=tp,
-                    metadata={
-                        "source": "options_flow",
-                        "evaluation_ref": ref,
-                        "decision_id": decision_journal.resolve_decision_id(flow_signal),
-                        "entry_decision": entry_memory(
-                            flow_signal, route="options_flow", firewall="approved" if container.firewall else None,
-                        ),
+                trade_id = _open_direct_paper_trade(
+                    container, flow_signal, balance, ref, "options_flow", {
                         "conviction": conv["conviction_pct"],
                         "net_flow": conv["net_flow"],
                         "prints": conv["total_prints"],
-                        "risk_policy": dict((flow_signal.context or {}).get("risk_policy", {}) or {}),
                     },
                 )
                 decision_journal.record_paper_opened(
@@ -2169,17 +2179,8 @@ def _run_alpha_arena(container, regime_data):
                             decision_coverage.bind_signal(ref, live_signal)
                             position_pct = live_signal.position_pct
                             live_active = is_live_trading_active(container)
-                            account = None if live_active else db.get_paper_account()
-                            account_balance = None
-                            if live_active and container.live_trader is not None:
-                                trader = container.live_trader
-                                if hasattr(trader, "get_free_margin"):
-                                    account_balance = trader.get_free_margin()
-                                if account_balance is None and hasattr(trader, "get_account_value"):
-                                    account_balance = trader.get_account_value()
-                            elif account:
-                                account_balance = account.get("balance")
-                            if account_balance is None or not math.isfinite(float(account_balance)) or float(account_balance) <= 0:
+                            account_balance = _direct_account_balance(container)
+                            if account_balance is None:
                                 decision_coverage.resolve(ref, "blocked", reason="account_balance_unavailable")
                                 continue
                             account_balance = float(account_balance)
@@ -2199,51 +2200,15 @@ def _run_alpha_arena(container, regime_data):
                                 except Exception as exc:
                                     logger.debug("  Arena champion sizing failed: %s", exc)
                             live_signal.position_pct = position_pct
-                            arena_firewall = getattr(container, "firewall", None)
-                            if arena_firewall is None:
-                                decision_coverage.resolve(ref, "blocked", reason="firewall_unavailable")
-                                continue
-                            passed, reason = arena_firewall.validate(
-                                live_signal, regime_data=regime_data,
-                                open_positions=get_execution_open_positions(container),
-                                account_balance=account_balance, require_live_balance=live_active,
-                            )
-                            if not passed:
-                                logger.info("  Arena firewall rejected %s %s: %s", sig["coin"], side, reason)
-                                decision_coverage.resolve(ref, "blocked", reason=f"firewall: {reason}")
+                            account_balance = _admit_direct_entry(container, live_signal, regime_data, ref)
+                            if account_balance is None:
                                 continue
                             if live_active:
                                 _execute_signal_live(container, live_signal, "ARENA")
                                 continue
-                            # Use the approved, possibly reduced size and leverage.
-                            sl, tp = live_signal.risk.resolve_trigger_prices(
-                                price, side, live_signal.leverage,
-                                atr_pct=(live_signal.context or {}).get("atr_pct"),
-                            )
-                            if account:
-                                from src.trading.paper_risk import size_for_planned_stop
-                                size, stop_budget = size_for_planned_stop(
-                                    balance=account_balance, side=side, entry=price, stop=sl,
-                                    size=account_balance * live_signal.position_pct / price,
-                                    leverage=live_signal.leverage, execution_role="taker",
-                                )
-                                source_key = arena_firewall._source_key(live_signal)
-                                scorer = getattr(container, "agent_scorer", None)
-                                signal_id = scorer.record_signal(source_key, {
-                                    "coin": sig["coin"], "side": side, "confidence": conf,
-                                }) if scorer else None
-                                trade_id = db.open_paper_trade(
-                                    strategy_id=None, coin=sig["coin"], side=side,
-                                    entry_price=price, size=size, leverage=live_signal.leverage,
-                                    stop_loss=sl, take_profit=tp,
-                                    metadata={
-                                        "source": "arena_champion",
-                                        "evaluation_ref": ref,
-                                        "decision_id": decision_journal.resolve_decision_id(live_signal),
-                                        "entry_decision": entry_memory(live_signal, route="arena_champion", firewall="approved"),
-                                        "source_key": source_key,
-                                        "signal_id": signal_id,
-                                        "planned_stop": stop_budget,
+                            if account_balance:
+                                trade_id = _open_direct_paper_trade(
+                                    container, live_signal, account_balance, ref, "arena_champion", {
                                         "agent_id": sig["agent_id"],
                                         "agent_name": sig["agent_name"],
                                         "strategy_type": sig["strategy_type"],

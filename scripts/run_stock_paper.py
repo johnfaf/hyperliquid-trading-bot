@@ -123,6 +123,11 @@ def tick(broker, journal, *, symbol, orders_enabled=False, flatten=False,
     now = timestamp(clock["timestamp"])
     if abs((datetime.now(UTC) - now).total_seconds()) > 30:
         return {"state": "stale_broker_clock"}
+    from src.trading.equity_risk import EquityRiskLedger
+    risk_ledger = EquityRiskLedger(journal.path)
+    risk_ledger.observe(journal.account, now=now, equity=account["equity"], cash=account.get("cash"),
+                        day_baseline=account.get("last_equity"))
+    equity_risk = risk_ledger.status(journal.account, now=now, daily_loss_usd=float(DAILY_LOSS_USD))
     day = now.astimezone(NY).date()
     today = day.isoformat()
     if not clock["is_open"] or timestamp(clock["next_close"]) - now < timedelta(minutes=5):
@@ -144,7 +149,7 @@ def tick(broker, journal, *, symbol, orders_enabled=False, flatten=False,
         return {"state": "not_enough_completed_bars"}
     equity = positive(account["equity"])
     delta = equity - positive(account["last_equity"])
-    entry_paused = bool(journal.pause_reason())
+    entry_paused = bool(journal.pause_reason()) or equity_risk["blocked"]
     drill_qty = evidence.drill_position(symbol) if evidence and qty else Decimal(0)
     paper_guard = qty and drill_qty and not (drill or flatten)
     if qty:
@@ -163,11 +168,11 @@ def tick(broker, journal, *, symbol, orders_enabled=False, flatten=False,
             return {"state": "drill_position_unverified", "session": today}
     elif paper_guard:
         return {"state": "drill_position_open", "session": today}
-    status = "entries_paused" if entry_paused else "daily_limit_reached" if delta <= -DAILY_LOSS_USD else "no_order"
+    status = "equity_risk_blocked" if equity_risk["blocked"] else "entries_paused" if entry_paused else "daily_limit_reached" if delta <= -DAILY_LOSS_USD else "no_order"
     report = {"state": status, "session": today, "symbol": symbol, "quantity": str(qty),
               "account_equity": str(equity), "account_cash": str(account["cash"]) if account.get("cash") is not None else None,
               "account_daily_change": str(delta), "mode": "paper" if orders_enabled else "shadow",
-              "decision": side}
+              "decision": side, "equity_risk": equity_risk}
     row = broker.request(f"/v2/stocks/{symbol}/quotes/latest", market_data=True, query={"feed": "iex"})["quote"]
     try:
         quote_at = timestamp(row["t"]).astimezone(UTC)

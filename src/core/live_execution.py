@@ -346,21 +346,26 @@ def get_execution_open_positions(container) -> List[Dict]:
     trader = get_live_trader(container)
     if trader and is_live_trading_active(container):
         try:
-            return trader.get_positions(force_fresh=True) or []
+            positions = trader.get_positions(force_fresh=True)
         except TypeError:
-            return trader.get_positions() or []
+            positions = trader.get_positions()
+        if positions is None:
+            raise RuntimeError("live positions snapshot unavailable")
+        return positions
     return db.get_open_paper_trades()
 
 
 def get_execution_account_balance(container) -> Optional[float]:
-    """Use live account value when available, otherwise fall back to paper balance."""
+    """Use the active wallet; a missing live value is never paper capital."""
     trader = get_live_trader(container)
     if trader and is_live_trading_active(container):
         get_value = getattr(trader, "get_account_value", None)
         if callable(get_value):
             value = get_value()
             if value is not None:
-                return float(value)
+                parsed = float(value)
+                return parsed if 0 < parsed < float("inf") else None
+        return None
 
     account = db.get_paper_account()
     if not account:

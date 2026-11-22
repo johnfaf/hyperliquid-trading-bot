@@ -164,6 +164,12 @@ def review(days=7, group="source", scope="copy", *, path=None, now=None, period=
     base = {"days": days, "group": group, "scope": scope, "available": False, "limited": False,
             "summary": {}, "groups": [], "recent": [], "excluded": 0, "peak": None,
             "period": period, "start": start.isoformat(), "end": end.isoformat(), "valuation": valuation(path, now)}
+    from src.trading.equity_risk import EquityRiskLedger, PAPER_ACCOUNT
+    base["equity_risk"] = EquityRiskLedger(path.with_suffix(".risk.sqlite3")).status(
+        PAPER_ACCOUNT, now=now, daily_loss_pct=config.PAPER_DAILY_EQUITY_LOSS_PCT,
+        max_drawdown_pct=config.PAPER_MAX_EQUITY_DRAWDOWN_PCT,
+    )
+    base["guard_enabled"] = config.PAPER_PORTFOLIO_GUARD_ENABLED
     if scope == "copy":
         status = host_status(path.with_name("dashboard_ops.json"), now)
         base.update(copy_daily=status.get("copy_daily"), copy_alerts=status.get("copy_alerts") or [])

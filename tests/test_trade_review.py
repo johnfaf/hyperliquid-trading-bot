@@ -18,7 +18,8 @@ from src.ui.v2.trade_review import detail, review
 def ledger(tmp_path):
     path = tmp_path / "paper.db"
     now = datetime.now(timezone.utc)
-    ts = lambda minutes: (now - timedelta(minutes=minutes)).isoformat()
+    def ts(minutes):
+        return (now - timedelta(minutes=minutes)).isoformat()
     first = "0x" + "a" * 40
     second = "0x" + "b" * 40
     with closing(sqlite3.connect(path)) as conn, conn:

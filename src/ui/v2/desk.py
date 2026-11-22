@@ -16,6 +16,7 @@ from src.ui.v2.state import get_components
 log = logging.getLogger(__name__)
 
 STOCK_LABELS = {
+    "equity_risk_blocked": ("Equity-risk budget reached", "warn"),
     "waiting_for_paper_credentials": ("Paper keys needed", "warn"),
     "outside_entry_or_exit_window": ("US session closed", "neutral"),
     "no_order": ("Monitoring", "good"),
@@ -174,6 +175,10 @@ def snapshot(hours: int = 24) -> dict:
         "crypto": {"requested": requested, "signer": signer, "paper_only": not requested and not signer,
                    "unresolved": unresolved, "paused": bool(getattr(trader, "kill_switch_active", False))},
         "settings": {
+            "paper_guard_enabled": config.PAPER_PORTFOLIO_GUARD_ENABLED,
+            "paper_daily_equity_loss_pct": config.PAPER_DAILY_EQUITY_LOSS_PCT * 100,
+            "paper_max_equity_drawdown_pct": config.PAPER_MAX_EQUITY_DRAWDOWN_PCT * 100,
+            "paper_open_stop_risk_pct": config.PAPER_MAX_OPEN_STOP_RISK_PCT * 100,
             "paper_risk_pct": config.PAPER_MAX_PLANNED_STOP_LOSS_PCT * 100,
             "paper_start_usd": config.PAPER_TRADING_INITIAL_BALANCE,
             "live_max_order_usd": getattr(trader, "max_order_usd", config.LIVE_MAX_ORDER_USD),
