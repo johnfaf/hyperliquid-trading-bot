@@ -15,6 +15,7 @@ from src.backtest.candle_exit_replay import Bar
 from src.data import database as db
 from src.learning.strategy_evidence import stamp_paper_entry
 from src.trading.paper_funding import FundingLedger, MODEL, ledger_path, millis, verified_cost
+from src.trading.paper_funding_health import funding_health
 from src.trading.paper_trader import PaperTrader
 
 NOW = datetime(2026, 11, 22, 9, 5, tzinfo=timezone.utc)
@@ -107,6 +108,25 @@ def test_actual_paper_close_with_restart_proof_credits_once(tmp_path, monkeypatc
     metadata = json.loads(closed["metadata"])
     assert verified_cost(closed, metadata["funding_coverage"]) == pytest.approx(.604)
     assert db.get_paper_account()["balance"] == pytest.approx(1009.4)
+    report = funding_health(path, NOW+timedelta(seconds=1))
+    assert report["cross_hour_closes"] == report["verified_closes"] == 1
+    assert report["state"] == "Funded closes verified"
+
+
+def test_funding_health_distinguishes_not_due_pending_and_overdue(tmp_path):
+    path = tmp_path / "bot.db"
+    hour = NOW.replace(minute=0)
+    with closing(sqlite3.connect(path)) as conn, conn:
+        conn.execute("CREATE TABLE paper_trades(coin,side,size,leverage,opened_at,closed_at,metadata,status)")
+        conn.execute("INSERT INTO paper_trades VALUES ('BTC','long',1,2,?,NULL,?,'open')",
+                     ((hour-timedelta(minutes=15)).isoformat(), json.dumps({"paper_funding_model": MODEL})))
+    assert funding_health(path, hour-timedelta(seconds=1))["open_due"] == 0
+    assert funding_health(path, hour+timedelta(minutes=1))["pending_hours"] == 1
+    report = funding_health(path, NOW)
+    assert report["overdue_hours"] == 1 and report["verified_closes"] == 0
+    settlement(FundingLedger(ledger_path(path)), millis(hour), 0, 100)
+    report = funding_health(path, NOW)
+    assert report["state"] == "Open settlements measured" and report["overdue_hours"] == 0
 
 
 def test_rule_identity_ignores_deploy_commit_but_not_config_or_strategy_params(monkeypatch):

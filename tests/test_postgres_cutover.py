@@ -218,6 +218,35 @@ def test_dualwrite_insert_preserves_sqlite_generated_ids_in_postgres():
     assert pg_conn.commit_calls == 1
 
 
+@pytest.mark.parametrize("failure", ["exception", "zero_rows"])
+def test_dualwrite_discards_whole_mirror_after_failed_statement(failure):
+    class Cursor(_RecordingPgCursor):
+        def execute(self, sql, params=()):
+            super().execute(sql, params)
+            if params == (2,) and failure == "exception":
+                raise RuntimeError("private row contents")
+
+        @property
+        def rowcount(self):
+            return 0 if failure == "zero_rows" and self._conn.executed[-1][1] == (2,) else 1
+
+    class Postgres(_RecordingPgConn):
+        def cursor(self):
+            return Cursor(self)
+
+    with sqlite3.connect(":memory:") as sq:
+        sq.execute("CREATE TABLE ledger (balance INTEGER)")
+        sq.execute("INSERT INTO ledger VALUES (0)")
+        pg = Postgres()
+        adapter = DualWriteAdapter(sq, pg)
+        for value in (1, 2, 3):
+            adapter.execute("UPDATE ledger SET balance=?", (value,))
+        adapter.commit()
+        assert sq.execute("SELECT balance FROM ledger").fetchone() == (3,)
+        assert [params for _, params in pg.executed] == [(1,), (2,)]
+        assert pg.rollback_calls == 1 and pg.commit_calls == 0
+
+
 def test_dualwrite_metadata_cas_uses_jsonb_predicate_for_postgres():
     sqlite_conn = sqlite3.connect(":memory:")
     sqlite_conn.row_factory = sqlite3.Row
@@ -751,13 +780,13 @@ def test_dualwrite_adapter_mirror_failure_feeds_health_counters():
         "CREATE TABLE strategies (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL)"
     )
     pg_conn = _FlakyPgConn()
-    adapter = DualWriteAdapter(sqlite_conn, pg_conn)
-
     for i in range(6):
+        adapter = DualWriteAdapter(sqlite_conn, pg_conn)
         adapter.execute(
             "INSERT INTO strategies (name) VALUES (?)",
             (f"strat-{i}",),
         )
+        adapter.commit()
 
     after = dualwrite_stats.snapshot()
     assert after["pg_writes_failed"] - before_failed >= 6

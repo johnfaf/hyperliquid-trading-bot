@@ -26,6 +26,24 @@
     <div class="desk-decision-empty">{{ evidence.min_closes }} verified closes &middot; {{ evidence.min_days }} UTC days &middot; +{{ evidence.stress_bps }} bps round trip{% if evidence.total_cohorts > evidence.rows|length %} &middot; Showing {{ evidence.rows|length }} of {{ evidence.total_cohorts }} cohorts{% endif %}</div>
     {% endif %}
   </section>
+  {% if funding_health %}
+  <section class="desk-panel" id="funding-evidence">
+    <div class="desk-panel-heading">
+      <div><h2>Paper funding evidence</h2><p>{{ funding_health.state }} &middot; Last 24 hours</p></div>
+      {% if funding_worker.get("timer_active") and funding_worker.get("result") == "success"
+          and funding_worker.get("age_seconds") is number and funding_worker.age_seconds <= 150 %}
+      {{ badge("Collector current", "good") }}
+      {% else %}
+      {{ badge("Collector unconfirmed", "warn") }}
+      {% endif %}
+    </div>
+    <div class="desk-kpis">
+      <div><span>Verified funded closes</span><strong>{{ funding_health.verified_closes }} / {{ funding_health.cross_hour_closes }}</strong><small>{{ funding_health.unverified_closes }} unverified</small></div>
+      <div><span>Open modeled positions</span><strong>{{ funding_health.active }}</strong><small>{{ funding_health.open_due }} crossed a settlement hour{% if funding_health.invalid_open %} &middot; {{ funding_health.invalid_open }} invalid{% endif %}</small></div>
+      <div><span>Missing position-hours</span><strong>{{ funding_health.overdue_hours }}</strong><small>{{ funding_health.pending_hours }} awaiting publication</small></div>
+    </div>
+  </section>
+  {% endif %}
   <section class="desk-panel">
     <div class="desk-panel-heading"><div><h2>BTC forward shadow</h2><p>24-hour channel breakout &middot; Separate $1,000 book</p></div>{{ badge("Simulation only") }}</div>
     {% if not forward_shadow %}<div class="desk-empty compact"><p>Forward scorecard unavailable.</p></div>

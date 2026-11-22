@@ -84,6 +84,36 @@ jobs:
       - name: Run full test suite
         run: python -m pytest tests/ -q --tb=short --durations=15
 
+  postgres-integration:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18-bookworm
+        env:
+          POSTGRES_DB: hl_audit_integration
+          POSTGRES_USER: hl_audit
+          POSTGRES_PASSWORD: local-ci-only
+        ports:
+          - 5432/tcp
+        options: >-
+          --health-cmd "pg_isready -U hl_audit -d hl_audit_integration"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: |
+          python -m pip install --require-hashes -r requirements.lock
+          python -m pip install pytest==9.0.2
+      - name: Verify migrations and the funded close transaction
+        env:
+          HL_AUDIT_POSTGRES_DSN: postgresql://hl_audit:local-ci-only@127.0.0.1:${{ job.services.postgres.ports[5432] }}/hl_audit_integration
+        run: python -m pytest tests/test_postgres_runtime_integration.py -q --tb=short
+
   dependency-audit:
     runs-on: ubuntu-latest
     steps:

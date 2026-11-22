@@ -340,9 +340,9 @@ class _DualWriteStats:
         while self._recent_failures and self._recent_failures[0] < cutoff:
             self._recent_failures.popleft()
 
-    def record_ok(self):
+    def record_ok(self, count: int = 1):
         with self._lock:
-            self.pg_writes_ok += 1
+            self.pg_writes_ok += count
 
     def record_fail(self, err: str):
         now = time.time()
@@ -408,6 +408,10 @@ def dualwrite_is_healthy(*, window_s: float = 300.0, max_failures: int = 5) -> b
     )
 
 
+class _MirrorRowCountMismatch(RuntimeError):
+    pass
+
+
 class DualWriteAdapter:
     """Executes on SQLite (authoritative) and mirrors to Postgres (best-effort).
 
@@ -425,6 +429,8 @@ class DualWriteAdapter:
         self._pg = pg_conn           # raw psycopg connection
         self.backend = "sqlite"      # callers see SQLite semantics
         self._sqlite_id_pk_cache: dict[str, bool] = {}
+        self._pg_failed = False
+        self._pg_pending = 0
 
     # -- helpers -------------------------------------------------------------
 
@@ -486,28 +492,43 @@ class DualWriteAdapter:
         mirror_params = (inserted_id,) + coerced_params
         return mirror_sql, mirror_params
 
+    def _fail_mirror(self, exc: Exception) -> None:
+        self._pg_failed = True
+        self._pg_pending = 0
+        # Database exceptions can include private row values.
+        detail = str(exc) if isinstance(exc, _MirrorRowCountMismatch) else type(exc).__name__
+        dualwrite_stats.record_fail(detail)
+        logger.warning("Dualwrite Postgres transaction skipped: %s", detail)
+        try:
+            self._pg.rollback()
+        except Exception:
+            logger.warning("Dualwrite Postgres rollback failed")
+
+    @staticmethod
+    def _check_mirror_count(sqlite_result, pg_result) -> None:
+        authoritative = sqlite_result.rowcount
+        mirrored = pg_result.rowcount
+        if authoritative >= 0 and mirrored >= 0 and authoritative != mirrored:
+            raise _MirrorRowCountMismatch(
+                f"row count mismatch (SQLite {authoritative}, Postgres {mirrored})"
+            )
+
     def _mirror_to_pg(self, sql: str, params: Sequence = None, sqlite_result=None) -> None:
-        """Best-effort replay of a single statement to Postgres."""
-        pg_sql, pg_params = self._prepare_pg_mirror(sql, params, sqlite_result=sqlite_result)
-        if pg_sql is None:
+        """Abandon the mirror after any statement failure in this unit of work."""
+        if self._pg_failed:
             return
         try:
+            pg_sql, pg_params = self._prepare_pg_mirror(sql, params, sqlite_result=sqlite_result)
+            if pg_sql is None:
+                return
             pg_sql = _translate_sql(pg_sql, "postgres")
             # Don't add RETURNING for mirror writes — we don't need lastrowid
             cur = self._pg.cursor()
             cur.execute(pg_sql, pg_params or ())
-            dualwrite_stats.record_ok()
+            self._check_mirror_count(sqlite_result, cur)
+            self._pg_pending += 1
         except Exception as exc:
-            err_str = f"{type(exc).__name__}: {exc}"
-            dualwrite_stats.record_fail(err_str)
-            logger.warning("Dualwrite Postgres mirror failed: %s | SQL: %s",
-                           err_str[:120], sql[:80])
-            # Rollback the Postgres transaction so subsequent statements
-            # in this connection don't fail with "in error state".
-            try:
-                self._pg.rollback()
-            except Exception:
-                pass
+            self._fail_mirror(exc)
 
     # -- public interface (mirrors ConnectionAdapter) ------------------------
 
@@ -543,7 +564,7 @@ class DualWriteAdapter:
                 return result
 
         result = self._sq.executemany(sql, params_list)
-        if self._should_skip_pg_mirror(sql) or not params_list:
+        if self._pg_failed or self._should_skip_pg_mirror(sql) or not params_list:
             return result
 
         try:
@@ -566,20 +587,10 @@ class DualWriteAdapter:
             if pg_sql and pg_params:
                 cur = self._pg.cursor()
                 cur.executemany(pg_sql, pg_params)
-                for _ in pg_params:
-                    dualwrite_stats.record_ok()
+                self._check_mirror_count(result, cur)
+                self._pg_pending += len(pg_params)
         except Exception as exc:
-            err_str = f"{type(exc).__name__}: {exc}"
-            dualwrite_stats.record_fail(err_str)
-            logger.warning(
-                "Dualwrite Postgres batch mirror failed: %s | SQL: %s",
-                err_str[:120],
-                sql[:80],
-            )
-            try:
-                self._pg.rollback()
-            except Exception:
-                pass
+            self._fail_mirror(exc)
         return result
 
     def executescript(self, sql: str):
@@ -588,22 +599,22 @@ class DualWriteAdapter:
 
     def commit(self):
         self._sq.commit()
+        if self._pg_failed:
+            return
         try:
             self._pg.commit()
+            dualwrite_stats.record_ok(self._pg_pending)
+            self._pg_pending = 0
         except Exception as exc:
-            dualwrite_stats.record_fail(f"commit: {exc}")
-            logger.warning("Dualwrite Postgres commit failed: %s", exc)
-            try:
-                self._pg.rollback()
-            except Exception:
-                pass
+            self._fail_mirror(exc)
 
     def rollback(self):
         self._sq.rollback()
+        self._pg_pending = 0
         try:
             self._pg.rollback()
         except Exception:
-            pass
+            self._pg_failed = True
 
     def close(self):
         """Close SQLite; Postgres is returned to pool by the router."""

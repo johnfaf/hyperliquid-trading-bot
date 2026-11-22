@@ -25,7 +25,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 import config
 
 from src.core.env_utils import safe_env_float
-from src.data.db.connection import ConnectionAdapter, DualWriteAdapter
+from src.data.db.connection import ConnectionAdapter, DualWriteAdapter, dualwrite_stats
 
 logger = logging.getLogger(__name__)
 _SQLITE_WRITE_LOCK = threading.RLock()
@@ -151,12 +151,13 @@ def get_connection(*, for_read: bool = False):
             try:
                 pg_raw = _pg_connect()
             except Exception as exc:
+                dualwrite_stats.record_fail(f"connect: {type(exc).__name__}")
                 # Rate-limit this warning to avoid log spam when PG is down
                 if not hasattr(get_connection, "_pg_warn_ts") or \
                    (time.time() - get_connection._pg_warn_ts) > 300:
                     logger.warning(
                         "Dualwrite: could not obtain Postgres connection (%s) -- "
-                        "falling back to SQLite-only.", exc,
+                        "falling back to SQLite-only.", type(exc).__name__,
                     )
                     get_connection._pg_warn_ts = time.time()
 

@@ -49,6 +49,14 @@ PY
 
 verify_paper configuration
 sudo -n grep -Fx 'BOT_RUN_MODE=paper' "$env_file" >/dev/null
+stock_env=/etc/hyperliquid-stock-paper/paper.env
+if sudo -n test -e "$stock_env"; then
+    stock_orders=$(sudo -n grep -E '^[[:space:]]*STOCK_PAPER_SEND_ORDERS[[:space:]]*=' "$stock_env" || true)
+    if [[ -n "$stock_orders" && "$stock_orders" != STOCK_PAPER_SEND_ORDERS=false ]]; then
+        printf '%s\n' "Stock shadow-only configuration was not confirmed." >&2
+        exit 1
+    fi
+fi
 
 # These files are local infrastructure and notification settings, not part of the stock rollout.
 install -m 0644 "$previous/.dockerignore" "$release/.dockerignore"
@@ -184,7 +192,8 @@ sudo -n systemctl start hyperliquid-stock-paper-report.service
 sudo -n install -D -m 0644 "$release/scripts/publish_dashboard_status.py" /opt/hyperliquid-dashboard/publish_dashboard_status.py
 for file in src/trading/alpaca_paper.py src/trading/order_journal.py src/trading/stock_evidence.py \
     src/core/clock_provider.py src/backtest/replay/clock.py src/trading/trade_decision_memory.py src/trading/equity_risk.py \
-    src/trading/copy_shadow_report.py src/trading/paper_reporting.py src/data/decision_coverage.py; do
+    src/trading/copy_shadow_report.py src/trading/paper_reporting.py src/trading/paper_funding.py \
+    src/trading/paper_funding_health.py src/data/decision_coverage.py; do
     sudo -n install -D -m 0644 "$release/$file" "/opt/hyperliquid-dashboard/$file"
 done
 for unit in hyperliquid-dashboard-status.service hyperliquid-dashboard-status.timer; do

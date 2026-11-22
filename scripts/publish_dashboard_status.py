@@ -8,6 +8,7 @@ import re
 import sqlite3
 import subprocess
 import sys
+from time import monotonic
 from tempfile import NamedTemporaryFile
 from urllib.request import Request, urlopen
 
@@ -19,6 +20,8 @@ UNITS = {
     "study_backup": "hyperliquid-study-backup",
     "stock_report": "hyperliquid-stock-paper-report",
     "absorption_report": "hyperliquid-absorption-report",
+    "paper_funding": "hyperliquid-paper-funding",
+    "forward_shadow": "hyperliquid-forward-shadow",
 }
 STOCK_STATES = {
     "waiting_for_paper_credentials", "no_order", "outside_entry_or_exit_window", "shadow_intent",
@@ -57,7 +60,10 @@ COPY_ALERTS = {
 
 
 def host_command(*args):
-    completed = subprocess.run(args, capture_output=True, check=False, text=True, timeout=6)
+    try:
+        completed = subprocess.run(args, capture_output=True, check=False, text=True, timeout=3)
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
     return completed.stdout if completed.returncode == 0 else ""
 
 
@@ -79,12 +85,18 @@ def collect_stock(log: str) -> dict:
 
 def unit_info(name: str) -> dict:
     timer = host_command("systemctl", "show", name + ".timer", "-p", "ActiveState", "--value").strip()
-    output = host_command("systemctl", "show", name + ".service", "-p", "Result", "-p", "ExecMainExitTimestamp")
+    output = host_command("systemctl", "show", name + ".service", "-p", "Result", "-p", "ExecMainExitTimestamp",
+                          "-p", "ExecMainExitTimestampMonotonic")
     fields = dict(line.split("=", 1) for line in output.splitlines() if "=" in line)
     result = fields.get("Result")
     last_run = fields.get("ExecMainExitTimestamp")
+    try:
+        last_exit = int(fields.get("ExecMainExitTimestampMonotonic", "0")) / 1_000_000
+        age = monotonic() - last_exit if last_exit else None
+    except ValueError:
+        age = None
     return {"timer_active": timer == "active", "result": result if result in {"success", "exit-code", "timeout", "signal"} else None,
-            "last_run": last_run or None}
+            "last_run": last_run or None, "age_seconds": round(age) if age is not None and age >= 0 else None}
 
 
 def latest_report(directory: Path, prefix: str) -> Path | None:
@@ -349,7 +361,9 @@ def main() -> None:
     snapshot["forward_shadow"] = forward_shadow_status(args.forward_report, now)
     if args.paper_db:
         from src.data.decision_coverage import read_report
+        from src.trading.paper_funding_health import funding_health
 
+        snapshot["paper_funding"] = funding_health(args.paper_db, now)
         try:
             report = daily_copy_report(args.paper_db, args.copy_report_dir, now)
         except (sqlite3.Error, ValueError, OSError):
