@@ -20,8 +20,8 @@
       <div><span>Monthly operating costs</span><strong>{{ money(investment.btc.monthly_ops) if investment.btc.monthly_ops is not none else "Unmeasured" }}</strong><small>{% if investment.btc.monthly_ops is not none %}{{ "{:.2f}%".format(investment.btc.monthly_ops / investment.btc.basis * 100) }} monthly break-even before trades{% else %}Hosting and data{% endif %}</small></div>
     </div>
     <div class="desk-table-scroll" tabindex="0" aria-label="Weekly investment checks">
-      <table class="desk-table"><thead><tr><th>Evidence</th><th>Result</th><th>Basis</th></tr></thead>
-      <tbody>{% for row in investment.checks %}<tr><th scope="row">{{ row.check }}</th><td>{{ badge(row.status, "good" if row.status == "Pass" else "warn") }}</td><td>{{ row.note }}</td></tr>{% endfor %}</tbody></table>
+      <table class="desk-table desk-investment-checks"><thead><tr><th>Evidence</th><th>Result</th></tr></thead>
+      <tbody>{% for row in investment.checks %}<tr><th scope="row">{{ row.check }}<small class="desk-muted">{{ row.note }}</small></th><td>{{ badge(row.status, "good" if row.status == "Pass" else "bad" if row.status == "Fail" else "warn") }}</td></tr>{% endfor %}</tbody></table>
     </div>
     {% if investment.btc.scenarios %}
     <p class="desk-muted desk-research-status">BTC study to {{ investment.btc.through[:16]|replace("T"," ") }} UTC &middot; Cumulative, separate from paper week</p>

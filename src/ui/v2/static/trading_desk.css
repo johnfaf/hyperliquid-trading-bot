@@ -142,6 +142,9 @@ body.desk-body, html.theme-light body.desk-body {
 .desk-table tbody th { font-weight: 700; }
 .desk-table :is(td,th):last-child { text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; }
 .desk-table td:nth-child(5) { white-space: nowrap; }
+.desk-investment-checks tbody th small { display: block; margin-top: 3px; font-weight: 400; }
+.desk-investment-checks .desk-badge { white-space: nowrap; overflow-wrap: normal; }
+#investment-scorecard > .desk-panel-heading .desk-badge { flex: none; white-space: nowrap; }
 .desk-table tbody tr:hover { background: var(--desk-raised); }
 .stock-table td:first-child { white-space: nowrap; font-variant-numeric: tabular-nums; }
 .stock-table td:nth-child(5) { text-align: right; }
