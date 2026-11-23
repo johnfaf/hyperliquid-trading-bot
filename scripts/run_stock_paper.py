@@ -21,6 +21,7 @@ from src.trading.alpaca_paper import (
 )
 from src.trading.order_journal import OrderJournal, client_id
 from src.trading.stock_evidence import StockEvidence
+from src.trading.stock_signals import completed_sma20 as trend
 
 NY = ZoneInfo("America/New_York")
 ACTIVE = {"submitting", "unknown", "accepted", "partial"}
@@ -88,23 +89,6 @@ def reconcile(broker, journal):
     if open_orders or any(row["status"] in ACTIVE for row in journal.orders()):
         return positions, "order_pending"
     return positions, None
-
-
-def trend(bars, sessions, today):
-    previous = [day for day in sessions if day < today][-21:]
-    if len(previous) != 21:
-        return None
-    closes = {}
-    for bar in bars:
-        day = timestamp(bar["t"]).astimezone(NY).date().isoformat()
-        if day < today:
-            if day in closes:
-                return None
-            closes[day] = positive(bar["c"])
-    if any(day not in closes for day in previous):
-        return None
-    prices = [closes[day] for day in previous]
-    return prices[-2] * 20 <= sum(prices[:-1]) and prices[-1] * 20 > sum(prices[1:]), prices[-1] * 20 < sum(prices[1:])
 
 
 def tick(broker, journal, *, symbol, orders_enabled=False, flatten=False,

@@ -1,0 +1,19 @@
+[Unit]
+Description=Capture read-only forward SPY shadow observations
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+DynamicUser=yes
+StateDirectory=hyperliquid-stock-forward
+StateDirectoryMode=0700
+EnvironmentFile=-/etc/hyperliquid-stock-paper/paper.env
+ExecStart=/usr/bin/python3 -I -B /opt/hyperliquid-stock-forward/current/scripts/run_stock_forward_shadow.py --state-dir /var/lib/hyperliquid-stock-forward
+TimeoutStartSec=60
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+InaccessiblePaths=-/srv/hyperliquid-bot -/etc/hyperliquid-bot -/etc/hyperliquid-stock-paper -/etc/hyperliquid-stock-drill -/var/lib/hyperliquid-stock-paper -/var/lib/private/hyperliquid-stock-paper -/var/lib/hyperliquid-stock-drill -/var/lib/private/hyperliquid-stock-drill

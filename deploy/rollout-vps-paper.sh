@@ -175,7 +175,8 @@ stock=/opt/hyperliquid-stock-paper
 sudo -n install -d -m 0700 /etc/hyperliquid-stock-paper
 sudo -n install -d -m 0755 "$stock/$rev"
 for file in scripts/run_stock_paper.py scripts/isolated_stock_drill.py scripts/stock_pilot_report.py scripts/check_stock_paper_readonly.py src/trading/alpaca_paper.py \
-    src/trading/order_journal.py src/trading/equity_risk.py src/trading/stock_evidence.py src/core/clock_provider.py src/backtest/replay/clock.py; do
+    src/trading/order_journal.py src/trading/equity_risk.py src/trading/stock_evidence.py src/trading/stock_signals.py \
+    src/core/clock_provider.py src/backtest/replay/clock.py; do
     sudo -n install -D -m 0644 "$release/$file" "$stock/$rev/$file"
 done
 sudo -n ln -sfn "$stock/$rev" "$stock/current"
@@ -217,6 +218,21 @@ sudo -n systemctl enable --now hyperliquid-stock-reconciliation.timer
 sudo -n systemctl start hyperliquid-stock-reconciliation.service
 sudo -n systemctl enable --now hyperliquid-stock-paper-report.timer
 sudo -n systemctl start hyperliquid-stock-paper-report.service
+
+# A deploy never changes the evaluator of an already registered forward study.
+stock_forward=/opt/hyperliquid-stock-forward
+if ! sudo -n test -L "$stock_forward/current"; then
+    for file in scripts/run_stock_forward_shadow.py src/backtest/stock_shadow.py src/trading/stock_signals.py; do
+        sudo -n install -D -m 0644 "$release/$file" "$stock_forward/$rev/$file"
+    done
+    sudo -n ln -s "$stock_forward/$rev" "$stock_forward/current"
+fi
+for unit in hyperliquid-stock-forward.service hyperliquid-stock-forward.timer; do
+    sudo -n install -m 0644 "$release/deploy/research/$unit" "/etc/systemd/system/$unit"
+done
+sudo -n systemctl daemon-reload
+sudo -n systemctl start hyperliquid-stock-forward.service
+sudo -n systemctl enable --now hyperliquid-stock-forward.timer
 
 sudo -n install -D -m 0644 "$release/scripts/publish_dashboard_status.py" /opt/hyperliquid-dashboard/publish_dashboard_status.py
 sudo -n install -D -m 0644 "$release/scripts/recovery_bundle.py" /opt/hyperliquid-recovery/recovery_bundle.py

@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Publish a small allowlisted host status snapshot to the dashboard bind mount."""
 import argparse
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 import json
+import math
 from pathlib import Path
 import re
 import sqlite3
@@ -23,6 +24,7 @@ UNITS = {
     "paper_funding": "hyperliquid-paper-funding",
     "forward_shadow": "hyperliquid-forward-shadow",
     "stock_reconciliation": "hyperliquid-stock-reconciliation",
+    "stock_forward": "hyperliquid-stock-forward",
 }
 STOCK_STATES = {
     "waiting_for_paper_credentials", "no_order", "outside_entry_or_exit_window", "shadow_intent",
@@ -151,8 +153,6 @@ def load_object(path: Path, *, max_bytes=65536) -> dict:
 
 
 def forward_shadow_status(path, now):
-    import math
-
     data = load_object(path, max_bytes=8192)
     if data.get("rule") != "btc_long_24h_channel_v1" or data.get("capital") != 1000 or data.get("live_approval") is not False:
         return None
@@ -182,6 +182,80 @@ def forward_shadow_status(path, now):
         if all(type(v) in (float, int) and abs(v) <= 1e12 and math.isfinite(v) for v in values.values()):
             results[name] = values
     return {"state": state, **stamps, "results": results if len(results) == 2 else None, "stale": age > 7200}
+
+
+def stock_forward_status(path, now, monthly_ops):
+    from zoneinfo import ZoneInfo
+
+    data = load_object(path, max_bytes=8192)
+    if (data.get("rule") != "spy_sma20_two_quote_forward_v1" or data.get("capital") != 1000
+            or data.get("sleeve") != 75 or data.get("live_approval") is not False):
+        return None
+    try:
+        published = datetime.fromisoformat(data["published_at"])
+        if published.utcoffset() is None or published > now:
+            return None
+        published = published.astimezone(UTC)
+    except (ValueError, KeyError, TypeError):
+        return None
+    stale = now-published > timedelta(hours=72)
+    state = data.get("state")
+    market = data.get("market_status")
+    if market not in ("Missing shadow-only market configuration", "Frozen protocol or market data unavailable",
+                      "Market data not usable in this slot"):
+        market = None
+    status = {"state": state, "stale": stale, "market_status": market, "published_at": published.isoformat(),
+              "verdict": "Insufficient evidence"}
+    if state == "Unavailable":
+        return status
+    if state not in ("Awaiting forward observations", "Observing", "Window complete"):
+        return None
+    try:
+        start, end = (date.fromisoformat(data[k]) for k in ("start", "end"))
+        if (end-start).days != 60:
+            return None
+        next_at = datetime.fromisoformat(data["next_slot"]) if data.get("next_slot") else None
+        if next_at is not None and (next_at.utcoffset() is None or next_at < published-timedelta(seconds=75)):
+            return None
+    except (ValueError, KeyError, TypeError):
+        return None
+    coverage = {k: data.get(k) for k in ("sessions_planned", "sessions_due", "paired", "samples_due", "samples_captured")}
+    if not all(type(v) is int and 0 <= v <= 120 for v in coverage.values()):
+        return None
+    planned, due, paired, samples_due, captured = coverage.values()
+    if not (0 <= paired <= due <= planned <= 60 and paired*2 <= captured <= samples_due <= planned*2):
+        return None
+    local = ZoneInfo("America/New_York")
+    elapsed = max(0, (min(datetime.combine(end, datetime.min.time(), local), published)
+                      - datetime.combine(start, datetime.min.time(), local)).total_seconds()/86400)
+    expense = None if monthly_ops is None else monthly_ops * elapsed / (365.25/12)
+    results = {}
+    raw = data.get("results")
+    if raw is not None:
+        if not isinstance(raw, dict):
+            return None
+        for name in ("base", "stress"):
+            row = raw.get(name)
+            if not isinstance(row, dict):
+                return None
+            values = {k: row.get(k) for k in ("net", "cash", "passive", "drawdown_pct", "net_without_largest", "closed", "entries")}
+            if not all(type(v) in (int, float) and abs(v) <= 1e6 and math.isfinite(v) for v in values.values()):
+                return None
+            if (not all(type(values[k]) is int for k in ("closed", "entries"))
+                    or not 0 <= values["closed"] <= values["entries"] <= paired
+                    or not 0 <= values["drawdown_pct"] <= 100 or values["cash"] != 0):
+                return None
+            values["after_ops"] = None if expense is None else values["net"]-expense
+            results[name] = values
+    if (not stale and state == "Window complete" and planned == due and planned and paired/planned >= .9
+            and data.get("final_pair") is True and expense is not None and results and results["stress"]["closed"] >= 10):
+        stress = results["stress"]
+        status["verdict"] = ("Initial screen passed; research only"
+                             if min(stress["net"], stress["net_without_largest"])-expense > max(0, stress["passive"])
+                             else "Did not clear the cost and benchmark screen")
+    return {**status, **coverage, "start": start.isoformat(), "end": end.isoformat(),
+            "next_slot": next_at.astimezone(UTC).isoformat() if next_at else None, "capital": 1000, "sleeve": 75,
+            "results": results or None, "monthly_ops": monthly_ops, "operating_cost": expense if results else None}
 
 
 def offhost_restore_status(path, now):
@@ -426,6 +500,7 @@ def main() -> None:
     parser.add_argument("--copy-report-dir", type=Path)
     parser.add_argument("--absorption-report", type=Path, default=Path("/var/lib/hyperliquid-absorption/reports/latest.json"))
     parser.add_argument("--forward-report", type=Path, default=Path("/var/lib/hyperliquid-forward-shadow/latest.json"))
+    parser.add_argument("--stock-forward-report", type=Path, default=Path("/var/lib/hyperliquid-stock-forward/latest.json"))
     parser.add_argument("--offhost-restore", type=Path, default=Path("/var/lib/hyperliquid-dashboard/offhost-restore.json"))
     parser.add_argument("--stock-reconciliation", type=Path, default=Path("/var/lib/hyperliquid-stock-paper/broker-reconciliation.json"))
     parser.add_argument("--isolated-stock-drill", type=Path, default=Path("/var/lib/hyperliquid-stock-drill/verified.json"))
@@ -449,6 +524,7 @@ def main() -> None:
     now = datetime.now(UTC)
     snapshot["absorption"] = absorption_status(args.absorption_report, now)
     snapshot["forward_shadow"] = forward_shadow_status(args.forward_report, now)
+    snapshot["stock_forward"] = stock_forward_status(args.stock_forward_report, now, args.monthly_ops_usd)
     snapshot["offhost_restore"] = offhost_restore_status(args.offhost_restore, now)
     if args.paper_db:
         from src.data.decision_coverage import read_report

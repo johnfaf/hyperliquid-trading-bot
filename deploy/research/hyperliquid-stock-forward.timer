@@ -1,0 +1,10 @@
+[Unit]
+Description=Observe preregistered stock research slots
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 13..21:00/5:15 UTC
+AccuracySec=1s
+Persistent=false
+
+[Install]
+WantedBy=timers.target

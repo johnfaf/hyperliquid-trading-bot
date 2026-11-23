@@ -45,6 +45,26 @@
     <div class="desk-decision-empty">{{ replay.omitted_copy.base.n }} copy closes omitted &middot; {{ replay.carry_in_copy_closes }} carry-in copy closes kept &middot; {{ replay.open_at_end }} unscored at cutoff &middot; +{{ replay.extra_roundtrip_bps }} bps stress.<br>No replacement trades or reallocation modeled.</div>
   </section>
   {% endif %}
+  <section class="desk-panel" id="stock-forward-shadow">
+    <div class="desk-panel-heading"><div><h2>Stock forward shadow</h2><p>SPY &middot; 20-session moving-average crossover</p></div>{{ badge("Simulation only") }}</div>
+    {% if not stock_forward or stock_forward.state == "Unavailable" %}
+    <div class="desk-empty compact"><p>{{ stock_forward.market_status if stock_forward and stock_forward.market_status else "Stock forward scorecard unavailable." }}</p></div>
+    {% else %}
+    <p class="desk-muted desk-research-status">{{ stock_forward.state }}{% if stock_forward.stale %} &middot; Stale report{% endif %}<br>{{ stock_forward.start }} to {{ stock_forward.end }} New York dates (end exclusive)</p>
+    <div class="desk-kpis">
+      <div><span>Reference book</span><strong>{{ money(stock_forward.capital) }}</strong><small>{{ money(stock_forward.sleeve) }} SPY sleeve</small></div>
+      <div><span>Scorable sessions</span><strong>{{ stock_forward.paired }} / {{ stock_forward.sessions_due }}</strong><small>{{ stock_forward.sessions_planned }} planned</small></div>
+      <div><span>Quote observations</span><strong>{{ stock_forward.samples_captured }} / {{ stock_forward.samples_due }}</strong><small>{% if stock_forward.next_slot %}Next: {{ stock_forward.next_slot[:16]|replace("T"," ") }} UTC{% else %}No more scheduled{% endif %}</small></div>
+    </div>
+    {% if stock_forward.results %}
+    <div class="desk-table-scroll" tabindex="0" aria-label="Stock shadow performance against cash and passive SPY">
+      <table class="desk-table"><thead><tr><th>Costs</th><th>Strategy</th><th>After operations</th><th>Cash</th><th>Passive SPY</th><th>Observed drawdown</th><th>Closes</th><th>Without largest winner</th></tr></thead>
+      <tbody>{% for scenario, row in stock_forward.results.items() %}<tr><th scope="row">{{ scenario|capitalize }}</th><td>{{ money(row.net,true) }}</td><td>{{ money(row.after_ops,true) if row.after_ops is not none else "Unmeasured" }}</td><td>{{ money(row.cash,true) }}</td><td>{{ money(row.passive,true) }}</td><td>{{ "{:.2f}%".format(row.drawdown_pct) }}</td><td>{{ row.closed }}</td><td>{{ money(row.net_without_largest,true) }}</td></tr>{% endfor %}</tbody></table>
+    </div>
+    {% endif %}
+    <div class="desk-decision-empty">{{ stock_forward.verdict }}{% if stock_forward.market_status %} &middot; {{ stock_forward.market_status }}{% endif %}{% if stock_forward.monthly_ops is not none %}<br>Operating assumption: {{ money(stock_forward.monthly_ops) }}/month{% if stock_forward.operating_cost is not none %} &middot; {{ money(stock_forward.operating_cost) }} accrued{% endif %}{% endif %}</div>
+    {% endif %}
+  </section>
   <section class="desk-panel" id="release-review">
     <div class="desk-panel-heading"><div><h2>Release review</h2><p>Paper and shadow evidence</p></div>{{ badge("Live entries locked", "warn") }}</div>
     <dl class="desk-settings-list evidence-list">
