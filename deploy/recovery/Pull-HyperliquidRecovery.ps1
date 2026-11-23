@@ -7,6 +7,14 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+$stock = Join-Path $Directory 'Pull-StockForwardEvidence.ps1'
+if (Test-Path -LiteralPath $stock) {
+    try {
+        & $stock -Server $Server -SshKey $SshKey -Directory $Directory -Python $Python | Out-Null
+    } catch {
+        Write-Warning 'Stock forward evidence checkpoint failed; continuing regular ledger recovery.'
+    }
+}
 $runner = Join-Path $Directory 'recovery_bundle.py'
 $age = Join-Path $Directory 'age/age.exe'
 $pull = & $Python $runner pull --directory $Directory --host $Server --key $SshKey

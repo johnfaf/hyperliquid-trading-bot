@@ -61,6 +61,13 @@ COPY_ALERTS = {
     "report_unavailable": "The daily copy comparison could not be generated.",
 }
 
+FORWARD_GAPS = {
+    "both_quotes": "both scheduled quotes missing",
+    "decision_quote": "decision quote missing",
+    "fill_quote": "execution quote missing",
+    "signal_inputs": "completed-session signal inputs missing",
+}
+
 
 def host_command(*args):
     try:
@@ -256,6 +263,62 @@ def stock_forward_status(path, now, monthly_ops):
     return {**status, **coverage, "start": start.isoformat(), "end": end.isoformat(),
             "next_slot": next_at.astimezone(UTC).isoformat() if next_at else None, "capital": 1000, "sleeve": 75,
             "results": results or None, "monthly_ops": monthly_ops, "operating_cost": expense if results else None}
+
+
+def stock_forward_integrity(path, now):
+    from scripts.stock_forward_evidence import current
+
+    try:
+        return current(path, now)
+    except (OSError, sqlite3.Error, ValueError, TypeError, KeyError, ArithmeticError, OverflowError):
+        return None
+
+
+def forward_restore_status(path, integrity, now):
+    if integrity is None:
+        return None
+    proof = load_object(path, max_bytes=8192)
+    if (proof.get("verified") is not True or proof.get("protocol_sha256") != integrity["protocol_sha256"]
+            or (proof.get("start"), proof.get("end")) != (integrity["start"], integrity["end"])
+            or proof.get("sessions") != integrity["sessions"]):
+        return None
+    digest, revision, frames, paired = (proof.get(k) for k in ("encrypted_sha256", "revision", "frames", "paired_sessions"))
+    if (not isinstance(digest, str) or not re.fullmatch("[a-f0-9]{64}", digest)
+            or not isinstance(revision, str) or not re.fullmatch("[a-f0-9]{40}", revision)
+            or type(frames) is not int or type(paired) is not int
+            or not 0 <= paired <= min(integrity["paired_sessions"], frames//2)
+            or not 0 <= frames <= integrity["frames"]):
+        return None
+    try:
+        checked, verified = (datetime.fromisoformat(proof[k]) for k in ("checkpoint_at", "verified_at"))
+        if checked.utcoffset() is None or verified.utcoffset() is None or not checked <= verified <= now:
+            return None
+    except (KeyError, TypeError, ValueError):
+        return None
+    return {"verified": True, "checkpoint_at": checked.astimezone(UTC).isoformat(),
+            "verified_at": verified.astimezone(UTC).isoformat(), "revision": revision, "frames": frames,
+            "paired_sessions": paired, "current": frames == integrity["frames"], "stale": now-checked > timedelta(hours=30)}
+
+
+def notify_forward_gaps(integrity, config, state_path):
+    if not integrity or not integrity["missed"]:
+        return "quiet"
+    protocol = integrity["protocol_sha256"]
+    history = load_object(state_path, max_bytes=8192)
+    seen = history.get("sent", []) if history.get("protocol") == protocol else []
+    seen = set(value for value in seen if isinstance(value, str)) if isinstance(seen, list) else set()
+    pending = {day: reason for day, reason in integrity["missed"].items() if day not in seen}
+    if not pending:
+        return "quiet"
+    body = "\n".join(f"- {day}: {FORWARD_GAPS[reason]}" for day, reason in pending.items())
+    message = "SPY forward study coverage (New York dates):\n" + body + "\nThese sessions will not be backfilled. No orders placed."
+    try:
+        if send_telegram(config, message):
+            publish(state_path, {"protocol": protocol, "sent": list(integrity["missed"])}, mode=0o600)
+            return "sent"
+    except (OSError, ValueError, TypeError):
+        pass  # Avoid printing transport exceptions or the notification URL.
+    return "delivery_unavailable"
 
 
 def offhost_restore_status(path, now):
@@ -501,6 +564,8 @@ def main() -> None:
     parser.add_argument("--absorption-report", type=Path, default=Path("/var/lib/hyperliquid-absorption/reports/latest.json"))
     parser.add_argument("--forward-report", type=Path, default=Path("/var/lib/hyperliquid-forward-shadow/latest.json"))
     parser.add_argument("--stock-forward-report", type=Path, default=Path("/var/lib/hyperliquid-stock-forward/latest.json"))
+    parser.add_argument("--stock-forward-ledger", type=Path, default=Path("/var/lib/hyperliquid-stock-forward/market.sqlite3"))
+    parser.add_argument("--stock-forward-restore", type=Path, default=Path("/var/lib/hyperliquid-dashboard/stock-forward-restore.json"))
     parser.add_argument("--offhost-restore", type=Path, default=Path("/var/lib/hyperliquid-dashboard/offhost-restore.json"))
     parser.add_argument("--stock-reconciliation", type=Path, default=Path("/var/lib/hyperliquid-stock-paper/broker-reconciliation.json"))
     parser.add_argument("--isolated-stock-drill", type=Path, default=Path("/var/lib/hyperliquid-stock-drill/verified.json"))
@@ -525,6 +590,17 @@ def main() -> None:
     snapshot["absorption"] = absorption_status(args.absorption_report, now)
     snapshot["forward_shadow"] = forward_shadow_status(args.forward_report, now)
     snapshot["stock_forward"] = stock_forward_status(args.stock_forward_report, now, args.monthly_ops_usd)
+    integrity = stock_forward_integrity(args.stock_forward_ledger, now)
+    snapshot["stock_forward_restore"] = forward_restore_status(args.stock_forward_restore, integrity, now)
+    stock_forward = snapshot["stock_forward"]
+    if stock_forward and stock_forward["state"] != "Unavailable":
+        if integrity is None:
+            stock_forward["market_status"] = "Independent coverage check unavailable"
+        else:
+            stock_forward["missing_sessions"] = len(integrity["missed"])
+            if integrity["missed"]:
+                last = max(integrity["missed"])
+                stock_forward["market_status"] = f"Latest gap {last} NY: {FORWARD_GAPS[integrity['missed'][last]]}"
     snapshot["offhost_restore"] = offhost_restore_status(args.offhost_restore, now)
     if args.paper_db:
         from src.data.decision_coverage import read_report
@@ -552,6 +628,9 @@ def main() -> None:
                 snapshot["investment"] = None
     publish(args.output, snapshot)
     if args.telegram_env and args.alert_state:
+        delivery = notify_forward_gaps(integrity, args.telegram_env, args.alert_state.with_name("stock-forward-alerts.json"))
+        if delivery in {"sent", "delivery_unavailable"}:
+            print("Stock forward coverage:", delivery)
         delivery = maybe_alert(snapshot, args.telegram_env, args.alert_state, now=now)
         if delivery in {"sent", "delivery_unavailable"}:
             print("Stock Pilot alert:", delivery)

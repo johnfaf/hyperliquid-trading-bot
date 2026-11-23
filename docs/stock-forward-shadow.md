@@ -13,3 +13,9 @@ The successful isolated Alpaca paper drill verifies order handling, not an inves
 ## Operation
 
 The isolated systemd timer polls on US weekday trading hours. It does not backfill after downtime. State and fixed inputs live under `/var/lib/hyperliquid-stock-forward/`; the root-owned dashboard publisher relays only the validated summary to **Research → Stock forward shadow**. Reproduce modeled fills using the pinned code and private `market.sqlite3`; `trace.json` holds deterministic simulated trades, not broker evidence. Preserve the study files and the pinned release together. A report with zero scorable sessions is not proof of zero return.
+
+## Coverage and recovery
+
+The dashboard publisher independently checks the frozen calendar, quote timestamps and completed-session inputs. Once the execution slot and publication buffer have elapsed, it reports a gap and deduplicates Telegram notices after confirmed delivery. Holidays, future dates and in-progress slots do not register as misses. This check cannot repair data or make trading decisions.
+
+The Windows encrypted recovery job also pulls a separate small SPY checkpoint at login and on its normal daily schedule. The VPS takes a consistent SQLite copy and streams it together with the three pinned source files through the existing `age` recipient. The Windows job decrypts, checks the SQLite database in disposable scratch, verifies hashes and the frozen protocol fingerprint, and publishes a separate receipt only on success. It never executes recovered source. The encrypted backup is retained apart from the main paper-ledger bundle; the decryption identity remains DPAPI-protected on Windows. The checkpoint can be restored without touching an active database. A verified checkpoint proves recoverability, not strategy performance.
