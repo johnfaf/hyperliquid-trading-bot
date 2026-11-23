@@ -1,0 +1,19 @@
+[Unit]
+Description=Read-only stock paper broker-to-journal reconciliation
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+DynamicUser=yes
+User=hyperliquid-stock-paper
+StateDirectory=hyperliquid-stock-paper
+StateDirectoryMode=0700
+EnvironmentFile=-/etc/hyperliquid-stock-paper/paper.env
+ExecStart=/usr/bin/python3 -I -B /opt/hyperliquid-stock-paper/current/scripts/check_stock_paper_readonly.py --db /var/lib/hyperliquid-stock-paper/orders.sqlite3 --out /var/lib/hyperliquid-stock-paper/broker-reconciliation.json
+TimeoutStartSec=90
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+UMask=0077

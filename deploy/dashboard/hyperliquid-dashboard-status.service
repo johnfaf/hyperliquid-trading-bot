@@ -3,7 +3,8 @@ Description=Publish read-only dashboard operations status
 
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/python3 -I -B /opt/hyperliquid-dashboard/publish_dashboard_status.py --study /srv/hyperliquid-audit-pilot --output /srv/hyperliquid-bot/paper/dashboard_ops.json --stock-db /var/lib/hyperliquid-stock-paper/orders.sqlite3 --telegram-env /etc/hyperliquid-bot/paper/bot.env --alert-state /var/lib/hyperliquid-dashboard/stock-alerts.json --paper-db /srv/hyperliquid-bot/paper/bot.db --copy-report-dir /var/lib/hyperliquid-dashboard/copy-reports
+EnvironmentFile=-/etc/hyperliquid-bot/investment-review.env
+ExecStart=/usr/bin/python3 -I -B /opt/hyperliquid-dashboard/publish_dashboard_status.py --study /srv/hyperliquid-audit-pilot --output /srv/hyperliquid-bot/paper/dashboard_ops.json --stock-db /var/lib/hyperliquid-stock-paper/orders.sqlite3 --telegram-env /etc/hyperliquid-bot/paper/bot.env --alert-state /var/lib/hyperliquid-dashboard/stock-alerts.json --paper-db /srv/hyperliquid-bot/paper/bot.db --copy-report-dir /var/lib/hyperliquid-dashboard/copy-reports --investment-dir /var/lib/hyperliquid-dashboard/investment $INVESTMENT_COST_ARGS
 StateDirectory=hyperliquid-dashboard
 StateDirectoryMode=0700
 NoNewPrivileges=yes

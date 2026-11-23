@@ -6,6 +6,33 @@
     <div><div class="desk-kicker">{{ icon("activity",15) }} Hyperliquid</div><h1>Research</h1><p class="desk-muted">Separate ledgers &middot; No live approval</p></div>
     <div class="desk-actions"><a class="text-sm text-sky-300 underline" href="/trades?scope=all">Trade review</a><a class="desk-icon-btn" href="/research" title="Refresh research" aria-label="Refresh research">{{ icon("refresh") }}</a></div>
   </header>
+  <section class="desk-panel" id="investment-scorecard">
+    <div class="desk-panel-heading">
+      <div><h2>Investment scorecard</h2>{% if investment %}<p>Paper book: {{ investment.week_start[:10] }} to {{ investment.week_end[:10] }} UTC (end exclusive)</p>{% endif %}</div>
+      {{ badge("Research only", "warn") }}
+    </div>
+    {% if not investment %}
+    <div class="desk-empty compact"><p>No archived investment review available.</p></div>
+    {% else %}
+    <div class="desk-kpis">
+      <div><span>Crypto paper book</span><strong>{{ money(investment.crypto_week.net,true) if investment.crypto_week else "Unmeasured" }}</strong><small>{{ investment.crypto_week.closed|string ~ " closes" if investment.crypto_week else "No dated accounting record" }}</small></div>
+      <div><span>Stock mode</span><strong>Shadow</strong><small>{{ money(investment.stock.basis) }} reference book</small></div>
+      <div><span>Monthly operating costs</span><strong>{{ money(investment.btc.monthly_ops) if investment.btc.monthly_ops is not none else "Unmeasured" }}</strong><small>{% if investment.btc.monthly_ops is not none %}{{ "{:.2f}%".format(investment.btc.monthly_ops / investment.btc.basis * 100) }} monthly break-even before trades{% else %}Hosting and data{% endif %}</small></div>
+    </div>
+    <div class="desk-table-scroll" tabindex="0" aria-label="Weekly investment checks">
+      <table class="desk-table"><thead><tr><th>Evidence</th><th>Result</th><th>Basis</th></tr></thead>
+      <tbody>{% for row in investment.checks %}<tr><th scope="row">{{ row.check }}</th><td>{{ badge(row.status, "good" if row.status == "Pass" else "warn") }}</td><td>{{ row.note }}</td></tr>{% endfor %}</tbody></table>
+    </div>
+    {% if investment.btc.scenarios %}
+    <p class="desk-muted desk-research-status">BTC study to {{ investment.btc.through[:16]|replace("T"," ") }} UTC &middot; Cumulative, separate from paper week</p>
+    <div class="desk-table-scroll" tabindex="0" aria-label="BTC investment scenario comparison">
+      <table class="desk-table"><thead><tr><th>Costs</th><th>Closed</th><th>Net</th><th>After operations</th><th>Cash</th><th>Passive</th><th>Without largest winner</th></tr></thead>
+      <tbody>{% for name, row in investment.btc.scenarios.items() %}<tr><th scope="row">{{ name|capitalize }}</th><td>{{ row.closed }}</td><td>{{ money(row.net,true) }}</td><td>{{ money(row.after_ops,true) }}</td><td>{{ money(row.cash,true) }}</td><td>{{ money(row.passive,true) }}</td><td>{{ money(row.net_without_largest,true) }}</td></tr>{% endfor %}</tbody></table>
+    </div>
+    {% endif %}
+    <div class="desk-decision-empty">Latest cash check: {{ investment.current_cash_check.note }}<br>Latest stock check: {{ investment.current_stock_check.note }}<br>Current protection: {{ investment.current_protection_check.note }}<br>Review captured {{ investment.reviewed_at[:16]|replace("T"," ") }} UTC</div>
+    {% endif %}
+  </section>
   <section class="desk-panel" id="release-review">
     <div class="desk-panel-heading"><div><h2>Release review</h2><p>Paper and shadow evidence</p></div>{{ badge("Live entries locked", "warn") }}</div>
     <dl class="desk-settings-list evidence-list">

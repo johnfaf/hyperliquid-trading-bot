@@ -22,6 +22,7 @@ UNITS = {
     "absorption_report": "hyperliquid-absorption-report",
     "paper_funding": "hyperliquid-paper-funding",
     "forward_shadow": "hyperliquid-forward-shadow",
+    "stock_reconciliation": "hyperliquid-stock-reconciliation",
 }
 STOCK_STATES = {
     "waiting_for_paper_credentials", "no_order", "outside_entry_or_exit_window", "shadow_intent",
@@ -239,6 +240,43 @@ def fixed_weekly_report(path, directory, now):
     return report
 
 
+def investment_review(path, directory, broker_path, weekly, host, now, monthly_ops):
+    from src.learning.investment_scorecard import UNKNOWN, build_week, check, paper_cash_check, paper_checkpoint, paper_protection_check
+    from src.trading.paper_reporting import completed_week, timestamp
+
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    recent = now.date()
+    checkpoint = directory / f"cash-{recent}.json"
+    current = load_object(checkpoint, max_bytes=4096)
+    if not checkpoint.exists():
+        current = paper_checkpoint(path, now)
+        publish(checkpoint, current, mode=0o600)
+    elif not current:
+        raise ValueError("invalid immutable daily accounting checkpoint")
+    prior = load_object(directory / f"cash-{recent-timedelta(days=1)}.json", max_bytes=4096)
+    cash = paper_cash_check(prior, current)
+    protection = paper_protection_check(path, now)
+    broker = load_object(broker_path, max_bytes=4096)
+    seen = timestamp(broker.get("observed_at"))
+    statuses = {"Pass","Fail",UNKNOWN}
+    note = broker.get("note")
+    if (seen is None or not 0 <= (now-seen).total_seconds() <= 30*3600 or broker.get("status") not in statuses
+            or not isinstance(note, str) or len(note) > 160):
+        broker = check("Stock paper identities", UNKNOWN, "No fresh read-only broker audit.")
+    start, end = completed_week(now-timedelta(minutes=10))
+    archive = directory / f"investment-{start.date()}-to-{end.date()}.json"
+    if not archive.exists():
+        memo = build_week(now, weekly, host, cash, broker, monthly_ops, protection)
+        publish(archive, memo, mode=0o600)
+    else:
+        memo = load_object(archive)
+        if (memo.get("version") != 1 or memo.get("week_start") != start.isoformat()
+                or memo.get("week_end") != end.isoformat() or memo.get("live_approved") is not False):
+            raise ValueError("invalid immutable investment memo")
+    return {**memo, "current_cash_check": cash, "current_protection_check": protection,
+            "current_stock_check": {"status":broker["status"], "note":broker["note"]}}
+
+
 def absorption_status(path, now):
     from src.trading.paper_reporting import timestamp
 
@@ -368,9 +406,16 @@ def main() -> None:
     parser.add_argument("--absorption-report", type=Path, default=Path("/var/lib/hyperliquid-absorption/reports/latest.json"))
     parser.add_argument("--forward-report", type=Path, default=Path("/var/lib/hyperliquid-forward-shadow/latest.json"))
     parser.add_argument("--offhost-restore", type=Path, default=Path("/var/lib/hyperliquid-dashboard/offhost-restore.json"))
+    parser.add_argument("--stock-reconciliation", type=Path, default=Path("/var/lib/hyperliquid-stock-paper/broker-reconciliation.json"))
+    parser.add_argument("--investment-dir", type=Path)
+    parser.add_argument("--monthly-ops-usd", type=float)
     args = parser.parse_args()
     if bool(args.paper_db) != bool(args.copy_report_dir):
         parser.error("--paper-db and --copy-report-dir must be used together")
+    if args.investment_dir and not args.paper_db:
+        parser.error("--investment-dir requires --paper-db")
+    if args.monthly_ops_usd is not None and not 0 <= args.monthly_ops_usd <= 100_000:
+        parser.error("--monthly-ops-usd must be a finite nonnegative amount")
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     snapshot = build_snapshot(args.study)
     if args.stock_db:
@@ -399,6 +444,14 @@ def main() -> None:
             snapshot["weekly"] = {key: value for key, value in weekly.items() if key != "trades"}
         except (sqlite3.Error, ValueError, OSError):
             snapshot["weekly"] = None
+        if args.investment_dir:
+            try:
+                snapshot["investment"] = investment_review(
+                    args.paper_db, args.investment_dir, args.stock_reconciliation, snapshot["weekly"],
+                    snapshot, now, args.monthly_ops_usd,
+                )
+            except (sqlite3.Error, ValueError, OSError):
+                snapshot["investment"] = None
     publish(args.output, snapshot)
     if args.telegram_env and args.alert_state:
         delivery = maybe_alert(snapshot, args.telegram_env, args.alert_state, now=now)

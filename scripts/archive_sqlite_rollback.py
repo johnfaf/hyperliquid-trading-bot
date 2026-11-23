@@ -10,18 +10,29 @@ import re
 from tempfile import NamedTemporaryFile
 
 
-def archive(root, name):
+def archive(root, name, *, allow_empty_wal=False):
     if not re.fullmatch(r"(?:bot|decisions|orders|risk|funding|stock)-pre-[a-f0-9]{40}\.db", name):
         raise ValueError("select an exact rollout backup filename")
     source = root.resolve(strict=True) / name
     target = source.with_suffix(".db.gz")
     if not source.is_file() or source.is_symlink() or target.exists() or target.is_symlink():
         raise ValueError("need a regular unarchived backup")
-    def unsettled():
-        return any(Path(str(source) + suffix).exists() for suffix in ("-wal", "-journal", "-shm"))
+    def sidecars():
+        result = []
+        for suffix in ("-wal", "-journal", "-shm"):
+            path = Path(str(source) + suffix)
+            if path.is_symlink():
+                raise ValueError("unexpected symbolic SQLite sidecar")
+            if not path.exists():
+                continue
+            stamp = path.stat()
+            if (not allow_empty_wal or not path.is_file() or suffix == "-journal"
+                    or (suffix == "-wal" and stamp.st_size != 0)):
+                raise ValueError("backup has SQLite sidecars; inspect it before archiving")
+            result.append((suffix, stamp.st_ino, stamp.st_size, stamp.st_mtime_ns))
+        return result
 
-    if unsettled():
-        raise ValueError("backup has SQLite sidecars; inspect it before archiving")
+    untouched_sidecars = sidecars()
     original = source.stat()
     digest = sha256()
     temporary = None
@@ -39,7 +50,7 @@ def archive(root, name):
             while chunk := zipped.read(1024*1024):
                 copied.update(chunk)
         current = source.stat()
-        if (copied.digest() != digest.digest() or unsettled()
+        if (copied.digest() != digest.digest() or sidecars() != untouched_sidecars
                 or (current.st_ino, current.st_size, current.st_mtime_ns)
                 != (original.st_ino, original.st_size, original.st_mtime_ns)):
             raise ValueError("archive verification or source stability check failed")
@@ -67,8 +78,10 @@ def main():
     parser = ArgumentParser(description=__doc__)
     parser.add_argument("backup")
     parser.add_argument("--directory", default=Path("/srv/hyperliquid-bot/rollbacks"), type=Path)
+    parser.add_argument("--allow-empty-wal", action="store_true",
+                        help="For verified inactive snapshots only; preserve an empty WAL and its SHM unchanged")
     args = parser.parse_args()
-    print(json.dumps(archive(args.directory, args.backup)))
+    print(json.dumps(archive(args.directory, args.backup, allow_empty_wal=args.allow_empty_wal)))
 
 
 if __name__ == "__main__":

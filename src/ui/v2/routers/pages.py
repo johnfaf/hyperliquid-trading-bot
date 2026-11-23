@@ -104,6 +104,7 @@ async def research(request: Request):
         "forward_shadow": host.get("forward_shadow"), "funding_health": host.get("paper_funding"),
         "funding_worker": (host.get("jobs") or {}).get("paper_funding") or {},
         "promotion_review": review(evidence, host),
+        "investment": host.get("investment"),
     })
 
 
