@@ -68,6 +68,7 @@ def test_investment_memo_is_immutable_and_missing_cost_is_not_zero(tmp_path):
     original = saved.read_bytes()
     second = investment_review(path, output, tmp_path/"absent.json", None, {}, NOW+timedelta(hours=1), 10.)
     assert second["reviewed_at"] == first["reviewed_at"] and second["btc"]["monthly_ops"] is None
+    assert second["current_btc"]["monthly_ops"] == 10.
     assert saved.read_bytes() == original and first["live_approved"] is False
 
 

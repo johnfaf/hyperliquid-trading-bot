@@ -100,20 +100,10 @@ marked inventory, and an estimated two basis points per fill. It does not
 claim full-session coverage, fees charged by the broker, or live returns.
 Drill fills do not enter strategy accounting.
 
-After reviewing a fresh open-session shadow cycle, keep
-`STOCK_PAPER_SEND_ORDERS=false` and explicitly supervise the paper test:
-
-1. `sudo systemctl start hyperliquid-stock-paper-drill@buy.service` sends
-   at most a $10 limit order to paper, with 15 minutes required before
-   session close. It requires an empty, reconciled position and a fresh
-   shadow quote. Do not treat an acknowledgement as a fill.
-2. Check the order and confirmed fill on the Stock Pilot tab and in Alpaca.
-   If the order is still open or ambiguous, wait or cancel it in Alpaca
-   Paper before proceeding.
-3. After a fill, `sudo systemctl start hyperliquid-stock-paper-drill@sell.service`
-   sends a separate sell for the verified paper drill position. Monitor it
-   until the position is flat and the verified fills and broker cash match.
-   A limit order may not fill. The timer never runs the drill automatically.
+Keep `STOCK_PAPER_SEND_ORDERS=false` and follow the
+[isolated paper drill runbook](isolated-paper-drill.md). The manual service
+never uses the stock worker's keys or journal. A simulated broker fill
+does not prove live execution, and it never enters strategy accounting.
 
 The dashboard publisher uses the existing bot Telegram configuration for
 stock incidents. Normal closed sessions and no-signal cycles are quiet;

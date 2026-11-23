@@ -240,8 +240,9 @@ def fixed_weekly_report(path, directory, now):
     return report
 
 
-def investment_review(path, directory, broker_path, weekly, host, now, monthly_ops):
-    from src.learning.investment_scorecard import UNKNOWN, build_week, check, paper_cash_check, paper_checkpoint, paper_protection_check
+def investment_review(path, directory, broker_path, weekly, host, now, monthly_ops, drill_path=None):
+    from src.learning.copy_toggle_replay import compare
+    from src.learning.investment_scorecard import UNKNOWN, build_week, check, economics, paper_cash_check, paper_checkpoint, paper_protection_check
     from src.trading.paper_reporting import completed_week, timestamp
 
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -264,6 +265,17 @@ def investment_review(path, directory, broker_path, weekly, host, now, monthly_o
             or not isinstance(note, str) or len(note) > 160):
         broker = check("Stock paper identities", UNKNOWN, "No fresh read-only broker audit.")
     start, end = completed_week(now-timedelta(minutes=10))
+    copy_path = directory / f"copy-toggle-{start.date()}-to-{end.date()}.json"
+    copy = load_object(copy_path)
+    if not copy and not copy_path.exists():
+        try:
+            copy = compare(path,start,end)
+            publish(copy_path,copy,mode=0o600)
+        except (OSError,ValueError,sqlite3.Error):
+            copy = None
+    if copy and (copy.get("start"),copy.get("end"),copy.get("method")) != (
+            start.isoformat(),end.isoformat(),"fixed_recorded_fills_no_reallocation"):
+        copy = None
     archive = directory / f"investment-{start.date()}-to-{end.date()}.json"
     if not archive.exists():
         memo = build_week(now, weekly, host, cash, broker, monthly_ops, protection)
@@ -273,8 +285,17 @@ def investment_review(path, directory, broker_path, weekly, host, now, monthly_o
         if (memo.get("version") != 1 or memo.get("week_start") != start.isoformat()
                 or memo.get("week_end") != end.isoformat() or memo.get("live_approved") is not False):
             raise ValueError("invalid immutable investment memo")
+    receipt = load_object(drill_path,max_bytes=4096) if drill_path is not None else {}
+    observed = timestamp(receipt.get("observed_at"))
+    passed = (receipt.get("protocol") == "isolated_paper_round_trip_v1" and receipt.get("action") == "verify"
+              and receipt.get("passed") is True and receipt.get("flat") is True and receipt.get("restart_recovered") is True
+              and receipt.get("unique_orders") == 2 and type(receipt.get("fills")) is int and receipt["fills"] >= 2
+              and observed is not None and 0 <= (now-observed).total_seconds() <= 30*86400)
+    verdict, figures = economics(host.get("forward_shadow") or {},monthly_ops)
     return {**memo, "current_cash_check": cash, "current_protection_check": protection,
-            "current_stock_check": {"status":broker["status"], "note":broker["note"]}}
+            "current_stock_check": {"status":broker["status"], "note":broker["note"]},
+            "current_drill": "Paper round trip and restart verified" if passed else "No verified isolated broker drill",
+            "current_btc": figures, "current_btc_verdict": verdict["status"], "copy_toggle": copy}
 
 
 def absorption_status(path, now):
@@ -407,6 +428,7 @@ def main() -> None:
     parser.add_argument("--forward-report", type=Path, default=Path("/var/lib/hyperliquid-forward-shadow/latest.json"))
     parser.add_argument("--offhost-restore", type=Path, default=Path("/var/lib/hyperliquid-dashboard/offhost-restore.json"))
     parser.add_argument("--stock-reconciliation", type=Path, default=Path("/var/lib/hyperliquid-stock-paper/broker-reconciliation.json"))
+    parser.add_argument("--isolated-stock-drill", type=Path, default=Path("/var/lib/hyperliquid-stock-drill/verified.json"))
     parser.add_argument("--investment-dir", type=Path)
     parser.add_argument("--monthly-ops-usd", type=float)
     args = parser.parse_args()
@@ -448,7 +470,7 @@ def main() -> None:
             try:
                 snapshot["investment"] = investment_review(
                     args.paper_db, args.investment_dir, args.stock_reconciliation, snapshot["weekly"],
-                    snapshot, now, args.monthly_ops_usd,
+                    snapshot, now, args.monthly_ops_usd, args.isolated_stock_drill,
                 )
             except (sqlite3.Error, ValueError, OSError):
                 snapshot["investment"] = None

@@ -69,10 +69,19 @@ Operating costs are unmeasured until the operator supplies current monthly
 hosting and data costs in USD. The root-owned dashboard-only optional
 environment file is `/etc/hyperliquid-bot/investment-review.env`; set
 `INVESTMENT_COST_ARGS="--monthly-ops-usd 10.00"` with the actual total,
-not the example. The next weekly memo captures the assumptions then in
-force. Expenses are prorated using 12 months per 365 days and applied once
+not the example. The current BTC comparison uses the latest recorded
+expenses. The next weekly memo captures the assumptions then in force;
+existing memos remain unchanged. Expenses are prorated using 12 months per 365 days and applied once
 to the reference strategy book; separate alternatives are not added
 together. Do not add any brokerage secrets to this file.
 
 The weekly memo and ongoing audits have no path to order authorization.
 Production code still holds live entries independently of this report.
+
+The completed-week **Copy on vs off** panel removes only new copy entries
+opened in the weekly window. Existing positions stay in both books.
+Retained trades use identical recorded sizing, fills, and costs; both
+sides apply the same added 16 bps round-trip stress using leveraged
+notional. Closes at or beyond the cutoff are unscored. This is attribution
+on recorded fills, not a fresh execution replay: changed approvals,
+replacement trades, and portfolio reallocation are not measured.

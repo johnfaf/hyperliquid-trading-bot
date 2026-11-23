@@ -1,19 +1,21 @@
 [Unit]
-Description=Manually supervise stock paper drill (%i)
+Description=Manually supervise the isolated stock paper drill (%i)
 Wants=network-online.target
 After=network-online.target
 
 [Service]
 Type=oneshot
 DynamicUser=yes
-User=hyperliquid-stock-paper
-StateDirectory=hyperliquid-stock-paper
+User=hyperliquid-stock-drill
+StateDirectory=hyperliquid-stock-drill
 StateDirectoryMode=0700
-EnvironmentFile=/etc/hyperliquid-stock-paper/paper.env
-ExecStart=/usr/bin/python3 -I -B /opt/hyperliquid-stock-paper/current/scripts/run_stock_paper.py --db /var/lib/hyperliquid-stock-paper/orders.sqlite3 --action drill-%i --confirm-paper-drill
+EnvironmentFile=-/etc/hyperliquid-stock-drill/paper.env
+EnvironmentFile=/etc/hyperliquid-stock-drill/excluded.env
+ExecStart=/usr/bin/python3 -I -B /opt/hyperliquid-stock-paper/current/scripts/isolated_stock_drill.py --db /var/lib/hyperliquid-stock-drill/drill.sqlite3 --action %i --confirm-paper-submit
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
 ProtectHome=yes
+InaccessiblePaths=-/etc/hyperliquid-stock-paper -/var/lib/hyperliquid-stock-paper -/var/lib/private/hyperliquid-stock-paper -/srv/hyperliquid-bot
 TimeoutStartSec=90
 UMask=0077
