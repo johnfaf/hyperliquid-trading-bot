@@ -1,0 +1,10 @@
+[Unit]
+Description=Capture paired paper-study signals and later book quotes
+
+[Timer]
+OnCalendar=*-*-* *:10,15,40:15 UTC
+AccuracySec=1s
+Persistent=false
+
+[Install]
+WantedBy=timers.target

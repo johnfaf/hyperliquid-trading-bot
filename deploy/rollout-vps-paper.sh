@@ -234,6 +234,20 @@ sudo -n systemctl daemon-reload
 sudo -n systemctl start hyperliquid-stock-forward.service
 sudo -n systemctl enable --now hyperliquid-stock-forward.timer
 
+copy_forward=/opt/hyperliquid-copy-forward
+if ! sudo -n test -L "$copy_forward/current"; then
+    for file in scripts/run_copy_forward.py src/backtest/copy_forward.py; do
+        sudo -n install -D -m 0644 "$release/$file" "$copy_forward/$rev/$file"
+    done
+    sudo -n ln -s "$copy_forward/$rev" "$copy_forward/current"
+fi
+for unit in hyperliquid-copy-forward.service hyperliquid-copy-forward.timer; do
+    sudo -n install -m 0644 "$release/deploy/research/$unit" "/etc/systemd/system/$unit"
+done
+sudo -n systemctl daemon-reload
+sudo -n systemctl start hyperliquid-copy-forward.service
+sudo -n systemctl enable --now hyperliquid-copy-forward.timer
+
 sudo -n install -D -m 0644 "$release/scripts/publish_dashboard_status.py" /opt/hyperliquid-dashboard/publish_dashboard_status.py
 sudo -n install -D -m 0644 "$release/scripts/recovery_bundle.py" /opt/hyperliquid-recovery/recovery_bundle.py
 sudo -n install -D -m 0644 "$release/scripts/stock_forward_evidence.py" /opt/hyperliquid-dashboard/scripts/stock_forward_evidence.py

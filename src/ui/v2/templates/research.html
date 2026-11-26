@@ -17,7 +17,7 @@
     {% set btc = investment.get("current_btc") or investment.btc %}
     <div class="desk-kpis">
       <div><span>Crypto paper book</span><strong>{{ money(investment.crypto_week.net,true) if investment.crypto_week else "Unmeasured" }}</strong><small>{{ investment.crypto_week.closed|string ~ " closes" if investment.crypto_week else "No dated accounting record" }}</small></div>
-      <div><span>Stock mode</span><strong>Shadow</strong><small>{{ money(investment.stock.basis) }} reference book</small></div>
+      <div><span>Stock forward study</span><strong>Shadow</strong><small>{{ money(investment.stock.basis) }} reference book</small></div>
       <div><span>Monthly operating costs</span><strong>{{ money(btc.monthly_ops) if btc.monthly_ops is not none else "Unmeasured" }}</strong><small>{% if btc.monthly_ops is not none %}{{ "{:.2f}%".format(btc.monthly_ops / btc.basis * 100) }} monthly break-even before trades{% else %}Hosting and data{% endif %}</small></div>
     </div>
     <div class="desk-table-scroll" tabindex="0" aria-label="Weekly investment checks">
@@ -45,6 +45,25 @@
     <div class="desk-decision-empty">{{ replay.omitted_copy.base.n }} copy closes omitted &middot; {{ replay.carry_in_copy_closes }} carry-in copy closes kept &middot; {{ replay.open_at_end }} unscored at cutoff &middot; +{{ replay.extra_roundtrip_bps }} bps stress.<br>No replacement trades or reallocation modeled.</div>
   </section>
   {% endif %}
+  <section class="desk-panel" id="copy-forward">
+    <div class="desk-panel-heading"><div><h2>Forward copy comparison</h2><p>BTC, ETH and SOL &middot; Two independent simulated books</p></div>{{ badge("Research only") }}</div>
+    {% if not copy_forward %}<div class="desk-empty compact"><p>Forward comparison unavailable.</p></div>
+    {% else %}
+    <p class="desk-muted desk-research-status">{{ copy_forward.state }}{% if copy_forward.stale %} &middot; Stale report{% endif %}<br>{{ copy_forward.start[:16]|replace("T"," ") }} to {{ copy_forward.end[:16]|replace("T"," ") }} UTC</p>
+    <div class="desk-kpis">
+      <div><span>Complete capture hours</span><strong>{{ copy_forward.coverage }} / {{ copy_forward.due_hours }}</strong></div>
+      <div><span>Observed candidates</span><strong>{{ copy_forward.candidates }}</strong><small>{{ copy_forward.copy_candidates }} copy</small></div>
+      <div><span>Capital per book</span><strong>{{ money(1000) }}</strong><small>{{ money(75) }} maximum per position</small></div>
+    </div>
+    {% if copy_forward.results %}
+    <div class="desk-table-scroll" tabindex="0" aria-label="Forward copy turnover and net comparison">
+      <table class="desk-table"><thead><tr><th>Costs</th><th>Copy on</th><th>Copy off</th><th>Off minus on</th><th>Closes on / off</th><th>Scored / divergent hours</th></tr></thead>
+      <tbody>{% for scenario, row in copy_forward.results.items() %}<tr><th scope="row">{{ scenario|capitalize }}</th><td>{{ money(row.copy_on.net,true) if row.scored_hours else "Unmeasured" }}</td><td>{{ money(row.copy_off.net,true) if row.scored_hours else "Unmeasured" }}</td><td>{{ money(row.delta_off_minus_on,true) if row.scored_hours else "Unmeasured" }}</td><td>{{ row.copy_on.closes }} / {{ row.copy_off.closes }}</td><td>{{ row.scored_hours }} / {{ row.different_hours }}</td></tr>{% endfor %}</tbody></table>
+    </div>
+    {% endif %}
+    <div class="desk-decision-empty">{{ copy_forward.verdict }} &middot; Fixed intrahour exits &middot; No broker orders</div>
+    {% endif %}
+  </section>
   <section class="desk-panel" id="stock-forward-shadow">
     <div class="desk-panel-heading"><div><h2>Stock forward shadow</h2><p>SPY &middot; 20-session moving-average crossover</p></div>{{ badge("Simulation only") }}</div>
     {% if not stock_forward or stock_forward.state == "Unavailable" %}
@@ -63,6 +82,7 @@
     </div>
     {% endif %}
     <div class="desk-decision-empty">{{ stock_forward.verdict }}{% if stock_forward.market_status %} &middot; {{ stock_forward.market_status }}{% endif %}{% if stock_forward.monthly_ops is not none %}<br>Operating assumption: {{ money(stock_forward.monthly_ops) }}/month{% if stock_forward.operating_cost is not none %} &middot; {{ money(stock_forward.operating_cost) }} accrued{% endif %}{% endif %}</div>
+    {% if stock_forward_backup and not stock_forward_backup.overdue %}<div class="desk-decision-empty">{{ stock_forward_backup.status }}</div>{% endif %}
     {% endif %}
   </section>
   <section class="desk-panel" id="release-review">

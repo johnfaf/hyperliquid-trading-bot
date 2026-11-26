@@ -102,6 +102,7 @@ async def research(request: Request):
     return get_templates().TemplateResponse(request, "research.html", {
         "title": "Research", "study": host.get("absorption"), "weekly": host.get("weekly"), "evidence": evidence,
         "forward_shadow": host.get("forward_shadow"), "stock_forward": host.get("stock_forward"),
+        "copy_forward": host.get("copy_forward"), "stock_forward_backup": host.get("stock_forward_backup"),
         "funding_health": host.get("paper_funding"),
         "funding_worker": (host.get("jobs") or {}).get("paper_funding") or {},
         "promotion_review": review(evidence, host),

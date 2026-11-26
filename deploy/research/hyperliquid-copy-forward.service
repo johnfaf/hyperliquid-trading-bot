@@ -1,0 +1,20 @@
+[Unit]
+Description=Capture paired crypto copy research with a read-only decision ledger
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+StateDirectory=hyperliquid-copy-forward
+StateDirectoryMode=0700
+ExecStart=/usr/bin/python3 -I -B /opt/hyperliquid-copy-forward/current/scripts/run_copy_forward.py --state-dir /var/lib/hyperliquid-copy-forward --decision-db /srv/hyperliquid-bot/paper/bot.db
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+InaccessiblePaths=-/etc/hyperliquid-bot -/etc/hyperliquid-stock-paper -/etc/hyperliquid-stock-drill -/srv/hyperliquid-bot/rollbacks
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=CAP_DAC_READ_SEARCH
+UMask=0077
+TimeoutStartSec=40

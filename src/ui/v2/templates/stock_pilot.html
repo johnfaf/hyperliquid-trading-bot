@@ -54,6 +54,28 @@
     </section>
   </div>
 
+  {% set execution = pilot.get("execution") %}
+  {% if execution %}
+  <section class="desk-panel" id="natural-execution">
+    <div class="desk-panel-heading"><div><h2>Automatic paper execution</h2><p>{{ execution.state }}</p></div>{{ badge("Check required" if execution.get("evidence_gap") or execution.get("stuck") else "Paper only", "warn" if execution.get("evidence_gap") or execution.get("stuck") else "neutral") }}</div>
+    {% if "reserved" in execution %}
+    <div class="desk-kpis">
+      <div><span>Reserved / broker IDs</span><strong>{{ execution.reserved }} / {{ execution.broker_identified }}</strong><small>{{ execution.working }} working &middot; {{ execution.stuck }} aging</small></div>
+      <div><span>Filled / partial</span><strong>{{ execution.filled }} / {{ execution.partial }}</strong><small>{{ execution.rejected }} rejected &middot; {{ execution.canceled }} canceled</small></div>
+      <div><span>Natural round trips</span><strong>{{ execution.round_trips if execution.round_trips is not none else "Unmeasured" }}</strong><small>{{ execution.fills }} matched fills</small></div>
+    </div>
+    {% endif %}
+    {% set broker = pilot.get("broker_check") %}
+    {% if broker %}<div class="desk-decision-empty">Independent broker check: {{ broker.status }} &middot; {{ broker.note }}</div>{% endif %}
+    {% if execution.orders %}
+    <div class="desk-table-scroll" tabindex="0" aria-label="Latest automatic stock paper orders">
+      <table class="desk-table"><thead><tr><th>Decision UTC</th><th>Order</th><th>Status</th><th>Shares matched</th></tr></thead>
+      <tbody>{% for row in execution.orders %}<tr><td>{{ row.at[:16]|replace("T"," ") if row.at else "Unverified" }}</td><th scope="row">{{ row.symbol }} {{ row.side }} &middot; {{ row.ref }}</th><td>{{ row.status|replace("_"," ")|capitalize }}</td><td>{{ row.shares if row.shares is not none else "Unverified" }}</td></tr>{% endfor %}</tbody></table>
+    </div>
+    {% endif %}
+  </section>
+  {% endif %}
+
   <section class="desk-panel desk-trades">
     <div class="desk-panel-heading"><div><h2>Decision journal</h2>
       {% set coverage = pilot.get("coverage") %}

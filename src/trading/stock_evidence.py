@@ -177,6 +177,13 @@ def scorecard(conn, scope: str, session: str | None) -> dict:
         result["state"] = "Execution incident; strategy comparison withheld"
         return result
     fills = _paper_fills(conn, scope)
+    relevant = [f for f in fills if f["purpose"] == "strategy" and f["symbol"] == last["symbol"]]
+    first_at = first["quote_at"]
+    held = sum((Decimal(f["qty"]) * (1 if f["side"] == "buy" else -1) for f in relevant
+                if f["occurred_at"] and f["occurred_at"] <= first_at), Decimal(0))
+    if not held and not any(not f["occurred_at"] or first_at < f["occurred_at"] <= last["quote_at"] for f in relevant):
+        result["state"] = "No confirmed strategy fills; execution unmeasured"
+        return result
     start_value = _model_value(fills, first["quote_at"], first["symbol"], start_mark)
     end_value = _model_value(fills, last["quote_at"], last["symbol"], end_mark)
     if start_value is None or end_value is None or start_value <= 0:
@@ -216,6 +223,90 @@ def drill_status(conn, scope: str, fills: list[dict]) -> dict:
     return result
 
 
+def execution_audit(conn, scope, now):
+    """Account-scoped automatic orders only; use exact client IDs for joins."""
+    rows = conn.execute("""
+        WITH actions AS (
+            SELECT client_id,
+                   min(CASE WHEN purpose='strategy' THEN observed_at END) AS proposed_at,
+                   max(CASE WHEN purpose='operator' THEN 1 ELSE 0 END) AS operator
+            FROM stock_cycles
+            WHERE account=? AND client_id IS NOT NULL AND mode='paper'
+                AND state IN ('submitting','intent_sent','submission_unknown','order_rejected')
+            GROUP BY client_id
+        )
+        SELECT o.client_id,o.venue_id,o.intent,o.status,a.proposed_at,a.operator
+        FROM orders o LEFT JOIN actions a ON a.client_id=o.client_id WHERE o.account=? LIMIT 2001
+    """, (scope,scope)).fetchall()
+    fills = conn.execute("""
+        SELECT order_id,quantity,price,occurred_at,symbol,side FROM fills
+        WHERE account=? ORDER BY occurred_at,rowid LIMIT 4001
+    """, (scope,)).fetchall()
+    if len(rows) > 2000 or len(fills) > 4000:
+        return {"state": "Execution audit limit reached", "orders": []}
+    by_order = {}
+    for fill in fills:
+        by_order.setdefault(fill["order_id"], []).append(fill)
+    orders, natural_fills = [], []
+    counts = dict(reserved=0, broker_identified=0, filled=0, partial=0, working=0, rejected=0, canceled=0)
+    stuck = evidence_gap = 0
+    has_operator = False
+    venue_counts = {}
+    for row in rows:
+        if row["venue_id"]:
+            venue_counts[row["venue_id"]] = venue_counts.get(row["venue_id"], 0) + 1
+    for row in rows:
+        intent = json.loads(row["intent"])
+        if intent.get("_purpose") != "strategy":
+            continue
+        if row["operator"]:
+            has_operator = True
+            continue
+        counts["reserved"] += 1
+        counts["broker_identified"] += bool(row["venue_id"])
+        intended = number(intent.get("qty"))
+        stamp = iso_date(row["proposed_at"])
+        linked = by_order.get(row["venue_id"], [])
+        sizes = [number(f["quantity"]) for f in linked]
+        done = None if None in sizes else sum(sizes, Decimal(0))
+        valid = (stamp is not None and stamp.utcoffset() is not None and intended is not None and intended > 0
+                 and intent.get("side") in ("buy", "sell") and done is not None and 0 <= done <= intended
+                 and (not row["venue_id"] or venue_counts[row["venue_id"]] == 1)
+                 and all(size > 0 and f["symbol"] == intent.get("symbol") and f["side"] == intent["side"]
+                         and number(f["price"]) is not None and Decimal(f["price"]) > 0
+                         and (at := iso_date(f["occurred_at"])) is not None and at.utcoffset() is not None
+                         and stamp - timedelta(seconds=10) <= at <= now for f,size in zip(linked,sizes)))
+        status = row["status"]
+        if not valid or (status == "filled" and done != intended):
+            evidence_gap += 1
+        elif linked:
+            natural_fills.extend(linked)
+        counts["filled"] += bool(valid and status == "filled" and done == intended)
+        counts["partial"] += bool(valid and 0 < done < intended)
+        counts["rejected"] += status == "rejected"
+        counts["canceled"] += status == "canceled"
+        active = status in {"submitting", "unknown", "accepted", "partial", "cancel_pending"}
+        counts["working"] += active
+        if active and stamp is not None and stamp.utcoffset() is not None:
+            limit = 10 if status in {"submitting", "unknown", "cancel_pending"} else 30
+            stuck += now-stamp > timedelta(minutes=limit)
+        orders.append({"ref": row["client_id"][:8], "at": row["proposed_at"], "symbol": intent.get("symbol"),
+                       "side": intent.get("side"), "status": status, "shares": str(done) if valid else None})
+    inventory, round_trips = {}, 0
+    for f in sorted(natural_fills, key=lambda f: iso_date(f["occurred_at"])):
+        before = inventory.get(f["symbol"], Decimal(0))
+        after = before + Decimal(f["quantity"]) * (1 if f["side"] == "buy" else -1)
+        inventory[f["symbol"]] = after
+        if after < 0:
+            evidence_gap += 1
+        round_trips += before > 0 and after == 0
+    state = ("Review execution" if stuck or evidence_gap else "Natural fills recorded" if natural_fills else
+             "Waiting for a natural fill" if orders else "No natural strategy orders yet")
+    return {"state": state, **counts, "fills": len(natural_fills), "round_trips": None if has_operator else round_trips,
+            "stuck": stuck, "evidence_gap": evidence_gap,
+            "orders": sorted(orders, key=lambda row: row["at"] or "", reverse=True)[:8]}
+
+
 def read_summary(path: Path, *, session: str | None = None) -> dict:
     """Expose only bounded, anonymous decision, fill and scorecard data."""
     with closing(_reader(path)) as conn:
@@ -252,6 +343,7 @@ def read_summary(path: Path, *, session: str | None = None) -> dict:
             coverage = dict(zip(("started", "finished", "overdue"), row))
         return {"decisions": cycles, "fills": fills[-12:][::-1], "scorecard": scorecard(conn, scope, session),
                 "drill": drill_status(conn, scope, fills), "coverage": coverage,
+                "execution": execution_audit(conn, scope, clock_provider.utc_now()),
                 "equity_risk": _equity_risk(path, scope)}
 
 

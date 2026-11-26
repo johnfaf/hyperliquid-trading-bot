@@ -104,7 +104,8 @@ def study(db, now):
                 "fill_quote" if not second else "signal_inputs")
             missed[day] = reason
     return {"start": start_raw, "end": end_raw, "protocol_sha256": digest, "sessions": len(forward),
-            "frames": len(frames), "paired_sessions": paired, "missed": missed}
+            "frames": len(frames), "paired_sessions": paired, "missed": missed,
+            "capture_timestamps": sorted(observed for _, observed, _ in frames.values())}
 
 
 def current(path, now):
@@ -154,7 +155,8 @@ def verify(stream, scratch, now):
         actual = study(db, checkpoint)
     if actual["protocol_sha256"] != sha256(b"".join(payload[name] for name in SOURCES)).hexdigest():
         raise ValueError("checkpoint source does not match the frozen protocol")
-    return {"verified": True, "revision": meta["revision"], "checkpoint_at": checkpoint.isoformat(), **actual}
+    return {"verified": True, "revision": meta["revision"], "checkpoint_at": checkpoint.isoformat(),
+            **{k:v for k,v in actual.items() if k != "capture_timestamps"}}
 
 
 def fetch(host, key, directory):

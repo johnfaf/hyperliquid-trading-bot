@@ -147,5 +147,32 @@ def test_stock_pilot_page_requires_auth_and_renders_closed_session(tmp_path, mon
     response = client.get("/stock-pilot")
     assert response.status_code == 200
     assert "No confirmed stock paper fills" in response.text
+    assert "No natural strategy orders yet" in response.text
     assert "Shadow or mixed session; strategy P&amp;L unmeasured" in response.text
     assert "test-login" not in response.text
+
+
+def test_natural_execution_uses_exact_order_links_and_ignores_drills(tmp_path):
+    path = tmp_path/"orders.db"
+    journal = OrderJournal(path,"paper")
+    evidence = StockEvidence(path,journal.account)
+    mark(evidence,"start",0,100,mode="paper")
+    mark(evidence,"empty",2,100,mode="paper")
+    initial = read_summary(path)
+    assert initial["execution"]["reserved"] == 0
+    assert initial["scorecard"]["strategy_move"] is None
+    buy = order(journal,"natural-buy","regular-b","buy",purpose="strategy")
+    sell = order(journal,"natural-sell","regular-s","sell",purpose="strategy")
+    order(journal,"drill","separate","buy",purpose="drill")
+    mark(evidence,"buy",3,100,mode="paper",state="intent_sent",intent=buy)
+    mark(evidence,"sell",5,100,mode="paper",state="intent_sent",intent=sell)
+    pending = read_summary(path)["execution"]
+    assert pending["reserved"] == pending["evidence_gap"] == 2 and pending["filled"] == 0
+    journal.record_fills([
+        Fill("a","regular-b","SPY","buy",Decimal("1"),Decimal("100"),(START+timedelta(minutes=4)).isoformat()),
+        Fill("b","regular-s","SPY","sell",Decimal("1"),Decimal("100"),(START+timedelta(minutes=6)).isoformat()),
+        Fill("c","separate","SPY","buy",Decimal("1"),Decimal("100"),(START+timedelta(minutes=6)).isoformat()),
+    ])
+    restored = read_summary(path)["execution"]
+    assert restored["filled"] == restored["fills"] == 2 and restored["round_trips"] == 1
+    assert not restored["evidence_gap"]

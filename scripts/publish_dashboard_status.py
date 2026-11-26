@@ -25,6 +25,7 @@ UNITS = {
     "forward_shadow": "hyperliquid-forward-shadow",
     "stock_reconciliation": "hyperliquid-stock-reconciliation",
     "stock_forward": "hyperliquid-stock-forward",
+    "copy_forward": "hyperliquid-copy-forward",
 }
 STOCK_STATES = {
     "waiting_for_paper_credentials", "no_order", "outside_entry_or_exit_window", "shadow_intent",
@@ -48,6 +49,7 @@ ALERTS = {
     "order_rejected": "Alpaca reported a rejected paper order.",
     "equity_risk_blocked": "The stock paper equity-risk budget is blocking new entries.",
     "paper_account_unverified": "The stock worker did not match the authorized Alpaca Paper account. No orders sent.",
+    "strategy_order_aging": "An automatic Alpaca paper order is aging. Check broker status; do not resend it.",
     "quote_not_usable": "Three open-session cycles could not verify a usable quote.",
 }
 
@@ -301,6 +303,86 @@ def forward_restore_status(path, integrity, now):
             "paired_sessions": paired, "current": frames == integrity["frames"], "stale": now-checked > timedelta(hours=30)}
 
 
+def forward_backup_lag(integrity, restore, now):
+    if not integrity or not integrity["frames"]:
+        return None
+    covered = restore["frames"] if restore else 0
+    if covered == integrity["frames"]:
+        return {"missing": 0, "overdue": False, "status": "Encrypted checkpoint current"}
+    oldest = integrity["capture_timestamps"][covered]
+    overdue = now.timestamp()-oldest >= 12*3600
+    return {"missing": integrity["frames"]-covered, "overdue": overdue,
+            "status": "Encrypted checkpoint overdue" if overdue else "New observations awaiting the next checkpoint"}
+
+
+def notify_backup_lag(lag, config, state_path, now):
+    if not lag or not lag["overdue"]:
+        return "quiet"
+    history = load_object(state_path)
+    last = history.get("backup_lag_at")
+    if type(last) in (int, float) and 0 <= now.timestamp()-last < 86400:
+        return "quiet"
+    try:
+        if send_telegram(config, f"SPY off-VPS restore overdue: {lag['missing']} captured observations lack a verified "
+                                "encrypted checkpoint. Check the Windows recovery task and its AC power requirement."):
+            publish(state_path, {"backup_lag_at":now.timestamp()}, mode=0o600)
+            return "sent"
+    except Exception:
+        pass  # Do not log transport details or the Telegram URL.
+    return "delivery_unavailable"
+
+
+def copy_forward_status(path, now):
+    data = load_object(path, max_bytes=8192)
+    if data.get("rule") != "paired_copy_intrahour_v1" or data.get("live_approval") is not False:
+        return None
+    try:
+        start, end, stamp = (datetime.fromisoformat(data[k]) for k in ("start","end","published_at"))
+        if any(t.utcoffset() is None for t in (start,end,stamp)) or end-start != timedelta(days=28) or stamp > now:
+            return None
+        due, captured, candidates, copies = (data[k] for k in ("due_hours","capture_hours","candidates","copy_candidates"))
+        if (any(type(x) is not int for x in (due,captured,candidates,copies))
+                or not 0 <= captured <= due <= 672 or not 0 <= copies <= candidates <= 300*captured):
+            return None
+        if data["capital"] != 1000 or data["sleeve"] != 75 or data["state"] not in (
+            "Observing","Window complete","Awaiting scheduled captures",
+        ):
+            return None
+    except (KeyError, ValueError, TypeError):
+        return None
+    results = {}
+    raw = data.get("results")
+    if raw is not None:
+        try:
+            for scenario in ("base","stress"):
+                sample = raw[scenario]
+                counts = {k:sample[k] for k in ("scored_hours","unscored_hours","different_hours")}
+                if (any(type(v) is not int or not 0 <= v <= due for v in counts.values())
+                        or counts["scored_hours"] > captured or counts["different_hours"] > counts["scored_hours"]
+                        or counts["scored_hours"]+counts["unscored_hours"] != due):
+                    return None
+                comparison = {}
+                for name in ("copy_on","copy_off"):
+                    row = {k:sample[name][k] for k in ("net","closes","marked_after_exit_drawdown","net_without_largest","copy_closes")}
+                    if (not all(type(v) in (int,float) and abs(v) <= 1e6 and math.isfinite(v) for v in row.values())
+                            or type(row["closes"]) is not int or type(row["copy_closes"]) is not int
+                            or not 0 <= row["copy_closes"] <= row["closes"] <= counts["scored_hours"]):
+                        return None
+                    comparison[name] = row
+                delta = comparison["copy_off"]["net"]-comparison["copy_on"]["net"]
+                results[scenario] = {**counts, **comparison, "delta_off_minus_on":delta}
+        except (KeyError, TypeError):
+            return None
+    state = data["state"]
+    stale = now-stamp > timedelta(minutes=90)
+    enough = (not stale and state == "Window complete" and due == 672 and results
+              and all(r["scored_hours"] >= due*.9 and r["different_hours"] >= 20 for r in results.values()))
+    return {"state":state, "coverage":captured, "due_hours":due, "candidates":candidates, "copy_candidates":copies,
+            "results":results or None, "published_at":stamp.astimezone(UTC).isoformat(), "stale":stale,
+            "start":start.astimezone(UTC).isoformat(), "end":end.astimezone(UTC).isoformat(),
+            "verdict":"Exploratory comparison complete" if enough else "Insufficient evidence"}
+
+
 def notify_forward_gaps(integrity, config, state_path):
     if not integrity or not integrity["missed"]:
         return "quiet"
@@ -378,9 +460,22 @@ def fixed_weekly_report(path, directory, now):
     return report
 
 
+def stock_broker_check(path, now):
+    from src.trading.paper_reporting import timestamp
+
+    data = load_object(path, max_bytes=4096)
+    seen = timestamp(data.get("observed_at"))
+    note = data.get("note")
+    if (seen is None or not 0 <= (now-seen).total_seconds() <= 30*3600
+            or data.get("status") not in ("Pass","Fail","Insufficient evidence")
+            or not isinstance(note,str) or len(note) > 160):
+        return {"status":"Insufficient evidence", "note":"No fresh read-only broker audit.", "observed_at":None}
+    return {"status":data["status"], "note":note, "observed_at":seen.isoformat()}
+
+
 def investment_review(path, directory, broker_path, weekly, host, now, monthly_ops, drill_path=None):
     from src.learning.copy_toggle_replay import compare
-    from src.learning.investment_scorecard import UNKNOWN, build_week, check, economics, paper_cash_check, paper_checkpoint, paper_protection_check
+    from src.learning.investment_scorecard import build_week, economics, paper_cash_check, paper_checkpoint, paper_protection_check
     from src.trading.paper_reporting import completed_week, timestamp
 
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -395,13 +490,7 @@ def investment_review(path, directory, broker_path, weekly, host, now, monthly_o
     prior = load_object(directory / f"cash-{recent-timedelta(days=1)}.json", max_bytes=4096)
     cash = paper_cash_check(prior, current)
     protection = paper_protection_check(path, now)
-    broker = load_object(broker_path, max_bytes=4096)
-    seen = timestamp(broker.get("observed_at"))
-    statuses = {"Pass","Fail",UNKNOWN}
-    note = broker.get("note")
-    if (seen is None or not 0 <= (now-seen).total_seconds() <= 30*3600 or broker.get("status") not in statuses
-            or not isinstance(note, str) or len(note) > 160):
-        broker = check("Stock paper identities", UNKNOWN, "No fresh read-only broker audit.")
+    broker = stock_broker_check(broker_path, now)
     start, end = completed_week(now-timedelta(minutes=10))
     copy_path = directory / f"copy-toggle-{start.date()}-to-{end.date()}.json"
     copy = load_object(copy_path)
@@ -509,6 +598,8 @@ def stock_alert(snapshot: dict, now: datetime) -> str | None:
         return None
     if age > 900:
         return "stale_worker"
+    if ((snapshot.get("stock_pilot") or {}).get("execution") or {}).get("stuck"):
+        return "strategy_order_aging"
     recent = (snapshot.get("stock_pilot") or {}).get("decisions", [])
     if state == "quote_not_usable":
         return state if len(recent) >= 3 and all(row["state"] == state for row in recent[:3]) else None
@@ -567,6 +658,7 @@ def main() -> None:
     parser.add_argument("--stock-forward-report", type=Path, default=Path("/var/lib/hyperliquid-stock-forward/latest.json"))
     parser.add_argument("--stock-forward-ledger", type=Path, default=Path("/var/lib/hyperliquid-stock-forward/market.sqlite3"))
     parser.add_argument("--stock-forward-restore", type=Path, default=Path("/var/lib/hyperliquid-dashboard/stock-forward-restore.json"))
+    parser.add_argument("--copy-forward-report", type=Path, default=Path("/var/lib/hyperliquid-copy-forward/latest.json"))
     parser.add_argument("--offhost-restore", type=Path, default=Path("/var/lib/hyperliquid-dashboard/offhost-restore.json"))
     parser.add_argument("--stock-reconciliation", type=Path, default=Path("/var/lib/hyperliquid-stock-paper/broker-reconciliation.json"))
     parser.add_argument("--isolated-stock-drill", type=Path, default=Path("/var/lib/hyperliquid-stock-drill/verified.json"))
@@ -588,11 +680,16 @@ def main() -> None:
         except (sqlite3.Error, ValueError, OSError):
             snapshot["stock_pilot"] = None
     now = datetime.now(UTC)
+    if snapshot.get("stock_pilot"):
+        snapshot["stock_pilot"]["broker_check"] = stock_broker_check(args.stock_reconciliation, now)
     snapshot["absorption"] = absorption_status(args.absorption_report, now)
     snapshot["forward_shadow"] = forward_shadow_status(args.forward_report, now)
     snapshot["stock_forward"] = stock_forward_status(args.stock_forward_report, now, args.monthly_ops_usd)
     integrity = stock_forward_integrity(args.stock_forward_ledger, now)
     snapshot["stock_forward_restore"] = forward_restore_status(args.stock_forward_restore, integrity, now)
+    lag = forward_backup_lag(integrity, snapshot["stock_forward_restore"], now)
+    snapshot["stock_forward_backup"] = lag
+    snapshot["copy_forward"] = copy_forward_status(args.copy_forward_report, now)
     stock_forward = snapshot["stock_forward"]
     if stock_forward and stock_forward["state"] != "Unavailable":
         if integrity is None:
@@ -602,6 +699,9 @@ def main() -> None:
             if integrity["missed"]:
                 last = max(integrity["missed"])
                 stock_forward["market_status"] = f"Latest gap {last} NY: {FORWARD_GAPS[integrity['missed'][last]]}"
+            if lag and lag["overdue"]:
+                message = f"Encrypted checkpoint overdue: {lag['missing']} observations not verified off-VPS"
+                stock_forward["market_status"] = " | ".join(x for x in (stock_forward["market_status"], message) if x)
     snapshot["offhost_restore"] = offhost_restore_status(args.offhost_restore, now)
     if args.paper_db:
         from src.data.decision_coverage import read_report
@@ -629,6 +729,9 @@ def main() -> None:
                 snapshot["investment"] = None
     publish(args.output, snapshot)
     if args.telegram_env and args.alert_state:
+        delivery = notify_backup_lag(lag, args.telegram_env, args.alert_state.with_name("stock-forward-backup-alerts.json"), now)
+        if delivery in {"sent", "delivery_unavailable"}:
+            print("Stock forward backup:", delivery)
         delivery = notify_forward_gaps(integrity, args.telegram_env, args.alert_state.with_name("stock-forward-alerts.json"))
         if delivery in {"sent", "delivery_unavailable"}:
             print("Stock forward coverage:", delivery)

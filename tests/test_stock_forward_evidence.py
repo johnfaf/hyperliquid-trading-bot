@@ -116,3 +116,20 @@ def test_audit_rejects_unreproducible_signal(tmp_path):
     with closing(sqlite3.connect(path)) as db, db:
         db.execute("UPDATE frames SET entry=0")
     assert publisher.stock_forward_integrity(path, feed.now) is None
+
+
+def test_recovery_alert_targets_oldest_unprotected_capture(monkeypatch, tmp_path):
+    now = datetime(2026,11,26,20,tzinfo=UTC)
+    seconds = int(now.timestamp())
+    integrity = {"frames":3, "capture_timestamps":[seconds-48*3600,seconds-20*3600,seconds-60]}
+    lag = publisher.forward_backup_lag(integrity, {"frames":1}, now)
+    assert lag["missing"] == 2 and lag["overdue"]
+    assert not publisher.forward_backup_lag(integrity, {"frames":2}, now)["overdue"]
+    complete = publisher.forward_backup_lag(integrity, {"frames":3,"stale":True}, now)
+    assert complete["status"] == "Encrypted checkpoint current" and not complete["overdue"]
+    calls = []
+    monkeypatch.setattr(publisher,"send_telegram",lambda cfg,msg:calls.append(msg) or True)
+    path = tmp_path/"lag.json"
+    assert publisher.notify_backup_lag(lag,None,path,now) == "sent"
+    assert publisher.notify_backup_lag(lag,None,path,now+timedelta(hours=2)) == "quiet"
+    assert "2 captured observations" in calls[0]
