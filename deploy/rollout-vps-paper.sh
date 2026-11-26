@@ -53,7 +53,7 @@ stock_env=/etc/hyperliquid-stock-paper/paper.env
 if sudo -n test -e "$stock_env"; then
     stock_orders=$(sudo -n grep -E '^[[:space:]]*STOCK_PAPER_SEND_ORDERS[[:space:]]*=' "$stock_env" || true)
     if [[ -n "$stock_orders" && "$stock_orders" != STOCK_PAPER_SEND_ORDERS=false ]]; then
-        printf '%s\n' "Stock shadow-only configuration was not confirmed." >&2
+        printf '%s\n' "The shared stock credentials must stay read-only; use the worker's separate activation file." >&2
         exit 1
     fi
 fi

@@ -12,7 +12,7 @@ from tempfile import NamedTemporaryFile
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from src.trading.alpaca_paper import AlpacaPaper
+from src.trading.alpaca_paper import AlpacaPaper, paper_account_pin
 
 LIMIT = 2000
 
@@ -38,10 +38,12 @@ def _position(rows):
     return {symbol: qty for symbol, qty in values.items() if qty}
 
 
-def compare(broker, path):
+def compare(broker, path, *, required_flat_account=None):
     first = broker.request("/v2/account")
     if first.get("status") != "ACTIVE" or first.get("trading_blocked") is not False or not first.get("id"):
         return {"status": "Insufficient evidence", "note": "Paper account not available for verification."}
+    if required_flat_account is not None and first["id"] != required_flat_account:
+        return {"status":"Fail","note":"The paper account changed during activation."}
     scope = "alpaca-paper:" + first["id"]
     positions = _position(broker.request("/v2/positions"))
     open_orders = broker.request("/v2/orders", query={"status":"open","limit":500})
@@ -82,17 +84,55 @@ def compare(broker, path):
         inventory[symbol] = inventory.get(symbol,Decimal(0)) + (qty if side=="buy" else -qty)
     if {k:v for k,v in inventory.items() if v} != positions:
         return {"status":"Fail","note":"Broker position quantities do not match the local fill ledger."}
+    if required_flat_account is not None:
+        if positions or open_orders:
+            return {"status":"Fail","note":"Initial activation requires a flat account with no open orders."}
+        return {"status":"Pass","note":"Flat paper account and durable order journal verified."}
     if not local_fills:
         return {"status":"Insufficient evidence","note":"Connected paper account is flat and matched; no fills to verify."}
     return {"status":"Pass","note":f"{len(local_fills)} fill IDs, open orders and positions matched; cash drill separate."}
 
 
+def arm(broker, ledger, output, *, drill_account):
+    account = broker.request("/v2/account")["id"]
+    if not drill_account or account == drill_account:
+        raise ValueError("strategy and drill paper accounts must be distinct")
+    pin = paper_account_pin(account)
+    proof = compare(broker, ledger, required_flat_account=account)
+    if proof["status"] != "Pass":
+        raise ValueError(proof["note"])
+    temporary = None
+    try:
+        with NamedTemporaryFile(dir=output.parent, mode="w", encoding="ascii", delete=False) as stream:
+            temporary = Path(stream.name)
+            stream.write(f"STOCK_PAPER_SEND_ORDERS=true\nSTOCK_PAPER_ACCOUNT_SHA256={pin}\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        temporary.chmod(0o600)
+        temporary.replace(output)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+    return proof
+
+
 def main():
     parser = ArgumentParser(description=__doc__)
     parser.add_argument("--db", required=True, type=Path)
-    parser.add_argument("--out", required=True, type=Path)
+    output = parser.add_mutually_exclusive_group(required=True)
+    output.add_argument("--out", type=Path)
+    output.add_argument("--arm-output", type=Path)
     args = parser.parse_args()
     key, secret = os.getenv("STOCK_PAPER_KEY"), os.getenv("STOCK_PAPER_SECRET")
+    if args.arm_output:
+        if os.getenv("STOCK_PAPER_SEND_ORDERS") != "false" or not key or not secret:
+            parser.error("Arming requires the shared paper credentials file in read-only mode.")
+        try:
+            print(json.dumps(arm(AlpacaPaper(key, secret), args.db, args.arm_output,
+                                 drill_account=os.getenv("DRILL_ALPACA_ACCOUNT_ID"))))
+        except (ValueError, KeyError, TypeError, OSError, ArithmeticError, RuntimeError, sqlite3.Error):
+            parser.error("Paper activation preflight failed; no permission change made.")
+        return
     if os.getenv("STOCK_PAPER_SEND_ORDERS") != "false" or not key or not secret:
         result = {"status":"Insufficient evidence","note":"Shadow mode or paper credentials not confirmed."}
     else:

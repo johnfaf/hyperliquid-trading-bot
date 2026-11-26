@@ -10,6 +10,7 @@ User=hyperliquid-stock-paper
 StateDirectory=hyperliquid-stock-paper
 StateDirectoryMode=0700
 EnvironmentFile=-/etc/hyperliquid-stock-paper/paper.env
+EnvironmentFile=-/etc/hyperliquid-stock-paper/execution.env
 ExecStart=/usr/bin/python3 -I -B /opt/hyperliquid-stock-paper/current/scripts/run_stock_paper.py --db /var/lib/hyperliquid-stock-paper/orders.sqlite3
 TimeoutStartSec=90
 NoNewPrivileges=yes

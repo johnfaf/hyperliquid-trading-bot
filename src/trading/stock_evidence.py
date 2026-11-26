@@ -15,7 +15,7 @@ NEW_YORK = ZoneInfo("America/New_York")
 MODELED_FEE_RATE = Decimal("0.0002")
 INCIDENTS = {
     "broker_position_mismatch", "unmanaged_or_unconfirmed_fill", "unmanaged_open_order",
-    "submission_unknown", "submitting", "cycle_failed", "stale_broker_clock", "order_rejected",
+    "submission_unknown", "submitting", "cycle_failed", "stale_broker_clock", "order_rejected", "paper_account_unverified",
 }
 NEUTRAL = {"outside_entry_or_exit_window", "no_order"}
 

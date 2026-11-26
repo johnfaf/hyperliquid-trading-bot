@@ -17,7 +17,7 @@ if str(ROOT) not in sys.path:
 
 from src.trading.alpaca_paper import (
     AlpacaPaper, DAILY_LOSS_USD, DEFAULT_SYMBOL, MAX_ENTRY_USD,
-    MAX_QUOTE_AGE_SECONDS, MAX_QUOTE_SPREAD_FRACTION, STRATEGY_ID,
+    MAX_QUOTE_AGE_SECONDS, MAX_QUOTE_SPREAD_FRACTION, STRATEGY_ID, paper_account_pin,
 )
 from src.trading.order_journal import OrderJournal, client_id
 from src.trading.stock_evidence import StockEvidence
@@ -70,7 +70,10 @@ def reconcile(broker, journal):
             remote = broker.lookup(row["client_id"])
             if remote is not None:
                 observe(journal, row["client_id"], remote)
-    known = {x["venue_id"]: x for x in journal.orders() if x["venue_id"]}
+    orders = [x for x in journal.orders() if x["venue_id"]]
+    known = {x["venue_id"]: x for x in orders}
+    if len(known) != len(orders):
+        return {}, "unmanaged_open_order"
     fills = broker.fills()
     for fill in fills:
         order = known.get(fill.order_id)
@@ -79,10 +82,12 @@ def reconcile(broker, journal):
     journal.record_fills(fills)
     rows = broker.request("/v2/positions")
     positions = {row["symbol"]: Decimal(row["qty"]) for row in rows}
-    if any(not qty.is_finite() or qty <= 0 for qty in positions.values()) or positions != journal.inventory():
+    if len(positions) != len(rows) or any(not qty.is_finite() or qty <= 0 for qty in positions.values()) or positions != journal.inventory():
         return {}, "broker_position_mismatch"
     open_orders = broker.request("/v2/orders", query={"status": "open", "limit": 500})
-    if any(row["id"] not in known for row in open_orders):
+    if not isinstance(open_orders, list) or len(open_orders) >= 500 or any(
+        row["id"] not in known or row.get("client_order_id") != known[row["id"]]["client_id"] for row in open_orders
+    ):
         return {}, "unmanaged_open_order"
     if journal.unresolved():
         return positions, "submission_unknown"
@@ -92,13 +97,15 @@ def reconcile(broker, journal):
 
 
 def tick(broker, journal, *, symbol, orders_enabled=False, flatten=False,
-         evidence=None, remember=None, drill=None):
+         evidence=None, remember=None, drill=None, expected_account=None):
     if flatten:
         journal.set_pause("operator_flatten")
     positions, problem = reconcile(broker, journal)
     if problem:
         return {"state": problem}
     account = broker.request("/v2/account")
+    if expected_account is not None and account.get("id") != expected_account:
+        return {"state": "paper_account_unverified"}
     if set(positions) - {symbol}:
         return {"state": "unexpected_symbol"}
     if account.get("trading_blocked") or account.get("status") != "ACTIVE":
@@ -116,28 +123,34 @@ def tick(broker, journal, *, symbol, orders_enabled=False, flatten=False,
     today = day.isoformat()
     if not clock["is_open"] or timestamp(clock["next_close"]) - now < timedelta(minutes=5):
         return {"state": "outside_entry_or_exit_window", "session": today}
-    lookback = (day - timedelta(days=50)).isoformat()
-    calendar = broker.request("/v2/calendar", query={"start": lookback, "end": today})
-    sessions = sorted(row["date"] for row in calendar)
-    if today not in sessions:
-        return {"state": "not_a_trading_session"}
+    equity = positive(account["equity"])
+    delta = equity - positive(account["last_equity"])
+    qty = positions.get(symbol, Decimal(0))
+    risk_exit = qty and (delta <= -DAILY_LOSS_USD or equity_risk["reason"] in {
+        "daily_equity_loss_limit", "peak_equity_drawdown_limit",
+    })
+    closing = qty and (risk_exit or flatten or drill == "sell")
     asset = broker.request(f"/v2/assets/{symbol}")
     if asset.get("class") != "us_equity" or not asset.get("tradable") or not asset.get("fractionable"):
         return {"state": "unsupported_asset"}
-    bars = broker.request(f"/v2/stocks/{symbol}/bars", market_data=True, query={
-        "timeframe": "1Day", "feed": "iex", "start": lookback, "end": today, "adjustment": "split", "limit": 100,
-    })
-    signals = None if bars.get("next_page_token") else trend(bars["bars"], sessions, today)
-    qty = positions.get(symbol, Decimal(0))
-    if signals is None and not ((flatten or drill == "sell") and qty):
+    signals = None
+    if not closing:
+        lookback = (day - timedelta(days=50)).isoformat()
+        calendar = broker.request("/v2/calendar", query={"start": lookback, "end": today})
+        sessions = sorted(row["date"] for row in calendar)
+        if today not in sessions:
+            return {"state": "not_a_trading_session"}
+        bars = broker.request(f"/v2/stocks/{symbol}/bars", market_data=True, query={
+            "timeframe": "1Day", "feed": "iex", "start": lookback, "end": today, "adjustment": "split", "limit": 100,
+        })
+        signals = None if bars.get("next_page_token") else trend(bars["bars"], sessions, today)
+    if signals is None and not closing:
         return {"state": "not_enough_completed_bars"}
-    equity = positive(account["equity"])
-    delta = equity - positive(account["last_equity"])
     entry_paused = bool(journal.pause_reason()) or equity_risk["blocked"]
     drill_qty = evidence.drill_position(symbol) if evidence and qty else Decimal(0)
     paper_guard = qty and drill_qty and not (drill or flatten)
     if qty:
-        side = "sell" if flatten or (signals and signals[1]) or delta <= -DAILY_LOSS_USD else None
+        side = "sell" if closing or (signals and signals[1]) else None
     else:
         side = "buy" if not flatten and not entry_paused and signals and signals[0] and delta > -DAILY_LOSS_USD else None
     if drill:
@@ -204,6 +217,7 @@ def main():
         parser.error("symbol must be a simple US equity ticker")
     key, secret = os.getenv("STOCK_PAPER_KEY"), os.getenv("STOCK_PAPER_SECRET")
     orders_enabled = os.getenv("STOCK_PAPER_SEND_ORDERS") == "true"
+    allowed_pin = os.getenv("STOCK_PAPER_ACCOUNT_SHA256")
     drill = args.action.removeprefix("drill-") if args.action.startswith("drill-") else None
     if drill and (not args.confirm_paper_drill or orders_enabled):
         parser.error("the supervised drill requires --confirm-paper-drill and shadow mode")
@@ -226,6 +240,11 @@ def main():
             return
         broker = AlpacaPaper(key, secret)
         account_id = broker.request("/v2/account")["id"]
+        if orders_enabled and paper_account_pin(account_id) != allowed_pin:
+            result = {"state": "paper_account_unverified"}
+            remember(result, finished=True)
+            print(json.dumps({"mode": mode, **result}))
+            return
         account = f"alpaca-paper:{account_id}"
         journal = OrderJournal(args.db, account)
         evidence = StockEvidence(args.db, account)
@@ -236,6 +255,7 @@ def main():
             result = tick(
                 broker, journal, symbol=args.symbol, orders_enabled=orders_enabled,
                 flatten=args.action == "flatten", evidence=evidence, remember=remember, drill=drill,
+                expected_account=account_id if orders_enabled else None,
             )
         remember(result, finished=True)
         print(json.dumps({"mode": mode, **result}))

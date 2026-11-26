@@ -1,6 +1,7 @@
 """Paper-only US equity broker transport. No production trading host is accepted."""
 from decimal import Decimal
 from datetime import datetime, timezone
+from hashlib import sha256
 import json
 from urllib.error import HTTPError
 from urllib.parse import urlencode
@@ -15,6 +16,12 @@ MAX_ENTRY_USD = Decimal(75)
 DAILY_LOSS_USD = Decimal(10)
 MAX_QUOTE_AGE_SECONDS = 30
 MAX_QUOTE_SPREAD_FRACTION = Decimal("0.005")
+
+
+def paper_account_pin(account_id):
+    if not isinstance(account_id, str) or not account_id or account_id != account_id.strip():
+        raise ValueError("invalid paper account identity")
+    return sha256(account_id.encode()).hexdigest()
 
 
 class NoRedirects(HTTPRedirectHandler):
