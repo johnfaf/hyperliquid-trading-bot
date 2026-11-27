@@ -62,7 +62,7 @@ class Pilot:
         if orders:
             try:
                 with closing(sqlite3.connect(self.path.resolve().as_uri()+"?mode=ro",uri=True,timeout=2)) as db:
-                    plan=db.execute("SELECT signal_at,stop FROM plans WHERE account=? AND client_id=?",
+                    plan=db.execute("SELECT signal_at,stop FROM stock_orb_plans WHERE account=? AND client_id=?",
                                     (journal.account,orders[-1]["client_id"])).fetchone()
             except (OSError,sqlite3.Error):
                 pass
@@ -81,12 +81,12 @@ class Pilot:
     def reserve_plan(self,account,client,signal):
         with closing(sqlite3.connect(self.path,timeout=5)) as db, db:
             db.execute("PRAGMA synchronous=FULL")
-            db.execute("""CREATE TABLE IF NOT EXISTS plans (
+            db.execute("""CREATE TABLE IF NOT EXISTS stock_orb_plans (
                 account TEXT NOT NULL, client_id TEXT NOT NULL, protocol TEXT NOT NULL,
                 signal_at INTEGER, stop TEXT, signal_price TEXT, range_high TEXT,
                 PRIMARY KEY(account,client_id)
             )""")
             row=(account,client,RULE,signal.at,str(signal.stop),str(signal.price),str(signal.range_high))
-            db.execute("INSERT OR IGNORE INTO plans VALUES (?,?,?,?,?,?,?)",row)
-            if db.execute("SELECT * FROM plans WHERE account=? AND client_id=?",row[:2]).fetchone()!=row:
+            db.execute("INSERT OR IGNORE INTO stock_orb_plans VALUES (?,?,?,?,?,?,?)",row)
+            if db.execute("SELECT * FROM stock_orb_plans WHERE account=? AND client_id=?",row[:2]).fetchone()!=row:
                 raise ValueError("intraday plan changed after reservation")

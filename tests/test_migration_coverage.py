@@ -57,7 +57,8 @@ SQLITE_ONLY_MODULE_TABLES = {
     "data/decision_coverage.py": {"evidence"},  # sibling .decisions.sqlite3
     "data/absorption_feed.py": {"frames", "decisions"},  # independent public-feed ledger
     "trading/order_journal.py": {"orders", "fills", "pauses"},  # per-account execution journal
-    "trading/stock_evidence.py": {"stock_cycles", "stock_cycle_attempts"},  # stock-only journal
+    "trading/stock_evidence.py": {"stock_cycles", "stock_cycle_attempts", "stock_daily_signal_inputs"},  # stock-only journal
+    "trading/stock_intraday_pilot.py": {"stock_orb_plans"},  # separate paper-only protection plans
     "trading/equity_risk.py": {"account_equity_samples"},  # account-scoped SQLite risk sidecar
     "trading/paper_funding.py": {"paper_oracle_samples", "paper_funding_rates"},  # public settlement sidecar
 }
