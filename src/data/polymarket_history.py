@@ -13,6 +13,7 @@ from typing import Any, Dict, Iterable, List, Optional
 import requests
 
 import config
+from src.data.polymarket_snapshot_codec import decode as decode_snapshot, encode as encode_snapshot
 
 logger = logging.getLogger(__name__)
 
@@ -270,6 +271,7 @@ def store_markets(raw_markets: Iterable[Dict[str, Any]], observed_at_ms: Optiona
             closed = _bool(market.get("closed"), False)
             end_date = _first(market, ("endDate", "end_date", "end_date_iso"), None)
             raw_json = _json(market)
+            snapshot_json = encode_snapshot(raw_json)
             probability = _market_probability(market)
             volume = _float(_first(market, ("volume", "volumeNum", "totalVolume"), None))
             volume_24h = _float(_first(market, ("volume24hr", "volume24h", "volume_24h"), None))
@@ -331,7 +333,7 @@ def store_markets(raw_markets: Iterable[Dict[str, Any]], observed_at_ms: Optiona
                         best_bid,
                         best_ask,
                         spread_bps,
-                        raw_json,
+                        snapshot_json,
                     ),
                 )
                 if getattr(cur, "rowcount", 0) != 0:
@@ -689,9 +691,11 @@ class PolymarketHistoricalProvider:
         markets: List[Dict[str, Any]] = []
         for row in rows:
             record = dict(row)
-            raw = _loads(record.get("raw_market"), {}) or {}
-            if not isinstance(raw, dict):
-                raw = {}
+            try:
+                raw = decode_snapshot(record.get("raw_market"))
+            except ValueError:
+                logger.warning("Stored Polymarket snapshot could not be decoded")
+                continue
             raw.setdefault("id", record.get("market_id"))
             raw.setdefault("question", record.get("question"))
             raw.setdefault("slug", record.get("slug"))

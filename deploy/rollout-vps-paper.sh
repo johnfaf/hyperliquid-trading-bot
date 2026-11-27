@@ -58,6 +58,14 @@ if sudo -n test -e "$stock_env"; then
     fi
 fi
 
+rollback_dir=/srv/hyperliquid-bot/rollbacks
+sudo -n install -d -m 0700 "$rollback_dir"
+check_storage() {
+    sudo -n python3 -I -B "$release/scripts/paper_storage_capacity.py" --paper-db "$paper_data/bot.db" \
+        --stock-db /var/lib/hyperliquid-stock-paper/orders.sqlite3 --rollbacks "$rollback_dir" --require-rollout-space
+}
+check_storage
+
 # These files are local infrastructure and notification settings, not part of the stock rollout.
 install -m 0644 "$previous/.dockerignore" "$release/.dockerignore"
 install -D -m 0644 "$previous/deploy/vps/launch.py" "$release/deploy/vps/launch.py"
@@ -67,19 +75,14 @@ sudo -n docker build --build-arg RUN_AS_USER=bot --build-arg "BOT_BUILD_REVISION
 sudo -n docker run --rm --network=none --entrypoint python "$tag" -B -c \
     'from src.trading.order_journal import OrderJournal; from src.trading.live_trader import LiveTrader; from scripts.run_stock_paper import AlpacaPaper; from src.ui.v2.app import create_app; create_app()'
 
-sudo -n install -d -m 0700 /srv/hyperliquid-bot/rollbacks
-sudo -n python3 - "$paper_data" "/srv/hyperliquid-bot/rollbacks" "$rev" <<'PY'
+check_storage
+sudo -n python3 - "$paper_data" "$rollback_dir" "$rev" <<'PY'
 from contextlib import closing
 from pathlib import Path
-import shutil, sqlite3, sys
+import sqlite3, sys
 
 data, rollbacks = map(Path, sys.argv[1:3])
 revision = sys.argv[3]
-required = sum(path.stat().st_size for path in (data / "bot.db", data / "bot.decisions.sqlite3",
-               data / "bot.orders.sqlite3", data / "bot.risk.sqlite3", data / "bot.funding.sqlite3",
-               Path("/var/lib/hyperliquid-stock-paper/orders.sqlite3")) if path.exists())
-if shutil.disk_usage(rollbacks).free < required*2 + 2*1024**3:
-    raise SystemExit("not enough space for backups, isolated recovery verification, and reserve")
 for kind, filename in (("bot", "bot.db"), ("decisions", "bot.decisions.sqlite3"), ("orders", "bot.orders.sqlite3"),
                        ("risk", "bot.risk.sqlite3"), ("funding", "bot.funding.sqlite3"),
                        ("stock", "/var/lib/hyperliquid-stock-paper/orders.sqlite3")):
@@ -251,6 +254,7 @@ sudo -n systemctl enable --now hyperliquid-copy-forward.timer
 sudo -n install -D -m 0644 "$release/scripts/publish_dashboard_status.py" /opt/hyperliquid-dashboard/publish_dashboard_status.py
 sudo -n install -D -m 0644 "$release/scripts/recovery_bundle.py" /opt/hyperliquid-recovery/recovery_bundle.py
 sudo -n install -D -m 0644 "$release/scripts/stock_forward_evidence.py" /opt/hyperliquid-dashboard/scripts/stock_forward_evidence.py
+sudo -n install -D -m 0644 "$release/scripts/paper_storage_capacity.py" /opt/hyperliquid-dashboard/scripts/paper_storage_capacity.py
 sudo -n install -D -m 0644 "$release/scripts/stock_forward_evidence.py" /opt/hyperliquid-recovery/stock_forward_evidence.py
 for file in src/trading/alpaca_paper.py src/trading/order_journal.py src/trading/stock_evidence.py \
     src/core/clock_provider.py src/backtest/replay/clock.py src/trading/trade_decision_memory.py src/trading/equity_risk.py \

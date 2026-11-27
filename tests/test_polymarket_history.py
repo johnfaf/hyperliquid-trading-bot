@@ -1,4 +1,5 @@
 import contextlib
+import json
 import sqlite3
 
 import pytest
@@ -9,8 +10,10 @@ from src.data.polymarket_history import (
     CLOB_API,
     DATA_API,
     PolymarketHistoricalDownloader,
+    PolymarketHistoricalProvider,
     store_markets,
 )
+from src.data.polymarket_snapshot_codec import BLOB, SIZE, decode, encode
 from src.learning.schema import ensure_sqlite_schema
 
 
@@ -189,3 +192,31 @@ def test_store_markets_preserves_same_timestamp_snapshots(monkeypatch):
 
     assert [row["observed_at_ms"] for row in rows] == [3000, 3001]
     assert [row["probability"] for row in rows] == [0.51, 0.52]
+
+
+def test_snapshot_payload_is_lossless_and_byte_bounded():
+    payload = {"description":"State recorded at the source. "*300, "outcomes":["Yes","No"],"cents":0.42}
+    plain = json.dumps(payload)
+    compressed = encode(plain)
+    envelope = json.loads(compressed)
+    assert len(compressed) < len(plain)//4 and BLOB in envelope
+    assert decode(compressed) == decode(envelope) == decode(plain) == payload
+    assert encode('{"small":"packet"}') == '{"small":"packet"}'
+    with pytest.raises(ValueError, match="length"):
+        decode({**envelope, SIZE:192})
+    with pytest.raises(ValueError, match="stream"):
+        decode({**envelope, BLOB:"invalid!"})
+
+
+def test_point_in_time_provider_can_mix_legacy_and_compressed_rows(monkeypatch):
+    conn = _memory_db(monkeypatch)
+    market = {"id":"mid","question":"Old question","probability":.50,"active":True,"closed":False}
+    store_markets([market],observed_at_ms=1000)
+    newer = {**market,"question":"Updated question","probability":.70,"huge":"nested-provider-data"*1000}
+    store_markets([newer],observed_at_ms=2000)
+    snapshots = conn.execute("SELECT raw_market FROM polymarket_market_snapshots ORDER BY observed_at_ms").fetchall()
+    dimension = conn.execute("SELECT raw_market FROM polymarket_markets").fetchone()[0]
+    assert BLOB not in json.loads(snapshots[0][0]) and BLOB in json.loads(snapshots[1][0])
+    assert json.loads(dimension) == newer
+    assert PolymarketHistoricalProvider(1500).fetch_markets()[0]["question"] == "Old question"
+    assert PolymarketHistoricalProvider(2500).fetch_markets()[0]["huge"] == newer["huge"]

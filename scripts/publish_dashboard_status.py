@@ -332,6 +332,43 @@ def notify_backup_lag(lag, config, state_path, now):
     return "delivery_unavailable"
 
 
+def storage_status(paper_db, stock_db, rollback_dir, history_path, now):
+    from scripts.paper_storage_capacity import measure, track
+
+    try:
+        history = load_object(history_path, max_bytes=8192).get("samples")
+        report, series = track(measure(paper_db, stock_db, rollback_dir), history, now)
+        if series != history:
+            publish(history_path, {"samples":series}, mode=0o600)
+        return report
+    except OSError:
+        return None
+
+
+def notify_storage(storage, config, state_path, now):
+    from scripts.paper_storage_capacity import GIB
+
+    if not storage or storage["severity"] == "normal":
+        return "quiet"
+    history = load_object(state_path)
+    severity = storage["severity"]
+    last = history.get(severity)
+    if type(last) in (int,float) and 0 <= now.timestamp()-last < 86400:
+        return "quiet"
+    free, total = (storage[key]/GIB for key in ("active_free","active_total"))
+    shortfall = storage["shortfall"]/GIB
+    message = (f"Paper VPS storage {severity}: {free:.1f} of {total:.1f} GiB free. "
+               f"Guarded rollout is short by {shortfall:.1f} GiB. No ledger files were changed.")
+    try:
+        if send_telegram(config,message):
+            history[severity] = now.timestamp()
+            publish(state_path,{k:history[k] for k in ("low","critical") if k in history},mode=0o600)
+            return "sent"
+    except Exception:
+        pass  # Do not log transport details or the Telegram URL.
+    return "delivery_unavailable"
+
+
 def copy_forward_status(path, now):
     data = load_object(path, max_bytes=8192)
     if data.get("rule") != "paired_copy_intrahour_v1" or data.get("live_approval") is not False:
@@ -653,6 +690,7 @@ def main() -> None:
     parser.add_argument("--alert-state", type=Path)
     parser.add_argument("--paper-db", type=Path)
     parser.add_argument("--copy-report-dir", type=Path)
+    parser.add_argument("--rollback-dir", type=Path, default=Path("/srv/hyperliquid-bot/rollbacks"))
     parser.add_argument("--absorption-report", type=Path, default=Path("/var/lib/hyperliquid-absorption/reports/latest.json"))
     parser.add_argument("--forward-report", type=Path, default=Path("/var/lib/hyperliquid-forward-shadow/latest.json"))
     parser.add_argument("--stock-forward-report", type=Path, default=Path("/var/lib/hyperliquid-stock-forward/latest.json"))
@@ -703,10 +741,14 @@ def main() -> None:
                 message = f"Encrypted checkpoint overdue: {lag['missing']} observations not verified off-VPS"
                 stock_forward["market_status"] = " | ".join(x for x in (stock_forward["market_status"], message) if x)
     snapshot["offhost_restore"] = offhost_restore_status(args.offhost_restore, now)
+    storage = None
     if args.paper_db:
         from src.data.decision_coverage import read_report
         from src.trading.paper_funding_health import funding_health
 
+        storage = storage_status(args.paper_db, args.stock_db, args.rollback_dir,
+                                 args.copy_report_dir.parent/"storage-history.json",now)
+        snapshot["storage"] = storage
         snapshot["paper_funding"] = funding_health(args.paper_db, now)
         try:
             report = daily_copy_report(args.paper_db, args.copy_report_dir, now)
@@ -729,6 +771,9 @@ def main() -> None:
                 snapshot["investment"] = None
     publish(args.output, snapshot)
     if args.telegram_env and args.alert_state:
+        delivery = notify_storage(storage, args.telegram_env, args.alert_state.with_name("storage-alerts.json"), now)
+        if delivery in {"sent", "delivery_unavailable"}:
+            print("VPS storage:", delivery)
         delivery = notify_backup_lag(lag, args.telegram_env, args.alert_state.with_name("stock-forward-backup-alerts.json"), now)
         if delivery in {"sent", "delivery_unavailable"}:
             print("Stock forward backup:", delivery)

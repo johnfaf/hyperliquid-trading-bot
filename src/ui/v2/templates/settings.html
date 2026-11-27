@@ -49,6 +49,19 @@
       </dl>
     </section>
   </div>
+  {% set storage = desk.host.get("storage") %}
+  {% if storage %}
+  {% set gib = 1073741824 %}
+  <section class="desk-panel" id="storage">
+    <div class="desk-panel-heading"><div><h2>VPS storage</h2><p>Paper ledgers and rollback reserve</p></div>{{ badge(storage.severity|capitalize, "warn" if storage.severity != "normal" else "neutral") }}</div>
+    <dl class="desk-settings-list">
+      <div><dt>Active disk free</dt><dd>{{ "{:.1f} / {:.1f} GiB".format(storage.active_free/gib, storage.active_total/gib) }}</dd></div>
+      <div><dt>Active paper database</dt><dd>{{ "{:.1f} GiB".format(storage.paper_db_bytes/gib) }}</dd></div>
+      <div><dt>Guarded rollout</dt><dd>{{ "{:.1f} GiB short".format(storage.shortfall/gib) if storage.shortfall else "Space available" }}</dd></div>
+      <div><dt>Recent database growth</dt><dd>{{ "{:.2f} GiB/day".format(storage.growth_bytes_per_day/gib) if storage.growth_bytes_per_day is not none else "Collecting measurements" }}</dd></div>
+    </dl>
+  </section>
+  {% endif %}
   <section class="desk-panel settings-jobs">
     <div class="desk-panel-heading"><div><h2>Scheduled jobs</h2><p>UTC</p></div></div>
     <ul class="desk-jobs">
