@@ -1,6 +1,5 @@
 """Read-only capacity check shared by VPS monitoring and the guarded rollout."""
 import argparse
-from datetime import UTC, datetime
 import json
 from pathlib import Path
 from shutil import disk_usage

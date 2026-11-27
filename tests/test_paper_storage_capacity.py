@@ -25,7 +25,9 @@ def test_capacity_monitor_uses_oldest_bounded_sample_and_sees_runway():
     now = datetime(2026,11,27,18,tzinfo=UTC)
     unit = storage.GIB
     sample = {"paper_db_bytes":14*unit,"active_free":12*unit,"active_total":80*unit}
-    at = lambda hours: int((now-timedelta(hours=hours)).timestamp())
+    def at(hours):
+        return int((now-timedelta(hours=hours)).timestamp())
+
     history = [[at(80),unit],[at(-2),unit],[at(24),10*unit],[at(2),13*unit]]
     report, series = storage.track(sample, history, now)
     assert report["growth_bytes_per_day"] == 4*unit and report["days_to_reserve"] == 2.5
