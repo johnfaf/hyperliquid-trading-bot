@@ -54,7 +54,8 @@ class OrderJournal:
             db.execute("PRAGMA synchronous=FULL")
             yield db
 
-    def reserve(self, cid: str, intent: dict, *, entry: bool, purpose: str | None = None) -> bool:
+    def reserve(self, cid: str, intent: dict, *, entry: bool, purpose: str | None = None,
+                exclusive_entry: bool = False) -> bool:
         """Claim before network I/O. A previous claim is never permission to resend."""
         stored = {**intent, "_purpose": purpose} if purpose else intent
         encoded = json.dumps(stored, sort_keys=True, separators=(",", ":"))
@@ -75,6 +76,15 @@ class OrderJournal:
                 ).fetchone()
             ):
                 return False
+            if entry and exclusive_entry:
+                if db.execute("SELECT 1 FROM orders WHERE account=? AND status IN ('accepted','partial')",
+                              (self.account,)).fetchone():
+                    return False
+                inventory={}
+                for symbol,side,qty in db.execute("SELECT symbol,side,quantity FROM fills WHERE account=?",(self.account,)):
+                    inventory[symbol]=inventory.get(symbol,Decimal(0))+Decimal(qty)*(1 if side=="buy" else -1)
+                if any(inventory.values()):
+                    return False
             db.execute("INSERT INTO orders VALUES (?, ?, ?, 'submitting', NULL, ?)", (self.account, cid, encoded, entry))
             return True
 
@@ -158,3 +168,13 @@ class OrderJournal:
             ):
                 result[symbol] = result.get(symbol, Decimal(0)) + Decimal(qty) * (1 if side == "buy" else -1)
         return {symbol: qty for symbol, qty in result.items() if qty}
+
+    def owned_inventory(self, purpose: str) -> dict[str, Decimal]:
+        result={}
+        with self._connection() as db:
+            rows=db.execute("""SELECT f.symbol,f.side,f.quantity,o.intent FROM fills f
+                JOIN orders o ON o.account=f.account AND o.venue_id=f.order_id WHERE f.account=?""",(self.account,))
+            for symbol,side,qty,intent in rows:
+                if json.loads(intent).get("_purpose")==purpose:
+                    result[symbol]=result.get(symbol,Decimal(0))+Decimal(qty)*(1 if side=="buy" else -1)
+        return {symbol:qty for symbol,qty in result.items() if qty}

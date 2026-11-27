@@ -53,6 +53,10 @@ class StockEvidence:
                     id TEXT PRIMARY KEY, started_at TEXT NOT NULL, finished_at TEXT, purpose TEXT NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_stock_cycle_attempts_time ON stock_cycle_attempts(started_at);
+                CREATE TABLE IF NOT EXISTS stock_daily_signal_inputs (
+                    cycle_id TEXT PRIMARY KEY, last_session TEXT NOT NULL, last_close TEXT NOT NULL, sma20 TEXT NOT NULL,
+                    prior_close TEXT NOT NULL, prior_sma20 TEXT NOT NULL, entry INTEGER NOT NULL, exit INTEGER NOT NULL
+                );
             """)
 
     def start(self, cycle_id: str, purpose: str, *, observed_at: datetime | None = None):
@@ -84,6 +88,11 @@ class StockEvidence:
                       decision, state, intent.get("client_order_id"), result.get("quote_at"),
                       result.get("quote_age"), bool(result.get("quote_valid")), *quantities,
                       str(number(intent.get("qty"))) if number(intent.get("qty")) is not None else None))
+            daily = result.get("daily_signal")
+            if daily is not None and purpose == "strategy":
+                fields = ("last_session","last_close","sma20","prior_close","prior_sma20","entry","exit")
+                conn.execute("INSERT OR IGNORE INTO stock_daily_signal_inputs VALUES (?,?,?,?,?,?,?,?)",
+                             (cycle_id,*(daily[k] for k in fields)))
             if finished:
                 conn.execute("UPDATE stock_cycle_attempts SET finished_at=? WHERE id=?",
                              (now.astimezone(timezone.utc).isoformat(), cycle_id))
@@ -257,7 +266,7 @@ def execution_audit(conn, scope, now):
             venue_counts[row["venue_id"]] = venue_counts.get(row["venue_id"], 0) + 1
     for row in rows:
         intent = json.loads(row["intent"])
-        if intent.get("_purpose") != "strategy":
+        if intent.get("_purpose") not in ("strategy","intraday"):
             continue
         if row["operator"]:
             has_operator = True
@@ -291,7 +300,8 @@ def execution_audit(conn, scope, now):
             limit = 10 if status in {"submitting", "unknown", "cancel_pending"} else 30
             stuck += now-stamp > timedelta(minutes=limit)
         orders.append({"ref": row["client_id"][:8], "at": row["proposed_at"], "symbol": intent.get("symbol"),
-                       "side": intent.get("side"), "status": status, "shares": str(done) if valid else None})
+                       "side": intent.get("side"), "status": status, "shares": str(done) if valid else None,
+                       "route":intent["_purpose"]})
     inventory, round_trips = {}, 0
     for f in sorted(natural_fills, key=lambda f: iso_date(f["occurred_at"])):
         before = inventory.get(f["symbol"], Decimal(0))
@@ -333,6 +343,15 @@ def read_summary(path: Path, *, session: str | None = None) -> dict:
             d["ref"] = cid[:8] if cid else None
             cycles.append(d)
         fills = _paper_fills(conn, scope)
+        daily_signal = None
+        if conn.execute("SELECT 1 FROM sqlite_master WHERE name='stock_daily_signal_inputs'").fetchone():
+            row=conn.execute("""SELECT c.session,c.observed_at,c.state,s.last_session,s.last_close,s.sma20,
+                                s.prior_close,s.prior_sma20,s.entry,s.exit
+                                FROM stock_cycles c JOIN stock_daily_signal_inputs s ON s.cycle_id=c.id
+                                WHERE c.account=? AND c.session=? AND c.purpose='strategy'
+                                ORDER BY c.observed_at DESC,c.rowid DESC LIMIT 1""",(scope,session)).fetchone()
+            if row:
+                daily_signal=dict(row)
         coverage = None
         if conn.execute("SELECT 1 FROM sqlite_master WHERE name='stock_cycle_attempts'").fetchone():
             now = clock_provider.utc_now()
@@ -341,7 +360,13 @@ def read_summary(path: Path, *, session: str | None = None) -> dict:
                 FROM stock_cycle_attempts WHERE purpose='strategy' AND started_at>=?
                 """, ((now - timedelta(minutes=10)).isoformat(), (now - timedelta(hours=24)).isoformat())).fetchone()
             coverage = dict(zip(("started", "finished", "overdue"), row))
-        return {"decisions": cycles, "fills": fills[-12:][::-1], "scorecard": scorecard(conn, scope, session),
+        session_score = scorecard(conn,scope,session)
+        if (daily_signal and not daily_signal["entry"] and daily_signal["state"]=="no_order"
+                and session_score["state"] == "No confirmed strategy fills; execution unmeasured"):
+            previous,average=(number(daily_signal[k]) for k in ("last_close","sma20"))
+            if previous is not None and average is not None:
+                session_score["state"]=f"No SMA20 crossover: last close ${previous:.2f}, average ${average:.2f}. No strategy fills."
+        return {"decisions": cycles, "fills": fills[-12:][::-1], "scorecard": session_score,"daily_signal":daily_signal,
                 "drill": drill_status(conn, scope, fills), "coverage": coverage,
                 "execution": execution_audit(conn, scope, clock_provider.utc_now()),
                 "equity_risk": _equity_risk(path, scope)}

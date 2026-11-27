@@ -15,6 +15,31 @@
     </div>
   </header>
 
+  {% set signal = pilot.get("daily_signal") %}
+  {% if signal %}
+  <section class="desk-panel" id="stock-daily-signal">
+    <div class="desk-panel-heading"><div><h2>Daily SPY signal</h2><p>{{ signal.session }} decision &middot; Completed close from {{ signal.last_session }}</p></div>
+      {{ badge("Entry crossover" if signal.entry else "No crossover", "good" if signal.entry else "neutral") }}</div>
+    <div class="desk-kpis">
+      <div><span>Last close</span><strong>{{ money(signal.last_close|float) }}</strong><small>{{ signal.last_session }}</small></div>
+      <div><span>20-session average</span><strong>{{ money(signal.sma20|float) }}</strong><small>At that close</small></div>
+      <div><span>Worker result</span><strong>{{ "No order" if signal.state == "no_order" else signal.state|replace("_"," ")|capitalize }}</strong><small>{{ signal.observed_at[11:16] }} UTC</small></div>
+    </div>
+  </section>
+  {% endif %}
+
+  {% set intraday = pilot.get("intraday_study") %}
+  {% if intraday %}
+  <section class="desk-panel" id="stock-intraday-holdout">
+    <div class="desk-panel-heading"><div><h2>SPY opening-range holdout</h2><p>{{ intraday.start }} to {{ intraday.end }} (end exclusive)</p></div>{{ badge(intraday.state,"warn") }}</div>
+    <p class="desk-muted desk-research-status">{{ intraday.covered }} of {{ intraday.sessions }} usable sessions &middot; {{ intraday.signals }} signals</p>
+    <div class="desk-table-scroll" tabindex="0" aria-label="Intraday holdout outcomes">
+      <table class="desk-table"><thead><tr><th>Costs</th><th>Closed</th><th>Missed entry</th><th>Unresolved exit</th><th>Net</th><th>Without top winner</th></tr></thead>
+      <tbody>{% for name,row in intraday.results.items() %}<tr><th scope="row">{{ name|capitalize }}</th><td>{{ row.closed }}</td><td>{{ row.missed_entries }}</td><td>{{ row.unresolved }}</td><td>{{ money(row.net,true) }}</td><td>{{ money(row.without_largest,true) }}</td></tr>{% endfor %}</tbody></table>
+    </div>
+  </section>
+  {% endif %}
+
   <div class="desk-grid">
     <section class="desk-panel">
       <div class="desk-panel-heading">

@@ -179,6 +179,7 @@ sudo -n install -d -m 0700 /etc/hyperliquid-stock-paper
 sudo -n install -d -m 0755 "$stock/$rev"
 for file in scripts/run_stock_paper.py scripts/isolated_stock_drill.py scripts/stock_pilot_report.py scripts/check_stock_paper_readonly.py src/trading/alpaca_paper.py \
     src/trading/order_journal.py src/trading/equity_risk.py src/trading/stock_evidence.py src/trading/stock_signals.py \
+    src/trading/stock_orb.py src/trading/stock_intraday_pilot.py \
     src/core/clock_provider.py src/backtest/replay/clock.py; do
     sudo -n install -D -m 0644 "$release/$file" "$stock/$rev/$file"
 done

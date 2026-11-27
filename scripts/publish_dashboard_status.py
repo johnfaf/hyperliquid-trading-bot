@@ -37,6 +37,7 @@ STOCK_STATES = {
     "entries_paused", "daily_limit_reached",
     "order_rejected", "drill_entry_not_ready", "drill_position_unverified", "drill_position_open",
     "equity_risk_blocked", "paper_account_unverified",
+    "intraday_quote_outside_plan", "intraday_inventory_unverified",
 }
 
 ALERTS = {
@@ -50,6 +51,7 @@ ALERTS = {
     "equity_risk_blocked": "The stock paper equity-risk budget is blocking new entries.",
     "paper_account_unverified": "The stock worker did not match the authorized Alpaca Paper account. No orders sent.",
     "strategy_order_aging": "An automatic Alpaca paper order is aging. Check broker status; do not resend it.",
+    "intraday_inventory_unverified": "The intraday pilot's fills do not match the shared stock inventory. New orders are blocked.",
     "quote_not_usable": "Three open-session cycles could not verify a usable quote.",
 }
 
@@ -510,6 +512,37 @@ def stock_broker_check(path, now):
     return {"status":data["status"], "note":note, "observed_at":seen.isoformat()}
 
 
+def stock_orb_status(path,now):
+    raw=load_object(path,max_bytes=16384)
+    if (raw.get("rule")!="spy_opening_range_30m_v1" or raw.get("live_approval") is not False
+            or raw.get("state") not in ("Not qualified","Eligible for supervised paper pilot")):
+        return None
+    try:
+        stamp=datetime.fromisoformat(raw["published_at"])
+        start,end=(date.fromisoformat(raw[k]) for k in ("start","end"))
+        sessions,covered,signals=(raw[k] for k in ("sessions","covered","signals"))
+        if (stamp.utcoffset() is None or stamp>now or not 56 <= (end-start).days <= 160
+                or not all(type(x) is int for x in (sessions,covered,signals))
+                or not 0<=covered<=sessions<=100 or not 0<=signals<=sessions):
+            return None
+        results={}
+        for name in ("base","stress"):
+            result=raw["results"][name]
+            counts={k:result[k] for k in ("closed","missed_entries","unresolved")}
+            values={k:result[k] for k in ("net","without_largest","drawdown","realized_subtotal")}
+            if (any(type(v) is not int or not 0<=v<=signals for v in counts.values())
+                    or sum(counts.values())!=signals or any(v is not None and (
+                        type(v) not in (int,float) or abs(v)>10000 or not math.isfinite(v)) for v in values.values())):
+                return None
+            if counts["unresolved"] and values["net"] is not None:
+                return None
+            results[name]={**counts,**values}
+        return {"state":raw["state"],"start":start.isoformat(),"end":end.isoformat(),"sessions":sessions,
+                "covered":covered,"signals":signals,"results":results}
+    except (KeyError,ValueError,TypeError,OverflowError):
+        return None
+
+
 def investment_review(path, directory, broker_path, weekly, host, now, monthly_ops, drill_path=None):
     from src.learning.copy_toggle_replay import compare
     from src.learning.investment_scorecard import build_week, economics, paper_cash_check, paper_checkpoint, paper_protection_check
@@ -696,6 +729,7 @@ def main() -> None:
     parser.add_argument("--stock-forward-report", type=Path, default=Path("/var/lib/hyperliquid-stock-forward/latest.json"))
     parser.add_argument("--stock-forward-ledger", type=Path, default=Path("/var/lib/hyperliquid-stock-forward/market.sqlite3"))
     parser.add_argument("--stock-forward-restore", type=Path, default=Path("/var/lib/hyperliquid-dashboard/stock-forward-restore.json"))
+    parser.add_argument("--stock-orb-report", type=Path, default=Path("/var/lib/hyperliquid-stock-orb/replay-v1/latest.json"))
     parser.add_argument("--copy-forward-report", type=Path, default=Path("/var/lib/hyperliquid-copy-forward/latest.json"))
     parser.add_argument("--offhost-restore", type=Path, default=Path("/var/lib/hyperliquid-dashboard/offhost-restore.json"))
     parser.add_argument("--stock-reconciliation", type=Path, default=Path("/var/lib/hyperliquid-stock-paper/broker-reconciliation.json"))
@@ -720,6 +754,7 @@ def main() -> None:
     now = datetime.now(UTC)
     if snapshot.get("stock_pilot"):
         snapshot["stock_pilot"]["broker_check"] = stock_broker_check(args.stock_reconciliation, now)
+        snapshot["stock_pilot"]["intraday_study"] = stock_orb_status(args.stock_orb_report,now)
     snapshot["absorption"] = absorption_status(args.absorption_report, now)
     snapshot["forward_shadow"] = forward_shadow_status(args.forward_report, now)
     snapshot["stock_forward"] = stock_forward_status(args.stock_forward_report, now, args.monthly_ops_usd)
