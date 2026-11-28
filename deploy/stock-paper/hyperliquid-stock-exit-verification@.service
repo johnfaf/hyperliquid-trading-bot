@@ -1,0 +1,23 @@
+[Unit]
+Description=Supervised Alpaca Paper sell acknowledgement drill (%i)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+DynamicUser=yes
+User=hl-stock-exit-verify
+StateDirectory=hyperliquid-stock-exit-verification
+StateDirectoryMode=0700
+EnvironmentFile=/etc/hyperliquid-stock-drill/paper.env
+EnvironmentFile=/etc/hyperliquid-stock-drill/excluded.env
+LoadCredential=legacy-db:/etc/hyperliquid-stock-exit-verification/legacy-db
+LoadCredential=legacy-receipt:/etc/hyperliquid-stock-exit-verification/legacy-receipt
+ExecStart=/usr/bin/flock --nonblock /var/lib/hyperliquid-stock-exit-verification/.lock /usr/bin/python3 -I -B /opt/hyperliquid-stock-exit-verification/current/scripts/isolated_stock_exit_verification.py --state-dir /var/lib/hyperliquid-stock-exit-verification --action %i --confirm-paper-submit
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+InaccessiblePaths=-/etc/hyperliquid-stock-paper -/var/lib/hyperliquid-stock-paper -/var/lib/hyperliquid-stock-drill -/srv/hyperliquid-bot
+TimeoutStartSec=150
+UMask=0077

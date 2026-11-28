@@ -49,3 +49,51 @@ same account as the worker. The drill journal lives in
 None of these services is enabled by a timer. A verified receipt is
 separate from local fault fixtures, the weekly frozen memo, and strategy
 returns. It does not authorize money or qualify a live broker pilot.
+
+## Sell Acknowledgment Follow-up
+
+After a verified first round trip, the VPS can reuse that **dedicated**
+account without resetting its history. The follow-up copies the old
+journal into a separate v2 journal from an immutable, root-only SQLite
+snapshot. It rejects extra orders, accounts on the stock-worker exclusion
+list, fill discrepancies, and inventory that differs from the journal.
+Do not point the follow-up at the stock worker's account or database.
+
+1. Start `hyperliquid-stock-exit-verification@preflight.service` and check
+   its journal. The broker checks are read-only, even outside market hours.
+   A closed market does not prevent identity and history verification.
+2. During a supervised open session, start
+   `hyperliquid-stock-exit-verification@entry.service` once. This reserves
+   and sends a single SPY limit buy for at most $10 of **paper** notional.
+3. Start `hyperliquid-stock-exit-verification@exit.service` only after the
+   entry fills. It reconciles and sends one sell for the exact inventory,
+   then intentionally withholds its acknowledgment. A repeat invocation
+   cannot submit a second sell.
+4. Start `hyperliquid-stock-exit-verification@verify.service`. It looks
+   up the sell by its original client order ID. Reissue only **verify**
+   while it is working or waiting for fills. If the order stays open,
+   is canceled partially filled, or leaves a discrepancy, stop and
+   reconcile manually in Alpaca Paper. No replacement or working-order
+   cancellation is sent by this service.
+
+A successful receipt requires two new filled orders, zero remaining
+inventory, no open orders, and matching fill and cash records within one
+cent. A single reported sell fill leaves broker partial fills unverified.
+Multiple reported fills show a split execution, not that the cancellation
+race from the [offline drill](stock-exit-order-drill.md) occurred.
+Neither a successful receipt nor the test notification enables retries.
+
+### Test Alert
+
+`scripts/stock_exit_test_alert.py` sends the labeled
+`STOCK-EXIT-TEST-01` fixture message to the configured Telegram chat.
+It must be invoked deliberately with `--send-test`, a dedicated state
+directory, and a root-managed configuration containing only the Telegram
+bot token and chat ID. It may instead read the isolated systemd credential
+named `telegram`. It reserves the test in SQLite before posting to
+Telegram; a repeat process with the same state will not re-send, even if
+the previous delivery is uncertain. Do not clear state to force delivery.
+
+An accepted Telegram response confirms the API accepted the message,
+not that it was seen on a device. This test describes a simulated 0.07 SPY
+position and never places an order. There is no recurring alert job.
