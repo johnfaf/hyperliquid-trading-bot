@@ -111,6 +111,8 @@ def test_candle_snapshot_server_errors_fail_fast_without_retry_sleep(monkeypatch
     mgr = api_manager.APIManager()
     warns = []
     sleeps = []
+    # Exercise the warning path independently of the CI runner's boot time.
+    monkeypatch.setattr(api_manager.time, "monotonic", lambda: 120.0)
 
     class FakeResponse:
         status_code = 500
